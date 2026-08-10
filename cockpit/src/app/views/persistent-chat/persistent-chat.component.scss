@@ -2025,6 +2025,66 @@
         text-overflow: ellipsis;
       }
 
+      /* Send stage: one line naming the phase, one bar for the whole
+         commitment (bytes + POST). Never two bars, never one per file. */
+      .upload-stage {
+        margin-top: 6px;
+      }
+
+      .upload-stage-line {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      /* The percentage lives in the visible label, which updates ~4×/s; this
+         twin carries the coarse phase for the polite region. */
+      .upload-stage-announce {
+        @include m.visually-hidden;
+      }
+
+      .upload-bar {
+        margin-top: 4px;
+        height: 3px;
+        border-radius: var(--radius-pill);
+        overflow: hidden;
+        background: color-mix(in srgb, var(--text-muted) 25%, transparent);
+      }
+
+      .upload-bar-fill {
+        height: 100%;
+        background: var(--accent-color);
+
+        /* Matches the 250ms progress-write throttle, so the fill glides
+           between writes instead of stepping. */
+        transition: width 250ms linear;
+      }
+
+      /* No computable body length — claim no position rather than lie. */
+      .upload-bar.indeterminate .upload-bar-fill {
+        width: 40%;
+        animation: upload-bar-slide 1.2s ease-in-out infinite;
+      }
+
+      @keyframes upload-bar-slide {
+        from { transform: translateX(-100%); }
+        to { transform: translateX(250%); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .upload-bar-fill {
+          transition: none;
+        }
+
+        .upload-bar.indeterminate .upload-bar-fill {
+          width: 100%;
+          animation: none;
+          opacity: 0.5;
+        }
+      }
+
       /* Slash command autocomplete */
 
       .slash-menu {

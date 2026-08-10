@@ -2,6 +2,9 @@ import {describe, expect, it} from 'vitest';
 import {
     classifyUploadFailure,
     composeAgentContent,
+    progressWriteDue,
+    PROGRESS_WRITE_INTERVAL_MS,
+    sendProgressPercent,
     uploadSummary,
     type PendingUpload,
 } from './upload-stage';
@@ -88,5 +91,98 @@ describe('uploadSummary', () => {
 
     it('treats an empty list as done', () => {
         expect(uploadSummary([]).allDone).toBe(true);
+    });
+
+    it('carries the indicator position alongside the counts', () => {
+        const s = uploadSummary([
+            pending({id: 'a', size: 100, status: 'done'}),
+            pending({id: 'b', size: 100, total: 100, loaded: 50, status: 'uploading'}),
+        ]);
+        // 150 of 200 bytes, scaled into the 90% the upload owns.
+        expect(s.percent).toBe(68);
+    });
+});
+
+describe('progressWriteDue', () => {
+    it('lets the first event of a burst through (leading edge)', () => {
+        expect(progressWriteDue(0, 1_000_000)).toBe(true);
+    });
+
+    it('drops everything inside the interval', () => {
+        const t = 1_000_000;
+        expect(progressWriteDue(t, t + PROGRESS_WRITE_INTERVAL_MS - 1)).toBe(false);
+    });
+
+    it('reopens exactly at the interval — ~4 writes per second', () => {
+        const t = 1_000_000;
+        expect(PROGRESS_WRITE_INTERVAL_MS).toBe(250);
+        expect(progressWriteDue(t, t + PROGRESS_WRITE_INTERVAL_MS)).toBe(true);
+    });
+});
+
+describe('sendProgressPercent', () => {
+    it('never exceeds the upload share, so the bar cannot fill before the POST', () => {
+        // Every byte is in, but the send has not been accepted yet — the
+        // remaining scale belongs to the POST.
+        expect(sendProgressPercent([pending({status: 'done'})])).toBe(90);
+    });
+
+    it('weighs files by size, not by count', () => {
+        // A 1MB file landing while a 99MB file has not started is ~1%, not 50%.
+        const p = sendProgressPercent([
+            pending({id: 'small', size: 1_000_000, status: 'done'}),
+            pending({id: 'big', size: 99_000_000, status: 'queued'}),
+        ]);
+        expect(p).toBe(1);
+    });
+
+    it('counts the in-flight file fractionally', () => {
+        const p = sendProgressPercent([
+            pending({id: 'a', size: 100, total: 100, loaded: 50, status: 'uploading'}),
+        ]);
+        expect(p).toBe(45); // half the bytes × the 90% upload share
+    });
+
+    it('goes indeterminate when the in-flight file has no computable total', () => {
+        // HttpUploadProgressEvent.total is optional. Rendering 0% (or NaN)
+        // here would be a lie about a file that is actively moving.
+        expect(
+            sendProgressPercent([
+                pending({id: 'a', size: 100, total: null, loaded: 50, status: 'uploading'}),
+            ]),
+        ).toBeNull();
+    });
+
+    it('never divides by zero, and never emits NaN or Infinity', () => {
+        expect(
+            sendProgressPercent([pending({id: 'a', size: 0, total: 0, loaded: 0, status: 'uploading'})]),
+        ).toBeNull();
+        const zeroByteDone = sendProgressPercent([
+            pending({id: 'a', size: 0, total: null, status: 'done'}),
+        ]);
+        expect(Number.isFinite(zeroByteDone)).toBe(true);
+        expect(zeroByteDone).toBe(90);
+    });
+
+    it('clamps a total the browser under-reports (multipart framing) to 100%', () => {
+        // `loaded` counts wire bytes; if `total` ever lags them the fraction
+        // must not push the bar past its own scale.
+        expect(
+            sendProgressPercent([
+                pending({id: 'a', size: 100, total: 100, loaded: 140, status: 'uploading'}),
+            ]),
+        ).toBe(90);
+    });
+
+    it('reports nothing for an item with no files', () => {
+        expect(sendProgressPercent([])).toBeNull();
+    });
+
+    it('gives a failed file no credit', () => {
+        expect(
+            sendProgressPercent([
+                pending({id: 'a', size: 100, total: 100, loaded: 90, status: 'failed'}),
+            ]),
+        ).toBe(0);
     });
 });

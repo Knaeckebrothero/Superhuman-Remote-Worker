@@ -37,6 +37,7 @@ import {
     shouldPin,
     shouldSendOnEnter,
     textSizeToCss,
+    uploadStageAnnounceKey,
     uploadStageFor,
     uploadStageKey,
 } from './persistent-chat.component';
@@ -165,6 +166,42 @@ describe('uploadStageKey', () => {
     it('reports nothing for an item with no files', () => {
         expect(uploadStageKey(null)).toBeNull();
     });
+
+    it('takes the percentage variant once the fraction is known', () => {
+        expect(uploadStageKey({done: 1, total: 3, allDone: false, percent: 34})).toBe(
+            'chat.upload.stagePercent',
+        );
+    });
+
+    it('falls back to the plain line when the fraction is unknowable', () => {
+        // A file uploading with no computable body length. "Uploading 1 of 3 —
+        // 0%" would be a lie about bytes that are moving.
+        expect(uploadStageKey({done: 1, total: 3, allDone: false, percent: null})).toBe(
+            'chat.upload.stage',
+        );
+    });
+
+    it('still says Sending once the bytes are in, percentage or not', () => {
+        // The label changes; the indicator does not. It sits where the upload
+        // left it and never fills — the accepted send removes the bubble.
+        expect(uploadStageKey({done: 3, total: 3, allDone: true, percent: 90})).toBe(
+            'chat.upload.sending',
+        );
+    });
+});
+
+describe('uploadStageAnnounceKey', () => {
+    it('strips the percentage for the polite live region', () => {
+        // The visible label updates ~4×/s; a live region re-reading
+        // "34%… 36%… 39%" is unusable. The announced string changes only when
+        // a file lands or the phase flips.
+        expect(uploadStageAnnounceKey('chat.upload.stagePercent')).toBe('chat.upload.stage');
+    });
+
+    it('leaves every other line alone', () => {
+        expect(uploadStageAnnounceKey('chat.upload.sending')).toBe('chat.upload.sending');
+        expect(uploadStageAnnounceKey('chat.upload.waitingOn')).toBe('chat.upload.waitingOn');
+    });
 });
 
 describe('uploadStageFor', () => {
@@ -210,6 +247,30 @@ describe('uploadStageFor', () => {
             key: 'chat.upload.stage',
             params: {done: 1, total: 3},
         });
+    });
+
+    it('interpolates the percentage into the head\'s label when it is known', () => {
+        expect(uploadStageFor(true, {done: 1, total: 3, allDone: false, percent: 34}, null)).toEqual({
+            key: 'chat.upload.stagePercent',
+            params: {done: 1, total: 3, percent: 34},
+        });
+    });
+
+    it('omits the percent param entirely when the fraction is unknowable', () => {
+        // Not `percent: 0` — a param that is present but meaningless is how a
+        // future template starts rendering "0%" for a file that is moving.
+        expect(uploadStageFor(true, {done: 1, total: 3, allDone: false, percent: null}, null)).toEqual({
+            key: 'chat.upload.stage',
+            params: {done: 1, total: 3},
+        });
+    });
+
+    it('never puts a percentage on a non-head item — one indicator per send', () => {
+        // The bytes belong to the head. A percentage here would be a second
+        // reading of the same upload on a different bubble.
+        expect(
+            uploadStageFor(false, {done: 0, total: 2, allDone: false, percent: 12}, 'big.mp4'),
+        ).toEqual({key: 'chat.upload.waitingOn', params: {name: 'big.mp4'}});
     });
 });
 

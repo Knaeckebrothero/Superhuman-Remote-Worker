@@ -1,6 +1,13 @@
 import {inject, Injectable} from '@angular/core';
-import {HttpClient, HttpErrorResponse, HttpParams} from '@angular/common/http';
-import {catchError, map, Observable, of, tap, throwError, timeout} from 'rxjs';
+import {
+    HttpClient,
+    HttpErrorResponse,
+    HttpEventType,
+    HttpParams,
+    HttpResponse,
+    HttpUploadProgressEvent,
+} from '@angular/common/http';
+import {catchError, filter, map, Observable, of, tap, throwError, timeout} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
@@ -76,7 +83,7 @@ import {
     VoiceCapabilities,
 } from '../models/api.model';
 import {
-  ThreadUploadedFile,
+  ThreadUploadEvent,
   ThreadUploadResponse,
   UploadInfo,
   UploadResponse,
@@ -1153,23 +1160,44 @@ export class ApiService {
    *      oversized file failed the whole message.
    *   3. Per-file progress and per-file cancel are not expressible otherwise.
    *
-   * Returns the server's `files[]` for this request — an ARRAY, because a .zip
-   * expands into one entry per extracted member (services/thread_uploads.py).
+   * Emits `{kind: 'progress'}` as the bytes move, then exactly one
+   * `{kind: 'done', files}` — an ARRAY, because a .zip expands into one entry
+   * per extracted member (services/thread_uploads.py). Users attach 30-90MB
+   * PDFs; without the progress events the bubble can only show an opaque
+   * indeterminate label for the whole wait.
+   *
+   * `reportProgress: true` only does anything on the XHR backend — Angular's
+   * FetchBackend emits no UploadProgress events at all — which is why
+   * app.config.ts deliberately does NOT install `withFetch()`.
    *
    * Errors are RE-THROWN (not swallowed to `null`) so the caller can read the
    * status and the server-side `detail` field. Use `humanizeUploadError()` to
    * map an arbitrary HttpErrorResponse to a user-facing string.
    */
-  uploadOneToThread(threadId: string, file: File): Observable<ThreadUploadedFile[]> {
+  uploadOneToThread(threadId: string, file: File): Observable<ThreadUploadEvent> {
     const formData = new FormData();
     formData.append('files', file, file.name);
     return this.http
       .post<ThreadUploadResponse>(
         `${this.baseUrl}/persistent/threads/${threadId}/uploads`,
         formData,
+        {reportProgress: true, observe: 'events'},
       )
       .pipe(
-        map((res) => res.files),
+        // Sent / ResponseHeader / DownloadProgress carry nothing the send
+        // outbox can use, so they never reach the caller.
+        filter(
+          (e): e is HttpUploadProgressEvent | HttpResponse<ThreadUploadResponse> =>
+            e.type === HttpEventType.UploadProgress || e.type === HttpEventType.Response,
+        ),
+        map((e) =>
+          e.type === HttpEventType.UploadProgress
+            ? // `total` is optional on the DOM event and absent whenever the
+              // body length is not computable. Normalise to null here so no
+              // consumer has to remember that it might be undefined.
+              {kind: 'progress' as const, loaded: e.loaded, total: e.total ?? null}
+            : {kind: 'done' as const, files: e.body?.files ?? []},
+        ),
         catchError((error: HttpErrorResponse) => {
           console.error(`Failed to upload ${file.name} to thread ${threadId}:`, error);
           return throwError(() => error);

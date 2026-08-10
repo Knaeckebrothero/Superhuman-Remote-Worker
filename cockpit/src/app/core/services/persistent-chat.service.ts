@@ -1,10 +1,10 @@
 import {computed, DestroyRef, effect, inject, Injectable, NgZone, signal, untracked} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {HttpClient} from '@angular/common/http';
-import {firstValueFrom} from 'rxjs';
+import {filter, firstValueFrom, map, tap} from 'rxjs';
 import {environment} from '../environment';
 import {Project, ThreadCloudDiffSummary, ThreadStatus} from '../models/api.model';
-import {FilePreview} from '../models/file.model';
+import {FilePreview, ThreadUploadEvent} from '../models/file.model';
 import {
     AssistantTurn,
     ConversationState,
@@ -22,7 +22,12 @@ import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
 import {classifyResumeError, ConfigDriftItem} from './resume-error';
 import {reduce, ReducerAction} from './turn-reducer';
-import {classifyUploadFailure, composeAgentContent, PendingUpload} from './upload-stage';
+import {
+    classifyUploadFailure,
+    composeAgentContent,
+    PendingUpload,
+    progressWriteDue,
+} from './upload-stage';
 import {AppToastService} from '../../ui/toast';
 import {
     CanvasControl,
@@ -2784,7 +2789,14 @@ export class PersistentChatService {
      * The upload goes through ApiService → HttpClient on purpose. A raw
      * XHR/fetch would miss auth.interceptor's `ngsw-bypass: 1` and the service
      * worker would corrupt the multipart body
-     * (docs/done/cockpit_service_worker_breaks_file_uploads.md).
+     * (docs/done/cockpit_service_worker_breaks_file_uploads.md) — and a SW that
+     * answers with respondWith() also destroys the very upload-progress events
+     * this stage now reports.
+     *
+     * Progress: the observable emits `progress` events as the bytes move and
+     * one `done` at the end. Progress is patched onto the PendingUpload —
+     * throttled, see PROGRESS_WRITE_INTERVAL_MS — while `done` still resolves
+     * the single await below, so every guard around it is unchanged.
      *
      * Returns the same {ok, status} shape as _postInput so the flush's existing
      * terminal-vs-retryable branching applies unchanged.
@@ -2813,10 +2825,38 @@ export class PersistentChatService {
                 this._patchPendingFile(head.localId, f.id, {
                     status: 'uploading',
                     error: undefined,
+                    // A retry re-sends the whole file, so a `loaded` left over
+                    // from the failed attempt would park the bar high until the
+                    // first new progress event contradicted it.
+                    loaded: 0,
                 });
+                // Throttle state, per file and per attempt — scoped to this
+                // iteration so nothing survives into the next file or leaks
+                // onto the service. See PROGRESS_WRITE_INTERVAL_MS for why the
+                // rate matters (the scroll pin re-pins synchronously).
+                let lastProgressAt = 0;
                 try {
                     const results = await firstValueFrom(
-                        this.api.uploadOneToThread(threadId, f.file),
+                        this.api.uploadOneToThread(threadId, f.file).pipe(
+                            tap((ev) => {
+                                if (ev.kind !== 'progress') return;
+                                const now = Date.now();
+                                if (!progressWriteDue(lastProgressAt, now)) return;
+                                lastProgressAt = now;
+                                // Through the signal, never in place — the
+                                // bubble's bar reads these. _patchPendingFile
+                                // no-ops once the item has left the queue.
+                                this._patchPendingFile(head.localId, f.id, {
+                                    loaded: ev.loaded,
+                                    total: ev.total,
+                                });
+                            }),
+                            filter(
+                                (ev): ev is Extract<ThreadUploadEvent, {kind: 'done'}> =>
+                                    ev.kind === 'done',
+                            ),
+                            map((ev) => ev.files),
+                        ),
                     );
                     // A .zip expands to one entry per extracted member, so one
                     // PendingUpload can resolve into several ChatAttachments.
