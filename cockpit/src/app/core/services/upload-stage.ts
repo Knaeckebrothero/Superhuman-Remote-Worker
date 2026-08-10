@@ -26,6 +26,47 @@ export interface PendingUpload {
 }
 
 /**
+ * Uppy's identity key for a selected file. Two chips with the same key are the
+ * same file, so the second is refused rather than attached.
+ *
+ * This matters more since eager upload (§5.4): the backend has no upload
+ * idempotency — `_claim_name` resolves a collision with a `_1` suffix against a
+ * live listing — so two chips for one file become two files in `uploads/`, and
+ * the message hint names both. Rejecting the duplicate at the composer removes
+ * the most common path to that at zero cost.
+ *
+ * Deliberately keyed off the `File`, not the `FilePreview`: a voice recording's
+ * preview `name` is a human label ("Voice message (0:03)"), while its File
+ * carries the real, timestamped filename.
+ */
+export function attachmentDedupeKey(file: {
+    name: string;
+    size: number;
+    lastModified?: number;
+}): string {
+    return `${file.name}|${file.size}|${file.lastModified ?? 0}`;
+}
+
+/**
+ * The smallest set of `uploads/`-relative paths whose deletion removes every
+ * one of `names`.
+ *
+ * One upload can produce many entries: a `.zip` is expanded server-side into
+ * `<stem>/a.txt`, `<stem>/sub/b.txt`, … Because the DELETE route removes a
+ * named subtree, collapsing to the distinct top-level segments turns a
+ * 100-member archive into one request. A plain file is its own top-level
+ * segment, so the same code covers both.
+ */
+export function topLevelUploadTargets(names: readonly string[]): string[] {
+    const targets = new Set<string>();
+    for (const name of names) {
+        const top = name.split('/')[0];
+        if (top) targets.add(top);
+    }
+    return [...targets];
+}
+
+/**
  * What the agent sees: the user's text plus a plain-language hint naming the
  * uploaded files. Kept identical to the pre-refactor string so existing
  * sessions and prompt expectations don't shift.

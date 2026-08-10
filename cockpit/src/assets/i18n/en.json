@@ -1609,6 +1609,7 @@
       "failed": "{{name}} could not be uploaded",
       "removeAndSend": "Remove file and send",
       "slashCommandWithAttachments": "Remove the attached files before running a command.",
+      "duplicateFile": "{{name}} is already attached",
       "tooLarge": "{{name}} is larger than the 100 MB limit",
       "tooManyFiles": "You can attach at most 20 files at once",
       "noWorkspace": "This session has no workspace, so files cannot be attached."

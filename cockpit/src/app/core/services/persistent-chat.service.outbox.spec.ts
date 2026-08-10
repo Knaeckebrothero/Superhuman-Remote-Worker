@@ -11,7 +11,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {HttpClient, HttpErrorResponse} from '@angular/common/http';
-import {of, throwError, Subject} from 'rxjs';
+import {Observable, of, throwError, Subject} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
@@ -68,6 +68,7 @@ function createService() {
     };
     const mockApi: any = {
         uploadOneToThread: vi.fn().mockReturnValue(of(done())),
+        deleteThreadUpload: vi.fn().mockReturnValue(of(undefined)),
         humanizeUploadError: vi.fn().mockReturnValue('upload failed'),
     };
     const mockCache: any = {
@@ -155,10 +156,13 @@ const inputPosts = (ctx: {mockHttp: any}) =>
 /** The body of the Nth POST /input (mock.calls entries are [url, body]). */
 const inputBody = (ctx: {mockHttp: any}, n = 0) => inputPosts(ctx)[n][1];
 
-function filePreview(name: string): FilePreview {
+function filePreview(name: string, id = `preview-${name}`): FilePreview {
     return {
-        id: `preview-${name}`,
-        file: new File(['x'], name),
+        id,
+        // Fixed `lastModified`: it is a third of the dedupe key
+        // (name|size|lastModified), and Date.now() would make two previews of
+        // the same file compare equal or not depending on the clock.
+        file: new File(['x'], name, {lastModified: 111}),
         name,
         size: 1,
         sizeFormatted: '1 B',
@@ -574,22 +578,32 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             const upload = vi
                 .fn()
                 .mockReturnValueOnce(of(done(uploaded('a.pdf'))))
-                .mockReturnValueOnce(throwError(() => new HttpErrorResponse({status: 503})));
+                .mockReturnValue(throwError(() => new HttpErrorResponse({status: 503})));
             ctx.mockApi.uploadOneToThread = upload;
+            /** How many requests carried this file, across eager and deferred. */
+            const sends = (name: string) =>
+                upload.mock.calls.filter((c: any) => (c[1] as File).name === name).length;
 
+            // Attaching starts both uploads eagerly (§5.4): a.pdf lands, b.pdf
+            // fails. b's failure leaves no trace, so the send falls back to the
+            // deferred path for it — and fails again.
             ctx.service.addAttachments([filePreview('a.pdf'), filePreview('b.pdf')]);
             await ctx.service.sendMessage('two files');
             await flushTick();
             expect(ctx.service.outboxStalled()).toBe(true);
-            expect(upload).toHaveBeenCalledTimes(2);
+            expect(sends('a.pdf')).toBe(1); // adopted, not re-sent
+            expect(sends('b.pdf')).toBe(2); // eager attempt + deferred attempt
 
             upload.mockReturnValue(of(done(uploaded('b.pdf'))));
             ctx.service.retryQueuedSends();
             await flushTick();
 
-            // 3 total, NOT 4 — a.pdf is never re-sent. The backend has no
-            // idempotency: a re-upload would land as a_1.pdf.
-            expect(upload).toHaveBeenCalledTimes(3);
+            // The invariant: a.pdf crossed the wire exactly once for the whole
+            // life of the send. The backend has no idempotency — a re-upload
+            // would land as a_1.pdf and nothing but the delete endpoint could
+            // take it back.
+            expect(sends('a.pdf')).toBe(1);
+            expect(sends('b.pdf')).toBe(3);
             expect(inputBody(ctx).content).toContain('a.pdf, b.pdf');
         });
 
@@ -789,6 +803,179 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             const localId = ctx.service.outbox()[0].localId;
             ctx.service.discardQueuedSend(localId);
             expect(ctx.service.outbox().length).toBe(1);
+        });
+    });
+
+    // --- 8. eager upload on attach (§5.4) ---------------------------------
+
+    describe('eager upload on attach', () => {
+        /** An upload that can be observed and ABORTED — the mock backends used
+         *  above cannot express an abort, and the abort is the property under
+         *  test for a cancel. */
+        function abortableUpload() {
+            const requests: {file: File; aborted: boolean; settle: () => void}[] = [];
+            const fn = vi.fn(
+                (_threadId: string, file: File) =>
+                    new Observable<ThreadUploadEvent>((sub) => {
+                        let settled = false;
+                        const rec = {
+                            file,
+                            aborted: false,
+                            settle: () => {
+                                settled = true;
+                                sub.next(done(uploaded(file.name)));
+                                sub.complete();
+                            },
+                        };
+                        requests.push(rec);
+                        return () => {
+                            rec.aborted = !settled;
+                        };
+                    }),
+            );
+            return {fn, requests};
+        }
+
+        it('uploads the moment a file is attached to a live thread', async () => {
+            // Most users attach first and type second. Starting here is what
+            // makes the send instant once they finally hit Enter.
+            const ctx = await readySession();
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(new Subject<ThreadUploadEvent>());
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+
+            expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledTimes(1);
+            expect(ctx.mockApi.uploadOneToThread.mock.calls[0][0]).toBe('thread-a');
+        });
+
+        it('waits for the flush when the session is not ready yet', async () => {
+            // The workspace is provisioned lazily and 409s until it is up.
+            const ctx = createService();
+            await ctx.service.connect('t1'); // no 'ready' frame
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+
+            expect(ctx.mockApi.uploadOneToThread).not.toHaveBeenCalled();
+        });
+
+        it('waits for the flush when the workspace tier is none', async () => {
+            // Permanent refusal, not a wait — but the message can still be sent
+            // without the files, so the deferred path owns the error.
+            const ctx = await readySession();
+            ctx.service.workspaceTier.set('none');
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+
+            expect(ctx.mockApi.uploadOneToThread).not.toHaveBeenCalled();
+        });
+
+        it('adopts the eager upload at send time instead of starting a second one', async () => {
+            const ctx = await readySession();
+            const {fn, requests} = abortableUpload();
+            ctx.mockApi.uploadOneToThread = fn;
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            expect(requests).toHaveLength(1);
+            requests[0].settle(); // lands while the user is still typing
+
+            await ctx.service.sendMessage('look at this');
+            await flushTick();
+
+            // One request for the whole life of the file. Re-uploading a
+            // success is a permanent duplicate.
+            expect(requests).toHaveLength(1);
+            expect(inputBody(ctx).content).toBe(
+                'look at this\n\n[Attached files in uploads/: a.pdf]',
+            );
+        });
+
+        it('removing the chip aborts an eager upload that is still transferring', async () => {
+            const ctx = await readySession();
+            const {fn, requests} = abortableUpload();
+            ctx.mockApi.uploadOneToThread = fn;
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            ctx.service.removeAttachment('preview-a.pdf');
+
+            expect(requests[0].aborted).toBe(true);
+            expect(ctx.service.pendingAttachments()).toEqual([]);
+            // Not an error: a cancel is intent, not a failure, and must never
+            // reach humanizeUploadError ("Network error — check your
+            // connection" for an abort is the service-worker incident's lie).
+            expect(ctx.service.error()).toBeNull();
+            expect(ctx.service.attachmentError()).toBeNull();
+            expect(ctx.mockApi.humanizeUploadError).not.toHaveBeenCalled();
+        });
+
+        it('removing the chip DELETES an eager upload that already landed', async () => {
+            const ctx = await readySession();
+            const {fn, requests} = abortableUpload();
+            ctx.mockApi.uploadOneToThread = fn;
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            requests[0].settle();
+            ctx.service.removeAttachment('preview-a.pdf');
+            await flushTick();
+
+            expect(ctx.mockApi.deleteThreadUpload).toHaveBeenCalledWith('thread-a', 'a.pdf');
+        });
+
+        it('a thread switch clears the chips, the banner and the eager uploads', async () => {
+            // Before eager upload the chips merely followed the user between
+            // threads (nothing cleared them). With it, that would push bytes
+            // into a workspace they had already left.
+            const ctx = await readySession('t1');
+            const {fn, requests} = abortableUpload();
+            ctx.mockApi.uploadOneToThread = fn;
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            ctx.service.attachmentError.set('some earlier complaint');
+
+            await ctx.service.connect('t2');
+
+            expect(ctx.service.pendingAttachments()).toEqual([]);
+            expect(ctx.service.attachmentError()).toBeNull();
+            expect(requests[0].aborted).toBe(true);
+        });
+
+        it('entering the landing draft clears the chips and the eager uploads', async () => {
+            const ctx = await readySession('t1');
+            const {fn, requests} = abortableUpload();
+            ctx.mockApi.uploadOneToThread = fn;
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            ctx.service.enterDraftSession();
+
+            expect(ctx.service.pendingAttachments()).toEqual([]);
+            expect(requests[0].aborted).toBe(true);
+        });
+
+        it('refuses a re-add of the same name|size|lastModified', async () => {
+            // Uppy's key. The backend has no upload idempotency, so a second
+            // chip for one file becomes a_1.pdf next to a.pdf, with the message
+            // hint naming both.
+            const ctx = await readySession();
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(new Subject<ThreadUploadEvent>());
+
+            ctx.service.addAttachments([filePreview('a.pdf', 'first')]);
+            ctx.service.addAttachments([filePreview('a.pdf', 'second')]);
+
+            expect(ctx.service.pendingAttachments().map((p) => p.id)).toEqual(['first']);
+            expect(ctx.service.attachmentError()).toBe('chat.upload.duplicateFile');
+            expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledTimes(1);
+        });
+
+        it('keeps the non-duplicate half of a mixed selection', async () => {
+            const ctx = await readySession();
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(new Subject<ThreadUploadEvent>());
+
+            ctx.service.addAttachments([filePreview('a.pdf', 'first')]);
+            ctx.service.addAttachments([
+                filePreview('a.pdf', 'dupe'),
+                filePreview('b.pdf', 'fresh'),
+            ]);
+
+            expect(ctx.service.pendingAttachments().map((p) => p.id)).toEqual(['first', 'fresh']);
+            expect(ctx.service.attachmentError()).toBe('chat.upload.duplicateFile');
         });
     });
 });

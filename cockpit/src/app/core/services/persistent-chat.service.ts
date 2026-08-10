@@ -23,11 +23,13 @@ import {NotificationService} from './notification.service';
 import {classifyResumeError, ConfigDriftItem} from './resume-error';
 import {reduce, ReducerAction} from './turn-reducer';
 import {
+    attachmentDedupeKey,
     classifyUploadFailure,
     composeAgentContent,
     PendingUpload,
     progressWriteDue,
 } from './upload-stage';
+import {UploadRegistryService} from './upload-registry.service';
 import {AppToastService} from '../../ui/toast';
 import {
     CanvasControl,
@@ -389,6 +391,12 @@ export class PersistentChatService {
     private readonly threadTransport = inject(PersistentThreadTransportBridge);
     private readonly canvas = inject(CanvasService);
     private readonly capabilities = inject(CapabilitiesService);
+    /** Uploads started when a file was ATTACHED, before the user committed to
+     *  sending it (docs/features/session_attachment_send_flow.md §5.4). Owned
+     *  by a root service, not this one: an uncommitted upload has a different
+     *  lifetime from the outbox, and must survive the chat page being
+     *  destroyed by navigation. */
+    private readonly uploads = inject(UploadRegistryService);
 
     constructor() {
         let datasourceDefaultsAvailable =
@@ -1005,6 +1013,11 @@ export class PersistentChatService {
             // wholesale — unless we're carrying it across a create/reprovision
             // (createAndConnect), where the queued sends belong to *this* thread.
             if (!opts.carryOutbox) this.outbox.set([]);
+            // Same gate, same reason, for anything still sitting in the
+            // composer: on the carry path the chips belong to the thread being
+            // created, and on a genuine switch they must not follow the user
+            // (nor may their bytes — see _discardComposerAttachments).
+            if (!opts.carryOutbox) this._discardComposerAttachments();
             // Accepted-send accounting is per-thread; a carried count would
             // pin the new thread's composer on "working".
             this.pendingTurnCount.set(0);
@@ -1084,6 +1097,10 @@ export class PersistentChatService {
         this.dispatch({type: 'reset', threadId: null});
         this.threadId.set(null);
         this.outbox.set([]);
+        // Leaving a thread for the landing draft is a thread transition like
+        // any other: the chips (and any eager upload behind them) belong to the
+        // thread being left, not to the draft being entered.
+        this._discardComposerAttachments();
         this.sessionReady.set(false);
         this.startupPhase.set(null);
         this.sessionTitle.set(null);
@@ -2486,21 +2503,111 @@ export class PersistentChatService {
         this.disconnect();
     }
 
-    /** Add files queued in the composer to be uploaded on next send. */
+    /**
+     * Queue files in the composer — and, when the thread can already take them,
+     * start uploading immediately (§5.4).
+     *
+     * Most users attach first and type second, so starting here usually means
+     * the bytes are in the workspace before they finish the sentence. When the
+     * preconditions don't hold the file simply waits and uploads at flush time:
+     * the deferred path is the fallback and is never removed.
+     *
+     * Duplicates are refused rather than attached. The backend has no upload
+     * idempotency, so a second chip for the same file becomes a second file
+     * (`report_1.pdf`) that only the delete endpoint can take back.
+     */
     addAttachments(previews: FilePreview[]): void {
         if (!previews.length) return;
-        this.pendingAttachments.update((existing) => [...existing, ...previews]);
-        this.attachmentError.set(null);
+
+        // A file with no name has no identity to compare, so it is never a
+        // duplicate — better to attach one file twice than to refuse a real one.
+        const keyOf = (p: FilePreview) => (p.file?.name ? attachmentDedupeKey(p.file) : null);
+        const seen = new Set(
+            this.pendingAttachments()
+                .map(keyOf)
+                .filter((k): k is string => k !== null),
+        );
+        const accepted: FilePreview[] = [];
+        const duplicates: string[] = [];
+        for (const preview of previews) {
+            const key = keyOf(preview);
+            if (key !== null && seen.has(key)) {
+                duplicates.push(preview.name);
+                continue;
+            }
+            if (key !== null) seen.add(key);
+            accepted.push(preview);
+        }
+
+        if (accepted.length > 0) {
+            this.pendingAttachments.update((existing) => [...existing, ...accepted]);
+        }
+        // Cleared-then-set, in that order: a selection that both accepts some
+        // files and rejects others must keep the rejection visible. (The
+        // component relies on this clearing to report its OWN rejections after
+        // calling us — see applyFilePreviews.)
+        this.attachmentError.set(
+            duplicates.length > 0
+                ? this.transloco.translate('chat.upload.duplicateFile', {name: duplicates[0]})
+                : null,
+        );
+
+        if (!this.canUploadEagerly()) return;
+        const threadId = this.threadId();
+        if (!threadId) return;
+        for (const preview of accepted) this.uploads.start(threadId, preview);
     }
 
-    /** Drop one queued attachment by id. */
+    /**
+     * Whether an attached file can start uploading before the user sends
+     * (§5.4). A thread has to exist to upload into, the session has to be ready
+     * (the workspace is provisioned lazily and 409s until it is), and a `none`
+     * tier has no workspace at all — that one is a permanent refusal, not a
+     * wait.
+     */
+    private canUploadEagerly(): boolean {
+        return (
+            this.threadId() !== null &&
+            this.sessionReady() &&
+            this.workspaceTier() !== 'none' &&
+            this.threadStatus() !== 'ended'
+        );
+    }
+
+    /** Drop one queued attachment by id, cancelling its upload if one is
+     *  running (abort while the bytes are moving; delete what already
+     *  landed — UploadRegistryService.cancel). */
     removeAttachment(id: string): void {
         this.pendingAttachments.update((list) => list.filter((p) => p.id !== id));
+        this.uploads.cancel(id);
     }
 
-    /** Drop all queued attachments. */
+    /**
+     * Drop all queued attachments WITHOUT cancelling their uploads.
+     *
+     * This is the send path's clearing: the chips leave the composer because
+     * they have moved onto the outbox item, which adopts their in-flight
+     * uploads a moment later. Cancelling here would abort the very transfer the
+     * send is about to await. Use `_discardComposerAttachments` for a
+     * transition that genuinely abandons them.
+     */
     clearAttachments(): void {
         this.pendingAttachments.set([]);
+    }
+
+    /**
+     * Abandon everything queued in the composer: cancel the uploads, drop the
+     * chips, clear the banner.
+     *
+     * Runs on every thread transition. Before eager upload the chips merely
+     * *followed* the user from thread to thread (nothing cleared them); with
+     * it, leaving them would put bytes in the wrong workspace and let an
+     * upload resolve into a foreign queue.
+     */
+    private _discardComposerAttachments(): void {
+        this.uploads.abortAll();
+        this.pendingAttachments.set([]);
+        this.attachmentError.set(null);
     }
 
     /** Send a user message (with slash command parsing).
@@ -2837,7 +2944,16 @@ export class PersistentChatService {
                 let lastProgressAt = 0;
                 try {
                     const results = await firstValueFrom(
-                        this.api.uploadOneToThread(threadId, f.file).pipe(
+                        // ADOPT, never restart: an upload started when the file
+                        // was attached (§5.4) is usually already running or
+                        // already finished by now, and re-uploading a success
+                        // is a permanent duplicate (_claim_name suffixes it
+                        // `_1` and nothing but the delete endpoint cleans that
+                        // up). The registry hands back a stream shaped exactly
+                        // like uploadOneToThread's — including a fresh request
+                        // when there is nothing to adopt — so every guard
+                        // around this await is unchanged.
+                        this.uploads.adopt(threadId, f.id, f.file).pipe(
                             tap((ev) => {
                                 if (ev.kind !== 'progress') return;
                                 const now = Date.now();
@@ -2874,6 +2990,19 @@ export class PersistentChatService {
                     });
                     this._mergeResolvedAttachments(head.localId, f.id, resolved);
                 } catch (err) {
+                    // Intent BEFORE status. Angular reports a user abort and a
+                    // dead network identically as `status: 0`, so reading the
+                    // status first would turn a cancellation into "Network
+                    // error — check your connection" (spec §5.5: a cancel is
+                    // not an error and is filtered before humanizeUploadError).
+                    // `queued` is the honest state for a file nobody attempted.
+                    if (this.uploads.wasCancelled(f.id)) {
+                        this._patchPendingFile(head.localId, f.id, {
+                            status: 'queued',
+                            loaded: 0,
+                        });
+                        return {ok: false, status: 0};
+                    }
                     const status = (err as { status?: number })?.status ?? 0;
                     const msg = this.api.humanizeUploadError(err);
                     this._patchPendingFile(head.localId, f.id, {status: 'failed', error: msg});

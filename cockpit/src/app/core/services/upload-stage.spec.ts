@@ -1,10 +1,12 @@
 import {describe, expect, it} from 'vitest';
 import {
+    attachmentDedupeKey,
     classifyUploadFailure,
     composeAgentContent,
     progressWriteDue,
     PROGRESS_WRITE_INTERVAL_MS,
     sendProgressPercent,
+    topLevelUploadTargets,
     uploadSummary,
     type PendingUpload,
 } from './upload-stage';
@@ -184,5 +186,54 @@ describe('sendProgressPercent', () => {
                 pending({id: 'a', size: 100, total: 100, loaded: 90, status: 'failed'}),
             ]),
         ).toBe(0);
+    });
+});
+
+describe('attachmentDedupeKey', () => {
+    it('is Uppy\'s name|size|lastModified', () => {
+        expect(attachmentDedupeKey({name: 'a.pdf', size: 12, lastModified: 99})).toBe(
+            'a.pdf|12|99',
+        );
+    });
+
+    it('separates files that differ in any one component', () => {
+        const base = {name: 'a.pdf', size: 12, lastModified: 99};
+        const keys = new Set([
+            attachmentDedupeKey(base),
+            attachmentDedupeKey({...base, name: 'b.pdf'}),
+            attachmentDedupeKey({...base, size: 13}),
+            attachmentDedupeKey({...base, lastModified: 100}),
+        ]);
+        expect(keys.size).toBe(4);
+    });
+
+    it('tolerates a File with no lastModified rather than producing undefined', () => {
+        expect(attachmentDedupeKey({name: 'a.pdf', size: 12})).toBe('a.pdf|12|0');
+    });
+});
+
+describe('topLevelUploadTargets', () => {
+    it('names a plain file directly', () => {
+        expect(topLevelUploadTargets(['report.pdf'])).toEqual(['report.pdf']);
+    });
+
+    it("collapses a zip's members to the one subtree that contains them", () => {
+        // The DELETE route removes a named subtree, so a 100-member archive is
+        // one request rather than a hundred.
+        expect(
+            topLevelUploadTargets(['bundle/a.txt', 'bundle/sub/b.txt', 'bundle/sub/c.txt']),
+        ).toEqual(['bundle']);
+    });
+
+    it('keeps distinct roots distinct', () => {
+        expect(topLevelUploadTargets(['bundle/a.txt', 'loose.txt'])).toEqual([
+            'bundle',
+            'loose.txt',
+        ]);
+    });
+
+    it('ignores an empty name rather than targeting the uploads root', () => {
+        // A DELETE of '' would address uploads/ itself.
+        expect(topLevelUploadTargets(['', '/leading.txt'])).toEqual([]);
     });
 });
