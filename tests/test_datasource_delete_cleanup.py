@@ -5,7 +5,7 @@ names a disposable, fully migrated application database — mirroring the
 convention in ``tests/test_canvas_viewer_postgres_integration.py``. A mocked
 connection would validate nothing about the SQL itself (untyped asyncpg
 parameters, jsonb_set on NULL, atomicity), which is the entire risk here.
-See docs/features/session_config_drift_resume.md §5.1 and §6.
+See docs/done/session_config_drift_resume.md §5.1 and §6.
 """
 
 from __future__ import annotations
