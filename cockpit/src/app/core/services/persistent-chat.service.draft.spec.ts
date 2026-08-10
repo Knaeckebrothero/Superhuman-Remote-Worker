@@ -70,7 +70,7 @@ function createService(opts: {
         delete: vi.fn().mockReturnValue(of({})),
     };
     const mockApi: any = {
-        uploadToThread: vi.fn().mockReturnValue(of({thread_id: 't', files: []})),
+        uploadOneToThread: vi.fn().mockReturnValue(of([])),
         humanizeUploadError: vi.fn().mockReturnValue('upload failed'),
         getEligibleDatasources: vi.fn().mockReturnValue(of(opts.eligible ?? [])),
     };

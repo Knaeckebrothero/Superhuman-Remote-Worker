@@ -75,7 +75,12 @@ import {
     UserCapabilities,
     VoiceCapabilities,
 } from '../models/api.model';
-import {ThreadUploadResponse, UploadInfo, UploadResponse} from '../models/file.model';
+import {
+  ThreadUploadedFile,
+  ThreadUploadResponse,
+  UploadInfo,
+  UploadResponse,
+} from '../models/file.model';
 import {AuditEntry, AuditFilterCategory, AuditResponse, JobSummary,} from '../models/audit.model';
 import {LLMRequest} from '../../workbench/request.model';
 import {GraphChangeResponse} from '../../workbench/graph.model';
@@ -1137,28 +1142,36 @@ export class ApiService {
   }
 
   /**
-   * Push files into the persistent thread's live workspace uploads/ directory.
-   * Used by the persistent-chat composer for attachment, camera capture, and
-   * voice-message uploads.
+   * Push ONE file into the persistent thread's live workspace uploads/ directory.
    *
-   * Errors are RE-THROWN (not swallowed to ``null``) so the caller can read
-   * the server-side ``detail`` field — typical messages include
-   * ``"Workspace is not ready — try again in a moment"`` (409) or
-   * ``"Could not reach workspace (host:port)"`` (502). Use
-   * ``humanizeUploadError()`` to map an arbitrary HttpErrorResponse to a
-   * user-facing string.
+   * Deliberately one request per file rather than one batched multipart POST.
+   * Three reasons, in order of severity:
+   *   1. The deployment traverses a Cloudflare Tunnel whose request-body cap is
+   *      100MB. A batched send sums every file into that ceiling; per-file keeps
+   *      each request under the backend's own 100MB per-file cap.
+   *   2. A batch fails atomically from the client's point of view, so one
+   *      oversized file failed the whole message.
+   *   3. Per-file progress and per-file cancel are not expressible otherwise.
+   *
+   * Returns the server's `files[]` for this request — an ARRAY, because a .zip
+   * expands into one entry per extracted member (services/thread_uploads.py).
+   *
+   * Errors are RE-THROWN (not swallowed to `null`) so the caller can read the
+   * status and the server-side `detail` field. Use `humanizeUploadError()` to
+   * map an arbitrary HttpErrorResponse to a user-facing string.
    */
-  uploadToThread(threadId: string, files: File[]): Observable<ThreadUploadResponse> {
+  uploadOneToThread(threadId: string, file: File): Observable<ThreadUploadedFile[]> {
     const formData = new FormData();
-    files.forEach((file) => formData.append('files', file, file.name));
+    formData.append('files', file, file.name);
     return this.http
       .post<ThreadUploadResponse>(
         `${this.baseUrl}/persistent/threads/${threadId}/uploads`,
         formData,
       )
       .pipe(
+        map((res) => res.files),
         catchError((error: HttpErrorResponse) => {
-          console.error(`Failed to upload files to thread ${threadId}:`, error);
+          console.error(`Failed to upload ${file.name} to thread ${threadId}:`, error);
           return throwError(() => error);
         }),
       );
