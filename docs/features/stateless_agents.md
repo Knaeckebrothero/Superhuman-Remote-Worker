@@ -1239,43 +1239,77 @@ awareness over the control WebSocket, and a fresh popout rotates a copied
 opener identity before its first sync while retaining that identity across its
 own reload.
 
-The final server contract passed **7 real-Postgres tests** and the complete
-scratch-Postgres substrate through 0126 passed **108/108**; affected Python
-tests passed **66/66**, the focused route/SSE contract **8/8**, and the final
-focused Cockpit controller group **39/39**. Full Cockpit Vitest passed **1,815 tests in 119
-files** and its production build passed. Repository-wide pytest passed
-**15,412 tests** with **134 skipped** and exactly the established **11
-environment failures**. The k3d orchestrator is **1/1 Ready**,
-publishes the exact PUT/GET paths, and its running migration bytes match the
-successful ledger checksum. During verification Tilt applied the first 0126
-snapshot before an optional constraint hardening; the changed checksum
-correctly stopped the replacement pod while the previous pod remained Ready.
-0126 was restored byte-for-byte, the safe-integer bound stayed at the API, and
-the next natural rebuild recovered. No ledger row was edited.
+The third §3.5 slice, hard interrupt, is now built. Migrations **0127–0129** add
+an exact-target interrupt inbox, a linked journal-receipt index and validated
+constraints. A new Cockpit request carries one stable UUID plus the concrete
+turn id it observed. Stateless admission locks the thread and queue in the
+established order and accepts only while the exact lease owner has opened that
+turn's interrupt window. Opening happens only after the consumer is ready;
+completion closes admission, joins the watcher without cancellation, and
+drains the committed tail before exposing the queue unit. Pinned legacy `{}`
+requests still take the historical direct-agent path; a correlated pinned
+request is checked against the exact active turn before it can set RAM state.
 
-An authenticated live browser transport proof used two independent Playwright
-contexts with real Keycloak/BFF cookies. On a stateless fixture, each context
-observed the other's PUT through the dedicated SSE in **1040 ms** and **649
-ms**; a hard reload renewed the same editor id and preserved the same server
-sender id, and expiry produced the complete empty snapshot in **14.897 s**. A
-pinned fixture used the identical route shape and delivered the peer snapshot
-in **916 ms**. The proof cleaned every harness awareness, Canvas, thread,
-session and queue row. It exercised the real authenticated REST/SSE transport,
-not the full Monaco/controller UI path.
+An admitted request is durable stop intent, not a best-effort signal. The live
+owner signals its exact turn and writes one linked `interrupt.ack`; applied
+sibling requests share one durable consumed-input marker so they cannot advance
+multiple human rows. If the owner disappears before writing the receipt, the
+reaper or exact successor settles the old request as an applied hard stop,
+advances only the human row whose `turn_number` matches the target, rotates the
+dead journal epoch once and never signals successor RAM. This ordering prevents
+a turn which the user stopped from being silently re-executed after a pod loss.
+The Cockpit correlates receipts and terminal frames by target/request, so a
+replayed old acknowledgement cannot close or rename a newer recovered turn.
 
-This still does **not** remove the tier gate. Browser unload is a TTL edge, not
-a reliable idle-PUT edge, and ordinary **Duplicate Tab** can copy
-`sessionStorage` and collapse two active tabs into one courtesy row while both
-remain active; neither signal is authorization or execution ownership. The
-full rendered two-editor Monaco UX and native EventSource recovery through
-authentication expiry remain unverified. More importantly, durable Canvas
-source/presentation invalidations still need their own mutation/outbox path;
-generic session outboxes and hard interrupt remain open.
-Workspace/runtime-incarnation authority and durable terminal-retirement
-acknowledgement are incomplete, and the §6.1 RAM/path-bypass work is deferred
-to its own pass. None of the direct proofs enqueued a turn, changed a sandbox
-thread's lane, or created a worker batch. The S2 sandbox tier gate remains
-**closed**.
+The Canvas server contract passed **7 real-Postgres tests** and the complete
+scratch-Postgres substrate through 0126 passed **108/108**. The final frozen
+interrupt integration group passed **502 tests with 116 environment skips**;
+an independent adversarial review passed **419 with the same 116 skips**. Full
+Cockpit Vitest passed **1,829 tests in 119 files** and its production build
+passed. Repository-wide pytest finished with **15,481 passed / 142 skipped /
+11 failed in 801.06 s**. The eleven failures are exactly the established
+localhost-Postgres, MCP transport/wiring and optional arXiv/Semantic Scholar
+environment baseline. The app schema replay passed **113 transactional plus 16
+non-transactional migrations**; 0127–0129 are already applied and their bytes
+and checksums are frozen. The non-behavioral 0127 comments still describe the
+superseded “successor never settles” model and must not be repaired by changing
+the applied migration.
+
+The earlier authenticated Canvas proof used two independent BFF contexts. On a
+stateless fixture, each observed the other's PUT through the dedicated SSE in
+**1040 ms** and **649 ms**; hard reload preserved the editor/sender identity,
+and expiry produced the complete empty snapshot in **14.897 s**. A pinned
+fixture delivered the same snapshot in **916 ms**. A separate authenticated
+hard-interrupt fallback accepted the correlated POST in **12.81 ms**, wrote and
+settled exactly one applied receipt in **51.82 ms**, returned the exact duplicate
+in **7.55 ms**, rejected both a fresh stale-turn UUID and an old UUID retargeted
+to the next turn with 409, and left that next turn's gate open. It cleaned every
+fixture, BFF, pre-auth and Keycloak row; the orchestrator stayed **1/1 Ready**
+and the stateless Deployment **2/2 Ready**. The fallback proves the public/API,
+database and replay fences, not a live executor's RAM unwind, LISTEN latency or
+a forced-pod interrupt handoff. No live pinned executor existed, so pinned
+interrupt behavior remains unit/integration-tested rather than live-smoked.
+
+The generic §3.5 outbox is deliberately **not** built. Its design requires
+effect enqueue in the same transaction as the turn's final message persist,
+but that persist is currently non-fatal and may time out while `complete_unit`
+still advances the input watermark. Making the enqueue authoritative therefore
+changes the normal completion protocol. No safe generic payload carrier exists
+in 0122–0129, and migrations 0130+ belong to Gate 3. Per the stop rule, this
+pass did not repurpose the officer wake outbox or add a competing live-epoch
+journal writer. Exact LLM audit, turn-end memory and post-callback Git ordering
+remain blocked on that boundary; Canvas revision snapshots, a pending-citation
+sweeper and orchestrator-derived notifications are separable future slices,
+but were not started after the stop condition triggered.
+
+This still does **not** remove the tier gate. Browser unload and ordinary
+**Duplicate Tab** retain the accepted awareness limitations, and the full
+rendered two-editor Monaco UX plus native EventSource auth-expiry recovery remain
+unverified. Durable Canvas mutation invalidations, the generic outbox,
+workspace/runtime-incarnation authority, durable terminal-retirement
+acknowledgement and the deferred §6.1 RAM/path-bypass work remain open. None of
+the direct proofs changed a sandbox thread's lane or created a worker batch.
+The S2 sandbox tier gate remains **closed**.
 
 **S3** (workers): **Gates 1 and 2 are built and merged**; worker admission stays
 closed. No `worker_batch` unit has ever been enqueued and no job carries a

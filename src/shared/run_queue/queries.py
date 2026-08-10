@@ -30,6 +30,12 @@ Contract invariants (the point of this module — do not weaken):
 * **Input during a leased turn touches ``input_seq`` only.** Flipping a
   leased row's state would break the lease; completion re-queues instead
   (``input_seq > consumed_seq`` at complete time ⇒ ``state='queued'``).
+* **Interrupt admission is an exact lease/turn window, not a watermark.** The
+  serving executor opens the nullable admission pair only after its consumer
+  is ready, then closes it before the final drain. Admission and closure lock
+  the same queue row, so a request either commits before closure and is
+  drained by that owner or observes the closed window and is refused. A
+  successor must never consume an interrupt aimed at an earlier turn.
 * **Attempts reset only on full completion** (and explicit unpark), never on
   release or partial progress — a unit that dies at the same tool call every
   cycle parks at ``max_attempts`` instead of hot-looping LLM spend.
@@ -204,6 +210,8 @@ UPDATE run_queue r SET
     leased_by = $2::text,
     last_leased_by = $2::text,
     leased_until = now() + make_interval(secs => $3::float8),
+    interrupt_admission_lease_token = NULL,
+    interrupt_admission_turn_id = NULL,
     attempts_since_completion = attempts_since_completion + 1
 FROM c
 WHERE r.unit_id = c.unit_id
@@ -257,6 +265,47 @@ WHERE unit_id = $1::uuid AND lease_token = $2::bigint AND state = 'leased'
 RETURNING leased_until
 """
 
+# The pair's nullable state is the admission bit. Open and close serialize with
+# REST admission on the same run_queue row; unlike a watermark, the pair is
+# deliberately tied to one lease and one concrete turn and never transfers to
+# a successor. Repeating the same operation is idempotent, while an attempt to
+# replace a different open turn fails closed.
+_OPEN_INTERRUPT_ADMISSION_SQL = """
+UPDATE run_queue SET
+    interrupt_admission_lease_token = $2::bigint,
+    interrupt_admission_turn_id = $3::integer
+WHERE unit_id = $1::uuid
+  AND unit_kind = 'session_turn'
+  AND state = 'leased'
+  AND lease_token = $2::bigint
+  AND (
+      (interrupt_admission_lease_token IS NULL
+       AND interrupt_admission_turn_id IS NULL)
+      OR
+      (interrupt_admission_lease_token = $2::bigint
+       AND interrupt_admission_turn_id = $3::integer)
+  )
+RETURNING 1
+"""
+
+_CLOSE_INTERRUPT_ADMISSION_SQL = """
+UPDATE run_queue SET
+    interrupt_admission_lease_token = NULL,
+    interrupt_admission_turn_id = NULL
+WHERE unit_id = $1::uuid
+  AND unit_kind = 'session_turn'
+  AND state = 'leased'
+  AND lease_token = $2::bigint
+  AND (
+      (interrupt_admission_lease_token = $2::bigint
+       AND interrupt_admission_turn_id = $3::integer)
+      OR
+      (interrupt_admission_lease_token IS NULL
+       AND interrupt_admission_turn_id IS NULL)
+  )
+RETURNING 1
+"""
+
 # §5.1 completion half, one fenced statement. NULL-safe watermark CASE: any
 # recorded input is "ahead" of a NULL consumed watermark, so input that
 # arrived during a turn whose claim carried no watermark still re-queues.
@@ -274,6 +323,8 @@ UPDATE run_queue SET
                  THEN 'queued' ELSE 'done' END,
     leased_by = NULL,
     leased_until = NULL,
+    interrupt_admission_lease_token = NULL,
+    interrupt_admission_turn_id = NULL,
     run_after = now()
 WHERE unit_id = $1::uuid AND lease_token = $2::bigint AND state = 'leased'
 RETURNING state
@@ -289,6 +340,8 @@ UPDATE run_queue SET
     -- over to a pod that can. Same reasoning as the reaper steal.
     last_leased_by = NULL,
     leased_until = NULL,
+    interrupt_admission_lease_token = NULL,
+    interrupt_admission_turn_id = NULL,
     queued_at = now(),
     run_after = now() + make_interval(secs =>
         CASE WHEN $4::boolean AND $3::float8 <= 0
@@ -436,9 +489,19 @@ FOR SHARE SKIP LOCKED
 # makes this a no-op (zero rows) instead of a double steal. Blocks behind an
 # in-flight persist's FOR SHARE fence and re-evaluates the guard on wake.
 _REAP_STEAL_SQL = """
-UPDATE run_queue SET
-    lease_token = lease_token + 1,
-    state = CASE WHEN attempts_since_completion >= max_attempts
+WITH previous AS (
+    SELECT unit_id, interrupt_admission_lease_token,
+           interrupt_admission_turn_id
+    FROM run_queue
+    WHERE unit_id = $1::uuid
+      AND lease_token = $2::bigint
+      AND state = 'leased'
+      AND leased_until < now() - make_interval(secs => $4::float8)
+    FOR UPDATE
+)
+UPDATE run_queue AS queue SET
+    lease_token = queue.lease_token + 1,
+    state = CASE WHEN queue.attempts_since_completion >= queue.max_attempts
                  THEN 'parked' ELSE 'queued' END,
     leased_by = NULL,
     -- The holder missed its heartbeats: it is dead, wedged, or partitioned.
@@ -446,13 +509,16 @@ UPDATE run_queue SET
     -- successor's claim on behalf of a pod that will never come back.
     last_leased_by = NULL,
     leased_until = NULL,
+    interrupt_admission_lease_token = NULL,
+    interrupt_admission_turn_id = NULL,
     queued_at = now(),
     run_after = now() + make_interval(secs => $3::float8)
-WHERE unit_id = $1::uuid
-  AND lease_token = $2::bigint
-  AND state = 'leased'
-  AND leased_until < now() - make_interval(secs => $4::float8)
-RETURNING unit_id, unit_kind, state, attempts_since_completion, lease_token
+FROM previous
+WHERE queue.unit_id = previous.unit_id
+RETURNING queue.unit_id, queue.unit_kind, queue.state,
+          queue.attempts_since_completion, queue.lease_token,
+          previous.interrupt_admission_lease_token,
+          previous.interrupt_admission_turn_id
 """
 
 _UNPARK_SQL = """
@@ -714,6 +780,68 @@ async def heartbeat_unit(
     )
 
 
+async def open_interrupt_admission(
+    conn: Executor,
+    *,
+    unit_id: UUID | str,
+    lease_token: int,
+    turn_id: int,
+) -> bool:
+    """Open the stateless interrupt inbox for one exact lease and turn.
+
+    The serving executor calls this only after the concrete input turn is
+    known and its consumer is ready. The update is fenced by the current
+    ``session_turn`` lease and refuses to replace a different open turn. A
+    repeated open of the same pair is idempotent.
+
+    Returns ``False`` when the lease is stale, the unit is not a leased
+    session turn, or a different turn is already open. Positive tokens and
+    turn ids are required because zero is not a real claim/turn generation.
+    """
+    if int(lease_token) <= 0:
+        raise ValueError("lease_token must be positive")
+    if int(turn_id) <= 0:
+        raise ValueError("turn_id must be positive")
+    opened = await conn.fetchval(
+        _OPEN_INTERRUPT_ADMISSION_SQL,
+        _uuid(unit_id),
+        int(lease_token),
+        int(turn_id),
+    )
+    return opened is not None
+
+
+async def close_interrupt_admission(
+    conn: Executor,
+    *,
+    unit_id: UUID | str,
+    lease_token: int,
+    turn_id: int,
+) -> bool:
+    """Close one exact stateless interrupt admission window.
+
+    Closure and REST admission update/lock the same queue row, providing the
+    boundary for the executor's final drain. The expected turn prevents stale
+    cleanup from closing a newer window; repeating a close after the pair is
+    already NULL is idempotent while the exact lease remains current.
+
+    Returns ``False`` for a stale lease, a non-session unit, or a different
+    open turn. The caller must treat ``False`` as lost ownership unless it can
+    independently prove another lifecycle path already cleared the lease.
+    """
+    if int(lease_token) <= 0:
+        raise ValueError("lease_token must be positive")
+    if int(turn_id) <= 0:
+        raise ValueError("turn_id must be positive")
+    closed = await conn.fetchval(
+        _CLOSE_INTERRUPT_ADMISSION_SQL,
+        _uuid(unit_id),
+        int(lease_token),
+        int(turn_id),
+    )
+    return closed is not None
+
+
 async def complete_unit(
     conn: Executor,
     *,
@@ -877,6 +1005,13 @@ async def reap_expired(
                 attempts_since_completion=row["attempts_since_completion"],
                 leased_by=cand["leased_by"],
                 lease_token=row["lease_token"],
+                previous_lease_token=cand["lease_token"],
+                interrupt_admission_turn_id=(
+                    int(row["interrupt_admission_turn_id"])
+                    if row["interrupt_admission_turn_id"] is not None
+                    and row["interrupt_admission_lease_token"] == cand["lease_token"]
+                    else None
+                ),
             )
         )
     return stolen

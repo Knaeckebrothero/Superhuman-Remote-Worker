@@ -56,11 +56,13 @@ from src.shared.run_queue import (
     UNIT_KIND_SESSION_TURN,
     UNIT_KIND_WORKER_BATCH,
     claim_unit,
+    close_interrupt_admission,
     complete_unit,
     enqueue_unit,
     fence_lease,
     heartbeat_unit,
     list_active,
+    open_interrupt_admission,
     queue_depth_for,
     reap_expired,
     record_control_seq,
@@ -119,6 +121,9 @@ MIGRATION_FILES = [
     _MIGRATIONS_DIR / "0124_cloud_sync_marker_comment.sql",
     _MIGRATIONS_DIR / "0125_thread_client_presence.sql",
     _MIGRATIONS_DIR / "0126_canvas_editor_awareness.sql",
+    _MIGRATIONS_DIR / "0127_thread_interrupt_inbox.sql",
+    _MIGRATIONS_DIR / "0128_thread_interrupt_receipt_idx.notx.sql",
+    _MIGRATIONS_DIR / "0129_thread_interrupt_validate_constraints.sql",
 ]
 
 SESSION = UNIT_KIND_SESSION_TURN
@@ -151,6 +156,7 @@ async def _apply_schema() -> None:
         await conn.execute("DROP TABLE IF EXISTS thread_permission_requests CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_events CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_control_requests CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS thread_interrupt_requests CASCADE")
         await conn.execute("DROP TABLE IF EXISTS run_queue CASCADE")
         await conn.execute("DROP TABLE IF EXISTS canvases CASCADE")
         await conn.execute("DROP TABLE IF EXISTS threads CASCADE")
@@ -208,7 +214,8 @@ async def conn(schema):
         "TRUNCATE canvas_editor_awareness, canvases, "
         "thread_client_presence, thread_permission_requests, "
         "thread_cloud_sync_generations, thread_events, "
-        "thread_control_requests, run_queue, agents, threads "
+        "thread_control_requests, thread_interrupt_requests, "
+        "run_queue, agents, threads "
         "RESTART IDENTITY CASCADE"
     )
     try:
@@ -314,6 +321,381 @@ class TestSchema:
             "SELECT execution_lane FROM threads WHERE id = $1", tid
         )
         assert lane == "pinned"
+
+    async def test_interrupt_constraints_and_receipt_index_are_valid(self, conn):
+        constraints = {
+            row["conname"]: row["convalidated"]
+            for row in await conn.fetch(
+                "SELECT conname, convalidated FROM pg_constraint "
+                "WHERE conname = ANY($1::text[])",
+                [
+                    "run_queue_interrupt_admission_shape",
+                    "thread_events_interrupt_request_thread_fkey",
+                ],
+            )
+        }
+        assert constraints == {
+            "run_queue_interrupt_admission_shape": True,
+            "thread_events_interrupt_request_thread_fkey": True,
+        }
+        index = await conn.fetchrow(
+            "SELECT indisunique, indisvalid FROM pg_index "
+            "WHERE indexrelid = 'idx_thread_events_interrupt_request'::regclass"
+        )
+        assert tuple(index.values()) == (True, True)
+
+
+class TestInterruptAdmissionGate:
+    async def test_open_and_close_are_exact_owner_turn_fenced(self, conn):
+        unit_id = uuid4()
+        await enqueue_unit(conn, unit_id=unit_id, unit_kind=SESSION)
+        claim = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-a")
+        assert claim is not None
+
+        assert await open_interrupt_admission(
+            conn,
+            unit_id=unit_id,
+            lease_token=claim.lease_token,
+            turn_id=7,
+        )
+        assert await open_interrupt_admission(
+            conn,
+            unit_id=unit_id,
+            lease_token=claim.lease_token,
+            turn_id=7,
+        )
+        assert not await open_interrupt_admission(
+            conn,
+            unit_id=unit_id,
+            lease_token=claim.lease_token,
+            turn_id=8,
+        )
+        assert not await open_interrupt_admission(
+            conn,
+            unit_id=unit_id,
+            lease_token=claim.lease_token + 1,
+            turn_id=7,
+        )
+        row = await _row(conn, unit_id)
+        assert (
+            row["interrupt_admission_lease_token"],
+            row["interrupt_admission_turn_id"],
+        ) == (claim.lease_token, 7)
+
+        assert not await close_interrupt_admission(
+            conn,
+            unit_id=unit_id,
+            lease_token=claim.lease_token,
+            turn_id=8,
+        )
+        assert await close_interrupt_admission(
+            conn,
+            unit_id=unit_id,
+            lease_token=claim.lease_token,
+            turn_id=7,
+        )
+        assert await close_interrupt_admission(
+            conn,
+            unit_id=unit_id,
+            lease_token=claim.lease_token,
+            turn_id=7,
+        )
+        row = await _row(conn, unit_id)
+        assert row["interrupt_admission_lease_token"] is None
+        assert row["interrupt_admission_turn_id"] is None
+
+    async def test_gate_rejects_non_session_and_nonpositive_generations(self, conn):
+        worker_id = uuid4()
+        await enqueue_unit(conn, unit_id=worker_id, unit_kind=WORKER)
+        claim = await claim_unit(conn, unit_kind=WORKER, pod_name="pod-a")
+        assert claim is not None
+        assert not await open_interrupt_admission(
+            conn,
+            unit_id=worker_id,
+            lease_token=claim.lease_token,
+            turn_id=1,
+        )
+        with pytest.raises(ValueError, match="lease_token must be positive"):
+            await open_interrupt_admission(
+                conn, unit_id=worker_id, lease_token=0, turn_id=1
+            )
+        with pytest.raises(ValueError, match="turn_id must be positive"):
+            await open_interrupt_admission(
+                conn,
+                unit_id=worker_id,
+                lease_token=claim.lease_token,
+                turn_id=0,
+            )
+
+    async def test_shape_constraint_rejects_half_or_mismatched_gate(self, conn):
+        unit_id = uuid4()
+        await enqueue_unit(conn, unit_id=unit_id, unit_kind=SESSION)
+        claim = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-a")
+        assert claim is not None
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE run_queue "
+                "SET interrupt_admission_turn_id = 1 WHERE unit_id = $1",
+                unit_id,
+            )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE run_queue SET interrupt_admission_lease_token = $2, "
+                "interrupt_admission_turn_id = 1 WHERE unit_id = $1",
+                unit_id,
+                claim.lease_token + 1,
+            )
+
+    async def test_lifecycle_transitions_clear_gate(self, conn):
+        complete_id = uuid4()
+        await enqueue_unit(conn, unit_id=complete_id, unit_kind=SESSION, input_seq=1)
+        complete_claim = await claim_unit(
+            conn, unit_kind=SESSION, pod_name="pod-complete"
+        )
+        await open_interrupt_admission(
+            conn,
+            unit_id=complete_id,
+            lease_token=complete_claim.lease_token,
+            turn_id=1,
+        )
+        assert (
+            await complete_unit(
+                conn,
+                unit_id=complete_id,
+                lease_token=complete_claim.lease_token,
+                consumed_seq=1,
+            )
+            == STATE_DONE
+        )
+        complete_row = await _row(conn, complete_id)
+        assert complete_row["interrupt_admission_lease_token"] is None
+        assert complete_row["interrupt_admission_turn_id"] is None
+
+        release_id = uuid4()
+        await enqueue_unit(conn, unit_id=release_id, unit_kind=SESSION)
+        release_claim = await claim_unit(
+            conn, unit_kind=SESSION, pod_name="pod-release"
+        )
+        await open_interrupt_admission(
+            conn,
+            unit_id=release_id,
+            lease_token=release_claim.lease_token,
+            turn_id=2,
+        )
+        assert (
+            await release_unit(
+                conn, unit_id=release_id, lease_token=release_claim.lease_token
+            )
+            == STATE_QUEUED
+        )
+        release_row = await _row(conn, release_id)
+        assert release_row["interrupt_admission_lease_token"] is None
+        assert release_row["interrupt_admission_turn_id"] is None
+
+        reap_id = uuid4()
+        await enqueue_unit(conn, unit_id=reap_id, unit_kind=SESSION)
+        reap_claim = await claim_unit(
+            conn,
+            unit_kind=SESSION,
+            pod_name="pod-reap",
+            prefer_unit_id=reap_id,
+        )
+        assert reap_claim is not None and reap_claim.unit_id == reap_id
+        await open_interrupt_admission(
+            conn,
+            unit_id=reap_id,
+            lease_token=reap_claim.lease_token,
+            turn_id=3,
+        )
+        await _expire(conn, reap_id)
+        stolen = await reap_expired(conn, grace_seconds=0.0)
+        assert len(stolen) == 1
+        assert stolen[0].previous_lease_token == reap_claim.lease_token
+        assert stolen[0].interrupt_admission_turn_id == 3
+        reap_row = await _row(conn, reap_id)
+        assert reap_row["interrupt_admission_lease_token"] is None
+        assert reap_row["interrupt_admission_turn_id"] is None
+
+    async def test_claim_scrubs_a_legacy_stale_gate(self, conn):
+        """The claim assignment is defensive even if old data predates 0127."""
+        unit_id = uuid4()
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            await conn.execute(
+                "ALTER TABLE run_queue DROP CONSTRAINT "
+                "run_queue_interrupt_admission_shape"
+            )
+            await enqueue_unit(conn, unit_id=unit_id, unit_kind=SESSION)
+            await conn.execute(
+                "UPDATE run_queue SET interrupt_admission_lease_token = 99, "
+                "interrupt_admission_turn_id = 41 WHERE unit_id = $1",
+                unit_id,
+            )
+            claim = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-a")
+            assert claim is not None
+            row = await _row(conn, unit_id)
+            assert row["interrupt_admission_lease_token"] is None
+            assert row["interrupt_admission_turn_id"] is None
+        finally:
+            await transaction.rollback()
+
+    async def test_admission_and_close_serialize_on_queue_row(self, conn, extra_conn):
+        thread_id = uuid4()
+        owner_id = uuid4()
+        client_request_id = uuid4()
+        await conn.execute(
+            "INSERT INTO threads (id, user_id, execution_lane) "
+            "VALUES ($1, $2, 'stateless')",
+            thread_id,
+            owner_id,
+        )
+        await enqueue_unit(conn, unit_id=thread_id, unit_kind=SESSION)
+        claim = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-a")
+        await open_interrupt_admission(
+            conn,
+            unit_id=thread_id,
+            lease_token=claim.lease_token,
+            turn_id=9,
+        )
+
+        admission_tx = conn.transaction()
+        await admission_tx.start()
+        gate = await conn.fetchrow(
+            "SELECT interrupt_admission_lease_token, "
+            "interrupt_admission_turn_id FROM run_queue "
+            "WHERE unit_id = $1 FOR UPDATE",
+            thread_id,
+        )
+        assert tuple(gate.values()) == (claim.lease_token, 9)
+
+        closer = await extra_conn()
+        close_task = asyncio.create_task(
+            close_interrupt_admission(
+                closer,
+                unit_id=thread_id,
+                lease_token=claim.lease_token,
+                turn_id=9,
+            )
+        )
+        done, pending = await asyncio.wait({close_task}, timeout=0.1)
+        assert close_task in pending
+        assert not done
+
+        request_id = await conn.fetchval(
+            "INSERT INTO thread_interrupt_requests ("
+            "thread_id, client_request_id, target_turn_id, "
+            "accepted_lease_token, accepted_leased_by, requested_by"
+            ") VALUES ($1, $2, 9, $3, 'pod-a', $4) RETURNING id",
+            thread_id,
+            client_request_id,
+            claim.lease_token,
+            str(owner_id),
+        )
+        await admission_tx.commit()
+        assert await asyncio.wait_for(close_task, timeout=3.0)
+        assert (
+            await conn.fetchval(
+                "SELECT id FROM thread_interrupt_requests WHERE id = $1",
+                request_id,
+            )
+            == request_id
+        )
+
+        await open_interrupt_admission(
+            conn,
+            unit_id=thread_id,
+            lease_token=claim.lease_token,
+            turn_id=9,
+        )
+        close_tx = conn.transaction()
+        await close_tx.start()
+        assert await close_interrupt_admission(
+            conn,
+            unit_id=thread_id,
+            lease_token=claim.lease_token,
+            turn_id=9,
+        )
+
+        observer = await extra_conn()
+
+        async def _observe_gate_after_close():
+            return await observer.fetchrow(
+                "SELECT interrupt_admission_lease_token, "
+                "interrupt_admission_turn_id FROM run_queue "
+                "WHERE unit_id = $1 FOR UPDATE",
+                thread_id,
+            )
+
+        observe_task = asyncio.create_task(_observe_gate_after_close())
+        done, pending = await asyncio.wait({observe_task}, timeout=0.1)
+        assert observe_task in pending
+        assert not done
+        await close_tx.commit()
+        closed_gate = await asyncio.wait_for(observe_task, timeout=3.0)
+        assert tuple(closed_gate.values()) == (None, None)
+
+    async def test_request_identity_and_receipt_constraints(self, conn):
+        owner_id = uuid4()
+        thread_id = uuid4()
+        other_thread_id = uuid4()
+        request_id = uuid4()
+        await conn.execute(
+            "INSERT INTO threads (id, user_id, execution_lane) VALUES "
+            "($1, $3, 'stateless'), ($2, $3, 'stateless')",
+            thread_id,
+            other_thread_id,
+            owner_id,
+        )
+        await conn.execute(
+            "INSERT INTO thread_interrupt_requests ("
+            "id, thread_id, client_request_id, target_turn_id, "
+            "accepted_lease_token, accepted_leased_by, requested_by"
+            ") VALUES ($1, $2, $3, 4, 7, 'pod-a', $4)",
+            request_id,
+            thread_id,
+            uuid4(),
+            str(owner_id),
+        )
+        # Distinct tabs retain distinct correlation rows for the same target.
+        await conn.execute(
+            "INSERT INTO thread_interrupt_requests ("
+            "thread_id, client_request_id, target_turn_id, "
+            "accepted_lease_token, accepted_leased_by, requested_by"
+            ") VALUES ($1, $2, 4, 7, 'pod-a', $3)",
+            thread_id,
+            uuid4(),
+            str(owner_id),
+        )
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await conn.execute(
+                "INSERT INTO thread_events ("
+                "thread_id, epoch, seq, kind, payload, interrupt_request_id"
+                ") VALUES ($1, 2, 8, 'interrupt.ack', '{}'::jsonb, $2)",
+                other_thread_id,
+                request_id,
+            )
+        await conn.execute(
+            "INSERT INTO thread_events ("
+            "thread_id, epoch, seq, kind, payload, interrupt_request_id"
+            ") VALUES ($1, 2, 8, 'interrupt.ack', '{}'::jsonb, $2)",
+            thread_id,
+            request_id,
+        )
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await conn.execute(
+                "INSERT INTO thread_events ("
+                "thread_id, epoch, seq, kind, payload, interrupt_request_id"
+                ") VALUES ($1, 2, 9, 'interrupt.ack', '{}'::jsonb, $2)",
+                thread_id,
+                request_id,
+            )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE thread_interrupt_requests SET outcome = 'applied' "
+                "WHERE id = $1",
+                request_id,
+            )
 
 
 class TestCloudSyncGenerationFence:

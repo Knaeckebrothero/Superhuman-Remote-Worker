@@ -266,6 +266,12 @@ _pending_cloud_push_task: Optional[asyncio.Task] = None
 # turn wait.
 _turn_complete_external_hook: Optional[Callable[[int], None]] = None
 
+# S2 turn-start seam for the stateless executor. Unlike the completion seam,
+# this hook is awaited: the exact lease/turn interrupt admission must be open
+# and its consumer armed before ``turn.started`` makes the turn interruptible
+# to clients. Pinned sessions leave it unset.
+_turn_start_external_hook: Optional[Callable[[int], Awaitable[None]]] = None
+
 # Phase 2 event-log cursor. Allocated synchronously by _broadcast, then queued
 # through one ordered writer so a later sequence can never become visible in
 # Postgres before an earlier queued sequence. Each DB-backed runtime attach
@@ -290,6 +296,20 @@ _control_drain_lock: asyncio.Lock = asyncio.Lock()
 _CONTROL_NOTIFY_CHANNEL = "thread_control_requests"
 _CONTROL_POLL_SECONDS = 5.0
 _CONTROL_STOP_GRACE_SECONDS = 1.0
+
+# A stateless interrupt belongs to one exact (lease token, turn id) pair. Its
+# consumer is deliberately independent of the scalar-control watcher: an
+# interrupt has a synchronous RAM side effect and its admission window closes
+# before queue completion, not at attach/detach.
+_interrupt_watcher_task: Optional[asyncio.Task] = None
+_interrupt_watcher_stop: Optional[asyncio.Event] = None
+_interrupt_owner_lease_token: Optional[int] = None
+_interrupt_owner_turn_id: Optional[int] = None
+_interrupt_drain_lock: asyncio.Lock = asyncio.Lock()
+_interrupt_watcher_lifecycle_lock: asyncio.Lock = asyncio.Lock()
+
+_INTERRUPT_NOTIFY_CHANNEL = "thread_interrupt_requests"
+_INTERRUPT_POLL_SECONDS = 1.0
 
 _EVENT_WRITER_QUEUE_MAXSIZE: int = int(
     os.environ.get("THREAD_EVENT_WRITER_QUEUE_MAXSIZE", "10000")
@@ -435,6 +455,10 @@ class EventJournalUnavailable(RuntimeError):
 
 class ControlInboxBlocked(EventJournalUnavailable):
     """The oldest control cannot be safely consumed by this runtime owner."""
+
+
+class InterruptInboxBlocked(EventJournalUnavailable):
+    """An exact-turn interrupt cannot be safely consumed by this owner."""
 
 
 async def _ensure_nats_client():
@@ -1906,6 +1930,7 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
     global _loop_user_queue, _loop_interrupt_flag, _hard_interrupt_event
     global _loop_last_user_content
 
+    await _stop_thread_interrupt_watcher()
     await _stop_thread_control_watcher()
 
     writer = _event_writer
@@ -2959,6 +2984,7 @@ async def _terminate_session_inner(
     # A pinned consumer owns the attach lifetime; a stateless consumer owns
     # the active lease. In both cases it must be fully stopped before the
     # journal writer drains or ownership is released.
+    await _stop_thread_interrupt_watcher()
     await _stop_thread_control_watcher()
 
     # B11: final memory capture for ALL terminate reasons — the ✕-button
@@ -3330,8 +3356,8 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         return await handle_api_input(request)
 
     @app.post("/api/interrupt")
-    async def api_interrupt():
-        return await handle_api_interrupt()
+    async def api_interrupt(request: Request):
+        return await handle_api_interrupt(request)
 
     @app.post("/api/approve")
     async def api_approve(request: Request):
@@ -3500,14 +3526,22 @@ async def handle_api_input(request: Request) -> JSONResponse:
     )
 
 
-async def handle_api_interrupt() -> JSONResponse:
-    """Signal the loop to stop. Mode is hard vs graceful based on
-    whether a tool call is currently in flight."""
+def _signal_interrupt_for_turn(target_turn_id: int) -> Optional[str]:
+    """Synchronously signal RAM iff ``target_turn_id`` is still active.
+
+    The check and mutation have no await between them. That is the local half
+    of the exact-target fence: the database protects the lease generation,
+    while this function prevents a late request for turn N from interrupting
+    turn N+1 after an in-process transition.
+    """
+
     global _loop_interrupt_flag
-    if _stateless_mode():
-        return _stateless_reject()
-    if _session is None:
-        return JSONResponse({"error": "Session not active"}, status_code=503)
+    if (
+        _session is None
+        or not _turn_event_open
+        or int(_session.turn_count) != int(target_turn_id)
+    ):
+        return None
     mode = "graceful" if _tool_inflight else "hard"
     _loop_interrupt_flag = mode
     # Hard interrupt with no tool in flight ⇒ the loop is parked in an LLM /
@@ -3515,12 +3549,119 @@ async def handle_api_interrupt() -> JSONResponse:
     # waiting for the next cooperative check_interrupt poll.
     if mode == "hard" and _hard_interrupt_event is not None:
         _hard_interrupt_event.set()
+    return mode
+
+
+async def handle_api_interrupt(request: Optional[Request] = None) -> JSONResponse:
+    """Signal the pinned loop, optionally fenced to a correlated turn.
+
+    A body-less call retains the legacy in-cluster contract. New orchestrator
+    forwarding supplies ``client_request_id`` and ``target_turn_id``; those
+    calls are rejected before any RAM mutation unless the exact transcript
+    turn is active. Stateless pods consume the durable inbox instead of this
+    direct route.
+    """
+
+    if _stateless_mode():
+        return _stateless_reject()
+    if _session is None:
+        return JSONResponse({"error": "Session not active"}, status_code=503)
+
+    body: Optional[Dict[str, Any]] = None
+    if request is not None:
+        raw = await request.body()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "invalid JSON", "error_code": "invalid_request"},
+                    status_code=400,
+                )
+            if not isinstance(parsed, dict):
+                return JSONResponse(
+                    {
+                        "error": "body must be a JSON object",
+                        "error_code": "invalid_request",
+                    },
+                    status_code=400,
+                )
+            if parsed:
+                body = parsed
+
+    if body is None:
+        # Legacy callers did not carry a turn identity. Preserve their exact
+        # historical behavior while all new public traffic uses correlation.
+        mode = "graceful" if _tool_inflight else "hard"
+        global _loop_interrupt_flag
+        _loop_interrupt_flag = mode
+        if mode == "hard" and _hard_interrupt_event is not None:
+            _hard_interrupt_event.set()
+        logger.info(
+            "Interrupt received via legacy REST (mode=%s, tool_inflight=%s)",
+            mode,
+            _tool_inflight,
+        )
+        return JSONResponse({"ack": True, "mode": mode})
+
+    client_request_id = body.get("client_request_id")
+    target_turn_id = body.get("target_turn_id")
+    if not isinstance(client_request_id, str) or not client_request_id:
+        return JSONResponse(
+            {
+                "error": "client_request_id must be a non-empty string",
+                "error_code": "invalid_request",
+            },
+            status_code=400,
+        )
+    if (
+        isinstance(target_turn_id, bool)
+        or not isinstance(target_turn_id, int)
+        or target_turn_id < 1
+    ):
+        return JSONResponse(
+            {
+                "error": "target_turn_id must be a positive integer",
+                "error_code": "invalid_request",
+            },
+            status_code=400,
+        )
+
+    response: Dict[str, Any] = {
+        "client_request_id": client_request_id,
+        "target_turn_id": target_turn_id,
+    }
+    request_id = body.get("request_id")
+    if request_id is not None:
+        if not isinstance(request_id, str) or not request_id:
+            return JSONResponse(
+                {
+                    "error": "request_id must be a non-empty string",
+                    "error_code": "invalid_request",
+                },
+                status_code=400,
+            )
+        response["request_id"] = request_id
+
+    mode = _signal_interrupt_for_turn(target_turn_id)
+    if mode is None:
+        return JSONResponse(
+            {
+                **response,
+                "applied": False,
+                "error": "target turn is no longer active",
+                "error_code": "target_turn_not_active",
+            },
+            status_code=409,
+        )
     logger.info(
-        "Interrupt received via REST (mode=%s, tool_inflight=%s)",
+        "Correlated interrupt received via REST "
+        "(target_turn=%d mode=%s tool_inflight=%s)",
+        target_turn_id,
         mode,
         _tool_inflight,
     )
-    return JSONResponse({"ack": True, "mode": mode})
+    return JSONResponse({**response, "ack": True, "applied": True, "mode": mode})
 
 
 async def handle_api_approve(request: Request) -> JSONResponse:
@@ -3699,6 +3840,12 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
     # --- WebSocket receive loop ---
     global _loop_interrupt_flag
     try:
+        # The exact current queue lock is also the admission serialization
+        # point. Any old-token admission that started before this claim must
+        # commit before this snapshot; one that starts after it observes the
+        # new token and cannot create old-generation work. Fetch the complete
+        # (unbounded) generation once so one steal produces at most one epoch
+        # rotation and one terminal boundary per abandoned target.
         while True:
             raw = await ws.receive_text()
             try:
@@ -3973,6 +4120,10 @@ class _QueuedPersistentEvent:
     control_request_id: Optional[str] = None
     control_lease_token: Optional[int] = None
     control_agent_id: Optional[str] = None
+    interrupt_request_id: Optional[str] = None
+    interrupt_lease_token: Optional[int] = None
+    interrupt_accepted_lease_token: Optional[int] = None
+    interrupt_stale_recovery: bool = False
     receipt: Optional[asyncio.Future] = None
 
 
@@ -4034,17 +4185,21 @@ class _OrderedPersistentEventWriter:
                 queued.value->'payload'           AS payload,
                 NULLIF(queued.value->>'control_request_id', '')::uuid
                                                     AS control_request_id,
+                NULLIF(queued.value->>'interrupt_request_id', '')::uuid
+                                                    AS interrupt_request_id,
                 queued.ordinal                    AS ordinal
             FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY
                 AS queued(value, ordinal)
         ),
         inserted AS (
             INSERT INTO thread_events (
-                thread_id, epoch, seq, kind, payload, control_request_id
+                thread_id, epoch, seq, kind, payload, control_request_id,
+                interrupt_request_id
             )
             SELECT $1, queued_rows.epoch, queued_rows.seq,
                    queued_rows.kind, queued_rows.payload,
-                   queued_rows.control_request_id
+                   queued_rows.control_request_id,
+                   queued_rows.interrupt_request_id
             FROM queued_rows
             WHERE EXISTS (
                     SELECT 1 FROM threads
@@ -4113,6 +4268,18 @@ class _OrderedPersistentEventWriter:
             WHERE request.id = ANY($1::uuid[])
               AND request.thread_id = $2::uuid
               AND request.accepted_agent_id IS NOT DISTINCT FROM $3::uuid
+              AND request.outcome IS NULL
+            FOR SHARE
+        ) locked_requests
+    """
+    _LOCK_INTERRUPT_REQUESTS_SQL = """
+        SELECT COUNT(*)::bigint
+        FROM (
+            SELECT request.id
+            FROM thread_interrupt_requests request
+            WHERE request.id = ANY($1::uuid[])
+              AND request.thread_id = $2::uuid
+              AND request.accepted_lease_token = $3::bigint
               AND request.outcome IS NULL
             FOR SHARE
         ) locked_requests
@@ -4296,13 +4463,16 @@ class _OrderedPersistentEventWriter:
             # batch with ordinary trailing journal frames. If its live lease
             # fence fails, only that acknowledgement may fail; ordinary frames
             # retain the established epoch/token trailing-flush contract.
-            if first.control_request_id is None:
+            if first.control_request_id is None and first.interrupt_request_id is None:
                 while len(batch) < self._batch_size:
                     try:
                         candidate = self._queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
-                    if candidate.control_request_id is not None:
+                    if (
+                        candidate.control_request_id is not None
+                        or candidate.interrupt_request_id is not None
+                    ):
                         self._deferred_event = candidate
                         break
                     batch.append(candidate)
@@ -4421,6 +4591,7 @@ class _OrderedPersistentEventWriter:
                 "kind": event.kind,
                 "payload": event.payload,
                 "control_request_id": event.control_request_id,
+                "interrupt_request_id": event.interrupt_request_id,
             }
             for event in batch
         ]
@@ -4428,6 +4599,17 @@ class _OrderedPersistentEventWriter:
         control_events = [
             event for event in batch if event.control_request_id is not None
         ]
+        interrupt_events = [
+            event for event in batch if event.interrupt_request_id is not None
+        ]
+        if control_events and interrupt_events:
+            return 0
+        if any(
+            event.control_request_id is not None
+            and event.interrupt_request_id is not None
+            for event in batch
+        ):
+            return 0
         control_agent_id: Optional[str] = None
         control_lease_token: Optional[int] = None
         if control_events and self._lease is not None:
@@ -4454,6 +4636,45 @@ class _OrderedPersistentEventWriter:
             ):
                 return 0
             control_agent_id = control_agents.pop()
+
+        interrupt_lease_token: Optional[int] = None
+        interrupt_accepted_lease_token: Optional[int] = None
+        if interrupt_events:
+            # The inbox is stateless-only. ``interrupt_lease_token`` is the
+            # CURRENT writer authority. Usually it is also the immutable
+            # admission token. Explicit stale recovery instead locks an older
+            # accepted request while still fencing the INSERT on the current
+            # live queue token; a warm LeaseHandle is never authority here.
+            if self._lease is None:
+                return 0
+            interrupt_tokens = {
+                event.interrupt_lease_token for event in interrupt_events
+            }
+            if None in interrupt_tokens or len(interrupt_tokens) != 1:
+                return 0
+            interrupt_lease_token = interrupt_tokens.pop()
+            accepted_tokens = {
+                (
+                    event.interrupt_accepted_lease_token
+                    if event.interrupt_accepted_lease_token is not None
+                    else event.interrupt_lease_token
+                )
+                for event in interrupt_events
+            }
+            stale_modes = {
+                bool(event.interrupt_stale_recovery) for event in interrupt_events
+            }
+            if None in accepted_tokens or len(accepted_tokens) != 1:
+                return 0
+            if len(stale_modes) != 1:
+                return 0
+            interrupt_accepted_lease_token = accepted_tokens.pop()
+            stale_recovery = stale_modes.pop()
+            if stale_recovery:
+                if interrupt_accepted_lease_token >= interrupt_lease_token:
+                    return 0
+            elif interrupt_accepted_lease_token != interrupt_lease_token:
+                return 0
 
         async with self.postgres_conn.acquire() as conn:
             if control_events:
@@ -4508,6 +4729,40 @@ class _OrderedPersistentEventWriter:
                     if locked_requests != len(request_ids):
                         return 0
                     inserted = await conn.fetchval(self._INSERT_BATCH_SQL, *args)
+            elif interrupt_events:
+                request_ids = [
+                    str(event.interrupt_request_id) for event in interrupt_events
+                ]
+                if len(set(request_ids)) != len(request_ids):
+                    return 0
+                if interrupt_lease_token is None:
+                    return 0
+                async with conn.transaction():
+                    thread_fenced = await conn.fetchval(
+                        self._LOCK_STATELESS_CONTROL_THREAD_SQL,
+                        self.thread_id,
+                    )
+                    if thread_fenced is None:
+                        return 0
+                    queue_fenced = await conn.fetchval(
+                        self._LOCK_STATELESS_CONTROL_QUEUE_SQL,
+                        self.thread_id,
+                        interrupt_lease_token,
+                    )
+                    if queue_fenced is None:
+                        return 0
+                    locked_requests = int(
+                        await conn.fetchval(
+                            self._LOCK_INTERRUPT_REQUESTS_SQL,
+                            request_ids,
+                            self.thread_id,
+                            interrupt_accepted_lease_token,
+                        )
+                        or 0
+                    )
+                    if locked_requests != len(request_ids):
+                        return 0
+                    inserted = await conn.fetchval(self._INSERT_BATCH_SQL, *args)
             else:
                 insert_sql = self._insert_sql
                 ordinary_args = list(args)
@@ -4530,7 +4785,7 @@ class _OrderedPersistentEventWriter:
         if receipt is not None and not receipt.done():
             receipt.set_exception(
                 EventJournalUnavailable(
-                    f"control result journal persistence failed: {reason}"
+                    f"durable owner result journal persistence failed: {reason}"
                 )
             )
 
@@ -4609,6 +4864,10 @@ def _broadcast_frame(
     control_request_id: Optional[str] = None,
     control_lease_token: Optional[int] = None,
     control_agent_id: Optional[str] = None,
+    interrupt_request_id: Optional[str] = None,
+    interrupt_lease_token: Optional[int] = None,
+    interrupt_accepted_lease_token: Optional[int] = None,
+    interrupt_stale_recovery: bool = False,
     durable_receipt: bool = False,
 ) -> Optional[asyncio.Future]:
     """Fan out one frame and enqueue its ordered journal write.
@@ -4673,6 +4932,10 @@ def _broadcast_frame(
             control_request_id=control_request_id,
             control_lease_token=control_lease_token,
             control_agent_id=control_agent_id,
+            interrupt_request_id=interrupt_request_id,
+            interrupt_lease_token=interrupt_lease_token,
+            interrupt_accepted_lease_token=interrupt_accepted_lease_token,
+            interrupt_stale_recovery=interrupt_stale_recovery,
             receipt=receipt,
         )
         writer = _event_writer
@@ -4691,7 +4954,7 @@ def _broadcast_frame(
     elif receipt is not None:
         receipt.set_exception(
             EventJournalUnavailable(
-                "control result journal persistence failed: session_unavailable"
+                "durable owner result journal persistence failed: session_unavailable"
             )
         )
     return receipt
@@ -4726,6 +4989,51 @@ async def _broadcast_durable(
     )
     if receipt is None:  # pragma: no cover - defensive; durable always creates one
         raise EventJournalUnavailable("control result receipt was not created")
+    return await receipt
+
+
+async def _broadcast_interrupt_durable(
+    method: str,
+    params: Dict[str, Any],
+    *,
+    interrupt_request_id: str,
+    lease_token: int,
+    accepted_lease_token: Optional[int] = None,
+    stale_recovery: bool = False,
+) -> tuple[int, int]:
+    """Wait for one immutable-lease interrupt receipt to commit.
+
+    ``_broadcast_frame`` allocates and enqueues synchronously before this
+    coroutine reaches its first suspension. The RAM interrupt signal can
+    therefore be followed immediately by this call without allowing the graph
+    to consume the flag and finish ahead of receipt allocation.
+    """
+
+    receipt = _broadcast_frame(
+        method,
+        params,
+        interrupt_request_id=interrupt_request_id,
+        interrupt_lease_token=int(lease_token),
+        interrupt_accepted_lease_token=(
+            int(accepted_lease_token) if accepted_lease_token is not None else None
+        ),
+        interrupt_stale_recovery=bool(stale_recovery),
+        durable_receipt=True,
+    )
+    if receipt is None:  # pragma: no cover - defensive; durable always creates one
+        raise EventJournalUnavailable("interrupt result receipt was not created")
+    return await receipt
+
+
+async def _broadcast_event_durable(
+    method: str,
+    params: Dict[str, Any],
+) -> tuple[int, int]:
+    """Wait for an ordinary current-owner journal frame to commit."""
+
+    receipt = _broadcast_frame(method, params, durable_receipt=True)
+    if receipt is None:  # pragma: no cover - defensive; durable always creates one
+        raise EventJournalUnavailable("durable event receipt was not created")
     return await receipt
 
 
@@ -5447,6 +5755,724 @@ async def _stop_thread_control_watcher() -> None:
     _control_watcher_stop = None
     _control_owner_lease_token = None
     _control_owner_agent_id = None
+
+
+async def _finalize_durable_interrupt(
+    request: Any,
+    *,
+    lease_token: int,
+    outcome: str,
+    mode: Optional[str],
+    error_code: Optional[str],
+    accepted_lease_token: Optional[int] = None,
+    stale_recovery: bool = False,
+) -> str:
+    """Terminalize one interrupt from its committed journal receipt."""
+
+    from ..shared.thread_interrupts import finalize_interrupt_request
+
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return "lost_owner"
+    async with _session.postgres_conn.acquire() as conn:
+        async with conn.transaction():
+            return await finalize_interrupt_request(
+                conn,
+                request_id=request.id,
+                thread_id=_thread_id,
+                lease_token=int(lease_token),
+                target_turn_id=int(request.target_turn_id),
+                outcome=outcome,
+                mode=mode,
+                error_code=error_code,
+                accepted_lease_token=accepted_lease_token,
+                stale_recovery=stale_recovery,
+            )
+
+
+async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> int:
+    """Consume pending interrupts for one exact live lease/turn pair.
+
+    The RAM signal happens synchronously before allocating the durable receipt.
+    Only a committed receipt may terminalize the request. Receipt recovery
+    deliberately skips the RAM mutation: repeating a historical hard signal
+    after its target await already unwound could hit unrelated work inside the
+    same turn.
+    """
+
+    from ..shared.thread_interrupts import (
+        fetch_interrupt_receipt,
+        fetch_next_interrupt_request,
+        interrupt_receipt_result,
+        owner_fence_current,
+    )
+
+    applied_count = 0
+    async with _interrupt_drain_lock:
+        while True:
+            if _session is None or _session.postgres_conn is None or _thread_id is None:
+                return applied_count
+            handle = _current_lease_var.get()
+            if (
+                handle is None
+                or handle.unit_id != str(_thread_id)
+                or handle.lease_token != int(lease_token)
+                or handle.lost.is_set()
+            ):
+                if handle is not None:
+                    handle.lost.set()
+                raise InterruptInboxBlocked(f"interrupt owner lost lease {lease_token}")
+
+            started = time.perf_counter()
+            async with _session.postgres_conn.acquire() as conn:
+                async with conn.transaction():
+                    owns_thread = await owner_fence_current(
+                        conn,
+                        thread_id=_thread_id,
+                        lease_token=int(lease_token),
+                    )
+                    if not owns_thread:
+                        handle.lost.set()
+                        raise InterruptInboxBlocked(
+                            "interrupt owner fence is no longer current"
+                        )
+                    request = await fetch_next_interrupt_request(
+                        conn,
+                        thread_id=_thread_id,
+                        lease_token=int(lease_token),
+                        target_turn_id=int(target_turn_id),
+                    )
+                    if request is None:
+                        return applied_count
+                    receipt = await fetch_interrupt_receipt(
+                        conn,
+                        thread_id=_thread_id,
+                        request_id=request.id,
+                    )
+
+            if receipt is not None:
+                receipt_result = interrupt_receipt_result(
+                    request_id=request.id,
+                    client_request_id=request.client_request_id,
+                    target_turn_id=request.target_turn_id,
+                    event_kind=receipt.kind,
+                    event_payload=receipt.payload,
+                )
+                if receipt_result is None:
+                    raise InterruptInboxBlocked(
+                        "interrupt receipt does not match its durable request: "
+                        f"{request.id}"
+                    )
+                outcome, mode, error_code = receipt_result
+                result = await _finalize_durable_interrupt(
+                    request,
+                    lease_token=int(lease_token),
+                    outcome=outcome,
+                    mode=mode,
+                    error_code=error_code,
+                )
+                if result not in {outcome, "already_terminal"}:
+                    if result == "lost_owner":
+                        handle.lost.set()
+                    raise InterruptInboxBlocked(
+                        "interrupt receipt recovery failed: "
+                        f"request={request.id} result={result}"
+                    )
+                applied_count += 1
+                logger.info(
+                    "session-interrupt timing: thread=%s turn=%d "
+                    "recovered_receipt=true total=%.3fs",
+                    _thread_id,
+                    request.target_turn_id,
+                    time.perf_counter() - started,
+                )
+                continue
+
+            mode = _signal_interrupt_for_turn(request.target_turn_id)
+            outcome = "applied" if mode is not None else "rejected"
+            error_code = None if mode is not None else "target_turn_not_active"
+            params: Dict[str, Any] = {
+                "request_id": str(request.id),
+                "client_request_id": str(request.client_request_id),
+                "target_turn_id": request.target_turn_id,
+                "applied": outcome == "applied",
+            }
+            if mode is not None:
+                params["mode"] = mode
+            else:
+                params["error_code"] = error_code
+
+            journal_started = time.perf_counter()
+            try:
+                epoch, seq = await _broadcast_interrupt_durable(
+                    "interrupt.ack",
+                    params,
+                    interrupt_request_id=str(request.id),
+                    lease_token=int(lease_token),
+                )
+            except EventJournalUnavailable as exc:
+                raise InterruptInboxBlocked(
+                    f"interrupt journal acknowledgement failed: {request.id}"
+                ) from exc
+            journal_seconds = time.perf_counter() - journal_started
+            result = await _finalize_durable_interrupt(
+                request,
+                lease_token=int(lease_token),
+                outcome=outcome,
+                mode=mode,
+                error_code=error_code,
+            )
+            if result not in {outcome, "already_terminal"}:
+                if result == "lost_owner":
+                    handle.lost.set()
+                raise InterruptInboxBlocked(
+                    "interrupt finalization failed: "
+                    f"request={request.id} journal={epoch}/{seq} result={result}"
+                )
+            applied_count += 1
+            logger.info(
+                "session-interrupt timing: thread=%s turn=%d applied=%s "
+                "recovered_receipt=false journal=%.3fs total=%.3fs",
+                _thread_id,
+                request.target_turn_id,
+                outcome == "applied",
+                journal_seconds,
+                time.perf_counter() - started,
+            )
+
+
+async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
+    """Fence an abandoned turn before its successor emits any turn output.
+
+    A claim can beat the reaper's post-steal journal transaction. The attach
+    then initially seeds an ordered writer in the abandoned epoch. Close that
+    writer first, lock the stateless thread then the exact CURRENT queue token,
+    bump the epoch, and publish a fresh writer at seq 0.
+    Any old process or partial-delta flush is now rejected by the epoch/token
+    fence before this owner journals recovery receipts or starts a new turn.
+    """
+
+    global _event_writer, _events_epoch, _next_seq
+
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        raise EventJournalUnavailable("interrupt epoch recovery lost its session")
+    handle = _current_lease_var.get()
+    if (
+        handle is None
+        or handle.unit_id != str(_thread_id)
+        or handle.lease_token != int(lease_token)
+        or handle.lost.is_set()
+    ):
+        raise InterruptInboxBlocked("interrupt epoch recovery lost local lease")
+
+    old_writer = _event_writer
+    if old_writer is None or old_writer.thread_id != str(_thread_id):
+        raise EventJournalUnavailable("interrupt epoch recovery has no writer")
+    _event_writer = None
+    await old_writer.close()
+
+    old_epoch = _events_epoch
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            async with conn.transaction():
+                # Two statements make the cross-writer lock order explicit;
+                # a joined FOR clause does not guarantee acquisition order.
+                thread = await conn.fetchrow(
+                    "SELECT 1 FROM threads WHERE id = $1::uuid "
+                    "AND execution_lane = 'stateless' AND agent_id IS NULL "
+                    "FOR UPDATE",
+                    _thread_id,
+                )
+                if thread is None:
+                    handle.lost.set()
+                    raise InterruptInboxBlocked(
+                        "interrupt epoch recovery thread is no longer stateless"
+                    )
+                queue = await conn.fetchrow(
+                    "SELECT 1 FROM run_queue "
+                    "WHERE unit_id = $1::uuid AND unit_kind = 'session_turn' "
+                    "AND state = 'leased' AND lease_token = $2::bigint "
+                    "FOR UPDATE",
+                    _thread_id,
+                    int(lease_token),
+                )
+                if queue is None:
+                    handle.lost.set()
+                    raise InterruptInboxBlocked(
+                        "interrupt epoch recovery queue token is no longer current"
+                    )
+                new_epoch = await _event_journal.bump_epoch(
+                    conn,
+                    thread_id=str(_thread_id),
+                )
+    except BaseException:
+        # A failed transaction exit can be commit-ambiguous. Never recreate a
+        # writer in the old epoch by guessing that the bump rolled back; leave
+        # this token to expire and let the next exact claimant resolve the DB.
+        handle.lost.set()
+        raise
+
+    _events_epoch = int(new_epoch)
+    _next_seq = 0
+    try:
+        new_writer = _OrderedPersistentEventWriter(
+            postgres_conn=_session.postgres_conn,
+            thread_id=str(_thread_id),
+            epoch=_events_epoch,
+            on_terminal_failure=_event_persistence_failed,
+            lease=handle,
+        )
+        new_writer.start()
+    except BaseException:
+        handle.lost.set()
+        raise
+    _event_writer = new_writer
+    logger.info(
+        "session-interrupt recovery epoch: thread=%s token=%d old=%d new=%d",
+        _thread_id,
+        lease_token,
+        old_epoch,
+        _events_epoch,
+    )
+    return _events_epoch
+
+
+async def _reconcile_stale_thread_interrupts(
+    *, lease_token: int
+) -> tuple[int, Optional[int]]:
+    """Settle pending requests from superseded leases without signalling RAM.
+
+    The current exact owner supplies journal authority and holds the queue row
+    against a concurrent reaper/claim. The request retains its immutable OLD
+    accepted token; ``applied_lease_token`` stores that token solely because
+    the frozen schema requires equality. It does not attribute a
+    successor/system-writer owner-loss receipt to the expired process. The
+    successor never signals its own RAM from the stale request.
+    """
+
+    from ..shared.thread_interrupts import (
+        fetch_interrupt_receipt,
+        consume_applied_interrupt_input_live,
+        fetch_stale_interrupt_requests,
+        interrupt_receipt_result,
+        owner_fence_current_for_update,
+    )
+
+    reconciled = 0
+    async with _interrupt_drain_lock:
+        if _session is None or _session.postgres_conn is None or _thread_id is None:
+            return reconciled, None
+        while True:
+            handle = _current_lease_var.get()
+            if (
+                handle is None
+                or handle.unit_id != str(_thread_id)
+                or handle.lease_token != int(lease_token)
+                or handle.lost.is_set()
+            ):
+                if handle is not None:
+                    handle.lost.set()
+                raise InterruptInboxBlocked(
+                    f"stale-interrupt reconciler lost lease {lease_token}"
+                )
+
+            async with _session.postgres_conn.acquire() as conn:
+                async with conn.transaction():
+                    owns_thread = await owner_fence_current_for_update(
+                        conn,
+                        thread_id=_thread_id,
+                        lease_token=int(lease_token),
+                    )
+                    if not owns_thread:
+                        handle.lost.set()
+                        raise InterruptInboxBlocked(
+                            "stale-interrupt owner fence is no longer current"
+                        )
+                    requests = await fetch_stale_interrupt_requests(
+                        conn,
+                        thread_id=_thread_id,
+                        current_lease_token=int(lease_token),
+                    )
+                    if not requests:
+                        queue = await conn.fetchrow(
+                            "SELECT consumed_seq FROM run_queue "
+                            "WHERE unit_id = $1::uuid AND state = 'leased' "
+                            "AND lease_token = $2::bigint",
+                            _thread_id,
+                            int(lease_token),
+                        )
+                        return (
+                            reconciled,
+                            (
+                                int(queue["consumed_seq"])
+                                if queue is not None
+                                and queue["consumed_seq"] is not None
+                                else None
+                            ),
+                        )
+                    receipts = {
+                        request.id: await fetch_interrupt_receipt(
+                            conn,
+                            thread_id=_thread_id,
+                            request_id=request.id,
+                        )
+                        for request in requests
+                    }
+
+            # A stale row proves the claim beat the reaper's post-steal
+            # boundary. Rotate before any recovery frame or successor output.
+            await _rotate_thread_interrupt_recovery_epoch(lease_token=int(lease_token))
+
+            results: list[tuple[Any, str, Optional[str], Optional[str]]] = []
+            for request in requests:
+                receipt = receipts[request.id]
+                if receipt is not None:
+                    receipt_result = interrupt_receipt_result(
+                        request_id=request.id,
+                        client_request_id=request.client_request_id,
+                        target_turn_id=request.target_turn_id,
+                        event_kind=receipt.kind,
+                        event_payload=receipt.payload,
+                    )
+                    if receipt_result is None:
+                        raise InterruptInboxBlocked(
+                            "stale interrupt receipt does not match its request: "
+                            f"{request.id}"
+                        )
+                    outcome, mode, error_code = receipt_result
+                elif request.outcome is not None:
+                    raise InterruptInboxBlocked(
+                        "terminal stale interrupt is missing its durable receipt: "
+                        f"{request.id}"
+                    )
+                else:
+                    # Exact durable admission is itself stop intent. The old
+                    # owner may have signalled RAM and died before allocating
+                    # its receipt; rejecting here would re-run a turn the user
+                    # already stopped. The successor never signals its own
+                    # RAM, but durably settles the old target as a hard stop.
+                    outcome = "applied"
+                    mode = "hard"
+                    error_code = None
+                    params: Dict[str, Any] = {
+                        "request_id": str(request.id),
+                        "client_request_id": str(request.client_request_id),
+                        "target_turn_id": request.target_turn_id,
+                        "applied": True,
+                        "mode": mode,
+                        "reason": "owner_lost",
+                        "owner_loss_reason": "lease_expired",
+                    }
+                    try:
+                        await _broadcast_interrupt_durable(
+                            "interrupt.ack",
+                            params,
+                            interrupt_request_id=str(request.id),
+                            lease_token=int(lease_token),
+                            accepted_lease_token=int(request.accepted_lease_token),
+                            stale_recovery=True,
+                        )
+                    except EventJournalUnavailable as exc:
+                        raise InterruptInboxBlocked(
+                            f"stale interrupt journal settlement failed: {request.id}"
+                        ) from exc
+                results.append((request, outcome, mode, error_code))
+
+            # Match the reaper's generation shape: all correlated acks become
+            # durable first, then one terminal boundary closes the abandoned
+            # partial turn before any input watermark moves.
+            requests_by_target: Dict[int, list[Any]] = {}
+            for request in requests:
+                requests_by_target.setdefault(int(request.target_turn_id), []).append(
+                    request
+                )
+            for target_turn_id, target_requests in requests_by_target.items():
+                await _broadcast_event_durable(
+                    "turn.interrupted",
+                    {
+                        "reason": "lease_expired",
+                        "recovered_by_lease_token": int(lease_token),
+                        "target_turn_id": target_turn_id,
+                        "interrupt_request_ids": [
+                            str(request.id) for request in target_requests
+                        ],
+                        "accepted_lease_tokens": sorted(
+                            {
+                                int(request.accepted_lease_token)
+                                for request in target_requests
+                            }
+                        ),
+                    },
+                )
+
+            for request, outcome, mode, error_code in results:
+                if request.outcome == "applied":
+                    # Receipt-before-finalizer recovery may also encounter an
+                    # already-terminal applied row written by older code. The
+                    # same group helper stamps/reuses the exactly-once marker.
+                    async with _session.postgres_conn.acquire() as conn:
+                        async with conn.transaction():
+                            if not await owner_fence_current_for_update(
+                                conn,
+                                thread_id=_thread_id,
+                                lease_token=int(lease_token),
+                            ):
+                                handle.lost.set()
+                                raise InterruptInboxBlocked(
+                                    "stale applied interrupt lost current owner"
+                                )
+                            consumed = await consume_applied_interrupt_input_live(
+                                conn,
+                                thread_id=_thread_id,
+                                current_lease_token=int(lease_token),
+                                accepted_lease_token=int(request.accepted_lease_token),
+                                target_turn_id=int(request.target_turn_id),
+                                request_id=request.id,
+                            )
+                            if consumed is None:
+                                raise InterruptInboxBlocked(
+                                    "stale applied interrupt could not settle input"
+                                )
+                    result = "already_terminal"
+                elif request.outcome is not None:
+                    # Only unmarked applied terminal rows are selected.
+                    raise InterruptInboxBlocked(
+                        "unexpected terminal stale interrupt candidate: "
+                        f"{request.id}/{request.outcome}"
+                    )
+                else:
+                    result = await _finalize_durable_interrupt(
+                        request,
+                        lease_token=int(lease_token),
+                        outcome=outcome,
+                        mode=mode,
+                        error_code=error_code,
+                        accepted_lease_token=int(request.accepted_lease_token),
+                        stale_recovery=True,
+                    )
+                if result not in {outcome, "already_terminal"}:
+                    if result == "lost_owner":
+                        handle.lost.set()
+                    raise InterruptInboxBlocked(
+                        "stale interrupt finalization failed: "
+                        f"request={request.id} result={result}"
+                    )
+                reconciled += 1
+                logger.info(
+                    "session-interrupt stale recovery: thread=%s request=%s "
+                    "accepted_token=%d current_token=%d receipt=%s",
+                    _thread_id,
+                    request.id,
+                    request.accepted_lease_token,
+                    lease_token,
+                    receipts[request.id] is not None,
+                )
+
+            async with _session.postgres_conn.acquire() as conn:
+                async with conn.transaction():
+                    if not await owner_fence_current_for_update(
+                        conn,
+                        thread_id=_thread_id,
+                        lease_token=int(lease_token),
+                    ):
+                        handle.lost.set()
+                        raise InterruptInboxBlocked(
+                            "stale-interrupt owner lost before watermark refresh"
+                        )
+                    queue = await conn.fetchrow(
+                        "SELECT consumed_seq FROM run_queue "
+                        "WHERE unit_id = $1::uuid AND state = 'leased' "
+                        "AND lease_token = $2::bigint",
+                        _thread_id,
+                        int(lease_token),
+                    )
+                    return (
+                        reconciled,
+                        (
+                            int(queue["consumed_seq"])
+                            if queue is not None and queue["consumed_seq"] is not None
+                            else None
+                        ),
+                    )
+
+
+async def _interrupt_watcher_loop(
+    *,
+    postgres_conn: Any,
+    thread_id: str,
+    stop: asyncio.Event,
+    lease_token: int,
+    target_turn_id: int,
+) -> None:
+    """LISTEN for interrupt latency and poll for correctness."""
+
+    wake = asyncio.Event()
+
+    def _on_notify(_conn: Any, _pid: int, _channel: str, payload: str) -> None:
+        try:
+            notice = json.loads(payload)
+        except Exception:
+            return
+        if str(notice.get("thread_id") or "") == thread_id:
+            wake.set()
+
+    async def _drain_once() -> None:
+        try:
+            await _drain_thread_interrupts(
+                lease_token=lease_token,
+                target_turn_id=target_turn_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "session-interrupt drain failed; request remains pending "
+                "(thread=%s turn=%d)",
+                thread_id,
+                target_turn_id,
+                exc_info=True,
+            )
+
+    try:
+        async with postgres_conn.acquire() as listener:
+            await listener.add_listener(_INTERRUPT_NOTIFY_CHANNEL, _on_notify)
+            try:
+                while not stop.is_set():
+                    await _drain_once()
+                    wake.clear()
+                    if stop.is_set():
+                        break
+                    wake_waiter = asyncio.create_task(wake.wait())
+                    stop_waiter = asyncio.create_task(stop.wait())
+                    waiters = {wake_waiter, stop_waiter}
+                    try:
+                        await asyncio.wait(
+                            waiters,
+                            timeout=_INTERRUPT_POLL_SECONDS,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for waiter in waiters:
+                            if not waiter.done():
+                                waiter.cancel()
+                        await asyncio.gather(*waiters, return_exceptions=True)
+            finally:
+                with suppress(Exception):
+                    await listener.remove_listener(
+                        _INTERRUPT_NOTIFY_CHANNEL,
+                        _on_notify,
+                    )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "session-interrupt LISTEN unavailable; polling (thread=%s turn=%d)",
+            thread_id,
+            target_turn_id,
+            exc_info=True,
+        )
+        while not stop.is_set():
+            await _drain_once()
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=_INTERRUPT_POLL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+
+async def _start_thread_interrupt_watcher(
+    *, lease_token: int, target_turn_id: int
+) -> int:
+    """Synchronously drain then watch one exact stateless turn."""
+
+    async with _interrupt_watcher_lifecycle_lock:
+        return await _start_thread_interrupt_watcher_locked(
+            lease_token=lease_token,
+            target_turn_id=target_turn_id,
+        )
+
+
+async def _start_thread_interrupt_watcher_locked(
+    *, lease_token: int, target_turn_id: int
+) -> int:
+    """Start while holding ``_interrupt_watcher_lifecycle_lock``."""
+
+    global _interrupt_watcher_task, _interrupt_watcher_stop
+    global _interrupt_owner_lease_token, _interrupt_owner_turn_id
+
+    await _stop_thread_interrupt_watcher_locked()
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        raise EventJournalUnavailable("cannot start interrupt owner without a session")
+    _interrupt_owner_lease_token = int(lease_token)
+    _interrupt_owner_turn_id = int(target_turn_id)
+    try:
+        drained = await _drain_thread_interrupts(
+            lease_token=_interrupt_owner_lease_token,
+            target_turn_id=_interrupt_owner_turn_id,
+        )
+    except BaseException:
+        _interrupt_owner_lease_token = None
+        _interrupt_owner_turn_id = None
+        raise
+
+    stop = asyncio.Event()
+    _interrupt_watcher_stop = stop
+    _interrupt_watcher_task = asyncio.create_task(
+        _interrupt_watcher_loop(
+            postgres_conn=_session.postgres_conn,
+            thread_id=str(_thread_id),
+            stop=stop,
+            lease_token=_interrupt_owner_lease_token,
+            target_turn_id=_interrupt_owner_turn_id,
+        ),
+        name=f"thread-interrupt-watcher-{str(_thread_id)[:8]}",
+    )
+    return drained
+
+
+async def _stop_thread_interrupt_watcher() -> None:
+    """Stop and terminally join the consumer before any final drain.
+
+    This join is intentionally unbounded. Cancelling a drain that is awaiting
+    its ordered-writer receipt is ambiguous: the INSERT may still commit after
+    cancellation, and a replacement drain could then re-signal RAM and try to
+    write a duplicate receipt. Queue completion must wait until the original
+    consumer has reached a durable terminal outcome instead.
+    """
+
+    async with _interrupt_watcher_lifecycle_lock:
+        await _stop_thread_interrupt_watcher_locked()
+
+
+async def _stop_thread_interrupt_watcher_locked() -> None:
+    """Terminally join while holding the watcher lifecycle lock."""
+
+    global _interrupt_watcher_task, _interrupt_watcher_stop
+    global _interrupt_owner_lease_token, _interrupt_owner_turn_id
+
+    task = _interrupt_watcher_task
+    stop = _interrupt_watcher_stop
+    if stop is not None:
+        stop.set()
+    terminal = task is None
+    try:
+        if task is not None:
+            await asyncio.shield(task)
+            terminal = True
+    finally:
+        # If our caller is cancelled, shield leaves the consumer running and
+        # these owner globals intact. The queue transition is abandoned; a
+        # later cleanup can join the same unambiguous task. A task that itself
+        # failed/cancelled is terminal and may be cleared, while its exception
+        # still propagates so the executor marks the lease lost.
+        if task is not None and task.done():
+            terminal = True
+        if terminal:
+            _interrupt_watcher_task = None
+            _interrupt_watcher_stop = None
+            _interrupt_owner_lease_token = None
+            _interrupt_owner_turn_id = None
 
 
 def _emit_citation_verdict(citation_id: int, verification_status: str) -> None:
@@ -7283,8 +8309,18 @@ async def _loop_on_turn_start(turn_id: int) -> None:
     if _session is None:
         _turn_event_open = False
         return
-    _turn_event_open = True
     _session.turn_count = turn_id
+    _turn_event_open = True
+    hook = _turn_start_external_hook
+    if hook is not None:
+        try:
+            await hook(turn_id)
+        except BaseException:
+            # Do not publish a turn as interruptible when its exact admission
+            # and consumer could not be armed. The loop will run its normal
+            # terminal callback for this failed turn.
+            _turn_event_open = False
+            raise
     _broadcast("turn.started", {"turn_id": turn_id})
 
     # Cloud sync never started for this session (lost the race against

@@ -66,15 +66,17 @@ import socket
 import time
 from typing import Any, Dict, List, Optional
 
-from .lease_context import LeaseHandle, current_lease
+from .lease_context import LeaseHandle, LeaseLostError, current_lease
 from .orchestrator_client import ClaimBundleError
 from ..shared.run_queue import (
     HEARTBEAT_INTERVAL_SECONDS,
     UNIT_KIND_SESSION_TURN,
     ClaimedUnit,
     claim_unit,
+    close_interrupt_admission,
     complete_unit,
     heartbeat_unit,
+    open_interrupt_admission,
     release_unit,
 )
 
@@ -103,7 +105,7 @@ PENDING_ROWS_LIMIT = 50
 # answered. ``seq > COALESCE(consumed_seq, -1)`` — a NULL consumed watermark
 # means nothing was ever answered, so the oldest human row qualifies.
 _PENDING_INPUT_SQL = """
-    SELECT id, seq, content
+    SELECT id, seq, content, turn_number
     FROM thread_messages
     WHERE thread_id = $1
       AND role = 'human'
@@ -580,11 +582,37 @@ class StatelessTurnExecutor:
             # Belt for every exception/cancellation path. Normal completion
             # and release paths stop it earlier, before mutating the queue;
             # this prevents a lease-scoped consumer leaking into warm idle.
+            interrupt_turn = (
+                pa._interrupt_owner_turn_id
+                if pa._interrupt_owner_lease_token == token
+                else None
+            )
+            if interrupt_turn is not None:
+                try:
+                    await self._close_interrupt_window(
+                        pa,
+                        claim,
+                        target_turn_id=int(interrupt_turn),
+                    )
+                except (asyncio.CancelledError, Exception):
+                    self._lease.mark_lost()
+                    logger.warning(
+                        "interrupt window cleanup failed; lease will not be "
+                        "released (unit=%s token=%d turn=%d)",
+                        unit_id,
+                        token,
+                        interrupt_turn,
+                        exc_info=True,
+                    )
+            else:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pa._stop_thread_interrupt_watcher()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await pa._stop_thread_control_watcher()
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await heartbeat_task
+            pa._turn_start_external_hook = None
             pa._turn_complete_external_hook = None
 
     async def _serve_claim_inner(
@@ -688,6 +716,45 @@ class StatelessTurnExecutor:
         if pa._session is not None:
             pa._session.set_shell_owner_token(token)
 
+        # A claim may beat the reaper's post-steal journal transaction. Close
+        # that abandoned generation and settle its exact interrupted input
+        # before controls or pending-input selection can expose successor
+        # output. The returned watermark is newer than the claim snapshot
+        # precisely when an applied old-turn receipt consumed its target.
+        t0 = time.perf_counter()
+        try:
+            (
+                stale_count,
+                recovered_consumed_seq,
+            ) = await pa._reconcile_stale_thread_interrupts(lease_token=token)
+        except Exception as e:
+            logger.warning(
+                "stale-interrupt recovery failed for unit %s; no successor "
+                "input will be injected: %s",
+                unit_id,
+                e,
+                exc_info=True,
+            )
+            await self._detach_cached_session("stale_interrupt_recovery_failed")
+            await self._release(claim, reason="stale_interrupt_recovery_failed")
+            return
+        timing["interrupt_recovery"] = time.perf_counter() - t0
+        if recovered_consumed_seq is not None:
+            consumed_seq = max(
+                consumed_seq if consumed_seq is not None else -1,
+                int(recovered_consumed_seq),
+            )
+        if stale_count:
+            logger.info(
+                "session-interrupt claim recovery: unit=%s token=%d count=%d "
+                "consumed_seq=%s total=%.3fs",
+                unit_id,
+                token,
+                stale_count,
+                consumed_seq,
+                timing["interrupt_recovery"],
+            )
+
         # Controls are consumed only by the exact serving owner. The initial
         # drain is synchronous so a control-only claim cannot take either
         # no-input completion edge; the watcher then stays live for mid-turn
@@ -752,6 +819,8 @@ class StatelessTurnExecutor:
             self._mark_warm(claim)
             return
 
+        target = pending[0]
+
         # (g) Strip restored pending copies — only a fresh attach ran the
         # restore; a reused session's memory holds no unanswered copies
         # (inputs land in the DB via the orchestrator, never in this pod's
@@ -766,7 +835,6 @@ class StatelessTurnExecutor:
                     unit_id,
                 )
 
-        target = pending[0]
         if not target["content"]:
             # An empty row can never produce a turn (the loop skips empty
             # input, and the completion hook would never fire) — consume it.
@@ -788,6 +856,48 @@ class StatelessTurnExecutor:
             self._mark_warm(claim)
             return
 
+        target_turn_id = target.get("turn_number")
+        if (
+            isinstance(target_turn_id, bool)
+            or not isinstance(target_turn_id, int)
+            or target_turn_id <= 0
+            or pa._session is None
+        ):
+            logger.error(
+                "pending input lacks an exact durable turn identity; refusing "
+                "injection (unit=%s seq=%s turn=%r)",
+                unit_id,
+                target.get("seq"),
+                target_turn_id,
+            )
+            await pa._stop_thread_control_watcher()
+            await self._detach_cached_session("pending_turn_identity_invalid")
+            await self._release(claim, reason="pending_turn_identity_invalid")
+            return
+
+        expected_previous_turn = int(target_turn_id) - 1
+        if fresh_attach:
+            # Restore includes unanswered human rows and therefore seeds
+            # turn_count to the newest pending row. We just stripped those
+            # copies; rewind the in-process counter to the predecessor of the
+            # OLDEST pending row so on_turn_start opens admission for the
+            # turn_number already durable on that exact human row. This must
+            # happen before queue injection: persist_message runs only after
+            # on_turn_start and cannot repair a crash in between.
+            pa._session.turn_count = expected_previous_turn
+        elif int(pa._session.turn_count) != expected_previous_turn:
+            logger.error(
+                "warm pending turn identity diverged; refusing injection "
+                "(unit=%s session_turn=%s target_turn=%d)",
+                unit_id,
+                pa._session.turn_count,
+                target_turn_id,
+            )
+            await pa._stop_thread_control_watcher()
+            await self._detach_cached_session("pending_turn_identity_mismatch")
+            await self._release(claim, reason="pending_turn_identity_mismatch")
+            return
+
         timing["pending"] = time.perf_counter() - t0
 
         # (h) Inject — the row already exists (accept-time persist is
@@ -796,6 +906,11 @@ class StatelessTurnExecutor:
         # deliberately not. The id makes the loop's own turn-start persist an
         # idempotent upsert onto the same row.
         turn_done = asyncio.Event()
+        pa._turn_start_external_hook = lambda turn_id: self._arm_interrupt_window(
+            pa,
+            claim,
+            target_turn_id=turn_id,
+        )
         pa._turn_complete_external_hook = lambda _turn_id: turn_done.set()
         if not pa._ensure_persistent_loop_started("stateless_claim"):
             await self._detach_cached_session("loop_not_ready")
@@ -813,6 +928,43 @@ class StatelessTurnExecutor:
         timing["turn"] = time.perf_counter() - t0
 
         if outcome == "turn_done":
+            interrupt_turn_id = pa._interrupt_owner_turn_id
+            if pa._interrupt_owner_lease_token != token or interrupt_turn_id is None:
+                self._lease.mark_lost()
+                logger.error(
+                    "interrupt window identity missing at turn completion; "
+                    "leaving lease to expire (unit=%s token=%d)",
+                    unit_id,
+                    token,
+                )
+                await self._detach_cached_session("interrupt_identity_missing")
+                return
+            try:
+                interrupt_closed = await self._close_interrupt_window(
+                    pa,
+                    claim,
+                    target_turn_id=int(interrupt_turn_id),
+                )
+            except Exception:
+                self._lease.mark_lost()
+                logger.error(
+                    "interrupt final drain failed after turn completion; "
+                    "leaving lease to expire (unit=%s token=%d)",
+                    unit_id,
+                    token,
+                    exc_info=True,
+                )
+                await self._detach_cached_session("interrupt_final_drain_failed")
+                return
+            if not interrupt_closed:
+                logger.warning(
+                    "lease lost: unit=%s token=%d while closing interrupt "
+                    "window — successor owns completion",
+                    unit_id,
+                    token,
+                )
+                await self._detach_cached_session("interrupt_close_lost_lease")
+                return
             t0 = time.perf_counter()
             await self._await_cloud_push(pa)
             timing["push"] = time.perf_counter() - t0
@@ -875,6 +1027,19 @@ class StatelessTurnExecutor:
                 unit_id,
                 token,
             )
+            turn_id = (
+                pa._interrupt_owner_turn_id
+                if pa._interrupt_owner_lease_token == token
+                else None
+            )
+            if turn_id is not None:
+                await self._close_interrupt_window(
+                    pa,
+                    claim,
+                    target_turn_id=int(turn_id),
+                )
+            else:
+                await pa._stop_thread_interrupt_watcher()
             await pa._stop_thread_control_watcher()
             self._abort_turn_politely(pa)
             await self._wait_turn_unwind(turn_done, loop_task)
@@ -889,12 +1054,145 @@ class StatelessTurnExecutor:
                 unit_id,
                 outcome,
             )
+            turn_id = (
+                pa._interrupt_owner_turn_id
+                if pa._interrupt_owner_lease_token == token
+                else None
+            )
+            if turn_id is not None:
+                try:
+                    interrupt_closed = await self._close_interrupt_window(
+                        pa,
+                        claim,
+                        target_turn_id=int(turn_id),
+                    )
+                except Exception:
+                    self._lease.mark_lost()
+                    logger.error(
+                        "interrupt final drain failed after loop death; "
+                        "leaving lease to expire (unit=%s token=%d)",
+                        unit_id,
+                        token,
+                        exc_info=True,
+                    )
+                    await self._detach_cached_session(
+                        "loop_died_interrupt_drain_failed"
+                    )
+                    return
+                if not interrupt_closed:
+                    await self._detach_cached_session("loop_died_lost_lease")
+                    return
             await self._release(claim, reason="loop_died")
             await self._detach_cached_session("loop_died")
 
     # ------------------------------------------------------------------
     # Pieces
     # ------------------------------------------------------------------
+
+    async def _arm_interrupt_window(
+        self,
+        pa: Any,
+        claim: ClaimedUnit,
+        *,
+        target_turn_id: int,
+    ) -> None:
+        """Arm the consumer, then publish exact-turn admission.
+
+        The watcher starts before the public gate opens. A synchronous drain
+        after opening closes the LISTEN-registration window; only then may the
+        persistent loop emit ``turn.started``.
+        """
+
+        token = claim.lease_token
+        opened = False
+        try:
+            await pa._start_thread_interrupt_watcher(
+                lease_token=token,
+                target_turn_id=int(target_turn_id),
+            )
+            opened = await open_interrupt_admission(
+                self._db,
+                unit_id=claim.unit_id,
+                lease_token=token,
+                turn_id=int(target_turn_id),
+            )
+            if not opened:
+                self._lease.mark_lost()
+                raise LeaseLostError(
+                    "interrupt admission rejected stale lease/turn: "
+                    f"{claim.unit_id}/{token}/{target_turn_id}"
+                )
+            await pa._drain_thread_interrupts(
+                lease_token=token,
+                target_turn_id=int(target_turn_id),
+            )
+        except BaseException:
+            closed = False
+            if opened:
+                try:
+                    closed = await close_interrupt_admission(
+                        self._db,
+                        unit_id=claim.unit_id,
+                        lease_token=token,
+                        turn_id=int(target_turn_id),
+                    )
+                except BaseException:
+                    self._lease.mark_lost()
+            try:
+                await pa._stop_thread_interrupt_watcher()
+            except BaseException:
+                # A consumer that cannot be joined must never survive a queue
+                # transition, even when the public gate did not open.
+                self._lease.mark_lost()
+            if opened and closed:
+                try:
+                    await pa._drain_thread_interrupts(
+                        lease_token=token,
+                        target_turn_id=int(target_turn_id),
+                    )
+                except BaseException:
+                    # Never release a queue row after closing a window whose
+                    # committed admission tail could not be settled.
+                    self._lease.mark_lost()
+            elif opened:
+                self._lease.mark_lost()
+            raise
+
+    async def _close_interrupt_window(
+        self,
+        pa: Any,
+        claim: ClaimedUnit,
+        *,
+        target_turn_id: int,
+    ) -> bool:
+        """Close admission, stop the watcher, then drain the committed tail."""
+
+        token = claim.lease_token
+        try:
+            closed = await close_interrupt_admission(
+                self._db,
+                unit_id=claim.unit_id,
+                lease_token=token,
+                turn_id=int(target_turn_id),
+            )
+        except BaseException:
+            self._lease.mark_lost()
+            with contextlib.suppress(BaseException):
+                await pa._stop_thread_interrupt_watcher()
+            raise
+        await pa._stop_thread_interrupt_watcher()
+        if not closed:
+            self._lease.mark_lost()
+            return False
+        try:
+            await pa._drain_thread_interrupts(
+                lease_token=token,
+                target_turn_id=int(target_turn_id),
+            )
+        except BaseException:
+            self._lease.mark_lost()
+            raise
+        return True
 
     async def _fetch_bundle(self, unit_id: str, token: int) -> Dict[str, Any]:
         client = _pa()._orchestrator_client
@@ -912,7 +1210,12 @@ class StatelessTurnExecutor:
             PENDING_ROWS_LIMIT,
         )
         return [
-            {"id": str(r["id"]), "seq": r["seq"], "content": r["content"] or ""}
+            {
+                "id": str(r["id"]),
+                "seq": r["seq"],
+                "content": r["content"] or "",
+                "turn_number": r["turn_number"],
+            }
             for r in rows
         ]
 
@@ -1085,6 +1388,15 @@ class StatelessTurnExecutor:
             and pa._pending_cloud_push_task.done()
         ):
             pa._pending_cloud_push_task = None
+        if self._lease.lost.is_set():
+            logger.info(
+                "run_queue release: unit=%s token=%d reason=%s "
+                "skipped after local ownership loss",
+                claim.unit_id,
+                claim.lease_token,
+                reason,
+            )
+            return
         # Exact lifecycle boundary: no consumer may survive the state change
         # from leased back to queued, even on an error path.
         with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1143,6 +1455,7 @@ class StatelessTurnExecutor:
         self._prefer_unit_id = None
         self._warm_since = None
         pa._turn_complete_external_hook = None
+        pa._turn_start_external_hook = None
         if pa._session is None:
             # A failed attach can leave _thread_id set with no session
             # (dual_app precedent) — clear it so the next claim starts clean.

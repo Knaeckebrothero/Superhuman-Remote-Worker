@@ -38,8 +38,10 @@ _APPEND_SYSTEM_FRAME_SQL = """
         WHERE id = $1
         RETURNING events_epoch, events_seq_hwm AS seq
     )
-    INSERT INTO thread_events (thread_id, epoch, seq, kind, payload)
-    SELECT $1, allocated.events_epoch, allocated.seq, $2, $3::jsonb
+    INSERT INTO thread_events (
+        thread_id, epoch, seq, kind, payload, interrupt_request_id
+    )
+    SELECT $1, allocated.events_epoch, allocated.seq, $2, $3::jsonb, $4::uuid
     FROM allocated
     RETURNING epoch, seq
 """
@@ -54,15 +56,23 @@ _BUMP_EPOCH_SQL = """
 
 
 async def append_system_frame(
-    conn: Any, *, thread_id: str, kind: str, payload: dict[str, Any]
+    conn: Any,
+    *,
+    thread_id: str,
+    kind: str,
+    payload: dict[str, Any],
+    interrupt_request_id: str | None = None,
 ) -> tuple[int, int] | None:
     """Append one system-class frame under the thread's CURRENT epoch.
 
     One statement: a CTE pre-increments ``threads.events_seq_hwm`` (reserving
     the seq durably — the mark survives retention pruning) and reads
     ``events_epoch`` in the same snapshot, then inserts the frame at that
-    (epoch, seq). Returns the allocated ``(epoch, seq)``, or ``None`` when the
-    thread row does not exist.
+    (epoch, seq). ``interrupt_request_id`` optionally links a post-steal
+    ``interrupt.ack`` to its durable inbox row; the database's partial unique
+    index enforces one receipt per request. Other system frames leave it NULL.
+    Returns the allocated ``(epoch, seq)``, or ``None`` when the thread row
+    does not exist.
 
     WRITER-EXCLUSION CONSTRAINT: call this only from contexts where no live
     in-process journal writer holds this epoch — reaper post-steal, post-park,
@@ -78,6 +88,7 @@ async def append_system_frame(
         thread_id,
         kind,
         json.dumps(payload),
+        interrupt_request_id,
     )
     if row is None:
         return None

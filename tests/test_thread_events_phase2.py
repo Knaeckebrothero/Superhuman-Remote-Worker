@@ -22,12 +22,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
-def test_pruner_preserves_receipts_until_control_request_is_terminal():
+def test_pruner_preserves_receipts_until_owner_request_is_terminal():
     import orchestrator.main as om
 
     source = inspect.getsource(om.thread_events_prune_sweeper)
     assert source.count("request.id = thread_events.control_request_id") == 2
-    assert source.count("request.outcome IS NULL") == 2
+    assert source.count("request.id = thread_events.interrupt_request_id") == 2
+    assert source.count("request.outcome IS NULL") == 4
+    assert source.count("request.outcome = 'applied'") == 2
+    assert source.count("'consumed_input_seq'") == 2
 
 
 # ---------------------------------------------------------------------------

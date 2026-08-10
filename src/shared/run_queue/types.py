@@ -39,8 +39,12 @@ class ClaimedUnit:
 class StolenUnit:
     """One lease stolen by the reaper.
 
-    ``leased_by`` is the *previous* holder (diagnostics only), read just
+    ``leased_by``, ``previous_lease_token``, and
+    ``interrupt_admission_turn_id`` describe the *previous* holder, read just
     before the steal; ``lease_token`` and ``state`` are the post-steal values.
+    The old token lets callers terminalize exact-lease inbox rows without
+    deriving it from the new token, while the captured admission turn lets a
+    crash frame identify its target even when no request row committed.
     The caller — not this module — bumps ``threads.events_epoch`` and writes
     the ``turn.interrupted`` / ``turn.parked`` system frames from this record
     (layering: run_queue never touches threads/thread_events).
@@ -52,6 +56,8 @@ class StolenUnit:
     attempts_since_completion: int
     leased_by: str | None
     lease_token: int
+    previous_lease_token: int | None = None
+    interrupt_admission_turn_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
