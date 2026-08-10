@@ -2464,7 +2464,7 @@ async def _acknowledged_grant_strip(
     ``resolve_config`` call with no strip at all, so an acknowledged
     ``catalog_authoring`` violation (say) still read "on" in the settings
     view after the delivered blob had already dropped it. See
-    docs/features/session_config_drift_resume.md §3.3.
+    docs/done/session_config_drift_resume.md §3.3.
     """
     ack_grant_keys = acknowledged_grant_keys(metadata)
     if not ack_grant_keys:
@@ -30264,7 +30264,7 @@ async def resume_thread(
     Drifted config (deleted/revoked connectors or projects, withdrawn grants)
     is reported as 428 rather than silently denied; the caller re-POSTs with
     ``acknowledge`` naming the drift ids it accepts losing. See
-    docs/features/session_config_drift_resume.md.
+    docs/done/session_config_drift_resume.md.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     if thread.get("status") != "ended":

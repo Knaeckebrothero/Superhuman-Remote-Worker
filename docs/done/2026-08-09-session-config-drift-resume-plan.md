@@ -2,13 +2,24 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status: COMPLETE.** All 14 tasks executed and reviewed; shipped and live-gated
+on dev 2026-08-10. See `docs/done/session_config_drift_resume.md` §11 for the
+outcome and what remains open.
+
+> **Note on this plan's own text:** four defects were found *in the code this
+> plan prescribed*, and the plan was corrected in place each time (commits
+> `2dae8f78`, `a5cd8497`). If you are reading this as a worked example, the
+> corrected passages are the interesting ones: Task 1's two-tier precedence,
+> Task 4's guard test, Task 6's fail-closed grant probe, Task 7's reuse of
+> `strip_to_grants` and where the strip must land, and Task 9's currency guard.
+
 **Goal:** Replace the silent 403 that permanently bricks a session whose connector, project, or grant disappeared with a dialog listing everything that drifted and a "resume without them" acknowledgment.
 
 **Architecture:** The policy layer gains per-item *reporting* entry points; today's raising functions become thin wrappers over them, so the rules keep exactly one implementation. A new `collect_config_drift()` composes those reports across three families (connectors, projects, grants). `POST /resume` returns **428** carrying the drift list; the client re-POSTs with `acknowledge`, which is stored in `metadata.config_drift_ack` and honored at attach — the stored config is never rewritten.
 
 **Tech Stack:** Python 3.12 (CI gate) / FastAPI / asyncpg / pytest + pytest-asyncio; Angular + signals / vitest / transloco.
 
-**Spec:** `docs/features/session_config_drift_resume.md` (commit `03f9aefd`)
+**Spec:** `docs/done/session_config_drift_resume.md` (commit `03f9aefd`)
 
 ## Global Constraints
 
@@ -940,7 +951,7 @@ Create `orchestrator/services/config_drift.py`:
 
 Deliberately free of FastAPI and of policy decisions: callers hand in verdicts
 already produced by the code that *enforces* them, so this module can never
-drift from the enforcer. See docs/features/session_config_drift_resume.md.
+drift from the enforcer. See docs/done/session_config_drift_resume.md.
 """
 
 from __future__ import annotations
@@ -1106,7 +1117,7 @@ Create `orchestrator/database/migrations/app/0115_datasource_tombstones.sql`:
 ```sql
 -- Deleted connectors leave a name behind so a session that still references
 -- one can say WHICH connector vanished. Append-only; never joined in a hot
--- path. See docs/features/session_config_drift_resume.md §5.1.
+-- path. See docs/done/session_config_drift_resume.md §5.1.
 CREATE TABLE IF NOT EXISTS datasource_tombstones (
     id          UUID PRIMARY KEY,
     name        TEXT NOT NULL,
@@ -2614,7 +2625,7 @@ Expected: the throwaway connector's name is present, and the new session resumes
 
 - [ ] **Step 7: Record the outcome**
 
-Append a "Live gate" section to `docs/features/session_config_drift_resume.md` recording the date, what passed, and anything that did not. Commit.
+Append a "Live gate" section to `docs/done/session_config_drift_resume.md` recording the date, what passed, and anything that did not. Commit.
 
 ---
 
