@@ -36,6 +36,7 @@ import {
     shouldPin,
     shouldSendOnEnter,
     textSizeToCss,
+    uploadStageKey,
 } from './persistent-chat.component';
 import {AssistantTurn, MIN_FOLD_RUN, Turn, UserTurn} from '../../core/models/turn.model';
 
@@ -147,6 +148,20 @@ describe('canSendMessage', () => {
 
     it('never sends while composing is blocked, regardless of content', () => {
         expect(canSendMessage(false, 'hello', 1)).toBe(false);
+    });
+});
+
+describe('uploadStageKey', () => {
+    it('reports per-file progress while files remain', () => {
+        expect(uploadStageKey({done: 1, total: 3, allDone: false})).toBe('chat.upload.stage');
+    });
+
+    it('switches to sending once every file has landed', () => {
+        expect(uploadStageKey({done: 3, total: 3, allDone: true})).toBe('chat.upload.sending');
+    });
+
+    it('reports nothing for an item with no files', () => {
+        expect(uploadStageKey(null)).toBeNull();
     });
 });
 
