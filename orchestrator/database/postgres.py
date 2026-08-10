@@ -1670,6 +1670,8 @@ class PostgresDB:
         error_message: str | None = None,
         freeze_data: Dict[str, Any] | None = None,
         error_details: Dict[str, Any] | None = None,
+        *,
+        stash_and_clear_freeze: bool = False,
     ) -> bool:
         """Update job status fields.
 
@@ -1678,9 +1680,13 @@ class PostgresDB:
             status: New job status
             assigned_agent_id: Agent ID if being assigned
             error_message: Error message if failed
-            freeze_data: Freeze metadata dict (for waiting_for_reply, pending_review)
+            freeze_data: Freeze metadata dict (for waiting_for_reply and
+                pending_review), or the exact payload to stash when
+                ``stash_and_clear_freeze`` is true
             error_details: Structured agent error (classification/model/reset_at)
                 persisted alongside a failure so heal-path re-reads see it
+            stash_and_clear_freeze: Move the supplied ``freeze_data`` payload to
+                ``context.last_freeze_data`` and clear the column in this UPDATE.
 
         Returns:
             True if updated, False if not found
@@ -1694,6 +1700,7 @@ class PostgresDB:
         updates = []
         values = []
         param_count = 0
+        stash_freeze_param: int | None = None
 
         if status is not None:
             param_count += 1
@@ -1712,16 +1719,20 @@ class PostgresDB:
 
         if freeze_data is not None:
             param_count += 1
-            updates.append(f"freeze_data = ${param_count}::jsonb")
+            if stash_and_clear_freeze:
+                stash_freeze_param = param_count
+            else:
+                updates.append(f"freeze_data = ${param_count}::jsonb")
             values.append(json.dumps(freeze_data))
+        elif stash_and_clear_freeze:
+            raise ValueError(
+                "stash_and_clear_freeze requires the exact freeze_data payload"
+            )
 
         if error_details is not None:
             param_count += 1
             updates.append(f"error_details = ${param_count}::jsonb")
             values.append(json.dumps(error_details))
-
-        if not updates:
-            return False
 
         # Stamp the failure time on the transition INTO 'failed'. updated_at
         # cannot serve this: the update_jobs_updated_at trigger also fires on
@@ -1731,6 +1742,31 @@ class PostgresDB:
         # docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 4)
         if status == "failed":
             updates.append("failed_at = COALESCE(failed_at, CURRENT_TIMESTAMP)")
+
+        # Class-A completion disposition fields all belong to the same jobs-row
+        # UPDATE as status. Keeping completed_at here prevents a durable
+        # completed/NULL split, while the stash-and-clear pair prevents a
+        # paused job from ever existing with the freeze in both locations (the
+        # dispatchable partial index requires freeze_data IS NULL).
+        if status == "completed":
+            updates.append("completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)")
+
+        if stash_and_clear_freeze:
+            if stash_freeze_param is None:
+                raise ValueError(
+                    "stash_and_clear_freeze requires the exact freeze_data payload"
+                )
+            updates.extend(
+                [
+                    "context = COALESCE(context, '{}'::jsonb) || "
+                    f"jsonb_build_object('last_freeze_data', "
+                    f"${stash_freeze_param}::jsonb)",
+                    "freeze_data = NULL",
+                ]
+            )
+
+        if not updates:
+            return False
 
         updates.append("updated_at = CURRENT_TIMESTAMP")
         param_count += 1

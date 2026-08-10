@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncpg
 import pytest
 
 # Add project root to path
@@ -497,6 +498,69 @@ class TestVerificationTriggerGuards:
         await main._trigger_verification_on_complete(job, result, actions)
 
         create_job_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_index_loser_skips_critic_side_effects(self, monkeypatch):
+        """The unique index, not the optimistic live-critic read, owns races."""
+        from orchestrator import main
+
+        violation = asyncpg.UniqueViolationError("duplicate critic round")
+        violation.constraint_name = "jobs_verification_uniq"
+        create_job_mock = AsyncMock(side_effect=violation)
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
+        trigger_dispatch = MagicMock()
+        monkeypatch.setattr(main, "_trigger_dispatch", trigger_dispatch)
+
+        job = self._passing_job()
+        actions: list[str] = []
+        await main._trigger_verification_on_complete(
+            job, self._passing_result(), actions
+        )
+
+        create_job_mock.assert_awaited_once()
+        trigger_dispatch.assert_not_called()
+        assert actions == [
+            f"critic round 0 already exists for {job['id']} — spawn skipped"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unrelated_unique_violation_still_raises(self, monkeypatch):
+        """Only the exact critic-index loser is a successful dedupe."""
+        from orchestrator import main
+
+        violation = asyncpg.UniqueViolationError("other duplicate")
+        violation.constraint_name = "some_other_unique_index"
+        monkeypatch.setattr(
+            main.postgres_db,
+            "create_job",
+            AsyncMock(side_effect=violation),
+        )
+        monkeypatch.setattr(
+            main,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
+
+        with pytest.raises(asyncpg.UniqueViolationError) as exc_info:
+            await main._trigger_verification_on_complete(
+                self._passing_job(), self._passing_result(), []
+            )
+        assert exc_info.value.constraint_name == "some_other_unique_index"
 
 
 class TestVerificationTriggerIntegration:

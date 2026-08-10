@@ -662,9 +662,12 @@ no undo. Compensations must themselves be idempotent and run in reverse order.
 
 ##### The critic index, in full
 
-Shipping first and alone (migration 0130), because it fixes a live correctness
-hole — the duplicate-critic race can drop a blocking finding and produce an
-unwarranted approval — and needs none of the protocol above.
+Shipping first and alone (migrations 0130–0132), because it fixes a live
+correctness hole — the duplicate-critic race can drop a blocking finding and
+produce an unwarranted approval — and needs none of the protocol above. Three
+files are required by the runner's one-statement `.notx.sql` contract: a
+transactional dedupe, a concurrent same-name-shell drop, and the concurrent
+build itself.
 
 **Decided 2026-08-09: one critic per round, ever — the predicate does not
 reference `status`.** A round's slot is never freed for a re-spawn. This matches
@@ -724,18 +727,34 @@ back a named constraint, keeps `ON CONFLICT` simple, preserves HOT on status
 churn, and sidesteps the slower concurrent-build path that partial+expression
 indexes opt into. Prefer it unless there is a reason not to.
 
+**Implemented choice:** keep the exact partial expression index above. No caller
+needs a named constraint, and changing every `jobs` row merely to simplify a
+single conflict target would broaden the schema for no benefit. The critic
+writer keeps its ordinary INSERT and handles only a `23505` whose named index is
+`jobs_verification_uniq`; unrelated uniqueness failures still propagate. Thus
+there is no `ON CONFLICT` inference clause to drift from the predicate.
+
 **Build safely, and dedupe first.** A failed `CREATE UNIQUE INDEX CONCURRENTLY`
 leaves an INVALID index that is *ignored for queries but still enforces
 uniqueness* — no benefit, live write rejections. A unique index cannot be added
 `NOT VALID`, so pre-existing duplicates must be resolved in an **earlier**
-migration (transition losers to `cancelled`, which removes them from the
-predicate without deleting history). k3d currently has 7 critics with zero
-duplicates and zero missing round keys, which is far too little data to say
-anything about production — the pre-flight query is mandatory regardless. And
+migration. **Correction at implementation:** status is deliberately absent from
+the final predicate, so cancellation alone cannot remove a loser. Migration
+0130 cancels and unassigns the loser, archives its original round and chosen
+winner under `context.verification_dedupe`, then removes only the loser's
+`verification_round` key. The critic identity and row history remain; the loser
+leaves the exact index predicate. The mandatory pre-flight found 138 indexed
+candidates / 138 keys and zero duplicate groups in the production workload;
+k3d had 7 / 7 and zero duplicates. And
 **`CREATE … IF NOT EXISTS` must not be the `.notx.sql` idempotency mechanism**:
 it succeeds against a leftover INVALID index and records the migration green
 while the index is permanently unusable and permanently rejecting writes. Check
-`pg_index.indisvalid` explicitly and drop-then-recreate.
+`pg_index.indisvalid` explicitly and drop-then-recreate. The registered 0132
+runner recovery does exactly that: it verifies the catalog shape, executes
+0131's concurrent drop for an INVALID or unexpected shell, replays the
+replay-safe 0130 dedupe, executes the immutable 0132 bytes, and records success
+only after the rebuilt index is unique, valid, ready, live, and exact. The
+CREATE deliberately has no `IF NOT EXISTS`.
 
 **(5) The fence replaces the status guard, and is strictly stronger.** Today's
 early return keys on a status the handler is itself about to change, which is why
@@ -882,12 +901,12 @@ strict improvement, no dependencies), and step 4 shrinks from "move the status
 write last" to "move it after Class B and the delivery effects only". The
 window that (6)'s liveness machinery has to defend shrinks with it.
 
-1. **0130** — the standalone fixes, all independent of the protocol and all
+1. **0130–0132** — the standalone fixes, all independent of the protocol and all
    fixing live pinned-lane bugs today: the **Class A merge** (status,
    `completed_at`, `assigned_agent_id`, freeze stash/null in one UPDATE — this
    subsumes the `COALESCE` patch and closes S19's invisibility window), and the
    critic index with its dedupe pre-flight as a separate earlier migration.
-2. **0131** — the command and effect tables, `jobs.completion_seq_hwm`, the
+2. **0133+** — the command and effect tables, `jobs.completion_seq_hwm`, the
    leader lease row, and the sweep predicate view. Dead schema; zero behaviour
    change.
 3. Accept writes the command for **both** lanes; the finalizer runs **inline**
@@ -1376,16 +1395,23 @@ wall-clock-first with a 300 s floor, correctly placed at both phase and
 mid-phase boundaries, and it clears its whole arming envelope in the same
 checkpoint as the freeze so a resumed job cannot immediately re-freeze.
 
-*Gate 3 — designed 2026-08-09, not built (§5.4.5).* Two independent audits
-reached the same conclusion: there is no assigned-agent completion CAS to re-key,
-and adding a token check around today's completion route would still permit
-steal-during-handler mutations, because that route is 1046 lines with 29 database
-awaits, no explicit transaction, and external effects with no rollback. The
-design is now settled to DDL: a `job_completion_commands` table modelled on the
-control inbox (0119), identity/fence/order separated, a finalizer speaking
-`run_queue`'s retry dialect, three classes of per-effect key, and a six-step
-rollout whose first step is two standalone fixes for live pinned-lane bugs.
-Implementation has not started; migrations begin at 0130.
+*Gate 3 — step 1 built 2026-08-10; protocol not built (§5.4.5).* The two
+standalone pinned-lane fixes now ship in isolation. `/complete` writes status,
+the first `completed_at`, paused-agent release and any auto-redispatch freeze
+stash/null as one jobs-row UPDATE. Migrations 0130–0132 dedupe historical
+critic keys, explicitly remove any valid/INVALID same-name shell, and build the
+exact immutable one-critic-per-round index concurrently. The production
+pre-flight found **138 candidates / 138 keys and zero duplicate groups**, so
+there is no durable evidence that S30 fired there; it did find **one of 382
+completed jobs with `completed_at IS NULL`**, confirming S21 fired. The command
+table, polymorphic effects table, finalizer and every completion-protocol change
+remain unbuilt and begin at 0133+.
+
+The checksummed 0131/0132 SQL headers retain their initial manual-repair
+runbook because those bytes were applied before automatic recovery was added.
+They are historical only: `orchestrator/database/migration_recovery.py` and the
+database migration runbook are the status of record for a standard dirty-0132
+retry; no ledger-row surgery is required.
 
 **Everything downstream of Gate 3 is blocked**: the worker driver, TodoManager
 hydration on any resume, conditional tmux kill, generator-close discipline,

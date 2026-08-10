@@ -16053,6 +16053,22 @@ async def _trigger_verification_on_complete(
                 [project_id] if critic_owner_id and project_id else []
             ),
         )
+    except asyncpg.UniqueViolationError as exc:
+        # The optimistic has_live_verification_critic read is intentionally
+        # not the authority: two completions can pass it concurrently. The
+        # immutable partial index owns that race. Handle only its named loser;
+        # an unrelated create_job uniqueness failure is still a real error.
+        if getattr(exc, "constraint_name", None) != "jobs_verification_uniq":
+            raise
+        logger.info(
+            "Critic skipped for job %s: round %d already has a critic",
+            job_id,
+            len(rounds),
+        )
+        actions.append(
+            f"critic round {len(rounds)} already exists for {job_id} — spawn skipped"
+        )
+        return
     except DatasourcePolicyConflictError:
         reason = (
             "Verification could not start because the target's connector "
@@ -18258,6 +18274,10 @@ async def complete_job(
 
         if new_status:
             kwargs: dict[str, Any] = {"status": new_status}
+            had_assigned_agent = False
+            fd_row: dict[str, Any] | None = None
+            stash_and_clear_freeze = False
+
             if error_message:
                 kwargs["error_message"] = error_message
             # Persist the agent's structured error alongside the failure so the
@@ -18267,6 +18287,33 @@ async def complete_job(
             # without the other. docs/issues/loop_advances_into_active_model_cooldown.md
             if new_status == "failed" and isinstance(result.get("error"), dict):
                 kwargs["error_details"] = result["error"]
+
+            # Class A: every field that defines this jobs-row disposition rides
+            # one UPDATE. ``None`` means "omit" to update_job_status, so the
+            # established empty-string sentinel is required to clear the agent.
+            if new_status == "paused":
+                had_assigned_agent = bool(job.get("assigned_agent_id"))
+                kwargs["assigned_agent_id"] = ""
+
+                raw_fd = job.get("freeze_data")
+                if isinstance(raw_fd, str):
+                    try:
+                        raw_fd = json.loads(raw_fd)
+                    except (json.JSONDecodeError, ValueError):
+                        raw_fd = None
+                if isinstance(raw_fd, dict):
+                    fd_row = raw_fd
+                    from src.shared.job_freeze_types import (
+                        AUTO_REDISPATCH_FREEZE_TYPES,
+                    )
+
+                    stash_and_clear_freeze = (
+                        fd_row.get("freeze_type") in AUTO_REDISPATCH_FREEZE_TYPES
+                    )
+                    if stash_and_clear_freeze:
+                        kwargs["stash_and_clear_freeze"] = True
+                        kwargs["freeze_data"] = fd_row
+
             await postgres_db.update_job_status(job_id, **kwargs)
             actions.append(f"status -> {new_status}")
             logger.info(f"Job {job_id} status set to '{new_status}'")
@@ -18277,18 +18324,10 @@ async def complete_job(
             # attached — and the dispatcher only picks up paused jobs with
             # assigned_agent_id IS NULL, so without this clear they wedge until
             # gc_offline_agents' 24h FK cascade frees them.
-            if new_status == "paused" and job.get("assigned_agent_id"):
-                try:
-                    async with postgres_db.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE jobs SET assigned_agent_id = NULL "
-                            "WHERE id = $1::uuid",
-                            job_id,
-                        )
-                    job["assigned_agent_id"] = None
+            if new_status == "paused":
+                job["assigned_agent_id"] = None
+                if had_assigned_agent:
                     actions.append("cleared agent on paused job (re-dispatchable)")
-                except Exception as e:
-                    logger.warning(f"Failed to clear agent on paused job {job_id}: {e}")
 
             # Auto-redispatch pauses must ALSO shed the row-level freeze blob:
             # get_dispatchable_jobs requires ``freeze_data IS NULL`` (partial
@@ -18297,94 +18336,54 @@ async def complete_job(
             # resume state itself lives in the checkpoint + pushed branch, not
             # here. Pauses awaiting explicit action (vm_upgrade_required,
             # user-feedback freezes) keep their freeze_data untouched.
-            if new_status == "paused":
-                from src.shared.job_freeze_types import (
-                    AUTO_REDISPATCH_FREEZE_TYPES,
-                )
+            if new_status == "paused" and stash_and_clear_freeze:
+                job["freeze_data"] = None
+                actions.append("freeze stashed to context (auto-redispatch)")
 
-                fd_row = job.get("freeze_data")
-                if isinstance(fd_row, str):
-                    try:
-                        fd_row = json.loads(fd_row)
-                    except (json.JSONDecodeError, ValueError):
-                        fd_row = None
-                if (
-                    isinstance(fd_row, dict)
-                    and fd_row.get("freeze_type") in AUTO_REDISPATCH_FREEZE_TYPES
-                ):
-                    try:
-                        await postgres_db.merge_job_context(
-                            job_id, {"last_freeze_data": fd_row}
-                        )
-                        async with postgres_db.acquire() as conn:
-                            await conn.execute(
-                                "UPDATE jobs SET freeze_data = NULL "
-                                "WHERE id = $1::uuid",
-                                job_id,
-                            )
-                        job["freeze_data"] = None
-                        actions.append("freeze stashed to context (auto-redispatch)")
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to stash/clear freeze on paused job {job_id}: {e}"
-                        )
-
-                    # Progress-aware drain backstop (defense-in-depth for the
-                    # version_upgrade drain livelock,
-                    # docs/issues/version_upgrade_drain_livelock.md). Detects a
-                    # re-dispatch loop that is NOT advancing (freeze phase_number
-                    # stuck) and alerts, rather than letting it churn invisibly.
-                    # Pure decision in services.completion; I/O stays here.
-                    try:
-                        from services.completion import auto_continue_drain_update
-
-                        ctx = job.get("context") or {}
-                        if isinstance(ctx, str):
-                            ctx = json.loads(ctx)
-                        cap = int(os.environ.get("AUTO_CONTINUE_DRAIN_ALERT_CAP", "10"))
-                        drains, last_phase, should_alert = auto_continue_drain_update(
-                            ctx or {}, fd_row, cap=cap
-                        )
-                        await postgres_db.merge_job_context(
-                            job_id,
-                            {
-                                "auto_continue_drains": drains,
-                                "auto_continue_last_phase": last_phase,
-                            },
-                        )
-                        if should_alert:
-                            logger.error(
-                                f"Job {job_id}: {drains} consecutive "
-                                f"{fd_row.get('freeze_type')} re-dispatches with NO "
-                                f"phase progress (stuck at phase {last_phase}) — the "
-                                f"agent-side resume-clear may be failing; alerting "
-                                f"operator."
-                            )
-                            try:
-                                await _notify_operator_freeze(
-                                    job, job_id, fd_row.get("freeze_type"), fd_row
-                                )
-                            except Exception as _ne:
-                                logger.warning(
-                                    f"Failed to alert on drain-stall for "
-                                    f"{job_id}: {_ne}"
-                                )
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to update auto-continue drain counter for "
-                            f"{job_id}: {e}"
-                        )
-
-            # Set completed_at for terminal statuses
-            if new_status == "completed":
+                # Progress-aware drain backstop (defense-in-depth for the
+                # version_upgrade drain livelock,
+                # docs/issues/version_upgrade_drain_livelock.md). Detects a
+                # re-dispatch loop that is NOT advancing (freeze phase_number
+                # stuck) and alerts, rather than letting it churn invisibly.
+                # Pure decision in services.completion; I/O stays here.
                 try:
-                    async with postgres_db.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE jobs SET completed_at = NOW() WHERE id = $1::uuid",
-                            job_id,
+                    from services.completion import auto_continue_drain_update
+
+                    ctx = job.get("context") or {}
+                    if isinstance(ctx, str):
+                        ctx = json.loads(ctx)
+                    cap = int(os.environ.get("AUTO_CONTINUE_DRAIN_ALERT_CAP", "10"))
+                    drains, last_phase, should_alert = auto_continue_drain_update(
+                        ctx or {}, fd_row, cap=cap
+                    )
+                    await postgres_db.merge_job_context(
+                        job_id,
+                        {
+                            "auto_continue_drains": drains,
+                            "auto_continue_last_phase": last_phase,
+                        },
+                    )
+                    if should_alert:
+                        logger.error(
+                            f"Job {job_id}: {drains} consecutive "
+                            f"{fd_row.get('freeze_type')} re-dispatches with NO "
+                            f"phase progress (stuck at phase {last_phase}) — the "
+                            f"agent-side resume-clear may be failing; alerting "
+                            f"operator."
                         )
+                        try:
+                            await _notify_operator_freeze(
+                                job, job_id, fd_row.get("freeze_type"), fd_row
+                            )
+                        except Exception as _ne:
+                            logger.warning(
+                                f"Failed to alert on drain-stall for {job_id}: {_ne}"
+                            )
                 except Exception as e:
-                    logger.warning(f"Failed to set completed_at for {job_id}: {e}")
+                    logger.warning(
+                        f"Failed to update auto-continue drain counter for "
+                        f"{job_id}: {e}"
+                    )
 
             # Update job dict with new status for downstream checks
             job["status"] = new_status
@@ -19789,12 +19788,6 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     await postgres_db.update_job_cloud_diff(job_id, diff_status="accepted")
     await postgres_db.update_job_merge_status(job_id, merge_status="cloud-applied")
     await postgres_db.update_job_status(job_id, status="completed")
-    async with postgres_db.acquire() as conn:
-        await conn.execute(
-            "UPDATE jobs SET completed_at = COALESCE(completed_at, NOW()) "
-            "WHERE id = $1::uuid",
-            job_id,
-        )
     delivery = {
         "delivery_status": "cloud-applied",
         "needs_review": False,
@@ -19887,12 +19880,6 @@ async def reject_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     await postgres_db.update_job_cloud_diff(job_id, diff_status="rejected")
     await postgres_db.update_job_merge_status(job_id, merge_status="cloud-rejected")
     await postgres_db.update_job_status(job_id, status="completed")
-    async with postgres_db.acquire() as conn:
-        await conn.execute(
-            "UPDATE jobs SET completed_at = COALESCE(completed_at, NOW()) "
-            "WHERE id = $1::uuid",
-            job_id,
-        )
     delivery = {
         "delivery_status": "cloud-rejected",
         "needs_review": False,

@@ -56,6 +56,13 @@ excluded_rules = [
 #                CONCURRENTLY — which cannot run in a transaction — can't live in
 #                it anyway, and it is already applied on develop; the runner's
 #                checksum guard forbids editing it in place.
+#        - app/0132: the exact settled critic index intentionally omits IF NOT
+#                EXISTS. A failed concurrent build leaves an INVALID shell, so
+#                treating that shell as success would make the guard both
+#                unusable and write-rejecting. Migration 0131 performs the
+#                same-name concurrent drop first; the applied 0132 checksum is
+#                immutable, so this intentional prefer-robust-stmts exception
+#                belongs here rather than in the SQL file.
 excluded_paths = [
     "orchestrator/database/migrations/app/0001_initial.sql",
     "orchestrator/database/migrations/vector/0001_initial.sql",
@@ -63,5 +70,6 @@ excluded_paths = [
     "orchestrator/database/migrations/app/0006_headless_notifications.sql",
     "orchestrator/database/migrations/app/0008_thread_awaiting_user.sql",
     "orchestrator/database/migrations/app/0058_canvases.sql",
+    "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql",
     "orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]

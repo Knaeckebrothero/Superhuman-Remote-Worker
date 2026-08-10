@@ -10633,6 +10633,13 @@ CREATE INDEX jobs_lease_expiry_idx ON public.jobs USING btree (lease_expires_at)
 
 
 --
+-- Name: jobs_verification_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX jobs_verification_uniq ON public.jobs USING btree (parent_job_id, ((context ->> 'verification_round'::text))) WHERE (((context ->> 'verification_target'::text) IS NOT NULL) AND jsonb_exists(context, 'verification_round'::text));
+
+
+--
 -- Name: legacy_workspace_cutover_plans_pending_idx; Type: INDEX; Schema: public; Owner: -
 --
 
