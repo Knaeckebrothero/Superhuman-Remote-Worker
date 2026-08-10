@@ -62,7 +62,7 @@ import {ChatPreferencesService, type ChatTextSize, type ReadingWidth} from '../.
 import {DeviceCapabilitiesService} from '../../core/services/device-capabilities.service';
 import {VoiceCapabilitiesService} from '../../core/services/voice-capabilities.service';
 import {VoiceRecordingService} from '../../core/services/voice-recording.service';
-import {FilePreview, FileType} from '../../core/models/file.model';
+import {FilePreview, FilePreviewResult, FileType, RejectedFile} from '../../core/models/file.model';
 import {RecordingConfig} from '../../core/models/recording.model';
 import {environment} from '../../core/environment';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
@@ -636,6 +636,25 @@ export function extractClipboardFiles(
         }
     }
     return files;
+}
+
+/**
+ * Turn a createFilePreviews() rejection list into a single translation key +
+ * params for the composer's `chat.attachmentError` banner. Only one message
+ * can show at a time, so when a selection trips both reasons at once the
+ * size rejection wins: a file that silently exceeded the byte cap is more
+ * surprising than one dropped for the (generous, 20-file) composer count
+ * cap, and the count message doesn't need a filename anyway. Pure so it's
+ * unit-testable without mounting PersistentChatComponent (NG0951).
+ */
+export function describeAttachmentRejection(
+    rejected: readonly RejectedFile[],
+): {key: string; params?: Record<string, unknown>} | null {
+    if (rejected.length === 0) return null;
+    const oversized = rejected.find((r) => r.reason === 'size');
+    return oversized
+        ? {key: 'chat.upload.tooLarge', params: {name: oversized.name}}
+        : {key: 'chat.upload.tooManyFiles'};
 }
 
 /**
@@ -3115,12 +3134,29 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
     }
 
+    /**
+     * Queue accepted previews and surface a rejection (if any) in the
+     * composer's error banner. Centralizes what all four attach entry points
+     * (file picker, paste, camera, drop) do with a createFilePreviews()
+     * result, including an ordering that matters: addAttachments() always
+     * clears attachmentError (see persistent-chat.service.ts), so the
+     * rejection must be set AFTER queuing previews, not before, or a
+     * selection that both accepts some files and rejects others would have
+     * its error wiped the instant it's set.
+     */
+    private applyFilePreviews({previews, rejected}: FilePreviewResult): void {
+        this.chat.addAttachments(previews);
+        const rejection = describeAttachmentRejection(rejected);
+        if (rejection) {
+            this.chat.attachmentError.set(this.transloco.translate(rejection.key, rejection.params));
+        }
+    }
+
     /** Handler for both `<input type=file>` (file picker and mobile camera). */
     async onFilesSelected(event: Event): Promise<void> {
         const input = event.target as HTMLInputElement;
         if (!input.files || input.files.length === 0) return;
-        const previews = await this.fileHandling.createFilePreviews(Array.from(input.files));
-        this.chat.addAttachments(previews);
+        this.applyFilePreviews(await this.fileHandling.createFilePreviews(Array.from(input.files)));
         // Allow re-selecting the same file later.
         input.value = '';
     }
@@ -3136,8 +3172,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         const files = extractClipboardFiles(event.clipboardData?.items, Date.now());
         if (files.length === 0) return; // text paste — let the default run
         event.preventDefault();
-        const previews = await this.fileHandling.createFilePreviews(files);
-        if (previews.length > 0) this.chat.addAttachments(previews);
+        this.applyFilePreviews(await this.fileHandling.createFilePreviews(files));
     }
 
     /** Drop one queued attachment. */
@@ -3301,8 +3336,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
                             type: 'image/jpeg',
                             lastModified: Date.now(),
                         });
-                        const previews = await this.fileHandling.createFilePreviews([file]);
-                        this.chat.addAttachments(previews);
+                        this.applyFilePreviews(await this.fileHandling.createFilePreviews([file]));
                     }
                     cleanup();
                 },
@@ -3366,8 +3400,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // disconnected, the upload would fail anyway.
         if (!this.chat.isConnected()) return;
 
-        const previews = await this.fileHandling.createFilePreviews(Array.from(files));
-        if (previews.length > 0) this.chat.addAttachments(previews);
+        this.applyFilePreviews(await this.fileHandling.createFilePreviews(Array.from(files)));
     }
 
     onInputChange(value: string): void {
