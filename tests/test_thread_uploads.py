@@ -1068,9 +1068,13 @@ class _FakeSftpFile:
 
 class _FakeSftpAttrs:
     """paramiko ``SFTPAttributes`` stand-in — ``st_mode`` plus, for
-    ``listdir_attr`` results, the entry's own ``filename``."""
+    ``listdir_attr`` results, the entry's own ``filename``.
 
-    def __init__(self, st_mode: int, filename: str = ""):
+    ``st_mode`` is ``int | None`` because paramiko's is: the permissions flag
+    is optional in the SFTP protocol and a server may simply not send it.
+    """
+
+    def __init__(self, st_mode: int | None, filename: str = ""):
         self.st_mode = st_mode
         self.filename = filename
 
@@ -1163,18 +1167,46 @@ class _FakeSftp:
         pass
 
 
-@pytest.fixture
-def sftp_env(monkeypatch):
-    """Patch paramiko.SSHClient so _sftp_write_files runs against a fake
-    in-memory SFTP filesystem instead of a real connection."""
+class _ModelessSftp(_FakeSftp):
+    """A server that omits ``SSH_FILEXFER_ATTR_PERMISSIONS``.
+
+    Entirely legal: the permissions flag is optional in the SFTP protocol, and
+    paramiko surfaces its absence as ``SFTPAttributes.st_mode is None``.
+    Nothing else changes — the filesystem, and in particular the faithful
+    parent-symlink resolution that makes the escape real, is inherited — so
+    the *only* variable between this and ``_FakeSftp`` is the missing mode.
+    """
+
+    def lstat(self, path: str) -> _FakeSftpAttrs:
+        attrs = super().lstat(path)  # still raises when the path is absent
+        attrs.st_mode = None
+        return attrs
+
+
+def _patch_sshclient(monkeypatch, fake_sftp) -> None:
     import paramiko
 
     from unittest.mock import MagicMock
 
-    fake_sftp = _FakeSftp()
     mock_ssh = MagicMock()
     mock_ssh.open_sftp.return_value = fake_sftp
     monkeypatch.setattr(paramiko, "SSHClient", MagicMock(return_value=mock_ssh))
+
+
+@pytest.fixture
+def sftp_env(monkeypatch):
+    """Patch paramiko.SSHClient so _sftp_write_files runs against a fake
+    in-memory SFTP filesystem instead of a real connection."""
+    fake_sftp = _FakeSftp()
+    _patch_sshclient(monkeypatch, fake_sftp)
+    return fake_sftp
+
+
+@pytest.fixture
+def modeless_sftp_env(monkeypatch):
+    """``sftp_env``, but the server never reports a file's mode."""
+    fake_sftp = _ModelessSftp()
+    _patch_sshclient(monkeypatch, fake_sftp)
     return fake_sftp
 
 
@@ -1393,6 +1425,44 @@ class TestSftpDelete:
         assert err.value.status_code == 409
         assert sftp_env.files["/home/agent-host/.bashrc"] == b"export PATH=..."
 
+    def test_a_server_that_reports_no_mode_cannot_walk_the_symlink(
+        self, modeless_sftp_env
+    ):
+        """The guard must fail CLOSED on an unknown file type.
+
+        ``SSH_FILEXFER_ATTR_PERMISSIONS`` is optional in the SFTP protocol, so
+        ``st_mode`` is legitimately ``None`` against a server that omits it.
+        The original ``attrs.st_mode or 0`` turned that into ``0``, and
+        ``S_ISLNK(0)`` is False — so this exact scenario (the same planted
+        ``uploads/escape -> ~/.ssh`` as the test above) walked straight past
+        the symlink check and deleted ``authorized_keys``. Demonstrated, not
+        inferred: revert ``_entry_mode`` to ``or 0`` and both assertions below
+        flip together.
+        """
+        self._seed(modeless_sftp_env, "/home/agent-host/.ssh")
+        modeless_sftp_env.files[self.KEYS] = b"ssh-ed25519 AAAA"
+        modeless_sftp_env.symlinks[f"{self.UPLOADS_DIR}/escape"] = (
+            "/home/agent-host/.ssh"
+        )
+
+        with pytest.raises(ThreadUploadError) as err:
+            _sftp_delete_file(_ssh_target(), "escape/authorized_keys")
+
+        assert err.value.status_code == 409
+        assert modeless_sftp_env.files[self.KEYS] == b"ssh-ed25519 AAAA"
+
+    def test_a_mode_less_ordinary_delete_is_refused_too(self, modeless_sftp_env):
+        """No escape attempt at all — just a server that reports no
+        permissions. Refusing costs one honest 409; guessing costs the guard."""
+        self._seed(modeless_sftp_env)
+        modeless_sftp_env.files[f"{self.UPLOADS_DIR}/report.pdf"] = b"bytes"
+
+        with pytest.raises(ThreadUploadError) as err:
+            _sftp_delete_file(_ssh_target(), "report.pdf")
+
+        assert err.value.status_code == 409
+        assert modeless_sftp_env.files[f"{self.UPLOADS_DIR}/report.pdf"] == b"bytes"
+
     def test_an_unreachable_workspace_is_a_502(self, sftp_env, monkeypatch):
         """Same taxonomy the writer uses — connect failure is 502, not a
         500 traceback."""
@@ -1566,6 +1636,26 @@ class TestDeleteRoutingAndTaxonomy:
         assert seen["relpath"] == "bundle/a.txt"
 
     @pytest.mark.asyncio
+    async def test_the_normalized_path_is_what_the_caller_gets_back(self, monkeypatch):
+        """The route interpolates this straight into its 200 body. Echoing
+        the caller's raw string instead reported ``bundle/sub/../a.txt`` as
+        deleted while ``bundle/a.txt`` was the file that actually went."""
+        from services import thread_uploads
+
+        monkeypatch.setattr(
+            thread_uploads, "_virtual_delete_file", lambda target, relpath: True
+        )
+
+        assert (
+            await delete_file_from_thread_workspace(
+                _thread(backend="virtual"),
+                "bundle/sub/../a.txt",
+                destination=_VirtualTarget(spec=SPEC, prefix=PREFIX),
+            )
+            == "bundle/a.txt"
+        )
+
+    @pytest.mark.asyncio
     async def test_a_virtual_thread_routes_to_the_object_store_deleter(
         self, virtual_env, monkeypatch
     ):
@@ -1583,7 +1673,7 @@ class TestDeleteRoutingAndTaxonomy:
             await delete_file_from_thread_workspace(
                 _bound_virtual_thread(), "report.pdf"
             )
-            is True
+            == "report.pdf"
         )
         assert isinstance(seen["target"], _VirtualTarget)
         assert seen["target"].prefix == PREFIX
@@ -1604,7 +1694,7 @@ class TestDeleteRoutingAndTaxonomy:
             await delete_file_from_thread_workspace(
                 _thread(), "report.pdf", destination=_ssh_target()
             )
-            is False
+            is None
         )
         assert isinstance(seen["target"], _SshTarget)
 
