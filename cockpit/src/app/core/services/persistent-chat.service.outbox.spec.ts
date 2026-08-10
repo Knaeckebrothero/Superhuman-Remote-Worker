@@ -937,6 +937,26 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             expect(requests[0].aborted).toBe(true);
         });
 
+        it('a reconnect to the SAME thread keeps the chips and the upload', async () => {
+            // The cold path also runs for the current thread when history has
+            // not loaded — a failed connect the user retries. Treating that as
+            // a thread switch would take their staged attachments away AND
+            // delete the bytes, over a transient reconnect. Losing staged work
+            // is worse than the leak the clear exists to close.
+            const ctx = await readySession('t1');
+            const {fn, requests} = abortableUpload();
+            ctx.mockApi.uploadOneToThread = fn;
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            requests[0].settle(); // it even landed — a discard would DELETE it
+            ctx.service.historyLoaded.set(false); // the failed-load state
+
+            await ctx.service.connect('t1'); // same thread, cold path
+
+            expect(ctx.service.pendingAttachments().map((p) => p.name)).toEqual(['a.pdf']);
+            expect(ctx.mockApi.deleteThreadUpload).not.toHaveBeenCalled();
+        });
+
         it('entering the landing draft clears the chips and the eager uploads', async () => {
             const ctx = await readySession('t1');
             const {fn, requests} = abortableUpload();

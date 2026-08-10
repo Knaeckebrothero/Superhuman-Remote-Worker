@@ -995,7 +995,8 @@ export class PersistentChatService {
         threadId: string,
         opts: { carryOutbox?: boolean } = {},
     ): Promise<void> {
-        const sameThread = this.threadId() === threadId && this.historyLoaded();
+        const previousThreadId = this.threadId();
+        const sameThread = previousThreadId === threadId && this.historyLoaded();
         this.disconnect();
         const generation = this.connectGeneration;
         this.isDraftSession.set(false);
@@ -1013,11 +1014,20 @@ export class PersistentChatService {
             // wholesale — unless we're carrying it across a create/reprovision
             // (createAndConnect), where the queued sends belong to *this* thread.
             if (!opts.carryOutbox) this.outbox.set([]);
-            // Same gate, same reason, for anything still sitting in the
-            // composer: on the carry path the chips belong to the thread being
-            // created, and on a genuine switch they must not follow the user
-            // (nor may their bytes — see _discardComposerAttachments).
-            if (!opts.carryOutbox) this._discardComposerAttachments();
+            // Same reason for anything still sitting in the composer: on a
+            // genuine switch the chips must not follow the user (nor may their
+            // bytes — see _discardComposerAttachments).
+            //
+            // Gated on the thread ID CHANGING, not on `!sameThread`. The cold
+            // path also runs for the same thread when history has not loaded —
+            // a failed connect the user retries — and discarding there would
+            // take their staged attachments away, and DELETE the bytes, over a
+            // transient reconnect. Losing staged work is worse than the leak
+            // this closes. `carryOutbox` (createAndConnect) is excluded too:
+            // there the chips belong to the thread being created.
+            if (!opts.carryOutbox && previousThreadId !== threadId) {
+                this._discardComposerAttachments();
+            }
             // Accepted-send accounting is per-thread; a carried count would
             // pin the new thread's composer on "working".
             this.pendingTurnCount.set(0);
