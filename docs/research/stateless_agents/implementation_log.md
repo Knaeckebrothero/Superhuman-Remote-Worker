@@ -2968,3 +2968,135 @@ The live interrupt proof did not exercise a real executor unwind or forced pod
 handoff, and no live pinned interrupt smoke was available. No worker admission,
 worker queue unit, job-completion path, migration 0130+ or sandbox lane was
 touched. The S2 sandbox tier gate remains **closed**.
+
+# Session 10 — Gate 3 step 1: atomic pinned disposition and critic uniqueness (2026-08-10)
+
+## Scope and Class A merge
+
+Only the two standalone pinned-lane fixes from Gate 3 step 1 were built. The
+command table, effects table, completion high-water mark, finalizer and every
+step-2 protocol path remain absent.
+
+`PostgresDB.update_job_status` now stamps
+`completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)` automatically for
+every `status='completed'` transition. The generic completion route, diff
+accept and diff reject therefore cannot commit a completed row with a NULL
+completion time; the latter two routes' redundant timestamp writes were
+removed. The other raw completed transitions already wrote status and timestamp
+in one statement.
+
+For a pause, the same helper can bind the exact parsed completion-report freeze
+payload into `context.last_freeze_data`, set `freeze_data=NULL`, clear
+`assigned_agent_id`, and write status in one UPDATE. The generic completion
+route enables that disposition only for the existing auto-redispatch freeze
+types. Explicit-action freezes such as `vm_upgrade_required` keep their column
+payload while still releasing the agent. A regression which injects failure of
+the earlier best-effort freeze persist proves that the final atomic disposition
+still stashes the exact report payload rather than a stale row value.
+
+## Immutable critic guard and real-data pre-flight
+
+The chosen schema remains the settled partial expression index rather than a
+generated stored column. No caller needs a named constraint, so changing every
+jobs row merely to simplify conflict inference would broaden the row shape for
+no benefit. The critic writer keeps its ordinary INSERT and handles only a
+`23505` naming `jobs_verification_uniq`; unrelated unique violations propagate.
+There is consequently no `ON CONFLICT` predicate which can drift from the
+index predicate.
+
+The mandatory production pre-flight examined **138 indexed critic candidates
+and 138 parent/round keys**: it found **zero duplicate groups and zero loser
+rows**, zero missing or explicit-NULL round keys, and zero NULL parents. The
+current k3d data had **7 candidates / 7 keys and zero duplicates**. The race has
+therefore not left durable duplicates in the production data examined. A
+separate Class-A pre-flight did find **one of 382 completed production jobs
+with `completed_at IS NULL`**, proving S21 had fired; it found no surviving
+paused-agent or auto-freeze dispatcher wedge. This slice fixes future
+transitions and deliberately does not invent a timestamp for that historical
+row.
+
+The migration chain is:
+
+* **0130** deterministically keeps the earliest `created_at, id` critic for a
+  key. Because status is deliberately absent from the final predicate,
+  cancellation alone cannot remove a loser. It cancels and unassigns the loser,
+  archives its original round, winner and reason under
+  `context.verification_dedupe`, and removes only the loser's
+  `verification_round` key.
+* **0131** is the single-statement concurrent drop of any valid or INVALID
+  same-name index shell.
+* **0132** is the exact settled `CREATE UNIQUE INDEX CONCURRENTLY`, with no
+  status term and no `IF NOT EXISTS`.
+
+An interrupted concurrent build exposed a second-order runner requirement. A
+successful 0131 followed by a failed 0132 would otherwise leave 0131 ledgered,
+0132 dirty and an INVALID shell; a normal retry could never advance. The runner
+now has an explicit, reviewed recovery registry instead of inferring safety
+from arbitrary SQL. For 0132 it takes a separate session try-lock across the
+physical operation, catalog verification and ledger write; a blocking advisory
+lock was rejected after a real test produced a concurrent-index virtual-XID
+deadlock. It checks `pg_index` for the exact table, access method, keys,
+predicate and unique/valid/ready/live flags, drops an INVALID or wrong-shape
+shell through 0131, replays the checksummed/replay-safe 0130, executes the
+immutable 0132 bytes, and records success only after the exact invariant holds.
+An exact healthy-but-unledgered build is safely adopted. No manual ledger-row
+deletion is part of the normal retry.
+
+The applied migration hashes are frozen at:
+
+* 0130: `5bcd766940730961c3f93019d16e6b8ada4e2eb6beed7b6c764fcfd5e158fd2e`;
+* 0131: `75d532f151dc2672862b9a688fb1bcdbf814eb7e514c8bd177210f19ede25aed`;
+* 0132: `498b6c004c2e2f7ca9808dde7d9109384409c536236e810370ce7b17ef98002e`.
+
+A lint annotation was briefly added after k3d had applied 0132. The next natural
+rollout correctly rejected the checksum drift. The annotation was removed,
+restoring the exact ledger bytes, and the intentional Squawk exception moved to
+`.squawk.toml`. The checksummed 0131/0132 headers still describe the initial
+manual repair procedure; the recovery registry and database migration runbook
+are the status of record.
+
+## Verification
+
+* Class-A and affected completion coverage passed **295 tests**; the exact
+  endpoint/writer group passed **49/49** after the final automatic-timestamp
+  change.
+* The final critic/recovery/head group passed **57 tests with 3 optional-DSN
+  skips**. Separately, **four real PostgreSQL 15 recovery tests** proved a
+  runner-created INVALID+dirty index with a post-0130 duplicate and no ledger
+  surgery, healthy exact unledgered adoption, valid wrong-shape rebuild without
+  false-green, and two-runner serialization. The earlier direct migration
+  matrix passed **6/6** on scratch PostgreSQL.
+* The app schema replay passed through **114 transactional and 18
+  non-transactional migrations**; `schema_current.sql` is current at **13,008
+  lines** and contains the exact predicate.
+* Repository-wide Ruff check passed and Ruff format check reported **1,066
+  files** formatted. Squawk 2.59 reported zero issues in the two lint-covered
+  migration files; 0132 is intentionally config-excluded and its full DDL is
+  asserted byte-for-byte. `git diff --check` passed.
+* Repository-wide pytest completed with **15,498 passed / 145 skipped / 11
+  failed in 812.27 s**. The eleven failures are exactly the standing
+  environment baseline: one unavailable localhost PostgreSQL test, seven MCP
+  transport/wiring tests, and three optional arXiv/provider tests.
+
+The final natural k3d rollout was **1/1 Ready** and health returned 200 in
+**0.970 ms**. The running source and all three migration hashes matched the
+tree. Its ledger showed 0130/0131/0132 successful in **2/0/29 ms**, no dirty
+rows, and `jobs_verification_uniq` unique/valid/ready/live with the exact keys
+and predicate. A deployed-package import mistake in the new runner was caught
+by the first live attempt; the package-relative import fixed it, and that
+orphan-reclaimed fixture was deliberately discarded rather than counted.
+
+The clean README smoke created one disposable General Worker job through
+Cockpit and proved `execution_lane='pinned'`, zero datasources and zero
+Scholar/Critic children. It reached processing in **16.469 s**; its workspace
+and dedicated agent pod became Ready with zero restarts. The completion
+decision was journaled, `/complete` returned 200 in **4.186 s**, and the job
+reached `completed|pinned` with non-NULL `completed_at` **718.062 s** after
+creation. The workspace released and the agent pod was reaped. Its assignment
+remained until deletion, matching the existing pinned lifecycle and S18's
+pause-only clear. Authenticated deletion removed the exact job, two snapshot
+objects, isolated Gitea repository and offline fixture agent; final job,
+binding, agent and Kubernetes residue were all zero.
+
+The S2 sandbox tier gate remains closed. No stateless admission, worker queue
+unit, command/effect schema or finalization protocol was added in this step.
