@@ -4379,6 +4379,61 @@ CREATE TABLE public.bench_runs (
 
 
 --
+-- Name: canvas_editor_awareness; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.canvas_editor_awareness (
+    thread_id uuid NOT NULL,
+    canvas_id character varying(64) DEFAULT 'main'::character varying NOT NULL,
+    editing_session_id character varying(128) NOT NULL,
+    sender_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    state character varying(16) NOT NULL,
+    client_seq bigint NOT NULL,
+    path text NOT NULL,
+    presentation_revision bigint NOT NULL,
+    source_version character varying(71) NOT NULL,
+    refreshed_at timestamp with time zone NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT ck_canvas_editor_awareness_client_seq CHECK ((client_seq > 0)),
+    CONSTRAINT ck_canvas_editor_awareness_expiry CHECK (((((state)::text = 'editing'::text) AND (expires_at > refreshed_at)) OR (((state)::text = 'idle'::text) AND (expires_at = refreshed_at)))),
+    CONSTRAINT ck_canvas_editor_awareness_main CHECK (((canvas_id)::text = 'main'::text)),
+    CONSTRAINT ck_canvas_editor_awareness_path CHECK (((char_length(path) >= 1) AND (char_length(path) <= 4096))),
+    CONSTRAINT ck_canvas_editor_awareness_revision CHECK ((presentation_revision > 0)),
+    CONSTRAINT ck_canvas_editor_awareness_session_id CHECK (((editing_session_id)::text ~ '^[A-Za-z0-9_-]{8,128}$'::text)),
+    CONSTRAINT ck_canvas_editor_awareness_source_version CHECK (((source_version)::text ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT ck_canvas_editor_awareness_state CHECK (((state)::text = ANY ((ARRAY['editing'::character varying, 'idle'::character varying])::text[])))
+);
+
+
+--
+-- Name: TABLE canvas_editor_awareness; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.canvas_editor_awareness IS 'Owner-authenticated Canvas editor courtesy leases. Per-editor rows keep tabs independent; idle tombstones and client_seq reject reordered stale renewals. This is UX state only, never authorization or execution lease.';
+
+
+--
+-- Name: COLUMN canvas_editor_awareness.sender_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvas_editor_awareness.sender_id IS 'Server-minted stable public fan-out identity for this editor row.';
+
+
+--
+-- Name: COLUMN canvas_editor_awareness.client_seq; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvas_editor_awareness.client_seq IS 'Client-monotonic sequence. Lower values never mutate the row; equal values are idempotent only when the complete state and Canvas identity match.';
+
+
+--
+-- Name: COLUMN canvas_editor_awareness.expires_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvas_editor_awareness.expires_at IS 'Database-clock editing deadline. Idle tombstones set expires_at equal to refreshed_at and remain briefly so delayed lower-sequence renewals lose.';
+
+
+--
 -- Name: canvas_origin_sessions; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -8566,6 +8621,14 @@ ALTER TABLE ONLY public.notification_queue
 
 
 --
+-- Name: canvas_editor_awareness pk_canvas_editor_awareness; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_editor_awareness
+    ADD CONSTRAINT pk_canvas_editor_awareness PRIMARY KEY (thread_id, canvas_id, editing_session_id);
+
+
+--
 -- Name: canvas_snapshots pk_canvas_snapshots; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -9302,6 +9365,14 @@ ALTER TABLE ONLY public.canvas_view_bootstraps
 
 
 --
+-- Name: canvas_editor_awareness uq_canvas_editor_awareness_sender; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_editor_awareness
+    ADD CONSTRAINT uq_canvas_editor_awareness_sender UNIQUE (sender_id);
+
+
+--
 -- Name: canvases uq_canvases_thread_canvas; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -9657,6 +9728,13 @@ CREATE INDEX idx_automations_owner ON public.automations USING btree (owner_id);
 --
 
 CREATE INDEX idx_automations_project ON public.automations USING btree (project_id) WHERE (project_id IS NOT NULL);
+
+
+--
+-- Name: idx_canvas_editor_awareness_expires_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_canvas_editor_awareness_expires_at ON public.canvas_editor_awareness USING btree (expires_at);
 
 
 --
@@ -11916,6 +11994,14 @@ ALTER TABLE ONLY public.external_contacts
 
 ALTER TABLE ONLY public.external_contacts
     ADD CONSTRAINT external_contacts_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: canvas_editor_awareness fk_canvas_editor_awareness_canvas; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_editor_awareness
+    ADD CONSTRAINT fk_canvas_editor_awareness_canvas FOREIGN KEY (thread_id, canvas_id) REFERENCES public.canvases(thread_id, canvas_id) ON DELETE CASCADE;
 
 
 --

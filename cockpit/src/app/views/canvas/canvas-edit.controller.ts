@@ -1,13 +1,9 @@
 import {HttpErrorResponse} from '@angular/common/http';
 import {computed, DestroyRef, inject, Injectable, signal} from '@angular/core';
-import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {Subscription} from 'rxjs';
-import {CanvasMutationResponse, CanvasState, MAIN_CANVAS_ID} from '../../core/models/canvas.model';
+import {CanvasMutationResponse, CanvasState} from '../../core/models/canvas.model';
 import {CanvasService} from '../../core/services/canvas.service';
-import {
-  CanvasAwarenessEvent,
-  PersistentThreadTransportBridge,
-} from '../../core/services/persistent-thread-transport-bridge.service';
+import {CanvasAwarenessController} from './canvas-awareness.controller';
 import {canvasSourceKey, CanvasTrustedRenderer, resolveCanvasContentUrl, selectCanvasRenderer} from './canvas-rendering';
 
 export type CanvasEditConflict =
@@ -31,13 +27,11 @@ interface CanvasEditSnapshot {
   readonly content: string;
 }
 
-const EDITING_RENEW_INTERVAL_MS = 5_000;
-
 /** Pane-local optimistic edit state. Dirty buffers never become Canvas state. */
 @Injectable()
 export class CanvasEditController {
   private readonly canvas = inject(CanvasService);
-  private readonly transport = inject(PersistentThreadTransportBridge);
+  private readonly awareness = inject(CanvasAwarenessController);
   private readonly destroyRef = inject(DestroyRef);
 
   readonly editMode = signal(false);
@@ -46,7 +40,7 @@ export class CanvasEditController {
   readonly saveStatus = signal<CanvasEditSaveStatus>('idle');
   readonly conflict = signal<CanvasEditConflict | null>(null);
   readonly refreshPending = signal(false);
-  readonly remoteEditing = signal(false);
+  readonly remoteEditing = this.awareness.remoteEditing;
   readonly sessionState = signal<CanvasState | null>(null);
   readonly sessionPath = computed(() => {
     const source = this.sessionState()?.source;
@@ -82,28 +76,17 @@ export class CanvasEditController {
   private selectedThread: string | null = null;
   private active = false;
   private focused = false;
-  private awarenessActive = false;
-  private awarenessTimer: ReturnType<typeof setInterval> | null = null;
   private saveRequest: Subscription | null = null;
   private refreshRequest: Subscription | null = null;
   private savedTimer: ReturnType<typeof setTimeout> | null = null;
   private bufferGeneration = 0;
   private adoptAfterRefreshGeneration: number | null = null;
-  private readonly editingSessionId = createEditingSessionId();
-  private readonly remoteEditors = new Map<string, {
-    event: CanvasAwarenessEvent;
-    timer: ReturnType<typeof setTimeout>;
-  }>();
 
   constructor() {
-    this.transport.canvasAwareness$
-      .pipe(takeUntilDestroyed(this.destroyRef))
-      .subscribe(event => this.handleAwareness(event));
     this.destroyRef.onDestroy(() => {
-      this.sendIdle();
+      this.awareness.stopEditing();
       this.cancelRequests();
       if (this.savedTimer) clearTimeout(this.savedTimer);
-      this.clearRemoteEditors();
     });
   }
 
@@ -116,15 +99,17 @@ export class CanvasEditController {
     contentEtag: string | null,
     contentReady: boolean,
     sourceChanged: boolean,
+    popout = false,
   ): void {
     if (threadId !== this.selectedThread) {
-      this.sendIdle();
+      this.awareness.stopEditing();
       this.cancelRequests();
       this.resetSession();
       this.selectedThread = threadId;
     }
     this.active = active;
-    if (!active) this.sendIdle();
+    if (!active) this.awareness.stopEditing();
+    this.syncAwareness(popout);
 
     if (
       this.snapshot() &&
@@ -153,7 +138,6 @@ export class CanvasEditController {
     }
 
     if (this.snapshot() && sourceChanged) this.conflict.set('content_changed');
-    this.pruneRemoteEditors();
 
     const snapshot = this.snapshot();
     if (snapshot && this.dirty()) {
@@ -217,7 +201,7 @@ export class CanvasEditController {
 
   showPreview(): void {
     this.editMode.set(false);
-    this.sendIdle();
+    this.awareness.stopEditing();
   }
 
   updateBuffer(value: string): void {
@@ -225,17 +209,17 @@ export class CanvasEditController {
     this.buffer.set(value);
     this.bufferGeneration += 1;
     if (this.saveStatus() !== 'saving') this.saveStatus.set('idle');
-    if (this.focused) this.sendEditing();
+    if (this.focused) this.awareness.startEditing();
   }
 
   editorFocused(): void {
     this.focused = true;
-    if (this.active) this.sendEditing();
+    if (this.active) this.awareness.startEditing();
   }
 
   editorBlurred(): void {
     this.focused = false;
-    this.sendIdle();
+    this.awareness.stopEditing();
   }
 
   save(): void {
@@ -373,7 +357,8 @@ export class CanvasEditController {
       // A late Monaco/composition change is newer than the committed bytes.
       this.saveStatus.set('idle');
     }
-    if (this.focused) this.sendEditing();
+    this.syncAwareness();
+    if (this.focused) this.awareness.startEditing();
   }
 
   private handleSaveError(error: unknown): void {
@@ -407,11 +392,11 @@ export class CanvasEditController {
       clearTimeout(this.savedTimer);
       this.savedTimer = null;
     }
-    this.pruneRemoteEditors();
+    this.syncAwareness();
   }
 
   private resetSession(): void {
-    this.sendIdle();
+    this.awareness.stopEditing();
     this.snapshot.set(null);
     this.pendingRemote = null;
     this.editMode.set(false);
@@ -427,105 +412,16 @@ export class CanvasEditController {
     this.refreshPending.set(false);
     this.adoptAfterRefreshGeneration = null;
     this.bufferGeneration = 0;
-    this.clearRemoteEditors();
+    this.syncAwareness();
   }
 
-  private sendEditing(): void {
-    const snapshot = this.snapshot();
-    const threadId = this.selectedThread;
-    if (!this.active || !this.focused || !snapshot || !threadId || !snapshot.state.source_version) {
-      return;
-    }
-    this.transport.sendCanvasControl(threadId, {
-      method: 'canvas.user_editing',
-      canvas_id: MAIN_CANVAS_ID,
-      path: snapshot.path,
-      presentation_revision: snapshot.state.presentation_revision,
-      source_version: snapshot.state.source_version,
-      editing_session_id: this.editingSessionId,
-    });
-    this.awarenessActive = true;
-    if (!this.awarenessTimer) {
-      this.awarenessTimer = setInterval(() => this.sendEditing(), EDITING_RENEW_INTERVAL_MS);
-    }
-  }
-
-  private sendIdle(): void {
-    if (this.awarenessTimer) clearInterval(this.awarenessTimer);
-    this.awarenessTimer = null;
-    if (!this.awarenessActive) return;
-    const snapshot = this.snapshot();
-    const threadId = this.selectedThread;
-    this.awarenessActive = false;
-    if (!snapshot || !threadId || !snapshot.state.source_version) return;
-    this.transport.sendCanvasControl(threadId, {
-      method: 'canvas.user_idle',
-      canvas_id: MAIN_CANVAS_ID,
-      path: snapshot.path,
-      presentation_revision: snapshot.state.presentation_revision,
-      source_version: snapshot.state.source_version,
-      editing_session_id: this.editingSessionId,
-    });
-  }
-
-  private handleAwareness(event: CanvasAwarenessEvent): void {
-    if (
-      event.threadId !== this.selectedThread ||
-      event.editingSessionId === this.editingSessionId
-    ) {
-      return;
-    }
-    if (event.method === 'canvas.user_idle') {
-      const key = awarenessKey(event);
-      const remote = this.remoteEditors.get(key);
-      if (remote && sameAwarenessIdentity(remote.event, event)) this.removeRemoteEditor(key);
-      return;
-    }
-    if (!this.awarenessMatchesSnapshot(event)) return;
-    const key = awarenessKey(event);
-    this.removeRemoteEditor(key);
-    const timer = setTimeout(
-      () => this.removeRemoteEditor(key),
-      event.ttlMs ?? 15_000,
+  private syncAwareness(popout = false): void {
+    this.awareness.sync(
+      this.active,
+      this.selectedThread,
+      this.snapshot()?.state ?? null,
+      popout,
     );
-    this.remoteEditors.set(key, {event, timer});
-    this.remoteEditing.set(true);
-  }
-
-  private awarenessMatchesSnapshot(event: CanvasAwarenessEvent): boolean {
-    const snapshot = this.snapshot();
-    const current = this.canvas.state();
-    const currentSource = current?.source;
-    return !!(
-      snapshot &&
-      event.path === snapshot.path &&
-      event.presentationRevision === snapshot.state.presentation_revision &&
-      event.sourceVersion === snapshot.state.source_version &&
-      currentSource?.type === 'workspace_file' &&
-      typeof currentSource.path === 'string' &&
-      currentSource.path === event.path &&
-      current?.presentation_revision === event.presentationRevision &&
-      current.source_version === event.sourceVersion
-    );
-  }
-
-  private pruneRemoteEditors(): void {
-    for (const [id, remote] of this.remoteEditors) {
-      if (!this.awarenessMatchesSnapshot(remote.event)) this.removeRemoteEditor(id);
-    }
-  }
-
-  private removeRemoteEditor(id: string): void {
-    const remote = this.remoteEditors.get(id);
-    if (remote) clearTimeout(remote.timer);
-    this.remoteEditors.delete(id);
-    this.remoteEditing.set(this.remoteEditors.size > 0);
-  }
-
-  private clearRemoteEditors(): void {
-    for (const remote of this.remoteEditors.values()) clearTimeout(remote.timer);
-    this.remoteEditors.clear();
-    this.remoteEditing.set(false);
   }
 
   private cancelRequests(): void {
@@ -599,27 +495,4 @@ function canvasEditError(error: unknown): {status: number | null; code: string |
       ? detail.code
       : null,
   };
-}
-
-function awarenessKey(event: CanvasAwarenessEvent): string {
-  return `${event.senderId}\u0000${event.editingSessionId}`;
-}
-
-function sameAwarenessIdentity(left: CanvasAwarenessEvent, right: CanvasAwarenessEvent): boolean {
-  return left.path === right.path &&
-    left.presentationRevision === right.presentationRevision &&
-    left.sourceVersion === right.sourceVersion;
-}
-
-function createEditingSessionId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-    const bytes = crypto.getRandomValues(new Uint8Array(16));
-    return Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
-  }
-  // Presence IDs are only echo-suppression hints, never authorization or user
-  // identity. This deterministic SSR fallback is replaced in every browser.
-  return 'canvas-editor-server';
 }

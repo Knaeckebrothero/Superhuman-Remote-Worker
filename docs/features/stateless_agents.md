@@ -1225,12 +1225,57 @@ without being fabricated as user denials. A fresh migration replay took
 **6.47/7.19 ms warm**, and an unauthenticated SSE request returned 401 with no
 presence row written.
 
-This does **not** remove the gate. Outbox, hard interrupt and **Canvas editor**
-presence re-homing remain open; the generic attached-client signal does not
-make socketless Canvas awareness work. Workspace/runtime-incarnation authority
-and durable terminal-retirement acknowledgement are incomplete, and the §6.1
-RAM/path-bypass work is deferred to its own pass. None of the direct proofs
-enqueued a turn, changed a sandbox thread's lane, or created a worker batch.
+The second §3.5 slice is now built as well. Migration **0126** adds one durable
+Canvas-awareness row per browser editor, with a database-clock **15-second**
+editing lease, idle tombstone, stable server sender id and monotonic client
+sequence. A thread advisory lock makes the **256-row** cap exact under
+concurrent first writes; equal retries do not refresh TTL, and exact
+path/revision/source-version validation prevents a stale editor from presenting
+against a newer Canvas. Both lanes use the same owner-gated PUT and dedicated
+SSE stream. The SSE sends named, complete `canvas_awareness` snapshots (including
+empty), comments for transport keepalive, and no `id:` or journal row; it
+periodically reauthorizes the current BFF cookie. The Cockpit no longer sends
+awareness over the control WebSocket, and a fresh popout rotates a copied
+opener identity before its first sync while retaining that identity across its
+own reload.
+
+The final server contract passed **7 real-Postgres tests** and the complete
+scratch-Postgres substrate through 0126 passed **108/108**; affected Python
+tests passed **66/66**, the focused route/SSE contract **8/8**, and the final
+focused Cockpit controller group **39/39**. Full Cockpit Vitest passed **1,815 tests in 119
+files** and its production build passed. Repository-wide pytest passed
+**15,412 tests** with **134 skipped** and exactly the established **11
+environment failures**. The k3d orchestrator is **1/1 Ready**,
+publishes the exact PUT/GET paths, and its running migration bytes match the
+successful ledger checksum. During verification Tilt applied the first 0126
+snapshot before an optional constraint hardening; the changed checksum
+correctly stopped the replacement pod while the previous pod remained Ready.
+0126 was restored byte-for-byte, the safe-integer bound stayed at the API, and
+the next natural rebuild recovered. No ledger row was edited.
+
+An authenticated live browser transport proof used two independent Playwright
+contexts with real Keycloak/BFF cookies. On a stateless fixture, each context
+observed the other's PUT through the dedicated SSE in **1040 ms** and **649
+ms**; a hard reload renewed the same editor id and preserved the same server
+sender id, and expiry produced the complete empty snapshot in **14.897 s**. A
+pinned fixture used the identical route shape and delivered the peer snapshot
+in **916 ms**. The proof cleaned every harness awareness, Canvas, thread,
+session and queue row. It exercised the real authenticated REST/SSE transport,
+not the full Monaco/controller UI path.
+
+This still does **not** remove the tier gate. Browser unload is a TTL edge, not
+a reliable idle-PUT edge, and ordinary **Duplicate Tab** can copy
+`sessionStorage` and collapse two active tabs into one courtesy row while both
+remain active; neither signal is authorization or execution ownership. The
+full rendered two-editor Monaco UX and native EventSource recovery through
+authentication expiry remain unverified. More importantly, durable Canvas
+source/presentation invalidations still need their own mutation/outbox path;
+generic session outboxes and hard interrupt remain open.
+Workspace/runtime-incarnation authority and durable terminal-retirement
+acknowledgement are incomplete, and the §6.1 RAM/path-bypass work is deferred
+to its own pass. None of the direct proofs enqueued a turn, changed a sandbox
+thread's lane, or created a worker batch. The S2 sandbox tier gate remains
+**closed**.
 
 **S3** (workers): **Gates 1 and 2 are built and merged**; worker admission stays
 closed. No `worker_batch` unit has ever been enqueued and no job carries a

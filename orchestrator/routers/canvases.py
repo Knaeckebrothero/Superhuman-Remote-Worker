@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime
 from email.utils import format_datetime
 from email.utils import parsedate_to_datetime
 from pathlib import PurePosixPath
+import json
 import logging
 import re
 import secrets
 from tempfile import SpooledTemporaryFile
+import time
 from typing import Any, Literal
 from urllib.parse import quote, urlencode
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from security.access import require_internal, require_thread_owner
@@ -38,6 +42,15 @@ from services.canvas_apps import (
     CanvasAppError,
     ThreadWorkspaceAppGateway,
     canvas_live_preview_enabled,
+)
+from services.canvas_awareness import (
+    CANVAS_AWARENESS_CLEANUP_LIMIT,
+    CANVAS_AWARENESS_MAX_SEQUENCE,
+    CANVAS_AWARENESS_TTL_SECONDS,
+    CanvasAwarenessConflict,
+    cleanup_canvas_awareness,
+    fetch_canvas_awareness_snapshot,
+    mutate_canvas_awareness,
 )
 from services.canvas_files import (
     MAX_TEXT_BYTES,
@@ -87,6 +100,11 @@ internal_router = APIRouter(
 _STATE_CACHE_CONTROL = "private, no-cache"
 _CONTENT_CACHE_CONTROL = "private, no-cache"
 _VIEWER_SECRET_PATTERN = r"^[A-Za-z0-9_-]{32,128}$"
+_AWARENESS_SESSION_PATTERN = r"^[A-Za-z0-9_-]{8,128}$"
+_CANVAS_AWARENESS_STREAM_POLL_S = 1.0
+_CANVAS_AWARENESS_STREAM_REAUTH_S = 10.0
+_CANVAS_AWARENESS_STREAM_KEEPALIVE_S = 10.0
+_CANVAS_AWARENESS_STREAM_CLEANUP_S = 60.0
 
 # Re-pin attempts already made, keyed by (thread, current generation, revision,
 # source version). Insertion-ordered so the oldest entry evicts first.
@@ -203,6 +221,28 @@ class CanvasBootstrapAuthorizeRequest(BaseModel):
     bridge_nonce: str = Field(
         min_length=32, max_length=128, pattern=_VIEWER_SECRET_PATTERN
     )
+
+
+class CanvasAwarenessRequest(BaseModel):
+    """One monotonic Canvas editor heartbeat or idle tombstone."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sequence: int = Field(ge=1, le=CANVAS_AWARENESS_MAX_SEQUENCE)
+    state: Literal["editing", "idle"]
+    path: str = Field(min_length=1, max_length=4096)
+    presentation_revision: int = Field(ge=1)
+    source_version: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class CanvasAwarenessResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    applied: bool
+    sender_id: str
+    sequence: int
+    state: Literal["editing", "idle"]
+    expires_at: datetime
 
 
 def _get_db() -> Any:
@@ -323,6 +363,14 @@ def _raise_office_error(error: CanvasOfficeError) -> None:
     raise HTTPException(
         status_code=error.status_code,
         detail={"code": error.code, "message": error.message},
+    ) from error
+
+
+def _raise_awareness_conflict(error: CanvasAwarenessConflict) -> None:
+    status_code = 503 if error.code == "canvas_awareness_capacity_exhausted" else 409
+    raise HTTPException(
+        status_code=status_code,
+        detail={"code": error.code, "message": str(error)},
     ) from error
 
 
@@ -724,6 +772,144 @@ async def get_main_canvas(thread_id: str, request: Request) -> Response:
             },
         )
     return _state_response(representation.payload, representation.etag)
+
+
+@router.put(
+    "/main/awareness/{editing_session_id}",
+    response_model=CanvasAwarenessResponse,
+    responses={401: {}, 403: {}, 409: {}, 422: {}, 503: {}},
+)
+async def put_main_canvas_awareness(
+    thread_id: str,
+    editing_session_id: str,
+    payload: CanvasAwarenessRequest,
+    request: Request,
+) -> CanvasAwarenessResponse:
+    """Apply one owner-authenticated editor heartbeat or idle tombstone.
+
+    The browser never sends or learns an execution lane. Both pinned and
+    stateless sessions use this same database-backed courtesy signal.
+    """
+
+    if not re.fullmatch(_AWARENESS_SESSION_PATTERN, editing_session_id):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_canvas_awareness_session",
+                "message": "Canvas editing session id is invalid",
+            },
+        )
+    db = _get_db()
+    await require_thread_owner(request, db, thread_id)
+    try:
+        mutation = await mutate_canvas_awareness(
+            db,
+            thread_id=thread_id,
+            editing_session_id=editing_session_id,
+            sequence=payload.sequence,
+            state=payload.state,
+            path=payload.path,
+            presentation_revision=payload.presentation_revision,
+            source_version=payload.source_version,
+            ttl_seconds=CANVAS_AWARENESS_TTL_SECONDS,
+        )
+    except CanvasAwarenessConflict as exc:
+        _raise_awareness_conflict(exc)
+    return CanvasAwarenessResponse(
+        applied=mutation.applied,
+        sender_id=mutation.sender_id,
+        sequence=mutation.sequence,
+        state=mutation.state,
+        expires_at=mutation.expires_at,
+    )
+
+
+@router.get(
+    "/main/awareness/stream",
+    response_class=StreamingResponse,
+    responses={401: {}, 403: {}, 404: {}},
+)
+async def stream_main_canvas_awareness(
+    thread_id: str, request: Request
+) -> StreamingResponse:
+    """Stream complete, unjournaled Canvas editor snapshots for both lanes.
+
+    Frames are named ``canvas_awareness`` events and deliberately carry no
+    SSE ``id`` line: reconnect reads a fresh complete DB snapshot, so no event
+    cursor or session-journal sequence allocation is involved.
+    """
+
+    db = _get_db()
+    await require_thread_owner(request, db, thread_id)
+
+    async def event_stream():
+        yield ": open\n\n"
+        previous_signature: tuple[tuple[str, str, str, int, str, int], ...] | None = (
+            None
+        )
+        next_reauth = time.monotonic() + _CANVAS_AWARENESS_STREAM_REAUTH_S
+        next_keepalive = time.monotonic() + _CANVAS_AWARENESS_STREAM_KEEPALIVE_S
+        next_cleanup = time.monotonic()
+        try:
+            while True:
+                if await request.is_disconnected():
+                    return
+                now = time.monotonic()
+                if now >= next_reauth:
+                    # A long-lived SSE response does not retain authorization
+                    # forever. Failure closes it; EventSource reconnects with
+                    # the browser's current BFF cookie.
+                    await require_thread_owner(request, db, thread_id)
+                    next_reauth = now + _CANVAS_AWARENESS_STREAM_REAUTH_S
+                if now >= next_cleanup:
+                    try:
+                        await cleanup_canvas_awareness(
+                            db, limit=CANVAS_AWARENESS_CLEANUP_LIMIT
+                        )
+                    except Exception as exc:
+                        # Cleanup is only a storage bound. It must not hide the
+                        # current courtesy snapshot from an attached editor.
+                        logger.warning("Canvas awareness cleanup failed: %s", exc)
+                    next_cleanup = now + _CANVAS_AWARENESS_STREAM_CLEANUP_S
+
+                editors = await fetch_canvas_awareness_snapshot(db, thread_id=thread_id)
+                signature = tuple(editor.signature() for editor in editors)
+                if previous_signature is None or signature != previous_signature:
+                    body = json.dumps(
+                        {
+                            "canvas_id": "main",
+                            "editors": [editor.public_dict() for editor in editors],
+                        },
+                        separators=(",", ":"),
+                    )
+                    yield f"event: canvas_awareness\ndata: {body}\n\n"
+                    previous_signature = signature
+                    next_keepalive = now + _CANVAS_AWARENESS_STREAM_KEEPALIVE_S
+                elif now >= next_keepalive:
+                    # A comment is transport keepalive only. It is separate
+                    # from the DB snapshot contract and has no resumable id.
+                    yield ": keepalive\n\n"
+                    next_keepalive = now + _CANVAS_AWARENESS_STREAM_KEEPALIVE_S
+                await asyncio.sleep(_CANVAS_AWARENESS_STREAM_POLL_S)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning(
+                "Canvas awareness stream closed (thread=%s): %s",
+                thread_id,
+                exc,
+            )
+            return
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.delete(
