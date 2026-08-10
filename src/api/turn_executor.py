@@ -1012,28 +1012,31 @@ class StatelessTurnExecutor:
                     await done_waiter
 
     async def _await_cloud_push(self, pa: Any) -> None:
-        """§5.3.5 option (i): the lease covers the turn-end cloud push.
+        """Keep the lease until the turn-end push reaches a terminal outcome.
 
-        Bounded; the pending-task global is deliberately NOT cleared — on
-        timeout the push keeps running and the next same-pod turn start (or
-        the teardown path) awaits the remainder, preserving the strict
-        push(N)→pull(N+1) per-mount ordering."""
+        A live task after ``complete_unit`` has no durable ownership and can
+        race the next claimant's recovery/pull. The DB generation stays
+        pending when a finished task reports failure, so the successor can
+        safely replay; there is no safe equivalent for a still-running PUT.
+        """
         task = pa._pending_cloud_push_task
-        if task is None or task.done():
+        if task is None:
             return
         started = time.monotonic()
-        _done, pending = await asyncio.wait(
-            {task}, timeout=self._cloud_push_wait_seconds
-        )
-        waited = time.monotonic() - started
-        if pending:
+        try:
+            await task
+        except asyncio.CancelledError:
+            raise
+        except Exception:
             logger.warning(
-                "turn-end cloud push still running after %.1fs — completing "
-                "the unit anyway (next same-pod turn start awaits the rest)",
-                waited,
+                "turn-end cloud push reached failure under the lease; "
+                "durable generation remains pending for successor recovery",
+                exc_info=True,
             )
-        else:
-            logger.info("turn-end cloud push finished in %.1fs under the lease", waited)
+        logger.info(
+            "turn-end cloud push reached a terminal outcome in %.1fs under the lease",
+            time.monotonic() - started,
+        )
 
     async def _complete_with_retry(
         self, claim: ClaimedUnit, *, consumed_seq: int
@@ -1072,10 +1075,20 @@ class StatelessTurnExecutor:
     async def _release(self, claim: ClaimedUnit, *, reason: str) -> None:
         """Voluntary error release (§5.1): default linear backoff, token-
         guarded (a genuinely lost lease makes this a recorded no-op)."""
+        pa = _pa()
+        # Warm/lite sessions skip physical detach, so teardown cannot be the
+        # only push drain. No leased->queued transition may expose a successor
+        # while this owner's external PUT is still live.
+        await self._await_cloud_push(pa)
+        if (
+            pa._pending_cloud_push_task is not None
+            and pa._pending_cloud_push_task.done()
+        ):
+            pa._pending_cloud_push_task = None
         # Exact lifecycle boundary: no consumer may survive the state change
         # from leased back to queued, even on an error path.
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await _pa()._stop_thread_control_watcher()
+            await pa._stop_thread_control_watcher()
         await self._detach_physical_before_transition(f"release_{reason}")
         try:
             state = await release_unit(

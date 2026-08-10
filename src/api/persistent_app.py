@@ -8,6 +8,7 @@ Connect with: websocat ws://localhost:8001/ws/chat
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -48,6 +49,7 @@ from ..core.tool_policy import (
     validate_tool_override_fragment,
 )
 from ..core.workspace_backend import WorkspaceUnavailableError
+from .lease_context import LeaseLostError
 from .lease_context import current_lease as _current_lease_var
 from ..shared import event_journal as _event_journal
 from ..agent import UniversalAgent
@@ -1371,6 +1373,8 @@ def _build_sync_coordinator(
     workspace_path,
     workspace_backend,
     cloud_cfg: Optional[Dict[str, Any]],
+    thread_id: str = "",
+    workspace_generation: str = "",
 ):
     """Construct a ``WorkspaceSyncCoordinator`` from the orchestrator's payload.
 
@@ -1394,7 +1398,49 @@ def _build_sync_coordinator(
         build_workspace_sync,
     )
 
-    coordinator = WorkspaceSyncCoordinator()
+    coordinator = WorkspaceSyncCoordinator(
+        thread_id=thread_id,
+        workspace_generation=workspace_generation,
+    )
+
+    def _identity(
+        cfg: Dict[str, Any], *, logical_key: str, target_path: str
+    ) -> tuple[str, str]:
+        """Stable row key + exact non-secret source/destination digest.
+
+        ``thread_mounts.id`` is replace-on-edit and therefore cannot name a
+        durable generation. The logical key excludes workspace incarnation;
+        the scope digest includes it so a clean row can be rebound while a
+        pending row for an old incarnation fails closed.
+        """
+
+        destination = {
+            "backend": str(cfg.get("backend") or ""),
+            "mount_kind": str(cfg.get("mount_kind") or ""),
+            "target_path": str(target_path or "").strip("/"),
+            "webdav_url": str(cfg.get("webdav_url") or "").rstrip("/"),
+        }
+        encoded_destination = json.dumps(
+            destination, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        destination_sha = hashlib.sha256(encoded_destination).hexdigest()
+        mount_key = (
+            "legacy-session"
+            if logical_key == "legacy-session"
+            else f"mount:{destination_sha}"
+        )
+        if not thread_id or not workspace_generation:
+            return mount_key, ""
+        scope = {
+            "thread_id": str(thread_id),
+            "workspace_generation": str(workspace_generation),
+            "mount_key": mount_key,
+            "destination_sha256": destination_sha,
+        }
+        scope_sha = hashlib.sha256(
+            json.dumps(scope, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return mount_key, scope_sha
 
     def _attach(cfg: Dict[str, Any], *, mount_id: str, target_path: str) -> None:
         sync = build_workspace_sync(
@@ -1404,8 +1450,17 @@ def _build_sync_coordinator(
             mount_subdir=target_path,
         )
         if sync is not None:
+            mount_key, scope_sha = _identity(
+                cfg, logical_key=mount_id, target_path=target_path
+            )
             coordinator.add(
-                MountSync(mount_id=mount_id, target_path=target_path, sync=sync)
+                MountSync(
+                    mount_id=mount_id,
+                    target_path=target_path,
+                    sync=sync,
+                    sync_scope_sha256=scope_sha,
+                    generation_key=mount_key,
+                )
             )
 
     if cloud_cfg.get("version") == 2:
@@ -1946,10 +2001,12 @@ async def _attach_session(
     # The orchestrator attaches the lite object-store mounts to this response
     # for lite threads, so the session can build its backend without a pod.
     _rc, _co = resolved_config, config_override
+    workspace_generation = ""
     if _rc is None and _co is None and _orchestrator_client and _thread_id:
         try:
             _peek = await _orchestrator_client.get_thread_workspace(_thread_id)
-            if _peek:
+            if isinstance(_peek, dict):
+                workspace_generation = str(_peek.get("workspace_generation") or "")
                 _rc = _peek.get("resolved_config")
                 _co = _peek.get("config_override")
         except Exception:
@@ -1998,6 +2055,12 @@ async def _attach_session(
             _thread_id,
         )
 
+    workspace_generation = str(
+        (workspace_override or {}).get("workspace_generation")
+        or workspace_generation
+        or ""
+    )
+
     # Apply config overrides, project_ids, and datasources from thread metadata
     if not config_override:
         config_override = (workspace_override or {}).get("config_override")
@@ -2027,6 +2090,9 @@ async def _attach_session(
         try:
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if ws_info:
+                workspace_generation = workspace_generation or str(
+                    ws_info.get("workspace_generation") or ""
+                )
                 if not config_override:
                     config_override = ws_info.get("config_override")
                 if resolved_config is None:
@@ -2453,22 +2519,27 @@ async def _attach_session(
     # cloud_mount_active above); letting either field through here would
     # rebuild a live agent-service WebDAV sync in every degraded-protected
     # scenario (refused engage, flag off, VM tier, overlay-failure teardown).
+    suppress_disposable_cloud = bool(
+        _stateless_mode()
+        and getattr(getattr(effective_config, "workspace", None), "backend", None)
+        == "none"
+    )
     cloud_cfg = (
         None
-        if cloud_mount_active or protected_cloud
+        if cloud_mount_active or protected_cloud or suppress_disposable_cloud
         else workspace_override.get("cloud_sync")
         if workspace_override
         else None
     )
     nc_folder = (
         None
-        if protected_cloud
+        if protected_cloud or suppress_disposable_cloud
         else workspace_override.get("nc_session_folder")
         if workspace_override
         else None
     )
     cloud_degraded_hint = False
-    if (
+    if not suppress_disposable_cloud and (
         not cloud_mount_active
         and (not cloud_cfg or not nc_folder)
         and _orchestrator_client
@@ -2477,6 +2548,9 @@ async def _attach_session(
         try:
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if ws_info:
+                workspace_generation = workspace_generation or str(
+                    ws_info.get("workspace_generation") or ""
+                )
                 protected_cloud = protected_cloud or bool(
                     ws_info.get("protected_cloud")
                 )
@@ -2485,7 +2559,27 @@ async def _attach_session(
                     nc_folder = nc_folder or ws_info.get("nc_session_folder")
                 cloud_degraded_hint = bool(ws_info.get("cloud_sync_degraded"))
         except Exception:
-            pass
+            # A stateless turn cannot distinguish "no cloud configured" from
+            # "the credential/config boundary was unreachable" and must not
+            # execute unsynced on that ambiguity. Pinned keeps the historical
+            # degraded behavior and retries on its next boundary.
+            if _stateless_mode():
+                _cloud_sync_retry_pending = True
+    if suppress_disposable_cloud:
+        # backend=none is an intentionally disposable ScratchBackend with no
+        # user file tools. The orchestrator may still provision a generic
+        # session cloud folder; mirroring internal scratch scaffolding into it
+        # would both violate the stateless tier contract and lack a durable
+        # workspace generation. Suppress both structured and legacy sync paths
+        # only for stateless claims; pinned keeps its historical behavior.
+        cloud_cfg = None
+        nc_folder = None
+        _cloud_sync_retry_pending = False
+    # The late credential/config fetch above is often the first place a lite
+    # attach receives its binding generation. Retain the final value even when
+    # no coordinator is built, so an omitted/degraded payload cannot hide a
+    # pending generation row from the turn-start fail-closed check.
+    _session.cloud_sync_workspace_generation = workspace_generation
     # Back-compat: translate a bare nc_session_folder into the new schema.
     # F-C1: gated on `not protected_cloud` too (defense-in-depth — nc_folder
     # is already forced None above for a protected thread, but this keeps
@@ -2498,7 +2592,11 @@ async def _attach_session(
                 workspace_path=_session.workspace_manager.path,
                 workspace_backend=_session.workspace_manager.backend,
                 cloud_cfg=cloud_cfg,
+                thread_id=str(_thread_id or ""),
+                workspace_generation=workspace_generation,
             )
+            if _session.workspace_sync is None:
+                raise RuntimeError("cloud sync payload resolved no usable mounts")
             if _session.workspace_sync:
                 # Phase 1 of cloud_collaboration_model.md: turn-boundary sync,
                 # not background polling. Do one blocking initial pull to
@@ -2825,15 +2923,13 @@ async def _terminate_session_inner(
     if _session.workspace_sync:
         try:
             await _await_pending_cloud_push()
-            await _session.workspace_sync.push_all()
-            # The final PULL is skipped in stateless mode: it refreshes a
-            # workspace whose next consumer (the next claim's turn) always
-            # pulls first anyway, and it sat on the claim-switch critical
-            # path as a full remote-tree walk (measured 41s of the 51s
-            # detach, 2026-08-08 baseline). Pinned-lane teardown keeps it —
-            # its workspace may be browsed after detach without another
-            # attach ever running.
+            # Stateless bytes are committed only by the armed generation task
+            # above. A second raw push here would have no durable requirement
+            # or acknowledgement and, on lease-loss teardown, could overlap a
+            # successor's pull. Pinned teardown keeps its existing final
+            # push+pull byte-for-byte.
             if not _stateless_mode():
+                await _session.workspace_sync.push_all()
                 await _session.workspace_sync.pull_all()
         except Exception as e:
             logger.warning(f"Final cloud sync failed (non-fatal): {e}")
@@ -6704,7 +6800,208 @@ async def _resilient_cloud_sync(op: str, runner, turn_id: int) -> bool:
     return False
 
 
-async def _run_turn_end_cloud_push(sync: Any, turn_id: int) -> None:
+@dataclass(frozen=True)
+class _CloudGenerationClaim:
+    thread_id: str
+    lease_token: int
+    workspace_generation: str
+    postgres: Any
+    lease_handle: Any
+
+
+def _capture_cloud_generation_claim(sync: Any) -> _CloudGenerationClaim:
+    """Freeze the current claim identity for callbacks/background work."""
+
+    handle = _current_lease_var.get()
+    if (
+        handle is None
+        or not handle.active
+        or not _thread_id
+        or str(handle.unit_id) != str(_thread_id)
+        or _session is None
+        or _session.postgres_conn is None
+        or not str(getattr(sync, "workspace_generation", ""))
+    ):
+        raise LeaseLostError(
+            "stateless cloud sync lacks an exact queue/workspace generation"
+        )
+    return _CloudGenerationClaim(
+        thread_id=str(_thread_id),
+        lease_token=int(handle.lease_token),
+        workspace_generation=str(sync.workspace_generation),
+        postgres=_session.postgres_conn,
+        lease_handle=handle,
+    )
+
+
+async def _assert_cloud_generation_owner(claim: _CloudGenerationClaim) -> None:
+    """Recheck queue token + workspace incarnation before an external write."""
+
+    from ..shared.cloud_sync_generations import cloud_sync_lease_is_current
+
+    current = await cloud_sync_lease_is_current(
+        claim.postgres,
+        thread_id=claim.thread_id,
+        lease_token=claim.lease_token,
+        workspace_generation=claim.workspace_generation,
+    )
+    if current:
+        return
+    claim.lease_handle.mark_lost()
+    raise LeaseLostError(
+        "cloud sync write rejected by queue/workspace generation fence"
+    )
+
+
+async def _ack_cloud_generation(
+    claim: _CloudGenerationClaim, mount_id: str, requirement: Any
+) -> None:
+    from ..shared.cloud_sync_generations import acknowledge_cloud_sync_generation
+
+    acknowledged = await acknowledge_cloud_sync_generation(
+        claim.postgres,
+        thread_id=claim.thread_id,
+        lease_token=claim.lease_token,
+        mount_id=mount_id,
+        generation=requirement.required_generation,
+        workspace_generation=requirement.workspace_generation,
+        sync_scope_sha256=requirement.sync_scope_sha256,
+        baseline_sha256=requirement.baseline_sha256,
+    )
+    if acknowledged:
+        return
+    claim.lease_handle.mark_lost()
+    raise LeaseLostError(
+        f"cloud generation acknowledgement fenced for mount {mount_id}"
+    )
+
+
+async def _prepare_stateless_cloud_sync(sync: Any, turn_id: int) -> None:
+    """Recover predecessor, pull, then arm this claim before any tool work."""
+
+    from ..services.cloud_sync.coordinator import CloudSyncGenerationError
+    from ..shared.cloud_sync_generations import (
+        arm_cloud_sync_generations,
+        load_cloud_sync_requirements,
+    )
+
+    claim = _capture_cloud_generation_claim(sync)
+    await _assert_cloud_generation_owner(claim)
+    requirements = await load_cloud_sync_requirements(
+        claim.postgres,
+        thread_id=claim.thread_id,
+        lease_token=claim.lease_token,
+        workspace_generation=claim.workspace_generation,
+    )
+    # LOAD deliberately returns no rows when its owner CTE is fenced. Distinguish
+    # that from a genuine first claim before treating an empty set as safe.
+    await _assert_cloud_generation_owner(claim)
+
+    async def acknowledge(mount_id: str, requirement: Any) -> None:
+        await _ack_cloud_generation(claim, mount_id, requirement)
+
+    async def before_write() -> None:
+        await _assert_cloud_generation_owner(claim)
+
+    _broadcast("workspace_sync.reconciling", {"turn_id": turn_id})
+    recovered = await _resilient_cloud_sync(
+        "generation_recovery",
+        lambda: sync.reconcile_before_pull(
+            requirements,
+            before_write=before_write,
+            acknowledge=acknowledge,
+        ),
+        turn_id,
+    )
+    if not recovered:
+        raise CloudSyncGenerationError(
+            "predecessor cloud generation recovery failed; pull refused"
+        )
+
+    _broadcast("workspace_sync.pulling", {"turn_id": turn_id})
+    if not await _resilient_cloud_sync(
+        "pull",
+        lambda: sync.pull_all(before_write=before_write, force_unknown=True),
+        turn_id,
+    ):
+        raise CloudSyncGenerationError("stateless turn-start cloud pull failed")
+    _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
+
+    scopes = await sync.capture_generation_scopes()
+    armed = await arm_cloud_sync_generations(
+        claim.postgres,
+        thread_id=claim.thread_id,
+        lease_token=claim.lease_token,
+        scopes=scopes,
+    )
+    expected = {scope.mount_id for scope in scopes}
+    if set(armed) != expected:
+        raise CloudSyncGenerationError(
+            "cloud generation arm was fenced or left a partial mount set"
+        )
+    sync.validate_requirements(armed)
+    if _session is None:
+        raise LeaseLostError("session detached while arming cloud generation")
+    _session.cloud_sync_requirements = dict(armed)
+    logger.info(
+        "cloud generation armed: thread=%s lease=%d mounts=%d",
+        claim.thread_id,
+        claim.lease_token,
+        len(armed),
+    )
+
+
+async def _assert_no_pending_stateless_cloud_generation() -> None:
+    """Do not let an omitted cloud payload hide predecessor work."""
+
+    if _session is None or not _session.cloud_sync_workspace_generation:
+        return
+    from ..services.cloud_sync.coordinator import CloudSyncGenerationError
+    from ..shared.cloud_sync_generations import load_cloud_sync_requirements
+
+    handle = _current_lease_var.get()
+    if (
+        handle is None
+        or not handle.active
+        or not _thread_id
+        or str(handle.unit_id) != str(_thread_id)
+        or _session.postgres_conn is None
+    ):
+        raise LeaseLostError("stateless no-cloud check lacks an exact lease")
+    claim = _CloudGenerationClaim(
+        thread_id=str(_thread_id),
+        lease_token=int(handle.lease_token),
+        workspace_generation=_session.cloud_sync_workspace_generation,
+        postgres=_session.postgres_conn,
+        lease_handle=handle,
+    )
+    await _assert_cloud_generation_owner(claim)
+    requirements = await load_cloud_sync_requirements(
+        claim.postgres,
+        thread_id=claim.thread_id,
+        lease_token=claim.lease_token,
+        workspace_generation=claim.workspace_generation,
+    )
+    await _assert_cloud_generation_owner(claim)
+    pending = sorted(
+        mount_id
+        for mount_id, requirement in requirements.items()
+        if requirement.acknowledged_generation < requirement.required_generation
+    )
+    if pending:
+        raise CloudSyncGenerationError(
+            "pending cloud generation has no configured recovery target: "
+            + ", ".join(pending)
+        )
+
+
+async def _run_turn_end_cloud_push(
+    sync: Any,
+    turn_id: int,
+    *,
+    requirements: Optional[Dict[str, Any]] = None,
+    claim: Optional[_CloudGenerationClaim] = None,
+) -> None:
     """Body of the background turn-end push task.
 
     Same retry/backoff and the same ``workspace_sync.pushing/pushed/error``
@@ -6713,7 +7010,28 @@ async def _run_turn_end_cloud_push(sync: Any, turn_id: int) -> None:
     nulls the session mid-flight can't turn this into an AttributeError.
     """
     _broadcast("workspace_sync.pushing", {"turn_id": turn_id})
-    if await _resilient_cloud_sync("push", sync.push_all, turn_id):
+    runner = sync.push_all
+    op = "push"
+    if requirements is not None:
+        if claim is None:
+            raise LeaseLostError("generation push lacks a captured claim")
+
+        async def before_write() -> None:
+            await _assert_cloud_generation_owner(claim)
+
+        async def acknowledge(mount_id: str, requirement: Any) -> None:
+            await _ack_cloud_generation(claim, mount_id, requirement)
+
+        async def generation_runner() -> Any:
+            return await sync.push_generation(
+                requirements,
+                before_write=before_write,
+                acknowledge=acknowledge,
+            )
+
+        runner = generation_runner
+        op = "generation_push"
+    if await _resilient_cloud_sync(op, runner, turn_id):
         _broadcast("workspace_sync.pushed", {"turn_id": turn_id})
 
 
@@ -6756,6 +7074,12 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
 
     if _session is None or not _orchestrator_client or not _thread_id:
         return
+    if (
+        _session.workspace_manager is None
+        or not _session.workspace_manager.backend.supports_file_tools
+    ):
+        _cloud_sync_retry_pending = False
+        return
     try:
         ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
     except Exception:
@@ -6774,17 +7098,28 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
     if not cloud_cfg and ws_info.get("nc_session_folder"):
         cloud_cfg = _legacy_nc_cloud_cfg(ws_info["nc_session_folder"])
     if not cloud_cfg:
-        return  # still nothing to sync to — try again next turn
+        if _stateless_mode() and not ws_info.get("cloud_sync_degraded"):
+            # A successful authoritative response says there is deliberately
+            # no mirror. This is different from the transport ambiguity that
+            # set the retry flag and is safe to clear.
+            _cloud_sync_retry_pending = False
+        return  # still nothing to sync to — or explicit no-cloud configuration
 
     try:
         coordinator = _build_sync_coordinator(
             workspace_path=_session.workspace_manager.path,
             workspace_backend=_session.workspace_manager.backend,
             cloud_cfg=cloud_cfg,
+            thread_id=str(_thread_id),
+            workspace_generation=str(ws_info.get("workspace_generation") or ""),
         )
         if not coordinator:
             return
-        await coordinator.pull_all()
+        # A stateless successor must reconcile the prior required generation
+        # before its first pull. Construct-only here; the single fenced
+        # turn-start path below performs recovery -> pull -> arm in order.
+        if not _stateless_mode():
+            await coordinator.pull_all()
     except Exception as e:
         # Keep the flag set: the target exists but isn't usable yet. Don't
         # leave a half-built coordinator behind for the push at turn end.
@@ -6815,7 +7150,18 @@ async def _loop_on_turn_start(turn_id: int) -> None:
     # the pull below so a recovered session syncs from this turn on.
     if _cloud_sync_retry_pending and _session.workspace_sync is None:
         await _retry_cloud_sync_start(turn_id)
+        if (
+            _stateless_mode()
+            and _cloud_sync_retry_pending
+            and _session.workspace_sync is None
+        ):
+            from ..services.cloud_sync.coordinator import CloudSyncGenerationError
 
+            raise CloudSyncGenerationError(
+                "stateless cloud sync remains degraded; tool work refused"
+            )
+    if _stateless_mode() and _session.workspace_sync is None:
+        await _assert_no_pending_stateless_cloud_generation()
     # The previous turn's push may still be flushing in the background —
     # wait it out before pulling so each mount keeps strict push→pull
     # ordering (and the pull's remote listing reflects the last turn's
@@ -6828,11 +7174,14 @@ async def _loop_on_turn_start(turn_id: int) -> None:
     # On transient failure (Cloudflare/edge hiccup) we retry+surface via
     # workspace_sync.error rather than letting the exception kill the loop.
     if _session.workspace_sync:
-        _broadcast("workspace_sync.pulling", {"turn_id": turn_id})
-        if await _resilient_cloud_sync(
-            "pull", _session.workspace_sync.pull_all, turn_id
-        ):
-            _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
+        if _stateless_mode():
+            await _prepare_stateless_cloud_sync(_session.workspace_sync, turn_id)
+        else:
+            _broadcast("workspace_sync.pulling", {"turn_id": turn_id})
+            if await _resilient_cloud_sync(
+                "pull", _session.workspace_sync.pull_all, turn_id
+            ):
+                _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
 
     # User-message persistence moved to accept time (_accept_user_input) plus
     # the loop's per-append upsert (persist_message). The content-based save
@@ -7008,10 +7357,27 @@ async def _loop_on_turn_complete_body(
         # Only reachable with no task pending (turn start awaited it), but a
         # future caller must never let two pushes walk one mount concurrently.
         await _await_pending_cloud_push()
-        _pending_cloud_push_task = asyncio.create_task(
-            _run_turn_end_cloud_push(_session.workspace_sync, turn_id),
-            name=f"cloud-push-turn-{turn_id}",
-        )
+        if _stateless_mode():
+            requirements = dict(_session.cloud_sync_requirements)
+            if not requirements:
+                raise LeaseLostError(
+                    "stateless turn completed without an armed cloud generation"
+                )
+            claim = _capture_cloud_generation_claim(_session.workspace_sync)
+            _pending_cloud_push_task = asyncio.create_task(
+                _run_turn_end_cloud_push(
+                    _session.workspace_sync,
+                    turn_id,
+                    requirements=requirements,
+                    claim=claim,
+                ),
+                name=f"cloud-generation-push-turn-{turn_id}",
+            )
+        else:
+            _pending_cloud_push_task = asyncio.create_task(
+                _run_turn_end_cloud_push(_session.workspace_sync, turn_id),
+                name=f"cloud-push-turn-{turn_id}",
+            )
 
     # Slice C (design §5): ping the orchestrator to stage the protected
     # session's upperdir diff to S3. Fire-and-forget — never blocks the next
@@ -9256,6 +9622,7 @@ async def _poll_workspace_ready(
         if vm_status == "ready" and ws.get("vm_ssh_host"):
             return {
                 "backend": "vm",
+                "workspace_generation": ws.get("workspace_generation"),
                 # Slice 1 has no trusted VM host-identity adapter.
                 "canvas_presentation_available": False,
                 "canvas_live_apps_available": False,
@@ -9324,6 +9691,7 @@ async def _poll_workspace_ready(
         if status == "ready" and ws.get("pod_ip"):
             return {
                 "backend": "sandbox",
+                "workspace_generation": ws.get("workspace_generation"),
                 # This is an orchestrator-attested capability, not a property
                 # inferred from the backend label or endpoint reachability.
                 "canvas_presentation_available": (

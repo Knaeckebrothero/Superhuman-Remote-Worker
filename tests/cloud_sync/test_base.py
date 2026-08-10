@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import pytest
 
@@ -19,6 +19,7 @@ class FakeSync(WorkspaceSyncBase):
         self.uploads: list[tuple[str, str]] = []
         self.mkdirs: list[str] = []
         self.downloads: list[tuple[str, str]] = []
+        self.deletes: list[str] = []
         self.ready_calls = 0
         self.list_calls: list[str] = []
         self._listing = remote_listing or []
@@ -26,11 +27,36 @@ class FakeSync(WorkspaceSyncBase):
     async def _ensure_ready(self) -> None:
         self.ready_calls += 1
 
-    async def _ensure_remote_dir(self, rel_dir: str) -> None:
+    async def _ensure_remote_dir(
+        self,
+        rel_dir: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        if before_write is not None:
+            await before_write()
         self.mkdirs.append(rel_dir)
 
-    async def _upload_file(self, rel_path: str, local_path: str) -> None:
+    async def _upload_file(
+        self,
+        rel_path: str,
+        local_path: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        if before_write is not None:
+            await before_write()
         self.uploads.append((rel_path, local_path))
+
+    async def _delete_remote_file(
+        self,
+        rel_path: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        if before_write is not None:
+            await before_write()
+        self.deletes.append(rel_path)
 
     async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
         self.list_calls.append(rel_dir)

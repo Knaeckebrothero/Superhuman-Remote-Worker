@@ -1075,7 +1075,7 @@ The migration's steady state is **dual control planes** for the whole soak — a
 - **S4 — optional, bill-driven**: in-process multiplexing; compile-once; workspace pause tier (§10.7); JetStream hatch.
 - **Rollback**: per-class flag at every stage; pinned plane intact until lane retirement decisions (§10.9).
 
-### 9.1 Implementation status (2026-08-09)
+### 9.1 Implementation status (2026-08-10)
 
 Written against the code on the consolidated `feature/stateless-agents`, not against
 intent. The short version: **the shared substrate is built and genuinely
@@ -1182,15 +1182,28 @@ declared-virtual/physically-remote probe returned 409 for input and control with
 message/control/queue counts unchanged. The gate stays until S2 acceptance
 passes. The §6.1 inventory is recorded and corrects the agent-PVC premise, but
 its RAM/path-bypass remediations are not built. The gate-closed SSH/tmux
-handoff substrate is now built and directly k3d-verified across two stateless
-pods: environment and cwd survived, and the stale lease token could not mutate
-the successor. The chart supplies the existing read-only workspace SSH key and
-allows only SSH/CDP workspace ingress for the stateless Deployment. This does
-**not** remove the gate: workspace/runtime-incarnation authority, durable
-terminal-retirement acknowledgement, a control-plane-owned fence, cloud-push
-generation ordering, outbox re-homing, the two resident daemons and presence
-re-home are outstanding. The direct proof did not enqueue a turn or change a
-sandbox thread's lane.
+handoff substrate is built and directly k3d-verified across two stateless pods:
+environment and cwd survived, and the stale lease token could not mutate the
+successor. The chart supplies the existing read-only workspace SSH key and
+allows only SSH/CDP workspace ingress for the stateless Deployment.
+
+The §3.3 cloud sync-generation fence is also built and two-pod verified for the
+fallback push/pull driver. Migrations **0122–0124** bind a stable cloud scope,
+workspace generation, queue generation and content baseline. Claim start
+reconciles the predecessor before strict pull and ARM; turn completion cannot
+release while its generation push is live. A forced pod-A→pod-B sandbox/real-
+Nextcloud proof preserved one same-size local edit and one unrelated same-size
+cloud edit, with the successor doing ACK-only recovery and zero replay uploads.
+The DB fence is control-plane enforced among honest executors; WebDAV bytes and
+the user-writable resource marker remain cooperative, so a PUT already in
+flight can finish after lease loss without server-side conditional writes.
+
+This does **not** remove the gate. The default `rclone_mount` path still needs
+the §3.4 mid-idle token-expiry/adopt-or-heal proof; outbox, interrupt and
+presence re-homing remain open; workspace/runtime-incarnation authority and
+durable terminal-retirement acknowledgement are incomplete; and the §6.1
+RAM/path-bypass work is deferred to its own pass. Neither direct proof enqueued
+a turn, changed a sandbox thread's lane, or created a worker batch.
 
 **S3** (workers): **Gates 1 and 2 are built and merged**; worker admission stays
 closed. No `worker_batch` unit has ever been enqueued and no job carries a

@@ -272,6 +272,14 @@ class PersistentSession:
 
     # Nextcloud workspace sync (initialized if session has nc_session_folder)
     workspace_sync: Optional[Any] = None
+    # Stateless-only immutable requirements armed at turn start. A background
+    # generation push captures this dict rather than the mutable LeaseHandle,
+    # whose token is repointed when lite affinity claims the next turn.
+    cloud_sync_requirements: Dict[str, Any] = field(default_factory=dict)
+    # Orchestrator-attested binding generation, retained even when the current
+    # claim has no cloud target so pending rows for a removed/degraded mount
+    # cannot be hidden merely by omitting the coordinator payload.
+    cloud_sync_workspace_generation: str = ""
     # Lazy rclone cloud mounts (initialized from cloud_mount payload)
     cloud_mount_manager: Optional[Any] = None
     cloud_mount_error: Optional[str] = None
