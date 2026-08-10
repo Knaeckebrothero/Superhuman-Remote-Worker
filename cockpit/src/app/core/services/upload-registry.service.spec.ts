@@ -185,6 +185,53 @@ describe('UploadRegistryService', () => {
         expect(events).toEqual([done(uploaded('a.pdf'))]);
     });
 
+    it('releases a completed upload the moment the send adopts it', async () => {
+        // The leak this closes: `complete` had already run by adoption time, so
+        // its `adopted` branch could never fire again, and cancel/abortAll skip
+        // adopted entries by design. The entry — and the File's blob behind it,
+        // up to 100MB — stayed reachable for the life of the page, once per
+        // sent attachment.
+        const p = preview('a.pdf');
+        ctx.registry.start('t1', p);
+        ctx.uploads[0].emit(done(uploaded('a.pdf')));
+        ctx.uploads[0].finish();
+        expect(ctx.registry.trackedCount).toBe(1); // held for the send to adopt
+
+        const events: ThreadUploadEvent[] = [];
+        ctx.registry.adopt('t1', p.id, p.file).subscribe((e) => events.push(e));
+
+        expect(ctx.registry.trackedCount).toBe(0);
+        // Released, but not lost: the map holds cancellability, not data.
+        expect(events).toEqual([done(uploaded('a.pdf'))]);
+    });
+
+    it('releases an in-flight upload once it is adopted and lands', () => {
+        // The other ordering — adopted while transferring, so `complete` is the
+        // one that has to let go.
+        const p = preview('a.pdf');
+        ctx.registry.start('t1', p);
+        ctx.registry.adopt('t1', p.id, p.file).subscribe({error: () => undefined});
+        expect(ctx.registry.trackedCount).toBe(1);
+
+        ctx.uploads[0].emit(done(uploaded('a.pdf')));
+        ctx.uploads[0].finish();
+
+        expect(ctx.registry.trackedCount).toBe(0);
+    });
+
+    it('holds an unsent completed upload, because it is still cancellable', () => {
+        // The one entry that SHOULD be retained: attached, uploaded, not yet
+        // sent. Removing the chip still has to be able to delete it.
+        const p = preview('a.pdf');
+        ctx.registry.start('t1', p);
+        ctx.uploads[0].emit(done(uploaded('a.pdf')));
+        ctx.uploads[0].finish();
+
+        expect(ctx.registry.trackedCount).toBe(1);
+        ctx.registry.cancel(p.id);
+        expect(ctx.registry.trackedCount).toBe(0);
+    });
+
     it('does not adopt an entry belonging to another thread', () => {
         const p = preview('a.pdf');
         ctx.registry.start('t1', p);
@@ -329,6 +376,42 @@ describe('UploadRegistryService', () => {
         ctx.deletes[0].settle();
         await tick();
         expect(ctx.uploads).toHaveLength(2);
+    });
+
+    it('barriers BOTH DELETEs when two share a requested name', async () => {
+        // The key is the name a re-upload would REQUEST; the targets are the
+        // names the server ASSIGNED. Two chips for same-named but different
+        // files land as `a.pdf` and `a_1.pdf` and share the key `t1 a.pdf`.
+        // Overwriting the map entry left the first DELETE unbarriered, so a
+        // re-attached `a.pdf` could be uploaded and then deleted by that older
+        // DELETE — exactly the race the barrier exists to close.
+        const first = preview('a.pdf', 'p1');
+        const second = preview('a.pdf', 'p2', 222); // different lastModified
+        ctx.registry.start('t1', first);
+        ctx.registry.start('t1', second);
+        ctx.uploads[0].emit(done(uploaded('a.pdf')));
+        ctx.uploads[0].finish();
+        ctx.uploads[1].emit(done(uploaded('a_1.pdf')));
+        ctx.uploads[1].finish();
+
+        ctx.registry.cancel(first.id);
+        ctx.registry.cancel(second.id);
+        await tick();
+        expect(ctx.deletes.map((d) => d.path)).toEqual(['a.pdf']); // chained
+
+        // A re-attach must not start while EITHER delete is outstanding.
+        ctx.registry.start('t1', preview('a.pdf', 'p3'));
+        await tick();
+        expect(ctx.uploads).toHaveLength(2);
+
+        ctx.deletes[0].settle();
+        await tick();
+        expect(ctx.deletes.map((d) => d.path)).toEqual(['a.pdf', 'a_1.pdf']);
+        expect(ctx.uploads).toHaveLength(2); // still barriered by the second
+
+        ctx.deletes[1].settle();
+        await tick();
+        expect(ctx.uploads).toHaveLength(3);
     });
 
     it('a pending DELETE for a different name does not hold up an upload', async () => {
