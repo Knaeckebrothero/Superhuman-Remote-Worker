@@ -408,10 +408,18 @@ Worth recording, because each was correct-looking code with passing tests:
 
 ### Known open
 
-- **Live gate unrun.** §9's dev verification against thread `1930dec9` has not
-  been executed — it needs a push and a deploy. The admin-vs-owner defect below
-  did not surface in any unit suite, so this gate is worth running before
-  trusting the feature.
+- **Live gate partially run** (dev, 2026-08-10). Passing: `POST /resume` on
+  thread `1930dec9` returns **428** where it returned 403, the dialog renders,
+  and deleting a connector on the deployed image writes a tombstone carrying
+  its name and `deleted_by`. Not yet exercised on dev: acknowledge → 200 →
+  attach, and the delete-time reference scrub (the scratch connector was
+  attached to no thread, so its UPDATE matched zero rows). Both are covered by
+  tests against a real Postgres.
+- **Historical deletions can never show a name.** The nine connectors that were
+  already dangling were hard-deleted before tombstones existed, so the dialog
+  shows their bare uuid. Confirmed unrecoverable on dev: no tombstone, no table
+  denormalizes connector names, and zero audit rows mention the uuid. Only
+  deletions from 2026-08-10 onward carry a name.
 - **Prefilling the model writes it to `localStorage`.** "Start a new session"
   routes the prefilled model through the same path a manual pick takes, so
   merely landing on the prefilled form rewrites the user's "last picked" model
