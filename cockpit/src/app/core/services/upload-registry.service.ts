@@ -23,12 +23,36 @@
  * `Observable<ThreadUploadEvent>` shaped exactly like `uploadOneToThread`'s, so
  * the outbox's upload stage awaits an already-running transfer with the same
  * code that starts a new one. Every guard around that await is unchanged.
+ *
+ * It is also the ONLY place a thread upload is issued from, which is what lets
+ * spec §5.3's two limits live in one function (`_gatedUpload`): a per-filename
+ * FIFO barrier and a global concurrency ceiling. Both the eager path and the
+ * send path's fallback go through it, so neither can slip a request past them.
  */
 import {inject, Injectable} from '@angular/core';
-import {firstValueFrom, from, Observable, ReplaySubject, Subscription, switchMap} from 'rxjs';
+import {
+    defer,
+    finalize,
+    firstValueFrom,
+    from,
+    Observable,
+    ReplaySubject,
+    Subscription,
+    switchMap,
+} from 'rxjs';
 import {ApiService} from './api.service';
 import {FilePreview, ThreadUploadedFile, ThreadUploadEvent} from '../models/file.model';
 import {topLevelUploadTargets} from './upload-stage';
+
+/**
+ * How many upload requests may be on the wire at once (spec §5.3).
+ *
+ * The server's virtual-tier semaphore is 4 and is **shared across all users**
+ * (`MAX_CONCURRENT_VIRTUAL_UPLOADS`, `thread_uploads.py`), and every in-flight
+ * request is a fully-buffered body on both ends. One request per attached file
+ * with no ceiling — which is what shipped — lets a 10-file selection open ten.
+ */
+export const MAX_CONCURRENT_UPLOADS = 2;
 
 /**
  * The error an aborted eager upload terminates with.
@@ -81,7 +105,7 @@ interface EagerUpload {
  *  unambiguous separator here because the thread id is a UUID, and it keeps
  *  this file TEXT: a NUL byte in the template made git classify the whole
  *  module as binary, which hid it from `git diff` and `git grep` entirely. */
-function deleteKey(threadId: string, name: string): string {
+function barrierKey(threadId: string, name: string): string {
     return `${threadId} ${name}`;
 }
 
@@ -105,15 +129,31 @@ export class UploadRegistryService {
     private readonly cancelled = new Set<string>();
 
     /**
-     * In-flight DELETEs, keyed by the name a re-upload would REQUEST.
+     * One FIFO chain per `threadId + requested filename`, covering **both**
+     * uploads and DELETEs of that name.
      *
-     * The backend has no upload idempotency, and eager upload widens the window
-     * between "remove the chip" and "attach it again". Serializing on the
-     * client is the only ordering guarantee available: a re-upload of a name
-     * with a DELETE outstanding waits for it. That both removes the race and
-     * lets the file reclaim its clean name instead of landing as `_1`.
+     * Two independent races share this one fix, and both come from the backend
+     * having no upload idempotency:
+     *
+     *  - **Re-upload racing a DELETE.** Eager upload widens the window between
+     *    "remove the chip" and "attach it again"; a DELETE still in flight when
+     *    the re-upload claims the name could remove the file that just replaced
+     *    it. Waiting also lets the file reclaim its clean name instead of `_1`.
+     *  - **Two same-named uploads truncating each other.** The dedupe key is
+     *    `name|size|lastModified`, so two *different* files called `report.pdf`
+     *    both attach. Concurrently, each one lists `uploads/` before either has
+     *    written (`thread_uploads.py:763-769`), both claim `report.pdf`, and the
+     *    second `sftp.open(..., "wb")` truncates the first. Serializing them
+     *    makes the second list *after* the first wrote, so it takes `report_1`.
+     *    The old batched POST resolved names inside one listing and could not
+     *    hit this; per-file requests reintroduced it.
      */
-    private readonly pendingDeletes = new Map<string, Promise<void>>();
+    private readonly nameBarrier = new Map<string, Promise<void>>();
+
+    /** Requests currently on the wire, and the FIFO of gates waiting for one of
+     *  the {@link MAX_CONCURRENT_UPLOADS} slots to come free. */
+    private activeUploads = 0;
+    private readonly slotWaiters: (() => void)[] = [];
 
     /**
      * Begin uploading an attached file. Idempotent per preview id.
@@ -141,17 +181,7 @@ export class UploadRegistryService {
         };
         this.entries.set(preview.id, entry);
 
-        // Through ApiService → HttpClient, never a raw XHR/fetch: the auth
-        // interceptor's `ngsw-bypass: 1` is what stops the service worker
-        // corrupting the multipart body and killing upload progress.
-        const pendingDelete = this.pendingDeletes.get(deleteKey(threadId, preview.file.name));
-        const source = pendingDelete
-            ? from(pendingDelete).pipe(
-                switchMap(() => this.api.uploadOneToThread(threadId, entry.file)),
-            )
-            : this.api.uploadOneToThread(threadId, entry.file);
-
-        entry.sub = source.subscribe({
+        entry.sub = this._gatedUpload(threadId, entry.file).subscribe({
             next: (ev) => {
                 if (ev.kind === 'progress') {
                     entry.loaded = ev.loaded;
@@ -202,7 +232,11 @@ export class UploadRegistryService {
     adopt(threadId: string, previewId: string, file: File): Observable<ThreadUploadEvent> {
         const entry = this.entries.get(previewId);
         if (!entry || entry.threadId !== threadId || entry.deleteOnArrival) {
-            return this.api.uploadOneToThread(threadId, file);
+            // Gated like every other request: the deferred path is a fallback,
+            // not an exemption. Issuing it raw would let a flush-time upload
+            // race an eager one for the same name — the truncation the barrier
+            // exists to prevent — and would ignore the concurrency ceiling.
+            return this._gatedUpload(threadId, file);
         }
         entry.adopted = true;
         if (entry.status === 'done') {
@@ -283,22 +317,142 @@ export class UploadRegistryService {
         for (const previewId of [...this.entries.keys()]) this.cancel(previewId);
     }
 
+    /**
+     * The single point at which an upload request is issued.
+     *
+     * Wraps `uploadOneToThread` in the two limits spec §5.3 asks for — a FIFO
+     * barrier per requested filename, then a global concurrency ceiling — and
+     * releases both on completion, failure **or unsubscribe** (`finalize`), so
+     * a cancelled chip never wedges the name or leaks a slot.
+     *
+     * Through ApiService → HttpClient, never a raw XHR/fetch: the auth
+     * interceptor's `ngsw-bypass: 1` is what stops the service worker
+     * corrupting the multipart body and killing upload progress.
+     *
+     * `defer` matters: the gate is claimed at SUBSCRIBE time. Claiming it when
+     * the observable is merely constructed would hold the name for a caller
+     * that never subscribes.
+     */
+    private _gatedUpload(threadId: string, file: File): Observable<ThreadUploadEvent> {
+        return defer(() => {
+            const gate = this._enterGate(threadId, file.name);
+            const request = this.api.uploadOneToThread(threadId, file);
+            return (
+                gate.wait ? from(gate.wait).pipe(switchMap(() => request)) : request
+            ).pipe(finalize(() => gate.release()));
+        });
+    }
+
+    /**
+     * Claim a place in this filename's chain and, once it is ours, a
+     * concurrency slot.
+     *
+     * ORDER IS LOAD-BEARING: barrier first, slot second. Taking the scarce slot
+     * before waiting on the barrier would let a blocked upload sit on a slot
+     * that the upload it is waiting for needs — a deadlock with two same-named
+     * files and a ceiling of two. Waiting slotless cannot deadlock: whatever
+     * holds the slots is a request already on the wire.
+     *
+     * Returns `wait: null` when the name is free and a slot is available, so an
+     * ordinary attach still issues its request synchronously rather than a
+     * microtask later.
+     */
+    private _enterGate(
+        threadId: string,
+        name: string,
+    ): {wait: Promise<void> | null; release: () => void} {
+        const key = barrierKey(threadId, name);
+
+        // Chain: we run after everything already queued on this key, and
+        // anything queued after us runs after `mine` resolves.
+        let releaseBarrier!: () => void;
+        const mine = new Promise<void>((resolve) => (releaseBarrier = resolve));
+        const previous = this.nameBarrier.get(key);
+        const chained = (previous ?? Promise.resolve()).then(() => mine);
+        this.nameBarrier.set(key, chained);
+        void chained.then(() => {
+            if (this.nameBarrier.get(key) === chained) this.nameBarrier.delete(key);
+        });
+
+        const state = {slot: false, released: false};
+        const release = () => {
+            if (state.released) return;
+            state.released = true;
+            if (state.slot) {
+                state.slot = false;
+                this._releaseSlot();
+            }
+            releaseBarrier();
+            // Drop the key SYNCHRONOUSLY when we are the tail of the chain —
+            // waiting for `chained`'s own `.then` would leave a spent barrier
+            // in the map for a microtask, and the very next attach would defer
+            // behind a request that is already over. Nobody is chained behind
+            // the tail, so this can never skip a waiter.
+            if (this.nameBarrier.get(key) === chained) this.nameBarrier.delete(key);
+        };
+
+        if (previous === undefined) {
+            const slotWait = this._acquireSlot();
+            if (slotWait === null) {
+                state.slot = true;
+                return {wait: null, release}; // wholly unconstrained: go now
+            }
+            return {wait: slotWait.then(() => this._settleSlot(state)), release};
+        }
+        return {
+            wait: previous.then(async () => {
+                const slotWait = this._acquireSlot();
+                if (slotWait) await slotWait;
+                this._settleSlot(state);
+            }),
+            release,
+        };
+    }
+
+    /** A slot has just been granted: keep it, or hand it straight back when the
+     *  subscription was torn down while we queued for it. */
+    private _settleSlot(state: {slot: boolean; released: boolean}): void {
+        if (state.released) this._releaseSlot();
+        else state.slot = true;
+    }
+
+    /** Take a slot, or queue for one. Null means "taken, synchronously" — the
+     *  caller holds it either way once the returned promise settles. */
+    private _acquireSlot(): Promise<void> | null {
+        if (this.activeUploads < MAX_CONCURRENT_UPLOADS) {
+            this.activeUploads += 1;
+            return null;
+        }
+        return new Promise<void>((resolve) => {
+            this.slotWaiters.push(() => {
+                this.activeUploads += 1;
+                resolve();
+            });
+        });
+    }
+
+    /** Give a slot back and hand it to the longest-waiting gate, if any. */
+    private _releaseSlot(): void {
+        this.activeUploads -= 1;
+        this.slotWaiters.shift()?.();
+    }
+
     /** Delete what an upload actually stored, and hold the barrier that stops a
      *  re-upload of the same requested name from racing it. */
     private _deleteUploaded(entry: EagerUpload): void {
-        const key = deleteKey(entry.threadId, entry.file.name);
+        const key = barrierKey(entry.threadId, entry.file.name);
         const targets = topLevelUploadTargets(entry.resolved.map((f) => f.name));
         if (targets.length === 0) return;
 
-        // CHAIN onto whatever is already deleting under this key, never replace
-        // it. The key is the name a re-upload would REQUEST, while the targets
-        // are the names the server ASSIGNED — so two chips for same-named but
-        // different files (stored as `a.pdf` and `a_1.pdf`, both keyed
-        // `t1 a.pdf`) share a key. Overwriting left the first DELETE
-        // unbarriered, and a re-attached `a.pdf` could then be uploaded and
-        // deleted by that older, still-in-flight DELETE — precisely the race
-        // the barrier exists to close.
-        const previous = this.pendingDeletes.get(key) ?? Promise.resolve();
+        // CHAIN onto whatever is already queued under this key — an upload or
+        // an earlier DELETE — never replace it. The key is the name a re-upload
+        // would REQUEST, while the targets are the names the server ASSIGNED —
+        // so two chips for same-named but different files (stored as `a.pdf`
+        // and `a_1.pdf`, both keyed `t1 a.pdf`) share a key. Overwriting left
+        // the first DELETE unbarriered, and a re-attached `a.pdf` could then be
+        // uploaded and deleted by that older, still-in-flight DELETE —
+        // precisely the race the barrier exists to close.
+        const previous = this.nameBarrier.get(key) ?? Promise.resolve();
         const done = previous
             .then(() =>
                 Promise.all(
@@ -316,9 +470,9 @@ export class UploadRegistryService {
             )
             .then(() => undefined);
 
-        this.pendingDeletes.set(key, done);
+        this.nameBarrier.set(key, done);
         void done.then(() => {
-            if (this.pendingDeletes.get(key) === done) this.pendingDeletes.delete(key);
+            if (this.nameBarrier.get(key) === done) this.nameBarrier.delete(key);
         });
     }
 }

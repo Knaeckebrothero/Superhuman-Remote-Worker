@@ -14,6 +14,7 @@ import {Observable, Subscriber} from 'rxjs';
 import {ApiService} from './api.service';
 import {
     isUploadCancelled,
+    MAX_CONCURRENT_UPLOADS,
     UploadCancelledError,
     UploadRegistryService,
 } from './upload-registry.service';
@@ -391,6 +392,9 @@ describe('UploadRegistryService', () => {
         ctx.registry.start('t1', second);
         ctx.uploads[0].emit(done(uploaded('a.pdf')));
         ctx.uploads[0].finish();
+        // The second is barriered behind the first (same requested name), so
+        // it only reaches the wire once the first has landed.
+        await tick();
         ctx.uploads[1].emit(done(uploaded('a_1.pdf')));
         ctx.uploads[1].finish();
 
@@ -470,5 +474,138 @@ describe('UploadRegistryService', () => {
     it('does not start an upload for a preview with no File handle', () => {
         ctx.registry.start('t1', {...preview('a.pdf'), file: undefined as unknown as File});
         expect(ctx.uploads).toHaveLength(0);
+    });
+
+    // --- bounded concurrency + the same-name barrier (spec §5.3) ------------
+
+    describe('request gating', () => {
+        it(`never puts more than ${MAX_CONCURRENT_UPLOADS} requests on the wire`, async () => {
+            // Spec §5.3 asks for a ceiling of 2; the shipped code started one
+            // unbounded request per attached file. The server's own virtual-tier
+            // semaphore is 4 and shared across ALL users, and every request is a
+            // fully-buffered body on both ends.
+            for (let i = 0; i < 5; i++) ctx.registry.start('t1', preview(`f${i}.pdf`, `p${i}`));
+            await tick();
+
+            expect(ctx.uploads).toHaveLength(MAX_CONCURRENT_UPLOADS);
+            expect(ctx.uploads.map((u) => u.file.name)).toEqual(['f0.pdf', 'f1.pdf']);
+        });
+
+        it('admits the next queued file the moment a slot frees, in order', async () => {
+            for (let i = 0; i < 4; i++) ctx.registry.start('t1', preview(`f${i}.pdf`, `p${i}`));
+            await tick();
+
+            ctx.uploads[0].emit(done(uploaded('f0.pdf')));
+            ctx.uploads[0].finish();
+            await tick();
+            expect(ctx.uploads.map((u) => u.file.name)).toEqual([
+                'f0.pdf',
+                'f1.pdf',
+                'f2.pdf',
+            ]);
+
+            ctx.uploads[1].emit(done(uploaded('f1.pdf')));
+            ctx.uploads[1].finish();
+            await tick();
+            expect(ctx.uploads).toHaveLength(4);
+        });
+
+        it('gives the slot back when a queued upload is cancelled before it starts', async () => {
+            // A gate that leaked its slot on cancel would strangle the queue
+            // after two removed chips and never recover.
+            ctx.registry.start('t1', preview('f0.pdf', 'p0'));
+            ctx.registry.start('t1', preview('f1.pdf', 'p1'));
+            ctx.registry.start('t1', preview('f2.pdf', 'p2'));
+            await tick();
+            expect(ctx.uploads).toHaveLength(2);
+
+            ctx.registry.cancel('p0');
+            await tick();
+
+            expect(ctx.uploads.map((u) => u.file.name)).toEqual([
+                'f0.pdf',
+                'f1.pdf',
+                'f2.pdf',
+            ]);
+        });
+
+        it('serializes two same-named files so the second cannot truncate the first', async () => {
+            // THE DATA-LOSS CASE. The dedupe key is name|size|lastModified, so
+            // two *different* files called a.pdf both attach. Run concurrently,
+            // each lists uploads/ before either has written
+            // (thread_uploads.py:763-769), both claim `a.pdf`, and the second
+            // write truncates the first. The old batched POST resolved names
+            // inside ONE listing and could not hit this.
+            const first = preview('a.pdf', 'p1');
+            const second = preview('a.pdf', 'p2', 222);
+            ctx.registry.start('t1', first);
+            ctx.registry.start('t1', second);
+            await tick();
+
+            // Second is held, even though a concurrency slot is free.
+            expect(ctx.uploads).toHaveLength(1);
+
+            ctx.uploads[0].emit(done(uploaded('a.pdf')));
+            ctx.uploads[0].finish();
+            await tick();
+
+            // It lists AFTER the first landed, so the server hands it `a_1.pdf`.
+            expect(ctx.uploads).toHaveLength(2);
+            expect(ctx.uploads[1].file.name).toBe('a.pdf');
+        });
+
+        it('releases the name even when the first same-named upload fails', async () => {
+            const first = preview('a.pdf', 'p1');
+            ctx.registry.start('t1', first);
+            ctx.registry.start('t1', preview('a.pdf', 'p2', 222));
+            await tick();
+            expect(ctx.uploads).toHaveLength(1);
+
+            ctx.uploads[0].fail({status: 503});
+            await tick();
+
+            expect(ctx.uploads).toHaveLength(2);
+        });
+
+        it('does not hold up a different name behind a slow one', async () => {
+            ctx.registry.start('t1', preview('a.pdf', 'p1'));
+            ctx.registry.start('t1', preview('b.pdf', 'p2'));
+            await tick();
+
+            expect(ctx.uploads).toHaveLength(2);
+        });
+
+        it('does not hold up the same name in a DIFFERENT thread', async () => {
+            // Collisions are resolved per workspace; the key has to carry the
+            // thread or two sessions would needlessly serialize.
+            ctx.registry.start('t1', preview('a.pdf', 'p1'));
+            ctx.registry.start('t2', preview('a.pdf', 'p2'));
+            await tick();
+
+            expect(ctx.uploads).toHaveLength(2);
+        });
+
+        it("the send path's fallback request is gated too", async () => {
+            // adopt()'s fallback is the deferred upload path. Issuing it raw
+            // would let a flush-time upload race an eager one for the same name
+            // — the truncation this barrier exists to prevent.
+            ctx.registry.start('t1', preview('a.pdf', 'p1'));
+            await tick();
+            expect(ctx.uploads).toHaveLength(1);
+
+            // A different preview id, so nothing to adopt: fresh request.
+            ctx.registry
+                .adopt('t1', 'never-started', new File(['y'], 'a.pdf'))
+                .subscribe({error: () => undefined});
+            await tick();
+
+            expect(ctx.uploads).toHaveLength(1); // barriered behind the eager one
+
+            ctx.uploads[0].emit(done(uploaded('a.pdf')));
+            ctx.uploads[0].finish();
+            await tick();
+
+            expect(ctx.uploads).toHaveLength(2);
+        });
     });
 });

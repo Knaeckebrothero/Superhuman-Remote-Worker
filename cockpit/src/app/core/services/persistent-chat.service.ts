@@ -2565,6 +2565,11 @@ export class PersistentChatService {
         if (!this.canUploadEagerly()) return;
         const threadId = this.threadId();
         if (!threadId) return;
+        // One `start` per file, but NOT one request per file on the wire: the
+        // registry gates them (spec §5.3 — at most MAX_CONCURRENT_UPLOADS in
+        // flight, and same-named files strictly serialized so the second can
+        // never truncate the first). Selecting twenty files here opens two
+        // requests, not twenty.
         for (const preview of accepted) this.uploads.start(threadId, preview);
     }
 
@@ -2819,7 +2824,21 @@ export class PersistentChatService {
                 // so `head` is a stale snapshot of the attachments by now. Only
                 // files the server confirmed go into the hint.
                 const item = this.outbox().find((i) => i.localId === head.localId);
-                const names = (item?.attachments ?? [])
+                // Gone from the queue while stage 0 ran — discarded, drained,
+                // or carried to another thread. POSTing it now would send a
+                // message the queue no longer believes in, and (on the A→B→A
+                // path, where the thread ids match again so the guard below
+                // cannot see the switch) would deliver stale text into a
+                // re-opened thread. The upload stage widened that window from
+                // the ~30s POST timeout to the length of a whole transfer.
+                //
+                // A guard AFTER _postInput would be worse, not better: the send
+                // is already accepted server-side by then, so dropping the
+                // resolution loses the removal and the next flush double-sends
+                // — the exact failure the outbox's no-auto-retry rule exists to
+                // prevent. Refuse before committing, never after.
+                if (!item) return;
+                const names = (item.attachments ?? [])
                     .filter((a) => a.path)
                     .map((a) => a.name);
                 const content = composeAgentContent(head.displayContent, names);
@@ -2827,7 +2846,7 @@ export class PersistentChatService {
                 // queue can be inspected (and a retry compared) without
                 // recomputing. Skipped when unchanged — a retry must not churn
                 // the signal for nothing.
-                if (item && item.content !== content) {
+                if (item.content !== content) {
                     this.outbox.update((q) =>
                         q.map((i) => (i.localId === head.localId ? {...i, content} : i)),
                     );

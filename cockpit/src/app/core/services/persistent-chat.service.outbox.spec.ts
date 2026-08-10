@@ -804,6 +804,67 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             ctx.service.discardQueuedSend(localId);
             expect(ctx.service.outbox().length).toBe(1);
         });
+
+        it('does not POST an item that left the queue while its upload ran (A→B→A)', async () => {
+            // The flush's post-stage guard compares thread IDENTITY, so the
+            // A→B→A round trip defeats it: by the time the upload resolves the
+            // ids match again and the guard waves it through — but connect(B)
+            // emptied the outbox on the way past, so the item being POSTed no
+            // longer exists. Re-reading it and refusing is what closes this.
+            // The upload stage widened the window from the ~30s POST timeout to
+            // the length of a whole transfer.
+            const ctx = await readySession('t1');
+            const gate = new Subject<ThreadUploadEvent>();
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            void ctx.service.sendMessage('stale text');
+            await flushTick();
+            expect(inputPosts(ctx).length).toBe(0); // still in stage 0
+
+            await ctx.service.connect('t2'); // clears t1's outbox
+            await ctx.service.connect('t1'); // ids match again
+
+            gate.next(done(uploaded('a.pdf')));
+            gate.complete();
+            await flushTick();
+
+            expect(ctx.service.outbox()).toEqual([]);
+            expect(inputPosts(ctx).length).toBe(0);
+        });
+
+        it('a horizon reload KEEPS a mid-upload bubble — only the POST set may skip', async () => {
+            // The postingLocalIds / uploadingLocalIds asymmetry, pinned.
+            //
+            // `_redispatchOutboxBubbles(skipInFlight)` consults ONLY the POST
+            // set. A mid-upload item has never been POSTed, so it cannot be in
+            // the reloaded history, and skipping it would delete its bubble
+            // outright — the user's message vanishing mid-transfer with the
+            // outbox still holding it. `discardQueuedSend` legitimately checks
+            // both sets, so the two look interchangeable at a glance and a
+            // future "tidy-up" that merges them would go green everywhere else.
+            const ctx = await readySession('t1');
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(new Subject<ThreadUploadEvent>());
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            void ctx.service.sendMessage('with a file');
+            await flushTick();
+
+            // Precondition, so this can never pass vacuously on an upload that
+            // already finished: uploading yes, posting no.
+            const localId = ctx.service.outbox()[0].localId;
+            expect((ctx.service as any).uploadingLocalIds.has(localId)).toBe(true);
+            expect((ctx.service as any).postingLocalIds.has(localId)).toBe(false);
+
+            fireSseNamedEvent(ctx.sseInstances[0], 'gone_beyond_horizon', {
+                params: {epoch: 2, server_seq: 0},
+            });
+            await flushTick();
+            await flushTick();
+
+            const bubbles = ctx.service.turns().filter(isUserTurn).map((t) => (t as UserTurn).content);
+            expect(bubbles.filter((c) => c === 'with a file').length).toBe(1);
+        });
     });
 
     // --- 8. eager upload on attach (§5.4) ---------------------------------
