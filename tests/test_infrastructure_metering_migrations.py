@@ -136,7 +136,8 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 # worker-lane partition (0118), session control inbox (0119-0121), and the
 # stateless cloud-generation fence/content baseline (0122-0124), and durable
 # owner-gated client presence (0125), and lane-independent Canvas editor
-# awareness (0126), and the exact-lease interrupt inbox (0127-0129).
+# awareness (0126), the exact-lease interrupt inbox (0127-0129), and the
+# verification-critic dedupe/concurrent unique-index rollout (0130-0132).
 APP_JOBS_EXECUTION_LANE_MIGRATION = (
     ROOT / "orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
 )
@@ -177,9 +178,18 @@ APP_THREAD_INTERRUPT_VALIDATION = (
     ROOT
     / "orchestrator/database/migrations/app/0129_thread_interrupt_validate_constraints.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = (
+APP_JOBS_VERIFICATION_DEDUPE = (
+    ROOT / "orchestrator/database/migrations/app/0130_jobs_verification_dedupe.sql"
+)
+APP_JOBS_VERIFICATION_DROP_INDEX = (
     ROOT
-    / "orchestrator/database/migrations/app/0129_thread_interrupt_validate_constraints.sql"
+    / "orchestrator/database/migrations/app/0131_drop_jobs_verification_uniq.notx.sql"
+)
+APP_JOBS_VERIFICATION_INDEX = (
+    ROOT / "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = (
+    ROOT / "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

@@ -1,0 +1,474 @@
+"""Atomic jobs-row disposition regressions for completion Class A.
+
+The completion paths used to commit status, agent release, freeze shedding,
+and ``completed_at`` separately. These tests pin both halves of the repair:
+``PostgresDB.update_job_status`` emits one UPDATE containing the full
+disposition, and the live endpoints select the right freeze behavior.
+"""
+
+from __future__ import annotations
+
+import json
+from contextlib import ExitStack, asynccontextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
+
+import pytest
+
+import main
+from orchestrator.database.postgres import PostgresDB
+
+JOB_ID = "11111111-1111-1111-1111-111111111111"
+AGENT_ID = "22222222-2222-2222-2222-222222222222"
+PROJECT_ID = "33333333-3333-3333-3333-333333333333"
+
+
+def _normalized(sql: str) -> str:
+    return " ".join(sql.split())
+
+
+def _db_with_connection(conn: AsyncMock) -> PostgresDB:
+    db = PostgresDB.__new__(PostgresDB)
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    db.acquire = acquire
+    db.delete_checkpoint_thread = AsyncMock(return_value=0)
+    return db
+
+
+class TestUpdateJobStatusClassA:
+    @pytest.mark.asyncio
+    async def test_completed_status_automatically_coalesces_timestamp(self):
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        db = _db_with_connection(conn)
+
+        assert await db.update_job_status(
+            JOB_ID,
+            status="completed",
+        )
+
+        conn.execute.assert_awaited_once()
+        sql = _normalized(conn.execute.await_args.args[0])
+        assert sql.startswith("UPDATE jobs SET status = $1,")
+        assert "completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)" in sql
+        assert "assigned_agent_id" not in sql
+        assert "freeze_data" not in sql
+        assert conn.execute.await_args.args[1:] == ("completed", UUID(JOB_ID))
+
+    @pytest.mark.asyncio
+    async def test_pause_stashes_exact_payload_and_clears_in_one_update(self):
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        db = _db_with_connection(conn)
+        freeze = {
+            "freeze_type": "version_upgrade",
+            "phase_number": 7,
+            "reason": "drain",
+        }
+
+        assert await db.update_job_status(
+            JOB_ID,
+            status="paused",
+            assigned_agent_id="",
+            freeze_data=freeze,
+            stash_and_clear_freeze=True,
+        )
+
+        conn.execute.assert_awaited_once()
+        args = conn.execute.await_args.args
+        sql = _normalized(args[0])
+        assert sql.startswith("UPDATE jobs SET status = $1, assigned_agent_id = $2,")
+        assert (
+            "context = COALESCE(context, '{}'::jsonb) || "
+            "jsonb_build_object('last_freeze_data', $3::jsonb)"
+        ) in sql
+        assert "freeze_data = NULL" in sql
+        assert "freeze_data = $3::jsonb" not in sql
+        assert args[1:] == ("paused", None, json.dumps(freeze), UUID(JOB_ID))
+
+    @pytest.mark.asyncio
+    async def test_human_action_pause_clears_agent_but_keeps_freeze(self):
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        db = _db_with_connection(conn)
+
+        assert await db.update_job_status(
+            JOB_ID,
+            status="paused",
+            assigned_agent_id="",
+        )
+
+        conn.execute.assert_awaited_once()
+        sql = _normalized(conn.execute.await_args.args[0])
+        assert "assigned_agent_id = $2" in sql
+        assert "last_freeze_data" not in sql
+        assert "freeze_data = NULL" not in sql
+        assert "completed_at" not in sql
+
+
+class _EndpointDB(PostgresDB):
+    """Small real-helper/fake-connection DB for driving ``complete_job``."""
+
+    def __init__(
+        self,
+        job: dict,
+        *,
+        project: dict | None = None,
+        fail_initial_freeze_write: bool = False,
+    ) -> None:
+        self.job = job
+        self.project = project
+        self.statements: list[tuple[str, tuple]] = []
+        self.context_writes: list[dict] = []
+        self.fail_initial_freeze_write = fail_initial_freeze_write
+
+    @asynccontextmanager
+    async def acquire(self):
+        db = self
+
+        class _Connection:
+            async def execute(self, sql: str, *args):
+                db.statements.append((sql, args))
+                normalized = _normalized(sql)
+
+                if normalized.startswith("UPDATE jobs SET freeze_data = $1::jsonb"):
+                    if db.fail_initial_freeze_write:
+                        db.fail_initial_freeze_write = False
+                        raise RuntimeError("injected S3 freeze persist failure")
+                    db.job["freeze_data"] = json.loads(args[0])
+                elif normalized.startswith("UPDATE jobs SET status = $1"):
+                    db.job["status"] = args[0]
+                    if "assigned_agent_id = $2" in normalized:
+                        db.job["assigned_agent_id"] = args[1]
+                    if "last_freeze_data" in normalized:
+                        freeze_json = next(
+                            value
+                            for value in args
+                            if isinstance(value, str) and value.startswith("{")
+                        )
+                        frozen = json.loads(freeze_json)
+                        db.job.setdefault("context", {})["last_freeze_data"] = frozen
+                        db.job["freeze_data"] = None
+                    if "completed_at = COALESCE" in normalized:
+                        db.job["completed_at"] = "set"
+                return "UPDATE 1"
+
+        yield _Connection()
+
+    async def get_job(self, job_id: str) -> dict:
+        return self.job
+
+    async def get_project(self, project_id: str) -> dict | None:
+        return self.project
+
+    async def update_job_cloud_diff(self, job_id: str, **updates) -> bool:
+        self.job.update(updates)
+        return True
+
+    async def update_job_merge_status(self, job_id: str, **updates) -> bool:
+        self.job.update(updates)
+        return True
+
+    async def merge_job_context(self, job_id: str, updates: dict) -> bool:
+        self.context_writes.append(updates)
+        self.job.setdefault("context", {}).update(updates)
+        return True
+
+    async def delete_checkpoint_thread(self, job_id: str) -> int:
+        return 0
+
+    def class_a_statements(self) -> list[tuple[str, tuple]]:
+        return [
+            (sql, args)
+            for sql, args in self.statements
+            if _normalized(sql).startswith("UPDATE jobs SET status = $1")
+        ]
+
+
+def _job(*, freeze_data: dict | None = None, **overrides) -> dict:
+    job = {
+        "id": JOB_ID,
+        "status": "processing",
+        "assigned_agent_id": AGENT_ID,
+        "freeze_data": freeze_data,
+        "context": {},
+        "parent_job_id": None,
+        "project_id": None,
+        "user_id": None,
+        "config_name": "defaults",
+        "config_override": None,
+        "resolved_config": {
+            "agent": {
+                "autonomy": "full",
+                "verification": {"enabled": False},
+                "curator": {"enabled": False},
+            }
+        },
+        "cloud_diff_baseline_commit": None,
+        "merge_status": None,
+        "repo_name": None,
+        "branch_name": None,
+    }
+    job.update(overrides)
+    return job
+
+
+def _patch_completion(stack: ExitStack, db: _EndpointDB) -> None:
+    stack.enter_context(patch("main.require_internal", AsyncMock()))
+    stack.enter_context(patch("main.postgres_db", db))
+    gitea = MagicMock()
+    gitea.is_initialized = False
+    stack.enter_context(patch("main.gitea_client", gitea))
+    stack.enter_context(patch("main.vector_db", None))
+    stack.enter_context(
+        patch(
+            "services.completion.apply_deliverable_gate",
+            AsyncMock(
+                side_effect=lambda job, result, status, **kw: (status, [], False)
+            ),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "services.completion.apply_terminal_job_side_effects",
+            AsyncMock(return_value={"actions": []}),
+        )
+    )
+    for helper in (
+        "_handle_critic_verdict_on_complete",
+        "_handle_scholar_completion",
+        "_handle_delegation_child_completion",
+        "_trigger_verification_on_complete",
+        "_advance_project_loop",
+        "_archive_and_cleanup_workspace",
+        "maybe_wake_session",
+    ):
+        stack.enter_context(patch(f"main.{helper}", AsyncMock(return_value=[])))
+    stack.enter_context(patch("main._kick_session_wake_drain", MagicMock()))
+    stack.enter_context(patch("main._trigger_dispatch", MagicMock()))
+
+
+class TestCompleteJobClassA:
+    @pytest.mark.asyncio
+    async def test_completed_disposition_is_one_jobs_update(self):
+        job = _job()
+        db = _EndpointDB(job)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            freeze_data={"status": "job_completed", "summary": "done"},
+        )
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            handled = await main.complete_job(MagicMock(), JOB_ID, body)
+
+        [(sql, _args)] = db.class_a_statements()
+        normalized = _normalized(sql)
+        assert "completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)" in normalized
+        assert sum("completed_at" in sql for sql, _ in db.statements) == 1
+        assert handled["new_status"] == "completed"
+        assert handled["actions"] == ["status -> completed"]
+        assert job["completed_at"] == "set"
+
+    @pytest.mark.asyncio
+    async def test_auto_pause_uses_report_payload_after_initial_persist_failure(self):
+        freeze = {
+            "freeze_type": "version_upgrade",
+            "phase_number": 5,
+            "reason": "deploy drain",
+        }
+        job = _job()
+        db = _EndpointDB(job, fail_initial_freeze_write=True)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=False,
+            freeze_data=freeze,
+        )
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            handled = await main.complete_job(MagicMock(), JOB_ID, body)
+
+        [(sql, args)] = db.class_a_statements()
+        normalized = _normalized(sql)
+        assert "assigned_agent_id = $2" in normalized
+        assert "jsonb_build_object('last_freeze_data', $3::jsonb)" in normalized
+        assert "freeze_data = NULL" in normalized
+        assert json.loads(args[2]) == freeze
+        assert handled["new_status"] == "paused"
+        assert handled["actions"] == [
+            "status -> paused",
+            "cleared agent on paused job (re-dispatchable)",
+            "freeze stashed to context (auto-redispatch)",
+        ]
+        assert job["assigned_agent_id"] is None
+        assert job["freeze_data"] is None
+        assert job["context"]["last_freeze_data"] == freeze
+        assert all("last_freeze_data" not in update for update in db.context_writes)
+
+    @pytest.mark.asyncio
+    async def test_vm_upgrade_pause_keeps_freeze_in_the_same_row(self):
+        freeze = {
+            "freeze_type": "vm_upgrade_required",
+            "command": "apt install example",
+            "reason": "needs packages",
+        }
+        job = _job()
+        db = _EndpointDB(job)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=False,
+            freeze_data=freeze,
+        )
+
+        def close_capture(coroutine, **_kwargs):
+            coroutine.close()
+            return MagicMock()
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            stack.enter_context(patch("main._check_vm_permission", AsyncMock()))
+            stack.enter_context(
+                patch(
+                    "main.sudo_gate.insert_vm_upgrade_request",
+                    AsyncMock(return_value=None),
+                )
+            )
+            stack.enter_context(patch("main._notify_operator_freeze", AsyncMock()))
+            stack.enter_context(
+                patch("main._capture_workspace_snapshot_for_freeze", AsyncMock())
+            )
+            stack.enter_context(
+                patch("main.asyncio.create_task", MagicMock(side_effect=close_capture))
+            )
+            handled = await main.complete_job(MagicMock(), JOB_ID, body)
+
+        [(sql, _args)] = db.class_a_statements()
+        normalized = _normalized(sql)
+        assert "assigned_agent_id = $2" in normalized
+        assert "last_freeze_data" not in normalized
+        assert "freeze_data = NULL" not in normalized
+        assert "completed_at" not in normalized
+        assert handled["new_status"] == "paused"
+        assert handled["actions"][:2] == [
+            "status -> paused",
+            "cleared agent on paused job (re-dispatchable)",
+        ]
+        assert "freeze stashed to context (auto-redispatch)" not in handled["actions"]
+        assert job["freeze_data"] == freeze
+
+
+class TestDiffDecisionClassA:
+    @pytest.mark.asyncio
+    async def test_accept_uses_one_status_and_timestamp_update(self):
+        job = _job(
+            status="pending_review",
+            project_id=PROJECT_ID,
+            diff_status="pending",
+            cloud_diff_baseline_commit="a" * 40,
+        )
+        project = {
+            "id": PROJECT_ID,
+            "name": "Cloud project",
+            "main_cloud_backend": "opencloud",
+            "main_cloud_folder_handle": "opaque-handle",
+        }
+        db = _EndpointDB(job, project=project)
+        gitea = MagicMock()
+        gitea.is_initialized = True
+        router = MagicMock()
+        backend = MagicMock()
+        backend.is_initialized = True
+        router.for_backend.return_value = backend
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("main.require_job_access", AsyncMock(return_value=({}, job)))
+            )
+            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("main.gitea_client", gitea))
+            stack.enter_context(patch("main.main_cloud_router", router))
+            stack.enter_context(patch("main.vector_db", None))
+            stack.enter_context(
+                patch(
+                    "services.job_cloud_baseline.get_diff_summary",
+                    AsyncMock(
+                        return_value={
+                            "files": [],
+                            "head_commit": "b" * 40,
+                        }
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "services.job_cloud_baseline.detect_external_mods",
+                    AsyncMock(return_value=[]),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "services.job_cloud_baseline.apply_diff_to_cloud",
+                    AsyncMock(return_value={"applied": 2, "deleted": 1, "errors": []}),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "services.job_cloud_baseline.project_folder_slug", return_value="p"
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "services.completion.apply_terminal_job_side_effects",
+                    AsyncMock(return_value={"actions": []}),
+                )
+            )
+            result = await main.accept_job_diff(MagicMock(), JOB_ID)
+
+        [(sql, _args)] = db.class_a_statements()
+        assert (
+            "completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)"
+            in _normalized(sql)
+        )
+        assert sum("completed_at" in sql for sql, _ in db.statements) == 1
+        assert result["status"] == "completed"
+        assert result["diff_status"] == "accepted"
+
+    @pytest.mark.asyncio
+    async def test_reject_uses_one_status_and_timestamp_update(self):
+        job = _job(
+            status="pending_review",
+            project_id=PROJECT_ID,
+            diff_status="pending",
+        )
+        db = _EndpointDB(job)
+        gitea = MagicMock()
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("main.require_job_access", AsyncMock(return_value=({}, job)))
+            )
+            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("main.gitea_client", gitea))
+            stack.enter_context(patch("main.vector_db", None))
+            stack.enter_context(
+                patch(
+                    "services.completion.apply_terminal_job_side_effects",
+                    AsyncMock(return_value={"actions": []}),
+                )
+            )
+            result = await main.reject_job_diff(MagicMock(), JOB_ID)
+
+        [(sql, _args)] = db.class_a_statements()
+        assert (
+            "completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)"
+            in _normalized(sql)
+        )
+        assert sum("completed_at" in sql for sql, _ in db.statements) == 1
+        assert result["status"] == "completed"
+        assert result["diff_status"] == "rejected"
