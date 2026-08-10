@@ -270,6 +270,8 @@ GET    /api/persistent/threads/{thread_id}/browser/capability                   
 POST   /api/persistent/threads/{thread_id}/browser/open                                 gated:require_thread_owner
 DELETE /api/persistent/threads/{thread_id}/canvases/main                                gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/canvases/main                                gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/canvases/main/awareness/stream               gated:require_thread_owner
+PUT    /api/persistent/threads/{thread_id}/canvases/main/awareness/{editing_session_id} gated:require_thread_owner
 PUT    /api/persistent/threads/{thread_id}/canvases/main/content                        gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/canvases/main/office-session                 gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/canvases/main/refresh                        gated:require_thread_owner

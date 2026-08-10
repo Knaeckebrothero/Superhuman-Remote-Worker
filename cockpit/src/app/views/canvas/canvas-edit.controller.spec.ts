@@ -5,7 +5,7 @@ import {of, Subject, throwError} from 'rxjs';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {CanvasMutationResponse, CanvasState} from '../../core/models/canvas.model';
 import {CanvasService} from '../../core/services/canvas.service';
-import {PersistentThreadTransportBridge} from '../../core/services/persistent-thread-transport-bridge.service';
+import {CanvasAwarenessController} from './canvas-awareness.controller';
 import {CanvasEditController} from './canvas-edit.controller';
 
 function contentUrl(revision: number, version = `sha256:${revision}`): string {
@@ -43,7 +43,12 @@ function mutation(state: CanvasState, contentEtag: string): CanvasMutationRespon
 
 describe('CanvasEditController', () => {
   let controller: CanvasEditController;
-  let bridge: PersistentThreadTransportBridge;
+  let awareness: {
+    remoteEditing: ReturnType<typeof signal<boolean>>;
+    sync: ReturnType<typeof vi.fn>;
+    startEditing: ReturnType<typeof vi.fn>;
+    stopEditing: ReturnType<typeof vi.fn>;
+  };
   let canvas: {
     state: ReturnType<typeof signal<CanvasState | null>>;
     requestError: ReturnType<typeof signal<{status: number | null; code: string | null} | null>>;
@@ -60,15 +65,20 @@ describe('CanvasEditController', () => {
       refreshSource: vi.fn(),
       reconcile: vi.fn(),
     };
+    awareness = {
+      remoteEditing: signal(false),
+      sync: vi.fn(),
+      startEditing: vi.fn(),
+      stopEditing: vi.fn(),
+    };
     TestBed.configureTestingModule({
       providers: [
         CanvasEditController,
-        PersistentThreadTransportBridge,
         {provide: CanvasService, useValue: canvas},
+        {provide: CanvasAwarenessController, useValue: awareness},
       ],
     });
     controller = TestBed.inject(CanvasEditController);
-    bridge = TestBed.inject(PersistentThreadTransportBridge);
   });
 
   afterEach(() => {
@@ -306,68 +316,38 @@ describe('CanvasEditController', () => {
     expect(controller.refreshPending()).toBe(false);
   });
 
-  it('sends renewable editing/idle controls and expires matching remote awareness', () => {
-    vi.useFakeTimers();
-    const sender = vi.fn().mockReturnValue(true);
-    bridge.attachControlSender(sender);
-    sync(editableState(1), '# Original', '"sha256:1"');
+  it('delegates focus and retained Canvas identity to lane-free awareness', () => {
+    const state = editableState(1);
+    sync(state, '# Original', '"sha256:1"');
+    expect(awareness.sync).toHaveBeenLastCalledWith(
+      true,
+      'thread-1',
+      state,
+      false,
+    );
+    awareness.startEditing.mockClear();
+    awareness.stopEditing.mockClear();
 
     controller.editorFocused();
-    expect(sender).toHaveBeenCalledWith('thread-1', expect.objectContaining({
-      method: 'canvas.user_editing',
-      editing_session_id: expect.stringMatching(/^[A-Za-z0-9_-]{8,128}$/),
-    }));
-    vi.advanceTimersByTime(5_000);
-    expect(sender).toHaveBeenCalledTimes(2);
+    expect(awareness.startEditing).toHaveBeenCalledOnce();
     controller.editorBlurred();
-    expect(sender).toHaveBeenLastCalledWith('thread-1', expect.objectContaining({
-      method: 'canvas.user_idle',
-    }));
+    expect(awareness.stopEditing).toHaveBeenCalledOnce();
 
-    bridge.forwardEvent('thread-1', {
-      method: 'canvas.user_editing',
-      params: awarenessParams('remote-tab-123', 'socket-1'),
-    });
+    awareness.remoteEditing.set(true);
     expect(controller.remoteEditing()).toBe(true);
 
-    bridge.forwardEvent('thread-1', {
-      method: 'canvas.user_editing',
-      params: awarenessParams('remote-tab-123', 'socket-2'),
-    });
-    const firstIdle = awarenessParams('remote-tab-123', 'socket-1');
-    delete firstIdle['ttl_ms'];
-    bridge.forwardEvent('thread-1', {method: 'canvas.user_idle', params: firstIdle});
-    expect(controller.remoteEditing()).toBe(true);
-
-    const secondIdle = awarenessParams('remote-tab-123', 'socket-2');
-    delete secondIdle['ttl_ms'];
-    bridge.forwardEvent('thread-1', {method: 'canvas.user_idle', params: secondIdle});
-    expect(controller.remoteEditing()).toBe(false);
-
-    bridge.forwardEvent('thread-1', {
-      method: 'canvas.user_editing',
-      params: awarenessParams('remote-tab-123', 'socket-1'),
-    });
-
-    // A stale idle for the same sender/session must not clear a newer lease.
-    bridge.forwardEvent('thread-1', {
-      method: 'canvas.user_idle',
-      params: {...awarenessParams('remote-tab-123', 'socket-1'), presentation_revision: 2},
-    });
-    expect(controller.remoteEditing()).toBe(true);
-
-    const idle = awarenessParams('remote-tab-123', 'socket-1');
-    delete idle['ttl_ms'];
-    bridge.forwardEvent('thread-1', {method: 'canvas.user_idle', params: idle});
-    expect(controller.remoteEditing()).toBe(false);
-
-    bridge.forwardEvent('thread-1', {
-      method: 'canvas.user_editing',
-      params: awarenessParams('remote-tab-123', 'socket-1'),
-    });
-
-    vi.advanceTimersByTime(15_000);
-    expect(controller.remoteEditing()).toBe(false);
+    controller.sync(
+      true,
+      'thread-1',
+      state,
+      state,
+      '# Original',
+      '"sha256:1"',
+      true,
+      false,
+      true,
+    );
+    expect(awareness.sync).toHaveBeenLastCalledWith(true, 'thread-1', state, true);
   });
 
   it('tears down authorized dirty bytes on terminal access loss', () => {
@@ -418,15 +398,3 @@ describe('CanvasEditController', () => {
     controller.sync(true, 'thread-1', state, state, content, etag, ready, false);
   }
 });
-
-function awarenessParams(editingSessionId: string, senderId: string): Record<string, unknown> {
-  return {
-    canvas_id: 'main',
-    path: 'output/report.md',
-    presentation_revision: 1,
-    source_version: 'sha256:1',
-    editing_session_id: editingSessionId,
-    sender_id: senderId,
-    ttl_ms: 15000,
-  };
-}

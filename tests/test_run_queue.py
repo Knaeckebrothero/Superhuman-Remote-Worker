@@ -35,6 +35,12 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from orchestrator.services.canvas_awareness import (
+    CanvasAwarenessConflict,
+    cleanup_canvas_awareness,
+    fetch_canvas_awareness_snapshot,
+    mutate_canvas_awareness,
+)
 from src.shared.run_queue import (
     ENQUEUE_DEDUPED,
     ENQUEUE_INPUT_RECORDED,
@@ -112,6 +118,7 @@ MIGRATION_FILES = [
     _MIGRATIONS_DIR / "0123_thread_cloud_sync_baselines.sql",
     _MIGRATIONS_DIR / "0124_cloud_sync_marker_comment.sql",
     _MIGRATIONS_DIR / "0125_thread_client_presence.sql",
+    _MIGRATIONS_DIR / "0126_canvas_editor_awareness.sql",
 ]
 
 SESSION = UNIT_KIND_SESSION_TURN
@@ -138,12 +145,14 @@ def _assert_scratch_dsn() -> None:
 async def _apply_schema() -> None:
     conn = await asyncpg.connect(DSN, timeout=10)
     try:
+        await conn.execute("DROP TABLE IF EXISTS canvas_editor_awareness CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_cloud_sync_generations CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_client_presence CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_permission_requests CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_events CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_control_requests CASCADE")
         await conn.execute("DROP TABLE IF EXISTS run_queue CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS canvases CASCADE")
         await conn.execute("DROP TABLE IF EXISTS threads CASCADE")
         await conn.execute("DROP TABLE IF EXISTS agents CASCADE")
         await conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
@@ -169,6 +178,14 @@ async def _apply_schema() -> None:
             "seq BIGINT, kind TEXT, payload JSONB"
             ")"
         )
+        await conn.execute(
+            "CREATE TABLE canvases ("
+            "thread_id UUID NOT NULL REFERENCES threads(id) ON DELETE CASCADE, "
+            "canvas_id VARCHAR(64) NOT NULL DEFAULT 'main', "
+            "source JSONB, presentation_revision BIGINT NOT NULL DEFAULT 0, "
+            "source_version VARCHAR(71), UNIQUE (thread_id, canvas_id)"
+            ")"
+        )
         for migration in MIGRATION_FILES:
             await conn.execute(migration.read_text())
     finally:
@@ -188,7 +205,8 @@ async def conn(schema):
     """A fresh connection with an empty run_queue (enqueue_ord restarted)."""
     c = await asyncpg.connect(DSN, timeout=10)
     await c.execute(
-        "TRUNCATE thread_client_presence, thread_permission_requests, "
+        "TRUNCATE canvas_editor_awareness, canvases, "
+        "thread_client_presence, thread_permission_requests, "
         "thread_cloud_sync_generations, thread_events, "
         "thread_control_requests, run_queue, agents, threads "
         "RESTART IDENTITY CASCADE"
@@ -2177,3 +2195,252 @@ class TestThreadClientPresence:
             )
             == "pending"
         )
+
+
+# =============================================================================
+# Lane-independent Canvas editor awareness (0126)
+# =============================================================================
+
+
+_CANVAS_PATH = "output/report.md"
+_CANVAS_VERSION = "sha256:" + "a" * 64
+
+
+async def _insert_awareness_canvas(conn, *, lane: str = "stateless") -> UUID:
+    thread_id = uuid4()
+    await conn.execute(
+        "INSERT INTO threads (id, execution_lane, total_turns) VALUES ($1, $2, 1)",
+        thread_id,
+        lane,
+    )
+    await conn.execute(
+        "INSERT INTO canvases "
+        "(thread_id, canvas_id, source, presentation_revision, source_version) "
+        "VALUES ($1, 'main', $2::jsonb, 1, $3)",
+        thread_id,
+        json.dumps({"type": "workspace_file", "path": _CANVAS_PATH}),
+        _CANVAS_VERSION,
+    )
+    return thread_id
+
+
+class TestCanvasEditorAwareness:
+    async def test_same_sequence_is_idempotent_without_extending_ttl(self, conn):
+        thread_id = await _insert_awareness_canvas(conn)
+        pool = _SingleConnectionPool(conn)
+
+        first = await mutate_canvas_awareness(
+            pool,
+            thread_id=str(thread_id),
+            editing_session_id="editor_tab_1",
+            sequence=1,
+            state="editing",
+            path=_CANVAS_PATH,
+            presentation_revision=1,
+            source_version=_CANVAS_VERSION,
+            ttl_seconds=60,
+        )
+        retry = await mutate_canvas_awareness(
+            pool,
+            thread_id=str(thread_id),
+            editing_session_id="editor_tab_1",
+            sequence=1,
+            state="editing",
+            path=_CANVAS_PATH,
+            presentation_revision=1,
+            source_version=_CANVAS_VERSION,
+            ttl_seconds=120,
+        )
+
+        assert first.applied is True
+        assert retry.applied is False
+        assert retry.sender_id == first.sender_id
+        assert retry.expires_at == first.expires_at
+        with pytest.raises(
+            CanvasAwarenessConflict, match="already used for different state"
+        ) as reused:
+            await mutate_canvas_awareness(
+                pool,
+                thread_id=str(thread_id),
+                editing_session_id="editor_tab_1",
+                sequence=1,
+                state="idle",
+                path=_CANVAS_PATH,
+                presentation_revision=1,
+                source_version=_CANVAS_VERSION,
+            )
+        assert reused.value.code == "canvas_awareness_sequence_reused"
+
+    async def test_idle_tombstone_defeats_reordered_editing_renewal(self, conn):
+        thread_id = await _insert_awareness_canvas(conn)
+        pool = _SingleConnectionPool(conn)
+        common = {
+            "pool": pool,
+            "thread_id": str(thread_id),
+            "editing_session_id": "editor_tab_1",
+            "path": _CANVAS_PATH,
+            "presentation_revision": 1,
+            "source_version": _CANVAS_VERSION,
+        }
+
+        await mutate_canvas_awareness(sequence=1, state="editing", **common)
+        idle = await mutate_canvas_awareness(sequence=2, state="idle", **common)
+        stale = await mutate_canvas_awareness(sequence=1, state="editing", **common)
+
+        assert idle.applied is True
+        assert idle.state == "idle"
+        assert stale.applied is False
+        assert stale.sequence == 2
+        assert stale.state == "idle"
+        assert (
+            await fetch_canvas_awareness_snapshot(pool, thread_id=str(thread_id)) == ()
+        )
+
+    async def test_snapshot_requires_exact_current_canvas_identity(self, conn):
+        thread_id = await _insert_awareness_canvas(conn)
+        pool = _SingleConnectionPool(conn)
+        await mutate_canvas_awareness(
+            pool,
+            thread_id=str(thread_id),
+            editing_session_id="editor_tab_1",
+            sequence=1,
+            state="editing",
+            path=_CANVAS_PATH,
+            presentation_revision=1,
+            source_version=_CANVAS_VERSION,
+        )
+        await conn.execute(
+            "UPDATE canvases SET presentation_revision = 2, "
+            "source_version = $2 WHERE thread_id = $1",
+            thread_id,
+            "sha256:" + "b" * 64,
+        )
+
+        assert (
+            await fetch_canvas_awareness_snapshot(pool, thread_id=str(thread_id)) == ()
+        )
+        with pytest.raises(CanvasAwarenessConflict) as stale:
+            await mutate_canvas_awareness(
+                pool,
+                thread_id=str(thread_id),
+                editing_session_id="editor_tab_1",
+                sequence=2,
+                state="editing",
+                path=_CANVAS_PATH,
+                presentation_revision=1,
+                source_version=_CANVAS_VERSION,
+            )
+        assert stale.value.code == "canvas_awareness_stale"
+
+        # A late idle still retires the exact lease identity that this tab
+        # established before the Canvas changed.
+        retired = await mutate_canvas_awareness(
+            pool,
+            thread_id=str(thread_id),
+            editing_session_id="editor_tab_1",
+            sequence=2,
+            state="idle",
+            path=_CANVAS_PATH,
+            presentation_revision=1,
+            source_version=_CANVAS_VERSION,
+        )
+        assert retired.applied is True
+
+    async def test_thread_scoped_lock_makes_first_write_cap_exact(
+        self, conn, extra_conn
+    ):
+        thread_id = await _insert_awareness_canvas(conn)
+        first_conn, second_conn = await extra_conn(), await extra_conn()
+
+        async def write(connection, editor_id):
+            return await mutate_canvas_awareness(
+                _SingleConnectionPool(connection),
+                thread_id=str(thread_id),
+                editing_session_id=editor_id,
+                sequence=1,
+                state="editing",
+                path=_CANVAS_PATH,
+                presentation_revision=1,
+                source_version=_CANVAS_VERSION,
+                max_rows_per_thread=1,
+            )
+
+        results = await asyncio.gather(
+            write(first_conn, "editor_tab_1"),
+            write(second_conn, "editor_tab_2"),
+            return_exceptions=True,
+        )
+        successes = [result for result in results if not isinstance(result, Exception)]
+        failures = [result for result in results if isinstance(result, Exception)]
+        assert len(successes) == 1
+        assert len(failures) == 1
+        assert isinstance(failures[0], CanvasAwarenessConflict)
+        assert failures[0].code == "canvas_awareness_capacity_exhausted"
+        assert (
+            await conn.fetchval(
+                "SELECT COUNT(*) FROM canvas_editor_awareness WHERE thread_id = $1",
+                thread_id,
+            )
+            == 1
+        )
+
+    @pytest.mark.parametrize("lane", ["pinned", "stateless"])
+    async def test_same_service_contract_serves_both_lanes(self, conn, lane):
+        thread_id = await _insert_awareness_canvas(conn, lane=lane)
+        pool = _SingleConnectionPool(conn)
+        mutation = await mutate_canvas_awareness(
+            pool,
+            thread_id=str(thread_id),
+            editing_session_id="editor_tab_1",
+            sequence=1,
+            state="editing",
+            path=_CANVAS_PATH,
+            presentation_revision=1,
+            source_version=_CANVAS_VERSION,
+        )
+        snapshot = await fetch_canvas_awareness_snapshot(pool, thread_id=str(thread_id))
+
+        assert mutation.applied is True
+        assert len(snapshot) == 1
+        assert snapshot[0].editing_session_id == "editor_tab_1"
+        assert snapshot[0].ttl_ms > 0
+        assert await conn.fetchval("SELECT COUNT(*) FROM thread_events") == 0
+
+    async def test_cleanup_is_bounded_and_canvas_delete_cascades(self, conn):
+        thread_id = await _insert_awareness_canvas(conn)
+        pool = _SingleConnectionPool(conn)
+        for index in range(2):
+            await mutate_canvas_awareness(
+                pool,
+                thread_id=str(thread_id),
+                editing_session_id=f"editor_tab_{index}",
+                sequence=1,
+                state="editing",
+                path=_CANVAS_PATH,
+                presentation_revision=1,
+                source_version=_CANVAS_VERSION,
+            )
+        await conn.execute(
+            "UPDATE canvas_editor_awareness SET "
+            "refreshed_at = now() - interval '10 minutes', "
+            "expires_at = now() - interval '9 minutes'"
+        )
+
+        assert await cleanup_canvas_awareness(pool, retention_seconds=30, limit=1) == 1
+        assert await conn.fetchval("SELECT COUNT(*) FROM canvas_editor_awareness") == 1
+        assert await cleanup_canvas_awareness(pool, retention_seconds=30, limit=1) == 1
+        await mutate_canvas_awareness(
+            pool,
+            thread_id=str(thread_id),
+            editing_session_id="editor_after_cleanup",
+            sequence=1,
+            state="editing",
+            path=_CANVAS_PATH,
+            presentation_revision=1,
+            source_version=_CANVAS_VERSION,
+        )
+        await conn.execute(
+            "DELETE FROM canvases WHERE thread_id = $1 AND canvas_id = 'main'",
+            thread_id,
+        )
+        assert await conn.fetchval("SELECT COUNT(*) FROM canvas_editor_awareness") == 0
