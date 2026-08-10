@@ -163,9 +163,16 @@ class OpenCloudWorkspaceSync(WorkspaceSyncBase):
             self._current_client_token = token
         return self._dav_client
 
-    async def _with_401_retry(self, op: Callable[[], Awaitable[T]]) -> T:
+    async def _with_401_retry(
+        self,
+        op: Callable[[], Awaitable[T]],
+        *,
+        before_attempt: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> T:
         """Run ``op`` once; if 401, force a token refresh and retry once."""
         try:
+            if before_attempt is not None:
+                await before_attempt()
             return await op()
         except Exception as e:
             if not _looks_like_401(e):
@@ -178,6 +185,8 @@ class OpenCloudWorkspaceSync(WorkspaceSyncBase):
             self._dav_client = None
             self._current_client_token = None
             await self._get_token(force_refresh=True)
+            if before_attempt is not None:
+                await before_attempt()
             return await op()
 
     # ---------------------------------------------------------------- Primitives
@@ -185,14 +194,25 @@ class OpenCloudWorkspaceSync(WorkspaceSyncBase):
     async def _ensure_ready(self) -> None:
         await self._dav()
 
-    async def _ensure_remote_dir(self, rel_dir: str) -> None:
+    async def _ensure_remote_dir(
+        self,
+        rel_dir: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
         async def _run():
             client = await self._dav()
             return await asyncio.to_thread(client.mkdir, rel_dir)
 
-        await self._with_401_retry(_run)
+        await self._with_401_retry(_run, before_attempt=before_write)
 
-    async def _upload_file(self, rel_path: str, local_path: str) -> None:
+    async def _upload_file(
+        self,
+        rel_path: str,
+        local_path: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
         async def _run():
             client = await self._dav()
             return await asyncio.to_thread(
@@ -201,7 +221,24 @@ class OpenCloudWorkspaceSync(WorkspaceSyncBase):
                 local_path=local_path,
             )
 
-        await self._with_401_retry(_run)
+        await self._with_401_retry(_run, before_attempt=before_write)
+
+    async def _delete_remote_file(
+        self,
+        rel_path: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        async def _run():
+            client = await self._dav()
+            try:
+                return await asyncio.to_thread(client.clean, rel_path)
+            except Exception as exc:
+                if not self._marker_missing(exc):
+                    raise
+                return None
+
+        await self._with_401_retry(_run, before_attempt=before_write)
 
     async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
         async def _run():

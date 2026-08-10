@@ -318,6 +318,7 @@ from services.virtual_workspace import (  # noqa: E402
 from services.workspace_binding import (  # noqa: E402
     ensure_virtual_thread_workspace_binding,
     remote_canvas_presentation_available,
+    virtual_thread_backing_id,
 )
 from services.workspace import workspace_service  # noqa: E402
 from services.job_todos import (  # noqa: E402
@@ -25765,6 +25766,57 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
             metadata = {}
     ws = metadata.get("workspace_container") or {}
     vm = metadata.get("vm") or {}
+    binding = metadata.get("_workspace_binding") or {}
+    workspace_backend = _thread_workspace_backend(thread)
+    workspace_generation: str | None = None
+    if isinstance(binding, dict):
+        try:
+            candidate_generation = str(UUID(str(binding.get("generation"))))
+        except (TypeError, ValueError):
+            candidate_generation = ""
+        if (
+            workspace_backend == "virtual"
+            and binding.get("kind") == "virtual"
+            and candidate_generation
+        ):
+            # A virtual generation is authoritative only for the deployment's
+            # current durable object-store namespace.  Kind + UUID alone are
+            # historical evidence: after an object-store rotation they could
+            # attest bytes under the old ``threads/<id>/`` backing while this
+            # claimant is attached to the new one.
+            virtual_spec = _virtual_workspace_rclone_spec()
+            if (
+                isinstance(virtual_spec, dict)
+                and virtual_spec.get("type") != "memory"
+                and binding.get("backing_id")
+                == virtual_thread_backing_id(thread_id, virtual_spec)
+            ):
+                workspace_generation = candidate_generation
+        elif (
+            workspace_backend != "virtual"
+            and binding.get("kind") == "remote"
+            and ws.get("status") == "ready"
+            and str(ws.get("_canvas_workspace_generation") or "")
+            == candidate_generation
+        ):
+            # A remote binding alone is historical evidence. Pair it with the
+            # exact ready endpoint generation before cloud sync may call those
+            # workspace bytes the source of an acknowledged generation.
+            workspace_generation = candidate_generation
+    if (
+        thread.get("execution_lane") == "stateless"
+        and workspace_backend == "virtual"
+        and workspace_generation is None
+    ):
+        # A virtual workspace is durable only through its orchestrator-owned
+        # object-store binding.  Never hand a stateless claimant cloud
+        # credentials with an unbound/ambiguous source namespace: the
+        # generation fence could otherwise bless bytes from no authoritative
+        # workspace incarnation.
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless virtual workspace binding is unavailable",
+        )
     (
         canvas_presentation_available,
         canvas_live_apps_available,
@@ -25778,27 +25830,39 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         thread, metadata, project_ids=project_ids
     )
     mount_rows = await postgres_db.list_thread_mounts(thread_id)
-    cloud_mount_cfg = await _build_agent_cloud_mount(
-        thread,
-        mount_rows=mount_rows,
-        metadata=metadata,
+    suppress_disposable_cloud = bool(
+        thread.get("execution_lane") == "stateless" and workspace_backend == "none"
     )
-    if cloud_mount_cfg:
+    if suppress_disposable_cloud:
+        # ScratchBackend has no file tools and promises no durable workspace.
+        # Do not advertise either the structured or legacy cloud surface: a
+        # stateless claimant must not turn that explicitly disposable tier
+        # into an accidental session-folder mirror. Pinned sessions retain
+        # their historical cloud payload until that lane is retired/migrated.
+        cloud_mount_cfg = None
         cloud_sync_cfg = None
-    elif metadata.get("protected_cloud"):
-        # Protected thread with no engageable protected mount (flag off, VM
-        # tier, or a refused/absent grant): NO live sync fallback of any kind
-        # (fail-closed; agent sees degraded-cloud state, never a live write
-        # path on a thread the user marked protected).
-        cloud_sync_cfg = None
-    elif _cloud_workspace_driver() == "rclone_mount":
-        # rclone requested but unavailable/unsupported: fall back to the
-        # regular session folder only. Do not eagerly clone thread_mounts such
-        # as a default user home; that is the startup failure this driver is
-        # meant to avoid.
-        cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=[])
     else:
-        cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
+        cloud_mount_cfg = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=mount_rows,
+            metadata=metadata,
+        )
+        if cloud_mount_cfg:
+            cloud_sync_cfg = None
+        elif metadata.get("protected_cloud"):
+            # Protected thread with no engageable protected mount (flag off,
+            # VM tier, or a refused/absent grant): NO live sync fallback of
+            # any kind (fail-closed; agent sees degraded-cloud state, never a
+            # live write path on a thread the user marked protected).
+            cloud_sync_cfg = None
+        elif _cloud_workspace_driver() == "rclone_mount":
+            # rclone requested but unavailable/unsupported: fall back to the
+            # regular session folder only. Do not eagerly clone thread_mounts
+            # such as a default user home; that is the startup failure this
+            # driver is meant to avoid.
+            cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=[])
+        else:
+            cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
     # Issue 13 follow-up: if the main cloud is up but this thread resolved NO
     # sync target (session-folder provisioning failed upstream, or user-home /
     # project-mount resolution produced nothing usable), the agent would
@@ -25810,7 +25874,8 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
     except Exception:
         _cloud_up = False
     cloud_sync_degraded = bool(
-        _cloud_up
+        not suppress_disposable_cloud
+        and _cloud_up
         and not cloud_mount_cfg
         and not cloud_sync_cfg
         and (metadata.get("protected_cloud") or not thread.get("nc_session_folder"))
@@ -25878,6 +25943,11 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "status": ws.get("status", "none"),
+        # Internal claim/attach identity, never exposed by owner-facing thread
+        # routes. Durable cloud generations bind their source bytes to this
+        # orchestrator-owned workspace incarnation and recheck it before each
+        # external PUT.
+        "workspace_generation": workspace_generation,
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
         "pod_ip": ws.get("pod_ip") or ws.get("host"),
         "pod_name": ws.get("pod_name"),
@@ -25912,7 +25982,9 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
             externalize_urls=bool(vm.get("status") == "ready" and vm.get("ssh_host")),
         ),
         # Nextcloud session folder (legacy; preserved one release for back-compat)
-        "nc_session_folder": thread.get("nc_session_folder"),
+        "nc_session_folder": (
+            None if suppress_disposable_cloud else thread.get("nc_session_folder")
+        ),
         # Structured cloud-sync config (backend + webdav URL + auth).
         # Agent consumes this via ``src.services.cloud_sync.build_workspace_sync``.
         "cloud_sync": cloud_sync_cfg,

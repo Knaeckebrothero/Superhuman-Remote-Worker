@@ -133,7 +133,8 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 # Bump this whenever a new app migration lands — the assertion below is the
 # tripwire that says "a migration was added; check the snapshot was regenerated
 # and nothing was renumbered". Head as of the merged stateless work: the S3
-# worker-lane partition (0118) plus the session control inbox (0119-0121).
+# worker-lane partition (0118), session control inbox (0119-0121), and the
+# stateless cloud-generation fence and content baseline (0122-0124).
 APP_JOBS_EXECUTION_LANE_MIGRATION = (
     ROOT / "orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
 )
@@ -144,9 +145,21 @@ APP_THREAD_CONTROL_RECEIPT_INDEX = (
     ROOT
     / "orchestrator/database/migrations/app/0120_thread_control_receipt_idx.notx.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = (
+APP_THREAD_CONTROL_VALIDATION = (
     ROOT
     / "orchestrator/database/migrations/app/0121_thread_control_validate_constraints.sql"
+)
+APP_THREAD_CLOUD_SYNC_GENERATIONS = (
+    ROOT / "orchestrator/database/migrations/app/0122_thread_cloud_sync_generations.sql"
+)
+APP_THREAD_CLOUD_SYNC_BASELINES = (
+    ROOT / "orchestrator/database/migrations/app/0123_thread_cloud_sync_baselines.sql"
+)
+APP_CLOUD_SYNC_MARKER_COMMENT = (
+    ROOT / "orchestrator/database/migrations/app/0124_cloud_sync_marker_comment.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = (
+    ROOT / "orchestrator/database/migrations/app/0124_cloud_sync_marker_comment.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
@@ -705,7 +718,7 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
 def test_control_inbox_migration_preserves_and_constrains_narration_receipts() -> None:
     sql = _compact(APP_THREAD_CONTROL_INBOX_MIGRATION.read_text())
     index_sql = _compact(APP_THREAD_CONTROL_RECEIPT_INDEX.read_text())
-    validation_sql = _compact(APP_CURRENT_MIGRATION_HEAD.read_text())
+    validation_sql = _compact(APP_THREAD_CONTROL_VALIDATION.read_text())
 
     assert "ADD COLUMN narration_mode TEXT" in sql
     assert "ADD COLUMN control_admission_agent_id UUID" in sql
@@ -728,6 +741,25 @@ def test_control_inbox_migration_preserves_and_constrains_narration_receipts() -
         "VALIDATE CONSTRAINT thread_events_control_request_thread_fkey"
         in validation_sql
     )
+
+
+def test_stateless_cloud_sync_migrations_keep_resource_and_baseline_fences() -> None:
+    generations = _compact(APP_THREAD_CLOUD_SYNC_GENERATIONS.read_text())
+    baselines = _compact(APP_THREAD_CLOUD_SYNC_BASELINES.read_text())
+    marker_comment = _compact(APP_CLOUD_SYNC_MARKER_COMMENT.read_text())
+
+    assert "PRIMARY KEY (thread_id, mount_id)" in generations
+    assert "acknowledged_generation <= required_generation" in generations
+    assert "WHERE acknowledged_generation < required_generation" in generations
+    assert "workspace_generation TEXT NOT NULL" in generations
+    assert "sync_scope_sha256 CHAR(64) NOT NULL" in generations
+    assert "baseline_manifest JSONB NOT NULL DEFAULT '{}'::jsonb" in baselines
+    assert "octet_length(baseline_manifest::text) <= 4194304" in baselines
+    assert "baseline_sha256 CHAR(64) NOT NULL" in baselines
+    assert "thread_cloud_sync_baseline_digest_shape" in baselines
+    assert "The resource commit" in marker_comment
+    assert "marker binds this digest" in marker_comment
+    assert "Resource marker v2" not in marker_comment
 
 
 def test_compute_foundation_is_immutable_and_lock_fix_is_superseding() -> None:

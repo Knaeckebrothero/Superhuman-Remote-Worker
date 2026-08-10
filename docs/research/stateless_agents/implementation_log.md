@@ -2284,3 +2284,145 @@ No migration was needed for this slice. The agent-local PVC proposal remains
 rejected: the durable shell and files belong to the remote workspace, while the
 actual agent-local/process residue needs targeted externalization rather than a
 per-thread volume on the shared Deployment.
+
+## Phase 2 cloud sync-generation fence — DONE; tier gate remains closed
+
+§3.3 now has a durable handoff protocol and a forced two-pod proof. This is a
+phase boundary, not authorization to remove the lite-only gate: the default
+`rclone_mount` path and the §3.4/§3.5 resident/background work remain open.
+
+### Design that landed
+
+The first design used a durable Postgres requirement plus a resource marker and
+proposed a forced full upload for normal completion and recovery. Adversarial
+testing rejected that design. It preserved same-size local edits, but overwrote
+unrelated cloud-side edits to untouched files and would have turned the measured
+pathological fresh push (**121 s for 28 files**) into the ordinary turn cost.
+The shipped protocol instead records a content baseline and commits only the
+delta.
+
+Migrations **0122** and **0123** define one row per thread and stable logical
+cloud destination. Migration **0124** is comment-only: 0123 had already been
+applied and checksummed, so its stale “v2 marker” comment was corrected without
+rewriting an applied migration. The queue lease token is the required
+generation. Each row is bound to the orchestrator-owned workspace generation,
+a SHA-256 of the non-secret destination scope, and a canonical per-path
+`{sha256, remote_etag}` turn-start baseline. `thread_mounts.id` was rejected as
+the key because `replace_thread_mounts` deletes and reinserts those UUIDs. The
+stable identity is the legacy-session name or a digest-derived mount key.
+
+Claim start is now **reconcile predecessor -> strict pull -> capture content
+baseline -> ARM current generation**, all before tool or LLM work. The whole
+configured scope set is validated before any remote write, so a removed or
+duplicated mount cannot hide a pending generation. Missing or older resource
+markers replay only the baseline delta. An exact marker with a lagging DB ACK
+is ACK-only and performs zero recovery uploads. A marker ahead of the DB row,
+a pending scope mismatch, malformed baseline, stale Ready endpoint, or changed
+workspace binding fails closed.
+
+The v3 resource marker carries the bounded, validated post-commit manifest. It
+is namespaced by thread and scope so two threads sharing a WebDAV root do not
+overwrite one another. Membership lets the next strict pull distinguish a
+real remote deletion from a fresh local file without granting an edited marker
+authority over ignored paths. Same-size local and cloud edits are detected.
+Unrelated cloud edits are preserved. Local deletions use idempotent, fenced
+WebDAV deletes. A process that writes or deletes a durable workspace file after
+the predecessor's marker leaves a real next-generation delta rather than
+causing a false ACK.
+
+Pulls no longer trust equal file size on a fresh pod. Bytes are staged beneath
+`.srw`, written with a write-all loop, exact-replaced, then read back and hashed
+before sync state advances. Directory/file collisions and remote command
+failures fail closed. Strict sandbox walks propagate root and nested listing
+errors. OpenCloud rechecks ownership before a second write after a 401 refresh.
+The public workspace `move()` contract and pinned sync algorithm remain
+unchanged; exact replacement is a cloud-staging-only primitive.
+
+The executor captures immutable claim requirements for the push task and waits
+for it to become terminal before every queue completion or release. The old
+60-second “complete while the push may still run” edge is gone. Stateless
+teardown does not issue the old raw, unacknowledged second push; pinned teardown
+keeps its established push/pull behavior. A claim-start sync failure kills the
+loop and releases the unit without advancing the consumed-input watermark.
+
+Two compatibility findings were absorbed. `backend=none` has neither file
+tools nor a durable source identity, so cloud payloads are suppressed **only on
+the stateless lane**; pinned `none` retains its old behavior. A stateless virtual
+attach now exposes its workspace generation only when the binding's backing id
+exactly matches the current deterministic object-store backing. The final
+generation from a late workspace fetch is retained even when no coordinator is
+built, so a degraded payload cannot conceal a pending predecessor row.
+
+### Authority boundary
+
+The database half and resource half deliberately have different strength.
+ARM, LOAD, CURRENT and ACK are **control-plane enforced among honest
+executors**: each SQL operation proves the exact leased queue token and the
+exact current workspace binding/Ready endpoint generation. The WebDAV bytes,
+resource marker and per-write rechecks are **cooperative**, not an external
+transaction. A PUT that passed its check and then stalled can still finish
+after a lease steal. Closing that window needs conditional server-side writes
+or immutable generation objects plus a CAS pointer. Same-path concurrent edits
+retain the existing last-writer semantics; the phase does not claim
+transactional WebDAV ordering.
+
+### Verification and measurements
+
+* Final focused review: **133** generation/transport/integration tests, **229**
+  workspace-backend tests and **29** focused generation-fence tests passed.
+  Adversarial cases cover same-size edits on both sides, unrelated concurrent
+  cloud edits, empty ETags, remote and local deletions, post-marker workspace
+  writes, marker-before-DB-ACK recovery, partial multi-mount recovery, malformed
+  or ignored manifest entries, strict walk failures, duplicate logical keys,
+  idempotent deletes, OpenCloud 401/lease loss, short writes, staged replacement
+  failure, and start failure without input consumption.
+* A rollback-only real k3d Postgres transaction executed the actual schema and
+  application ARM/LOAD/ACK SQL. A token bump rejected stale CURRENT and ACK.
+  The transaction left **0 generation rows** and **0 probe leases**.
+* The schema snapshot was regenerated at migration head **0124**. Applied
+  migration checksums were preserved rather than edited in place.
+* The repository-wide comparable run completed with **15,351 passed, 11 failed
+  and 122 skipped in 783.74 s**. The 11 failures exactly match the established
+  environment baseline: localhost Postgres, MCP subprocess/loopback transport,
+  and unavailable arXiv. An earlier `.venv` run reported 23 failures because
+  that Python 3.13 environment lacked the declared `asyncssh` dependency; it is
+  not the baseline and is recorded to avoid repeating the count error.
+* Ruff check, repository-wide Ruff format check and `git diff --check` are
+  clean.
+
+The live proof used fallback `sync` deliberately: Helm defaults to
+`rclone_mount`, which bypasses the push/pull coordinator and would make a green
+handoff vacuous. Every non-terminating stateless pod first matched the working
+tree hashes and contained the v3 marker, committed-manifest, write-all,
+exact-replace and generation-path code.
+
+On a disposable real sandbox PVC and real Nextcloud folder, pod A captured a
+two-file baseline, changed one local file `1111 -> ABCD`, and an independent
+cloud writer changed the other `2222 -> WXYZ`; both edits preserved byte length.
+Generation N committed **1 upload / 4 bytes**, made **12** ownership checks,
+wrote one v3 marker and one DB ACK. Its comparable full generation cost was
+**12.140 s**; the delta portion was **2.35 s**.
+
+After confirming no queue lease, pod A was force-deleted. Pod B read the marker
+in **6.657 s**, reconciled ACK-only with **0 recovery uploads** in **7.101 s**,
+then pulled N+1 in **14.516 s**. Its workspace contained exactly `ABCD` and
+`WXYZ`; it downloaded **2 files / 8 bytes**, made **4** ownership checks and one
+ACK. SSH setup took **0.154 s**. Re-downloading the already-committed local file
+is safe but redundant and is the main measured optimization left in §3.3.
+
+Harness failures were kept rather than hidden: the first isolation attempt used
+the session-folder root and stopped before a marker; a fresh Nextcloud child was
+briefly inconsistent; and the first successor assertion expected one download,
+revealing the safe two-download behavior. Cleanup verified zero `srw-e2e-*`
+cloud entries, removed the workspace child, restored the fixture to
+`ended|pinned`, and left **0 generation rows**, **0 leased queue rows**, and
+**0 worker_batch rows**.
+
+### Remaining S2 boundary
+
+The rclone/overlay path is §3.4, not evidence supplied by this phase. The tier
+gate remains closed until mid-idle token expiry heals on a new claimant, the
+resident controllers and post-marker writers have safe ownership, §3.5's
+outbox/interrupt/presence decisions are implemented or explicitly accepted,
+and the remaining workspace-incarnation/terminal-retirement and §6.1 items are
+resolved. No worker batch was enqueued.

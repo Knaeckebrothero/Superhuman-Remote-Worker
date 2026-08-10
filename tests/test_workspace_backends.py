@@ -1492,7 +1492,7 @@ class TestRemoteBackendMove:
 
         backend.move("old.txt", "new.txt")
         cmd = mock_ssh.exec_command.call_args[0][0]
-        assert "mv" in cmd
+        assert "mv --" in cmd
         assert "/home/agent-host/workspace/old.txt" in cmd
         assert "/home/agent-host/workspace/new.txt" in cmd
 
@@ -1503,6 +1503,36 @@ class TestRemoteBackendMove:
         mock_sftp.stat.side_effect = FileNotFoundError()
         with pytest.raises(FileNotFoundError, match="Source not found"):
             backend.move("ghost.txt", "dst.txt")
+
+    def test_replace_file_rejects_directory_destination(self, remote_backend):
+        backend, _mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+        mock_sftp.stat.side_effect = [
+            _make_sftp_attr(is_dir=False),
+            _make_sftp_attr(is_dir=True),
+        ]
+
+        with pytest.raises(ValueError, match="Destination is a directory"):
+            backend.replace_file("old.txt", "existing-dir")
+
+    def test_replace_file_uses_exact_mv_target(self, remote_backend):
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+        mock_sftp.stat.return_value = _make_sftp_attr(is_dir=False)
+        _wire_exec_channel(mock_ssh, _WindowedChannel())
+
+        backend.replace_file("old.txt", "new.txt")
+
+        assert "mv -T --" in mock_ssh.exec_command.call_args[0][0]
+
+    def test_move_nonzero_exit_raises(self, remote_backend):
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+        mock_sftp.stat.return_value = _make_sftp_attr(is_dir=False)
+        _wire_exec_channel(mock_ssh, _WindowedChannel(exit_code=1))
+
+        with pytest.raises(OSError, match="Remote move failed with exit code 1"):
+            backend.move("old.txt", "new.txt")
 
 
 class TestRemoteBackendCopy:
@@ -1611,9 +1641,13 @@ class TestHeavyOpTimeouts:
                 return _make_sftp_attr(is_dir=False)
 
         mock_sftp.stat.side_effect = mock_stat
-        with patch.object(backend, "_exec", return_value="0\t/ws") as ex:
+        with (
+            patch.object(backend, "_exec", return_value="0\t/ws") as ex,
+            patch.object(backend, "_exec_with_status", return_value=("", 0)) as checked,
+        ):
             call(backend)
-        assert ex.call_args.kwargs.get("timeout") == expected_timeout
+        invoked = checked if checked.called else ex
+        assert invoked.call_args.kwargs.get("timeout") == expected_timeout
 
 
 class TestRemoteBackendExec:

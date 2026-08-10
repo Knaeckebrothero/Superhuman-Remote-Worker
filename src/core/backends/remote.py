@@ -1287,14 +1287,45 @@ class RemoteBackend(WorkspaceBackend):
         st = self._remote_stat(src_path)
         if st is None:
             raise FileNotFoundError(f"Source not found: {src}")
-
         # Ensure parent of destination exists
         self._ensure_remote_dir(posixpath.dirname(dst_path))
 
         safe_src = src_path.replace("'", "'\\''")
         safe_dst = dst_path.replace("'", "'\\''")
-        self._exec(f"mv '{safe_src}' '{safe_dst}'", timeout=_MEDIUM_OP_TIMEOUT_SECONDS)
+        _output, exit_code = self._exec_with_status(
+            f"mv -- '{safe_src}' '{safe_dst}'",
+            timeout=_MEDIUM_OP_TIMEOUT_SECONDS,
+        )
+        if exit_code != 0:
+            raise OSError(
+                f"Remote move failed with exit code {exit_code}: {src} -> {dst}"
+            )
         logger.debug(f"Moved remote: {src} -> {dst}")
+
+    def replace_file(self, src: str, dst: str) -> None:
+        """Replace one exact path; never move the source into a directory."""
+
+        self._ensure_connected()
+        src_path = self._resolve(src)
+        dst_path = self._resolve(dst)
+        st = self._remote_stat(src_path)
+        if st is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        dst_st = self._remote_stat(dst_path)
+        if dst_st is not None and stat_module.S_ISDIR(dst_st.st_mode):
+            raise ValueError(f"Destination is a directory: {dst}")
+        self._ensure_remote_dir(posixpath.dirname(dst_path))
+        safe_src = src_path.replace("'", "'\\''")
+        safe_dst = dst_path.replace("'", "'\\''")
+        _output, exit_code = self._exec_with_status(
+            f"mv -T -- '{safe_src}' '{safe_dst}'",
+            timeout=_MEDIUM_OP_TIMEOUT_SECONDS,
+        )
+        if exit_code != 0:
+            raise OSError(
+                f"Remote replace failed with exit code {exit_code}: {src} -> {dst}"
+            )
+        logger.debug(f"Replaced remote file: {src} -> {dst}")
 
     def copy(self, src: str, dst: str) -> None:
         self._ensure_connected()

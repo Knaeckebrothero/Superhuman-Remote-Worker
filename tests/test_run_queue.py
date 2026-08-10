@@ -67,6 +67,14 @@ from src.shared.thread_controls import (
     fetch_next_control_request,
     finalize_control_request,
 )
+from src.shared.cloud_sync_generations import (
+    CloudSyncScope,
+    acknowledge_cloud_sync_generation,
+    arm_cloud_sync_generations,
+    cloud_sync_lease_is_current,
+    encode_cloud_sync_baseline,
+    load_cloud_sync_requirements,
+)
 
 DSN = os.environ.get("RUN_QUEUE_TEST_DSN", "")
 
@@ -93,6 +101,9 @@ MIGRATION_FILES = [
     _MIGRATIONS_DIR / "0119_thread_control_inbox.sql",
     _MIGRATIONS_DIR / "0120_thread_control_receipt_idx.notx.sql",
     _MIGRATIONS_DIR / "0121_thread_control_validate_constraints.sql",
+    _MIGRATIONS_DIR / "0122_thread_cloud_sync_generations.sql",
+    _MIGRATIONS_DIR / "0123_thread_cloud_sync_baselines.sql",
+    _MIGRATIONS_DIR / "0124_cloud_sync_marker_comment.sql",
 ]
 
 SESSION = UNIT_KIND_SESSION_TURN
@@ -119,6 +130,7 @@ def _assert_scratch_dsn() -> None:
 async def _apply_schema() -> None:
     conn = await asyncpg.connect(DSN, timeout=10)
     try:
+        await conn.execute("DROP TABLE IF EXISTS thread_cloud_sync_generations CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_events CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_control_requests CASCADE")
         await conn.execute("DROP TABLE IF EXISTS run_queue CASCADE")
@@ -162,8 +174,9 @@ async def conn(schema):
     """A fresh connection with an empty run_queue (enqueue_ord restarted)."""
     c = await asyncpg.connect(DSN, timeout=10)
     await c.execute(
-        "TRUNCATE thread_events, thread_control_requests, run_queue, "
-        "agents, threads RESTART IDENTITY CASCADE"
+        "TRUNCATE thread_cloud_sync_generations, thread_events, "
+        "thread_control_requests, run_queue, agents, threads "
+        "RESTART IDENTITY CASCADE"
     )
     try:
         yield c
@@ -249,6 +262,83 @@ class TestSchema:
             "SELECT execution_lane FROM threads WHERE id = $1", tid
         )
         assert lane == "pinned"
+
+
+class TestCloudSyncGenerationFence:
+    async def test_arm_load_ack_and_stale_owner_rejection(self, conn):
+        thread_id = uuid4()
+        workspace_generation = str(uuid4())
+        await conn.execute(
+            "INSERT INTO threads (id, metadata) VALUES ($1, $2::jsonb)",
+            thread_id,
+            json.dumps(
+                {
+                    "_workspace_binding": {
+                        "kind": "virtual",
+                        "generation": workspace_generation,
+                        "backing_id": "rclone:test-cloud-generation",
+                        "ssh_host_key_fingerprint": None,
+                    }
+                }
+            ),
+        )
+        await enqueue_unit(conn, unit_id=thread_id, unit_kind=SESSION)
+        claim = await claim_unit(conn, unit_kind=SESSION, pod_name="cloud-owner")
+        baseline, _baseline_json, baseline_sha256 = encode_cloud_sync_baseline(
+            {"same.txt": {"sha256": "d" * 64, "remote_etag": "etag-1"}}
+        )
+        scope = CloudSyncScope(
+            mount_id="legacy-session",
+            workspace_generation=workspace_generation,
+            sync_scope_sha256="c" * 64,
+            baseline_manifest=baseline,
+            baseline_sha256=baseline_sha256,
+        )
+
+        armed = await arm_cloud_sync_generations(
+            conn,
+            thread_id=thread_id,
+            lease_token=claim.lease_token,
+            scopes=[scope],
+        )
+        loaded = await load_cloud_sync_requirements(
+            conn,
+            thread_id=thread_id,
+            lease_token=claim.lease_token,
+            workspace_generation=workspace_generation,
+        )
+        assert set(armed) == set(loaded) == {"legacy-session"}
+        assert loaded["legacy-session"].baseline_sha256 == baseline_sha256
+        assert await acknowledge_cloud_sync_generation(
+            conn,
+            thread_id=thread_id,
+            lease_token=claim.lease_token,
+            mount_id="legacy-session",
+            generation=claim.lease_token,
+            workspace_generation=workspace_generation,
+            sync_scope_sha256="c" * 64,
+            baseline_sha256=baseline_sha256,
+        )
+
+        await release_unit(
+            conn, unit_id=thread_id, lease_token=claim.lease_token, error=True
+        )
+        assert not await cloud_sync_lease_is_current(
+            conn,
+            thread_id=thread_id,
+            lease_token=claim.lease_token,
+            workspace_generation=workspace_generation,
+        )
+        assert not await acknowledge_cloud_sync_generation(
+            conn,
+            thread_id=thread_id,
+            lease_token=claim.lease_token,
+            mount_id="legacy-session",
+            generation=claim.lease_token,
+            workspace_generation=workspace_generation,
+            sync_scope_sha256="c" * 64,
+            baseline_sha256=baseline_sha256,
+        )
 
 
 # =============================================================================

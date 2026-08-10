@@ -6,7 +6,7 @@ import asyncio
 import logging
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 from urllib.parse import unquote, urlparse
 
 from .base import WorkspaceSyncBase, _normalize_dav_listing
@@ -77,17 +77,47 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
     async def _ensure_ready(self) -> None:
         self._get_client()
 
-    async def _ensure_remote_dir(self, rel_dir: str) -> None:
+    async def _ensure_remote_dir(
+        self,
+        rel_dir: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        if before_write is not None:
+            await before_write()
         client = self._get_client()
         await asyncio.to_thread(client.mkdir, rel_dir)
 
-    async def _upload_file(self, rel_path: str, local_path: str) -> None:
+    async def _upload_file(
+        self,
+        rel_path: str,
+        local_path: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        if before_write is not None:
+            await before_write()
         client = self._get_client()
         await asyncio.to_thread(
             client.upload_sync,
             remote_path=rel_path,
             local_path=local_path,
         )
+
+    async def _delete_remote_file(
+        self,
+        rel_path: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        if before_write is not None:
+            await before_write()
+        client = self._get_client()
+        try:
+            await asyncio.to_thread(client.clean, rel_path)
+        except Exception as exc:
+            if not self._marker_missing(exc):
+                raise
 
     async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
         client = self._get_client()
