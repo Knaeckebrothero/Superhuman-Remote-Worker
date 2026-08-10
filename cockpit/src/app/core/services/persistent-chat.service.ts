@@ -2480,26 +2480,53 @@ export class PersistentChatService {
                 this.attachmentError.set('Cannot upload: no active thread');
                 return false;
             }
-            const files = queued.filter((p) => p.file).map((p) => p.file);
+            // A prior sendMessage() attempt may have partially succeeded
+            // (e.g. file 2 of 3 hit the 100MB cap): files already marked
+            // COMPLETED are durably written server-side, and the backend
+            // has no delete endpoint or idempotency key, so a retry must
+            // never re-upload them — that would permanently duplicate the
+            // file under a `_1` suffix. Replay their already-known server
+            // results instead of re-sending the bytes.
+            const toUpload = queued.filter(
+                (p) => p.file && p.uploadStatus !== UploadStatus.COMPLETED,
+            );
+            queued
+                .filter((p) => p.uploadStatus === UploadStatus.COMPLETED)
+                .forEach((p) => uploaded.push(...(p.uploadedFiles ?? [])));
+
             this.isUploadingAttachments.set(true);
             this.attachmentError.set(null);
-            queued.forEach((p) => (p.uploadStatus = UploadStatus.UPLOADING));
+            toUpload.forEach((p) => (p.uploadStatus = UploadStatus.UPLOADING));
             try {
                 // One request per file (not one batched multipart POST) — see
                 // ApiService.uploadOneToThread for why. Sequential and
                 // fail-fast for now; Task 4 moves this into the send outbox
                 // with per-file progress and cancel.
-                for (const file of files) {
-                    const result = await firstValueFrom(this.api.uploadOneToThread(threadId, file));
+                //
+                // Each preview's status/result is committed the moment ITS
+                // request resolves (not in a batch after the loop) so that
+                // if a later file throws, earlier successes in this same
+                // call are already durably COMPLETED and won't be
+                // reclassified as failed below.
+                for (const p of toUpload) {
+                    const result = await firstValueFrom(this.api.uploadOneToThread(threadId, p.file));
+                    p.uploadedFiles = result;
+                    p.remoteName = result[0]?.name;
+                    p.uploadStatus = UploadStatus.COMPLETED;
+                    p.error = undefined;
                     uploaded.push(...result);
                 }
-                queued.forEach((p) => (p.uploadStatus = UploadStatus.COMPLETED));
             } catch (err) {
                 const msg = this.api.humanizeUploadError(err);
-                queued.forEach((p) => {
-                    p.uploadStatus = UploadStatus.FAILED;
-                    p.error = msg;
-                });
+                // Only the files that didn't make it this round — anything
+                // already flipped to COMPLETED above (this call or a prior
+                // one) keeps that status.
+                toUpload
+                    .filter((p) => p.uploadStatus !== UploadStatus.COMPLETED)
+                    .forEach((p) => {
+                        p.uploadStatus = UploadStatus.FAILED;
+                        p.error = msg;
+                    });
                 this.attachmentError.set(msg);
                 return false;
             } finally {
