@@ -2,7 +2,7 @@
 
 **Status:** v3.3 — **CONSOLIDATED 2026-08-09.** All three work streams are now on `feature/stateless-agents` (the session spine, its performance work, the S1 session-lane completion, and the S3 worker safety gates). Nothing is pushed; `develop` is untouched. **Where things stand is §9.1 Implementation status**, written against the code rather than intent.
 
-In one paragraph: the shared queue/lease substrate is built, k3d-verified and genuinely kind-agnostic; **the session lane is functionally complete** — turns queue and run on any pod, survive a mid-generation kill, never double-answer, reconnect with no socket, and take durable control verbs, all without the cockpit ever learning a lane exists; **the worker lane is not enabled** — two of its three safety gates are built, and Gate 3 (§5.4.5) is now designed down to DDL and a six-step rollout but not implemented, so no worker traffic can be admitted. Turn latency went 99.6 s → 5.4 s cold / 3.0 s warm (§5.3.3, §5.3.4). Build history, measurements and failures: `docs/research/stateless_agents/implementation_log.md`; the completion-path evidence base is `docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
+In one paragraph: the shared queue/lease substrate is built, k3d-verified and genuinely kind-agnostic; **the session lane is functionally complete** — turns queue and run on any pod, survive a mid-generation kill, never double-answer, reconnect with no socket, and take durable control verbs, all without the cockpit ever learning a lane exists; **the worker lane is not enabled** — the two coexistence gates are built, Gate 3's step-1 fixes are live, and the 2026-08-10 scope correction (§5.4.5) established that rotation never calls the completion handler, so admission now waits on the worker driver (plus a thin entry fence), not on the completion redesign; Gate 3 continues as the completion-reliability program for both lanes. Turn latency went 99.6 s → 5.4 s cold / 3.0 s warm (§5.3.3, §5.3.4). Build history, measurements and failures: `docs/research/stateless_agents/implementation_log.md`; the completion-path evidence base is `docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
 
 v1 2026-08-06 (initial proposal); v2 2026-08-07 after an 8-agent research fan-out; **v3 same night after a 6-lens adversarial panel** (10 critical + 28 major findings folded in). Raw research and critic reports: `docs/research/stateless_agents/`. Related implementation docs carrying pieces of this work: `no_workspace_agent_mode.md` §5.1 (op count is the cost — the virtual backend's scoped metadata index) and `cloud_collaboration_model.md` §4 (one `Depth: infinity` PROPFIND per turn boundary).
 **Origin:** user proposal — an LLM turn is conversation JSON in, bigger conversation JSON out; so agents can be a Deployment, not pinned pods.
@@ -226,7 +226,7 @@ Skip at batch boundary (verified skippable): `job_frozen.json`, git commit/push 
 #### 5.4.3 Steering, status sub-state, cost
 
 - **Steering consumption must be checkpoint-coupled.** The DB-direct pull exists, but its dedup is the in-process `_delivered_reply_keys` set with a fire-and-forget ack — batch rotation re-opens both windows (re-delivery on the successor; loss when an ack outruns an un-checkpointed injection under `durability="async"`) at *every* boundary instead of once per crash. Fix: ack rows carry the checkpoint id/superstep watermark that absorbed them; consumed only when that checkpoint is durable; dedup set rebuilt from checkpointed state each claim.
-- **`paused` gets a machine sub-state.** Rotation flips status every few minutes; `paused` is a human-actionable state today (resume-with-feedback, config edit gate on it) and the cockpit would flap. Add `paused_reason='batch_rotation'` (surfaced as "running" in user-facing views); human paused-actions CAS on the reason so a user pause and a rotation release are distinguishable.
+- **~~`paused` gets a machine sub-state~~ — dissolved by the §5.4.5 scope correction (2026-08-10).** Rotation releases through the queue and never touches `jobs.status`, so there is no flap to disguise and no sub-state to add. The residue of this item is real but different: the resume/approve/feedback verbs must be lane-aware (§5.4.5 condition 3), because `queue_job_for_resume` parks jobs as dispatcher-visible and the dispatcher never sees stateless jobs.
 - **Cost honesty**: per-claim setup is ~0.5–1.5 s *without* MCP; MCP `connect_all` is seconds-class, and the release→enqueue→claim→`/job/resume` handoff (credential re-injection ≈8–12 rt) adds ~1–5 s of dead time — at the fast end (25 supersteps ≈ 8–10 LLM calls ≈ 45–120 s wall) overhead recomputes to **3–15%, not <2%**. Therefore: **the batch budget is wall-clock-first** (e.g. ≥5 min/batch ⇒ overhead <2% by construction; also the lease-exposure and credential-revocation bound), superstep cap secondary; the Job Bench measures per-claim setup split by MCP-attached vs not, and the handoff, before N is fixed. Batch cadence vs Anthropic 5-min cache TTL: immediate re-queue keeps it warm; queue waits >5 min re-pay full input (consider `ttl:"1h"` at 2× write for long-wait experts).
 - Fairness rotation key + cooldown waiver for batch continuations (§5.1); workspace paused-reap grace (~30 min) must exceed queue wait or `batch_boundary` gets a reap carve-out; retire the pod-local snapshot crash lane (PG checkpoint is strictly better; D3 only works because sweeps flip to `paused` first).
 
@@ -241,9 +241,69 @@ v2 stood up `run_queue` next to the shipped jobs-row lease and never said which 
 
 #### 5.4.5 Completion is a command, not a call (Gate 3)
 
-**Status: design, 2026-08-08. Blocks the entire worker lane** — no `worker_batch`
-unit can be claimed safely until this lands. Evidence base:
+**Status: design 2026-08-08; step 1 shipped 2026-08-10 (`2f5307f0`); scope
+corrected 2026-08-10 — no longer admission-blocking (see below).** Evidence base:
 `docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
+
+##### Scope correction (2026-08-10): rotation never goes through `/complete`
+
+"Every batch rotation runs it" was the load-bearing sentence behind "blocks the
+entire worker lane", and it is wrong — it assumed the batch driver must route a
+rotation through `/complete`, and nothing requires that. The session lane is the
+existing disproof: `turn_executor.py` calls `/complete` **zero times**; a turn
+ends its unit with `complete_unit` against the queue. Traced against the code:
+
+- `/complete`'s pause path exists to make the job selectable again by the
+  **jobs-table dispatcher** (status→`paused`, clear `assigned_agent_id`, stash
+  the freeze, kick dispatch) and to record where it stopped for humans.
+  `determine_job_status` maps every continue-as-new freeze to `paused` — a value
+  whose only mechanical consumer is `get_dispatchable_jobs`, from which
+  stateless jobs are already excluded (the lane partition is live in eight
+  predicates).
+- The queue replaces each piece with an S1-proven primitive: re-selection =
+  release/requeue with watermarks; state carrier = the LangGraph checkpoint
+  (`restore_todo_state`), not the DB freeze stash; liveness = lease + reaper
+  (sole rescue authority, §5.4.4); the infra-outage counter arms (S5/S6, S11,
+  S12) become the queue's `attempts`/backoff/`parked` — which is replay-safe,
+  so the counter-burn bug class does not exist on this lane.
+- Agent-side, the only orchestrator interaction at job end is
+  `report_completion` itself plus a registered-agent heartbeat the stateless
+  lane doesn't have. Steering acks are a separate endpoint. A rotation has
+  nothing else to say.
+
+So a `batch_boundary` releases through the queue and never reports; `/complete`
+runs **once per job at a genuine stop — the pinned lane's frequency**. The
+freeze registry's `batch_boundary` entry stays as defense-in-depth for version
+skew (an agent that does report it gets a sane `paused`), not as the mechanism.
+
+**Four conditions, all driver-scope, none protocol-scope:**
+
+1. The driver arms the batch freeze and releases via the queue; it never
+   reports a rotation.
+2. `/complete` gains a **thin entry fence** for stateless-lane jobs: reject any
+   report whose lease token is not the unit's current token (~20 lines). This
+   closes the zombie-late-report lane outright — strictly stronger than the
+   pinned status guard. The concurrent double-report window that remains is
+   pinned parity, and its worst consequence (duplicate critic) is already
+   closed by 0132.
+3. Human-facing stops (blocking_message, budget review, dependent-autonomy
+   pauses, give-up failures) keep `/complete` — humans act on those statuses.
+   But the resume/approve/feedback verbs must become **lane-aware**:
+   `queue_job_for_resume` parks a job as "`paused` (dispatchable)", and the
+   same lane exclusion that protects a stateless job from the dispatcher
+   strands it there forever. A resumed stateless job re-enqueues its unit.
+4. Mid-batch cancel/preempt discovery rides lease-renewal `RETURNING` (already
+   planned as §7's heartbeat re-homing) — a stateless worker never sees the
+   heartbeat backstop.
+
+**Consequences.** Worker admission now waits on the **driver** (§5.4.1 freeze
+arming + TodoManager hydration, §5.7 fenced saver, §5.4.4 pt-2 claim CAS,
+enqueue, lane-aware resume, renewal backstop, §5.8 deployment) — build work
+with settled designs, no open questions. Gate 3 proceeds **unchanged in
+content** as the completion-reliability program for *both* lanes — the
+crash-window bugs it fixes are live on pinned today — but on its own schedule.
+§5.4.3's `paused_reason='batch_rotation'` sub-state dissolves: rotation never
+touches `jobs.status`, which is strictly better than flap-plus-substate.
 
 ##### What we thought this was, and what it is
 
@@ -252,7 +312,9 @@ unit can be claimed safely until this lands. Evidence base:
 change. **There is no completion CAS.** `assigned_agent_id` is not a guard
 anywhere in the path. `POST /api/jobs/{job_id}/complete` is **1046 lines with 29
 database awaits**, and it is the agent's single report-out for *every* stop, not
-just goal-achieved — so on the stateless lane **every batch rotation runs it**.
+just goal-achieved — so, this section originally concluded, on the stateless
+lane every batch rotation would run it. **Corrected above (2026-08-10): only if
+the driver routes rotations through it, which nothing requires.**
 
 Three structural facts make a guard insufficient:
 
@@ -1413,12 +1475,17 @@ They are historical only: `orchestrator/database/migration_recovery.py` and the
 database migration runbook are the status of record for a standard dirty-0132
 retry; no ledger-row surgery is required.
 
-**Everything downstream of Gate 3 is blocked**: the worker driver, TodoManager
-hydration on any resume, conditional tmux kill, generator-close discipline,
-pull-claim with claim-token renewal, checkpoint-coupled steering acks, atomic
-`paused_reason='batch_rotation'` rotation, the wall-clock batch budget, the
-worker Deployment and KEDA, job-log per-claim capture, and the Job Bench A/B
-gate.
+**What blocks worker admission is the driver, not Gate 3** (scope correction,
+§5.4.5, 2026-08-10 — rotation releases through the queue and never calls
+`/complete`). The driver work list, all with settled designs: the batch-freeze
+driver with TodoManager hydration on any resume, generator-close discipline,
+pull-claim with claim-token renewal, the §5.4.4 pt-2 claim CAS and enqueue,
+lane-aware resume/approve/feedback verbs (§5.4.5 condition 3), the thin
+`/complete` entry fence (condition 2), checkpoint-coupled steering acks, the
+wall-clock batch budget, the worker Deployment and KEDA, job-log per-claim
+capture, and the Job Bench A/B gate. Conditional tmux kill is superseded by
+S2's ownership-fenced handoff substrate; `paused_reason='batch_rotation'`
+dissolved with the scope correction.
 
 **The single-pool question is also unresolved, with evidence against it.** A
 pod-local capacity reserve cannot guarantee interactive availability across a
