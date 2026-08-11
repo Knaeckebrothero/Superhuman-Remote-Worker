@@ -1123,6 +1123,11 @@ class PostgresDB:
             total_turns   = GREATEST(total_turns, COALESCE($2, 0))
         WHERE id = $1
     """
+    _THREAD_MESSAGE_PARENT_LOCK_SQL = """
+        SELECT 1 FROM threads
+        WHERE id = $1::uuid
+        FOR KEY SHARE
+    """
 
     async def save_thread_message(
         self,
@@ -1199,17 +1204,26 @@ class PostgresDB:
             )
             return row
 
-        lease = _active_run_queue_lease()
+        lease = _active_run_queue_lease_for_thread(thread_id)
         async with self.acquire() as conn:
             if lease is None:
                 # Pinned lane: today's exact behavior (autocommit statements).
                 row = await _write(conn)
             else:
-                # Stateless lane (§5.2): the persist transaction opens with the
-                # run_queue fence; a rejected fence raises LeaseLostError and
-                # nothing lands. FOR SHARE inside the fence holds off a
-                # concurrent steal until this commit.
+                # Public End, admission, and reaper retirement lock the thread
+                # before its queue row.  Establish the message FK's parent-row
+                # authority explicitly in that same order before fencing the
+                # exact claim; otherwise an implicit FK lock after run_queue
+                # can deadlock with terminal retirement's threads -> queue
+                # transaction.  Both the upsert and activity update remain in
+                # this transaction, so a stale fence rolls everything back.
                 async with conn.transaction():
+                    thread_exists = await conn.fetchval(
+                        self._THREAD_MESSAGE_PARENT_LOCK_SQL,
+                        thread_id,
+                    )
+                    if thread_exists is None:
+                        raise ValueError("session thread no longer exists")
                     await _require_run_queue_fence(conn, lease)
                     row = await _write(conn)
         return {"id": str(row["id"]), "seq": row["seq"]}
@@ -1264,13 +1278,19 @@ class PostgresDB:
                 )
             )
 
-        lease = _active_run_queue_lease()
+        lease = _active_run_queue_lease_for_thread(thread_id)
         async with self.acquire() as conn:
             async with conn.transaction():
-                # Stateless lane (§5.2): the reconcile transaction opens with
-                # the run_queue fence. Pinned lane (no lease context) keeps
-                # today's exact transaction shape.
+                # Match public End's threads -> run_queue order before any
+                # batch FK/upsert or activity mutation. Pinned lane (no lease
+                # context) keeps today's exact transaction shape.
                 if lease is not None:
+                    thread_exists = await conn.fetchval(
+                        self._THREAD_MESSAGE_PARENT_LOCK_SQL,
+                        thread_id,
+                    )
+                    if thread_exists is None:
+                        raise ValueError("session thread no longer exists")
                     await _require_run_queue_fence(conn, lease)
                 # Same upsert as save_thread_message, minus RETURNING. Each
                 # execution's ON CONFLICT is independent (executemany runs N

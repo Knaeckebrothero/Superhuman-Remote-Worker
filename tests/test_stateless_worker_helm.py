@@ -90,6 +90,24 @@ def test_generic_pool_opens_sessions_without_opening_worker_admission() -> None:
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_stateless_executor_grace_exceeds_shutdown_and_abort_budget() -> None:
+    deployment = _only_kind(
+        _render(
+            "agent.stateless.enabled=true",
+            show_only="templates/agent/stateless-deployment.yaml",
+        ),
+        "Deployment",
+    )
+
+    # Runtime defaults are 120s graceful shutdown + 15s abort. The remaining
+    # margin lets local resource drains publish the exact claimant ACK before
+    # kubelet may send SIGKILL.
+    assert (
+        deployment["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] == 180
+    )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_stateless_worker_local_budget_override_reaches_both_planes() -> None:
     settings = (
         "agent.stateless.enabled=true",

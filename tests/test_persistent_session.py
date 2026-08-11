@@ -18,6 +18,7 @@ from src.api.persistent_session import (
     PersistentSession,
     _EXCLUDED_TOOLS,
 )
+from src.core.backends.remote import WorkspaceHostIdentityMismatch
 from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
 from src.core.workspace_backend import WorkspaceUnavailableError
 
@@ -845,6 +846,7 @@ class TestSetupWorkspace:
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
         }
 
         with (
@@ -870,6 +872,10 @@ class TestSetupWorkspace:
         assert remote_constructor.call_args.kwargs["runtime_incarnation"] == (
             "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         )
+        assert (
+            remote_constructor.call_args.kwargs["expected_host_key_fingerprint"]
+            == "SHA256:trusted"
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -877,14 +883,22 @@ class TestSetupWorkspace:
         [
             {
                 "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
             },
             {
                 "workspace_runtime_incarnation": (
                     "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
                 ),
+                "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
+            },
+            {
+                "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "workspace_runtime_incarnation": (
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                ),
             },
         ],
-        ids=["missing-runtime", "missing-backing"],
+        ids=["missing-runtime", "missing-backing", "missing-host"],
     )
     async def test_stateless_remote_attach_requires_paired_workspace_authority(
         self, workspace_override
@@ -903,9 +917,49 @@ class TestSetupWorkspace:
 
         with pytest.raises(
             WorkspaceUnavailableError,
-            match="orchestrator-attested workspace backing and runtime incarnation",
+            match="backing, runtime incarnation, and SSH host identity",
         ):
             await session._setup_workspace(workspace_override=workspace_override)
+
+    @pytest.mark.asyncio
+    async def test_stateless_host_key_mismatch_fails_without_setup_retry(self):
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+        )
+        session = _make_session(config=cfg)
+        session.shell_owner_token = 25
+        mock_remote = MagicMock()
+        mock_remote.connect.side_effect = WorkspaceHostIdentityMismatch(
+            "host key fingerprint mismatch"
+        )
+        workspace_override = {
+            "backend": "sandbox",
+            "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+            "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
+        }
+        sleep = AsyncMock()
+
+        with (
+            patch("src.api.persistent_session.asyncio.sleep", sleep),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.core.backends.remote": MagicMock(
+                        RemoteBackend=MagicMock(return_value=mock_remote)
+                    )
+                },
+            ),
+            pytest.raises(
+                WorkspaceUnavailableError,
+                match="SSH identity attestation failed",
+            ),
+        ):
+            await session._setup_workspace(workspace_override=workspace_override)
+
+        sleep.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_attested_sandbox_override_enables_canvas_presentation(self):
@@ -949,6 +1003,9 @@ class TestSetupWorkspace:
         assert mock_remote.supports_canvas_shared_browser is True
         assert remote_constructor.call_args.kwargs["workspace_generation"] is None
         assert remote_constructor.call_args.kwargs["runtime_incarnation"] is None
+        assert (
+            remote_constructor.call_args.kwargs["expected_host_key_fingerprint"] is None
+        )
 
     @pytest.mark.asyncio
     async def test_vm_remote_backend_disables_canvas_presentation(self):
@@ -3231,6 +3288,23 @@ def test_runtime_backend_id_comes_from_active_backend_features(backend, expected
 
 class TestCleanup:
     @pytest.mark.asyncio
+    async def test_quiesces_memory_and_citation_before_cleanup(self):
+        session = _make_session(shell_owner_token=19)
+        citation = SimpleNamespace(aclose=AsyncMock())
+        context = MagicMock()
+        context.citation_engine = citation
+        context.close_citation_engine = MagicMock()
+        session.tool_context = context
+        session.memory_service = SimpleNamespace(close_background=AsyncMock())
+
+        await session.quiesce_background_tasks()
+        await session.quiesce_background_tasks()  # idempotent
+
+        citation.aclose.assert_awaited_once_with()
+        context.close_citation_engine.assert_called_once_with()
+        session.memory_service.close_background.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
     async def test_cleanup_withdraws_runtime_facts_and_loaded_tool_names(self):
         session = _make_session()
         context = SimpleNamespace(
@@ -3316,6 +3390,26 @@ class TestCleanup:
         backend.retire.assert_called_once_with()
 
     @pytest.mark.asyncio
+    async def test_stateless_handoff_local_controller_failure_blocks_retirement(self):
+        session = _make_session(shell_owner_token=32)
+        backend = MagicMock()
+        session.workspace_manager = MagicMock(backend=backend)
+        overlay = MagicMock()
+        overlay.detach_local.side_effect = RuntimeError("controller still running")
+        session.overlay_mount_manager = overlay
+
+        with pytest.raises(
+            WorkspaceUnavailableError,
+            match="local workspace controllers remain active",
+        ):
+            await session.cleanup(
+                preserve_shell=True,
+                preserve_workspace_daemons=True,
+            )
+
+        backend.retire.assert_not_called()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         (
             "shell_owner_token",
@@ -3346,9 +3440,13 @@ class TestCleanup:
             preserve_workspace_daemons=preserve_workspace_daemons,
         )
 
-        overlay.unmount.assert_called_once_with()
+        if shell_owner_token is None:
+            overlay.unmount.assert_called_once_with()
+            cloud.aclose.assert_awaited_once_with()
+        else:
+            overlay.unmount.assert_called_once_with(strict=True)
+            cloud.aclose.assert_awaited_once_with(strict=True)
         overlay.detach_local.assert_not_called()
-        cloud.aclose.assert_awaited_once_with()
         cloud.detach_for_handoff.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -3367,9 +3465,13 @@ class TestCleanup:
         )
 
         overlay = MagicMock()
-        overlay.unmount.side_effect = lambda: order.append("overlay_unmounted")
+        overlay.unmount.side_effect = lambda *, strict=False: order.append(
+            "overlay_unmounted"
+        )
         cloud = MagicMock()
-        cloud.aclose = AsyncMock(side_effect=lambda: order.append("rclone_unmounted"))
+        cloud.aclose = AsyncMock(
+            side_effect=lambda *, strict=False: order.append("rclone_unmounted")
+        )
         session.overlay_mount_manager = overlay
         session.cloud_mount_manager = cloud
 

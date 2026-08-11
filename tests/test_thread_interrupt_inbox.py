@@ -16,10 +16,18 @@ from orchestrator.services.thread_interrupt_inbox import (
     admit_thread_interrupt,
     find_existing_thread_interrupt,
 )
+from src.shared.session_retirement import STATELESS_STOP_KEYS
 
 
 THREAD_ID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 OWNER_ID = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+
+
+def _virtual_metadata(**extra):
+    return {
+        "config_override": {"workspace": {"backend": "virtual"}},
+        **extra,
+    }
 
 
 class _Transaction:
@@ -68,6 +76,8 @@ class _Conn:
             "user_id": OWNER_ID,
             "execution_lane": "stateless",
             "agent_id": None,
+            "status": "active",
+            "metadata": _virtual_metadata(),
         }
         self.queue = queue or {
             "unit_kind": "session_turn",
@@ -142,7 +152,20 @@ async def test_exact_retry_returns_original_before_closed_gate_check():
         "accepted_leased_by": "stateless-agent-a",
         "outcome": "applied",
     }
-    conn = _Conn(existing=existing, queue={})
+    conn = _Conn(
+        existing=existing,
+        thread={
+            "id": THREAD_ID,
+            "user_id": OWNER_ID,
+            "execution_lane": "stateless",
+            "agent_id": None,
+            "status": "ended",
+            "metadata": _virtual_metadata(
+                _stateless_workspace_retirement_pending=False
+            ),
+        },
+        queue={},
+    )
 
     result = await admit_thread_interrupt(
         _DB(conn),
@@ -157,6 +180,118 @@ async def test_exact_retry_returns_original_before_closed_gate_check():
     assert result.state == "applied"
     assert result.duplicate is True
     assert all("FROM run_queue" not in sql for sql, _args, _depth in conn.calls)
+
+
+def _assert_no_queue_or_insert(conn):
+    assert all("FROM run_queue" not in sql for sql, _args, _depth in conn.calls)
+    assert all(
+        "INSERT INTO thread_interrupt_requests" not in sql
+        for sql, _args, _depth in conn.calls
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [None, "", "idle", "suspended", "ended"])
+async def test_new_interrupt_refuses_ineligible_lifecycle_before_queue(status):
+    conn = _Conn(thread=_Conn().thread | {"status": status})
+
+    with pytest.raises(InterruptAdmissionError, match="currently able"):
+        await admit_thread_interrupt(
+            _DB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=uuid4(),
+            target_turn_id=7,
+            requested_by=str(OWNER_ID),
+        )
+
+    _assert_no_queue_or_insert(conn)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", sorted(STATELESS_STOP_KEYS))
+@pytest.mark.parametrize("falsey_value", [None, False, 0, "", [], {}])
+async def test_new_interrupt_refuses_present_falsey_stop_marker_before_queue(
+    marker, falsey_value
+):
+    conn = _Conn(
+        thread=_Conn().thread
+        | {"metadata": _virtual_metadata(**{marker: falsey_value})}
+    )
+
+    with pytest.raises(InterruptAdmissionError, match="currently able"):
+        await admit_thread_interrupt(
+            _DB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=uuid4(),
+            target_turn_id=7,
+            requested_by=str(OWNER_ID),
+        )
+
+    _assert_no_queue_or_insert(conn)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,
+        "not-json",
+        _virtual_metadata(protected_cloud=True),
+        _virtual_metadata(protected_cloud=None),
+        _virtual_metadata(vm="malformed"),
+        _virtual_metadata(vm={"status": "ready"}),
+        _virtual_metadata(
+            config_override={
+                "workspace": {"backend": "virtual"},
+                "officer": {"enabled": True},
+            }
+        ),
+        _virtual_metadata(
+            config_override={
+                "workspace": {"backend": "virtual"},
+                "officer": {"conference": True},
+            }
+        ),
+        _virtual_metadata(
+            config_override={
+                "workspace": {"backend": "virtual"},
+                "officer": {"enabled": "false"},
+            }
+        ),
+        {
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "workspace_container": {"provisioner": "docker", "status": "ready"},
+        },
+    ],
+    ids=[
+        "null-metadata",
+        "malformed-metadata-json",
+        "protected-cloud",
+        "malformed-protected-cloud",
+        "malformed-vm",
+        "vm-present",
+        "officer",
+        "conference",
+        "malformed-officer-bit",
+        "docker-sandbox",
+    ],
+)
+async def test_new_interrupt_refuses_unsupported_session_before_queue(metadata):
+    conn = _Conn(thread=_Conn().thread | {"metadata": metadata})
+
+    with pytest.raises(InterruptAdmissionError, match="workspace binding"):
+        await admit_thread_interrupt(
+            _DB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=uuid4(),
+            target_turn_id=7,
+            requested_by=str(OWNER_ID),
+        )
+
+    _assert_no_queue_or_insert(conn)
 
 
 @pytest.mark.asyncio

@@ -52,7 +52,7 @@ skewed executor clocks cannot corrupt lease arithmetic.
 from __future__ import annotations
 
 import random
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from uuid import UUID
 
 from .types import ClaimedUnit, EnqueueResult, QueueWatermarks, StolenUnit
@@ -289,19 +289,64 @@ RETURNING 1
 """
 
 _CLOSE_INTERRUPT_ADMISSION_SQL = """
-UPDATE run_queue SET
+UPDATE run_queue AS queue SET
     interrupt_admission_lease_token = NULL,
-    interrupt_admission_turn_id = NULL
-WHERE unit_id = $1::uuid
-  AND unit_kind = 'session_turn'
-  AND state = 'leased'
-  AND lease_token = $2::bigint
+    interrupt_admission_turn_id = NULL,
+    consumed_seq = CASE
+        WHEN $4::bigint IS NULL THEN queue.consumed_seq
+        ELSE GREATEST(COALESCE(queue.consumed_seq, -1), $4::bigint)
+    END,
+    attempts_since_completion = CASE
+        WHEN $4::bigint IS NULL THEN queue.attempts_since_completion
+        ELSE 0
+    END
+WHERE queue.unit_id = $1::uuid
+  AND queue.unit_kind = 'session_turn'
+  AND queue.state = 'leased'
+  AND queue.lease_token = $2::bigint
   AND (
-      (interrupt_admission_lease_token = $2::bigint
-       AND interrupt_admission_turn_id = $3::integer)
-      OR
-      (interrupt_admission_lease_token IS NULL
-       AND interrupt_admission_turn_id IS NULL)
+      (
+          queue.interrupt_admission_lease_token = $2::bigint
+          AND queue.interrupt_admission_turn_id = $3::integer
+          AND (
+              $4::bigint IS NULL
+              OR (
+                  EXISTS (
+                      SELECT 1
+                      FROM thread_messages AS target
+                      WHERE target.thread_id = queue.unit_id
+                        AND target.seq = $4::bigint
+                        AND target.role = 'human'
+                        AND target.rewound_at IS NULL
+                        AND target.turn_number = $3::integer
+                  )
+                  AND (
+                      COALESCE(queue.consumed_seq, -1) >= $4::bigint
+                      OR (
+                          queue.input_seq IS NOT NULL
+                          AND $4::bigint <= queue.input_seq
+                          AND $4::bigint = (
+                              SELECT min(message.seq)
+                              FROM thread_messages AS message
+                              WHERE message.thread_id = queue.unit_id
+                                AND message.role = 'human'
+                                AND message.rewound_at IS NULL
+                                AND message.seq
+                                    > COALESCE(queue.consumed_seq, -1)
+                          )
+                      )
+                  )
+              )
+          )
+      )
+      OR (
+          queue.interrupt_admission_lease_token IS NULL
+          AND queue.interrupt_admission_turn_id IS NULL
+          AND (
+              $4::bigint IS NULL
+              OR COALESCE(queue.consumed_seq, -1) >= $4::bigint
+          )
+      )
   )
 RETURNING 1
 """
@@ -817,13 +862,20 @@ async def close_interrupt_admission(
     unit_id: UUID | str,
     lease_token: int,
     turn_id: int,
+    completed_input_seq: int | None = None,
 ) -> bool:
     """Close one exact stateless interrupt admission window.
 
     Closure and REST admission update/lock the same queue row, providing the
     boundary for the executor's final drain. The expected turn prevents stale
-    cleanup from closing a newer window; repeating a close after the pair is
-    already NULL is idempotent while the exact lease remains current.
+    cleanup from closing a newer window. After full settlement and cloud-push
+    completion, the executor also checkpoints the exact next unanswered human
+    row in this same statement. Thus no durable state can expose a NULL gate
+    while leaving the settled input replayable.
+
+    Repeating a close after the pair is already NULL is idempotent while the
+    exact lease remains current. A repeated checkpoint succeeds only when its
+    human seq is already consumed; it can never advance a later row.
 
     Returns ``False`` for a stale lease, a non-session unit, or a different
     open turn. The caller must treat ``False`` as lost ownership unless it can
@@ -833,11 +885,17 @@ async def close_interrupt_admission(
         raise ValueError("lease_token must be positive")
     if int(turn_id) <= 0:
         raise ValueError("turn_id must be positive")
+    completed_seq = (
+        int(completed_input_seq) if completed_input_seq is not None else None
+    )
+    if completed_seq is not None and completed_seq <= 0:
+        raise ValueError("completed_input_seq must be positive")
     closed = await conn.fetchval(
         _CLOSE_INTERRUPT_ADMISSION_SQL,
         _uuid(unit_id),
         int(lease_token),
         int(turn_id),
+        completed_seq,
     )
     return closed is not None
 
@@ -952,6 +1010,7 @@ async def reap_expired(
     max_rows: int = 50,
     backoff_base_seconds: float = 5.0,
     jitter: float = 0.2,
+    session_steal: Callable[..., Awaitable[StolenUnit | None]] | None = None,
 ) -> list[StolenUnit]:
     """Steal expired leases, per-row (§5.2 reaper) — never one bulk UPDATE.
 
@@ -974,7 +1033,14 @@ async def reap_expired(
     Each steal commits independently (run this OUTSIDE any transaction): a
     crash mid-pass keeps the steals already made.
 
-    Layering: this module touches only ``run_queue``. The CALLER (the
+    ``session_steal`` is the one deliberate layering seam.  When supplied for
+    a session candidate it owns the exact per-row steal and returns the same
+    :class:`StolenUnit` result.  The orchestrator uses it to lock
+    ``threads -> run_queue`` and record old-claim I/O-quiescence provenance in
+    the *same transaction* as the token bump; generic worker/background rows
+    keep the queue-only statement below.
+
+    Layering: without that callback this module touches only ``run_queue``. The CALLER (the
     leader-gated reaper loop — advisory lock ``RUN_QUEUE_REAPER_ID`` in
     ``orchestrator/database/lock_ids.py``) bumps ``threads.events_epoch`` for
     session units and writes the ``turn.interrupted`` / ``turn.parked``
@@ -988,6 +1054,16 @@ async def reap_expired(
     for cand in candidates:
         attempts = cand["attempts_since_completion"]
         backoff = backoff_base_seconds * attempts * (1.0 + random.uniform(0.0, jitter))
+        if cand["unit_kind"] == UNIT_KIND_SESSION_TURN and session_steal is not None:
+            unit = await session_steal(
+                conn,
+                candidate=cand,
+                backoff_seconds=backoff,
+                grace_seconds=float(grace_seconds),
+            )
+            if unit is not None:
+                stolen.append(unit)
+            continue
         row = await conn.fetchrow(
             _REAP_STEAL_SQL,
             cand["unit_id"],

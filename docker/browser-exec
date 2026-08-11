@@ -1104,6 +1104,7 @@ class BrowserDaemon:
                 self._focus_change_task = None
 
     async def _close_session(self) -> None:
+        errors = []
         focus_task = self._focus_change_task
         if focus_task is not None and focus_task is not asyncio.current_task():
             focus_task.cancel()
@@ -1111,16 +1112,23 @@ class BrowserDaemon:
         self._focus_change_task = None
         self._focus_handler = None
         if self._screencast is not None:
-            await self._screencast.stop()
+            try:
+                await self._screencast.stop()
+            except Exception as exc:
+                errors.append(exc)
             self._screencast = None
         if self._session is not None:
             try:
                 await self._session.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(exc)
             self._session = None
         self.hub.clear_generation()
         self.hub.shutdown_viewers("browser_gone")
+        if errors:
+            raise RuntimeError(
+                f"browser session shutdown failed ({len(errors)} error(s))"
+            ) from errors[0]
 
     # ── action handlers (mirror browser_direct.py helpers) ──
 
@@ -1362,6 +1370,8 @@ class BrowserDaemon:
 
         if action not in VALID_ACTIONS:
             return {"error": f"unknown action: {action!r}"}
+        if self.should_exit and action != "shutdown":
+            return {"error": "browser daemon is shutting down"}
 
         # While the user drives, refuse mutating agent actions up front:
         # never spawn Chromium and never take the action lock.
@@ -1378,10 +1388,23 @@ class BrowserDaemon:
                     return self._user_driving_refusal()
 
                 if action == "shutdown":
-                    await self._close_session()
-                    self._files.close()
+                    cleanup_error = None
+                    try:
+                        await self._close_session()
+                    except Exception as exc:
+                        cleanup_error = exc
+                    try:
+                        self._files.close()
+                    except Exception as exc:
+                        cleanup_error = cleanup_error or exc
+                    # Always retire the daemon after a shutdown request. The
+                    # client performs an exact /proc + socket postcondition and
+                    # can TERM/KILL any exact-profile orphan if graceful
+                    # browser-use cleanup failed.
                     self.should_exit = True
-                    return {"ok": True}
+                    if cleanup_error is not None:
+                        return {"error": "browser shutdown required forced cleanup"}
+                    return {"ok": True, "pid": os.getpid()}
 
                 session = await self._get_session()
 
@@ -1728,6 +1751,121 @@ def _ping(path: str) -> bool:
         return False
 
 
+def _proc_cmdline(pid: int) -> list[str]:
+    """Read one process argv without trusting a writable pid marker."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, ValueError):
+        return []
+    return [
+        part.decode(errors="surrogateescape")
+        for part in raw.split(b"\0")
+        if part
+    ]
+
+
+def _browser_resident_pids() -> dict[int, str]:
+    """Return exact browser-exec/Chromium residents owned by this profile.
+
+    Local file servers are threads inside the browser-exec daemon, so proving
+    the daemon absent proves those listeners absent too. Xvfb is deliberately
+    not included: it owns only a display socket below ``/tmp`` and cannot write
+    the durable profile/workspace paths. A daemon-spawned Xvfb is reaped by
+    ``_stop_display`` during the graceful path.
+    """
+    residents = {}
+    if not _proc_cmdline(os.getpid()):
+        return {-1: "proc scan unavailable"}
+    script = str(Path(__file__).resolve())
+    profile_flag = f"--user-data-dir={PROFILE_DIR}"
+    try:
+        proc_entries = Path("/proc").iterdir()
+    except OSError:
+        return residents
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        args = _proc_cmdline(pid)
+        if not args:
+            continue
+        is_daemon = (
+            len(args) >= 3
+            and os.path.realpath(args[1]) == script
+            and args[2] == "serve"
+        )
+        has_profile = profile_flag in args or any(
+            arg == "--user-data-dir"
+            and index + 1 < len(args)
+            and args[index + 1] == PROFILE_DIR
+            for index, arg in enumerate(args)
+        )
+        if is_daemon:
+            residents[pid] = "browser-exec"
+        elif has_profile:
+            residents[pid] = "chromium-profile"
+    return residents
+
+
+def _wait_for_browser_shutdown(timeout: float) -> dict[int, str]:
+    deadline = time.monotonic() + timeout
+    while True:
+        residents = _browser_resident_pids()
+        accepting = _ping(SOCKET_PATH)
+        if not residents and not accepting:
+            return {}
+        if time.monotonic() >= deadline:
+            return residents or {-1: "browser-exec socket still accepting"}
+        time.sleep(0.1)
+
+
+def _signal_browser_residents(residents: dict[int, str], sig: int) -> None:
+    for pid in residents:
+        if pid <= 0:
+            continue
+        try:
+            os.kill(pid, sig)
+        except (OSError, ValueError):
+            pass
+
+
+def _complete_shutdown() -> dict:
+    """Gracefully wait, then stop exact residual processes and prove absence."""
+    import signal
+
+    was_running = bool(_browser_resident_pids()) or _ping(SOCKET_PATH)
+    remaining = _wait_for_browser_shutdown(10.0)
+    forced = bool(remaining)
+    if remaining:
+        _signal_browser_residents(remaining, signal.SIGTERM)
+        remaining = _wait_for_browser_shutdown(3.0)
+    if remaining:
+        _signal_browser_residents(remaining, signal.SIGKILL)
+        remaining = _wait_for_browser_shutdown(2.0)
+    if remaining or _ping(SOCKET_PATH):
+        kinds = sorted(set(remaining.values()))
+        return {
+            "error": "browser residents did not stop",
+            "remaining": kinds,
+        }
+    # The server normally unlinks this itself. Remove only a non-accepting
+    # stale socket after process absence has been established.
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return {"error": "browser socket cleanup was not acknowledged"}
+    return {
+        "ok": True,
+        "shutdown_complete": True,
+        "already_stopped": not was_running,
+        "forced": forced,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Client
 # ─────────────────────────────────────────────────────────────────────
@@ -1765,14 +1903,33 @@ def run_client(action: str, args: dict, timeout: float) -> int:
     """Send one action; print the JSON reply to stdout. Returns exit code."""
     req = json.dumps({"action": action, "args": args}).encode() + b"\n"
 
+    # Shutdown is idempotent and must never cold-start the daemon it is trying
+    # to retire. It also cleans up an exact-profile Chromium orphan left by a
+    # previously killed daemon.
+    if action == "shutdown" and not _ping(SOCKET_PATH):
+        result = _complete_shutdown()
+        print(json.dumps(result))
+        return 0 if result.get("ok") is True else 1
+
     last_err = None
     for attempt in range(12):  # ~ up to 6s of daemon spin-up
         try:
             resp = _request(req, timeout)
+            if action == "shutdown":
+                # The daemon replies before its server finally block closes
+                # sockets and reaps the display. Do not expose that early reply
+                # as terminal acknowledgement; return only the physical proof.
+                result = _complete_shutdown()
+                print(json.dumps(result))
+                return 0 if result.get("ok") is True else 1
             sys.stdout.write(resp.decode().rstrip("\n") + "\n")
             return 0
         except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
             last_err = e
+            if action == "shutdown":
+                result = _complete_shutdown()
+                print(json.dumps(result))
+                return 0 if result.get("ok") is True else 1
             if attempt == 0:
                 log("daemon not running, spawning")
                 _spawn_daemon()

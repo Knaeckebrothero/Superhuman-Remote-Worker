@@ -41,12 +41,14 @@ import mimetypes
 import os
 import posixpath
 import re
+import secrets
 import stat as stat_module
 import zipfile
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Iterable, Iterator
+from typing import Any, Awaitable, Callable, Iterable, Iterator
+from uuid import UUID
 
 try:
     import paramiko
@@ -58,6 +60,13 @@ except ImportError:  # pragma: no cover - import-time guard
     )
 
 from . import resolve_ssh_key_path
+from .canvas_ssh import (
+    PINNED_SSH_TRANSPORT_POOL,
+    CanvasSSHError,
+    PinnedSFTPPool,
+    asyncssh,
+)
+from .stateless_workspace_gate import stateless_session_workspace_check
 from .workspace_binding import VirtualBackingUnavailable, resolve_virtual_thread_backing
 
 logger = logging.getLogger(__name__)
@@ -83,6 +92,19 @@ UNREACHABLE_BACKENDS = frozenset({"none"})
 MAX_CONCURRENT_VIRTUAL_UPLOADS = int(os.getenv("THREAD_UPLOAD_MAX_CONCURRENT", "4"))
 VIRTUAL_UPLOAD_QUEUE_TIMEOUT = float(os.getenv("THREAD_UPLOAD_QUEUE_TIMEOUT", "10"))
 _VIRTUAL_UPLOAD_SEMAPHORE = asyncio.Semaphore(max(1, MAX_CONCURRENT_VIRTUAL_UPLOADS))
+
+# Stateless sandbox uploads share Canvas's provisioner-pinned SSH transport,
+# but use a runtime-incarnation-qualified pool identity below.  A same-name pod
+# replacement can retain the workspace generation, IP, and deployment-wide SSH
+# host key; including the immutable Kubernetes Pod UID prevents a pooled channel
+# from silently crossing that replacement boundary.
+_ATTESTED_SFTP_POOL = PinnedSFTPPool(transport_pool=PINNED_SSH_TRANSPORT_POOL)
+
+RuntimeAuthorityProbe = Callable[[], Awaitable[str]]
+
+_WORKSPACE_GENERATION_KEY = "_canvas_workspace_generation"
+_RUNTIME_INCARNATION_KEY = "_runtime_incarnation"
+_RESTORE_REQUIRED_KEY = "_snapshot_restore_required"
 
 
 @dataclass
@@ -110,6 +132,23 @@ class _VirtualTarget:
 
     spec: dict[str, Any]  # rclone {type, config, root}
     prefix: str  # "threads/<thread_id>/"
+
+
+@dataclass(frozen=True, slots=True)
+class _StatelessUploadAuthority:
+    """Exact sandbox runtime tuple authorized to receive upload bytes."""
+
+    thread_id: str
+    workspace_generation: UUID
+    runtime_incarnation: UUID
+    host_key_fingerprint: str
+    target: _SshTarget
+
+    @property
+    def transport_pool_thread_id(self) -> str:
+        """Pool namespace which cannot be reused by a replacement Pod UID."""
+
+        return f"{self.thread_id}:{self.runtime_incarnation}"
 
 
 class ThreadUploadError(Exception):
@@ -638,6 +677,179 @@ def resolve_thread_upload_destination(
     )
 
 
+def _parse_required_uuid(value: Any, *, label: str) -> UUID:
+    try:
+        parsed = UUID(str(value))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ThreadUploadError(
+            status_code=409,
+            detail=f"Stateless workspace {label} attestation is unavailable",
+        ) from exc
+    if parsed.int == 0:
+        raise ThreadUploadError(
+            status_code=409,
+            detail=f"Stateless workspace {label} attestation is unavailable",
+        )
+    return parsed
+
+
+def _valid_ssh_fingerprint(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value.startswith("SHA256:")
+        and len(value) > len("SHA256:")
+        and len(value) <= 128
+        and not any(char.isspace() for char in value)
+    )
+
+
+def _resolve_stateless_upload_authority(
+    thread: dict[str, Any],
+    *,
+    destination: _SshTarget | _VirtualTarget,
+    expected_workspace_generation: str,
+    expected_runtime_incarnation: str,
+    expected_host_key_fingerprint: str,
+) -> _StatelessUploadAuthority:
+    """Validate one route-locked stateless sandbox upload authority.
+
+    The three expected values are captured by the route from its fresh,
+    lifecycle-locked row.  Requiring them separately means an accidental call
+    with an old pre-lock destination cannot silently authorize the current
+    endpoint.  This check deliberately accepts no VM/Docker compatibility
+    shapes; those stay on ``upload_files_to_thread_workspace``'s legacy path.
+    """
+
+    if thread.get("execution_lane") != "stateless":
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Attested workspace upload requires a stateless session",
+        )
+    backend, refusal = stateless_session_workspace_check(thread)
+    if backend != "sandbox" or refusal is not None:
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Stateless sandbox workspace attestation is unavailable",
+        )
+    if not isinstance(destination, _SshTarget):
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Stateless sandbox upload destination is unavailable",
+        )
+
+    thread_id = str(thread.get("id") or "").strip()
+    if not thread_id:
+        raise ThreadUploadError(status_code=404, detail="Thread is unavailable")
+
+    metadata = _thread_metadata(thread)
+    workspace = metadata.get("workspace_container") or {}
+    binding = metadata.get("_workspace_binding") or {}
+    if not isinstance(workspace, dict) or not isinstance(binding, dict):
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Stateless sandbox workspace attestation is unavailable",
+        )
+    if (
+        _RESTORE_REQUIRED_KEY in workspace
+        and workspace[_RESTORE_REQUIRED_KEY] is not False
+    ):
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Stateless workspace restore is not complete",
+        )
+
+    expected_generation = _parse_required_uuid(
+        expected_workspace_generation, label="generation"
+    )
+    expected_runtime = _parse_required_uuid(
+        expected_runtime_incarnation, label="runtime incarnation"
+    )
+    bound_generation = _parse_required_uuid(
+        binding.get("generation"), label="generation"
+    )
+    endpoint_generation = _parse_required_uuid(
+        workspace.get(_WORKSPACE_GENERATION_KEY), label="endpoint generation"
+    )
+    runtime_incarnation = _parse_required_uuid(
+        workspace.get(_RUNTIME_INCARNATION_KEY), label="runtime incarnation"
+    )
+    if not (
+        expected_generation == bound_generation == endpoint_generation
+        and expected_runtime == runtime_incarnation
+    ):
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Stateless workspace authority changed before upload",
+        )
+
+    bound_fingerprint = binding.get("ssh_host_key_fingerprint")
+    if not _valid_ssh_fingerprint(expected_host_key_fingerprint) or not (
+        _valid_ssh_fingerprint(bound_fingerprint)
+        and secrets.compare_digest(
+            expected_host_key_fingerprint,
+            str(bound_fingerprint),
+        )
+    ):
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Stateless workspace SSH identity changed before upload",
+        )
+
+    # Resolve again from the exact row instead of trusting the caller's target.
+    # This catches stale host, port, key-path, username, and workspace-root
+    # values before any network I/O.
+    resolved = resolve_thread_upload_destination(thread)
+    if not isinstance(resolved, _SshTarget) or resolved != destination:
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Stateless workspace endpoint changed before upload",
+        )
+    if (
+        destination.username != DEFAULT_USERNAME
+        or destination.workspace_path != DEFAULT_WORKSPACE_PATH
+        or not destination.host
+        or any(ord(char) < 33 or ord(char) == 127 for char in destination.host)
+        or not 1 <= destination.port <= 65535
+    ):
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Stateless workspace endpoint attestation is invalid",
+        )
+
+    return _StatelessUploadAuthority(
+        thread_id=thread_id,
+        workspace_generation=expected_generation,
+        runtime_incarnation=expected_runtime,
+        host_key_fingerprint=expected_host_key_fingerprint,
+        target=destination,
+    )
+
+
+async def _require_exact_live_runtime(authority_probe: RuntimeAuthorityProbe) -> None:
+    """Require positive Kubernetes evidence for the exact immutable Pod UID."""
+
+    try:
+        state = await authority_probe()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise ThreadUploadError(
+            status_code=503,
+            detail="Stateless workspace runtime authority could not be verified",
+        ) from exc
+    if state == "exact_live":
+        return
+    if state in {"exact_absent", "replacement"}:
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Stateless workspace runtime changed before upload completed",
+        )
+    raise ThreadUploadError(
+        status_code=503,
+        detail="Stateless workspace runtime authority is ambiguous",
+    )
+
+
 def _ensure_remote_dir(sftp: Any, path: str) -> None:
     """mkdir -p over SFTP. Tolerates parts that already exist."""
     parts = [p for p in path.split("/") if p]
@@ -741,6 +953,113 @@ def _sftp_write_files(
         client.close()
 
 
+def _is_sftp_missing(exc: BaseException) -> bool:
+    return isinstance(exc, FileNotFoundError) or bool(
+        asyncssh is not None and isinstance(exc, asyncssh.SFTPNoSuchFile)
+    )
+
+
+async def _ensure_remote_dir_async(sftp: Any, path: str) -> None:
+    """AsyncSSH equivalent of ``_ensure_remote_dir`` for pinned SFTP."""
+
+    parts = [part for part in path.split("/") if part]
+    cursor = "/" if path.startswith("/") else ""
+    for part in parts:
+        cursor = posixpath.join(cursor, part) if cursor else part
+        try:
+            await sftp.stat(cursor)
+        except Exception as exc:
+            if not _is_sftp_missing(exc):
+                raise
+            await sftp.mkdir(cursor)
+
+
+async def _remove_attested_uploads(sftp: Any, paths: Iterable[str]) -> None:
+    """Best-effort removal when the exact Pod authority changes post-write."""
+
+    for path in reversed(list(paths)):
+        try:
+            await sftp.remove(path)
+        except Exception:
+            logger.warning(
+                "Could not remove upload %s after runtime authority changed",
+                path,
+                exc_info=True,
+            )
+
+
+async def _write_attested_sftp_files(
+    sftp: Any,
+    *,
+    authority: _StatelessUploadAuthority,
+    payloads: list[tuple[str, bytes, str]],
+    authority_probe: RuntimeAuthorityProbe,
+) -> list[UploadedFile]:
+    """Write one batch only while the immutable Pod UID remains exact-live."""
+
+    uploads_dir = posixpath.join(authority.target.workspace_path, UPLOADS_SUBDIR)
+    await _ensure_remote_dir_async(sftp, uploads_dir)
+
+    taken: set[str] = set()
+    try:
+        taken.update(await sftp.listdir(uploads_dir))
+    except Exception as exc:
+        if not _is_sftp_missing(exc):
+            raise
+
+    expanded = _expand_payloads_for_extraction(payloads, taken)
+
+    # Directory setup/name planning can take long enough for a same-name Pod
+    # replacement. This is the final positive UID proof immediately before the
+    # first payload byte is opened for writing.
+    await _require_exact_live_runtime(authority_probe)
+
+    results: list[UploadedFile] = []
+    created_paths: list[str] = []
+    try:
+        for name, data, mime_type in expanded:
+            remote_path = posixpath.join(uploads_dir, name)
+            parent = posixpath.dirname(remote_path)
+            if parent != uploads_dir:
+                await _ensure_remote_dir_async(sftp, parent)
+            # Exclusive creation closes the small race between the directory
+            # listing and open without ever overwriting an agent-created file.
+            async with sftp.open(remote_path, "xb") as remote_file:
+                created_paths.append(remote_path)
+                await remote_file.write(data)
+            results.append(
+                UploadedFile(
+                    name=name,
+                    size=len(data),
+                    mime_type=mime_type or "application/octet-stream",
+                    path=posixpath.join(UPLOADS_SUBDIR, name),
+                )
+            )
+
+        # A post-write control-plane proof detects a replacement racing the
+        # batch. On failure, remove every newly claimed path over this same
+        # authenticated channel before surfacing the refusal.
+        await _require_exact_live_runtime(authority_probe)
+    except asyncio.CancelledError:
+        await _remove_attested_uploads(sftp, created_paths)
+        raise
+    except Exception:
+        # Never leave successfully-created batch members behind after
+        # cancellation, transport failure, or authority loss. Cleanup is
+        # bounded by the outer operation timeout.
+        await _remove_attested_uploads(sftp, created_paths)
+        raise
+
+    for result in results:
+        logger.info(
+            "Uploaded %s (%d bytes) to attested runtime %s",
+            result.name,
+            result.size,
+            authority.runtime_incarnation,
+        )
+    return results
+
+
 def _virtual_write_files(
     target: _VirtualTarget,
     payloads: list[tuple[str, bytes, str]],
@@ -812,6 +1131,85 @@ def _virtual_write_files(
             store.close()
 
 
+def _virtual_purge_prefix(
+    target: _VirtualTarget,
+    *,
+    store: Any | None = None,
+) -> bool:
+    """Delete one exact virtual backing and prove its prefix is empty."""
+
+    owned = store is None
+    if store is None:
+        from src.core.backends.rclone import RcloneObjectStore
+
+        store = RcloneObjectStore(
+            remote_type=str(target.spec["type"]),
+            config=target.spec.get("config") or {},
+            root=str(target.spec.get("root") or ""),
+        )
+    try:
+        for info in store.list(target.prefix):
+            if store.delete(info.key) is not True:
+                return False
+        return not store.list(target.prefix)
+    finally:
+        if owned:
+            store.close()
+
+
+async def _joined_blocking_call(func, /, *args, **kwargs):
+    """Do not release lifecycle ownership while a blocking effect still runs."""
+
+    task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        with suppress(Exception):
+            task.result()
+        raise asyncio.CancelledError
+    return task.result()
+
+
+async def purge_attested_stateless_virtual_workspace(
+    thread: dict[str, Any],
+) -> bool:
+    """Purge the exact virtual backing of a terminal stateless thread.
+
+    The caller owns the stateless lifecycle advisory lock. Resolution is
+    repeated from the authoritative ended row, so a configuration/backing
+    mismatch fails before any rclone effect. Cancellation is delayed until the
+    blocking store operation is terminal; a cancelled End can never leave a
+    stale deleter racing Resume or a retry.
+    """
+
+    if thread.get("execution_lane") != "stateless" or thread.get("status") != "ended":
+        return False
+    backend, refusal = stateless_session_workspace_check(thread)
+    if backend != "virtual" or refusal is not None:
+        return False
+    try:
+        target = resolve_thread_upload_destination(thread)
+    except ThreadUploadError:
+        return False
+    if not isinstance(target, _VirtualTarget):
+        return False
+    try:
+        return bool(await _joined_blocking_call(_virtual_purge_prefix, target))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Failed to purge stateless virtual workspace for thread %s: %s",
+            thread.get("id"),
+            exc,
+        )
+        return False
+
+
 @asynccontextmanager
 async def _virtual_upload_slot():
     """Acquire an object-store upload slot with a bounded queue wait."""
@@ -832,6 +1230,103 @@ async def _virtual_upload_slot():
     finally:
         if acquired:
             _VIRTUAL_UPLOAD_SEMAPHORE.release()
+
+
+def _validate_upload_payloads(
+    files: Iterable[tuple[str, bytes, str]],
+) -> list[tuple[str, bytes, str]]:
+    payloads = list(files)
+    if not payloads:
+        raise ThreadUploadError(status_code=400, detail="No files provided")
+    if len(payloads) > MAX_FILES_PER_REQUEST:
+        raise ThreadUploadError(
+            status_code=400,
+            detail=f"Maximum {MAX_FILES_PER_REQUEST} files per request",
+        )
+    for name, data, _ in payloads:
+        if len(data) > MAX_FILE_SIZE:
+            raise ThreadUploadError(
+                status_code=413,
+                detail=f"File '{name}' exceeds {MAX_FILE_SIZE // (1024 * 1024)}MB",
+            )
+    return payloads
+
+
+async def upload_files_to_attested_stateless_workspace(
+    thread: dict[str, Any],
+    files: Iterable[tuple[str, bytes, str]],
+    *,
+    destination: _SshTarget | _VirtualTarget,
+    expected_workspace_generation: str,
+    expected_runtime_incarnation: str,
+    expected_host_key_fingerprint: str,
+    authority_probe: RuntimeAuthorityProbe,
+) -> list[UploadedFile]:
+    """Upload to one exact-live stateless Kubernetes sandbox over pinned SFTP.
+
+    The caller must hold the distributed stateless workspace lifecycle lock and
+    pass the values read from the fresh row under that lock.  This service then
+    validates the complete tuple before network I/O, pins the SSH server key,
+    qualifies pooled transports by immutable Pod UID, and positively probes
+    that UID before connecting, immediately before the first byte, and after
+    the final byte.  Virtual stateless workspaces continue through
+    ``upload_files_to_thread_workspace`` while the route holds the same lock.
+    """
+
+    payloads = _validate_upload_payloads(files)
+    authority = _resolve_stateless_upload_authority(
+        thread,
+        destination=destination,
+        expected_workspace_generation=expected_workspace_generation,
+        expected_runtime_incarnation=expected_runtime_incarnation,
+        expected_host_key_fingerprint=expected_host_key_fingerprint,
+    )
+
+    # Do not even open a TCP connection without current positive UID evidence.
+    await _require_exact_live_runtime(authority_probe)
+    try:
+        async with asyncio.timeout(45):
+            async with _ATTESTED_SFTP_POOL.checkout(
+                thread_id=authority.transport_pool_thread_id,
+                generation=authority.workspace_generation,
+                host=authority.target.host,
+                port=authority.target.port,
+                fingerprint=authority.host_key_fingerprint,
+                key_path=authority.target.key_path,
+            ) as sftp:
+                # Pool checkout can wait behind another operation. Re-probe
+                # before even creating upload directories on the connection.
+                await _require_exact_live_runtime(authority_probe)
+                return await _write_attested_sftp_files(
+                    sftp,
+                    authority=authority,
+                    payloads=payloads,
+                    authority_probe=authority_probe,
+                )
+    except asyncio.CancelledError:
+        raise
+    except ThreadUploadError:
+        raise
+    except TimeoutError as exc:
+        raise ThreadUploadError(
+            status_code=503,
+            detail="Stateless workspace upload timed out",
+        ) from exc
+    except CanvasSSHError as exc:
+        raise ThreadUploadError(
+            status_code=exc.status_code,
+            detail="Stateless workspace pinned SSH connection failed",
+        ) from exc
+    except Exception as exc:
+        logger.warning(
+            "Pinned SFTP upload failed for stateless thread %s: %s",
+            authority.thread_id,
+            exc,
+        )
+        raise ThreadUploadError(
+            status_code=502,
+            detail="Could not write to the attested stateless workspace",
+        ) from exc
 
 
 async def upload_files_to_thread_workspace(
@@ -856,25 +1351,21 @@ async def upload_files_to_thread_workspace(
     Returns:
         Metadata for each successfully uploaded file.
     """
-    payloads = list(files)
-    if not payloads:
-        raise ThreadUploadError(status_code=400, detail="No files provided")
-    if len(payloads) > MAX_FILES_PER_REQUEST:
-        raise ThreadUploadError(
-            status_code=400,
-            detail=f"Maximum {MAX_FILES_PER_REQUEST} files per request",
-        )
-    for name, data, _ in payloads:
-        if len(data) > MAX_FILE_SIZE:
-            raise ThreadUploadError(
-                status_code=413,
-                detail=f"File '{name}' exceeds {MAX_FILE_SIZE // (1024 * 1024)}MB",
-            )
+    payloads = _validate_upload_payloads(files)
 
     if destination is None:
         destination = resolve_thread_upload_destination(thread)
 
     if isinstance(destination, _VirtualTarget):
         async with _virtual_upload_slot():
+            if thread.get("execution_lane") == "stateless":
+                return await _joined_blocking_call(
+                    _virtual_write_files, destination, payloads
+                )
             return await asyncio.to_thread(_virtual_write_files, destination, payloads)
+    if thread.get("execution_lane") == "stateless":
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Stateless sandbox uploads require exact runtime attestation",
+        )
     return await asyncio.to_thread(_sftp_write_files, destination, payloads)

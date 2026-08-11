@@ -20,10 +20,54 @@ pattern of patching ``main.require_approved_user`` AND
 """
 
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+
+
+FORWARD_THREAD_ID = "11111111-1111-4111-8111-111111111111"
+FORWARD_RUNTIME_ID = "22222222-2222-4222-8222-222222222222"
+FORWARD_GENERATION = "33333333-3333-4333-8333-333333333333"
+
+
+def _forwarding_stateless_thread(*, ready: bool) -> dict:
+    workspace = {
+        "status": "ready" if ready else "created",
+        "provisioner": "k8s",
+        "pod_name": f"ws-thread-{FORWARD_THREAD_ID[:12]}",
+        "namespace": "agent-workspaces",
+        "pod_ip": "10.42.0.9",
+        "port": 30022,
+        "_runtime_incarnation": FORWARD_RUNTIME_ID,
+    }
+    metadata = {
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "workspace_container": workspace,
+    }
+    if ready:
+        workspace["_canvas_workspace_generation"] = FORWARD_GENERATION
+        metadata["_workspace_binding"] = {
+            "generation": FORWARD_GENERATION,
+            "kind": "remote",
+            "backing_id": f"k8s-pod:agent-workspaces:{FORWARD_RUNTIME_ID}",
+            "ssh_host_key_fingerprint": "SHA256:" + ("A" * 43),
+        }
+    else:
+        workspace["_stateless_runtime_creation"] = {
+            "generation": "44444444-4444-4444-8444-444444444444",
+            "mode": "create",
+            "attempted": True,
+            "replaces_uid": None,
+        }
+    return {
+        "id": FORWARD_THREAD_ID,
+        "user_id": "user-1",
+        "agent_id": "agent-1",
+        "execution_lane": "stateless",
+        "metadata": metadata,
+    }
 
 
 # =============================================================================
@@ -78,6 +122,132 @@ class TestRequireThreadOwner:
             with pytest.raises(HTTPException) as exc:
                 await require_thread_owner(fake_request, fake_db, str(thread_a["id"]))
         assert exc.value.status_code == 403
+
+
+class TestForwardingWorkspaceAuthority:
+    @pytest.mark.asyncio
+    async def test_direct_stateless_forwarding_finishes_nonce_lifecycle(self):
+        import orchestrator.main as main
+
+        in_progress = _forwarding_stateless_thread(ready=False)
+        ready = _forwarding_stateless_thread(ready=True)
+        db = SimpleNamespace(
+            get_thread=AsyncMock(side_effect=[in_progress, ready]),
+            get_agent=AsyncMock(return_value={"id": "agent-1", "pod_ip": "10.0.0.2"}),
+        )
+        ensure = AsyncMock()
+        suspension = SimpleNamespace(
+            is_enabled=True,
+            restore_thread_workspace=AsyncMock(),
+        )
+        provisioner = SimpleNamespace()
+
+        with (
+            patch.object(main, "postgres_db", db),
+            patch.object(main, "ensure_session_workspace", ensure),
+            patch.object(main, "container_provisioner", provisioner),
+            patch.object(main, "workspace_suspension_service", suspension),
+        ):
+            resolved, agent = await main._resolve_thread_for_forwarding(
+                FORWARD_THREAD_ID, {"id": "user-1", "is_admin": False}
+            )
+
+        assert resolved is ready
+        assert agent["id"] == "agent-1"
+        ensure.assert_awaited_once_with(
+            FORWARD_THREAD_ID,
+            db=db,
+            provisioner=provisioner,
+            suspension=suspension,
+        )
+        suspension.restore_thread_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stateless_forwarding_refuses_fresh_lane_flip(self):
+        import orchestrator.main as main
+
+        initial = _forwarding_stateless_thread(ready=False)
+        flipped = _forwarding_stateless_thread(ready=True)
+        flipped["execution_lane"] = "pinned"
+        db = SimpleNamespace(
+            get_thread=AsyncMock(side_effect=[initial, flipped]),
+            get_agent=AsyncMock(),
+        )
+        ensure = AsyncMock()
+        suspension = SimpleNamespace(
+            is_enabled=True,
+            restore_thread_workspace=AsyncMock(),
+        )
+
+        with (
+            patch.object(main, "postgres_db", db),
+            patch.object(main, "ensure_session_workspace", ensure),
+            patch.object(main, "container_provisioner", SimpleNamespace()),
+            patch.object(main, "workspace_suspension_service", suspension),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main._resolve_thread_for_forwarding(
+                    FORWARD_THREAD_ID,
+                    {"id": "user-1", "is_admin": False},
+                )
+
+        assert exc.value.status_code == 409
+        db.get_agent.assert_not_awaited()
+        suspension.restore_thread_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stateless_suspended_forwarding_never_uses_legacy_restore(self):
+        import orchestrator.main as main
+
+        suspended = _forwarding_stateless_thread(ready=False)
+        workspace = suspended["metadata"]["workspace_container"]
+        workspace["status"] = "suspended"
+        workspace["_snapshot_restore_required"] = True
+        workspace["_stateless_runtime_creation"]["mode"] = "restore"
+        ready = _forwarding_stateless_thread(ready=True)
+        db = SimpleNamespace(
+            get_thread=AsyncMock(side_effect=[suspended, ready]),
+            get_agent=AsyncMock(return_value={"id": "agent-1", "pod_ip": "10.0.0.2"}),
+        )
+        suspension = SimpleNamespace(
+            is_enabled=True,
+            restore_thread_workspace=AsyncMock(),
+        )
+
+        with (
+            patch.object(main, "postgres_db", db),
+            patch.object(main, "ensure_session_workspace", AsyncMock()),
+            patch.object(main, "container_provisioner", SimpleNamespace()),
+            patch.object(main, "workspace_suspension_service", suspension),
+        ):
+            await main._resolve_thread_for_forwarding(
+                FORWARD_THREAD_ID,
+                {"id": "user-1", "is_admin": False},
+            )
+
+        suspension.restore_thread_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stateless_forwarding_refuses_malformed_physical_class_first(self):
+        import orchestrator.main as main
+
+        thread = _forwarding_stateless_thread(ready=True)
+        thread["metadata"]["vm"] = {"status": "ready"}
+        db = SimpleNamespace(get_thread=AsyncMock(return_value=thread))
+        ensure = AsyncMock()
+
+        with (
+            patch.object(main, "postgres_db", db),
+            patch.object(main, "ensure_session_workspace", ensure),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main._resolve_thread_for_forwarding(
+                    FORWARD_THREAD_ID,
+                    {"id": "user-1", "is_admin": False},
+                )
+
+        assert exc.value.status_code == 409
+        ensure.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_orphan_thread_fail_closed(self, user_a, fake_db, fake_request):

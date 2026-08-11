@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 
 from orchestrator.services.stateless_workspace_gate import (
+    stateless_session_workspace_check,
     stateless_workspace_check,
 )
 
@@ -18,6 +19,7 @@ THREAD_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 VIRTUAL_GENERATION = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 SANDBOX_GENERATION = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 SANDBOX_RUNTIME = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+CREATION_GENERATION = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
 
 
 def _thread(metadata):
@@ -60,6 +62,31 @@ def _k8s_sandbox_metadata(*, status: str = "ready", **workspace_extra):
         }
     workspace.update(workspace_extra)
     return metadata
+
+
+def _creation_marker(*, mode="create", attempted=False, replaces_uid=None, **extra):
+    return {
+        "generation": CREATION_GENERATION,
+        "mode": mode,
+        "attempted": attempted,
+        "replaces_uid": replaces_uid,
+        **extra,
+    }
+
+
+def test_record_shaped_mapping_preserves_stateless_sandbox_authority():
+    class RecordLike:
+        """Match asyncpg.Record's duck type without registering as Mapping."""
+
+        def __init__(self, values):
+            self._values = values
+
+        def get(self, key, default=None):
+            return self._values.get(key, default)
+
+    record = RecordLike(_thread(_k8s_sandbox_metadata()))
+
+    assert stateless_session_workspace_check(record) == ("sandbox", None)
 
 
 @pytest.mark.parametrize(
@@ -114,6 +141,163 @@ def test_classifier_admits_attested_k8s_sandbox_lifecycle(metadata):
 
     assert backend == "sandbox"
     assert refusal is None
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {**_k8s_sandbox_metadata(), "protected_cloud": True},
+        _metadata("virtual", protected_cloud=True),
+        _metadata("none", protected_cloud="true"),
+        json.dumps(_metadata("sandbox", protected_cloud=True)),
+    ],
+    ids=["sandbox", "virtual", "malformed-none", "json"],
+)
+def test_classifier_keeps_protected_cloud_on_pinned_plane(metadata):
+    backend, refusal = stateless_workspace_check(_thread(metadata))
+
+    assert backend in {"sandbox", "virtual", "none"}
+    assert refusal == "protected_cloud_requires_pinned"
+
+
+def test_classifier_accepts_exact_disabled_protected_cloud_marker():
+    metadata = _metadata("virtual", protected_cloud=False)
+
+    assert stateless_workspace_check(_thread(metadata)) == ("virtual", None)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [None, 0, "", [], {}],
+    ids=["null", "zero", "empty-string", "empty-list", "empty-map"],
+)
+def test_classifier_refuses_present_malformed_protected_cloud_marker(malformed):
+    metadata = _metadata("virtual", protected_cloud=malformed)
+
+    assert stateless_workspace_check(_thread(metadata)) == (
+        "virtual",
+        "protected_cloud_requires_pinned",
+    )
+
+
+@pytest.mark.parametrize("restore_required", [True, False])
+def test_classifier_accepts_exact_boolean_restore_marker(restore_required):
+    metadata = _k8s_sandbox_metadata(
+        _snapshot_restore_required=restore_required,
+    )
+
+    assert stateless_workspace_check(_thread(metadata)) == ("sandbox", None)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [None, 0, "", [], {}],
+    ids=["null", "zero", "empty-string", "empty-list", "empty-map"],
+)
+def test_classifier_refuses_malformed_restore_marker(malformed):
+    metadata = _k8s_sandbox_metadata(_snapshot_restore_required=malformed)
+
+    assert stateless_workspace_check(_thread(metadata)) == (
+        "sandbox",
+        "workspace_restore_marker_malformed",
+    )
+
+
+@pytest.mark.parametrize(
+    "status", ["pending", "created", "creating", "failed", "deleted"]
+)
+@pytest.mark.parametrize("attempted", [False, True])
+def test_classifier_accepts_exact_in_progress_creation_marker(status, attempted):
+    metadata = _k8s_sandbox_metadata(
+        status=status,
+        _stateless_runtime_creation=_creation_marker(attempted=attempted),
+    )
+
+    assert stateless_session_workspace_check(_thread(metadata)) == ("sandbox", None)
+
+
+def test_classifier_accepts_restore_creation_marker_only_with_exact_restore_intent():
+    metadata = _k8s_sandbox_metadata(
+        status="restoring",
+        _snapshot_restore_required=True,
+        _stateless_runtime_creation=_creation_marker(
+            mode="restore",
+            replaces_uid=SANDBOX_RUNTIME,
+        ),
+    )
+
+    assert stateless_session_workspace_check(_thread(metadata)) == ("sandbox", None)
+
+
+def test_classifier_refuses_ready_credentials_while_creation_marker_remains():
+    metadata = _k8s_sandbox_metadata(
+        _stateless_runtime_creation=_creation_marker(attempted=True),
+    )
+
+    assert stateless_session_workspace_check(_thread(metadata)) == (
+        "sandbox",
+        "workspace_creation_in_progress",
+    )
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        None,
+        False,
+        0,
+        "",
+        [],
+        {},
+        _creation_marker(generation="EEEEEEEE-EEEE-4EEE-8EEE-EEEEEEEEEEEE"),
+        _creation_marker(attempted=1),
+        _creation_marker(mode="recreate"),
+        _creation_marker(replaces_uid="not-a-uuid"),
+        _creation_marker(extra=True),
+    ],
+    ids=[
+        "null",
+        "false",
+        "zero",
+        "empty-string",
+        "empty-list",
+        "empty-map",
+        "noncanonical-generation",
+        "numeric-attempted",
+        "bad-mode",
+        "bad-replacement-uid",
+        "extra-field",
+    ],
+)
+def test_classifier_refuses_malformed_creation_marker_at_all_statuses(marker):
+    metadata = _k8s_sandbox_metadata(
+        status="creating",
+        _stateless_runtime_creation=marker,
+    )
+
+    assert stateless_session_workspace_check(_thread(metadata)) == (
+        "sandbox",
+        "workspace_creation_marker_malformed",
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "restore_required"),
+    [("create", True), ("restore", False)],
+)
+def test_classifier_refuses_creation_mode_restore_intent_mismatch(
+    mode, restore_required
+):
+    metadata = _k8s_sandbox_metadata(
+        status="restoring",
+        _snapshot_restore_required=restore_required,
+        _stateless_runtime_creation=_creation_marker(mode=mode),
+    )
+
+    assert stateless_session_workspace_check(_thread(metadata)) == (
+        "sandbox",
+        "workspace_creation_marker_malformed",
+    )
 
 
 @pytest.mark.parametrize(
@@ -379,6 +563,34 @@ def test_pinned_only_session_classes_do_not_auto_admit(monkeypatch, officer):
         )
         == "pinned"
     )
+
+
+@pytest.mark.parametrize(
+    "officer",
+    [
+        [],
+        {"enabled": None},
+        {"enabled": 0},
+        {"enabled": "yes"},
+        {"conference": "false"},
+        {"conference": 1},
+    ],
+)
+def test_malformed_session_class_pins_and_cannot_be_materialized(monkeypatch, officer):
+    from orchestrator import main as orch_main
+
+    monkeypatch.setattr(orch_main, "STATELESS_SESSION_ENABLED", True)
+    config = {"workspace": {"backend": "none"}, "officer": officer}
+
+    assert (
+        orch_main._resolve_thread_execution_lane(
+            workspace_backend="none", effective_config=config
+        )
+        == "pinned"
+    )
+    with pytest.raises(HTTPException) as exc:
+        orch_main._materialized_session_class_override(config)
+    assert exc.value.status_code == 400
 
 
 def test_materialized_ordinary_class_wins_over_later_expert_and_account_changes():

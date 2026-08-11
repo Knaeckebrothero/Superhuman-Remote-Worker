@@ -58,6 +58,7 @@ class StolenUnit:
     lease_token: int
     previous_lease_token: int | None = None
     interrupt_admission_turn_id: int | None = None
+    lifecycle_journaled: bool = False
 
 
 @dataclass(frozen=True, slots=True)

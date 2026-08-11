@@ -81,8 +81,12 @@ def _pending(
     }
 
 
-def _thread(*, lane="stateless", agent_id=None):
-    return {"execution_lane": lane, "agent_id": agent_id}
+def _thread(*, lane="stateless", agent_id=None, metadata=None):
+    return {
+        "execution_lane": lane,
+        "agent_id": agent_id,
+        "metadata": metadata or {},
+    }
 
 
 def _queue(
@@ -108,6 +112,12 @@ def _queue(
         "consumed_seq": consumed_seq,
         "control_input_seq": control_input_seq,
         "control_consumed_seq": control_consumed_seq,
+        "max_attempts": 5,
+        "queued_at": None,
+        "run_after": None,
+        "leased_until": None,
+        "interrupt_admission_lease_token": None,
+        "interrupt_admission_turn_id": None,
     }
 
 
@@ -135,6 +145,7 @@ def _conn():
     conn.stolen_interrupts = []
     conn.retry_candidates = []
     conn.retry_interrupts = []
+    conn.claim_loss_candidates = []
     conn.thread_row = _thread()
     conn.queue_row = _queue()
 
@@ -145,6 +156,8 @@ def _conn():
             return conn.retry_candidates
         if sql == mod._PENDING_STALE_INTERRUPT_RETRY_SQL:
             return conn.retry_interrupts
+        if sql == mod._CLAIM_LOSS_HOLD_CANDIDATES_SQL:
+            return conn.claim_loss_candidates
         raise AssertionError(f"unexpected fetch SQL: {sql}")
 
     def _fetchrow(sql, *_args):
@@ -208,6 +221,114 @@ async def test_reap_cas_returns_exact_pre_steal_admission_turn():
 
 
 @pytest.mark.asyncio
+async def test_atomic_session_steal_parks_exact_uid_debt_after_settlement(monkeypatch):
+    conn = _conn()
+    conn.thread_row = _thread(
+        metadata={
+            "_stateless_active_claim": {
+                "lease_token": 8,
+                "pod": "pod-1",
+                "pod_uid": "uid-old",
+            }
+        }
+    )
+    leased = _queue(state="leased", token=8, leased_by="pod-1")
+    leased["leased_until"] = "expired"
+    settled = _queue(state="queued", token=9, leased_by=None, attempts=2)
+    settled["queued_at"] = "2026-08-11T12:00:00+00:00"
+    settled["run_after"] = "2026-08-11T12:00:03+00:00"
+
+    async def _fetchrow(sql, *_args):
+        if sql == mod._LOCK_THREAD_SQL:
+            return conn.thread_row
+        if sql == mod._LOCK_QUEUE_UNIT_SQL:
+            _fetchrow.queue_reads += 1
+            return leased if _fetchrow.queue_reads == 1 else settled
+        if sql == mod._STEAL_LOCKED_SESSION_SQL:
+            return {
+                "unit_id": UNIT_A,
+                "unit_kind": "session_turn",
+                "state": "queued",
+                "attempts_since_completion": 2,
+                "lease_token": 9,
+            }
+        if sql == mod._PARK_CLAIM_LOSS_HOLD_SQL:
+            return {"unit_id": UNIT_A}
+        raise AssertionError(f"unexpected fetchrow SQL: {sql}")
+
+    _fetchrow.queue_reads = 0
+    conn.fetchrow.side_effect = _fetchrow
+    conn.fetchval.side_effect = lambda sql, *_args: (
+        UNIT_A
+        if sql == mod._STORE_CLAIM_LOSS_HOLD_SQL
+        else (_ for _ in ()).throw(AssertionError(f"unexpected fetchval SQL: {sql}"))
+    )
+    monkeypatch.setattr(mod, "bump_epoch", AsyncMock(return_value=2))
+    monkeypatch.setattr(mod, "append_system_frame", AsyncMock(return_value=(2, 1)))
+
+    unit = await mod._steal_session_with_claim_loss(
+        conn,
+        candidate={
+            "unit_id": UNIT_A,
+            "lease_token": 8,
+            "leased_by": "pod-1",
+        },
+        backoff_seconds=3,
+        grace_seconds=0,
+    )
+
+    assert unit is not None and unit.lease_token == 9
+    stored = json.loads(conn.fetchval.await_args.args[2])
+    assert stored["_stateless_claim_losses"]["8"] == {
+        "pod": "pod-1",
+        "pod_uid": "uid-old",
+        "quiesced": False,
+    }
+    assert stored["_stateless_claim_loss_hold"] == {
+        "lease_token": 9,
+        "intended_state": "queued",
+        "attempts_since_completion": 2,
+        "queued_at": "2026-08-11T12:00:00+00:00",
+        "run_after": "2026-08-11T12:00:03+00:00",
+    }
+    assert "_stateless_active_claim" not in stored
+    assert conn.fetchrow.await_args_list[-1].args[0] == mod._PARK_CLAIM_LOSS_HOLD_SQL
+
+
+@pytest.mark.asyncio
+async def test_post_eviction_404_does_not_settle_claimant_debt(monkeypatch):
+    import services.agent_provisioner as provisioner_module
+    import src.shared.session_retirement as retirement
+
+    conn = _conn()
+    conn.claim_loss_candidates = [
+        {
+            "id": UNIT_A,
+            "metadata": {
+                "_stateless_claim_losses": {
+                    "8": {
+                        "pod": "pod-1",
+                        "pod_uid": "uid-old",
+                        "quiesced": False,
+                        "eviction_requested_at": "2026-08-11T12:00:00Z",
+                    }
+                }
+            },
+        }
+    ]
+    authority = AsyncMock(return_value="exact_absent")
+    monkeypatch.setattr(
+        provisioner_module.agent_provisioner, "agent_pod_authority", authority
+    )
+    ack = AsyncMock(return_value=True)
+    monkeypatch.setattr(retirement, "acknowledge_session_claim_quiesced", ack)
+
+    assert await mod.reconcile_claim_loss_holds(conn) == 0
+    authority.assert_awaited_once_with("pod-1", expected_pod_uid="uid-old")
+    ack.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_steal_of_requeued_session_unit_journals_turn_interrupted(monkeypatch):
     conn = _conn()
     monkeypatch.setattr(
@@ -229,7 +350,8 @@ async def test_steal_of_requeued_session_unit_journals_turn_interrupted(monkeypa
         payload={"reason": "lease_expired", "attempts": 2, "stolen_from": "pod-1"},
     )
     assert conn.txn_enters == 1, "bump + frame share ONE transaction per unit"
-    assert conn.fetch.await_count == 2  # exact-token rows + bounded retry scan
+    # exact-token rows + bounded interrupt retry + claimant-loss reconciliation
+    assert conn.fetch.await_count == 3
     assert conn.fetch.await_args_list[0].args[1:] == (str(UNIT_A), 8)
     conn.fetchval.assert_not_awaited()
     # grace flows through to the substrate
@@ -363,6 +485,7 @@ async def test_unreceipted_stop_intents_each_ack_applied_and_consume_once(monkey
         accepted_lease_token=8,
         target_turn_id=17,
         request_id=str(REQUEST_A),
+        terminal=False,
     )
     assert conn.txn_enters == conn.txn_exits == 1
     assert conn.txn_failures == 0
@@ -424,6 +547,7 @@ async def test_existing_receipt_is_terminalized_without_duplicate_frame(monkeypa
         accepted_lease_token=8,
         target_turn_id=21,
         request_id=str(REQUEST_A),
+        terminal=False,
     )
 
 
@@ -624,6 +748,7 @@ async def test_applied_sibling_receipts_settle_one_input_group(monkeypatch):
         accepted_lease_token=8,
         target_turn_id=21,
         request_id=str(REQUEST_A),
+        terminal=False,
     )
     frame.assert_awaited_once()
     assert frame.await_args.kwargs["payload"]["target_turn_id"] == 21
@@ -705,6 +830,7 @@ async def test_failed_parked_journal_transaction_is_rebuilt_in_periodic_retry(
         accepted_lease_token=8,
         target_turn_id=17,
         request_id=str(REQUEST_A),
+        terminal=False,
     )
     assert conn.txn_enters == conn.txn_exits == 2
     assert conn.txn_failures == 1
@@ -930,7 +1056,7 @@ async def test_loop_leader_gates_on_reaper_advisory_lock(monkeypatch):
     conn.fetchval = _fetchval
     conn.execute = AsyncMock()
 
-    async def _reap(c, *, grace_seconds):
+    async def _reap(c, *, grace_seconds, session_steal=None):
         assert c is conn
         shutdown.set()  # one cycle, then stop
         return []
@@ -996,7 +1122,7 @@ async def test_loop_survives_cycle_errors_and_recontends(monkeypatch):
     conn.execute = AsyncMock()
     rounds = []
 
-    async def _reap(c, *, grace_seconds):
+    async def _reap(c, *, grace_seconds, session_steal=None):
         rounds.append(1)
         if len(rounds) == 1:
             raise ConnectionError("db blip")

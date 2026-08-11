@@ -29,6 +29,7 @@ from src.core.workspace_backend import (  # noqa: E402
     WorkspaceAuthenticationError,
     WorkspaceUnavailableError,
 )
+from src.core.backends.remote import WorkspaceHostIdentityMismatch  # noqa: E402
 
 
 # =============================================================================
@@ -310,12 +311,21 @@ from src.core.backends.remote import (  # noqa: E402
     _TCP_USER_TIMEOUT_MILLIS,
     _TRANSPORT_KEEPALIVE_SECONDS,
     _parse_shell_completion_record,
+    _sha256_public_key_fingerprint,
     _validate_private_key,
 )
 
 
 _WORKSPACE_GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 _RUNTIME_INCARNATION = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+
+class _HostKey:
+    def __init__(self, material: bytes):
+        self._material = material
+
+    def asbytes(self) -> bytes:
+        return self._material
 
 
 def _tmux_window_row(
@@ -490,6 +500,25 @@ class TestRemoteBackendInit:
                 runtime_incarnation=runtime_incarnation,
             )
 
+    @pytest.mark.parametrize(
+        "fingerprint",
+        [
+            "MD5:legacy",
+            "SHA256:has space",
+            "SHA256:short",
+            "SHA256:" + "A" * 43 + "=",
+        ],
+    )
+    def test_expected_host_key_requires_sha256_fingerprint(self, fingerprint):
+        with pytest.raises(
+            WorkspaceAuthenticationError, match="OpenSSH SHA256 fingerprint"
+        ):
+            RemoteBackend(
+                host="host",
+                workspace_path="/ws",
+                expected_host_key_fingerprint=fingerprint,
+            )
+
 
 class TestRemoteBackendConnect:
     """Tests for RemoteBackend.connect()."""
@@ -509,6 +538,62 @@ class TestRemoteBackendConnect:
             allow_agent=False,
             look_for_keys=False,
         )
+
+    def test_connect_accepts_exact_pinned_host_key(self):
+        host_key = _HostKey(b"pod-u1-host-key")
+        expected = _sha256_public_key_fingerprint(host_key)
+        mock_ssh = MagicMock()
+        mock_sftp = MagicMock()
+        mock_ssh.open_sftp.return_value = mock_sftp
+        mock_ssh.get_transport.return_value.is_active.return_value = True
+
+        def present_host_key(**_kwargs):
+            policy = mock_ssh.set_missing_host_key_policy.call_args.args[0]
+            policy.missing_host_key(mock_ssh, "workspace.test", host_key)
+
+        mock_ssh.connect.side_effect = present_host_key
+        with patch("paramiko.SSHClient", return_value=mock_ssh):
+            backend = RemoteBackend(
+                host="workspace.test",
+                key_path="/key",
+                workspace_path="/ws",
+                max_retries=5,
+                expected_host_key_fingerprint=expected,
+            )
+            backend.connect()
+
+        mock_ssh.connect.assert_called_once()
+        mock_ssh.open_sftp.assert_called_once()
+
+    def test_connect_rejects_host_key_mismatch_before_sftp(self):
+        expected = _sha256_public_key_fingerprint(_HostKey(b"pod-u1-host-key"))
+        replacement_key = _HostKey(b"pod-u2-host-key")
+        mock_ssh = MagicMock()
+
+        def present_replacement_key(**_kwargs):
+            policy = mock_ssh.set_missing_host_key_policy.call_args.args[0]
+            policy.missing_host_key(mock_ssh, "workspace.test", replacement_key)
+
+        mock_ssh.connect.side_effect = present_replacement_key
+        with patch("paramiko.SSHClient", return_value=mock_ssh):
+            backend = RemoteBackend(
+                host="workspace.test",
+                key_path="/key",
+                workspace_path="/ws",
+                max_retries=5,
+                expected_host_key_fingerprint=expected,
+            )
+            with pytest.raises(
+                WorkspaceHostIdentityMismatch,
+                match="host key fingerprint mismatch",
+            ) as mismatch:
+                backend.connect()
+
+        # Identity mismatch is terminal: no retries and no workspace channel.
+        assert isinstance(mismatch.value, WorkspaceAuthenticationError)
+        mock_ssh.connect.assert_called_once()
+        mock_ssh.open_sftp.assert_not_called()
+        mock_ssh.close.assert_called()
 
     def test_connect_with_key_path(self):
         mock_ssh = MagicMock()
@@ -839,6 +924,77 @@ class TestRemoteBackendEnsureConnected:
 
         with patch("time.sleep"):
             backend._ensure_connected()
+
+    def test_reconnect_identity_rotation_requests_fresh_attestation_before_io(self):
+        original_key = _HostKey(b"pod-u1-host-key")
+        replacement_key = _HostKey(b"pod-u2-host-key")
+        expected = _sha256_public_key_fingerprint(original_key)
+
+        first_ssh = MagicMock()
+        first_sftp = MagicMock()
+        first_transport = MagicMock()
+        first_transport.is_active.return_value = True
+        first_ssh.open_sftp.return_value = first_sftp
+        first_ssh.get_transport.return_value = first_transport
+
+        second_ssh = MagicMock()
+        second_ssh.get_transport.return_value.is_active.return_value = True
+
+        def present(client, key):
+            def _connect(**_kwargs):
+                policy = client.set_missing_host_key_policy.call_args.args[0]
+                policy.missing_host_key(client, "workspace.test", key)
+
+            return _connect
+
+        first_ssh.connect.side_effect = present(first_ssh, original_key)
+        second_ssh.connect.side_effect = present(second_ssh, replacement_key)
+
+        with patch("paramiko.SSHClient", side_effect=[first_ssh, second_ssh]):
+            backend = RemoteBackend(
+                host="workspace.test",
+                key_path="/key",
+                workspace_path="/ws",
+                max_retries=5,
+                expected_host_key_fingerprint=expected,
+            )
+            backend.connect()
+            reconnect_hook = MagicMock()
+            backend.set_reconnect_hook(reconnect_hook)
+            first_transport.is_active.return_value = False
+
+            with pytest.raises(
+                WorkspaceUnavailableError,
+                match="fresh workspace attestation is required",
+            ) as unavailable:
+                # Exercise the public workspace-I/O path: no SFTP byte may
+                # cross to U2 under U1's host-key/runtime attestation.
+                backend.read_file("handoff.txt")
+
+        assert isinstance(unavailable.value.__cause__, WorkspaceHostIdentityMismatch)
+        second_ssh.connect.assert_called_once()
+        second_ssh.open_sftp.assert_not_called()
+        reconnect_hook.assert_not_called()
+
+    def test_reconnect_genuine_auth_failure_keeps_authentication_classification(
+        self, remote_backend
+    ):
+        import paramiko as real_paramiko
+
+        backend, mock_ssh, _mock_sftp = remote_backend
+        backend.connect()
+        transport = mock_ssh.get_transport.return_value
+        transport.is_active.return_value = False
+        mock_ssh.connect.side_effect = real_paramiko.AuthenticationException(
+            "Authentication failed"
+        )
+
+        with pytest.raises(
+            WorkspaceAuthenticationError, match="authentication failed"
+        ) as auth:
+            backend.read_file("must-not-open.txt")
+
+        assert not isinstance(auth.value, WorkspaceUnavailableError)
 
     def test_raises_after_reconnect_failure(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend
@@ -1873,12 +2029,61 @@ class TestRemoteBackendTmuxFences:
             assert backend._stateless_create_or_observe_tmux_session() == "existing"
 
         command = execute.call_args.args[0]
-        assert f"2|{backend._tmux_owner_digest}|{_WORKSPACE_GENERATION}|" in command
+        assert f"3|{backend._tmux_owner_digest}|{_WORKSPACE_GENERATION}|" in command
         assert f"|{_RUNTIME_INCARNATION}|%s|%s|%s" in command
         assert _TMUX_WORKSPACE_GENERATION_OPTION in command
         assert _TMUX_RUNTIME_INCARNATION_OPTION in command
         assert f'"$_srw_runtime_incarnation" = {_RUNTIME_INCARNATION}' in command
         assert f'"$_srw_tmux_runtime_incarnation" = {_RUNTIME_INCARNATION}' in command
+
+    def test_incarnation_creation_stamps_inherited_process_tags(self):
+        backend = self._incarnation_backend()
+        generation = "c" * 32
+
+        command = backend._stateless_tmux_create_shell("21", generation)
+
+        assert "@srw_process_tag" in command
+        assert "SRW_WORKSPACE_PROCESS_TAG" in command
+        assert "SRW_SHELL_PROCESS_TAG" in command
+        assert backend._workspace_process_tag() in command
+        assert backend._shell_process_tag(generation) in command
+        new_session = command.index("tmux new-session")
+        first_option = command.index("tmux set-option", new_session)
+        assert " -e SRW_WORKSPACE_PROCESS_TAG=" in command[new_session:first_option]
+        assert " -e SRW_SHELL_PROCESS_TAG=" in command[new_session:first_option]
+
+    def test_terminal_process_zero_kills_disowned_tagged_child_and_excludes_ancestors(
+        self,
+    ):
+        backend = self._incarnation_backend()
+        tag = backend._workspace_process_tag()
+        command = backend._stateless_workspace_process_zero_shell(terminate=True)
+        assert "\x00" not in command
+
+        child = subprocess.Popen(
+            ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"],
+            env={**os.environ, "SRW_WORKSPACE_PROCESS_TAG": tag},
+            start_new_session=True,
+        )
+        try:
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                env={**os.environ, "SRW_WORKSPACE_PROCESS_TAG": tag},
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            # The shared test host can contain same-UID, non-dumpable sibling
+            # processes. Production correctly treats those as ambiguous (86)
+            # rather than a zero proof, but must still retire every readable
+            # exact-tag child before refusing.
+            assert completed.returncode in {0, 86}, completed.stderr
+            child.wait(timeout=3)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=3)
 
     def test_replacement_runtime_supersedes_stale_marker_only_without_live_tmux(self):
         backend = self._incarnation_backend(token=22)
@@ -1943,7 +2148,7 @@ class TestRemoteBackendTmuxFences:
         assert completed.stdout == "created"
         fields = state_file.read_text().strip().split("|")
         assert fields[:6] == [
-            "2",
+            "3",
             backend._tmux_owner_digest,
             _WORKSPACE_GENERATION,
             _RUNTIME_INCARNATION,
@@ -1995,7 +2200,9 @@ class TestRemoteBackendTmuxFences:
             backend, command, tmp_path
         )
 
-        assert completed.returncode == 75
+        # Protocol-v2 successor records predate mandatory process tags and are
+        # refused before the later token comparison.
+        assert completed.returncode == 81
         assert state_file.read_text() == successor_state
 
     def test_legacy_live_session_migration_installs_both_authority_options(self):
@@ -2408,7 +2615,7 @@ class TestRemoteBackendShellOperations:
                 backend,
                 "_read_tmux_session_option",
                 side_effect=lambda option: (
-                    _TMUX_SETUP_COMPLETE if option == _TMUX_SETUP_OPTION else "2"
+                    _TMUX_SETUP_COMPLETE if option == _TMUX_SETUP_OPTION else "3"
                 ),
             ),
             patch.object(backend, "_rehydrate_tabs") as rehydrate,

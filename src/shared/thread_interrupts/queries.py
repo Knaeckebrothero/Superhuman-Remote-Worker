@@ -324,6 +324,7 @@ async def _consume_applied_interrupt_input(
     target_turn_id: int,
     request_id: UUID | str,
     idle: bool,
+    terminal: bool = False,
 ) -> InterruptInputConsumption | None:
     """Consume one input for an applied request group under the queue lock.
 
@@ -354,12 +355,15 @@ async def _consume_applied_interrupt_input(
     if thread is None:
         return None
     if idle:
+        idle_states = (
+            "('queued', 'parked', 'done')" if terminal else "('queued', 'parked')"
+        )
         queue = await conn.fetchrow(
             "SELECT input_seq, consumed_seq, control_input_seq, "
             "control_consumed_seq, state FROM run_queue "
             "WHERE unit_id = $1::uuid AND unit_kind = 'session_turn' "
             "AND lease_token = $2::bigint "
-            "AND state IN ('queued', 'parked') "
+            f"AND state IN {idle_states} "
             "AND leased_by IS NULL AND leased_until IS NULL FOR UPDATE",
             tid,
             current_token,
@@ -455,23 +459,40 @@ async def _consume_applied_interrupt_input(
     )
 
     if idle:
-        updated = await conn.fetchrow(
-            "UPDATE run_queue SET consumed_seq = GREATEST(consumed_seq, $3::bigint), "
-            "attempts_since_completion = 0, queued_at = now(), run_after = now(), "
-            "state = CASE WHEN (input_seq IS NOT NULL "
-            "AND input_seq > GREATEST(COALESCE(consumed_seq, -1), $3::bigint)) "
-            "OR control_input_seq > control_consumed_seq THEN 'queued' ELSE 'done' END, "
-            "leased_by = NULL, leased_until = NULL, "
-            "interrupt_admission_lease_token = NULL, "
-            "interrupt_admission_turn_id = NULL "
-            "WHERE unit_id = $1::uuid AND lease_token = $2::bigint "
-            "AND state IN ('queued', 'parked') AND leased_by IS NULL "
-            "RETURNING consumed_seq, state, input_seq, control_input_seq, "
-            "control_consumed_seq",
-            tid,
-            current_token,
-            consumed_seq,
-        )
+        if terminal:
+            updated = await conn.fetchrow(
+                "UPDATE run_queue SET consumed_seq = GREATEST(consumed_seq, $3::bigint), "
+                "attempts_since_completion = 0, queued_at = now(), run_after = now(), "
+                "state = 'queued', leased_by = NULL, leased_until = NULL, "
+                "interrupt_admission_lease_token = NULL, "
+                "interrupt_admission_turn_id = NULL "
+                "WHERE unit_id = $1::uuid AND lease_token = $2::bigint "
+                "AND state IN ('queued', 'parked', 'done') "
+                "AND leased_by IS NULL AND leased_until IS NULL "
+                "RETURNING consumed_seq, state, input_seq, control_input_seq, "
+                "control_consumed_seq",
+                tid,
+                current_token,
+                consumed_seq,
+            )
+        else:
+            updated = await conn.fetchrow(
+                "UPDATE run_queue SET consumed_seq = GREATEST(consumed_seq, $3::bigint), "
+                "attempts_since_completion = 0, queued_at = now(), run_after = now(), "
+                "state = CASE WHEN (input_seq IS NOT NULL "
+                "AND input_seq > GREATEST(COALESCE(consumed_seq, -1), $3::bigint)) "
+                "OR control_input_seq > control_consumed_seq THEN 'queued' ELSE 'done' END, "
+                "leased_by = NULL, leased_until = NULL, "
+                "interrupt_admission_lease_token = NULL, "
+                "interrupt_admission_turn_id = NULL "
+                "WHERE unit_id = $1::uuid AND lease_token = $2::bigint "
+                "AND state IN ('queued', 'parked') AND leased_by IS NULL "
+                "RETURNING consumed_seq, state, input_seq, control_input_seq, "
+                "control_consumed_seq",
+                tid,
+                current_token,
+                consumed_seq,
+            )
     else:
         updated = await conn.fetchrow(
             "UPDATE run_queue SET consumed_seq = GREATEST(consumed_seq, $3::bigint), "
@@ -528,6 +549,7 @@ async def consume_applied_interrupt_input_idle(
     accepted_lease_token: int,
     target_turn_id: int,
     request_id: UUID | str,
+    terminal: bool = False,
 ) -> InterruptInputConsumption | None:
     """Settle one applied interrupt when no runtime owns the queue row."""
 
@@ -539,6 +561,7 @@ async def consume_applied_interrupt_input_idle(
         target_turn_id=target_turn_id,
         request_id=request_id,
         idle=True,
+        terminal=terminal,
     )
 
 

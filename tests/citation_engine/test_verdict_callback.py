@@ -12,6 +12,7 @@ No Postgres / aux LLM needed — the db is a mock and the aux funnel
 imports it at call time.
 """
 
+import asyncio
 import types
 from unittest.mock import MagicMock
 
@@ -82,3 +83,27 @@ async def test_callback_exception_is_swallowed(monkeypatch):
 
     eng = _engine(on_verdict=_boom)
     await eng._run_verification(1)  # no exception == pass
+
+
+@pytest.mark.asyncio
+async def test_aclose_disarms_and_joins_blocked_verifier(monkeypatch):
+    import src.services.auxiliary as aux
+
+    started = asyncio.Event()
+
+    async def _blocked(*_args, **_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(aux, "verify_and_store_citation", _blocked)
+    seen = []
+    eng = _engine(on_verdict=lambda cid, status: seen.append((cid, status)))
+    eng._schedule_verification(9)
+    await started.wait()
+
+    await eng.aclose(timeout=1.0)
+
+    assert seen == []
+    assert not {task for task in eng._verify_tasks if not task.done()}
+    eng._schedule_verification(10)
+    assert not {task for task in eng._verify_tasks if not task.done()}

@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 
 from services import canvas_snapshots
 from services.canvas import (
+    CanvasEditError,
     CanvasRecord,
     CanvasService,
     WorkspaceAppSource,
@@ -93,14 +94,18 @@ def _thread(*, generation: UUID = GENERATION) -> dict[str, Any]:
             "_workspace_binding": {
                 "generation": str(generation),
                 "kind": "remote",
-                "backing_id": "test-backing",
+                "backing_id": "k8s-pvc:srw:test",
                 "ssh_host_key_fingerprint": "SHA256:test",
             },
             "workspace_container": {
                 "status": "ready",
-                "host": "workspace.test",
-                "port": 22,
+                "provisioner": "k8s",
+                "pod_ip": "workspace.test",
+                "pod_port": 30022,
+                "pod_name": "workspace-test",
+                "namespace": "srw",
                 "_canvas_workspace_generation": str(generation),
+                "_runtime_incarnation": "22222222-bbbb-4bbb-8bbb-222222222222",
             },
         },
     }
@@ -548,10 +553,18 @@ async def test_offline_content_without_a_snapshot_reports_the_workspace_error(
 class _RepinDB:
     """asyncpg-shaped double for repin_workspace_generation's statements."""
 
-    def __init__(self, record: CanvasRecord, *, generation: UUID) -> None:
+    def __init__(
+        self,
+        record: CanvasRecord,
+        *,
+        generation: UUID,
+        thread: dict[str, Any] | None = None,
+    ) -> None:
         self.record = record
         self.generation = generation
+        self.thread = thread or _thread(generation=generation)
         self.updates = 0
+        self.thread_lock_queries: list[str] = []
 
     @asynccontextmanager
     async def acquire(self):
@@ -586,8 +599,9 @@ class _RepinDB:
 
     async def fetchrow(self, query: str, *args: Any):
         sql = " ".join(query.split())
-        if sql.startswith("SELECT id, user_id, metadata FROM threads"):
-            return _thread(generation=self.generation)
+        if "FROM threads" in sql:
+            self.thread_lock_queries.append(sql)
+            return dict(self.thread)
         if sql.startswith("SELECT thread_id"):
             return self._row()
         if sql.startswith("UPDATE canvases"):
@@ -648,6 +662,46 @@ async def test_repin_declines_when_the_verifier_finds_different_bytes() -> None:
 
     assert mutation.changed is False
     assert db.updates == 0
+
+
+@pytest.mark.asyncio
+async def test_repin_refuses_stateless_claim_loss_before_workspace_verifier() -> None:
+    """Generation repair is remote I/O and shares the terminal write fence."""
+
+    record = _record()
+    thread = _thread(generation=NEW_GENERATION)
+    thread.update(execution_lane="stateless", status="active")
+    thread["metadata"] = {
+        **thread["metadata"],
+        "_stateless_claim_losses": {
+            "7": {"pod": "agent-a", "pod_uid": "uid-a", "quiesced": False}
+        },
+    }
+    db = _RepinDB(record, generation=NEW_GENERATION, thread=thread)
+    verifier_called = False
+
+    async def verifier(*_args):
+        nonlocal verifier_called
+        verifier_called = True
+        raise AssertionError("retiring stateless thread reached workspace verifier")
+
+    with pytest.raises(CanvasEditError) as error:
+        await CanvasService(db).repin_workspace_generation(
+            THREAD_ID,
+            expected_source_version=record.source_version,
+            verifier=verifier,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.code == "canvas_editing_unavailable"
+    assert verifier_called is False
+    assert db.updates == 0
+    assert len(db.thread_lock_queries) == 1
+    assert (
+        "SELECT id, user_id, status, execution_lane, metadata"
+        in (db.thread_lock_queries[0])
+    )
+    assert db.thread_lock_queries[0].endswith("FOR SHARE")
 
 
 @pytest.mark.asyncio
