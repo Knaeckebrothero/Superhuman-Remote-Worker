@@ -577,9 +577,9 @@ async def acknowledge_session_claim_quiesced(
                     UPDATE run_queue
                     SET state = $3::text,
                         attempts_since_completion = $4::integer,
-                        run_after = COALESCE($5::timestamptz, run_after),
+                        run_after = COALESCE($5::text::timestamptz, run_after),
                         queued_at = CASE WHEN $6::text IS NULL THEN queued_at
-                                         ELSE $6::timestamptz END
+                                         ELSE $6::text::timestamptz END
                     WHERE unit_id = $1::uuid
                       AND unit_kind = 'session_turn'
                       AND state = 'parked'
