@@ -8,6 +8,7 @@ from src.shared.session_retirement import (
     active_claim_authority,
     acknowledge_session_claim_quiesced,
     claim_loss_hold,
+    mark_session_claim_eviction_requested,
     stateless_retirement_authority,
     stateless_retirement_release_authorized,
     stateless_settled_retirement_authority,
@@ -330,6 +331,7 @@ async def test_exact_uid_ack_removes_debt_and_restores_intended_state():
     )
 
     thread_update = conn.fetchval.await_args_list[0]
+    assert thread_update.args[2] == "8"
     stored = json.loads(thread_update.args[3])
     assert stored == {"kept": True}
     queue_update = conn.fetchval.await_args_list[1]
@@ -371,3 +373,60 @@ async def test_new_human_while_held_requeues_an_intended_done_row():
 
     queue_update = conn.fetchval.await_args_list[1]
     assert queue_update.args[3] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_exact_uid_eviction_marker_binds_json_path_token_as_text():
+    conn = _db(_metadata(), _queue())
+
+    assert await mark_session_claim_eviction_requested(
+        conn,
+        thread_id=THREAD_ID,
+        previous_lease_token=8,
+        leased_by="pod-a",
+        pod_uid="uid-a",
+    )
+
+    thread_update = conn.fetchval.await_args
+    assert thread_update.args[2] == "8"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    [acknowledge_session_claim_quiesced, mark_session_claim_eviction_requested],
+)
+async def test_claim_loss_write_rejects_mismatched_token(operation):
+    conn = _db(_metadata(), _queue())
+
+    assert not await operation(
+        conn,
+        thread_id=THREAD_ID,
+        previous_lease_token=7,
+        leased_by="pod-a",
+        pod_uid="uid-a",
+    )
+    conn.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    [acknowledge_session_claim_quiesced, mark_session_claim_eviction_requested],
+)
+async def test_claim_loss_write_refuses_malformed_ledger_token(operation):
+    metadata = _metadata()
+    metadata["_stateless_claim_losses"]["08"] = metadata["_stateless_claim_losses"].pop(
+        "8"
+    )
+    conn = _db(metadata, _queue())
+
+    with pytest.raises(RuntimeError, match="noncanonical"):
+        await operation(
+            conn,
+            thread_id=THREAD_ID,
+            previous_lease_token=8,
+            leased_by="pod-a",
+            pod_uid="uid-a",
+        )
+    conn.fetchval.assert_not_awaited()
