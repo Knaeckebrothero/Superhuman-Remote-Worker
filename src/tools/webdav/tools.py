@@ -9,10 +9,13 @@ Connection is established by datasource_setup.create_datasource_connection()
 and injected via ToolContext.get_datasource("webdav").
 """
 
+import asyncio
 import hashlib
 import logging
-import os
+import posixpath
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
@@ -132,7 +135,7 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
             return f"Error listing {path}: {e}"
 
     @tool
-    def webdav_read(path: str, target: str = "") -> str:
+    async def webdav_read(path: str, target: str = "") -> str:
         """Download a file from WebDAV into the workspace.
 
         Args:
@@ -143,28 +146,49 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
             Confirmation with local path, or error message
         """
         try:
-            filename = target or os.path.basename(path.rstrip("/"))
+            filename = target or posixpath.basename(path.rstrip("/"))
             if not filename:
                 return "Error: could not determine filename from path"
 
-            documents_dir = str(workspace.get_path("documents"))
-            os.makedirs(documents_dir, exist_ok=True)
-            local_path = os.path.join(documents_dir, filename)
+            workspace_path = posixpath.join("documents", filename)
+            with tempfile.TemporaryDirectory(prefix="webdav_dl_") as temp_dir:
+                local_path = Path(temp_dir) / Path(filename).name
+                await asyncio.to_thread(
+                    client.download_sync,
+                    remote_path=path,
+                    local_path=str(local_path),
+                )
+                data = await asyncio.to_thread(local_path.read_bytes)
 
-            client.download_sync(remote_path=path, local_path=local_path)
+                # Phase 3 (D7): stash a cloud snapshot-anchor for this file so a
+                # later cite_* persists its drift fingerprint + live pointer onto
+                # the source.
+                try:
+                    anchor = await asyncio.to_thread(
+                        _build_cloud_anchor,
+                        client,
+                        path,
+                        str(local_path),
+                    )
+                except Exception as e:
+                    logger.debug("Could not build cloud anchor for %s: %s", path, e)
+                    anchor = None
 
-            size = os.path.getsize(local_path)
+                # A backend path may be an object key or a path on another pod.
+                # Only the operation-scoped staging path above is local.
+                await asyncio.to_thread(
+                    workspace.backend.write_file,
+                    workspace_path,
+                    data,
+                )
 
-            # Phase 3 (D7): stash a cloud snapshot-anchor for this file so a
-            # later cite_* persists its drift fingerprint + live pointer onto
-            # the source. Best-effort — never let metadata capture break a read.
-            try:
-                anchor = _build_cloud_anchor(client, path, local_path)
-                context.record_cloud_anchor(local_path, anchor)
-            except Exception as e:
-                logger.debug("Could not record cloud anchor for %s: %s", path, e)
+            if anchor:
+                # Persistent sessions bind this seam to a durable per-thread
+                # upsert. Await it before reporting success so provenance cannot
+                # silently disappear at the next claim.
+                await context.persist_cloud_anchor(workspace_path, anchor)
 
-            return f"Downloaded {path} → documents/{filename} ({_human_size(size)})"
+            return f"Downloaded {path} → {workspace_path} ({_human_size(len(data))})"
         except Exception as e:
             return f"Error downloading {path}: {e}"
 
@@ -208,8 +232,7 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
             Confirmation with file size, or error message
         """
         try:
-            local_path = str(workspace.get_path(source))
-            if not os.path.isfile(local_path):
+            if not workspace.backend.is_file(source):
                 return f"Error: file not found in workspace: {source}"
 
             # Create parent directories on WebDAV if needed
@@ -220,8 +243,15 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
                 except Exception:
                     pass  # Directory may already exist
 
-            client.upload_sync(remote_path=remote_path, local_path=local_path)
-            size = os.path.getsize(local_path)
+            # The WebDAV client requires a local filename. Materialize through
+            # the workspace abstraction instead of treating a backend path as
+            # local agent storage.
+            with workspace.local_copy(source) as local_path:
+                client.upload_sync(
+                    remote_path=remote_path,
+                    local_path=str(local_path),
+                )
+                size = local_path.stat().st_size
             return f"Uploaded {source} → {remote_path} ({_human_size(size)})"
         except Exception as e:
             return f"Error uploading {source} to {remote_path}: {e}"

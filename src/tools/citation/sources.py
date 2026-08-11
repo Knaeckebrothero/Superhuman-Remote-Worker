@@ -270,20 +270,6 @@ def create_source_tools(context: ToolContext) -> List[Any]:
     # Get workspace manager for path resolution
     workspace = context.workspace_manager if context.has_workspace() else None
 
-    def resolve_path(path: str) -> str:
-        """Resolve a path relative to workspace if available.
-
-        Args:
-            path: Relative or absolute path
-
-        Returns:
-            Absolute path string
-        """
-        if workspace is not None:
-            resolved = workspace.get_path(path)
-            return str(resolved)
-        return path
-
     @tool
     async def cite_document(
         text: str,
@@ -337,25 +323,23 @@ def create_source_tools(context: ToolContext) -> List[Any]:
             # Register source and create citation
             cloud_anchor = None
             try:
-                resolved_path = resolve_path(document_path)
                 # Phase 3 (D7): if this file was read from a user's cloud, a
                 # snapshot-anchor (drift fingerprint + live pointer) was stashed
                 # at read time — persist it onto the source's metadata.cloud.
-                cloud_anchor = context.get_cloud_anchor(resolved_path)
+                # The identity is workspace-relative. Resolving it first is a
+                # backend-path bypass: virtual paths are object keys and remote
+                # paths name files on another pod, not local agent files.
+                cloud_anchor = context.get_cloud_anchor(document_path)
                 # Phase 3b: snapshot the original bytes to the blob store (via the
                 # orchestrator — the agent has no S3 creds) so the citation has a
                 # "view original" backup. Mutates cloud_anchor with the blob key
                 # before registration; best-effort, never blocks the citation.
                 if cloud_anchor:
                     await context.snapshot_cloud_source_bytes(
-                        resolved_path, cloud_anchor
+                        document_path, cloud_anchor
                     )
-                # Pass the workspace-relative path (not the resolved one): the
-                # engine reads files locally, but on a remote workspace backend
-                # the file lives on the workspace pod, so registration must
-                # materialize it via local_copy (handled in
-                # get_or_register_doc_source). resolved_path stays for the local
-                # cloud-anchor lookup/snapshot above.
+                # Registration also materializes through local_copy in
+                # get_or_register_doc_source; no backend path reaches local I/O.
                 source_id = await context.get_or_register_doc_source(
                     document_path,
                     name=Path(document_path).name,
