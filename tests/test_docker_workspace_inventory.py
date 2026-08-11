@@ -52,6 +52,22 @@ class _InventoryConnection:
 
     async def fetchrow(self, query: str, *args):
         sql = _compact(query)
+        if (
+            "SELECT execution_lane, status::text AS status, metadata FROM threads"
+            in sql
+        ):
+            workspace = self.threads.get(str(args[0]))
+            return (
+                None
+                if workspace is None
+                else {
+                    "execution_lane": "pinned",
+                    "status": "active",
+                    "metadata": {
+                        "workspace_container": copy.deepcopy(workspace),
+                    },
+                }
+            )
         if "AS workspace FROM jobs" in sql:
             workspace = self.jobs.get(str(args[0]))
             return (
@@ -220,7 +236,13 @@ class _InventoryConnection:
                 return "UPDATE 0"
             self.threads[owner_id] = json.loads(raw)
             return "UPDATE 1"
-        if sql.startswith("DELETE FROM thread_messages"):
+        if sql.startswith(
+            (
+                "DELETE FROM thread_turn_commits",
+                "DELETE FROM thread_rewinds",
+                "DELETE FROM thread_messages",
+            )
+        ):
             return "DELETE 0"
         if sql.startswith("DELETE FROM jobs"):
             return (
