@@ -772,7 +772,7 @@ __SRW_PROCESS_ZERO_PY__
                 + command
             )
             output, exit_code = self._exec_with_status(
-                self._tmux_lock_command(inner),
+                self._tmux_lock_command(inner, shell="bash"),
                 timeout=timeout,
                 retain_tail=True,
             )
@@ -824,7 +824,7 @@ __SRW_PROCESS_ZERO_PY__
             )
             with self._shell_io_lock:
                 output, exit_code = self._exec_with_status(
-                    self._tmux_lock_command(inner),
+                    self._tmux_lock_command(inner, shell="bash"),
                     timeout=timeout,
                     retain_tail=True,
                 )
@@ -855,7 +855,7 @@ __SRW_PROCESS_ZERO_PY__
             inner = self._stateless_retired_resource_fence_shell() + command
             with self._shell_io_lock:
                 output, exit_code = self._exec_with_status(
-                    self._tmux_lock_command(inner),
+                    self._tmux_lock_command(inner, shell="bash"),
                     timeout=timeout,
                     retain_tail=True,
                 )
@@ -1946,8 +1946,10 @@ __SRW_PROCESS_ZERO_PY__
             "}\n"
         )
 
-    def _tmux_lock_command(self, inner: str) -> str:
+    def _tmux_lock_command(self, inner: str, *, shell: str = "sh") -> str:
         """Wrap one tmux transaction in the appropriate workspace-side lock."""
+        if shell not in {"sh", "bash"}:
+            raise ValueError("tmux lock shell must be sh or bash")
         lock_name = self._tmux_durable_lock_filename
         return (
             # Keep the lock in flock's waiting parent, but do not let the tmux
@@ -1955,7 +1957,7 @@ __SRW_PROCESS_ZERO_PY__
             # stateless owners intentionally share this session-name lock.
             'umask 077; mkdir -p "$HOME/.srw/tmux" || exit 78; '
             f'flock -o -w 30 "$HOME/.srw/tmux/{lock_name}" '
-            f"sh -c {shlex.quote(inner)}"
+            f"{shell} -c {shlex.quote(inner)}"
         )
 
     def _pinned_tmux_fence_shell(self) -> str:
