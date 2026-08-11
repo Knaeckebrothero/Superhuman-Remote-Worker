@@ -144,7 +144,7 @@ RETURNING id
 
 _PARK_CLAIM_LOSS_HOLD_SQL = """
 UPDATE run_queue
-SET state = 'parked', run_after = NULL,
+SET state = 'parked',
     leased_by = NULL, last_leased_by = NULL, leased_until = NULL
 WHERE unit_id = $1::uuid
   AND unit_kind = 'session_turn'
