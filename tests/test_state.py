@@ -99,6 +99,10 @@ class TestCreateInitialState:
         state = create_initial_state(job_id="j1", workspace_path="/ws")
         assert state["resume_feedback"] is None
 
+    def test_instruction_read_receipts_empty(self):
+        state = create_initial_state(job_id="j1", workspace_path="/ws")
+        assert state["instruction_read_receipts"] == {}
+
     def test_metadata_defaults_to_empty(self):
         """None metadata should become empty dict."""
         state = create_initial_state(job_id="j1", workspace_path="/ws")

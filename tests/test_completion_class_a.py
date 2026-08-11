@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
+from fastapi import HTTPException
 
 import main
 from orchestrator.database.postgres import PostgresDB
@@ -108,6 +109,23 @@ class TestUpdateJobStatusClassA:
         assert "last_freeze_data" not in sql
         assert "freeze_data = NULL" not in sql
         assert "completed_at" not in sql
+
+    @pytest.mark.asyncio
+    async def test_optional_status_cas_rides_the_same_disposition_update(self):
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        db = _db_with_connection(conn)
+
+        assert await db.update_job_status(
+            JOB_ID,
+            status="completed",
+            expected_status="processing",
+        )
+
+        args = conn.execute.await_args.args
+        sql = _normalized(args[0])
+        assert "WHERE id = $2 AND status::text = $3::text" in sql
+        assert args[1:] == ("completed", UUID(JOB_ID), "processing")
 
 
 class _EndpointDB(PostgresDB):
@@ -253,6 +271,174 @@ def _patch_completion(stack: ExitStack, db: _EndpointDB) -> None:
 
 
 class TestCompleteJobClassA:
+    @pytest.mark.asyncio
+    async def test_stale_stateless_token_rejected_before_late_callback_guard(self):
+        job = _job(status="completed", execution_lane="stateless")
+        db = _EndpointDB(job)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            lease_token=6,
+        )
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            current = stack.enter_context(
+                patch(
+                    "src.shared.worker_queue.worker_lease_is_current",
+                    AsyncMock(return_value=False),
+                )
+            )
+            with pytest.raises(HTTPException) as exc:
+                await main.complete_job(MagicMock(), JOB_ID, body)
+
+        assert exc.value.status_code == 409
+        current.assert_awaited_once()
+        assert db.statements == []
+
+    @pytest.mark.asyncio
+    async def test_exact_stateless_token_retry_reaches_benign_late_guard(self):
+        job = _job(status="completed", execution_lane="stateless")
+        db = _EndpointDB(job)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            lease_token=7,
+        )
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            current = stack.enter_context(
+                patch(
+                    "src.shared.worker_queue.worker_lease_is_current",
+                    AsyncMock(return_value=True),
+                )
+            )
+            handled = await main.complete_job(MagicMock(), JOB_ID, body)
+
+        current.assert_awaited_once()
+        assert handled["new_status"] == "completed"
+        assert handled["actions"] == ["late callback ignored; job already completed"]
+        assert db.statements == []
+
+    @pytest.mark.asyncio
+    async def test_pinned_job_ignores_optional_stateless_lease_token(self):
+        job = _job(status="completed", execution_lane="pinned")
+        db = _EndpointDB(job)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=False,
+            lease_token=7,
+        )
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            current = stack.enter_context(
+                patch(
+                    "src.shared.worker_queue.worker_lease_is_current",
+                    AsyncMock(return_value=False),
+                )
+            )
+            handled = await main.complete_job(MagicMock(), JOB_ID, body)
+
+        assert handled["new_status"] == "completed"
+        current.assert_not_awaited()
+        assert db.statements == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status",
+        ["paused", "failed", "cancelled", "waiting", "waiting_for_reply"],
+    )
+    async def test_exact_stateless_terminal_retry_is_benign_for_published_status(
+        self,
+        status,
+    ):
+        job = _job(status=status, execution_lane="stateless")
+        db = _EndpointDB(job)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=status == "failed",
+            lease_token=7,
+        )
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            stack.enter_context(
+                patch(
+                    "src.shared.worker_queue.worker_lease_is_current",
+                    AsyncMock(return_value=True),
+                )
+            )
+            handled = await main.complete_job(MagicMock(), JOB_ID, body)
+
+        assert handled["new_status"] == status
+        assert handled["actions"] == [
+            f"exact-token terminal retry; job already {status}"
+        ]
+        assert db.statements == []
+
+    @pytest.mark.asyncio
+    async def test_stateless_disposition_cas_cannot_overwrite_winning_cancel(self):
+        job = _job(execution_lane="stateless")
+        db = _EndpointDB(job)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            lease_token=7,
+        )
+
+        async def lose_to_cancel(_job_id, **_kwargs):
+            job["status"] = "cancelled"
+            return False
+
+        db.update_job_status = AsyncMock(side_effect=lose_to_cancel)
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            stack.enter_context(
+                patch(
+                    "src.shared.worker_queue.worker_lease_is_current",
+                    AsyncMock(return_value=True),
+                )
+            )
+            with pytest.raises(HTTPException) as exc:
+                await main.complete_job(MagicMock(), JOB_ID, body)
+
+        assert exc.value.status_code == 409
+        assert exc.value.detail == (
+            "Completion report lost an out-of-band job control race"
+        )
+        db.update_job_status.assert_awaited_once()
+        assert db.update_job_status.await_args.kwargs["expected_status"] == "processing"
+
+    @pytest.mark.asyncio
+    async def test_stateless_stop_does_not_blanket_delete_checkpoint_acked_replies(
+        self,
+    ):
+        job = _job(
+            execution_lane="stateless",
+            context={"queued_replies": [{"reply": "keep until checkpoint ack"}]},
+        )
+        db = _EndpointDB(job)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            lease_token=7,
+        )
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            stack.enter_context(
+                patch(
+                    "src.shared.worker_queue.worker_lease_is_current",
+                    AsyncMock(return_value=True),
+                )
+            )
+            handled = await main.complete_job(MagicMock(), JOB_ID, body)
+
+        assert handled["new_status"] == "completed"
+        assert not any("context - 'queued_replies'" in sql for sql, _ in db.statements)
+
     @pytest.mark.asyncio
     async def test_completed_disposition_is_one_jobs_update(self):
         job = _job()

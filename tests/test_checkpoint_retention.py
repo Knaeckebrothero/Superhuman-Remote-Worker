@@ -101,6 +101,19 @@ class TestUpdateJobStatusPrunes:
         assert ok is True
         assert conn.execute.await_count == 1  # only the UPDATE — no prune
 
+    @pytest.mark.asyncio
+    async def test_resumable_stateless_failure_keeps_checkpoint(self, monkeypatch):
+        monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        conn.fetchval = AsyncMock(return_value="stateless")
+        db = _make_db(conn)
+        db.delete_checkpoint_thread = AsyncMock()
+
+        assert await db.update_job_status(_JOB_ID, status="failed")
+
+        db.delete_checkpoint_thread.assert_not_awaited()
+
 
 class TestPruneCheckpointsKeepLast:
     """In-flight keep-last-N retention across ALL threads (bounds long-running

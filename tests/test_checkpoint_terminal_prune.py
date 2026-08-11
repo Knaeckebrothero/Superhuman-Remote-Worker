@@ -127,6 +127,24 @@ class TestFailureIsLoud:
         assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
     @pytest.mark.asyncio
+    async def test_strict_prune_propagates_real_failure(self, monkeypatch):
+        conn = MagicMock()
+        conn.execute = AsyncMock(side_effect=RuntimeError("delete timed out"))
+        db = _db(monkeypatch, conn)
+
+        with pytest.raises(RuntimeError, match="delete timed out"):
+            await db.delete_checkpoint_thread("thread-1", strict=True)
+
+    @pytest.mark.asyncio
+    async def test_strict_prune_rejects_surviving_rows(self, monkeypatch):
+        conn = _conn_with_rows(0)
+        conn.fetchval = AsyncMock(return_value=True)
+        db = _db(monkeypatch, conn)
+
+        with pytest.raises(RuntimeError, match="left rows behind"):
+            await db.delete_checkpoint_thread("thread-1", strict=True)
+
+    @pytest.mark.asyncio
     async def test_no_op_when_backend_is_not_postgres(self, monkeypatch):
         conn = MagicMock()
         conn.execute = AsyncMock()
@@ -135,3 +153,16 @@ class TestFailureIsLoud:
 
         assert await db.delete_checkpoint_thread("thread-1") == 0
         conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_strict_prune_checks_tables_despite_backend_rollback(
+        self, monkeypatch
+    ):
+        conn = _conn_with_rows(0)
+        conn.fetchval = AsyncMock(return_value=False)
+        db = _db(monkeypatch, conn)
+        monkeypatch.setenv("CHECKPOINTER_BACKEND", "sqlite")
+
+        assert await db.delete_checkpoint_thread("thread-1", strict=True) == 0
+        assert conn.execute.await_count == len(_TABLES)
+        assert conn.fetchval.await_count == len(_TABLES)

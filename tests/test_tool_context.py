@@ -426,6 +426,100 @@ class TestInstructionPinning:
 
         assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is False
 
+    def test_worker_checkpoint_receipt_restores_enforcement_not_write_authority(self):
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+        source_ws = _make_workspace_manager()
+        source = ToolContext(workspace_manager=source_ws)
+        source._instruction_files = [entry]
+        source.set_current_phase("tactical", phase_number=2, turn_count=10)
+        source.record_file_read(entry.path, "guide version one")
+
+        receipts = source.export_instruction_read_receipts()
+
+        successor_ws = _make_workspace_manager()
+        successor_ws.read_file.return_value = "guide version one"
+        successor = ToolContext(workspace_manager=successor_ws)
+        successor._instruction_files = [entry]
+        assert successor.restore_instruction_read_receipts(receipts) == 1
+        successor.set_current_phase("tactical", phase_number=2, turn_count=11)
+        assert successor.check_tool_enforcement("todo_complete") is None
+        # The durable receipt can satisfy instruction enforcement, but cannot
+        # authorize a mutation of that file on a new lease.
+        assert not successor.recent_read_matches(entry.path, "guide version one")
+
+        successor.set_current_phase("tactical", phase_number=4, turn_count=12)
+        assert successor.check_tool_enforcement("todo_complete") is not None
+
+    def test_worker_checkpoint_receipt_fails_closed_when_instruction_changed(self):
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+        source = ToolContext(workspace_manager=_make_workspace_manager())
+        source._instruction_files = [entry]
+        source.set_current_phase("tactical", phase_number=2, turn_count=10)
+        source.record_file_read(entry.path, "old guide")
+
+        successor_ws = _make_workspace_manager()
+        successor_ws.read_file.return_value = "new guide"
+        successor = ToolContext(workspace_manager=successor_ws)
+        successor._instruction_files = [entry]
+        assert (
+            successor.restore_instruction_read_receipts(
+                source.export_instruction_read_receipts()
+            )
+            == 0
+        )
+        successor.set_current_phase("tactical", phase_number=2, turn_count=11)
+        assert successor.check_tool_enforcement("todo_complete") is not None
+
+    def test_worker_checkpoint_receipt_keeps_version_across_handoffs_and_fifo(self):
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+        source = ToolContext(workspace_manager=_make_workspace_manager())
+        source._instruction_files = [entry]
+        source.set_current_phase("tactical", phase_number=2, turn_count=10)
+        source.record_file_read(entry.path, "guide version one")
+        for index in range(25):
+            source.record_file_read(f"notes/read-{index}.md", str(index))
+
+        first_receipts = source.export_instruction_read_receipts()
+        expected_version = first_receipts[entry.path]["content_version"]
+
+        second_ws = _make_workspace_manager()
+        second_ws.read_file.return_value = "guide version one"
+        second = ToolContext(workspace_manager=second_ws)
+        second._instruction_files = [entry]
+        assert second.restore_instruction_read_receipts(first_receipts) == 1
+        # A restored enforcement receipt must never become write authority.
+        assert entry.path not in second._recent_read_versions
+        assert not second.recent_read_matches(entry.path, "guide version one")
+
+        second_receipts = second.export_instruction_read_receipts()
+        assert second_receipts[entry.path]["content_version"] == expected_version
+
+        third_ws = _make_workspace_manager()
+        third_ws.read_file.return_value = "guide version two"
+        third = ToolContext(workspace_manager=third_ws)
+        third._instruction_files = [entry]
+        assert third.restore_instruction_read_receipts(second_receipts) == 0
+        third.set_current_phase("tactical", phase_number=2, turn_count=11)
+        assert third.check_tool_enforcement("todo_complete") is not None
+
 
 # =============================================================================
 # Instruction enforcement

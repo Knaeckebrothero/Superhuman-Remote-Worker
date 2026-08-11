@@ -404,6 +404,19 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: CHECKPOINTER_BACKEND
+            # Worker-job stateless admission is independent from the executor
+            # Deployment gate. The batch floor comes from the same ConfigMap
+            # so admission and execution observe one rendered configuration.
+            - name: STATELESS_WORKER_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: STATELESS_WORKER_ENABLED
+            - name: WORKER_BATCH_MIN_WALL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKER_BATCH_MIN_WALL_SECONDS
             # LLM-outage/cooldown pause budget (12h default). Must equal the value
             # every agent pod reads via envFrom on the shared ConfigMap, so the
             # orchestrator references the same key here (it does not envFrom).
