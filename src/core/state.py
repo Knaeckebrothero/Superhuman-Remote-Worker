@@ -50,6 +50,14 @@ class UniversalAgentState(TypedDict):
         turn_count: LLM call counter, used by memory extraction to trigger every N turns
         phase_instruction_injections: Checkpointed once-per-phase instruction keys
         last_observed_turn: Last turn when memory extraction ran (for interval tracking)
+        delivered_reply_keys: Durable identities of queued replies already
+            appended to message history (worker handoff dedup)
+        delivered_guidance_ids: Guidance entries absorbed by an execute-node
+            response checkpoint
+        delivered_feedback_keys: Queued-feedback generations absorbed on resume
+        delivered_delegation_keys: Delegation-result generations absorbed on resume
+        instruction_read_receipts: Checkpointed instruction-file read receipts
+            used to preserve phase/freshness enforcement across worker claims
 
         # File-based context
         workspace_memory: Legacy; unused (workspace.md removed), always ""
@@ -63,7 +71,10 @@ class UniversalAgentState(TypedDict):
         worker_batch_started_at: Epoch timestamp when this claim began
         worker_batch_start_iteration: Execute-iteration value at claim start
         worker_batch_target_wall_seconds: Preferred wall-clock batch duration
+        worker_batch_min_wall_seconds: Effective floor for this claim's target
         worker_batch_iteration_cap: Optional execute-iteration delta cap
+        worker_resume_id: Durable explicit-resume generation applied to this
+            checkpoint, preventing an ambiguous paused report from resuming
 
         # Job metadata
         metadata: Job-specific data (document_path, prompt, etc.)
@@ -111,6 +122,11 @@ class UniversalAgentState(TypedDict):
     phase_instruction_injections: List[str]  # Once-per-phase instruction keys
     last_observed_turn: int  # Last turn when memory extraction ran
     last_assembled_turn: int  # Last turn when memory assembler ran
+    delivered_reply_keys: List[str]  # Checkpoint-coupled queued-reply dedup
+    delivered_guidance_ids: List[str]  # Checkpoint-coupled urgent guidance
+    delivered_feedback_keys: List[str]  # Checkpoint-coupled resume feedback
+    delivered_delegation_keys: List[str]  # Checkpoint-coupled child results
+    instruction_read_receipts: Dict[str, Dict[str, Any]]
 
     # File-based context (read from workspace into state)
     workspace_memory: str  # Legacy; unused (workspace.md removed), always ""
@@ -126,7 +142,9 @@ class UniversalAgentState(TypedDict):
     worker_batch_started_at: Optional[float]
     worker_batch_start_iteration: Optional[int]
     worker_batch_target_wall_seconds: Optional[float]
+    worker_batch_min_wall_seconds: Optional[float]
     worker_batch_iteration_cap: Optional[int]
+    worker_resume_id: Optional[str]
 
     # Job metadata (flexible, agent-type specific)
     # For Creator: document_path, prompt, etc.
@@ -227,6 +245,11 @@ def create_initial_state(
         phase_instruction_injections=[],
         last_observed_turn=0,
         last_assembled_turn=0,
+        delivered_reply_keys=[],
+        delivered_guidance_ids=[],
+        delivered_feedback_keys=[],
+        delivered_delegation_keys=[],
+        instruction_read_receipts={},
         # File-based context
         workspace_memory="",
         # Execution control
@@ -237,7 +260,9 @@ def create_initial_state(
         worker_batch_started_at=None,
         worker_batch_start_iteration=None,
         worker_batch_target_wall_seconds=None,
+        worker_batch_min_wall_seconds=None,
         worker_batch_iteration_cap=None,
+        worker_resume_id=None,
         # Metadata
         metadata=metadata or {},
         # Context management

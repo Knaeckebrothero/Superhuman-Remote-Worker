@@ -344,6 +344,16 @@ def endpoint_collaborators(monkeypatch, fake_conn):
     monkeypatch.setattr(main.postgres_db, "merge_job_context", AsyncMock())
     queue_for_resume = AsyncMock(return_value=True)
     monkeypatch.setattr(main.postgres_db, "queue_job_for_resume", queue_for_resume)
+    queue_stateless = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main.postgres_db, "queue_stateless_job_for_resume", queue_stateless
+    )
+    prepare_stateless = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main.postgres_db,
+        "prepare_stateless_job_for_workspace_resume",
+        prepare_stateless,
+    )
     monkeypatch.setattr(main, "snapshot_service", SimpleNamespace(is_available=False))
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
     delegate = AsyncMock(return_value=True)
@@ -354,10 +364,54 @@ def endpoint_collaborators(monkeypatch, fake_conn):
         delegate=delegate,
         conn=fake_conn,
         queue_for_resume=queue_for_resume,
+        queue_stateless=queue_stateless,
+        prepare_stateless=prepare_stateless,
     )
 
 
 class TestResumeEndpointDelegation:
+    @pytest.mark.asyncio
+    async def test_stateless_resume_reenqueues_without_registered_agent(
+        self, endpoint_collaborators
+    ):
+        endpoint_collaborators.job.update(
+            {
+                "execution_lane": "stateless",
+                "status": "pending_review",
+                "context": {
+                    "workspace_container": {
+                        "status": "ready",
+                        "provisioner": "k8s",
+                        "pod_ip": "10.0.0.8",
+                    }
+                },
+            }
+        )
+
+        result = await main.resume_job(
+            MagicMock(),
+            JOB_ID,
+            main.JobResumeRequest(feedback="reviewer correction"),
+        )
+
+        assert result["status"] == "queued"
+        endpoint_collaborators.queue_stateless.assert_awaited_once_with(
+            JOB_ID,
+            {
+                "queued_feedback": "reviewer correction",
+                "queued_feedback_reason": (
+                    "This job was frozen for review; a reviewer resumed it with "
+                    "the feedback below."
+                ),
+            },
+            priority=1,
+            fair_key=None,
+            expected_status="pending_review",
+        )
+        endpoint_collaborators.delegate.assert_not_awaited()
+        main.postgres_db.get_agent.assert_not_awaited()
+        endpoint_collaborators.queue_for_resume.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_fast_path_delegates_to_shared_resume(self, endpoint_collaborators):
         result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
@@ -408,7 +462,11 @@ class TestResumeEndpointDelegation:
         # the dispatcher-visibility contract) is locked against real Postgres in
         # tests/test_queue_job_for_resume.py. Here we only pin the seam: a
         # declined delegation must fall back to that write.
-        endpoint_collaborators.queue_for_resume.assert_awaited_once_with(JOB_ID, None)
+        endpoint_collaborators.queue_for_resume.assert_awaited_once_with(
+            JOB_ID,
+            None,
+            expected_status="paused",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +540,44 @@ class TestResumeEndpointWorkspacelessJob:
                     "An operator explicitly resumed this job with the feedback below."
                 ),
             },
+            expected_status="paused",
         )
+
+    @pytest.mark.asyncio
+    async def test_stateless_reprovision_resume_stamps_intent_without_enqueue(
+        self, workspaceless
+    ):
+        workspaceless.job.update(
+            {
+                "execution_lane": "stateless",
+                "status": "pending_review",
+                "config_override": {"workspace": {"backend": "sandbox"}},
+                "context": {"workspace_container": {"status": "deleted"}},
+            }
+        )
+
+        result = await main.resume_job(
+            MagicMock(),
+            JOB_ID,
+            main.JobResumeRequest(feedback="continue after rebuild"),
+        )
+
+        assert result["status"] == "queued"
+        workspaceless.prepare_stateless.assert_awaited_once_with(
+            JOB_ID,
+            "workspace_container",
+            {
+                "queued_feedback": "continue after rebuild",
+                "queued_feedback_reason": (
+                    "This job was frozen for review; a reviewer resumed it with "
+                    "the feedback below."
+                ),
+            },
+            expected_status="pending_review",
+        )
+        workspaceless.shed.assert_not_awaited()
+        workspaceless.queue_for_resume.assert_not_awaited()
+        workspaceless.queue_stateless.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_healthy_vm_job_still_resumes_directly(self, workspaceless):

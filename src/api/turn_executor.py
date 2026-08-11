@@ -64,10 +64,15 @@ import os
 import random
 import socket
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from .lease_context import LeaseHandle, LeaseLostError, current_lease
+from .models import JobStartRequest
 from .orchestrator_client import ClaimBundleError
+from ..shared.job_freeze_types import (
+    AUTO_CONTINUE_FREEZE_TYPES,
+    FREEZE_TYPE_BATCH_BOUNDARY,
+)
 from ..shared.run_queue import (
     HEARTBEAT_INTERVAL_SECONDS,
     UNIT_KIND_SESSION_TURN,
@@ -78,6 +83,15 @@ from ..shared.run_queue import (
     heartbeat_unit,
     open_interrupt_admission,
     release_unit,
+)
+from ..shared.worker_queue import (
+    WorkerClaim,
+    WorkerRenewal,
+    claim_worker_batch,
+    complete_worker_batch,
+    renew_worker_batch,
+    release_worker_batch,
+    rotate_worker_batch,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,6 +113,18 @@ CLOUD_PUSH_WAIT_SECONDS = 60.0  # §5.3.5 option (i): the lease covers the push
 TURN_ABORT_GRACE_SECONDS = 15.0  # polite-unwind budget after an interrupt
 COMPLETE_RETRY_ATTEMPTS = 3
 PENDING_ROWS_LIMIT = 50
+
+_WORKER_PRESERVE_SHELL_STATUSES = frozenset(
+    {"paused", "pending_review", "reviewing", "waiting", "waiting_for_reply"}
+)
+
+
+def _enabled_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 
 # Oldest-unanswered query (§5.1 watermarks + M0b role vocabulary): LangChain
 # roles ('human'/'ai'); rewound rows are dead timelines and must not be
@@ -297,6 +323,7 @@ class StatelessTurnExecutor:
         cloud_push_wait_seconds: float = CLOUD_PUSH_WAIT_SECONDS,
         abort_grace_seconds: float = TURN_ABORT_GRACE_SECONDS,
         warm_session_idle_ttl_seconds: float = WARM_SESSION_IDLE_TTL_SECONDS,
+        worker_enabled: Optional[bool] = None,
     ) -> None:
         self._pod_name = (
             pod_name or os.getenv("POD_NAME") or socket.gethostname() or "agent"
@@ -309,6 +336,14 @@ class StatelessTurnExecutor:
         self._abort_grace_seconds = abort_grace_seconds
         self._warm_session_idle_ttl = warm_session_idle_ttl_seconds
         self._warm_since: Optional[float] = None
+        self._worker_enabled = (
+            _enabled_env("STATELESS_WORKER_ENABLED", False)
+            if worker_enabled is None
+            else bool(worker_enabled)
+        )
+        self._worker_preempted = asyncio.Event()
+        self._worker_preempt_status: Optional[str] = None
+        self._worker_terminal_report_generation: tuple[str, int] | None = None
 
         # S1 acceptance (zero in-process claim state): everything below is
         # either the soft-affinity hint or plumbing. Correctness never
@@ -458,12 +493,13 @@ class StatelessTurnExecutor:
         current_lease.set(self._lease)
         logger.info(
             "stateless turn executor started: pod=%s idle_poll=%.2fs "
-            "backoff=%.2fs/%d heartbeat=%ss",
+            "backoff=%.2fs/%d heartbeat=%ss worker_enabled=%s",
             self._pod_name,
             self._idle_poll_seconds,
             self._idle_backoff_seconds,
             self._idle_polls_before_backoff,
             HEARTBEAT_INTERVAL_SECONDS,
+            self._worker_enabled,
         )
         idle_polls = 0
         while not self._stop.is_set():
@@ -478,7 +514,19 @@ class StatelessTurnExecutor:
                 logger.warning("run_queue claim poll failed (transient): %s", e)
                 await self._sleep_interruptible(self._idle_backoff_seconds)
                 continue
-            if claim is None:
+            worker_claim: Optional[WorkerClaim] = None
+            if claim is None and self._worker_enabled:
+                try:
+                    worker_claim = await claim_worker_batch(
+                        self._db,
+                        pod_name=self._pod_name,
+                    )
+                except Exception as e:
+                    logger.warning("worker_batch claim poll failed (transient): %s", e)
+                    await self._sleep_interruptible(self._idle_backoff_seconds)
+                    continue
+
+            if claim is None and worker_claim is None:
                 idle_polls += 1
                 await self._expire_warm_session()
                 await self._sleep_interruptible(self._idle_delay(idle_polls))
@@ -487,22 +535,42 @@ class StatelessTurnExecutor:
             if self._stop.is_set():
                 # Claimed on the stop boundary — hand it straight back for
                 # another pod (no backoff, not an error).
+                stop_claim = worker_claim.unit if worker_claim is not None else claim
                 with contextlib.suppress(Exception):
                     state = await release_unit(
                         self._db,
-                        unit_id=claim.unit_id,
-                        lease_token=claim.lease_token,
+                        unit_id=stop_claim.unit_id,
+                        lease_token=stop_claim.lease_token,
                         backoff_seconds=0.0,
                     )
                     logger.info(
                         "run_queue release: unit=%s token=%d reason=shutting_down "
                         "state=%s",
-                        claim.unit_id,
-                        claim.lease_token,
+                        stop_claim.unit_id,
+                        stop_claim.lease_token,
                         state,
                     )
                 break
+            if worker_claim is not None:
+                try:
+                    await self._serve_worker_claim(worker_claim)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "unhandled error serving worker unit %s — releasing and "
+                        "continuing",
+                        worker_claim.unit_id,
+                    )
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await self._cleanup_worker_runtime(preserve_shell=True)
+                    await self._release_worker_claim(
+                        worker_claim,
+                        reason="serve_crash",
+                    )
+                continue
             try:
+                assert claim is not None
                 await self._serve_claim(claim)
             except asyncio.CancelledError:
                 raise
@@ -523,6 +591,789 @@ class StatelessTurnExecutor:
     # ------------------------------------------------------------------
     # One claim
     # ------------------------------------------------------------------
+
+    async def _serve_worker_claim(self, claim: WorkerClaim) -> None:
+        """Drive one worker batch under its immutable queue lease.
+
+        This is deliberately a separate lifecycle from the persistent-session
+        driver below.  Worker rotation is queue-only; the completion API is
+        reserved for genuine terminal/human-facing graph stops.
+        """
+
+        unit = claim.unit
+        unit_id = str(unit.unit_id)
+        token = unit.lease_token
+        logger.info(
+            "run_queue claim: unit=%s kind=%s token=%d attempts=%d "
+            "input_seq=%s consumed_seq=%s prior_job_status=%s pod=%s",
+            unit_id,
+            unit.unit_kind,
+            token,
+            unit.attempts_since_completion,
+            unit.input_seq,
+            unit.consumed_seq,
+            claim.prior_job_status,
+            self._pod_name,
+        )
+        self._worker_preempted = asyncio.Event()
+        self._worker_preempt_status = None
+        self._worker_terminal_report_generation = None
+        heartbeat_task = asyncio.create_task(
+            self._worker_heartbeat_loop(claim),
+            name=f"worker-lease-heartbeat-{unit_id[:8]}",
+        )
+        try:
+            pa = _pa()
+            # A shared pod can still hold a warm interactive session when the
+            # next durable claim is a worker.  Perform the same physical claim
+            # switch even for the no-work ``attempts > max`` give-up path:
+            # terminal cleanup must never clear the singleton agent underneath
+            # an attached cached session or inherit its tenant residue.
+            if pa._session is not None:
+                await self._detach_cached_session("worker_claim_switch")
+            self._scrub_process_residue()
+            self._lease.update(unit_id, token)
+
+            await self._serve_worker_claim_inner(
+                claim,
+                retry_exhausted=(unit.attempts_since_completion > claim.max_attempts),
+            )
+        except asyncio.CancelledError:
+            # Hard executor shutdown: close local admission first.  A best-effort
+            # release is intentionally left to the outer shutdown/reaper path if
+            # cancellation prevents the DB call from completing.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._cleanup_worker_runtime(preserve_shell=True)
+            raise
+        except Exception as exc:
+            logger.exception(
+                "worker_batch failed before a disposition: unit=%s token=%d",
+                unit_id,
+                token,
+            )
+            report_started = self._worker_terminal_report_generation == (
+                unit_id,
+                int(token),
+            )
+            if report_started:
+                # Once an HTTP report has begun, correction 8 owns every
+                # ambiguous tail failure. Never issue a second report from
+                # this generation and never park it: preserve runtime state,
+                # release with backoff, and let a successor consume or
+                # benignly re-report the durable END checkpoint.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._cleanup_worker_runtime(preserve_shell=True)
+                await self._release_worker_claim(
+                    claim,
+                    reason="terminal_report_failed",
+                    park_on_exhaustion=False,
+                )
+                return
+            if str(self._lease.unit_id or "") != unit_id or int(
+                self._lease.lease_token
+            ) != int(token):
+                # Failure may precede the normal publication point (for
+                # example, while detaching a warm session). The queue claim is
+                # nevertheless authoritative; publish this generation before
+                # its retry/give-up disposition rather than inheriting the old
+                # handle's lost bit.
+                self._lease.update(unit_id, token)
+            if (
+                unit.attempts_since_completion > claim.max_attempts
+                and not self._lease.lost.is_set()
+            ):
+                # Above the cap, bundle/setup exists only to inspect the
+                # canonical checkpoint. If that inspection is temporarily
+                # unavailable, do not overwrite a potentially successful or
+                # human-facing END with an invented failure. Retry without
+                # parking until the checkpoint can decide the outcome.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._cleanup_worker_runtime(preserve_shell=True)
+                await self._release_worker_claim(
+                    claim,
+                    reason="exhausted_checkpoint_probe_failed",
+                    park_on_exhaustion=False,
+                )
+                return
+            if (
+                unit.attempts_since_completion == claim.max_attempts
+                and not self._lease.lost.is_set()
+            ):
+                final_state = self._worker_retry_exhausted_state(
+                    self._worker_driver_error_state(str(exc), job_id=unit_id),
+                    attempts=unit.attempts_since_completion,
+                    max_attempts=claim.max_attempts,
+                )
+                logger.error(
+                    "worker_batch driver retry exhausted: unit=%s token=%d "
+                    "attempts=%d/%d — reporting terminal give-up",
+                    unit_id,
+                    token,
+                    unit.attempts_since_completion,
+                    claim.max_attempts,
+                )
+                try:
+                    await self._report_worker_terminal(claim, final_state)
+                    return
+                except Exception:
+                    # The report path itself is retriable forever (correction
+                    # 8): never turn an unavailable completion handler into an
+                    # invisible parked processing job.
+                    logger.exception(
+                        "worker_batch exhausted give-up report failed before a "
+                        "disposition: unit=%s token=%d",
+                        unit_id,
+                        token,
+                    )
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await self._cleanup_worker_runtime(preserve_shell=True)
+                    await self._release_worker_claim(
+                        claim,
+                        reason="terminal_report_failed",
+                        park_on_exhaustion=False,
+                    )
+                    return
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._cleanup_worker_runtime(preserve_shell=True)
+            await self._release_worker_claim(claim, reason="driver_error")
+        finally:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await heartbeat_task
+
+    async def _serve_worker_claim_inner(
+        self,
+        claim: WorkerClaim,
+        *,
+        retry_exhausted: bool = False,
+    ) -> None:
+        pa = _pa()
+        unit = claim.unit
+        job_id = str(unit.unit_id)
+        token = unit.lease_token
+
+        bundle = await self._fetch_bundle(job_id, token)
+        request, batch = self._parse_worker_bundle(bundle, claim)
+        metadata = self._worker_job_metadata(request)
+        context = request.context or {}
+        self._seed_worker_inboxes(
+            job_id,
+            context.get("pending_guidance"),
+            context.get("queued_replies"),
+        )
+
+        # Close the claim→bundle race and get the authoritative control state
+        # before creating a workspace or invoking the graph.
+        renewal = await renew_worker_batch(
+            self._db,
+            unit_id=unit.unit_id,
+            lease_token=token,
+        )
+        if renewal is None:
+            self._lease.mark_lost()
+            logger.warning(
+                "lease lost: worker unit=%s token=%d before graph start",
+                job_id,
+                token,
+            )
+            return
+        self._observe_worker_renewal(job_id, renewal)
+        if self._worker_preempted.is_set():
+            await self._finish_external_worker_preempt(claim)
+            return
+
+        agent = pa._agent
+        client = pa._orchestrator_client
+        if agent is None or client is None:
+            raise RuntimeError("worker claim requires an initialized agent and client")
+        agent._orchestrator_client = client
+
+        from src.shared.job_steering import CheckpointSteeringAcker
+
+        steering_acker = CheckpointSteeringAcker(job_id, client)
+
+        streaming_gen: Optional[AsyncIterator[Dict[str, Any]]] = None
+        try:
+            streaming_gen = await agent.process_job(
+                job_id,
+                metadata,
+                stream=True,
+                resume=claim.resume,
+                feedback=context.get("queued_feedback"),
+                feedback_reason=context.get("queued_feedback_reason"),
+                original_config_name=request.config_name,
+                previous_status=claim.prior_job_status,
+                worker_lease_token=token,
+                worker_batch_target_wall_seconds=batch["target_wall_seconds"],
+                worker_batch_min_wall_seconds=batch.get("min_wall_seconds"),
+                worker_batch_iteration_cap=batch.get("iteration_cap"),
+                worker_resume_id=claim.resume_id,
+                worker_retry_exhausted=retry_exhausted,
+                defer_cleanup=True,
+                worker_checkpoint_post_commit=steering_acker,
+            )
+            outcome, final_state = await self._consume_worker_stream(streaming_gen)
+        finally:
+            if streaming_gen is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await streaming_gen.aclose()
+
+        if outcome == "lease_lost":
+            logger.warning(
+                "lease lost: worker unit=%s token=%d — no report/release/complete",
+                job_id,
+                token,
+            )
+            await self._cleanup_worker_runtime(preserve_shell=True)
+            return
+        if outcome == "preempted":
+            await self._finish_external_worker_preempt(claim)
+            return
+        # A renewal can commit between the stream's StopAsyncIteration and the
+        # disposition branch.  Recheck both signals so an external control is
+        # still guaranteed to make zero HTTP completion reports.
+        if self._lease.lost.is_set():
+            await self._cleanup_worker_runtime(preserve_shell=True)
+            return
+        if self._worker_preempted.is_set():
+            await self._finish_external_worker_preempt(claim)
+            return
+        if outcome != "graph_end" or final_state is None:
+            if unit.attempts_since_completion >= claim.max_attempts:
+                exhausted = self._worker_retry_exhausted_state(
+                    self._worker_driver_error_state(
+                        "worker graph stream ended without a durable terminal state",
+                        job_id=job_id,
+                    ),
+                    attempts=unit.attempts_since_completion,
+                    max_attempts=claim.max_attempts,
+                )
+                logger.error(
+                    "worker_batch empty-stream retry exhausted: unit=%s token=%d "
+                    "attempts=%d/%d — reporting terminal give-up",
+                    job_id,
+                    token,
+                    unit.attempts_since_completion,
+                    claim.max_attempts,
+                )
+                await self._report_worker_terminal(claim, exhausted, client=client)
+                return
+            await self._cleanup_worker_runtime(preserve_shell=True)
+            await self._release_worker_claim(claim, reason="graph_stream_ended_empty")
+            return
+
+        freeze = final_state.get("freeze_data") or {}
+        freeze_type = freeze.get("freeze_type") if isinstance(freeze, dict) else None
+        if freeze_type == FREEZE_TYPE_BATCH_BOUNDARY:
+            await self._cleanup_worker_runtime(preserve_shell=True)
+            rotation = await rotate_worker_batch(
+                self._db,
+                unit_id=unit.unit_id,
+                lease_token=token,
+                input_seq=unit.input_seq,
+                fair_key=unit.fair_key,
+            )
+            if rotation is None:
+                self._lease.mark_lost()
+                logger.warning(
+                    "lease lost: worker rotation fenced out unit=%s token=%d",
+                    job_id,
+                    token,
+                )
+                return
+            logger.info(
+                "worker_batch rotate: unit=%s token=%d "
+                "queue_verb=complete_and_requeue queue_state=%s "
+                "input_seq=%s next_input_seq=%d complete_calls=0 "
+                "http_complete_calls=0",
+                job_id,
+                token,
+                rotation.state,
+                rotation.prior_input_seq,
+                rotation.next_input_seq,
+            )
+            return
+
+        if self._worker_stop_is_recoverable(final_state, freeze_type):
+            if unit.attempts_since_completion >= claim.max_attempts:
+                final_state = self._worker_retry_exhausted_state(
+                    final_state,
+                    attempts=unit.attempts_since_completion,
+                    max_attempts=claim.max_attempts,
+                )
+                freeze_type = "worker_retry_exhausted"
+                logger.error(
+                    "worker_batch retry exhausted: unit=%s token=%d "
+                    "attempts=%d/%d — reporting terminal give-up",
+                    job_id,
+                    token,
+                    unit.attempts_since_completion,
+                    claim.max_attempts,
+                )
+            else:
+                await self._cleanup_worker_runtime(preserve_shell=True)
+                await self._release_worker_claim(claim, reason="recoverable_stop")
+                logger.info(
+                    "worker_batch recoverable release: unit=%s token=%d "
+                    "freeze=%s attempts=%d/%d complete_calls=0 "
+                    "http_complete_calls=0",
+                    job_id,
+                    token,
+                    freeze_type,
+                    unit.attempts_since_completion,
+                    claim.max_attempts,
+                )
+                return
+
+        await self._report_worker_terminal(claim, final_state, client=client)
+
+    async def _report_worker_terminal(
+        self,
+        claim: WorkerClaim,
+        final_state: Dict[str, Any],
+        *,
+        client: Any | None = None,
+    ) -> None:
+        """Report one genuine/give-up stop, then fence the queue disposition."""
+
+        unit = claim.unit
+        job_id = str(unit.unit_id)
+        token = unit.lease_token
+        if client is None:
+            client = _pa()._orchestrator_client
+        if client is None:
+            raise RuntimeError("worker terminal report requires orchestrator client")
+
+        # Genuine terminal/human-facing stop: report exactly once while the
+        # queue lease and renewal task remain alive.  Only a 2xx lets us close
+        # the queue unit.  A timeout/non-2xx preserves tmux and error-releases
+        # so a successor re-enters the END checkpoint and retries the report.
+        self._worker_terminal_report_generation = (job_id, int(token))
+        reported = await client.report_completion(
+            job_id,
+            final_state,
+            lease_token=token,
+        )
+        if not reported:
+            # A pause/cancel may win after the handler's thin entry fence.  The
+            # handler's jobs-row disposition CAS then rejects the report. Read
+            # the authoritative status once immediately (rather than waiting
+            # for the next heartbeat) and honor the external control with zero
+            # queue error-release. Never cancel an in-flight report: Starlette
+            # cancellation can strand the existing multi-write handler.
+            failed_report_status: str | None = None
+            if not self._lease.lost.is_set():
+                renewal = await renew_worker_batch(
+                    self._db,
+                    unit_id=unit.unit_id,
+                    lease_token=token,
+                )
+                if renewal is None:
+                    self._lease.mark_lost()
+                else:
+                    failed_report_status = renewal.job_status
+                    self._observe_worker_renewal(job_id, renewal)
+            if self._lease.lost.is_set():
+                await self._cleanup_worker_runtime(preserve_shell=True)
+                return
+            if self._worker_preempted.is_set():
+                await self._finish_external_worker_preempt(
+                    claim,
+                    http_complete_calls=1,
+                )
+                return
+            await self._cleanup_worker_runtime(
+                preserve_shell=failed_report_status
+                not in {"completed", "failed", "cancelled"}
+            )
+            await self._release_worker_claim(
+                claim,
+                reason="terminal_report_failed",
+                park_on_exhaustion=False,
+            )
+            return
+
+        # Do not rely on the heartbeat event observed before/during the HTTP
+        # call. Re-read the exact token and authoritative job status after the
+        # handler returns so a same-window control transition cannot be missed
+        # before queue closure. Report-authored paused/failed states use the
+        # same safe terminal closure; their cleanup disposition is status-based.
+        post_report_status: str | None = None
+        if not self._lease.lost.is_set():
+            renewal = await renew_worker_batch(
+                self._db,
+                unit_id=unit.unit_id,
+                lease_token=token,
+            )
+            if renewal is None:
+                self._lease.mark_lost()
+            else:
+                post_report_status = renewal.job_status
+                self._observe_worker_renewal(job_id, renewal)
+        if self._lease.lost.is_set():
+            await self._cleanup_worker_runtime(preserve_shell=True)
+            logger.warning(
+                "lease lost: worker unit=%s token=%d after accepted terminal "
+                "report — successor owns queue closure",
+                job_id,
+                token,
+            )
+            return
+        if self._worker_preempted.is_set():
+            await self._finish_external_worker_preempt(
+                claim,
+                http_complete_calls=1,
+            )
+            return
+        await self._cleanup_worker_runtime(
+            preserve_shell=post_report_status in _WORKER_PRESERVE_SHELL_STATUSES
+        )
+        state = await complete_worker_batch(
+            self._db,
+            unit_id=unit.unit_id,
+            lease_token=token,
+            consumed_seq=unit.input_seq,
+        )
+        if state is None:
+            self._lease.mark_lost()
+            logger.warning(
+                "lease lost: worker terminal queue closure fenced out unit=%s token=%d",
+                job_id,
+                token,
+            )
+            return
+        logger.info(
+            "worker_batch terminal: unit=%s token=%d queue_state=%s "
+            "complete_calls=1 http_complete_calls=1",
+            job_id,
+            token,
+            state,
+        )
+
+    @staticmethod
+    def _parse_worker_bundle(
+        bundle: Dict[str, Any], claim: WorkerClaim
+    ) -> Tuple[JobStartRequest, Dict[str, Any]]:
+        job_id = str(claim.unit_id)
+        if (
+            str(bundle.get("unit_id")) != job_id
+            or str(bundle.get("job_id")) != job_id
+            or bundle.get("unit_kind") != "worker_batch"
+            or bundle.get("execution_lane") != "stateless"
+        ):
+            raise ValueError("claim bundle does not describe the leased worker unit")
+        request = JobStartRequest.model_validate(bundle.get("job") or {})
+        if request.job_id != job_id:
+            raise ValueError("worker claim bundle job payload id mismatch")
+        batch = bundle.get("batch")
+        if not isinstance(batch, dict):
+            raise ValueError("worker claim bundle is missing its batch envelope")
+        return request, dict(batch)
+
+    @staticmethod
+    def _worker_job_metadata(request: JobStartRequest) -> Dict[str, Any]:
+        """Build the exact metadata shape used by the pinned start path."""
+
+        metadata: Dict[str, Any] = {"description": request.description}
+        for field, key in (
+            ("upload_id", "upload_id"),
+            ("config_upload_id", "config_upload_id"),
+            ("instructions_upload_id", "instructions_upload_id"),
+            ("document_path", "document_path"),
+            ("document_dir", "document_dir"),
+        ):
+            value = getattr(request, field)
+            if value:
+                metadata[key] = value
+        if request.context:
+            metadata.update(request.context)
+        if request.instructions:
+            metadata["instructions"] = request.instructions
+        if request.config_name and request.config_name != "worker_base":
+            metadata["config_name"] = request.config_name
+        for field, key in (
+            ("expert_id", "expert_id"),
+            ("config_override", "config_override"),
+            ("resolved_config", "resolved_config"),
+            ("git_remote_url", "git_remote_url"),
+            ("datasources", "datasources"),
+            ("repositories", "repositories"),
+            ("branch_name", "branch_name"),
+            ("project_id", "project_id"),
+        ):
+            value = getattr(request, field)
+            if value:
+                metadata[key] = value
+        return metadata
+
+    async def _consume_worker_stream(
+        self,
+        stream: AsyncIterator[Dict[str, Any]],
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Race each graph step against exact-lease loss and external stop."""
+
+        final_state: Optional[Dict[str, Any]] = None
+        lost_waiter = asyncio.create_task(self._lease.lost.wait())
+        preempt_waiter = asyncio.create_task(self._worker_preempted.wait())
+        try:
+            while True:
+                next_state = asyncio.create_task(anext(stream))
+                try:
+                    await asyncio.wait(
+                        {next_state, lost_waiter, preempt_waiter},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    # Ownership/control always wins a same-tick graph result.
+                    if self._lease.lost.is_set():
+                        next_state.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await next_state
+                        return "lease_lost", final_state
+                    if self._worker_preempted.is_set():
+                        next_state.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await next_state
+                        return "preempted", final_state
+                    try:
+                        state = next_state.result()
+                    except StopAsyncIteration:
+                        return "graph_end", final_state
+                    if isinstance(state, dict):
+                        final_state = state
+                finally:
+                    if not next_state.done():
+                        next_state.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await next_state
+        finally:
+            for waiter in (lost_waiter, preempt_waiter):
+                if not waiter.done():
+                    waiter.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await waiter
+
+    async def _worker_heartbeat_loop(self, claim: WorkerClaim) -> None:
+        unit = claim.unit
+        job_id = str(unit.unit_id)
+        token = unit.lease_token
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            try:
+                renewal = await renew_worker_batch(
+                    self._db,
+                    unit_id=unit.unit_id,
+                    lease_token=token,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "worker lease heartbeat failed for unit %s (transient): %s",
+                    job_id,
+                    e,
+                )
+                continue
+            if renewal is None:
+                self._lease.mark_lost()
+                logger.warning(
+                    "lease lost: worker unit=%s token=%d (renewal rejected)",
+                    job_id,
+                    token,
+                )
+                return
+            self._observe_worker_renewal(job_id, renewal)
+
+    def _observe_worker_renewal(self, job_id: str, renewal: WorkerRenewal) -> None:
+        self._seed_worker_inboxes(
+            job_id,
+            list(renewal.pending_guidance),
+            list(renewal.queued_replies),
+        )
+        if renewal.preempted:
+            if not self._worker_preempted.is_set():
+                logger.info(
+                    "worker_batch preempt discovered: unit=%s status=%s",
+                    job_id,
+                    renewal.job_status,
+                )
+            self._worker_preempt_status = renewal.job_status
+            self._worker_preempted.set()
+
+    @staticmethod
+    def _seed_worker_inboxes(
+        job_id: str,
+        pending_guidance: Any,
+        queued_replies: Any,
+    ) -> None:
+        try:
+            import src.api.dual_app as dual_app
+
+            dual_app._replace_inbox(
+                dual_app._guidance_inbox,
+                job_id,
+                pending_guidance,
+                "Supervisor guidance",
+            )
+            dual_app._replace_inbox(
+                dual_app._reply_inbox,
+                job_id,
+                queued_replies,
+                "Queued replies",
+            )
+        except Exception:
+            logger.debug("Worker steering inbox refresh failed", exc_info=True)
+
+    @staticmethod
+    def _worker_stop_is_recoverable(
+        final_state: Dict[str, Any], freeze_type: Any
+    ) -> bool:
+        # An explicit human-facing freeze wins over a coincident retryable
+        # error.  Those stops must remain visible/actionable through the
+        # completion handler (condition 3 of the governing scope correction).
+        if freeze_type and freeze_type not in AUTO_CONTINUE_FREEZE_TYPES:
+            return False
+        error = final_state.get("error")
+        if isinstance(error, dict) and error.get("recoverable") is True:
+            return True
+        return bool(
+            freeze_type in AUTO_CONTINUE_FREEZE_TYPES
+            and freeze_type != FREEZE_TYPE_BATCH_BOUNDARY
+        )
+
+    @staticmethod
+    def _worker_driver_error_state(
+        message: str,
+        *,
+        job_id: str | None = None,
+    ) -> Dict[str, Any]:
+        return {
+            "job_id": job_id,
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {
+                "type": "worker_driver_error",
+                "recoverable": True,
+                "message": str(message),
+            },
+        }
+
+    @staticmethod
+    def _worker_retry_exhausted_state(
+        final_state: Dict[str, Any],
+        *,
+        attempts: int,
+        max_attempts: int,
+    ) -> Dict[str, Any]:
+        """Turn the queue's last recoverable attempt into a visible give-up.
+
+        The queue owns retry accounting, but the orchestrator remains the sole
+        job-status authority. The final holder therefore reports a factual,
+        non-recoverable terminal envelope while it still owns the exact token;
+        it never writes ``jobs.status`` directly.
+        """
+
+        exhausted = dict(final_state)
+        prior_error = final_state.get("error")
+        error = dict(prior_error) if isinstance(prior_error, dict) else {}
+        prior_freeze = final_state.get("freeze_data")
+        reason = error.get("message")
+        if not reason and isinstance(prior_freeze, dict):
+            reason = prior_freeze.get("reason") or prior_freeze.get("error_summary")
+        error.update(
+            {
+                "type": "worker_retry_exhausted",
+                "recoverable": False,
+                "message": (
+                    f"Stateless worker recovery exhausted {attempts}/{max_attempts} "
+                    f"queue attempts" + (f": {reason}" if reason else "")
+                ),
+            }
+        )
+        exhausted.update(
+            {
+                "should_stop": True,
+                "goal_achieved": False,
+                "error": error,
+                "freeze_data": {
+                    "freeze_type": "worker_retry_exhausted",
+                    "reason": error["message"],
+                    "attempts": attempts,
+                    "max_attempts": max_attempts,
+                    "prior_freeze": prior_freeze,
+                },
+            }
+        )
+        return exhausted
+
+    async def _finish_external_worker_preempt(
+        self,
+        claim: WorkerClaim,
+        *,
+        http_complete_calls: int = 0,
+    ) -> None:
+        status = self._worker_preempt_status or "unknown"
+        preserve_shell = status in _WORKER_PRESERVE_SHELL_STATUSES
+        await self._cleanup_worker_runtime(preserve_shell=preserve_shell)
+        state = await complete_worker_batch(
+            self._db,
+            unit_id=claim.unit_id,
+            lease_token=claim.lease_token,
+            consumed_seq=claim.unit.input_seq,
+        )
+        logger.info(
+            "worker_batch external stop: unit=%s token=%d status=%s "
+            "queue_state=%s complete_calls=0 http_complete_calls=%d",
+            claim.unit_id,
+            claim.lease_token,
+            status,
+            state,
+            http_complete_calls,
+        )
+
+    async def _cleanup_worker_runtime(self, *, preserve_shell: bool) -> None:
+        agent = _pa()._agent
+        if agent is not None:
+            await agent.cleanup_worker_claim(preserve_shell=preserve_shell)
+
+    async def _release_worker_claim(
+        self,
+        claim: WorkerClaim,
+        *,
+        reason: str,
+        park_on_exhaustion: bool = True,
+    ) -> None:
+        if self._lease.lost.is_set():
+            logger.info(
+                "run_queue release: worker unit=%s token=%d reason=%s "
+                "skipped after local ownership loss",
+                claim.unit_id,
+                claim.lease_token,
+                reason,
+            )
+            return
+        try:
+            state = await release_worker_batch(
+                self._db,
+                unit_id=claim.unit_id,
+                lease_token=claim.lease_token,
+                park_on_exhaustion=park_on_exhaustion,
+            )
+        except Exception:
+            logger.warning(
+                "run_queue release failed for worker unit %s (reason=%s) — "
+                "the lease will expire instead",
+                claim.unit_id,
+                reason,
+                exc_info=True,
+            )
+            return
+        logger.info(
+            "run_queue release: worker unit=%s token=%d reason=%s state=%s",
+            claim.unit_id,
+            claim.lease_token,
+            reason,
+            state,
+        )
 
     async def _serve_claim(self, claim: ClaimedUnit) -> None:
         pa = _pa()
@@ -1551,10 +2402,17 @@ async def start_stateless_executor() -> StatelessTurnExecutor:
 
 async def stop_stateless_executor(timeout: Optional[float] = None) -> None:
     global _executor
-    if _executor is None:
-        return
-    await _executor.stop(timeout)
-    _executor = None
+    try:
+        if _executor is not None:
+            await _executor.stop(timeout)
+            _executor = None
+    finally:
+        # Worker savers share one process pool.  It is lifespan-owned, never
+        # closed at a batch boundary, and must still close when startup failed
+        # after opening it but before publishing the executor singleton.
+        from ..core.fenced_checkpointer import close_fenced_checkpointer_pool
+
+        await close_fenced_checkpointer_pool()
 
 
 def executor_running() -> bool:

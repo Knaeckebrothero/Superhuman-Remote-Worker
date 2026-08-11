@@ -1,4 +1,7 @@
 {{- $remoteIngress := .Values.infrastructureMetering.remoteIngress | default dict -}}
+{{- if and (.Values.agent.stateless.worker.enabled | default false) (not (.Values.agent.stateless.enabled | default false)) }}
+{{- fail "agent.stateless.worker.enabled requires agent.stateless.enabled so worker_batch units have a stateless executor pool" }}
+{{- end }}
 {{- $vmPvcInventory := .Values.infrastructureMetering.vmPvcInventoryEnabled | default false -}}
 {{- $vmPvInventory := .Values.infrastructureMetering.vmPvInventoryEnabled | default false -}}
 {{- $remoteInventory := or (.Values.infrastructureMetering.vmInventoryEnabled | default false) $vmPvcInventory $vmPvInventory -}}
@@ -347,6 +350,17 @@ data:
   # orchestrator/deployment.yaml). Default postgres (cross-pod resume on);
   # set checkpointer.backend=sqlite to fall back to the legacy pod-local store.
   CHECKPOINTER_BACKEND: {{ .Values.checkpointer.backend | default "postgres" | quote }}
+
+  # Stateless worker jobs are a separately gated lane. Enabling the generic
+  # stateless executor pool for session turns must not silently move worker
+  # jobs off the pinned dispatcher. Agents inherit these keys via envFrom;
+  # the orchestrator references them explicitly from this same ConfigMap.
+  STATELESS_WORKER_ENABLED: {{ .Values.agent.stateless.worker.enabled | default false | quote }}
+  WORKER_BATCH_MIN_WALL_SECONDS: {{ .Values.agent.stateless.worker.batchMinWallSeconds | default 300 | quote }}
+
+  # Reject pickle fallback in LangGraph checkpoint serialization. This is
+  # required for every worker process that can read shared Postgres state.
+  LANGGRAPH_STRICT_MSGPACK: "true"
 
   # LLM-outage/cooldown pause budget (seconds; default 12h). Read by BOTH the
   # orchestrator give-up ceiling (evaluate_llm_outage) AND every agent pod's

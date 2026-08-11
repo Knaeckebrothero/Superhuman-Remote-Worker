@@ -14,6 +14,7 @@ Key Features:
 
 import asyncio
 import logging
+import math
 import os
 import time
 import zipfile
@@ -52,12 +53,21 @@ from .core.workspace import (
     WorkspaceManagerConfig,
     get_checkpoints_path,
 )
-from .graph import build_phase_alternation_graph, run_graph_with_streaming
+from .graph import (
+    WORKER_BATCH_MIN_WALL_SECONDS,
+    build_phase_alternation_graph,
+    hydrate_todo_manager_from_state,
+    run_graph_with_streaming,
+)
 from .managers import TodoManager
 from .shared.job_freeze_types import AUTO_CONTINUE_FREEZE_TYPES
 from .tools import ToolContext, load_tools, apply_instruction_enforcement
 from .tools.description_manager import apply_description_overrides
-from .utils.db_url import checkpointer_backend, resolve_checkpoint_url
+from .utils.db_url import (
+    checkpointer_backend,
+    resolve_checkpoint_url,
+    resolve_fenced_checkpoint_url,
+)
 
 # Set True once per agent process after the Postgres checkpoint schema has been
 # ensured. AsyncPostgresSaver.setup() is idempotent, but there's no need to run
@@ -260,6 +270,12 @@ class UniversalAgent:
         self._graph = None
         self._checkpointer: Optional[BaseCheckpointSaver] = None
         self._checkpoint_conn: Optional[Any] = None
+        # Non-None only while the stateless worker driver owns an immutable
+        # worker_batch lease.  The saver and remote shell both bind to it.
+        self._worker_lease_token: Optional[int] = None
+        self._defer_job_cleanup = False
+        self._worker_checkpoint_post_commit = None
+        self._worker_env_restore: Dict[str, Optional[str]] = {}
 
         # Phase-specific LLMs (created if phase overrides configured)
         self._strategic_llm: Optional[BaseChatModel] = None
@@ -777,6 +793,14 @@ class UniversalAgent:
         feedback_reason: Optional[str] = None,
         original_config_name: Optional[str] = None,
         previous_status: Optional[str] = None,
+        worker_lease_token: Optional[int] = None,
+        worker_batch_target_wall_seconds: Optional[float] = None,
+        worker_batch_min_wall_seconds: Optional[float] = None,
+        worker_batch_iteration_cap: Optional[int] = None,
+        worker_resume_id: Optional[str] = None,
+        worker_retry_exhausted: bool = False,
+        defer_cleanup: bool = False,
+        worker_checkpoint_post_commit=None,
     ) -> Dict[str, Any]:
         """Process a single job.
 
@@ -812,11 +836,30 @@ class UniversalAgent:
         if not self._initialized:
             await self.initialize()
 
+        stateless_worker = worker_lease_token is not None
+        if stateless_worker:
+            if int(worker_lease_token) <= 0:
+                raise ValueError("worker_lease_token must be positive")
+            if (
+                worker_batch_target_wall_seconds is None
+                or float(worker_batch_target_wall_seconds) <= 0
+            ):
+                raise ValueError("worker batch target must be positive")
+            self._worker_lease_token = int(worker_lease_token)
+            self._defer_job_cleanup = bool(defer_cleanup)
+            self._worker_checkpoint_post_commit = worker_checkpoint_post_commit
+        else:
+            self._worker_lease_token = None
+            self._defer_job_cleanup = False
+            self._worker_checkpoint_post_commit = None
+
         # Reset config to base snapshot before applying per-job overrides
         self.config = self._base_config
 
         self._current_job_id = job_id
         self._job_metadata = metadata or {}
+        if stateless_worker:
+            self._capture_worker_environment(self._job_metadata)
         self._datasource_connections = {}
         self._datasource_clients = {}
         logger.info(f"Processing job {job_id}")
@@ -878,6 +921,11 @@ class UniversalAgent:
 
             # Load tools for this job
             await self._setup_job_tools()
+            if self._tool_context is not None:
+                self._tool_context._stateless_worker = stateless_worker
+                self._tool_context._worker_lease_token = (
+                    int(worker_lease_token) if stateless_worker else None
+                )
 
             # Phase 0: commit + push the fully seeded workspace so the job's
             # inputs (instructions, brief, documents, README) are visible in
@@ -905,10 +953,11 @@ class UniversalAgent:
                     f"kb_degraded={getattr(self, '_kb_degraded', False)}) — pausing "
                     f"for re-dispatch instead of running without memory/KB"
                 )
-                self._cleanup_shell_manager()
-                self._close_datasource_connections()
-                await self._cleanup_checkpointer()
-                self._current_job_id = None
+                if not getattr(self, "_defer_job_cleanup", False):
+                    self._cleanup_shell_manager()
+                    self._close_datasource_connections()
+                    await self._cleanup_checkpointer()
+                    self._current_job_id = None
                 freeze_state = {
                     "job_id": job_id,
                     "should_stop": True,
@@ -977,7 +1026,30 @@ class UniversalAgent:
                 "waiting",
             }
             graph_input = None
-            if resume:
+            worker_terminal_state: Optional[Dict[str, Any]] = None
+            if stateless_worker:
+                # Shared Postgres is the canonical crash/rotation lane.  Never
+                # rewind a stateless worker through the pod-local phase snapshot
+                # fallback, including prior_status='processing' steals.
+                checkpoint_state = await self._graph.aget_state(thread_config)
+                if checkpoint_state and checkpoint_state.values:
+                    graph_input = None
+                    resume = True
+                    logger.info(
+                        "[%s] Stateless worker resuming canonical Postgres checkpoint",
+                        job_id,
+                    )
+                else:
+                    graph_input = create_initial_state(
+                        job_id=job_id,
+                        workspace_path=str(self._workspace_manager.path),
+                        metadata=updated_metadata,
+                    )
+                    logger.info(
+                        "[%s] Stateless worker found no checkpoint; starting fresh",
+                        job_id,
+                    )
+            elif resume:
                 is_graceful = previous_status in GRACEFUL_STOP_STATUSES
                 if is_graceful:
                     logger.info(
@@ -1044,47 +1116,89 @@ class UniversalAgent:
                 # Every lookup failed: resume=True with nothing to resume from.
                 await self._note_resume_without_checkpoint(job_id, previous_status)
 
+            checkpoint_values: Dict[str, Any] = {}
+            if resume and graph_input is None:
+                # Process-local TodoManager state is not reconstructed by
+                # LangGraph itself.  A mid-loop checkpoint can resume at its
+                # pending next node and bypass route_entry/restore_todo_state,
+                # so hydrate it explicitly on every resume.
+                snapshot = await self._graph.aget_state(thread_config)
+                values = snapshot.values or {}
+                checkpoint_values = dict(values)
+                if hydrate_todo_manager_from_state(self._todo_manager, values):
+                    logger.info(
+                        "[%s] Hydrated TodoManager before checkpoint resume",
+                        job_id,
+                    )
+                delivered_reply_keys = values.get("delivered_reply_keys") or []
+                if (
+                    stateless_worker
+                    and self._tool_context is not None
+                    and isinstance(delivered_reply_keys, list)
+                ):
+                    self._tool_context._delivered_reply_keys = {
+                        str(key) for key in delivered_reply_keys if key is not None
+                    }
+                if stateless_worker and self._tool_context is not None:
+                    restored_instruction_reads = self._restore_worker_instruction_reads(
+                        values
+                    )
+                    if restored_instruction_reads:
+                        logger.info(
+                            "[%s] Restored %d checkpointed instruction-read receipt(s)",
+                            job_id,
+                            restored_instruction_reads,
+                        )
+                if stateless_worker and self._worker_checkpoint_post_commit:
+                    checkpoint_id = ""
+                    snapshot_config = getattr(snapshot, "config", None)
+                    if isinstance(snapshot_config, dict):
+                        configurable = snapshot_config.get("configurable")
+                        if isinstance(configurable, dict):
+                            checkpoint_id = str(configurable.get("checkpoint_id") or "")
+                    try:
+                        await self._worker_checkpoint_post_commit.reconcile_values(
+                            values,
+                            checkpoint_id=checkpoint_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[%s] Claim-time steering ack reconciliation failed; "
+                            "a later checkpoint/claim will retry",
+                            job_id,
+                            exc_info=True,
+                        )
+
             # Inject feedback into graph state via aupdate_state
             # This sets resume_feedback so route_entry routes to restore_from_feedback
-            if resume and feedback and graph_input is None:
-                await self._graph.aupdate_state(
-                    thread_config,
-                    {
-                        "resume_feedback": feedback,
-                        "resume_reason": feedback_reason,
-                        "should_stop": False,
-                        "goal_achieved": False,
-                        "is_final_phase": False,
-                        # A feedback resume voids any journaled finalization
-                        # decision from the previous round (restore_from_feedback
-                        # clears the process caches too).
-                        "completion_decision": None,
-                        "verdict_decision": None,
-                    },
-                    as_node="__start__",
+            if resume and feedback and (graph_input is None or stateless_worker):
+                await self._inject_resume_feedback(
+                    job_id=job_id,
+                    stateless_worker=stateless_worker,
+                    graph_input=graph_input,
+                    thread_config=thread_config,
+                    checkpoint_values=checkpoint_values,
+                    feedback=feedback,
+                    feedback_reason=feedback_reason,
+                    metadata=updated_metadata,
                 )
-                logger.info("Injected feedback into graph state via aupdate_state")
 
             # Inject delegation results into graph state when resuming from waiting
             delegation_results = (updated_metadata or {}).get("delegation_results")
-            if resume and delegation_results and graph_input is None:
-                from langchain_core.messages import HumanMessage
-
-                results_msg = _format_delegation_results(delegation_results)
-                await self._graph.aupdate_state(
-                    thread_config,
-                    {
-                        "messages": [HumanMessage(content=results_msg)],
-                        "should_stop": False,
-                        "goal_achieved": False,
-                    },
-                    as_node="restore_todo_state",
+            if (
+                resume
+                and delegation_results
+                and (graph_input is None or stateless_worker)
+            ):
+                await self._inject_delegation_results(
+                    job_id=job_id,
+                    stateless_worker=stateless_worker,
+                    graph_input=graph_input,
+                    thread_config=thread_config,
+                    checkpoint_values=checkpoint_values,
+                    delegation_results=delegation_results,
+                    metadata=updated_metadata,
                 )
-                logger.info(
-                    f"Injected delegation results into graph state "
-                    f"({len(delegation_results)} children)"
-                )
-
             # Auto-continue resume (version_upgrade / llm_unavailable / memory /
             # workspace-upgrade): a graceful re-dispatch with NO feedback and NO
             # delegation. The prior in-graph freeze persisted should_stop=True +
@@ -1122,6 +1236,7 @@ class UniversalAgent:
                                 "goal_achieved": False,
                                 "is_final_phase": False,
                                 "freeze_data": None,
+                                "error": None,
                             },
                             as_node="__start__",
                         )
@@ -1162,6 +1277,22 @@ class UniversalAgent:
                         f"resume (job may re-freeze without progress): {e}"
                     )
 
+            if stateless_worker:
+                # Arm last, after feedback/delegation/auto-continue has chosen
+                # the resume frontier.  A plain state update on a mid-loop
+                # checkpoint must preserve its pending next node; START is
+                # reserved for a clean END re-entry below.
+                worker_terminal_state = await self._arm_worker_batch(
+                    job_id=job_id,
+                    graph_input=graph_input,
+                    thread_config=thread_config,
+                    target_wall_seconds=worker_batch_target_wall_seconds,
+                    min_wall_seconds=worker_batch_min_wall_seconds,
+                    iteration_cap=worker_batch_iteration_cap,
+                    resume_id=worker_resume_id,
+                    retry_exhausted=worker_retry_exhausted,
+                )
+
             # Durable-first resume hydration (journal-before-observe):
             # a restarted process lost the in-memory completion decision, so
             # re-seed the cache from the journaled record. Never on feedback
@@ -1189,10 +1320,18 @@ class UniversalAgent:
                     )
 
             if stream:
+                if worker_terminal_state is not None:
+                    # An error-release after a failed terminal HTTP report
+                    # reclaims an already-ended checkpoint.  LangGraph emits
+                    # zero stream items for ainvoke(None) at END, so surface
+                    # the durable values once without re-running any node.
+                    return self._yield_error_state(worker_terminal_state)
                 # For streaming, cleanup happens inside the generator
                 return self._process_job_streaming(graph_input, thread_config)
             else:
                 try:
+                    if worker_terminal_state is not None:
+                        return worker_terminal_state
                     final_state = await self._graph.ainvoke(
                         graph_input,
                         config=thread_config,
@@ -1200,10 +1339,11 @@ class UniversalAgent:
                     self._jobs_processed += 1
                     return dict(final_state)
                 finally:
-                    self._current_job_id = None
-                    self._cleanup_shell_manager()
-                    self._close_datasource_connections()
-                    await self._cleanup_checkpointer()
+                    if not getattr(self, "_defer_job_cleanup", False):
+                        self._current_job_id = None
+                        self._cleanup_shell_manager()
+                        self._close_datasource_connections()
+                        await self._cleanup_checkpointer()
 
         except Exception as e:
             from .core.workspace_backend import completion_error_payload
@@ -1221,10 +1361,11 @@ class UniversalAgent:
             else:
                 logger.error(f"Job {job_id} failed: {e}", exc_info=True)
 
-            self._cleanup_shell_manager()
-            self._close_datasource_connections()
-            await self._cleanup_checkpointer()
-            self._current_job_id = None
+            if not getattr(self, "_defer_job_cleanup", False):
+                self._cleanup_shell_manager()
+                self._close_datasource_connections()
+                await self._cleanup_checkpointer()
+                self._current_job_id = None
             error_state = {
                 "job_id": job_id,
                 "error": error,
@@ -1235,6 +1376,325 @@ class UniversalAgent:
                 return self._yield_error_state(error_state)
             return error_state
 
+    def _restore_worker_instruction_reads(self, values: Dict[str, Any]) -> int:
+        """Restore only checkpoint-safe instruction receipts for this claim."""
+
+        if self._tool_context is None:
+            return 0
+        return self._tool_context.restore_instruction_read_receipts(
+            values.get("instruction_read_receipts")
+        )
+
+    async def _inject_resume_feedback(
+        self,
+        *,
+        job_id: str,
+        stateless_worker: bool,
+        graph_input: Optional[UniversalAgentState],
+        thread_config: Dict[str, Any],
+        checkpoint_values: Dict[str, Any],
+        feedback: str,
+        feedback_reason: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        """Inject one exact feedback generation before resumed graph work.
+
+        A stateless resume may legitimately have no checkpoint yet (for
+        example, a pre-graph failure). In that case the first fenced
+        checkpoint must contain both the feedback and its delivery key; an
+        ``aupdate_state`` is impossible because the thread does not exist.
+        """
+        from src.shared.job_steering import context_delivery_key
+
+        feedback_key = context_delivery_key(
+            "feedback",
+            feedback,
+            delivery_id=(metadata or {}).get("queued_feedback_delivery_id"),
+            companion=feedback_reason,
+        )
+        delivered_feedback_keys = {
+            str(value)
+            for value in checkpoint_values.get("delivered_feedback_keys") or []
+            if value is not None
+        }
+        if stateless_worker and feedback_key in delivered_feedback_keys:
+            logger.info(
+                "[%s] Suppressed checkpointed feedback generation %s",
+                job_id,
+                feedback_key,
+            )
+            return
+
+        feedback_update: Dict[str, Any] = {
+            "should_stop": False,
+            "goal_achieved": False,
+            "is_final_phase": False,
+            # A feedback resume voids any journaled finalization decision from
+            # the previous round (restore_from_feedback clears process caches).
+            "completion_decision": None,
+            "verdict_decision": None,
+        }
+        if stateless_worker:
+            feedback_update["delivered_feedback_keys"] = sorted(
+                delivered_feedback_keys | {feedback_key}
+            )
+        if graph_input is None:
+            feedback_update.update(
+                {
+                    "resume_feedback": feedback,
+                    "resume_reason": feedback_reason,
+                }
+            )
+            await self._graph.aupdate_state(
+                thread_config,
+                feedback_update,
+                as_node="__start__",
+            )
+            logger.info("Injected feedback into graph state via aupdate_state")
+        else:
+            # A no-checkpoint resume is still the job's first initialization.
+            # Setting resume_feedback would route around init_workspace and
+            # init_strategic_todos, losing the original task and its initial
+            # todo plan. Keep the fresh route and add feedback as a
+            # supplemental durable HumanMessage instead.
+            from langchain_core.messages import HumanMessage
+
+            reason = (feedback_reason or "").strip() or (
+                "This job was resumed with feedback from its operator."
+            )
+            existing_messages = list(graph_input.get("messages") or [])
+            feedback_message = HumanMessage(
+                content=(
+                    f"[FEEDBACK_RESUME] {reason}\n\n"
+                    f"## Feedback\n\n{feedback}\n\n"
+                    "Apply this feedback while initializing and carrying out "
+                    "the original task below."
+                )
+            )
+            graph_input.update(feedback_update)
+            graph_input["messages"] = [*existing_messages, feedback_message]
+            logger.info(
+                "[%s] Added feedback to fresh stateless initialization input",
+                job_id,
+            )
+        checkpoint_values.update(feedback_update)
+
+    async def _inject_delegation_results(
+        self,
+        *,
+        job_id: str,
+        stateless_worker: bool,
+        graph_input: Optional[UniversalAgentState],
+        thread_config: Dict[str, Any],
+        checkpoint_values: Dict[str, Any],
+        delegation_results: list,
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        """Inject one exact delegation generation on checkpoint or fresh input."""
+        from langchain_core.messages import HumanMessage
+        from src.shared.job_steering import context_delivery_key
+
+        delegation_key = context_delivery_key(
+            "delegation",
+            delegation_results,
+            delivery_id=(metadata or {}).get("delegation_results_delivery_id"),
+        )
+        delivered_delegation_keys = {
+            str(value)
+            for value in checkpoint_values.get("delivered_delegation_keys") or []
+            if value is not None
+        }
+        if stateless_worker and delegation_key in delivered_delegation_keys:
+            logger.info(
+                "[%s] Suppressed checkpointed delegation generation %s",
+                job_id,
+                delegation_key,
+            )
+            return
+
+        result_message = HumanMessage(
+            content=_format_delegation_results(delegation_results)
+        )
+        delegation_update: Dict[str, Any] = {
+            "messages": [result_message],
+            "should_stop": False,
+            "goal_achieved": False,
+        }
+        if stateless_worker:
+            delegation_update["delivered_delegation_keys"] = sorted(
+                delivered_delegation_keys | {delegation_key}
+            )
+        if graph_input is None:
+            await self._graph.aupdate_state(
+                thread_config,
+                delegation_update,
+                as_node="restore_todo_state",
+            )
+        else:
+            existing_messages = list(graph_input.get("messages") or [])
+            graph_input.update(delegation_update)
+            graph_input["messages"] = [*existing_messages, result_message]
+        checkpoint_values.update(delegation_update)
+        logger.info(
+            "Injected delegation results into graph state (%d children)",
+            len(delegation_results),
+        )
+
+    async def _arm_worker_batch(
+        self,
+        *,
+        job_id: str,
+        graph_input: Optional[UniversalAgentState],
+        thread_config: Dict[str, Any],
+        target_wall_seconds: Optional[float],
+        min_wall_seconds: Optional[float],
+        iteration_cap: Optional[int],
+        resume_id: Optional[str] = None,
+        retry_exhausted: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Arm a claim, or return durable values for an already-ended stop."""
+
+        target = float(target_wall_seconds or 0)
+        if not math.isfinite(target) or target <= 0:
+            raise ValueError("worker batch target must be a positive finite number")
+        floor = (
+            WORKER_BATCH_MIN_WALL_SECONDS
+            if min_wall_seconds is None
+            else float(min_wall_seconds)
+        )
+        if not math.isfinite(floor) or floor < 0:
+            raise ValueError("worker batch floor must be a finite non-negative number")
+        cap = None
+        if iteration_cap is not None:
+            if isinstance(iteration_cap, bool) or int(iteration_cap) <= 0:
+                raise ValueError("worker batch iteration cap must be positive")
+            cap = int(iteration_cap)
+
+        values: Dict[str, Any]
+        snapshot = None
+        if graph_input is None:
+            snapshot = await self._graph.aget_state(thread_config)
+            values = dict(snapshot.values or {})
+        else:
+            values = graph_input
+        iteration = values.get("iteration", 0)
+        if isinstance(iteration, bool) or not isinstance(iteration, int):
+            try:
+                iteration = int(iteration)
+            except (TypeError, ValueError):
+                iteration = 0
+
+        updates: Dict[str, Any] = {
+            "worker_batch_started_at": time.time(),
+            "worker_batch_start_iteration": iteration,
+            "worker_batch_target_wall_seconds": target,
+            "worker_batch_min_wall_seconds": floor,
+            "worker_batch_iteration_cap": cap,
+        }
+        applied_resume_id = values.get("worker_resume_id")
+        resume_intent_pending = bool(
+            resume_id and str(resume_id) != str(applied_resume_id or "")
+        )
+        if resume_intent_pending:
+            updates["worker_resume_id"] = str(resume_id)
+        frozen = values.get("freeze_data") or {}
+        freeze_type = frozen.get("freeze_type") if isinstance(frozen, dict) else None
+        error = values.get("error")
+        recoverable_error = bool(
+            isinstance(error, dict) and error.get("recoverable") is True
+        )
+        ended = bool(snapshot is not None and not tuple(snapshot.next or ()))
+        human_freeze = bool(
+            freeze_type and freeze_type not in AUTO_CONTINUE_FREEZE_TYPES
+        )
+        recoverable_end = bool(
+            ended
+            and not human_freeze
+            and (recoverable_error or freeze_type in AUTO_CONTINUE_FREEZE_TYPES)
+        )
+        if retry_exhausted:
+            if ended and values.get("should_stop") and not recoverable_end:
+                logger.info(
+                    "[%s] Worker retry budget exhausted, but canonical "
+                    "checkpoint is terminal/human END; re-reporting it unchanged",
+                    job_id,
+                )
+                return values
+            # The last real attempt has already been spent. Surface a
+            # recoverable driver envelope to the caller, which converts it to
+            # the factual non-recoverable worker_retry_exhausted report. Do not
+            # mutate the checkpoint or execute another graph node.
+            logger.error(
+                "[%s] Worker retry budget exhausted before a terminal/human "
+                "checkpoint; suppressing further graph work",
+                job_id,
+            )
+            return {
+                "job_id": job_id,
+                "should_stop": True,
+                "goal_achieved": False,
+                "error": {
+                    "type": "worker_retry_budget_exhausted",
+                    "recoverable": True,
+                    "message": "worker queue retry budget exhausted",
+                },
+            }
+        clean_end_reentry = bool(
+            ended
+            and values.get("should_stop")
+            and (
+                freeze_type in AUTO_CONTINUE_FREEZE_TYPES
+                or recoverable_error
+                or resume_intent_pending
+            )
+        )
+        if clean_end_reentry:
+            # Batch/outage/recoverable stops are machine continuations on this
+            # lane.  Clear their END envelope and route through START exactly
+            # once.  Human-facing and terminal END checkpoints are untouched;
+            # the driver re-reports them rather than re-running the graph.
+            updates.update(
+                {
+                    "freeze_data": None,
+                    "should_stop": False,
+                    "goal_achieved": False,
+                    "is_final_phase": False,
+                    "error": None,
+                }
+            )
+
+        if graph_input is not None:
+            graph_input.update(updates)
+        elif ended and not clean_end_reentry:
+            logger.info(
+                "[%s] Worker checkpoint is a terminal/human END; leaving it "
+                "unchanged for report retry",
+                job_id,
+            )
+            return values
+        else:
+            if clean_end_reentry:
+                await self._graph.aupdate_state(
+                    thread_config,
+                    updates,
+                    as_node="__start__",
+                )
+            else:
+                # No as_node: retain a mid-loop checkpoint's pending next-node
+                # frontier.  Forcing __start__ here silently replays route entry
+                # instead of continuing the interrupted superstep.
+                await self._graph.aupdate_state(thread_config, updates)
+        logger.info(
+            "[%s] Armed worker batch: target=%.3fs floor=%.3fs "
+            "start_iteration=%d iteration_cap=%s",
+            job_id,
+            target,
+            floor,
+            iteration,
+            cap,
+        )
+        return None
+
     async def _make_checkpointer(self, job_id: str) -> None:
         """Create the LangGraph checkpointer for this job per CHECKPOINTER_BACKEND.
 
@@ -1244,6 +1704,32 @@ class UniversalAgent:
         cold-starts. Default 'sqlite' keeps the legacy pod-local checkpoint.
         """
         backend = checkpointer_backend()
+        if self._worker_lease_token is not None:
+            if backend != "postgres":
+                raise RuntimeError(
+                    "Stateless workers require CHECKPOINTER_BACKEND=postgres"
+                )
+            from .core.fenced_checkpointer import make_fenced_checkpointer
+
+            url = resolve_fenced_checkpoint_url()
+            if not url:
+                raise RuntimeError(
+                    "Stateless worker checkpoints require the authoritative "
+                    "application Postgres URL (POSTGRES_* or DATABASE_URL)"
+                )
+            self._checkpoint_conn = None
+            self._checkpointer = await make_fenced_checkpointer(
+                url,
+                unit_id=job_id,
+                lease_token=self._worker_lease_token,
+                post_commit=self._worker_checkpoint_post_commit,
+            )
+            logger.info(
+                "Checkpointer initialized (fenced postgres, thread_id=%s token=%d)",
+                job_id,
+                self._worker_lease_token,
+            )
+            return
         if backend == "postgres":
             from psycopg import AsyncConnection
             from psycopg.rows import dict_row
@@ -1287,8 +1773,11 @@ class UniversalAgent:
                 await self._checkpoint_conn.close()
             except Exception as e:
                 logger.warning(f"Error closing checkpointer connection: {e}")
-            self._checkpoint_conn = None
-            self._checkpointer = None
+        # Fenced worker savers borrow from a lifespan-owned process pool and
+        # therefore have no per-job connection to close.  Dropping the saver is
+        # still required so a stale immutable token cannot be reused.
+        self._checkpoint_conn = None
+        self._checkpointer = None
 
     def _cleanup_shell_manager(self) -> None:
         """Clean up ShellManager (kill tmux session)."""
@@ -1298,6 +1787,139 @@ class UniversalAgent:
             except Exception:
                 pass
             self._shell_manager = None
+
+    def _capture_worker_environment(self, metadata: Dict[str, Any]) -> None:
+        """Snapshot every per-job env key before this worker can overwrite it.
+
+        A stateless process serves unrelated jobs sequentially.  Config
+        ``env_keys`` are intentionally open-ended, while managed datasource
+        CLIs populate a small fixed set.  Recording the pre-claim values lets
+        teardown restore the pod baseline instead of leaking one tenant's
+        credentials into the next claim.
+        """
+
+        self._restore_worker_environment()
+        env_keys = (metadata.get("config_override") or {}).get("env_keys")
+        if not env_keys:
+            env_keys = ((metadata.get("resolved_config") or {}).get("agent") or {}).get(
+                "env_keys"
+            )
+        keys = set(env_keys) if isinstance(env_keys, dict) else set()
+        datasource_env = {
+            "postgresql": {"PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"},
+            "neo4j": {"NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"},
+            "mongodb": {"MONGOSH_URI"},
+        }
+        for datasource in metadata.get("datasources") or []:
+            if isinstance(datasource, dict):
+                keys.update(datasource_env.get(str(datasource.get("type")), set()))
+        self._worker_env_restore = {key: os.environ.get(key) for key in keys}
+
+    def _restore_worker_environment(self) -> None:
+        restore = self._worker_env_restore
+        self._worker_env_restore = {}
+        for key, value in restore.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        if restore:
+            # Both embedding service variants cache clients derived from env.
+            # Resetting them after the values are restored prevents a secret
+            # surviving through a singleton even though os.environ is clean.
+            try:
+                import src.services.embedding_service as embedding_service
+
+                embedding_service._embedding_service = None
+                embedding_service._kb_embedding_service = None
+                embedding_service._kb_embedding_profile = None
+            except Exception:
+                logger.debug("Worker embedding singleton scrub failed", exc_info=True)
+
+    async def cleanup_worker_claim(self, *, preserve_shell: bool) -> None:
+        """Retire all claim-local runtime state under the driver's disposition.
+
+        ``preserve_shell=True`` is used for rotation, retry and lease handoff:
+        it closes this Python owner's admission and SSH transport without
+        killing the durable workspace tmux session.  A genuine terminal stop
+        passes ``False`` and keeps the historical destructive shell cleanup.
+        """
+
+        backend = None
+        if self._workspace_manager is not None:
+            try:
+                from .core.virtual_dirs import unwrap_backend
+
+                backend = unwrap_backend(self._workspace_manager.backend)
+            except Exception:
+                logger.debug("Could not unwrap worker workspace backend", exc_info=True)
+
+        if backend is not None:
+            retire_shell_owner = getattr(backend, "retire_shell_owner", None)
+            if retire_shell_owner is not None:
+                try:
+                    # First teardown action: cancelled synchronous work may
+                    # still hold this object, but can no longer submit tmux I/O.
+                    retire_shell_owner()
+                except Exception:
+                    logger.warning(
+                        "Worker shell admission retirement failed", exc_info=True
+                    )
+
+        if preserve_shell:
+            if self._shell_manager is not None:
+                logger.info(
+                    "Preserving remote shell for worker handoff: job=%s token=%s",
+                    self._current_job_id,
+                    self._worker_lease_token,
+                )
+            self._shell_manager = None
+        else:
+            self._cleanup_shell_manager()
+
+        if self._tool_context is not None:
+            self._tool_context.shell_manager = None
+            self._tool_context.citation_verdict_callback = None
+
+        if self._doc_registration_task is not None:
+            task = self._doc_registration_task
+            self._doc_registration_task = None
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug(
+                    "Worker document registration cleanup failed", exc_info=True
+                )
+
+        self._close_datasource_connections()
+        await self._cleanup_checkpointer()
+        self._restore_worker_environment()
+
+        if backend is not None:
+            retire = getattr(backend, "retire", None)
+            disconnect = getattr(backend, "disconnect", None)
+            try:
+                if retire is not None:
+                    await asyncio.to_thread(retire)
+                elif disconnect is not None:
+                    await asyncio.to_thread(disconnect)
+            except Exception:
+                logger.warning("Worker backend retirement failed", exc_info=True)
+
+        self._current_job_id = None
+        self._job_metadata = None
+        self._workspace_manager = None
+        self._todo_manager = None
+        self._tool_context = None
+        self._tools = None
+        self._graph = None
+        self._worker_lease_token = None
+        self._worker_checkpoint_post_commit = None
+        self._defer_job_cleanup = False
 
     async def _yield_error_state(
         self, error_state: Dict[str, Any]
@@ -1430,11 +2052,14 @@ class UniversalAgent:
                 except Exception as e:
                     logger.debug(f"Memory drain at job-end failed (non-fatal): {e}")
 
-            # Clean up after streaming completes (or errors)
-            self._current_job_id = None
-            self._cleanup_shell_manager()
-            self._close_datasource_connections()
-            await self._cleanup_checkpointer()
+            # Worker claims defer teardown until their driver classifies the
+            # exit (rotation/lease loss preserves tmux; genuine end destroys
+            # it).  Every other caller keeps the historical eager cleanup.
+            if not getattr(self, "_defer_job_cleanup", False):
+                self._current_job_id = None
+                self._cleanup_shell_manager()
+                self._close_datasource_connections()
+                await self._cleanup_checkpointer()
 
     async def _poll_job_workspace_ready(
         self, job_id: str, timeout: int = 300, poll_interval: float = 2.0
@@ -2215,6 +2840,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # SSH credentials injected by the orchestrator at dispatch time.
         from .core.backends.factory import LITE_BACKENDS, create_lite_backend
 
+        if (
+            self._worker_lease_token is not None
+            and self.config.workspace.backend != "sandbox"
+        ):
+            raise RuntimeError(
+                "The stateless worker lane admits Kubernetes-pod sandbox "
+                "workspaces only; VM and lite jobs remain pinned"
+            )
+
         if self.config.workspace.backend in LITE_BACKENDS:
             try:
                 workspace_backend = create_lite_backend(
@@ -2269,7 +2903,13 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     sudo_action=shell_config.get("sudo_action", "freeze"),
                     sudo_block_message=shell_config.get("sudo_block_message"),
                 )
+                if self._worker_lease_token is not None:
+                    workspace_backend.set_shell_owner_token(self._worker_lease_token)
                 workspace_backend.connect()
+                if self._worker_lease_token is not None:
+                    # Eager promotion fences a predecessor even when this batch
+                    # happens to be LLM-only and never opens a shell tool.
+                    workspace_backend.claim_shell_owner()
                 logger.info(
                     f"Remote workspace backend connected to {remote_cfg['host']}"
                 )

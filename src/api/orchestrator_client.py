@@ -1656,6 +1656,7 @@ class OrchestratorClient:
         self,
         job_id: str,
         result: dict[str, Any],
+        lease_token: int | None = None,
     ) -> bool:
         """Report job completion to the orchestrator.
 
@@ -1666,6 +1667,8 @@ class OrchestratorClient:
         Args:
             job_id: UUID of the completed job
             result: Final graph state (should_stop, goal_achieved, error, freeze_data)
+            lease_token: Current worker_batch fence for stateless jobs. Pinned
+                callers omit it and retain the historical payload byte shape.
 
         Returns:
             True if the orchestrator handled completion successfully.
@@ -1680,9 +1683,18 @@ class OrchestratorClient:
             "error": result.get("error"),
             "freeze_data": result.get("freeze_data"),
         }
+        if lease_token is not None:
+            payload["lease_token"] = int(lease_token)
 
         try:
-            response = await self._client.post(url, json=payload, timeout=60.0)
+            # Stateless terminal handling can include workspace/archive and
+            # verification side effects. A short client disconnect cancels the
+            # FastAPI handler, so the leased path gets a deliberately wide
+            # budget. Pinned retains its historical 60-second behavior.
+            timeout_seconds = 300.0 if lease_token is not None else 60.0
+            response = await self._client.post(
+                url, json=payload, timeout=timeout_seconds
+            )
             if response.status_code == 200:
                 resp_data = response.json()
                 actions = resp_data.get("actions", [])
@@ -1718,20 +1730,28 @@ class OrchestratorClient:
         job_id: str,
         guidance_ids: list[str] | None = None,
         reply_threads: list[str] | None = None,
+        reply_keys: list[str] | None = None,
+        feedback_keys: list[str] | None = None,
+        delegation_keys: list[str] | None = None,
+        checkpoint_id: str | None = None,
     ) -> bool:
         """Ack delivered supervisor guidance / drained queued replies.
 
         The orchestrator atomically moves the named entries from
-        ``context.pending_guidance`` (by entry id) and ``context.queued_replies``
-        (by thread id) to ``context.consumed_replies``, which stops redelivery
-        and lets the sender confirm delivery by reading job context. Best-effort:
-        a failed ack just means redelivery (at-least-once), so callers should
-        fire-and-forget.
+        ``context.pending_guidance`` (by entry id) and
+        ``context.queued_replies`` (by exact key for stateless workers, thread
+        id for legacy pinned callers) to ``context.consumed_replies``. A
+        stateless caller supplies the committed checkpoint proving the entries
+        reached durable graph state. Best-effort: failure means redelivery.
 
         Args:
             job_id: UUID of the job the guidance was delivered to
             guidance_ids: ``pending_guidance`` entry ids rendered into context
             reply_threads: thread ids whose queued replies were drained
+            reply_keys: exact queued-reply identities absorbed by a checkpoint
+            feedback_keys: exact queued-feedback generations absorbed
+            delegation_keys: exact delegation-result generations absorbed
+            checkpoint_id: durable checkpoint proving stateless delivery
 
         Returns:
             True if the orchestrator recorded the ack.
@@ -1743,6 +1763,10 @@ class OrchestratorClient:
         payload = {
             "guidance_ids": guidance_ids or [],
             "reply_threads": reply_threads or [],
+            "reply_keys": reply_keys or [],
+            "feedback_keys": feedback_keys or [],
+            "delegation_keys": delegation_keys or [],
+            "checkpoint_id": checkpoint_id,
         }
 
         try:

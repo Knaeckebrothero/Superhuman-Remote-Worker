@@ -377,6 +377,7 @@ class ContainerProvisioner:
                 owner,
                 {
                     "status": "created",
+                    "provisioner": "k8s",
                     "pod_name": pod_name,
                     "namespace": self._namespace,
                     **(
@@ -428,7 +429,12 @@ class ContainerProvisioner:
                             "Failed to bind trusted Canvas SSH identity for session %s",
                             owner.id,
                         )
-                ready_ctx = {"status": "ready", "pod_ip": pod_ip, "port": 30022}
+                ready_ctx = {
+                    "status": "ready",
+                    "provisioner": "k8s",
+                    "pod_ip": pod_ip,
+                    "port": 30022,
+                }
                 if owner.kind == "session":
                     # Pair this endpoint with the exact binding minted above.
                     # A failed/missing bind publishes null and Canvas fails closed.

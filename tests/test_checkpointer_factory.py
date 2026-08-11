@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import pytest
 
-from src.utils.db_url import checkpointer_backend, resolve_checkpoint_url
+from src.utils.db_url import (
+    checkpointer_backend,
+    resolve_checkpoint_url,
+    resolve_fenced_checkpoint_url,
+)
 
 _ENV_VARS = (
     "CHECKPOINTER_BACKEND",
@@ -74,3 +78,20 @@ class TestResolveCheckpointUrl:
     def test_database_url_last_resort(self, monkeypatch):
         monkeypatch.setenv("DATABASE_URL", "postgresql://legacy@h/db")
         assert resolve_checkpoint_url() == "postgresql://legacy@h/db"
+
+    def test_fenced_worker_ignores_dedicated_checkpoint_database(self, monkeypatch):
+        monkeypatch.setenv("CHECKPOINT_DB_URL", "postgresql://x:y@h:5432/ckpt")
+        monkeypatch.setenv("POSTGRES_USER", "srw")
+        monkeypatch.setenv("POSTGRES_PASSWORD", "pw")
+        monkeypatch.setenv("POSTGRES_HOST", "srw-postgres")
+        monkeypatch.setenv("POSTGRES_DB", "srw")
+
+        assert (
+            resolve_fenced_checkpoint_url()
+            == "postgresql://srw:pw@srw-postgres:5432/srw"
+        )
+
+    def test_fenced_worker_fails_closed_without_application_database(self, monkeypatch):
+        monkeypatch.setenv("CHECKPOINT_DB_URL", "postgresql://x:y@h:5432/ckpt")
+
+        assert resolve_fenced_checkpoint_url() is None

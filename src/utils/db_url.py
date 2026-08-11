@@ -70,3 +70,16 @@ def resolve_checkpoint_url() -> Optional[str]:
         or build_postgres_url("CHECKPOINT")
         or build_postgres_url("POSTGRES", fallback_env="DATABASE_URL")
     )
+
+
+def resolve_fenced_checkpoint_url() -> Optional[str]:
+    """Resolve the only valid DSN for lease-fenced worker checkpoints.
+
+    The fenced saver locks ``run_queue`` and writes the LangGraph checkpoint
+    in one transaction. Both tables must therefore be in the authoritative
+    application Postgres database. A dedicated checkpoint database remains
+    supported for pinned workers, but stateless workers deliberately ignore
+    it instead of fencing against a missing or non-authoritative queue copy.
+    """
+
+    return build_postgres_url("POSTGRES", fallback_env="DATABASE_URL")

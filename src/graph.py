@@ -128,6 +128,7 @@ from .core.toolcall_recovery import (
 from .core.workspace import WorkspaceManager
 from .core.workspace_backend import WorkspaceUnavailableError
 from .llm.exceptions import ContextOverflowError
+from .shared.job_steering import queued_reply_key
 from .llm.response_guards import is_degenerate_response
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
 from .services.guardrails import format_nudge
@@ -141,16 +142,16 @@ from .tools.context import ToolContext
 from .utils.db_url import checkpointer_backend
 
 
-# Worker rotation is wall-clock-first. A caller may request a longer batch, but
-# no iteration cap or undersized target may rotate sooner than five minutes;
-# otherwise setup/handoff overhead dominates and prompt-cache continuity is
-# needlessly disrupted (stateless_agents.md §5.4.3).
+# Worker rotation is wall-clock-first. Five minutes is the compatibility and
+# production default; the claim driver may stamp a lower effective floor for
+# an explicit per-job test/tuning override.
 WORKER_BATCH_MIN_WALL_SECONDS = 300.0
 
 _WORKER_BATCH_ARMING_FIELDS = (
     "worker_batch_started_at",
     "worker_batch_start_iteration",
     "worker_batch_target_wall_seconds",
+    "worker_batch_min_wall_seconds",
     "worker_batch_iteration_cap",
 )
 
@@ -181,8 +182,9 @@ def worker_batch_boundary_updates(
 
     Missing or invalid arming fields disable the boundary, which is the
     compatibility contract for pinned jobs, sessions, and old checkpoints.
-    The wall target is clamped to five minutes. The optional iteration cap is
-    secondary and cannot fire before the same wall-clock floor.
+    The wall target is clamped to the claim-stamped floor (five minutes for
+    legacy arming envelopes). The optional iteration cap is secondary and
+    cannot fire before the same wall-clock floor.
     """
     if (
         state.get("should_stop")
@@ -201,7 +203,13 @@ def worker_batch_boundary_updates(
     if current_time is None:
         return None
     elapsed = max(0.0, current_time - started_at)
-    target = max(target, WORKER_BATCH_MIN_WALL_SECONDS)
+    configured_min = _finite_number(state.get("worker_batch_min_wall_seconds"))
+    min_wall_seconds = (
+        WORKER_BATCH_MIN_WALL_SECONDS
+        if configured_min is None
+        else max(0.0, configured_min)
+    )
+    target = max(target, min_wall_seconds)
     wall_due = elapsed >= target
 
     iteration = _finite_number(state.get("iteration"))
@@ -216,10 +224,7 @@ def worker_batch_boundary_updates(
         and iteration_cap > 0
     ):
         iteration_delta = max(0.0, iteration - start_iteration)
-        iteration_due = (
-            elapsed >= WORKER_BATCH_MIN_WALL_SECONDS
-            and iteration_delta >= iteration_cap
-        )
+        iteration_due = elapsed >= min_wall_seconds and iteration_delta >= iteration_cap
 
     if not (wall_due or iteration_due):
         return None
@@ -1282,7 +1287,23 @@ def create_execute_node(
         # re-plan. Re-derived per turn, so compaction-immune; keeps rendering
         # until the post-turn ack (below) clears ``context.pending_guidance``
         # (~1-2 turns of overlap, at-least-once).
+        _stateless_steering = bool(
+            tool_context is not None and tool_context._stateless_worker
+        )
+        _delivered_guidance_ids = {
+            str(value)
+            for value in state.get("delivered_guidance_ids") or []
+            if value is not None
+        }
         _guidance_entries = _get_pending_supervisor_guidance(job_id)
+        if _stateless_steering:
+            _guidance_entries = [
+                entry
+                for entry in _guidance_entries
+                if not entry.get("id")
+                or str(entry["id"]) not in _delivered_guidance_ids
+            ]
+        _absorbed_guidance_ids: set[str] = set()
         _guidance_block = [""]
         if _guidance_entries:
             from src.core.guidance_injection import format_supervisor_guidance
@@ -1566,18 +1587,23 @@ def create_execute_node(
                     _usage = getattr(response, "usage_metadata", None) or {}
                     _record_usage(_usage.get("input_tokens"))
 
-                # Supervisor guidance rendered into THIS turn's request —
-                # ack it (best-effort, fire-and-forget) so the orchestrator
-                # moves the entries to ``context.consumed_replies`` and the
-                # officer can confirm delivery by reading job context. Once
-                # per execute() call, even across the retry loop.
+                # Supervisor guidance rendered into THIS turn's request. The
+                # pinned lane keeps its historical fire-and-forget ack. A
+                # stateless worker records the ids in this execute-node update;
+                # its fenced saver acks only after that checkpoint commits.
                 if _guidance_entries:
-                    _ack_supervisor_guidance(
-                        job_id,
-                        guidance_ids=[
-                            str(e["id"]) for e in _guidance_entries if e.get("id")
-                        ],
-                    )
+                    _turn_guidance_ids = {
+                        str(entry["id"])
+                        for entry in _guidance_entries
+                        if entry.get("id")
+                    }
+                    if _stateless_steering:
+                        _absorbed_guidance_ids.update(_turn_guidance_ids)
+                    else:
+                        _ack_supervisor_guidance(
+                            job_id,
+                            guidance_ids=sorted(_turn_guidance_ids),
+                        )
                     _guidance_entries = []
 
                 # Repair/scrub malformed tool-call arguments BEFORE anything
@@ -2167,6 +2193,10 @@ def create_execute_node(
                     result_update["last_observed_turn"] = new_turn_count
                 if assembly_triggered:
                     result_update["last_assembled_turn"] = new_turn_count
+                if _absorbed_guidance_ids:
+                    result_update["delivered_guidance_ids"] = sorted(
+                        _delivered_guidance_ids | _absorbed_guidance_ids
+                    )
 
                 # Return compacted messages + response if compaction occurred,
                 # otherwise just append the response (add_messages reducer handles this)
@@ -3247,6 +3277,8 @@ async def _process_queued_replies(
     job_id: str,
     workspace: "WorkspaceManager",
     postgres_db,
+    *,
+    delivered_reply_keys: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Consume queued async replies from job context and write to workspace.
 
@@ -3279,11 +3311,23 @@ async def _process_queued_replies(
     if not queued:
         return []
 
-    _write_reply_files(job_id, workspace, queued)
+    # The checkpoint ledger is authoritative on stateless reclaim.  An ack can
+    # fail after the absorbing checkpoint committed, leaving the same reply in
+    # jobs.context.  Filter before *any* workspace mutation; filtering only the
+    # later HumanMessage would still create duplicate received-mail files.
+    pending = [
+        reply
+        for reply in queued
+        if not delivered_reply_keys or _reply_key(reply) not in delivered_reply_keys
+    ]
+    if not pending:
+        return []
+
+    _write_reply_files(job_id, workspace, pending)
     logger.info(
-        f"[{job_id}] Processed {len(queued)} queued async replies at phase boundary"
+        f"[{job_id}] Processed {len(pending)} queued async replies at phase boundary"
     )
-    return list(queued)
+    return list(pending)
 
 
 def _write_reply_files(
@@ -3440,12 +3484,10 @@ def _replies_overdue(replies: List[Dict[str, Any]], max_wait_seconds: float) -> 
 def _reply_key(reply: Dict[str, Any]) -> str:
     """Stable identity for a queued reply.
 
-    Queued replies carry no id (unlike guidance entries), so identity is
-    content-derived: the same thread, timestamp and body is the same message.
+    Kept as a compatibility seam for existing imports/tests; the shared helper
+    prefers new UUIDs and hashes legacy thread/timestamp/body rows.
     """
-    return "|".join(
-        str(reply.get(field, "")) for field in ("thread_id", "timestamp", "message")
-    )
+    return queued_reply_key(reply)
 
 
 def _deliver_queued_replies(
@@ -3507,9 +3549,16 @@ def _deliver_queued_replies(
     ]
 
     delivered.update(_reply_key(r) for r in replies)
+    # Persist the cumulative set in the SAME node update as the HumanMessage.
+    # A successor can therefore hydrate process-local dedup only from a
+    # checkpoint that already absorbed the corresponding reply content.
+    result["delivered_reply_keys"] = sorted(delivered)
 
-    threads = sorted({str(r.get("thread_id")) for r in replies if r.get("thread_id")})
-    _ack_supervisor_guidance(job_id, reply_threads=threads)
+    if not tool_context._stateless_worker:
+        threads = sorted(
+            {str(r.get("thread_id")) for r in replies if r.get("thread_id")}
+        )
+        _ack_supervisor_guidance(job_id, reply_threads=threads)
     logger.info(
         f"[{job_id}] Delivered {len(replies)} queued reply(ies) at "
         f"{'a completed todo' if at_break else 'the wall-clock floor'}"
@@ -3582,15 +3631,21 @@ def create_handle_transition_node(
         drained_replies: List[Dict[str, Any]] = []
         if not is_strategic and postgres_db:
             try:
+                _already = (
+                    tool_context._delivered_reply_keys
+                    if tool_context is not None
+                    else None
+                )
                 drained_replies = await _process_queued_replies(
-                    job_id, workspace, postgres_db
+                    job_id,
+                    workspace,
+                    postgres_db,
+                    delivered_reply_keys=_already,
                 )
                 if tool_context is not None and drained_replies:
-                    _already = tool_context._delivered_reply_keys
-                    drained_replies = [
-                        r for r in drained_replies if _reply_key(r) not in _already
-                    ]
-                    _already.update(_reply_key(r) for r in drained_replies)
+                    tool_context._delivered_reply_keys.update(
+                        _reply_key(r) for r in drained_replies
+                    )
             except Exception as e:
                 logger.warning(f"[{job_id}] Failed to process queued replies: {e}")
 
@@ -3691,10 +3746,19 @@ def create_handle_transition_node(
                 content=_format_drained_replies(drained_replies)
             )
             updates["messages"] = list(updates.get("messages") or []) + [reply_message]
-            drained_threads = sorted(
-                {str(r.get("thread_id")) for r in drained_replies if r.get("thread_id")}
-            )
-            _ack_supervisor_guidance(job_id, reply_threads=drained_threads)
+            if tool_context is None or not tool_context._stateless_worker:
+                drained_threads = sorted(
+                    {
+                        str(r.get("thread_id"))
+                        for r in drained_replies
+                        if r.get("thread_id")
+                    }
+                )
+                _ack_supervisor_guidance(job_id, reply_threads=drained_threads)
+            if tool_context is not None:
+                updates["delivered_reply_keys"] = sorted(
+                    tool_context._delivered_reply_keys
+                )
 
         # Phase 1d — Continue-as-New on orchestrator drain intent.
         # The lifecycle reconciler marks workers on a stale image with
@@ -3976,6 +4040,42 @@ def route_entry(
     return "init_workspace"
 
 
+def hydrate_todo_manager_from_state(
+    todo_manager: TodoManager,
+    state: UniversalAgentState | Dict[str, Any],
+) -> bool:
+    """Hydrate process-local todo state from one durable graph snapshot.
+
+    The graph entry node uses this on ordinary END-lane resumes.  The worker
+    driver also calls it before *any* resume because a checkpoint can continue
+    at a pending next node and bypass ``route_entry`` entirely (the historical
+    mid-loop resume bug).  Keeping the mapping here prevents those two paths
+    from drifting.
+
+    Returns ``True`` when the snapshot carried todo data.  Old checkpoints
+    without those fields retain the existing recovery behavior.
+    """
+
+    todos = state.get("todos")
+    staged_todos = state.get("staged_todos")
+    if todos is None and staged_todos is None:
+        # Phase is still useful to tools even for an old checkpoint.
+        todo_manager.is_strategic_phase = state.get("is_strategic_phase", True)
+        todo_manager.phase_number = state.get("phase_number", 1)
+        return False
+
+    todo_manager.restore_state(
+        {
+            "todos": todos,
+            "staged_todos": staged_todos,
+            "next_id": state.get("todo_next_id"),
+            "phase_number": state.get("phase_number", 1),
+            "is_strategic_phase": state.get("is_strategic_phase", True),
+        }
+    )
+    return True
+
+
 def create_restore_todo_state_node(
     todo_manager: TodoManager,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
@@ -3996,19 +4096,7 @@ def create_restore_todo_state_node(
         """Restore TodoManager from checkpointed state."""
         job_id = state.get("job_id", "unknown")
 
-        todos = state.get("todos")
-        staged_todos = state.get("staged_todos")
-        todo_next_id = state.get("todo_next_id")
-
-        # Check if we have todo state in the checkpoint
-        if todos is not None or staged_todos is not None:
-            todo_manager.restore_state(
-                {
-                    "todos": todos,
-                    "staged_todos": staged_todos,
-                    "next_id": todo_next_id,
-                }
-            )
+        if hydrate_todo_manager_from_state(todo_manager, state):
             logger.info(f"[{job_id}] Restored TodoManager from checkpoint state")
         else:
             # No todo state in checkpoint - this is expected for old checkpoints
@@ -4016,11 +4104,6 @@ def create_restore_todo_state_node(
             logger.warning(
                 f"[{job_id}] No todo state in checkpoint, using legacy recovery"
             )
-
-        # Also restore phase state on TodoManager for tool access
-        is_strategic = state.get("is_strategic_phase", True)
-        todo_manager.is_strategic_phase = is_strategic
-        todo_manager.phase_number = state.get("phase_number", 1)
 
         # Detect phase-boundary resume: agent had staged tactical todos ready
         # when it froze. Apply them and flip to tactical so execution continues
@@ -4551,6 +4634,17 @@ def create_audited_tool_node(
         phase_number = state.get("phase_number", 0)
         phase_str = "strategic" if is_strategic else "tactical"
 
+        # A checkpoint may resume directly at this node after the LLM response
+        # was persisted. Rehydrate the phase clock before ToolNode evaluates
+        # instruction bindings; otherwise phase-scoped gates see the fresh
+        # ToolContext defaults and can be skipped on the first successor batch.
+        if tool_context is not None:
+            tool_context.set_current_phase(
+                phase_str,
+                phase_number=phase_number,
+                turn_count=state.get("turn_count", 0),
+            )
+
         # Extract tool calls from last message
         tool_calls_info = []
         if messages and isinstance(messages[-1], AIMessage):
@@ -5071,6 +5165,16 @@ def create_audited_tool_node(
                 _deliver_queued_replies(job_id, tool_context, config, result)
             except Exception as e:
                 logger.warning(f"[{job_id}] Queued-reply delivery failed: {e}")
+
+        # Instruction enforcement receipts are semantic process state for a
+        # stateless worker: a batch can rotate after read_file and before the
+        # gated tool call. Checkpoint only those configured instruction reads,
+        # never ordinary read-before-write authorization. The successor
+        # validates content/phase/turn freshness before restoring them.
+        if tool_context is not None and tool_context._stateless_worker:
+            result["instruction_read_receipts"] = (
+                tool_context.export_instruction_read_receipts()
+            )
 
         # Finalization-decision mirror (journal-before-observe step 3, docs/
         # issues/job_finalization_decisions_held_only_in_process_memory.md):

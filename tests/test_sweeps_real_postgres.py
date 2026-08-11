@@ -76,6 +76,10 @@ SWEEPS = [
         lambda db: db.cancel_stale_verification_subjobs(stale_hours=6),
     ),
     (
+        "list_stale_stateless_verification_subjobs",
+        lambda db: db.list_stale_stateless_verification_subjobs(stale_hours=6),
+    ),
+    (
         "unstick_reviewing_parents",
         lambda db: db.unstick_reviewing_parents(grace_minutes=30),
     ),

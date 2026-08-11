@@ -494,6 +494,15 @@ agent:
     # -- Pod resources for the stateless class. Empty = inherit
     # agent.resources.
     resources: {}
+    # -- Worker-job admission on the stateless executor plane. This is
+    # independent from `stateless.enabled`: the shared pool may serve session
+    # turns while every worker job continues to use the pinned lane.
+    worker:
+      # -- DEFAULT OFF. A fresh install preserves the pinned worker path.
+      enabled: false
+      # -- Minimum wall-clock budget for one worker batch. Production keeps a
+      # five-minute floor; local acceptance may explicitly lower it.
+      batchMinWallSeconds: 300
 
 # =============================================================================
 # Cockpit (Angular frontend)

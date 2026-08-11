@@ -120,7 +120,7 @@ def create_skill_tools(context: ToolContext) -> List[Any]:
                     f"exact name."
                 )
             body = workspace.read_file(skill_md)
-            context.record_file_read(skill_md)
+            context.record_file_read(skill_md, body)
             return f"[skill: {skill_name}]\n\n{body}{_script_availability_note(skill_name)}"
         except Exception as e:  # never raise to the model
             logger.warning("use_skill(%s) failed: %s", skill_name, e)

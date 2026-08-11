@@ -43,8 +43,10 @@ async def db(pg_dsn):
                 id uuid PRIMARY KEY,
                 parent_job_id uuid,
                 status text NOT NULL,
+                execution_lane text NOT NULL DEFAULT 'pinned',
                 assigned_agent_id uuid,
                 context jsonb,
+                created_at timestamptz DEFAULT now(),
                 updated_at timestamptz DEFAULT now()
             )
             """
@@ -69,6 +71,7 @@ async def _seed_critic(
     status="paused",
     stale_hours_ago=7,
     wake_in_s=None,
+    execution_lane="pinned",
 ):
     """Insert an agentless critic; wake_in_s sets llm_outage.next_retry_at
     relative to now (negative = already woke)."""
@@ -84,15 +87,18 @@ async def _seed_critic(
     async with db.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO jobs (id, parent_job_id, status, context, updated_at)
+            INSERT INTO jobs (
+                id, parent_job_id, status, context, updated_at, execution_lane
+            )
             VALUES ($1, $2, $3, $4::jsonb,
-                    CURRENT_TIMESTAMP - make_interval(hours => $5::int))
+                    CURRENT_TIMESTAMP - make_interval(hours => $5::int), $6)
             """,
             critic_id,
             PARENT,
             status,
             json.dumps(ctx),
             stale_hours_ago,
+            execution_lane,
         )
     return critic_id
 
@@ -183,3 +189,18 @@ async def test_fresh_waiting_critic_survives_staleness(db):
     critic = await _seed_critic(db, status="waiting", stale_hours_ago=1)
     assert await db.cancel_stale_verification_subjobs(stale_hours=6) == 0
     assert await _status(db, critic) == "waiting"
+
+
+@pytest.mark.asyncio
+async def test_stateless_critic_is_selected_not_bulk_cancelled(db):
+    await _seed_parent(db, status="failed")
+    critic = await _seed_critic(
+        db,
+        status="paused",
+        stale_hours_ago=0,
+        execution_lane="stateless",
+    )
+
+    assert await db.cancel_stale_verification_subjobs(stale_hours=6) == 0
+    assert await _status(db, critic) == "paused"
+    assert await db.list_stale_stateless_verification_subjobs() == [critic]

@@ -306,12 +306,10 @@ class ToolContext:
     _delivered_reply_keys: Set[str] = field(
         default_factory=set
     )  # Content keys of queued replies already appended to the conversation.
-    # The delivery ack is fire-and-forget, so the heartbeat inbox keeps
-    # returning the same entries for up to one interval afterwards; without
-    # this, every todo completed in that window would append the same reply
-    # again. Deliberately process-local: a successor pod has no record of the
-    # delivery, so it redelivers — which is the correct at-least-once
-    # behaviour when the ack may never have landed.
+    # Pinned workers use this process-locally while their ack is in flight.
+    # Stateless workers hydrate it from checkpointed delivered_reply_keys.
+    _stateless_worker: bool = False
+    _worker_lease_token: Optional[int] = None
     _snapshot_callback: Optional[Any] = (
         None  # Callable[[str], None] — pre-write file snapshot for undo
     )
@@ -935,16 +933,23 @@ class ToolContext:
             content: Complete text content observed by the reader, when available
         """
         normalized = path.lstrip("/").strip()
+        content_version = None
+        if content is not None:
+            raw = content.encode("utf-8") if isinstance(content, str) else content
+            content_version = "sha256:" + hashlib.sha256(raw).hexdigest()
         # Instruction files are pinned: unrelated reads must not make a
         # job-scoped gate look unread merely because the 10-entry FIFO cycled.
         # Phase/freshness-scoped gates use the independent stamp below.
         if self._is_instruction_path(normalized):
             self._pinned_reads.add(normalized)
-            self._instruction_read_stamps[normalized] = {
+            stamp: Dict[str, Any] = {
                 "phase": self._current_phase,
                 "phase_number": self._current_phase_number,
                 "turn_count": self._current_turn_count,
             }
+            if content_version is not None:
+                stamp["content_version"] = content_version
+            self._instruction_read_stamps[normalized] = stamp
         evicted = None
         # Remove if already present (we'll re-add at the end)
         if normalized in self._recent_reads:
@@ -966,10 +971,7 @@ class ToolContext:
             # other callers that do not have authoritative full text.
             self._recent_read_versions.pop(normalized, None)
         else:
-            raw = content.encode("utf-8") if isinstance(content, str) else content
-            self._recent_read_versions[normalized] = (
-                "sha256:" + hashlib.sha256(raw).hexdigest()
-            )
+            self._recent_read_versions[normalized] = content_version
 
     def _is_instruction_path(self, normalized: str) -> bool:
         """Whether a normalized path is a configured instruction file."""
@@ -1032,6 +1034,105 @@ class ToolContext:
         self._recent_read_versions.pop(normalized, None)
         self._instruction_read_stamps.pop(normalized, None)
         return present
+
+    def export_instruction_read_receipts(self) -> Dict[str, Dict[str, Any]]:
+        """Return safe instruction-read receipts for a worker checkpoint.
+
+        Only configured instruction paths are exported. Ordinary recent-file
+        reads and their write-authorizing versions remain claim-local: carrying
+        those across a handoff could authorize a stale edit. The optional
+        content version here is used solely to reject a receipt when the
+        instruction changed between images/claims.
+        """
+
+        receipts: Dict[str, Dict[str, Any]] = {}
+        for path, stamp in self._instruction_read_stamps.items():
+            if path not in self._pinned_reads or not self._is_instruction_path(path):
+                continue
+            receipt: Dict[str, Any] = {
+                "phase": stamp.get("phase"),
+                "phase_number": stamp.get("phase_number"),
+                "turn_count": int(stamp.get("turn_count") or 0),
+            }
+            content_version = stamp.get("content_version")
+            if content_version:
+                receipt["content_version"] = content_version
+            receipts[path] = receipt
+        return receipts
+
+    def restore_instruction_read_receipts(self, value: Any) -> int:
+        """Hydrate checkpointed instruction receipts into this claim.
+
+        Invalid paths/shapes and receipts for changed instruction content are
+        ignored fail-closed. This restores only enforcement visibility and its
+        phase/turn stamp; it never restores ``_recent_reads`` or
+        ``_recent_read_versions``, so read-before-write authorization cannot
+        cross a worker lease.
+        """
+
+        if not isinstance(value, dict):
+            return 0
+
+        configured_paths = {
+            (getattr(entry, "path", "") or "").lstrip("/").strip()
+            for entry in self._instruction_files
+        }
+        configured_paths.discard("")
+        for path in configured_paths:
+            if path in self._recent_reads:
+                self._recent_reads.remove(path)
+            self._pinned_reads.discard(path)
+            self._recent_read_versions.pop(path, None)
+            self._instruction_read_stamps.pop(path, None)
+
+        restored = 0
+        for raw_path, raw_receipt in value.items():
+            path = str(raw_path or "").lstrip("/").strip()
+            if path not in configured_paths or not isinstance(raw_receipt, dict):
+                continue
+            phase = raw_receipt.get("phase")
+            phase_number = raw_receipt.get("phase_number")
+            turn_count = raw_receipt.get("turn_count")
+            if phase is not None and not isinstance(phase, str):
+                continue
+            if phase_number is not None and (
+                isinstance(phase_number, bool) or not isinstance(phase_number, int)
+            ):
+                continue
+            if (
+                isinstance(turn_count, bool)
+                or not isinstance(turn_count, int)
+                or turn_count < 0
+            ):
+                continue
+
+            content_version = raw_receipt.get("content_version")
+            if content_version is not None:
+                if not (
+                    isinstance(content_version, str)
+                    and content_version.startswith("sha256:")
+                ):
+                    continue
+                try:
+                    content = self.workspace_manager.read_file(path)
+                except Exception:
+                    continue
+                raw = content.encode("utf-8") if isinstance(content, str) else content
+                current_version = "sha256:" + hashlib.sha256(raw).hexdigest()
+                if current_version != content_version:
+                    continue
+
+            self._pinned_reads.add(path)
+            stamp: Dict[str, Any] = {
+                "phase": phase,
+                "phase_number": phase_number,
+                "turn_count": turn_count,
+            }
+            if content_version is not None:
+                stamp["content_version"] = content_version
+            self._instruction_read_stamps[path] = stamp
+            restored += 1
+        return restored
 
     def get_read_tracking_limit(self) -> int:
         """Get the tracking window size from config or default.
