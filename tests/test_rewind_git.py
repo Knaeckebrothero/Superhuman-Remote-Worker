@@ -1,6 +1,9 @@
 """GitManager.restore_tree — forward restore of a full tree, deletions included."""
 
 import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
@@ -9,6 +12,7 @@ from src.managers.git_manager import (
     GitManager,
     WorkspaceUndoInvariantViolation,
 )
+from src.services.workspace_undo import apply_workspace_undo
 
 
 UNDO_REQUEST_ID = UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
@@ -30,6 +34,59 @@ def _make_repo(tmp_path):
     _git(repo, "config", "user.email", "t@t")
     _git(repo, "config", "user.name", "t")
     return repo
+
+
+class _LinewiseShellBackend:
+    """Execute real Git while emulating RemoteBackend's tmux text capture."""
+
+    supports_shell = True
+
+    def __init__(self, root: Path) -> None:
+        self.root = str(root)
+        self.commands: list[str] = []
+
+    def exists(self, path: str) -> bool:
+        return (Path(self.root) / path).exists()
+
+    def shell_run(
+        self,
+        command: str,
+        *,
+        timeout: int,
+        tab_name: str,
+        working_dir: str | None,
+    ) -> str:
+        del tab_name
+        self.commands.append(command)
+        cwd = Path(self.root) / working_dir if working_dir else Path(self.root)
+        completed = subprocess.run(
+            ["bash", "-lc", command],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        # The real tmux transport reconstructs command output line-by-line;
+        # embedded NUL record separators do not reach GitManager.
+        merged = (completed.stdout + completed.stderr).replace("\x00", "")
+        linewise = "\n".join(merged.splitlines())
+        return (
+            f"Exit code: {completed.returncode}\nCWD: {cwd}\n--- stdout ---\n{linewise}"
+        )
+
+
+def _commit_undo_preparation(repo, *, request_id, target_sha, change=None):
+    if change is not None:
+        (repo / "state.txt").write_text(change)
+        _git(repo, "add", "-A")
+    message = (
+        f"Prepare workspace undo to {target_sha[:12]}\n\n"
+        f"SRW-Undo-Prepare: {request_id}\n"
+        f"SRW-Undo-Target: {target_sha}"
+    )
+    _git(repo, "commit", "--allow-empty", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
 
 
 def test_restore_tree_restores_content_and_deletes_new_files(tmp_path):
@@ -152,3 +209,155 @@ def test_workspace_undo_recovery_rejects_marker_on_wrong_tree(tmp_path):
 
     with pytest.raises(WorkspaceUndoInvariantViolation, match="malformed"):
         GitManager(repo).find_workspace_undo_commit(UNDO_REQUEST_ID)
+
+
+def test_identical_duplicate_undo_preparations_converge_to_newest(tmp_path):
+    repo = _make_repo(tmp_path)
+    (repo / "state.txt").write_text("A")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "state A")
+    target = _git(repo, "rev-parse", "HEAD")
+    (repo / "state.txt").write_text("B")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "state B")
+
+    manager = GitManager(repo)
+    older = manager.commit_workspace_undo_preparation(
+        request_id=UNDO_REQUEST_ID,
+        target_sha=target,
+    )
+    assert older is not None
+    _commit_undo_preparation(
+        repo,
+        request_id=UNDO_REQUEST_ID,
+        target_sha=target,
+    )
+    newest = _commit_undo_preparation(
+        repo,
+        request_id=UNDO_REQUEST_ID,
+        target_sha=target,
+    )
+    assert manager.trees_match(older, newest)
+
+    recovered = manager.find_workspace_undo_preparation(UNDO_REQUEST_ID)
+    assert recovered is not None
+    assert recovered.commit_sha == newest
+    assert recovered.target_sha == target
+
+
+@pytest.mark.parametrize("conflict", ["target", "tree"])
+def test_conflicting_duplicate_undo_preparations_fail_closed(tmp_path, conflict):
+    repo = _make_repo(tmp_path)
+    (repo / "state.txt").write_text("A")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "state A")
+    target = _git(repo, "rev-parse", "HEAD")
+    (repo / "state.txt").write_text("B")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "state B")
+    source = _git(repo, "rev-parse", "HEAD")
+
+    manager = GitManager(repo)
+    assert manager.commit_workspace_undo_preparation(
+        request_id=UNDO_REQUEST_ID,
+        target_sha=target,
+    )
+    _commit_undo_preparation(
+        repo,
+        request_id=UNDO_REQUEST_ID,
+        target_sha=source if conflict == "target" else target,
+        change="C" if conflict == "tree" else None,
+    )
+
+    with pytest.raises(WorkspaceUndoInvariantViolation, match="conflicting"):
+        manager.find_workspace_undo_preparation(UNDO_REQUEST_ID)
+
+
+@pytest.mark.asyncio
+async def test_linewise_remote_retry_reuses_preparation_and_acknowledges_same_uuid(
+    tmp_path,
+):
+    repo = _make_repo(tmp_path)
+    (repo / "state.txt").write_text("A")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "state A")
+    target = _git(repo, "rev-parse", "HEAD")
+    (repo / "state.txt").write_text("B")
+    newline_path = repo / "line\nbreak.txt"
+    newline_path.write_text("created in B")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "state B")
+    source = _git(repo, "rev-parse", "HEAD")
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True)
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "push", "-u", "origin", "main")
+
+    backend = _LinewiseShellBackend(repo)
+    manager = GitManager(repo, backend=backend)
+    untracked_newline = repo / "untracked\nname.txt"
+    untracked_newline.write_text("not committed")
+    assert manager.workspace_matches_tree("HEAD") is False
+    untracked_newline.unlink()
+    assert manager.workspace_matches_tree("HEAD") is True
+    preparation = manager.commit_workspace_undo_preparation(
+        request_id=UNDO_REQUEST_ID,
+        target_sha=target,
+    )
+    assert preparation is not None
+
+    ledger = [source, target]
+
+    async def list_commits(_thread_id):
+        return list(ledger)
+
+    async def record_commit(_thread_id, commit_sha):
+        ledger[0] = commit_sha
+
+    postgres = SimpleNamespace(
+        list_workspace_turn_commits=AsyncMock(side_effect=list_commits),
+        record_turn_commit=AsyncMock(side_effect=record_commit),
+    )
+    workspace = SimpleNamespace(git_manager=manager)
+
+    # This call models a successor retry after the preparation commit landed
+    # but before restore. The remote lookup must find that one preparation.
+    first = await apply_workspace_undo(
+        thread_id="thread-remote",
+        request_id=UNDO_REQUEST_ID,
+        postgres=postgres,
+        workspace_manager=workspace,
+    )
+    replay = await apply_workspace_undo(
+        thread_id="thread-remote",
+        request_id=UNDO_REQUEST_ID,
+        postgres=postgres,
+        workspace_manager=workspace,
+    )
+
+    preparations = _git(
+        repo,
+        "log",
+        "--format=%H",
+        "--fixed-strings",
+        f"--grep=SRW-Undo-Prepare: {UNDO_REQUEST_ID}",
+    ).splitlines()
+    effects = _git(
+        repo,
+        "log",
+        "--format=%H",
+        "--fixed-strings",
+        f"--grep=SRW-Control-Request: {UNDO_REQUEST_ID}",
+    ).splitlines()
+    assert preparations == [preparation]
+    assert len(effects) == 1
+    assert first == replay
+    assert first.restored_to_sha == target
+    assert first.paths == ("line\nbreak.txt", "state.txt")
+    assert (repo / "state.txt").read_text() == "A"
+    assert not newline_path.exists()
+    postgres.record_turn_commit.assert_awaited_once_with(
+        "thread-remote", first.restore_commit_sha
+    )
+    assert any("git show --no-patch --format=%B" in cmd for cmd in backend.commands)
+    assert all("%x00" not in cmd for cmd in backend.commands)
