@@ -49,6 +49,7 @@ _UNDO_REQUEST_TRAILER = "SRW-Control-Request"
 _UNDO_PREPARE_TRAILER = "SRW-Undo-Prepare"
 _UNDO_SOURCE_TRAILER = "SRW-Undo-Source"
 _UNDO_TARGET_TRAILER = "SRW-Undo-Target"
+_GIT_NUL_INTEGRITY_FRAME = "SRW-Git-NUL-Integrity"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1773,13 +1774,38 @@ class GitManager:
         """
 
         if not self._use_backend:
-            result = self._run_git(args, timeout=timeout)
+            cmd = ["git"] + args
+            try:
+                result = subprocess.run(
+                    cmd,
+                    cwd=self._workspace_path,
+                    capture_output=True,
+                    text=False,
+                    timeout=timeout,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                logger.error("Local Git path command failed: %s", exc)
+                return None
             if result.returncode != 0:
                 return None
-            payload = result.stdout
+            raw_payload = result.stdout
         else:
             cmd_str = "git " + " ".join(shlex.quote(arg) for arg in args)
-            encoded_cmd = f"set -o pipefail; {cmd_str} | base64"
+            encoded_cmd = (
+                '( _srw_git_tmp=$(mktemp "${TMPDIR:-/tmp}/srw-git-nul.XXXXXX") '
+                "|| exit 1; "
+                "trap 'rm -f -- \"$_srw_git_tmp\"' EXIT; "
+                "trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; "
+                f'{cmd_str} >"$_srw_git_tmp"; '
+                "_srw_git_rc=$?; "
+                '[ "$_srw_git_rc" -eq 0 ] || exit "$_srw_git_rc"; '
+                '_srw_git_len=$(wc -c <"$_srw_git_tmp") || exit 1; '
+                '_srw_git_sha=$(sha256sum "$_srw_git_tmp") || exit 1; '
+                "_srw_git_sha=${_srw_git_sha%% *}; "
+                'base64 "$_srw_git_tmp" || exit 1; '
+                f"printf '{_GIT_NUL_INTEGRITY_FRAME} %s %s\\n' "
+                '"$_srw_git_len" "$_srw_git_sha"; )'
+            )
             try:
                 output = self._backend.shell_run(
                     encoded_cmd,
@@ -1793,22 +1819,47 @@ class GitManager:
                 return None
             if encoded_result.returncode != 0:
                 return None
-            encoded = "".join(encoded_result.stdout.split())
-            if not encoded:
-                return []
+
+            lines = encoded_result.stdout.splitlines()
+            while lines and not lines[-1].strip():
+                lines.pop()
+            if not lines:
+                logger.error("Backend Git path output lacked its integrity frame")
+                return None
+            frame_parts = lines.pop().split()
+            if (
+                len(frame_parts) != 3
+                or frame_parts[0] != _GIT_NUL_INTEGRITY_FRAME
+                or not frame_parts[1].isdigit()
+                or len(frame_parts[2]) != 64
+                or any(char not in "0123456789abcdef" for char in frame_parts[2])
+            ):
+                logger.error("Backend Git path output had an invalid integrity frame")
+                return None
+            expected_length = int(frame_parts[1])
+            expected_sha256 = frame_parts[2]
+            encoded = "".join(line.strip() for line in lines if line.strip())
             try:
                 raw_payload = base64.b64decode(encoded, validate=True)
-                payload = raw_payload.decode("utf-8", errors="surrogateescape")
-            except (binascii.Error, UnicodeDecodeError, ValueError):
+            except (binascii.Error, ValueError):
                 logger.error("Backend Git path output was not valid base64")
                 return None
+            if (
+                len(raw_payload) != expected_length
+                or hashlib.sha256(raw_payload).hexdigest() != expected_sha256
+            ):
+                logger.error("Backend Git path output failed its integrity frame")
+                return None
 
-        if not payload:
+        if not raw_payload:
             return []
-        if not payload.endswith("\x00"):
+        if not raw_payload.endswith(b"\x00"):
             logger.error("Git -z path output ended without its record delimiter")
             return None
-        return payload[:-1].split("\x00")
+        return [
+            record.decode("utf-8", errors="surrogateescape")
+            for record in raw_payload[:-1].split(b"\x00")
+        ]
 
     def _parse_shell_run_output(
         self, output: str, args: Optional[List[str]] = None
