@@ -101,12 +101,13 @@ spec:
           imagePullPolicy: {{ .Values.image.agent.pullPolicy }}
           # Provisioner invocation shape (sh -c, explicit port/host), changing
           # only the mode and adding --loop so the process returns to idle
-          # between units instead of exiting.
+          # between units instead of exiting. `exec` makes Python PID 1 so
+          # kubelet's SIGTERM reaches the executor's graceful-drain handler.
           command:
             - sh
             - -c
             - >-
-              python agent.py
+              exec python agent.py
               --mode stateless
               --config {{ .Values.agent.stateless.config }}
               --port {{ .Values.agent.port }}
