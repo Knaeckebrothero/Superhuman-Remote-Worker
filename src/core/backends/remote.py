@@ -177,6 +177,8 @@ _TMUX_PANE_ID_OPTION = "@srw_pane_id"
 _TMUX_OWNER_ID_OPTION = "@srw_owner_id"
 _TMUX_OWNER_TOKEN_OPTION = "@srw_owner_token"
 _TMUX_GENERATION_OPTION = "@srw_generation"
+_TMUX_WORKSPACE_GENERATION_OPTION = "@srw_workspace_generation"
+_TMUX_RUNTIME_INCARNATION_OPTION = "@srw_runtime_incarnation"
 _TMUX_PROTOCOL_OPTION = "@srw_shell_protocol"
 _TMUX_PROTOCOL_VERSION = "2"
 _TMUX_SETUP_OPTION = "@srw_setup_state"
@@ -192,6 +194,7 @@ _TMUX_PANE_ID_PATTERN = re.compile(r"^%(?:0|[1-9][0-9]*)$")
 _TMUX_PENDING_PATTERN = re.compile(r"^__DONE_[0-9a-f]{12}__$")
 _TMUX_PROMPT_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _TMUX_STATE_VERSION = "1"
+_TMUX_INCARNATION_STATE_VERSION = "2"
 
 # Default blocked commands
 DEFAULT_BLOCKED_COMMANDS = frozenset(
@@ -286,6 +289,8 @@ class RemoteBackend(WorkspaceBackend):
         retry_timeouts_as_booting: bool = False,
         sudo_action: str = "freeze",
         sudo_block_message: Optional[str] = None,
+        workspace_generation: Optional[str] = None,
+        runtime_incarnation: Optional[str] = None,
     ):
         if paramiko is None:
             raise ImportError(
@@ -312,6 +317,22 @@ class RemoteBackend(WorkspaceBackend):
         # operator's denial reason after a denied vm_upgrade request, so the
         # agent gets a reasoned rejection instead of the generic block text.
         self._sudo_block_message = sudo_block_message
+        self._workspace_generation: Optional[str] = None
+        if workspace_generation is not None:
+            try:
+                self._workspace_generation = str(uuid.UUID(str(workspace_generation)))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ValueError("workspace generation must be a UUID") from exc
+        self._runtime_incarnation: Optional[str] = None
+        if runtime_incarnation is not None:
+            try:
+                self._runtime_incarnation = str(uuid.UUID(str(runtime_incarnation)))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ValueError("runtime incarnation must be a UUID") from exc
+        if (self._workspace_generation is None) != (self._runtime_incarnation is None):
+            raise ValueError(
+                "workspace generation and runtime incarnation must be supplied together"
+            )
 
         if blocked_commands is None:
             self._blocked_commands = DEFAULT_BLOCKED_COMMANDS
@@ -461,6 +482,15 @@ class RemoteBackend(WorkspaceBackend):
         """True when this backend carries an exact stateless lease token."""
 
         return self._shell_owner_token is not None
+
+    @property
+    def workspace_incarnation_fenced(self) -> bool:
+        """True when shell state is bound to orchestrator workspace authority."""
+
+        return (
+            self._workspace_generation is not None
+            and self._runtime_incarnation is not None
+        )
 
     def retire_claim_resource_owner(self) -> None:
         """Wait out admitted resource I/O, then reject later local callers."""
@@ -1464,6 +1494,63 @@ class RemoteBackend(WorkspaceBackend):
         """Shell helpers for the PVC-resident stateless ownership tombstone."""
         filename = self._tmux_state_filename
         owner = self._tmux_owner_digest
+        if self.workspace_incarnation_fenced:
+            assert self._workspace_generation is not None
+            assert self._runtime_incarnation is not None
+            workspace_generation = shlex.quote(self._workspace_generation)
+            runtime_incarnation = shlex.quote(self._runtime_incarnation)
+            return (
+                '_srw_state_dir="$HOME/.srw/tmux"\n'
+                f'_srw_state="$_srw_state_dir/{filename}"\n'
+                "_srw_load_state() {\n"
+                '  [ -f "$_srw_state" ] || return 1\n'
+                '  [ "$(wc -l < "$_srw_state")" -eq 1 ] || exit 78\n'
+                "  IFS='|' read -r _srw_version _srw_owner _srw_field3 "
+                "_srw_field4 _srw_field5 _srw_field6 _srw_field7 _srw_extra "
+                '< "$_srw_state"\n'
+                f'  [ "$_srw_owner" = {shlex.quote(owner)} ] || exit 78\n'
+                '  [ -z "$_srw_extra" ] || exit 78\n'
+                '  if [ "$_srw_version" = '
+                f"{_TMUX_STATE_VERSION} ]; then\n"
+                '    [ -z "$_srw_field6$_srw_field7" ] || exit 78\n'
+                '    _srw_workspace_generation=""\n'
+                '    _srw_runtime_incarnation=""\n'
+                '    _srw_status="$_srw_field3"\n'
+                '    _srw_token="$_srw_field4"\n'
+                '    _srw_generation="$_srw_field5"\n'
+                '  elif [ "$_srw_version" = '
+                f"{_TMUX_INCARNATION_STATE_VERSION} ]; then\n"
+                '    _srw_workspace_generation="$_srw_field3"\n'
+                '    _srw_runtime_incarnation="$_srw_field4"\n'
+                '    _srw_status="$_srw_field5"\n'
+                '    _srw_token="$_srw_field6"\n'
+                '    _srw_generation="$_srw_field7"\n'
+                '    printf "%s" "$_srw_workspace_generation" | '
+                "grep -Eq '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-"
+                "[0-9a-f]{12}$' || exit 78\n"
+                '    printf "%s" "$_srw_runtime_incarnation" | '
+                "grep -Eq '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-"
+                "[0-9a-f]{12}$' || exit 78\n"
+                "  else\n"
+                "    exit 78\n"
+                "  fi\n"
+                '  case "$_srw_status" in active|creating|retired) ;; '
+                "*) exit 78 ;; esac\n"
+                '  case "$_srw_token" in ""|*[!0-9]*) exit 78 ;; esac\n'
+                '  printf "%s" "$_srw_generation" | '
+                "grep -Eq '^[0-9a-f]{32}$' || exit 78\n"
+                "}\n"
+                "_srw_write_state() {\n"
+                '  _srw_tmp=$(mktemp "$_srw_state_dir/.state.XXXXXX") || exit 78\n'
+                "  trap 'rm -f \"$_srw_tmp\"' EXIT HUP INT TERM\n"
+                f"  printf '{_TMUX_INCARNATION_STATE_VERSION}|{owner}|"
+                f"{workspace_generation}|{runtime_incarnation}|%s|%s|%s\\n' "
+                '"$1" "$2" "$3" > "$_srw_tmp" || exit 78\n'
+                '  chmod 600 "$_srw_tmp" || exit 78\n'
+                '  mv -f "$_srw_tmp" "$_srw_state" || exit 78\n'
+                "  trap - EXIT HUP INT TERM\n"
+                "}\n"
+            )
         return (
             '_srw_state_dir="$HOME/.srw/tmux"\n'
             f'_srw_state="$_srw_state_dir/{filename}"\n'
@@ -1521,9 +1608,33 @@ class RemoteBackend(WorkspaceBackend):
         token = str(self._shell_owner_token)
         expected_owner = self._job_id or self._session_name
         target = self._tmux_target()
+        workspace_state_check = ""
+        workspace_tmux_check = ""
+        if self.workspace_incarnation_fenced:
+            assert self._workspace_generation is not None
+            assert self._runtime_incarnation is not None
+            expected_workspace = shlex.quote(self._workspace_generation)
+            expected_runtime = shlex.quote(self._runtime_incarnation)
+            workspace_state_check = (
+                f'[ "$_srw_workspace_generation" = {expected_workspace} ] '
+                "|| exit 80\n"
+                f'[ "$_srw_runtime_incarnation" = {expected_runtime} ] '
+                "|| exit 80\n"
+            )
+            workspace_tmux_check = (
+                "_srw_tmux_workspace_generation=$(tmux display-message -p "
+                f"-t {target} '#{{{_TMUX_WORKSPACE_GENERATION_OPTION}}}')\n"
+                f'[ "$_srw_tmux_workspace_generation" = {expected_workspace} ] '
+                "|| exit 80\n"
+                "_srw_tmux_runtime_incarnation=$(tmux display-message -p "
+                f"-t {target} '#{{{_TMUX_RUNTIME_INCARNATION_OPTION}}}')\n"
+                f'[ "$_srw_tmux_runtime_incarnation" = {expected_runtime} ] '
+                "|| exit 80\n"
+            )
         return (
             self._tmux_state_shell()
             + "_srw_load_state || exit 78\n"
+            + workspace_state_check
             + '[ "$_srw_status" = active ] || exit 75\n'
             + f'[ "$_srw_token" = {shlex.quote(token)} ] || exit 75\n'
             + f"tmux has-session -t {target} 2>/dev/null || exit 79\n"
@@ -1536,6 +1647,7 @@ class RemoteBackend(WorkspaceBackend):
             + "_srw_tmux_generation=$(tmux display-message -p "
             + f"-t {target} '#{{{_TMUX_GENERATION_OPTION}}}')\n"
             + '[ "$_srw_tmux_generation" = "$_srw_generation" ] || exit 79\n'
+            + workspace_tmux_check
         )
 
     def _tmux_exec_checked(
@@ -1755,6 +1867,18 @@ class RemoteBackend(WorkspaceBackend):
         default_window = self._tmux_target("default")
         raw_session_name = shlex.quote(self._session_name)
         expected_owner = shlex.quote(self._job_id or self._session_name)
+        workspace_option = ""
+        if self.workspace_incarnation_fenced:
+            assert self._workspace_generation is not None
+            assert self._runtime_incarnation is not None
+            workspace_option = (
+                f"tmux set-option -t {session} "
+                f"{_TMUX_WORKSPACE_GENERATION_OPTION} "
+                f"{shlex.quote(self._workspace_generation)} || exit 77\n"
+                f"tmux set-option -t {session} "
+                f"{_TMUX_RUNTIME_INCARNATION_OPTION} "
+                f"{shlex.quote(self._runtime_incarnation)} || exit 77\n"
+            )
         return (
             f"_srw_write_state creating {shlex.quote(token)} "
             f"{shlex.quote(generation)}\n"
@@ -1766,6 +1890,7 @@ class RemoteBackend(WorkspaceBackend):
             f"{shlex.quote(token)} || exit 77\n"
             f"tmux set-option -t {session} {_TMUX_GENERATION_OPTION} "
             f"{shlex.quote(generation)} || exit 77\n"
+            f"{workspace_option}"
             f"tmux set-option -t {session} {_TMUX_SETUP_OPTION} "
             f"{_TMUX_SETUP_PENDING} || exit 77\n"
             f"tmux set-option -w -t {default_window} {_TMUX_WINDOW_SETUP_OPTION} "
@@ -1779,6 +1904,8 @@ class RemoteBackend(WorkspaceBackend):
         """Create/adopt tmux under a PVC-resident token+generation fence."""
         if self._shell_owner_token is None:
             raise AssertionError("stateless tmux ownership requires a lease token")
+        if self.workspace_incarnation_fenced:
+            return self._incarnation_create_or_observe_tmux_session()
 
         token = str(self._shell_owner_token)
         desired_generation = uuid.uuid4().hex
@@ -1850,6 +1977,200 @@ class RemoteBackend(WorkspaceBackend):
         output = self._tmux_exec_checked(
             self._tmux_lock_command(inner),
             operation="create or observe stateless session",
+        ).strip()
+        if output not in {"created", "existing"}:
+            raise WorkspaceUnavailableError(
+                f"Could not create or observe remote tmux session {self._session_name}"
+            )
+        return output
+
+    def _incarnation_create_or_observe_tmux_session(self) -> str:
+        """Create/adopt tmux under queue and authoritative-runtime fences.
+
+        The workspace generation identifies the durable backing and remains
+        stable across a same-PVC pod replacement.  The separate runtime
+        incarnation is the Kubernetes Pod UID.  A new pod therefore cannot
+        satisfy the old pod's ownership record even though that record survives
+        on the shared PVC.  A stale record can be superseded only when the
+        current runtime has no same-named tmux session; a conflicting live
+        session is ambiguous and fails closed.
+
+        Version-1 records are migrated in place when their exact tmux session
+        is still live.  If that process disappeared (pod replacement or an
+        interrupted terminal retirement), the current authoritative claimant
+        creates a fresh generation instead of being stranded forever.
+        """
+        if (
+            self._shell_owner_token is None
+            or self._workspace_generation is None
+            or self._runtime_incarnation is None
+        ):
+            raise AssertionError(
+                "incarnation-fenced tmux ownership requires token, backing, and runtime"
+            )
+
+        token = str(self._shell_owner_token)
+        desired_generation = uuid.uuid4().hex
+        target = self._tmux_target()
+        expected_owner = self._job_id or self._session_name
+        expected_workspace = self._workspace_generation
+        expected_runtime = self._runtime_incarnation
+        create_shell = self._stateless_tmux_create_shell(token, desired_generation)
+        inspect_tmux = (
+            "_srw_tmux_owner=$(tmux display-message -p "
+            f"-t {target} '#{{{_TMUX_OWNER_ID_OPTION}}}')\n"
+            "_srw_tmux_token=$(tmux display-message -p "
+            f"-t {target} '#{{{_TMUX_OWNER_TOKEN_OPTION}}}')\n"
+            'case "$_srw_tmux_token" in "" ) _srw_tmux_token=0 ;; '
+            "*[!0-9]* ) exit 76 ;; esac\n"
+            "_srw_tmux_generation=$(tmux display-message -p "
+            f"-t {target} '#{{{_TMUX_GENERATION_OPTION}}}')\n"
+            "_srw_tmux_workspace_generation=$(tmux display-message -p "
+            f"-t {target} '#{{{_TMUX_WORKSPACE_GENERATION_OPTION}}}')\n"
+            "_srw_tmux_runtime_incarnation=$(tmux display-message -p "
+            f"-t {target} '#{{{_TMUX_RUNTIME_INCARNATION_OPTION}}}')\n"
+        )
+        exact_owner = (
+            f'[ "$_srw_tmux_owner" = {shlex.quote(expected_owner)} ] || exit 73\n'
+        )
+        current_or_older_token = (
+            f'[ "$_srw_tmux_token" -le {shlex.quote(token)} ] || exit 75\n'
+        )
+        exact_generation = (
+            '[ "$_srw_tmux_generation" = "$_srw_generation" ] || exit 79\n'
+        )
+        exact_incarnation = (
+            f'[ "$_srw_tmux_workspace_generation" = '
+            f"{shlex.quote(expected_workspace)} ] || exit 80\n"
+            f'[ "$_srw_tmux_runtime_incarnation" = '
+            f"{shlex.quote(expected_runtime)} ] || exit 80\n"
+        )
+
+        current_record = (
+            '  if [ "$_srw_status" = active ]; then\n'
+            f'    [ "$_srw_token" -le {shlex.quote(token)} ] || exit 75\n'
+            f"    if tmux has-session -t {target} 2>/dev/null; then\n"
+            + "      "
+            + inspect_tmux.replace("\n", "\n      ").rstrip()
+            + "\n      "
+            + exact_owner
+            + "      "
+            + current_or_older_token
+            + "      "
+            + exact_generation
+            + "      "
+            + exact_incarnation
+            + f"      tmux set-option -t {target} {_TMUX_OWNER_TOKEN_OPTION} "
+            f"{shlex.quote(token)} || exit 77\n"
+            f"      _srw_write_state active {shlex.quote(token)} "
+            '"$_srw_generation"\n'
+            "      printf existing\n"
+            "    else\n      " + create_shell.replace("\n", "\n      ") + "\n    fi\n"
+            '  elif [ "$_srw_status" = creating ]; then\n'
+            f'    [ {shlex.quote(token)} -ge "$_srw_token" ] || exit 75\n'
+            f"    if tmux has-session -t {target} 2>/dev/null; then\n"
+            + "      "
+            + inspect_tmux.replace("\n", "\n      ").rstrip()
+            + "\n"
+            f'      [ -z "$_srw_tmux_owner" ] || '
+            f'[ "$_srw_tmux_owner" = {shlex.quote(expected_owner)} ] || exit 73\n'
+            + "      "
+            + current_or_older_token
+            + '      [ -z "$_srw_tmux_generation" ] || '
+            '[ "$_srw_tmux_generation" = "$_srw_generation" ] || exit 79\n'
+            + '      [ -z "$_srw_tmux_workspace_generation" ] || '
+            f'[ "$_srw_tmux_workspace_generation" = '
+            f"{shlex.quote(expected_workspace)} ] || exit 80\n"
+            + '      [ -z "$_srw_tmux_runtime_incarnation" ] || '
+            f'[ "$_srw_tmux_runtime_incarnation" = '
+            f"{shlex.quote(expected_runtime)} ] || exit 80\n"
+            f"      tmux kill-session -t {target} || exit 77\n"
+            "    fi\n    " + create_shell.replace("\n", "\n    ") + "\n"
+            "  else\n"
+            f'    [ {shlex.quote(token)} -gt "$_srw_token" ] || exit 75\n'
+            f"    if tmux has-session -t {target} 2>/dev/null; then\n"
+            + "      "
+            + inspect_tmux.replace("\n", "\n      ").rstrip()
+            + "\n      "
+            + exact_owner
+            + "      "
+            + current_or_older_token
+            + "      "
+            + exact_generation
+            + "      "
+            + exact_incarnation
+            + f"      tmux kill-session -t {target} || exit 77\n"
+            "    fi\n    " + create_shell.replace("\n", "\n    ") + "\n  fi\n"
+        )
+
+        legacy_record = (
+            f'  [ "$_srw_token" -le {shlex.quote(token)} ] || exit 75\n'
+            f'  if [ "$_srw_status" = retired ] && '
+            f'[ {shlex.quote(token)} -le "$_srw_token" ]; then exit 75; fi\n'
+            f"  if tmux has-session -t {target} 2>/dev/null; then\n"
+            + "    "
+            + inspect_tmux.replace("\n", "\n    ").rstrip()
+            + "\n"
+            f'    [ -z "$_srw_tmux_owner" ] || '
+            f'[ "$_srw_tmux_owner" = {shlex.quote(expected_owner)} ] || exit 73\n'
+            + "    "
+            + current_or_older_token
+            + '    [ -z "$_srw_tmux_generation" ] || '
+            '[ "$_srw_tmux_generation" = "$_srw_generation" ] || exit 79\n'
+            '    [ -z "$_srw_tmux_workspace_generation" ] || exit 80\n'
+            '    [ -z "$_srw_tmux_runtime_incarnation" ] || exit 80\n'
+            '    if [ "$_srw_status" = active ]; then\n'
+            + "      "
+            + exact_owner
+            + "      "
+            + exact_generation
+            + f"      tmux set-option -t {target} {_TMUX_OWNER_TOKEN_OPTION} "
+            f"{shlex.quote(token)} || exit 77\n"
+            f"      tmux set-option -t {target} "
+            f"{_TMUX_WORKSPACE_GENERATION_OPTION} "
+            f"{shlex.quote(expected_workspace)} || exit 77\n"
+            f"      tmux set-option -t {target} "
+            f"{_TMUX_RUNTIME_INCARNATION_OPTION} "
+            f"{shlex.quote(expected_runtime)} || exit 77\n"
+            f"      _srw_write_state active {shlex.quote(token)} "
+            '"$_srw_generation"\n'
+            "      printf existing\n"
+            "    else\n"
+            f"      tmux kill-session -t {target} || exit 77\n      "
+            + create_shell.replace("\n", "\n      ")
+            + "\n    fi\n"
+            "  else\n    " + create_shell.replace("\n", "\n    ") + "\n  fi\n"
+        )
+
+        inner = (
+            self._tmux_state_shell() + "if _srw_load_state; then _srw_marker=present; "
+            'else _srw_rc=$?; [ "$_srw_rc" -eq 1 ] || exit "$_srw_rc"; '
+            "_srw_marker=absent; fi\n"
+            'if [ "$_srw_marker" = present ] && '
+            f'[ "$_srw_workspace_generation" = '
+            f"{shlex.quote(expected_workspace)} ] && "
+            f'[ "$_srw_runtime_incarnation" = '
+            f"{shlex.quote(expected_runtime)} ]; then\n"
+            + current_record
+            + 'elif [ "$_srw_marker" = present ] && '
+            '[ -z "$_srw_workspace_generation" ] && '
+            '[ -z "$_srw_runtime_incarnation" ]; then\n'
+            + legacy_record
+            + 'elif [ "$_srw_marker" = present ]; then\n'
+            # A live same-named tmux in the new authoritative runtime cannot be
+            # explained by the stale record. Never kill or adopt it implicitly.
+            f'  [ "$_srw_token" -le {shlex.quote(token)} ] || exit 75\n'
+            f"  if tmux has-session -t {target} 2>/dev/null; then exit 80; fi\n  "
+            + create_shell.replace("\n", "\n  ")
+            + "\nelse\n"
+            # Marker deletion cannot authorize adoption of an unmarked session.
+            f"  if tmux has-session -t {target} 2>/dev/null; then exit 79; fi\n  "
+            + create_shell.replace("\n", "\n  ")
+            + "\nfi"
+        )
+        output = self._tmux_exec_checked(
+            self._tmux_lock_command(inner),
+            operation="create or observe incarnation-fenced stateless session",
         ).strip()
         if output not in {"created", "existing"}:
             raise WorkspaceUnavailableError(
@@ -3083,14 +3404,69 @@ class RemoteBackend(WorkspaceBackend):
                 target = self._tmux_target()
                 expected_owner = self._job_id or self._session_name
                 fallback_generation = uuid.uuid4().hex
+                if not self.workspace_incarnation_fenced:
+                    load_for_retirement = (
+                        "if _srw_load_state; then\n"
+                        f'  [ "$_srw_token" -le {shlex.quote(token)} ] || exit 75\n'
+                        "else\n"
+                        '  _srw_rc=$?; [ "$_srw_rc" -eq 1 ] || exit "$_srw_rc"\n'
+                        f"  _srw_generation={shlex.quote(fallback_generation)}\n"
+                        "fi\n"
+                    )
+                    tmux_incarnation_check = ""
+                else:
+                    assert self._workspace_generation is not None
+                    assert self._runtime_incarnation is not None
+                    expected_workspace = shlex.quote(self._workspace_generation)
+                    expected_runtime = shlex.quote(self._runtime_incarnation)
+                    load_for_retirement = (
+                        "if _srw_load_state; then\n"
+                        '  if [ -z "$_srw_workspace_generation" ] && '
+                        '[ -z "$_srw_runtime_incarnation" ]; then\n'
+                        "    _srw_retire_incarnation=legacy\n"
+                        f'    [ "$_srw_token" -le {shlex.quote(token)} ] '
+                        "|| exit 75\n"
+                        f'  elif [ "$_srw_workspace_generation" = '
+                        f"{expected_workspace} ] && "
+                        f'[ "$_srw_runtime_incarnation" = {expected_runtime} ]; then\n'
+                        "    _srw_retire_incarnation=current\n"
+                        f'    [ "$_srw_token" -le {shlex.quote(token)} ] '
+                        "|| exit 75\n"
+                        "  else\n"
+                        "    _srw_retire_incarnation=stale\n"
+                        f'    [ "$_srw_token" -le {shlex.quote(token)} ] '
+                        "|| exit 75\n"
+                        f"    tmux has-session -t {target} 2>/dev/null && exit 80\n"
+                        f"    _srw_generation={shlex.quote(fallback_generation)}\n"
+                        "  fi\n"
+                        "else\n"
+                        '  _srw_rc=$?; [ "$_srw_rc" -eq 1 ] || exit "$_srw_rc"\n'
+                        "  _srw_retire_incarnation=absent\n"
+                        f"  _srw_generation={shlex.quote(fallback_generation)}\n"
+                        "fi\n"
+                    )
+                    tmux_incarnation_check = (
+                        "  _srw_tmux_workspace_generation=$(tmux display-message -p "
+                        f"-t {target} '#{{{_TMUX_WORKSPACE_GENERATION_OPTION}}}')\n"
+                        "  _srw_tmux_runtime_incarnation=$(tmux display-message -p "
+                        f"-t {target} '#{{{_TMUX_RUNTIME_INCARNATION_OPTION}}}')\n"
+                        '  if [ "$_srw_retire_incarnation" = current ]; then\n'
+                        f'    [ "$_srw_tmux_workspace_generation" = '
+                        f"{expected_workspace} ] || exit 80\n"
+                        f'    [ "$_srw_tmux_runtime_incarnation" = '
+                        f"{expected_runtime} ] || exit 80\n"
+                        "  else\n"
+                        '    [ -z "$_srw_tmux_workspace_generation" ] || '
+                        f'[ "$_srw_tmux_workspace_generation" = '
+                        f"{expected_workspace} ] || exit 80\n"
+                        '    [ -z "$_srw_tmux_runtime_incarnation" ] || '
+                        f'[ "$_srw_tmux_runtime_incarnation" = '
+                        f"{expected_runtime} ] || exit 80\n"
+                        "  fi\n"
+                    )
                 inner = (
                     self._tmux_state_shell()
-                    + "if _srw_load_state; then\n"
-                    + f'  [ "$_srw_token" -le {shlex.quote(token)} ] || exit 75\n'
-                    + "else\n"
-                    + '  _srw_rc=$?; [ "$_srw_rc" -eq 1 ] || exit "$_srw_rc"\n'
-                    + f"  _srw_generation={shlex.quote(fallback_generation)}\n"
-                    + "fi\n"
+                    + load_for_retirement
                     + f"if tmux has-session -t {target} 2>/dev/null; then\n"
                     + "  _srw_tmux_owner=$(tmux display-message -p "
                     + f"-t {target} '#{{{_TMUX_OWNER_ID_OPTION}}}')\n"
@@ -3113,6 +3489,7 @@ class RemoteBackend(WorkspaceBackend):
                     + "|| exit 79; fi\n"
                     + "    _srw_generation=$_srw_tmux_generation\n"
                     + "  fi\n"
+                    + tmux_incarnation_check
                     + f"  _srw_write_state retired {shlex.quote(token)} "
                     + '"$_srw_generation"\n'
                     + f"  tmux kill-session -t {target} || exit 77\n"
@@ -3129,6 +3506,14 @@ class RemoteBackend(WorkspaceBackend):
                 self._tabs.clear()
                 self._shell_initialized = False
                 self._shell_generation = None
+                if self.workspace_incarnation_fenced:
+                    logger.info(
+                        "Remote shell retirement acknowledged: session=%s "
+                        "workspace_generation=%s runtime_incarnation=%s",
+                        self._session_name,
+                        self._workspace_generation,
+                        self._runtime_incarnation,
+                    )
                 return
 
             # A genuine end may inherit a shell without ever opening it locally.
@@ -3165,6 +3550,16 @@ class RemoteBackend(WorkspaceBackend):
             )
         except Exception as e:
             logger.warning(f"Error cleaning up remote tmux session: {e}")
+            if (
+                self._shell_owner_token is not None
+                and self.workspace_incarnation_fenced
+            ):
+                self._tabs.clear()
+                self._shell_initialized = False
+                self._shell_generation = None
+                raise WorkspaceUnavailableError(
+                    "Remote shell terminal retirement was not acknowledged"
+                ) from e
         self._tabs.clear()
         self._shell_initialized = False
         self._shell_generation = None

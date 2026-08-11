@@ -10801,6 +10801,9 @@ async def _poll_workspace_ready(
             return {
                 "backend": "vm",
                 "workspace_generation": ws.get("workspace_generation"),
+                "workspace_runtime_incarnation": ws.get(
+                    "workspace_runtime_incarnation"
+                ),
                 # Slice 1 has no trusted VM host-identity adapter.
                 "canvas_presentation_available": False,
                 "canvas_live_apps_available": False,
@@ -10870,6 +10873,9 @@ async def _poll_workspace_ready(
             return {
                 "backend": "sandbox",
                 "workspace_generation": ws.get("workspace_generation"),
+                "workspace_runtime_incarnation": ws.get(
+                    "workspace_runtime_incarnation"
+                ),
                 # This is an orchestrator-attested capability, not a property
                 # inferred from the backend label or endpoint reachability.
                 "canvas_presentation_available": (
@@ -11092,6 +11098,16 @@ async def _handle_workspace_upgrade(
         remote = ws_config["remote"]
         shell_config = _session.config.extra.get("shell", {})
         sudo_action = "allow" if backend_tier == "vm" else "freeze"
+        shell_owner_token = _session.shell_owner_token
+        workspace_generation = ws_config.get("workspace_generation")
+        workspace_runtime_incarnation = ws_config.get("workspace_runtime_incarnation")
+        if shell_owner_token is not None and (
+            not workspace_generation or not workspace_runtime_incarnation
+        ):
+            raise WorkspaceUnavailableError(
+                "A stateless physical workspace upgrade requires an "
+                "orchestrator-attested backing and runtime incarnation"
+            )
         new_backend = RemoteBackend(
             host=remote["host"],
             port=remote.get("port", 30022),
@@ -11105,6 +11121,12 @@ async def _handle_workspace_upgrade(
             max_retries=remote.get("max_retries", 5),
             retry_timeouts_as_booting=remote.get("retry_timeouts_as_booting", False),
             sudo_action=sudo_action,
+            workspace_generation=(
+                workspace_generation if shell_owner_token is not None else None
+            ),
+            runtime_incarnation=(
+                workspace_runtime_incarnation if shell_owner_token is not None else None
+            ),
         )
         # Capability is attested by the orchestrator from a paired generation
         # and pinned workspace identity. Never infer it from "sandbox": a
@@ -11122,7 +11144,13 @@ async def _handle_workspace_upgrade(
         # 4. Connect the new backend now so the SEED copy (next) runs while BOTH
         #    backends are live — swap_backend would otherwise disconnect the old
         #    one. swap_backend then sees it connected and skips re-connecting.
+        if shell_owner_token is not None:
+            new_backend.set_shell_owner_token(shell_owner_token)
         await asyncio.to_thread(new_backend.connect)
+        if shell_owner_token is not None:
+            # Promote before the swap exposes this backend to tools. The same
+            # backing+runtime fence used on a cold attach protects hot upgrades.
+            await asyncio.to_thread(new_backend.claim_shell_owner)
 
         # 5. Seed the new workspace from the live virtual prefix (S3a). Pure
         #    in-process copy (the agent holds the object-store creds). Run off

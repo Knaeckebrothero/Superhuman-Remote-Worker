@@ -49,6 +49,11 @@ except ImportError:
 # in 0016_project_network_tier.sql is the source of truth for valid names.
 DEFAULT_NETWORK_TIER = "internet-only"
 
+# Private control-plane attestation paired with the stable workspace backing
+# generation. Unlike the PVC-backed generation, this value changes whenever
+# Kubernetes replaces the workspace pod.
+WORKSPACE_RUNTIME_INCARNATION_KEY = "_runtime_incarnation"
+
 
 class WorkspaceSSHAuthenticationError(RuntimeError):
     """A K8s-ready workspace rejected the configured SSH identity."""
@@ -381,7 +386,10 @@ class ContainerProvisioner:
                     "pod_name": pod_name,
                     "namespace": self._namespace,
                     **(
-                        {CANVAS_WORKSPACE_GENERATION_KEY: None}
+                        {
+                            CANVAS_WORKSPACE_GENERATION_KEY: None,
+                            WORKSPACE_RUNTIME_INCARNATION_KEY: None,
+                        }
                         if owner.kind == "session"
                         else {}
                     ),
@@ -402,6 +410,7 @@ class ContainerProvisioner:
             pod_ip = await self._wait_for_ready(pod_name, timeout=ready_timeout)
             if pod_ip:
                 canvas_generation = None
+                runtime_incarnation = None
                 if owner.kind == "session" and self._db:
                     try:
                         # Now that sessions can be PVC-backed, this resolves the
@@ -410,7 +419,11 @@ class ContainerProvisioner:
                         # so the Canvas workspace_generation) stops churning on
                         # every pod recreate. A session that predates the PVC
                         # switch re-binds once, from pod UID to PVC UID.
-                        backing_id, fingerprint = await self._trusted_pod_ssh_identity(
+                        (
+                            backing_id,
+                            fingerprint,
+                            trusted_runtime_incarnation,
+                        ) = await self._trusted_pod_ssh_identity(
                             pod_name, pvc_name=pvc_name
                         )
                         binding = await self._db.bind_thread_workspace_backing(
@@ -421,6 +434,8 @@ class ContainerProvisioner:
                         )
                         if binding:
                             canvas_generation = binding.get("workspace_generation")
+                            if canvas_generation:
+                                runtime_incarnation = trusted_runtime_incarnation
                     except Exception:
                         # The workspace remains usable by its agent, but Canvas
                         # file serving fails closed until a trusted binding is
@@ -439,6 +454,7 @@ class ContainerProvisioner:
                     # Pair this endpoint with the exact binding minted above.
                     # A failed/missing bind publishes null and Canvas fails closed.
                     ready_ctx[CANVAS_WORKSPACE_GENERATION_KEY] = canvas_generation
+                    ready_ctx[WORKSPACE_RUNTIME_INCARNATION_KEY] = runtime_incarnation
                 # Hand the agent the STABLE Service DNS (not the ephemeral IP) so
                 # a reattached/recovered pod is reachable at the same address.
                 # The dispatch + resume paths prefer this `host` over `pod_ip`.
@@ -546,7 +562,18 @@ class ContainerProvisioner:
                 owner.id,
             )
             await self._delete_seed_configmap(pod_name)
-            await self._set_context(owner, {"status": "deleted", "pod_ip": None})
+            await self._set_context(
+                owner,
+                {
+                    "status": "deleted",
+                    "pod_ip": None,
+                    **(
+                        {WORKSPACE_RUNTIME_INCARNATION_KEY: None}
+                        if owner.kind == "session"
+                        else {}
+                    ),
+                },
+            )
             # Close the compute-metering interval (Slice 4b) — pod gone, billing
             # stops. Best-effort; the loop's reconciler bounds any missed close.
             await workspace_metering.close_interval(self._db, owner)
@@ -562,7 +589,18 @@ class ContainerProvisioner:
                     owner.kind,
                     owner.id,
                 )
-                await self._set_context(owner, {"status": "deleted", "pod_ip": None})
+                await self._set_context(
+                    owner,
+                    {
+                        "status": "deleted",
+                        "pod_ip": None,
+                        **(
+                            {WORKSPACE_RUNTIME_INCARNATION_KEY: None}
+                            if owner.kind == "session"
+                            else {}
+                        ),
+                    },
+                )
                 await workspace_metering.close_interval(self._db, owner)
                 return True
             logger.error(
@@ -1793,8 +1831,8 @@ class ContainerProvisioner:
 
     async def _trusted_pod_ssh_identity(
         self, pod_name: str, *, pvc_name: str | None = None
-    ) -> tuple[str, str]:
-        """Read pod UID + host-key fingerprint through the K8s control plane."""
+    ) -> tuple[str, str, str]:
+        """Read backing identity, host key, and Pod UID from the control plane."""
 
         if self._core_api is None or k8s_stream is None:
             raise RuntimeError("Kubernetes exec transport is unavailable")
@@ -1803,8 +1841,11 @@ class ContainerProvisioner:
             name=pod_name,
             namespace=self._namespace,
         )
+        runtime_incarnation = str(getattr(pod.metadata, "uid", "") or "")
+        if not runtime_incarnation:
+            raise RuntimeError("workspace pod has no Kubernetes UID")
         backing_kind = "pod"
-        backing_uid = str(getattr(pod.metadata, "uid", "") or "")
+        backing_uid = runtime_incarnation
         if pvc_name:
             claim = await asyncio.to_thread(
                 self._core_api.read_namespaced_persistent_volume_claim,
@@ -1839,7 +1880,11 @@ class ContainerProvisioner:
         )
         if not fingerprint:
             raise RuntimeError("workspace host-key fingerprint was not reported")
-        return f"k8s-{backing_kind}:{self._namespace}:{backing_uid}", fingerprint
+        return (
+            f"k8s-{backing_kind}:{self._namespace}:{backing_uid}",
+            fingerprint,
+            runtime_incarnation,
+        )
 
     async def _set_context(self, owner: WorkspaceOwner, updates: dict) -> None:
         """Atomically merge updates into the workspace context for a job or session."""
