@@ -1201,8 +1201,10 @@ The migration's steady state is **dual control planes** for the whole soak — a
 
 Written against the code on the consolidated `feature/stateless-agents`, not against
 intent. The short version: **the shared substrate is genuinely kind-agnostic;
-the session lane is functionally complete; and the default-off worker driver is
-built end to end on the current shared local pool.** Worker rotation obeys the
+the session lane now accepts exact virtual/none and Kubernetes sandbox
+workspaces; and the default-off worker driver is built end to end on the current
+shared local pool.** S2 sandbox admission passed its fail-closed lifecycle and
+two-pod acceptance gates on 2026-08-11. Worker rotation still obeys the
 2026-08-10 §5.4.5 scope correction: it releases only through `run_queue` and
 never calls `/complete`. The production two-Deployment/KEDA shape, Job Bench
 rollout gate and Gate 3's separate multi-effect completion program remain open.
@@ -1274,11 +1276,12 @@ nowhere in the cockpit. Verified under real BFF-cookie login: a supervised gate
 survived a hard reload and a second tab, was denied over REST, was
 journal-acknowledged, and the tool never executed.
 
-**Still open in S1**: permission-row retirement on lease expiry; stateless
-ended-session wake; Path-A resume-compaction persistence (a live bug — see
-§5.3.3); durable queued-turn UX; control verbs beyond the two scalars;
-metering lease-interval ingestion; the journal coalescing tick; object-store PUT
-fencing; and the §6.1 inventory's durable task/undo/extraction/anchor fixes.
+**Still open after S1/S2**: Path-A resume-compaction persistence; durable
+queued-turn UX; control verbs beyond the two scalars; metering lease-interval
+ingestion; the journal coalescing tick; and server-side conditional object-store
+PUT fencing. S2 closed permission retirement, ended-session wake, durable
+task/undo state, extraction cursor and citation-anchor items from the original
+§6.1 inventory.
 
 **Acceptance — met**: create-to-accepted <1 s; takeover ≤105 s with no duplicate
 answer; the fence assert; FIFO drain across a steal; epoch bump bounds; zero
@@ -1291,24 +1294,46 @@ frame and operator unpark end to end; the tenant A→B residue probe, which need
 a second user identity; and live mid-turn/retention fault injection for the
 control inbox, which is unit-tested rather than cluster-proven.
 
-#### S2 safety gate landed; S3 core worker driver built
+#### S2 sandbox and virtual lifecycle accepted; S3 core worker driver built
 
-**S2** (workspace sessions): the mandatory first fail-closed gate is built and
-k3d-verified. Stateless human input, new durable controls and the internal
-claim-bundle credential boundary admit only exact lite declarations
-(`virtual`/`none`) with no physical sandbox/VM evidence. Admission is rechecked
-on the locked thread row in the same message/control transaction; stale lite
-declarations carrying `workspace_container`, `vm`, or a remote workspace
-binding fail closed. Live workspace/VM upgrades and generic backend mutation
-also refuse stateless rows before provisioning or persistence. A live
-declared-virtual/physically-remote probe returned 409 for input and control with
-message/control/queue counts unchanged. The gate stays until S2 acceptance
-passes. The §6.1 inventory is recorded and corrects the agent-PVC premise, but
-its RAM/path-bypass remediations are not built. The gate-closed SSH/tmux
-handoff substrate is built and directly k3d-verified across two stateless pods:
-environment and cwd survived, and the stale lease token could not mutate the
-successor. The chart supplies the existing read-only workspace SSH key and
-allows only SSH/CDP workspace ingress for the stateless Deployment.
+**S2** (workspace sessions): the fail-closed gate has passed for exact
+Kubernetes sandbox workspaces. Stateless human input, control/interrupt,
+upload, IDE/browser/Canvas and the internal claim-bundle credential boundary
+admit `virtual`/`none` plus a Kubernetes-provisioned `sandbox` only when class,
+binding generation, endpoint generation, runtime incarnation, host-key and
+lifecycle markers are internally consistent. VM, Docker-backed physical,
+protected-cloud, officer/conference, unknown and malformed classes remain
+pinned or fail closed. Admission is rechecked on locked fresh rows at the final
+credential/write boundary. Migration **0133** makes session tasks, the
+memory-extraction cursor and per-path citation anchors durable; the app-schema
+head is now 0133 and 0134–0139 remain unused.
+
+The §6.1 dispositions are now explicit. Tasks hydrate from PostgreSQL on every
+attach. The extraction cursor and citation anchors are durable and lease
+fenced. Sandbox undo uses the Git/turn ledger plus one durable control request
+and receipt; virtual and `none` workspaces reject undo as unsupported rather
+than inventing Git authority. Read-before-write stamps and sync caches stay
+deliberately claim-local, forcing a fresh read after handoff. WebDAV and
+research downloads use operation-scoped staging and write through the
+workspace backend.
+
+Remote-shell ownership is bound to the authoritative backing id, workspace and
+endpoint generations, runtime incarnation, SSH host-key fingerprint and exact
+lease. One durable false-to-true creation attempt owns Pod actuation; every
+continuation and retirement revalidates exact Pod/PVC/ConfigMap/Service
+identity. Soft End retires claimant/resident/shell authority while retaining
+resumable bytes. Permanent End converges snapshots, external resources and DB
+anchors before deleting the thread. Claim loss is absorbing: the reaper parks
+the successor behind the immutable old Pod UID until that exact claimant or an
+exact terminal-runtime observation proves quiescence.
+
+The SSH/tmux handoff substrate is directly k3d-verified across stateless pods:
+environment and cwd survive, while a stale lease cannot mutate the successor.
+The chart supplies the existing read-only workspace SSH key and allows only
+SSH/CDP workspace ingress for the stateless Deployment. The remote tmux,
+rclone and overlay markers remain writable by the workload user; this is an
+accepted cooperative correctness protocol for sandbox v1, not a security
+boundary against hostile same-user workspace code.
 
 The §3.3 cloud sync-generation fence is also built and two-pod verified for the
 fallback push/pull driver. Migrations **0122–0124** bind a stable cloud scope,
@@ -1425,14 +1450,56 @@ remain blocked on that boundary; Canvas revision snapshots, a pending-citation
 sweeper and orchestrator-derived notifications are separable future slices,
 but were not started after the stop condition triggered.
 
-This still does **not** remove the tier gate. Browser unload and ordinary
-**Duplicate Tab** retain the accepted awareness limitations, and the full
-rendered two-editor Monaco UX plus native EventSource auth-expiry recovery remain
-unverified. Durable Canvas mutation invalidations, the generic outbox,
-workspace/runtime-incarnation authority, durable terminal-retirement
-acknowledgement and the deferred §6.1 RAM/path-bypass work remain open. None of
-the direct proofs changed a sandbox thread's lane or created a worker batch.
-The S2 sandbox tier gate remains **closed**.
+**Final S2 verification and live acceptance.** Repository-wide pytest completed
+in **843.10 s** with **16,681 passed / 156 skipped / 11 established environment
+failures / 53 warnings**. Ruff check and format check covered **1,092 files**;
+both Helm value sets passed. The app schema replay applied all **133** migrations
+(115 transactional plus 18 non-transactional), reproduced the **13,125-line**
+snapshot, and passed 141 changed-SQL plus 3 ordering tests. Cockpit passed
+**1,835 tests in 119 files**, its production build, and the **2,455-key** i18n
+check.
+
+The final sandbox fixture crossed two stateless executors with four tmux
+windows, cwd/environment/files, two durable tasks and exact PVC bytes intact.
+One undo request produced one receipt and restored the first of two 40-character
+Git states. One hard interrupt produced one receipt and zero forbidden
+successor answers. Safe workspace replacement retired UID 1 and created UID 2;
+soft End/Resume created UID 3 over the same PVC. Soft End at token 13 resumed
+exactly once at token 14. Permanent End at token 15 failed closed twice with
+503 while physical/auxiliary retirement converged, then returned 200. All 28
+`thread_id` relations, queue, Kubernetes resources, snapshot/virtual prefixes
+and repository were zero or absent afterward.
+
+A fresh virtual fixture persisted a 15-byte upload, completed exact turns at
+tokens 1 and 3 around soft End/Resume, retained four durable messages, and then
+permanently deleted. All **31** checked application relations, object prefix,
+repository and Kubernetes fixture resources were zero; public state returned
+404. A natural SIGTERM fixture delivered the signal to Python PID 1, kept its
+heartbeat through bounded completion, and committed exactly one answer after
+**99 s**. Its queue finished `done` at token 1 with
+`input_seq=consumed_seq=2662` and no loss/hold. A rollback-only real-PostgreSQL
+proof then materialized eviction provenance and restored a parked hold to
+queued in **5.0 ms**, preserving token, attempts, `run_after` and `queued_at`;
+rollback residue was zero.
+
+Failure injection drove the final repairs: fenced resource scripts run under
+Bash (`4594ea50`); rclone drain parsing, SFTP closure and retirement retry are
+strict (`f5c4a471`); parked rows retain their non-null retry deadline
+(`d4ed907e`); claim-loss JSON paths bind canonical text (`d34ada8f`); the Helm
+command `exec`s Python as PID 1 (`5e60a644`); eviction provenance is created
+before Pod deletion (`77d6909a`); and JSON-held deadlines cross asyncpg through
+explicit text-to-timestamp casts (`e17418bd`).
+
+**Residuals.** Public End's exact final-memory tail still needs a durable
+same-transaction effect/outbox; the five-turn interval can omit the final
+**0–4 turns** after a crash. The generic outbox, durable Canvas mutation
+invalidations, full two-editor Monaco/auth-expiry UX, and server-side
+conditional object-store writes remain open. Passing the displayed tool-call
+`id` rather than the UUID `approval_id` still returns 500 (P2 validation debt).
+A pinned parity run exposed pre-existing pinned snapshot/agent-retention debt;
+the exact disposable artifacts were removed, but the general pinned cleanup
+path is unchanged. These residuals do not reopen S2 sandbox admission. S3
+worker admission remains default off.
 
 **S3** (workers): the core lane is now built, but remains **default off** in the
 chart. Gate 1's migration **0118** still gives every job exactly one claim
@@ -1500,10 +1567,11 @@ verification critic sweep uses the same stateless hard-close and strict-prune
 path, so a parent cannot unblock while critic cleanup is merely pending.
 
 **Schema and remaining work.** This driver required **no migration**. App-schema
-head remains **0132**; none of the owned 0133–0139 range was created. Gate 3
-step 2 is deliberately absent: there is no command table, polymorphic effect
-table, completion high-water mark or finalizer. That multi-effect completion
-program remains an independent reliability residual for both lanes. Also
+head is now **0133**, owned by the completed S2 durable-session-state slice;
+none of the remaining 0134–0139 range was created. Gate 3 step 2 is deliberately
+absent: there is no command table, polymorphic effect table, completion
+high-water mark or finalizer. That multi-effect completion program remains an
+independent reliability residual for both lanes. Also
 unbuilt are §5.8's production two-Deployment/KEDA split, per-claim job-log
 capture, the §10.2 job-journal decision and the Job Bench performance/rollout
 gate. The current single-pool proof cannot guarantee interactive capacity
