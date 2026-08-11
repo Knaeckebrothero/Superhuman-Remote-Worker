@@ -70,6 +70,8 @@ class _ControlConn:
         reciprocal: int | None = None,
         queue_state: str | None = None,
         queue_kind: str = "session_turn",
+        input_seq: int | None = None,
+        consumed_seq: int | None = None,
         stranded_pinned: int | None = None,
         baseline_input_seq: int = 0,
         recorded_queue_state: str = "queued",
@@ -80,6 +82,8 @@ class _ControlConn:
         self.reciprocal = reciprocal
         self.queue_state = queue_state
         self.queue_kind = queue_kind
+        self.input_seq = input_seq
+        self.consumed_seq = consumed_seq
         self.stranded_pinned = stranded_pinned
         self.baseline_input_seq = baseline_input_seq
         self.recorded_queue_state = recorded_queue_state
@@ -103,7 +107,12 @@ class _ControlConn:
         if "FROM run_queue" in sql:
             if self.queue_state is None:
                 return None
-            return {"unit_kind": self.queue_kind, "state": self.queue_state}
+            return {
+                "unit_kind": self.queue_kind,
+                "state": self.queue_state,
+                "input_seq": self.input_seq,
+                "consumed_seq": self.consumed_seq,
+            }
         raise AssertionError(f"unexpected fetchrow query: {sql}")
 
     async def fetchval(self, sql: str, *args):
@@ -178,6 +187,24 @@ def test_public_control_envelope_rejects_invalid_method_mode_or_request_id(paylo
 
     with pytest.raises(ValidationError):
         orchestrator_main.ThreadControlRequest.model_validate(payload)
+
+
+def test_public_workspace_undo_envelope_has_empty_canonical_payload():
+    import main as orchestrator_main
+
+    body = orchestrator_main.ThreadControlRequest(
+        client_request_id=CLIENT_REQUEST_ID,
+        method="workspace.undo",
+    )
+    assert body.mode is None
+    assert body.control_payload() == {}
+
+    with pytest.raises(ValidationError, match="does not accept a mode"):
+        orchestrator_main.ThreadControlRequest(
+            client_request_id=CLIENT_REQUEST_ID,
+            method="workspace.undo",
+            mode="auto",
+        )
 
 
 @pytest.mark.asyncio
@@ -305,7 +332,7 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
 
 
 @pytest.mark.asyncio
-async def test_control_endpoint_refuses_new_non_lite_stateless_request():
+async def test_control_endpoint_refuses_unattested_stateless_sandbox_request():
     import main as orchestrator_main
 
     thread = {
@@ -341,8 +368,62 @@ async def test_control_endpoint_refuses_new_non_lite_stateless_request():
             )
 
     assert exc.value.status_code == 409
-    assert "virtual/none" in str(exc.value.detail)
+    assert "attested Kubernetes sandbox" in str(exc.value.detail)
     admit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_control_endpoint_admits_lane_free_workspace_undo_payload():
+    import main as orchestrator_main
+
+    thread = {
+        "id": THREAD_ID,
+        "user_id": OWNER_ID,
+        "project_id": PROJECT_ID,
+        "execution_lane": "stateless",
+        "metadata": {"config_override": {"workspace": {"backend": "sandbox"}}},
+    }
+    admitted = AdmittedControl(
+        id=REQUEST_ID,
+        request_seq=8,
+        client_request_id=CLIENT_REQUEST_ID,
+        verb="workspace.undo",
+        state="pending",
+        duplicate=False,
+    )
+    admit = AsyncMock(return_value=admitted)
+    gate = MagicMock(return_value="sandbox")
+    with (
+        patch.object(
+            orchestrator_main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"id": OWNER_ID}, thread)),
+        ),
+        patch.object(
+            orchestrator_main,
+            "find_existing_thread_control",
+            AsyncMock(return_value=None),
+        ) as find_existing,
+        patch.object(orchestrator_main, "_require_stateless_workspace", gate),
+        patch.object(orchestrator_main, "_enforce_session_create_grants") as grants,
+        patch.object(orchestrator_main, "admit_thread_control", admit),
+        patch.object(orchestrator_main, "log_security_event", AsyncMock()),
+    ):
+        response = await orchestrator_main.submit_thread_control(
+            str(THREAD_ID),
+            orchestrator_main.ThreadControlRequest(
+                client_request_id=CLIENT_REQUEST_ID,
+                method="workspace.undo",
+            ),
+            MagicMock(),
+        )
+
+    assert response["method"] == "workspace.undo"
+    assert response["state"] == "pending"
+    gate.assert_called_once_with(thread)
+    grants.assert_not_called()
+    assert find_existing.await_args.kwargs["payload"] == {}
+    assert admit.await_args.kwargs["payload"] == {}
 
 
 @pytest.mark.asyncio
@@ -678,7 +759,7 @@ async def test_locked_stateless_workspace_refusal_precedes_every_admission_write
         queue_state="done",
     )
 
-    with pytest.raises(ControlAdmissionError, match="virtual/none"):
+    with pytest.raises(ControlAdmissionError, match="workspace binding"):
         await admit_thread_control(
             _ControlDB(conn),
             thread_id=THREAD_ID,
@@ -693,6 +774,38 @@ async def test_locked_stateless_workspace_refusal_precedes_every_admission_write
     assert len(locked_read) == 1
     assert "metadata" in locked_read[0][1]
     assert "FOR UPDATE" in locked_read[0][1]
+    assert not _calls(conn, "fetchrow", "FROM run_queue")
+    assert not [call for call in conn.calls if call[0] in {"execute", "fetchval"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("class_flag", ["enabled", "conference"])
+async def test_locked_stateless_session_class_refusal_precedes_every_write(class_flag):
+    """The locked materialized class bits, not route preflight, are authority."""
+
+    conn = _ControlConn(
+        thread=_thread(
+            metadata={
+                "config_override": {
+                    "workspace": {"backend": "virtual"},
+                    "officer": {class_flag: True},
+                }
+            }
+        ),
+        queue_state="done",
+    )
+
+    with pytest.raises(ControlAdmissionError, match="session class"):
+        await admit_thread_control(
+            _ControlDB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="narration.set",
+            payload={"mode": "verbose"},
+            requested_by=str(OWNER_ID),
+        )
+
     assert not _calls(conn, "fetchrow", "FROM run_queue")
     assert not [call for call in conn.calls if call[0] in {"execute", "fetchval"}]
 
@@ -949,4 +1062,179 @@ async def test_stateless_admission_refuses_pending_pinned_generation():
             requested_by=str(OWNER_ID),
         )
 
+    assert not [call for call in conn.calls if call[0] == "execute"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_undo_admits_only_idle_stateless_sandbox():
+    conn = _ControlConn(
+        thread=_thread(
+            metadata={"config_override": {"workspace": {"backend": "sandbox"}}}
+        ),
+        queue_state="done",
+        baseline_input_seq=21,
+    )
+
+    with patch(
+        "orchestrator.services.thread_control_inbox.stateless_lite_workspace_check",
+        return_value=("sandbox", None),
+    ):
+        result = await admit_thread_control(
+            _ControlDB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="workspace.undo",
+            payload={},
+            requested_by=str(OWNER_ID),
+        )
+
+    assert result.verb == "workspace.undo"
+    inserts = _calls(conn, "fetchval", "INSERT INTO thread_control_requests")
+    assert len(inserts) == 1
+    assert inserts[0][2][3:5] == ("workspace.undo", "{}")
+    assert _calls(conn, "fetchval", "control_input_seq = GREATEST")
+
+
+@pytest.mark.asyncio
+async def test_workspace_undo_refuses_live_turn_before_any_write():
+    conn = _ControlConn(
+        thread=_thread(
+            metadata={"config_override": {"workspace": {"backend": "sandbox"}}}
+        ),
+        queue_state="leased",
+    )
+
+    with (
+        patch(
+            "orchestrator.services.thread_control_inbox.stateless_lite_workspace_check",
+            return_value=("sandbox", None),
+        ),
+        pytest.raises(ControlAdmissionNotReady, match="completing a turn"),
+    ):
+        await admit_thread_control(
+            _ControlDB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="workspace.undo",
+            payload={},
+            requested_by=str(OWNER_ID),
+        )
+
+    assert not [call for call in conn.calls if call[0] == "execute"]
+    assert not _calls(conn, "fetchval", "INSERT INTO thread_control_requests")
+
+
+@pytest.mark.asyncio
+async def test_workspace_undo_cannot_overtake_earlier_human_input():
+    conn = _ControlConn(
+        thread=_thread(
+            metadata={"config_override": {"workspace": {"backend": "sandbox"}}}
+        ),
+        queue_state="queued",
+        input_seq=22,
+        consumed_seq=21,
+    )
+
+    with (
+        patch(
+            "orchestrator.services.thread_control_inbox.stateless_lite_workspace_check",
+            return_value=("sandbox", None),
+        ),
+        pytest.raises(ControlAdmissionNotReady, match="pending input"),
+    ):
+        await admit_thread_control(
+            _ControlDB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="workspace.undo",
+            payload={},
+            requested_by=str(OWNER_ID),
+        )
+
+    assert not [call for call in conn.calls if call[0] == "execute"]
+    assert not _calls(conn, "fetchval", "INSERT INTO thread_control_requests")
+
+
+@pytest.mark.asyncio
+async def test_workspace_undo_allows_queued_control_only_row():
+    conn = _ControlConn(
+        thread=_thread(
+            metadata={"config_override": {"workspace": {"backend": "sandbox"}}}
+        ),
+        queue_state="queued",
+        input_seq=21,
+        consumed_seq=21,
+        baseline_input_seq=21,
+    )
+
+    with patch(
+        "orchestrator.services.thread_control_inbox.stateless_lite_workspace_check",
+        return_value=("sandbox", None),
+    ):
+        result = await admit_thread_control(
+            _ControlDB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="workspace.undo",
+            payload={},
+            requested_by=str(OWNER_ID),
+        )
+
+    assert result.verb == "workspace.undo"
+    assert _calls(conn, "fetchval", "INSERT INTO thread_control_requests")
+
+
+@pytest.mark.asyncio
+async def test_workspace_undo_fails_closed_for_virtual_and_pinned_lanes():
+    virtual = _ControlConn(thread=_thread(), queue_state="done")
+    with pytest.raises(ControlAdmissionError, match="only for sandbox"):
+        await admit_thread_control(
+            _ControlDB(virtual),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="workspace.undo",
+            payload={},
+            requested_by=str(OWNER_ID),
+        )
+
+    pinned = _ControlConn(
+        thread=_thread(execution_lane="pinned", agent_id=AGENT_ID),
+        reciprocal=1,
+    )
+    with pytest.raises(ControlAdmissionError, match="live session transport"):
+        await admit_thread_control(
+            _ControlDB(pinned),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="workspace.undo",
+            payload={},
+            requested_by=str(OWNER_ID),
+        )
+
+    assert not [call for call in virtual.calls if call[0] == "execute"]
+    assert not [call for call in pinned.calls if call[0] == "execute"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_undo_payload_is_rechecked_inside_locked_admission():
+    conn = _ControlConn(thread=_thread(), queue_state="done")
+
+    with pytest.raises(ControlAdmissionError, match="does not accept"):
+        await admit_thread_control(
+            _ControlDB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="workspace.undo",
+            payload={"mode": "auto"},
+            requested_by=str(OWNER_ID),
+        )
+
+    assert not _calls(conn, "fetchrow", "FROM run_queue")
     assert not [call for call in conn.calls if call[0] == "execute"]

@@ -7,10 +7,12 @@ result through its in-process journal allocator, and only then calls the
 terminalizer here.
 
 The request has no transient ``claimed`` state. A crash before the result event
-leaves it pending and safe to retry (the shipped verbs are idempotent scalar
-assignments). A crash after the event commit is recovered through the unique
+leaves it pending and safe to retry. Scalar assignments are naturally
+idempotent; workspace undo carries its request UUID in the resulting Git commit
+so a successor can recognize the already-applied effect. A crash after the
+event commit is recovered through the unique
 ``thread_events.control_request_id`` receipt without journaling a second time;
-the new owner re-converges its in-memory scalar before terminalization.
+the new owner re-converges any in-memory scalar before terminalization.
 """
 
 from __future__ import annotations
@@ -252,15 +254,49 @@ def control_receipt_result(
         receipt_request_seq = int(event_payload.get("request_seq"))
     except (TypeError, ValueError):
         return None
+    envelope_matches = (
+        str(event_payload.get("request_id") or "") == str(request_id)
+        and str(event_payload.get("client_request_id") or "") == str(client_request_id)
+        and receipt_request_seq == int(request_seq)
+        and str(event_payload.get("method") or "") == verb
+    )
+
+    # ``workspace.undo`` is a non-scalar control effect. Its durable journal
+    # receipt is still validated through the same closed verb mapping before
+    # terminalization can advance the stateless control watermark. Full Git
+    # object IDs are accepted for both SHA-1 and SHA-256 repositories.
+    if verb == "workspace.undo":
+        request_payload = _json_object(request_payload)
+        paths = event_payload.get("paths")
+        restored_to_sha = event_payload.get("restored_to_sha")
+        restore_commit_sha = event_payload.get("restore_commit_sha")
+
+        def _git_oid(value: Any) -> bool:
+            return (
+                isinstance(value, str)
+                and len(value) in {40, 64}
+                and all(char in "0123456789abcdef" for char in value)
+            )
+
+        def _workspace_path(value: Any) -> bool:
+            if not isinstance(value, str) or not value or "\x00" in value:
+                return False
+            return not value.startswith("/") and ".." not in value.split("/")
+
+        if (
+            event_kind == "files.restored"
+            and envelope_matches
+            and request_payload == {}
+            and isinstance(paths, list)
+            and all(_workspace_path(path) for path in paths)
+            and len(paths) == len(set(paths))
+            and _git_oid(restored_to_sha)
+            and _git_oid(restore_commit_sha)
+        ):
+            return "applied", None, None
+
     error_code = str(event_payload.get("error_code") or "")
-    if (
-        event_kind != "control.rejected"
-        or str(event_payload.get("request_id") or "") != str(request_id)
-        or str(event_payload.get("client_request_id") or "") != str(client_request_id)
-        or receipt_request_seq != int(request_seq)
-        or str(event_payload.get("method") or "") != verb
-        or not error_code
-    ):
+    if event_kind != "control.rejected" or not envelope_matches or not error_code:
         return None
     return "rejected", error_code, None
 

@@ -351,10 +351,13 @@ data:
   # set checkpointer.backend=sqlite to fall back to the legacy pod-local store.
   CHECKPOINTER_BACKEND: {{ .Values.checkpointer.backend | default "postgres" | quote }}
 
-  # Stateless worker jobs are a separately gated lane. Enabling the generic
-  # stateless executor pool for session turns must not silently move worker
-  # jobs off the pinned dispatcher. Agents inherit these keys via envFrom;
-  # the orchestrator references them explicitly from this same ConfigMap.
+  # The generic stateless executor gate is also the session-admission gate.
+  # Keeping one rendered value prevents admission without an executor pool.
+  # Worker jobs remain separately gated so enabling stateless sessions cannot
+  # silently move jobs off the pinned dispatcher. Agents inherit these keys
+  # via envFrom; the orchestrator references them explicitly from this same
+  # ConfigMap.
+  STATELESS_SESSION_ENABLED: {{ .Values.agent.stateless.enabled | default false | quote }}
   STATELESS_WORKER_ENABLED: {{ .Values.agent.stateless.worker.enabled | default false | quote }}
   WORKER_BATCH_MIN_WALL_SECONDS: {{ .Values.agent.stateless.worker.batchMinWallSeconds | default 300 | quote }}
 

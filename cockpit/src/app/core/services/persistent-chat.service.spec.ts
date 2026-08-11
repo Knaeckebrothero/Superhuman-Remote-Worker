@@ -2613,6 +2613,25 @@ describe('PersistentChatService — control commands', () => {
         return ctx;
     }
 
+    async function readySocketlessSession(threadId = 'thread-socketless-undo') {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation((url: string) =>
+            url.endsWith('/connection')
+                ? of({
+                    state: 'ready',
+                    control_socket: 'none',
+                    ws_url: null,
+                    token: null,
+                    expires_at: null,
+                })
+                : activeSessionGet(url),
+        );
+        await ctx.service.connect(threadId);
+        fireSseOpen(ctx.sseInstances[0]);
+        ctx.mockHttp.post.mockClear();
+        return ctx;
+    }
+
     it('approveAll() sends {method: "approve"} over the control WS', async () => {
         const ctx = await readySession();
         // Stage a pending permission so approveAll() has something to clear.
@@ -2753,11 +2772,109 @@ describe('PersistentChatService — control commands', () => {
         expect(sent).toContainEqual({method: 'archive'});
     });
 
-    it('/undo sends undo', async () => {
+    it('/undo preserves the pinned legacy WebSocket transport exactly', async () => {
         const ctx = await readySession();
+        ctx.mockHttp.post.mockClear();
         await ctx.service.sendMessage('/undo');
         const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
         expect(sent).toContainEqual({method: 'undo'});
+        expect(ctx.mockHttp.post.mock.calls.some((call: any[]) =>
+            String(call[0]).endsWith('/controls'),
+        )).toBe(false);
+    });
+
+    it('/undo submits workspace.undo through REST for a socketless session', async () => {
+        const ctx = await readySocketlessSession();
+
+        await ctx.service.sendMessage('/undo');
+
+        expect(ctx.wsInstances).toHaveLength(0);
+        expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringMatching(
+                /\/persistent\/threads\/thread-socketless-undo\/controls$/,
+            ),
+            {
+                method: 'workspace.undo',
+                client_request_id: expect.any(String),
+            },
+        );
+    });
+
+    it('/undo retries an ambiguous socketless admission with the same UUID', async () => {
+        vi.useFakeTimers();
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const ctx = await readySocketlessSession('thread-undo-retry');
+        try {
+            ctx.mockHttp.post
+                .mockReturnValueOnce(throwError(() => ({status: 0})))
+                .mockReturnValueOnce(of({accepted: true, duplicate: true}));
+
+            await ctx.service.sendMessage('/undo');
+            const firstRequest = ctx.mockHttp.post.mock.calls[0][1];
+            await vi.advanceTimersByTimeAsync(250);
+
+            expect(ctx.mockHttp.post).toHaveBeenCalledTimes(2);
+            expect(ctx.mockHttp.post.mock.calls[1][1]).toEqual(firstRequest);
+            expect(firstRequest).toMatchObject({method: 'workspace.undo'});
+        } finally {
+            ctx.service.disconnect();
+            warn.mockRestore();
+            vi.useRealTimers();
+        }
+    });
+
+    it('/undo clears only its request-correlated durable acknowledgement', async () => {
+        const ctx = await readySocketlessSession('thread-undo-ack');
+        await ctx.service.sendMessage('/undo');
+        const requestId = ctx.mockHttp.post.mock.calls[0][1].client_request_id;
+        expect((ctx.service as any).durableControlAwaitingAck.size).toBe(1);
+
+        fireSseMessage(ctx.sseInstances[0], {
+            method: 'files.restored',
+            params: {
+                method: 'workspace.undo',
+                client_request_id: crypto.randomUUID(),
+                paths: ['unrelated.txt'],
+            },
+        }, '1:2');
+        expect((ctx.service as any).durableControlAwaitingAck.size).toBe(1);
+
+        fireSseMessage(ctx.sseInstances[0], {
+            method: 'files.restored',
+            params: {
+                method: 'workspace.undo',
+                client_request_id: requestId,
+                paths: ['restored.txt'],
+            },
+        }, '1:3');
+        expect((ctx.service as any).durableControlAwaitingAck.size).toBe(0);
+    });
+
+    it('/undo never coalesces repeated socketless operations', async () => {
+        const ctx = await readySocketlessSession('thread-undo-fifo');
+        const firstAdmission = new Subject<Record<string, unknown>>();
+        ctx.mockHttp.post
+            .mockReturnValueOnce(firstAdmission.asObservable())
+            .mockReturnValue(of({accepted: true}));
+
+        await ctx.service.sendMessage('/undo');
+        await ctx.service.sendMessage('/undo');
+        await ctx.service.sendMessage('/undo');
+
+        expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+        const queued = (ctx.service as any).durableControlOutbox.map(
+            (item: any) => item.request,
+        );
+        expect(queued.map((request: any) => request.method)).toEqual([
+            'workspace.undo',
+            'workspace.undo',
+            'workspace.undo',
+        ]);
+        expect(new Set(queued.map((request: any) => request.client_request_id)).size)
+            .toBe(3);
+
+        firstAdmission.next({accepted: true});
+        expect(ctx.mockHttp.post).toHaveBeenCalledTimes(3);
     });
 
     it('/upgrade-workspace defaults to the sandbox tier', async () => {
@@ -3230,12 +3347,37 @@ describe('PersistentChatService — control WS frame filtering', () => {
                 turn_count: 1,
                 model: 'claude-opus-4-7',
                 temperature: 0.5,
+                tasks: [{
+                    id: 'task_9',
+                    description: 'Hydrated by the pinned owner',
+                    status: 'pending',
+                    priority: 'medium',
+                    notes: '',
+                    created_at: '2026-08-10T10:00:00+00:00',
+                    completed_at: null,
+                }],
             },
         });
 
         expect(service.sessionReady()).toBe(true);
         expect(service.permissionMode()).toBe('manual');
         expect(service.modelName()).toBe('claude-opus-4-7');
+        expect(service.tasks().map((task) => task.id)).toEqual(['task_9']);
+
+        // Rolling-deploy/metadata-only welcomes omit tasks. Absence is not an
+        // instruction to erase the newer authoritative list.
+        fireWsFrame(wsInstances[0], {
+            method: 'session.state',
+            params: {thread_id: 'thread-status', turn_count: 1},
+        });
+        expect(service.tasks().map((task) => task.id)).toEqual(['task_9']);
+
+        // An explicit empty list is authoritative.
+        fireWsFrame(wsInstances[0], {
+            method: 'session.state',
+            params: {thread_id: 'thread-status', tasks: []},
+        });
+        expect(service.tasks()).toEqual([]);
     });
 
     it('clears a stale "Agent not ready" error once session.state arrives', async () => {
@@ -3441,6 +3583,125 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
             String(c[0]).endsWith('/api/sessions/socketless/connection'),
         );
         expect(connectionGets).toHaveLength(1);
+    });
+
+    it('hydrates stateless tasks that are older than the SSE replay floor', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [of({
+                    state: 'ready',
+                    control_socket: 'none',
+                    ws_url: null,
+                    token: null,
+                    expires_at: null,
+                })],
+                sessionState: {
+                    thread_id: 'socketless-tasks',
+                    permission_mode: 'supervised',
+                    narration_mode: 'auto',
+                    turn_count: 8,
+                    turn_in_flight: false,
+                    message_count: 16,
+                    model: null,
+                    temperature: null,
+                    running_tool: null,
+                    pending_permissions: [],
+                    tasks: [{
+                        id: 'task_3',
+                        description: 'Survive the pod handoff',
+                        status: 'in_progress',
+                        priority: 'high',
+                        notes: 'created before the replay window',
+                        created_at: '2026-08-10T08:30:00+00:00',
+                        completed_at: null,
+                    }],
+                    event_cursor: {epoch: 5, seq: 80},
+                    replay_cursor: {epoch: 5, seq: 72},
+                    snapshot_source: 'durable_journal',
+                },
+            }),
+        );
+
+        await ctx.service.connect('socketless-tasks');
+
+        expect(ctx.service.tasks()).toEqual([{
+            id: 'task_3',
+            description: 'Survive the pod handoff',
+            status: 'in_progress',
+            priority: 'high',
+            notes: 'created before the replay window',
+            created_at: '2026-08-10T08:30:00+00:00',
+            completed_at: null,
+        }]);
+        expect(ctx.sseInstances[0].url).toContain('last_event_id=5%3A72');
+        expect(ctx.wsInstances).toHaveLength(0);
+    });
+
+    it('keeps snapshot tasks across covered replay and applies the live suffix', async () => {
+        const ctx = createService();
+        const task = (
+            status: 'pending' | 'in_progress' | 'completed',
+            notes: string,
+        ) => ({
+            id: 'task_5',
+            description: 'Fence task replay',
+            status,
+            priority: 'high',
+            notes,
+            created_at: '2026-08-10T08:30:00+00:00',
+            completed_at: status === 'completed'
+                ? '2026-08-10T09:00:00+00:00'
+                : null,
+        });
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [of({
+                    state: 'ready',
+                    control_socket: 'none',
+                    ws_url: null,
+                    token: null,
+                    expires_at: null,
+                })],
+                sessionState: {
+                    thread_id: 'socketless-task-fence',
+                    permission_mode: 'supervised',
+                    narration_mode: 'auto',
+                    turn_count: 10,
+                    turn_in_flight: false,
+                    message_count: 20,
+                    model: null,
+                    temperature: null,
+                    running_tool: null,
+                    pending_permissions: [],
+                    tasks: [task('completed', 'snapshot at seq 100')],
+                    event_cursor: {epoch: 6, seq: 100},
+                    replay_cursor: {epoch: 6, seq: 90},
+                    snapshot_source: 'durable_journal',
+                },
+            }),
+        );
+
+        await ctx.service.connect('socketless-task-fence');
+        expect(ctx.service.tasks()).toEqual([
+            task('completed', 'snapshot at seq 100'),
+        ]);
+
+        fireSseMessage(ctx.sseInstances[0], {
+            method: 'tasks.updated',
+            params: {tasks: [task('pending', 'stale replay at seq 95')]},
+        }, '6:95');
+        expect(ctx.service.tasks()).toEqual([
+            task('completed', 'snapshot at seq 100'),
+        ]);
+
+        fireSseMessage(ctx.sseInstances[0], {
+            method: 'tasks.updated',
+            params: {tasks: [task('in_progress', 'live update at seq 101')]},
+        }, '6:101');
+        expect(ctx.service.tasks()).toEqual([
+            task('in_progress', 'live update at seq 101'),
+        ]);
     });
 
     it('keeps a socketless session unready when its REST state cannot be loaded', async () => {

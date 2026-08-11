@@ -263,8 +263,6 @@ class PersistentSession:
     # Session task manager (lightweight in-session todos)
     session_task_manager: Optional[Any] = None
 
-    # File checkpoints for undo (turn_id -> list of snapshots)
-    file_checkpoints: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict)
     # Exact hashes of companion-skill files this runtime created. The persisted
     # manifest carries the same ownership proof across session-agent restarts.
     _managed_canvas_skill_files: Dict[str, str] = field(default_factory=dict)
@@ -407,6 +405,7 @@ class PersistentSession:
         await self._setup_workspace(
             workspace_override=workspace_override, git_remote_url=git_remote_url
         )
+        await self._seed_workspace_baseline_commit(postgres_conn)
         _steps["workspace"] = time.perf_counter() - _t
         _t = time.perf_counter()
 
@@ -449,6 +448,7 @@ class PersistentSession:
 
         # 5. Create tool context and load tools
         self._setup_tools(postgres_conn)
+        await self._hydrate_durable_session_state()
         _steps["tools"] = time.perf_counter() - _t
         _t = time.perf_counter()
 
@@ -488,6 +488,56 @@ class PersistentSession:
             " ".join(f"{k}={v:.2f}s" for k, v in _steps.items() if v >= 0.01),
             self._drain_store_stats(),
         )
+
+    async def _seed_workspace_baseline_commit(self, postgres_conn: Any) -> None:
+        """Seed seq=0 with the Git HEAD visible before the first turn.
+
+        The row is create-once in Postgres, so every later pod observes the
+        same pre-first-turn baseline.  Stateless sandbox attach fails closed
+        when an active Git workspace cannot durably publish that baseline;
+        pinned sessions retain their historical best-effort setup behavior.
+        Git-disabled virtual/none workspaces intentionally have no baseline
+        and their undo surface remains unavailable.
+        """
+
+        git_manager = getattr(self.workspace_manager, "git_manager", None)
+        if git_manager is None or not git_manager.is_active:
+            return
+
+        try:
+            if postgres_conn is None:
+                raise RuntimeError("Postgres is unavailable for workspace baseline")
+            commit_sha = await asyncio.to_thread(git_manager.get_current_commit)
+            if not commit_sha:
+                raise RuntimeError("Git HEAD is unavailable for workspace baseline")
+            await postgres_conn.seed_workspace_baseline_commit(
+                self.thread_id,
+                commit_sha,
+            )
+            # Reconcile the current durable HEAD to the latest transcript seq
+            # on every attach.  This heals the crash window where a prior pod
+            # pushed a turn/undo commit but died before its ledger upsert.  On
+            # the first attach it simply records the same baseline beside the
+            # already accepted user row; seq=0 remains the immutable fallback.
+            await postgres_conn.record_turn_commit(self.thread_id, commit_sha)
+            logger.debug(
+                "Workspace baseline/head are durable: thread=%s commit=%s",
+                self.thread_id,
+                commit_sha,
+            )
+        except Exception:
+            if self.shell_owner_token is not None:
+                logger.error(
+                    "Stateless workspace baseline seed failed: thread=%s",
+                    self.thread_id,
+                    exc_info=True,
+                )
+                raise
+            logger.warning(
+                "Pinned workspace baseline seed skipped after failure: thread=%s",
+                self.thread_id,
+                exc_info=True,
+            )
 
     def _unwrapped_backend(self, backend: Any = None) -> Any:
         """The real backend behind any virtual overlay wrapper."""
@@ -1493,7 +1543,10 @@ class PersistentSession:
         # Initialize session task manager
         from ..managers.session_tasks import SessionTaskManager
 
-        self.session_task_manager = SessionTaskManager()
+        self.session_task_manager = SessionTaskManager(
+            thread_id=self.thread_id,
+            postgres=postgres_conn,
+        )
 
         self.tool_context = ToolContext(
             workspace_manager=self.workspace_manager,
@@ -1518,12 +1571,41 @@ class PersistentSession:
         if self.project_ids:
             self.tool_context.project_ids = self.project_ids
 
-        # Wire file checkpoint callback for undo support
-        self.tool_context._snapshot_callback = lambda path: self.snapshot_file(
-            path, self.turn_count
-        )
+        if postgres_conn is not None:
+
+            async def _persist_cloud_anchor(
+                workspace_path: str, anchor: Dict[str, Any]
+            ) -> None:
+                await postgres_conn.upsert_thread_cloud_anchor(
+                    self.thread_id,
+                    workspace_path,
+                    anchor,
+                )
+
+            self.tool_context.cloud_anchor_persist_callback = _persist_cloud_anchor
 
         self._load_tools_for_backend()
+
+    async def _hydrate_durable_session_state(self) -> None:
+        """Restore migration-0133 state before this claimant serves tools.
+
+        The in-process objects are only claim-local views.  Failing setup is
+        safer than silently starting with an empty task list or missing cloud
+        provenance: both would make a healthy pod handoff look like data loss.
+        """
+
+        if self.session_task_manager is not None:
+            await self.session_task_manager.hydrate()
+        if self.postgres_conn is None or self.tool_context is None:
+            return
+        anchors = await self.postgres_conn.list_thread_cloud_anchors(self.thread_id)
+        for workspace_path, anchor in anchors.items():
+            self.tool_context.record_cloud_anchor(workspace_path, anchor)
+        logger.info(
+            "Restored cloud citation anchors: thread=%s anchors=%d",
+            self.thread_id,
+            len(anchors),
+        )
 
     @staticmethod
     def _runtime_backend_id(backend: Any) -> str | None:
@@ -2203,49 +2285,41 @@ class PersistentSession:
         bound_tools = apply_guardrails_to_tools(self.tools, model=self.config.llm.model)
         self.llm_with_tools = self._llm.bind_tools(bound_tools, **bind_kwargs)
 
-    # --- File checkpoints / undo ---
+    # --- Durable workspace undo ---
 
-    def snapshot_file(self, path: str, turn_id: int) -> None:
-        """Record original file content before a write/edit for undo."""
-        import time
+    async def undo_turn(
+        self,
+        turn_id: Optional[int] = None,
+        *,
+        control_request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Restore the preceding Git/turn-ledger workspace checkpoint.
 
-        if turn_id not in self.file_checkpoints:
-            self.file_checkpoints[turn_id] = []
-        # Don't snapshot same file twice in one turn
-        if any(cp["path"] == path for cp in self.file_checkpoints[turn_id]):
-            return
-        try:
-            content = self.workspace_manager.read_file(path)
-        except (FileNotFoundError, OSError):
-            content = None  # File doesn't exist yet
-        self.file_checkpoints[turn_id].append(
-            {
-                "path": path,
-                "original_content": content,
-                "timestamp": time.time(),
-            }
+        ``turn_id`` remains accepted for the pinned WebSocket contract, but the
+        durable operation is intentionally the latest completed-turn undo; the
+        old process-local per-file checkpoint map could not survive handoff and
+        has been removed. Stateless callers supply the durable control UUID so
+        a successor can recover an effect committed before journal ack.
+        """
+
+        from uuid import uuid4
+
+        from ..services.workspace_undo import apply_workspace_undo
+
+        if turn_id is not None:
+            logger.debug(
+                "Workspace undo uses the latest durable turn checkpoint; "
+                "legacy turn_id=%s is advisory",
+                turn_id,
+            )
+        request_id = control_request_id or str(uuid4())
+        result = await apply_workspace_undo(
+            thread_id=self.thread_id,
+            request_id=request_id,
+            postgres=self.postgres_conn,
+            workspace_manager=self.workspace_manager,
         )
-
-    def undo_turn(self, turn_id: Optional[int] = None) -> List[str]:
-        """Restore files from the given turn's checkpoints. Defaults to latest."""
-        if turn_id is None:
-            if not self.file_checkpoints:
-                return []
-            turn_id = max(self.file_checkpoints.keys())
-        checkpoints = self.file_checkpoints.pop(turn_id, [])
-        restored = []
-        for cp in checkpoints:
-            try:
-                if cp["original_content"] is None:
-                    self.workspace_manager.delete_file(cp["path"])
-                else:
-                    self.workspace_manager.write_file(
-                        cp["path"], cp["original_content"]
-                    )
-                restored.append(cp["path"])
-            except Exception as e:
-                logger.warning(f"Failed to restore {cp['path']}: {e}")
-        return restored
+        return result.event_params()
 
     def _build_context_config(self, config: Optional[Any] = None) -> ContextConfig:
         """Derive the ContextConfig from a config's limits (default: current).
@@ -2552,6 +2626,20 @@ class PersistentSession:
                         # The legacy persistent path bounds each store call at
                         # 5 s (_RETRIEVAL_TIMEOUT in persistent_graph.py).
                         retrieval_timeout=5.0,
+                        extra=(
+                            {
+                                "claim_persistent_extraction_interval": (
+                                    lambda turn_count,
+                                    interval: postgres_conn.claim_memory_extraction_interval(
+                                        self.thread_id,
+                                        turn_count=turn_count,
+                                        interval=interval,
+                                    )
+                                )
+                            }
+                            if postgres_conn is not None
+                            else {}
+                        ),
                     ),
                 )
             except Exception as e:

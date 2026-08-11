@@ -126,6 +126,33 @@ def _stateless_thread(**over):
     return thread
 
 
+def _k8s_sandbox_metadata(*, status="ready"):
+    generation = "11111111-1111-4111-8111-111111111111"
+    workspace = {"status": status, "provisioner": "k8s"}
+    metadata = {
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "workspace_container": workspace,
+    }
+    if status == "ready":
+        workspace.update(
+            {
+                "pod_ip": "10.42.0.25",
+                "port": 30022,
+                "pod_name": "ws-thread-aaaaaaaaaaaa",
+                "namespace": "agent-workspaces",
+                "_canvas_workspace_generation": generation,
+                "_runtime_incarnation": "22222222-2222-4222-8222-222222222222",
+            }
+        )
+        metadata["_workspace_binding"] = {
+            "generation": generation,
+            "kind": "remote",
+            "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+            "ssh_host_key_fingerprint": "SHA256:trusted",
+        }
+    return metadata
+
+
 def _patch_common(monkeypatch, orch_main, db):
     async def _fake_user(request, _db):
         return dict(USER)
@@ -238,8 +265,8 @@ async def test_stateless_input_rejects_empty_content(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("backend", ["sandbox", "vm", "future-tier", None])
-async def test_stateless_input_rejects_non_lite_workspace_before_writes(
+@pytest.mark.parametrize("backend", ["vm", "future-tier", None])
+async def test_stateless_input_rejects_unsupported_workspace_before_writes(
     monkeypatch, backend
 ):
     from fastapi import HTTPException
@@ -268,15 +295,39 @@ async def test_stateless_input_rejects_non_lite_workspace_before_writes(
 
 
 @pytest.mark.asyncio
+async def test_stateless_input_accepts_attested_k8s_sandbox(monkeypatch):
+    from orchestrator import main as orch_main
+
+    conn = FakeConn()
+    db = FakeDB(
+        _stateless_thread(metadata=_k8s_sandbox_metadata()),
+        conn,
+    )
+    _patch_common(monkeypatch, orch_main, db)
+
+    out = await orch_main.thread_input(
+        THREAD_ID,
+        orch_main.ThreadInputRequest(content="sandbox turn"),
+        MagicMock(),
+    )
+
+    assert out["accepted"] is True
+    assert conn.txn_enters == 1
+
+
+@pytest.mark.asyncio
 async def test_stateless_input_rechecks_locked_workspace_before_any_write(monkeypatch):
-    """A preflight lite row cannot authorize a sandbox row observed under lock."""
+    """A preflight-valid row cannot authorize Docker evidence under lock."""
     from fastapi import HTTPException
 
     from orchestrator import main as orch_main
 
     preflight = _stateless_thread()
     locked = _stateless_thread(
-        metadata={"config_override": {"workspace": {"backend": "sandbox"}}}
+        metadata={
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "workspace_container": {"status": "ready", "provisioner": "docker"},
+        }
     )
     conn = FakeConn(locked_thread=locked)
     db = FakeDB(preflight, conn)
@@ -297,6 +348,66 @@ async def test_stateless_input_rechecks_locked_workspace_before_any_write(monkey
     assert "FROM threads" in locked_read[1]
     assert "FOR UPDATE" in locked_read[1]
     assert locked_read[3] == 1
+
+
+@pytest.mark.asyncio
+async def test_ended_stateless_input_requires_explicit_resume_before_writes(
+    monkeypatch,
+):
+    from fastapi import HTTPException
+
+    from orchestrator import main as orch_main
+
+    conn = FakeConn()
+    db = FakeDB(_stateless_thread(status="ended"), conn)
+    _patch_common(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException, match="status=ended") as exc:
+        await orch_main.thread_input(
+            THREAD_ID,
+            orch_main.ThreadInputRequest(content="must resume first"),
+            MagicMock(),
+        )
+
+    assert exc.value.status_code == 409
+    assert conn.txn_enters == 1
+    assert len(conn.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_suspended_sandbox_input_commits_then_schedules_workspace_restore(
+    monkeypatch,
+):
+    import asyncio
+
+    from orchestrator import main as orch_main
+
+    thread = _stateless_thread(
+        status="suspended",
+        metadata=_k8s_sandbox_metadata(status="suspended"),
+    )
+    conn = FakeConn()
+    db = FakeDB(thread, conn)
+    _patch_common(monkeypatch, orch_main, db)
+    ensure_workspace = AsyncMock()
+    monkeypatch.setattr(orch_main, "ensure_session_workspace", ensure_workspace)
+
+    out = await orch_main.thread_input(
+        THREAD_ID,
+        orch_main.ThreadInputRequest(content="wake and continue"),
+        MagicMock(),
+    )
+    await asyncio.sleep(0)
+
+    assert out["accepted"] is True
+    ensure_workspace.assert_awaited_once_with(
+        THREAD_ID,
+        db=db,
+        provisioner=orch_main.container_provisioner,
+        suspension=orch_main.workspace_suspension_service,
+    )
+    admit = next(c for c in conn.calls if c[0] == "fetchval" and "run_queue" in c[1])
+    assert admit[3] == 1
 
 
 @pytest.mark.asyncio

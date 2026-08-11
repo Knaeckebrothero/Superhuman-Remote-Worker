@@ -70,13 +70,52 @@ def _active_run_queue_lease():
     return get_current_lease()
 
 
+def _active_run_queue_lease_for_thread(thread_id: str):
+    """Return the active lease only when it owns ``thread_id`` exactly.
+
+    A mutable lease handle is repointed between claims.  Callers must bind the
+    snapshot they fence to the thread whose durable state they are about to
+    access; fencing a valid queue row for thread A must never authorize SQL for
+    thread B.  The comparison happens before acquiring a connection so this
+    mismatch is a fail-closed, zero-SQL path.
+
+    No active handle means the pinned lane and preserves its historical
+    unfenced behavior.
+    """
+
+    lease = _active_run_queue_lease()
+    if lease is None:
+        return None
+
+    unit_id, lease_token = lease
+    if str(unit_id) == str(thread_id):
+        return lease
+
+    from src.api.lease_context import LeaseLostError, mark_current_lease_lost
+
+    mark_current_lease_lost()
+    logger.error(
+        "run_queue lease/thread mismatch: unit=%s target_thread=%s token=%s",
+        unit_id,
+        thread_id,
+        lease_token,
+    )
+    raise LeaseLostError(
+        f"run_queue lease for unit {unit_id} cannot access thread {thread_id}"
+    )
+
+
 async def _require_run_queue_fence(conn, lease) -> None:
-    """§5.2 persist fence: first statement of a fenced persist transaction.
+    """§5.2 exact-lease fence for a stateless persist transaction.
 
     ``FOR SHARE`` on the run_queue row blocks a concurrent reaper steal until
     this transaction commits, so check-then-write cannot interleave with a
     steal. Zero rows ⇒ the lease is lost ⇒ raise :class:`LeaseLostError` so
-    the enclosing transaction rolls back and nothing lands.
+    the enclosing transaction rolls back and nothing lands.  It is normally
+    the transaction's first SQL statement.  A durable-state table with a
+    ``threads`` foreign key first takes its required parent-row authority lock
+    to preserve the repository-wide ``threads -> run_queue`` lock order; the
+    fence still precedes every mutation/fenced persist statement.
 
     Torn-turn invariant (stateless_agents.md §5.2): a turn's durable footprint
     spans multiple fenced transactions (per-append message rows, the turn-end
@@ -96,7 +135,7 @@ async def _require_run_queue_fence(conn, lease) -> None:
         mark_current_lease_lost()
         logger.error(
             "run_queue fence rejected: unit=%s token=%s — lease lost, "
-            "aborting thread_messages persist",
+            "aborting fenced thread persist",
             unit_id,
             lease_token,
         )
@@ -598,10 +637,13 @@ class PostgresDB:
 
         One transaction: the sweep (skipped for mode='code' — files-only
         rewinds leave the transcript untouched), the ``thread_rewinds``
-        ledger insert, and the surviving-turn readback the caller uses to
-        reset ``turn_count``. Idempotent re-run sweeps 0 rows (the
-        ``rewound_at IS NULL`` guard) but does append a second ledger row —
-        callers serialize (session loop / advisory lock).
+        ledger insert, the surviving-turn readback the caller uses to reset
+        ``turn_count``, and a clamp of the durable memory-extraction cursor to
+        that surviving turn. The clamp updates an existing cursor only: a
+        thread that has never extracted memory must retain the implicit zero
+        baseline. Idempotent re-run sweeps 0 rows (the ``rewound_at IS NULL``
+        guard) but does append a second ledger row — callers serialize
+        (session loop / advisory lock).
         """
         if mode not in ("both", "conversation", "code"):
             raise ValueError(f"invalid rewind mode: {mode}")
@@ -651,6 +693,25 @@ class PostgresDB:
                     """,
                     thread_id,
                 )
+                if mode in ("both", "conversation"):
+                    # Rewind and cursor movement are one commit. Without this,
+                    # a cursor from the abandoned future (for example 10 after
+                    # rewinding to turn 5) suppresses extraction on the rebuilt
+                    # timeline until it catches up with that dead history.
+                    # Do not INSERT an absent row: absence is the pre-first-
+                    # extraction baseline and must continue to behave as zero.
+                    await conn.execute(
+                        """
+                        UPDATE thread_session_runtime_state
+                        SET memory_extraction_turn = LEAST(
+                                memory_extraction_turn, $2
+                            ),
+                            updated_at = now()
+                        WHERE thread_id = $1
+                        """,
+                        thread_id,
+                        int(surviving_turn or 0),
+                    )
         return {
             "rewind_id": str(row["id"]),
             "swept": int(swept or 0),
@@ -698,22 +759,54 @@ class PostgresDB:
         turn commit) collapse to the later SHA — the newest workspace state
         for that position is the correct restore target.
         """
+        sql = """
+            INSERT INTO thread_turn_commits (thread_id, seq, commit_sha)
+            SELECT $1,
+                   COALESCE(MAX(seq), 0),
+                   $2
+            FROM thread_messages
+            WHERE thread_id = $1
+            ON CONFLICT (thread_id, seq) DO UPDATE
+                SET commit_sha = EXCLUDED.commit_sha,
+                    created_at = now()
+        """
+        lease = _active_run_queue_lease_for_thread(thread_id)
         async with self.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO thread_turn_commits (thread_id, seq, commit_sha)
-                SELECT $1,
-                       COALESCE(MAX(seq), 0),
-                       $2
-                FROM thread_messages
-                WHERE thread_id = $1
-                ON CONFLICT (thread_id, seq) DO UPDATE
-                    SET commit_sha = EXCLUDED.commit_sha,
-                        created_at = now()
-                """,
-                thread_id,
-                commit_sha,
-            )
+            if lease is None:
+                await conn.execute(sql, thread_id, commit_sha)
+                return
+            async with conn.transaction():
+                # First statement: hold the exact queue row across the mapping
+                # upsert so a zombie cannot publish its Git SHA after a steal.
+                await _require_run_queue_fence(conn, lease)
+                await conn.execute(sql, thread_id, commit_sha)
+
+    async def seed_workspace_baseline_commit(
+        self, thread_id: str, commit_sha: str
+    ) -> None:
+        """Create the immutable pre-first-turn workspace ledger row.
+
+        A first completed turn needs two ledger points for files-only undo:
+        its new workspace commit and the workspace HEAD from before that turn.
+        Reattaches keep the original baseline (``DO NOTHING``), while the
+        active stateless claimant must prove the exact thread lease before the
+        insert. ``thread_turn_commits`` has no parent foreign key, so no
+        ``threads`` lock is needed and the queue fence remains first SQL.
+        """
+
+        sql = """
+            INSERT INTO thread_turn_commits (thread_id, seq, commit_sha)
+            VALUES ($1, 0, $2)
+            ON CONFLICT (thread_id, seq) DO NOTHING
+        """
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            if lease is None:
+                await conn.execute(sql, thread_id, commit_sha)
+                return
+            async with conn.transaction():
+                await _require_run_queue_fence(conn, lease)
+                await conn.execute(sql, thread_id, commit_sha)
 
     async def resolve_restore_commit(
         self, thread_id: str, before_seq: int
@@ -734,6 +827,266 @@ class PostgresDB:
             thread_id,
             before_seq,
         )
+
+    async def list_workspace_turn_commits(self, thread_id: str) -> List[str]:
+        """Return the thread's workspace ledger from newest to oldest.
+
+        Undo chooses the previous *distinct Git tree*, not merely the previous
+        row: attach reconciliation, read-only turns, and earlier undo effects
+        may all map the same file state at different transcript positions.
+        Git owns tree equivalence; this fenced method supplies its complete,
+        ordered durable candidate chain without trying to infer it in SQL.
+        """
+
+        sql = """
+            SELECT commit_sha
+            FROM thread_turn_commits
+            WHERE thread_id = $1
+            ORDER BY seq DESC
+        """
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        if lease is None:
+            rows = await self.fetch(sql, thread_id)
+        else:
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    # The chain is input to an external workspace mutation.
+                    # Hold the exact queue share lock through the complete read;
+                    # the Git marker + later fenced mapping make the wider
+                    # cross-system operation crash recoverable.
+                    await _require_run_queue_fence(conn, lease)
+                    rows = await conn.fetch(sql, thread_id)
+        return [str(row["commit_sha"]) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Durable persistent-session state (migration 0133)
+    # ------------------------------------------------------------------
+
+    async def list_session_tasks(self, thread_id: str) -> List[Dict[str, Any]]:
+        """Load the authoritative task checklist for one session thread."""
+
+        sql = """
+            SELECT task_number, description, status, priority, notes,
+                   created_at, completed_at
+            FROM thread_session_tasks
+            WHERE thread_id = $1
+            ORDER BY task_number
+        """
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        if lease is None:
+            rows = await self.fetch(sql, thread_id)
+        else:
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    await _require_run_queue_fence(conn, lease)
+                    rows = await conn.fetch(sql, thread_id)
+        return [dict(row) for row in rows]
+
+    async def create_session_task(
+        self,
+        thread_id: str,
+        description: str,
+        priority: str,
+    ) -> Dict[str, Any]:
+        """Allocate and insert one task under the thread/lease fence."""
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM threads WHERE id = $1 FOR UPDATE",
+                    thread_id,
+                )
+                if exists is None:
+                    raise ValueError("session thread no longer exists")
+                if lease is not None:
+                    # Global admission order is threads -> run_queue.  Keep the
+                    # numbering lock first, then prove the exact lease before
+                    # the INSERT; a rejected fence rolls the transaction back.
+                    await _require_run_queue_fence(conn, lease)
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO thread_session_tasks
+                        (thread_id, task_number, description, priority)
+                    SELECT $1,
+                           COALESCE(MAX(task_number), 0) + 1,
+                           $2,
+                           $3
+                    FROM thread_session_tasks
+                    WHERE thread_id = $1
+                    RETURNING task_number, description, status, priority,
+                              notes, created_at, completed_at
+                    """,
+                    thread_id,
+                    description,
+                    priority,
+                )
+        return dict(row)
+
+    async def start_session_task(
+        self, thread_id: str, task_number: int
+    ) -> Optional[Dict[str, Any]]:
+        """Move one pending task to ``in_progress`` under the owner fence."""
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                if lease is not None:
+                    await _require_run_queue_fence(conn, lease)
+                row = await conn.fetchrow(
+                    """
+                    UPDATE thread_session_tasks
+                    SET status = 'in_progress', updated_at = now()
+                    WHERE thread_id = $1 AND task_number = $2
+                      AND status = 'pending'
+                    RETURNING task_number, description, status, priority,
+                              notes, created_at, completed_at
+                    """,
+                    thread_id,
+                    task_number,
+                )
+        return dict(row) if row is not None else None
+
+    async def complete_session_task(
+        self,
+        thread_id: str,
+        task_number: int,
+        notes: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Complete one task durably before its tool result is returned."""
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                if lease is not None:
+                    await _require_run_queue_fence(conn, lease)
+                row = await conn.fetchrow(
+                    """
+                    UPDATE thread_session_tasks
+                    SET status = 'completed',
+                        completed_at = now(),
+                        notes = CASE WHEN $3 = '' THEN notes ELSE $3 END,
+                        updated_at = now()
+                    WHERE thread_id = $1 AND task_number = $2
+                      AND status <> 'completed'
+                    RETURNING task_number, description, status, priority,
+                              notes, created_at, completed_at
+                    """,
+                    thread_id,
+                    task_number,
+                    notes,
+                )
+        return dict(row) if row is not None else None
+
+    async def claim_memory_extraction_interval(
+        self,
+        thread_id: str,
+        *,
+        turn_count: int,
+        interval: int,
+    ) -> bool:
+        """Atomically claim one elapsed interval for memory extraction.
+
+        The cursor advances before the auxiliary call, matching the historical
+        in-process writer.  A successor observing the cursor cannot repeat the
+        same extraction after a claim handoff or process crash.
+        """
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        if interval <= 0 or turn_count < interval:
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                if lease is not None:
+                    # The INSERT/UPSERT may take a parent FK lock implicitly.
+                    # Take it explicitly before run_queue to keep the global
+                    # threads -> queue ordering, then fence before the write.
+                    exists = await conn.fetchval(
+                        "SELECT 1 FROM threads WHERE id = $1 FOR KEY SHARE",
+                        thread_id,
+                    )
+                    if exists is None:
+                        raise ValueError("session thread no longer exists")
+                    await _require_run_queue_fence(conn, lease)
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO thread_session_runtime_state
+                        (thread_id, memory_extraction_turn)
+                    VALUES ($1, $2)
+                    ON CONFLICT (thread_id) DO UPDATE
+                    SET memory_extraction_turn = EXCLUDED.memory_extraction_turn,
+                        updated_at = now()
+                    WHERE thread_session_runtime_state.memory_extraction_turn
+                          <= EXCLUDED.memory_extraction_turn - $3
+                    RETURNING memory_extraction_turn
+                    """,
+                    thread_id,
+                    turn_count,
+                    interval,
+                )
+        return row is not None
+
+    async def list_thread_cloud_anchors(
+        self, thread_id: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """Load durable cloud provenance keyed by logical workspace path."""
+
+        sql = """
+            SELECT workspace_path, anchor
+            FROM thread_cloud_citation_anchors
+            WHERE thread_id = $1
+        """
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        if lease is None:
+            rows = await self.fetch(sql, thread_id)
+        else:
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    await _require_run_queue_fence(conn, lease)
+                    rows = await conn.fetch(sql, thread_id)
+        anchors: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            value = row["anchor"]
+            if isinstance(value, str):
+                value = json.loads(value)
+            if isinstance(value, dict):
+                anchors[str(row["workspace_path"])] = value
+        return anchors
+
+    async def upsert_thread_cloud_anchor(
+        self,
+        thread_id: str,
+        workspace_path: str,
+        anchor: Dict[str, Any],
+    ) -> None:
+        """Persist one cloud anchor under the current stateless lease fence."""
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                if lease is not None:
+                    # See claim_memory_extraction_interval: establish parent
+                    # authority before queue fencing so the FK cannot invert
+                    # admission's threads -> run_queue lock order.
+                    exists = await conn.fetchval(
+                        "SELECT 1 FROM threads WHERE id = $1 FOR KEY SHARE",
+                        thread_id,
+                    )
+                    if exists is None:
+                        raise ValueError("session thread no longer exists")
+                    await _require_run_queue_fence(conn, lease)
+                await conn.execute(
+                    """
+                    INSERT INTO thread_cloud_citation_anchors
+                        (thread_id, workspace_path, anchor)
+                    VALUES ($1, $2, $3::jsonb)
+                    ON CONFLICT (thread_id, workspace_path) DO UPDATE
+                    SET anchor = EXCLUDED.anchor, updated_at = now()
+                    """,
+                    thread_id,
+                    workspace_path,
+                    json.dumps(anchor, sort_keys=True, separators=(",", ":")),
+                )
 
     # Shared by the single-row upsert (RETURNING id, seq) and the turn-complete
     # reconcile batch (same statement minus RETURNING — executemany discards

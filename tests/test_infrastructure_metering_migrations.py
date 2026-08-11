@@ -137,7 +137,8 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 # stateless cloud-generation fence/content baseline (0122-0124), and durable
 # owner-gated client presence (0125), and lane-independent Canvas editor
 # awareness (0126), the exact-lease interrupt inbox (0127-0129), and the
-# verification-critic dedupe/concurrent unique-index rollout (0130-0132).
+# verification-critic dedupe/concurrent unique-index rollout (0130-0132), and
+# the S2 durable persistent-session residue tables (0133).
 APP_JOBS_EXECUTION_LANE_MIGRATION = (
     ROOT / "orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
 )
@@ -188,8 +189,11 @@ APP_JOBS_VERIFICATION_DROP_INDEX = (
 APP_JOBS_VERIFICATION_INDEX = (
     ROOT / "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql"
 )
+APP_THREAD_SESSION_DURABLE_STATE = (
+    ROOT / "orchestrator/database/migrations/app/0133_thread_session_durable_state.sql"
+)
 APP_CURRENT_MIGRATION_HEAD = (
-    ROOT / "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql"
+    ROOT / "orchestrator/database/migrations/app/0133_thread_session_durable_state.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
@@ -742,6 +746,7 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
         "schema_current"
         not in APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.read_text()
     )
+    assert "schema_current" not in APP_THREAD_SESSION_DURABLE_STATE.read_text()
     assert "audit_schema_current" not in AUDIT_EXPANSION.read_text()
 
 

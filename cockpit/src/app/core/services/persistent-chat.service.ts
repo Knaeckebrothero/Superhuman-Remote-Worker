@@ -45,11 +45,12 @@ import {CapabilitiesService} from './capabilities.service';
  *    POST /api/persistent/threads/{id}/interrupt (interrupt). Canonical REST.
  *
  *  • Control plane: mode + narration assignments use the orchestrator's
- *    durable REST inbox for every session. Their result still arrives through
- *    the journal/SSE after the serving owner applies it. The agent's existing
- *    WebSocket handler remains for the smaller verbs that have not yet gained
- *    a safe durable contract — approve/deny, slash commands, config updates
- *    and vm-upgrade.
+ *    durable REST inbox for every session. Socketless workspace undo uses the
+ *    same inbox; pinned undo retains its legacy direct WebSocket verb. Durable
+ *    results arrive through the journal/SSE after the serving owner applies
+ *    them. The agent's existing WebSocket handler remains for the smaller
+ *    verbs that have not yet gained a safe durable contract — approve/deny,
+ *    the remaining slash commands, config updates and vm-upgrade.
  *
  * `gone_beyond_horizon`: the server emits this single named event when the
  * cursor is outside replay range (epoch mismatch or seq older than retention).
@@ -199,25 +200,36 @@ export interface SessionTask {
     status: 'pending' | 'in_progress' | 'completed';
     priority: string;
     notes: string;
+    created_at: string;
+    completed_at: string | null;
 }
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
 export type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
 export type NarrationMode = 'silent' | 'verbose' | 'auto';
 
-type DurableScalarControl =
+type DurableControl =
     | {method: 'mode.set'; mode: PermissionMode}
-    | {method: 'narration.set'; mode: NarrationMode};
+    | {method: 'narration.set'; mode: NarrationMode}
+    | {method: 'workspace.undo'};
+
+type DurableScalarControl = Exclude<DurableControl, {method: 'workspace.undo'}>;
+
+function isDurableScalarControl(
+    control: DurableControl,
+): control is DurableScalarControl {
+    return control.method !== 'workspace.undo';
+}
 
 interface DurableControlOutboxItem {
     threadId: string;
-    request: DurableScalarControl & {client_request_id: string};
+    request: DurableControl & {client_request_id: string};
     attempts: number;
     ordinal: number;
 }
 
 interface DurableControlMarker {
-    method: DurableScalarControl['method'] | null;
+    method: DurableControl['method'] | null;
     ordinal: number;
 }
 
@@ -358,6 +370,8 @@ interface SessionStateSnapshot extends Record<string, unknown> {
     temperature: number | null;
     running_tool: RunningToolInfo | null;
     pending_permissions: unknown[];
+    /** Present on task-aware servers; omitted by older rolling-deploy peers. */
+    tasks?: SessionTask[];
     event_cursor: {epoch: number; seq: number};
     /** Exclusive journal floor that reconstructs the latest logical turn. */
     replay_cursor: {epoch: number; seq: number};
@@ -2354,13 +2368,14 @@ export class PersistentChatService {
 
     /** Admit one of the deliberately small durable-control subset over REST.
      *
-     * There is no lane branch here: pinned and stateless sessions share the
-     * same endpoint. The HTTP 202 means only that the orchestrator committed
-     * the request. It must not synthesize the resulting mode.changed /
-     * narration.changed frame; the serving owner writes that acknowledgement
-     * through its journal allocator and the normal SSE reducer applies it.
+     * Scalar assignments are lane-free. The /undo caller enters this path only
+     * after /connection declared a socketless transport; pinned undo stays on
+     * its legacy direct WebSocket path. The HTTP 202 means only that the
+     * orchestrator committed the request. It must not synthesize owner state;
+     * the serving owner writes the acknowledgement through its journal
+     * allocator and the normal SSE reducer applies it.
      */
-    private _sendDurableControl(control: DurableScalarControl): void {
+    private _sendDurableControl(control: DurableControl): void {
         const threadId = this.threadId();
         if (!threadId || this.intentionalClose) return;
         const ordinal = ++this.durableControlOrdinal;
@@ -2368,22 +2383,24 @@ export class PersistentChatService {
         // later unsubmitted assignments of the same scalar to the user's
         // newest intent. Removing then appending preserves order relative to
         // the other scalar.
-        for (let index = this.durableControlOutbox.length - 1; index >= 0; index--) {
-            const queued = this.durableControlOutbox[index];
-            const ambiguousRetryHead =
-                this.durableControlRetryTimer !== null &&
-                queued === this.durableControlOutbox[0];
-            if (
-                queued !== this.durableControlInFlight &&
-                !ambiguousRetryHead &&
-                queued.threadId === threadId &&
-                queued.request.method === control.method
-            ) {
-                this.durableControlAwaitingAck.delete(
-                    queued.request.client_request_id,
-                );
-                this.durableControlOutbox.splice(index, 1);
-                break;
+        if (isDurableScalarControl(control)) {
+            for (let index = this.durableControlOutbox.length - 1; index >= 0; index--) {
+                const queued = this.durableControlOutbox[index];
+                const ambiguousRetryHead =
+                    this.durableControlRetryTimer !== null &&
+                    queued === this.durableControlOutbox[0];
+                if (
+                    queued !== this.durableControlInFlight &&
+                    !ambiguousRetryHead &&
+                    queued.threadId === threadId &&
+                    queued.request.method === control.method
+                ) {
+                    this.durableControlAwaitingAck.delete(
+                        queued.request.client_request_id,
+                    );
+                    this.durableControlOutbox.splice(index, 1);
+                    break;
+                }
             }
         }
         if (
@@ -2548,7 +2565,7 @@ export class PersistentChatService {
 
     private _takeDurableControlAck(
         params: Record<string, unknown>,
-        expectedMethod: DurableScalarControl['method'],
+        expectedMethod: DurableControl['method'],
     ): DurableControlMarker | null {
         const requestId = params['client_request_id'];
         if (typeof requestId !== 'string') return null;
@@ -3356,7 +3373,15 @@ export class PersistentChatService {
                 this.setNarrationMode('verbose');
                 return true;
             case '/undo':
-                this._sendControl({method: 'undo'});
+                if (this.controlSocket === 'none') {
+                    this._sendDurableControl({method: 'workspace.undo'});
+                } else {
+                    // Pinned sessions retain the legacy direct-WS verb. The
+                    // orchestrator deliberately refuses workspace.undo on the
+                    // pinned REST lane because there is no lease-owned queue
+                    // unit to fence the destructive operation against.
+                    this._sendControl({method: 'undo'});
+                }
                 this._systemMessage('Undoing last file changes...');
                 return true;
             case '/upgrade-workspace': {
@@ -3969,6 +3994,18 @@ export class PersistentChatService {
                         }
                     }
                 }
+                // Tasks are durable state, not replay state: a task update may
+                // predate replay_cursor. Presence is authoritative (including
+                // []), while an older pinned/rolling-deploy welcome frame that
+                // omits the key must not erase a newer REST/live task list.
+                if ('tasks' in params) {
+                    const snapshotTasks = params['tasks'];
+                    this.tasks.set(
+                        Array.isArray(snapshotTasks)
+                            ? snapshotTasks as SessionTask[]
+                            : [],
+                    );
+                }
                 if (allowSessionReady) this.markSessionReady();
                 break;
             }
@@ -4395,7 +4432,8 @@ export class PersistentChatService {
             case 'control.rejected': {
                 const rejectedMethod =
                     params['method'] === 'mode.set' ||
-                    params['method'] === 'narration.set'
+                    params['method'] === 'narration.set' ||
+                    params['method'] === 'workspace.undo'
                         ? params['method']
                         : null;
                 const rejectedMarker = rejectedMethod
@@ -4736,7 +4774,9 @@ export class PersistentChatService {
                 break;
 
             case 'tasks.updated':
-                this.tasks.set((params['tasks'] as SessionTask[]) || []);
+                if (!coveredBySnapshot) {
+                    this.tasks.set((params['tasks'] as SessionTask[]) || []);
+                }
                 break;
 
             case 'file.checkpoint':
@@ -4744,6 +4784,9 @@ export class PersistentChatService {
                 break;
 
             case 'files.restored':
+                this._clearDurableControlErrorAfter(
+                    this._takeDurableControlAck(params, 'workspace.undo'),
+                );
                 this.undoAvailable.set(false);
                 this._systemMessage(
                     `Restored ${(params['paths'] as string[])?.length || 0} file(s) to pre-edit state.`,

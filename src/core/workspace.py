@@ -20,6 +20,7 @@ Backend abstraction:
 
 import logging
 import os
+import posixpath
 import shutil
 import tempfile
 import time
@@ -829,15 +830,73 @@ class WorkspaceManager:
         """
         return Path(self._backend.resolve_path(relative_path))
 
+    def workspace_relative_path(self, path: str | os.PathLike[str]) -> str:
+        """Return one canonical workspace-relative identity for ``path``.
+
+        File tools historically returned the backend's canonical path while
+        most storage APIs accepted a workspace-relative path.  Remote
+        backends therefore surfaced absolute paths and virtual backends
+        surfaced object keys.  Treating either value as already relative can
+        escape the workspace root or double-prefix an object key.
+
+        This method accepts either representation, strips only the *exact*
+        canonical backend root, and rejects absolute/out-of-root or ``..``
+        paths.  Callers can consequently use the returned value consistently
+        for backend I/O and durable path-keyed state.
+        """
+
+        raw = os.fspath(path).strip()
+        if not raw:
+            return ""
+
+        root_raw = str(self._backend.resolve_path(""))
+        root = posixpath.normpath(root_raw) if root_raw else ""
+        candidate = posixpath.normpath(raw)
+
+        root_is_absolute = bool(root and posixpath.isabs(root))
+        if root and candidate == root:
+            relative = ""
+        elif root and candidate.startswith(root.rstrip("/") + "/"):
+            stripped = candidate[len(root.rstrip("/")) + 1 :]
+            if root_is_absolute:
+                relative = stripped
+            else:
+                # A virtual backend's canonical object key is relative-looking.
+                # It can collide with a legitimate workspace-relative path
+                # that happens to begin with the same prefix. Read/citation
+                # callers always address an existing object, so disambiguate
+                # from backend authority and refuse a two-object alias.
+                stripped_exists = self._backend.exists(stripped)
+                unstripped_exists = self._backend.exists(candidate)
+                if stripped_exists == unstripped_exists:
+                    reason = "ambiguous" if stripped_exists else "missing"
+                    raise ValueError(
+                        f"Path '{raw}' has {reason} workspace-relative identity"
+                    )
+                relative = stripped if stripped_exists else candidate
+        else:
+            if posixpath.isabs(candidate):
+                raise ValueError(f"Path '{raw}' is outside the workspace root")
+            relative = candidate
+
+        if relative in ("", "."):
+            return ""
+        if posixpath.isabs(relative) or relative == ".." or relative.startswith("../"):
+            raise ValueError(f"Path '{raw}' escapes workspace boundary")
+
+        # Let the concrete backend enforce any stricter path vocabulary too.
+        self._backend.resolve_path(relative)
+        return relative
+
     @contextmanager
     def local_copy(self, relative_path: str) -> Generator[Path, None, None]:
         """Yield a local filesystem path to a workspace file.
 
-        For local backends the resolved path already exists on the local
-        filesystem, so it is yielded directly (no copy, no cleanup).
-
-        For remote backends the file is downloaded via SFTP to a temporary
-        file which is cleaned up when the context manager exits.
+        Materialize through the backend unconditionally.  Whether a resolved
+        path happens to exist in the *agent* process is not evidence that the
+        workspace is local: remote and virtual paths can collide with files in
+        the agent image/CWD.  The small temporary copy is therefore the common
+        correctness path for every backend and is cleaned up on exit.
 
         Use this whenever a service (AudioHelper, VisionHelper, PDFReader,
         etc.) needs to open a file with local I/O.
@@ -848,13 +907,9 @@ class WorkspaceManager:
         Yields:
             A Path on the local filesystem containing the file data
         """
-        local_path = self.get_path(relative_path)
-        if local_path.exists():
-            yield local_path
-            return
-
-        # Remote file — download to a local temp file
         data = self._backend.read_file(relative_path, binary=True)
+        if isinstance(data, str):
+            data = data.encode()
         suffix = Path(relative_path).suffix
         tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
         try:

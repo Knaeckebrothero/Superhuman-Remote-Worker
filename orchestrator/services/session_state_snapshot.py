@@ -80,6 +80,32 @@ def _integer(value: Any) -> int | None:
         return None
 
 
+def _iso_timestamp(value: Any) -> str | None:
+    """Serialize a PostgreSQL timestamp like ``SessionTask.to_dict``."""
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    isoformat = getattr(value, "isoformat", None)
+    return isoformat() if callable(isoformat) else str(value)
+
+
+def _session_task(row: Any) -> dict[str, Any]:
+    """Map one migration-0133 row onto the stable Cockpit task shape."""
+
+    source = dict(row)
+    return {
+        "id": f"task_{int(source['task_number'])}",
+        "description": str(source.get("description") or ""),
+        "status": str(source.get("status") or "pending"),
+        "priority": str(source.get("priority") or "medium"),
+        "notes": str(source.get("notes") or ""),
+        "created_at": _iso_timestamp(source.get("created_at")),
+        "completed_at": _iso_timestamp(source.get("completed_at")),
+    }
+
+
 async def build_session_state_snapshot(
     db: Any,
     thread_id: str,
@@ -217,6 +243,16 @@ async def build_session_state_snapshot(
                 FROM thread_permission_requests
                 WHERE thread_id = $1 AND status = 'pending'
                 ORDER BY requested_at ASC, id ASC
+                """,
+                thread_id,
+            )
+            task_rows = await conn.fetch(
+                """
+                SELECT task_number, description, status, priority, notes,
+                       created_at, completed_at
+                FROM thread_session_tasks
+                WHERE thread_id = $1
+                ORDER BY task_number ASC
                 """,
                 thread_id,
             )
@@ -369,6 +405,7 @@ async def build_session_state_snapshot(
         "temperature": temperature,
         "running_tool": running_tool,
         "pending_permissions": pending_permissions,
+        "tasks": [_session_task(row) for row in task_rows],
         "event_cursor": {
             "epoch": epoch,
             "seq": hwm,

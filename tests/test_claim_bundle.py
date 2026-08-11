@@ -9,6 +9,7 @@ mismatch (no enumeration oracle); 404 absent unit row; 409 non-session unit /
 wrong lane / assembly refused.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -138,6 +139,39 @@ async def test_happy_path_returns_watermarks_and_shared_assembly(monkeypatch):
         "datasources",
         "config_name",
     }
+
+
+@pytest.mark.asyncio
+async def test_session_bundle_stolen_during_slow_assembly_is_rejected(monkeypatch):
+    """No attach credentials cross the response boundary after a token steal."""
+
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    _, assembly = _patch(monkeypatch, orch_main, db)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_assembly(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return {"thread_id": UNIT_ID, "datasources": {"secret": "in-flight"}}
+
+    assembly.side_effect = _slow_assembly
+    request_task = asyncio.create_task(
+        orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    # The reaper/successor owns a newer token by the time assembly returns.
+    db.conn.fetchval.return_value = False
+    release.set()
+
+    with pytest.raises(HTTPException) as exc:
+        await request_task
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Lease validation failed"
+    assert db.conn.fetchval.await_count == 1
 
 
 @pytest.mark.asyncio

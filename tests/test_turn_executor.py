@@ -789,6 +789,47 @@ class TestTurnError:
 
 class TestLeaseLost:
     @pytest.mark.asyncio
+    async def test_loss_during_bundle_cannot_be_erased_by_handle_update(
+        self, harness, monkeypatch
+    ):
+        monkeypatch.setattr(te, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
+        harness.heartbeat_result = None
+        prior_unit = uuid4()
+        harness.executor._lease.update(prior_unit, 4)
+        prior_lost_event = harness.executor._lease.lost
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _blocked_bundle(_unit_id, _token):
+            entered.set()
+            await release.wait()
+            return {
+                "attach": harness.attach_for(str(_unit_id)),
+                "watermarks": {},
+            }
+
+        claim = make_claim(unit_id=uuid4(), token=9, input_seq=2)
+        with patch.object(
+            harness.executor, "_fetch_bundle", side_effect=_blocked_bundle
+        ):
+            serve = asyncio.create_task(harness.executor._serve_claim(claim))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            deadline = asyncio.get_running_loop().time() + 2
+            while not harness.calls["heartbeat"]:
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.01)
+            release.set()
+            await asyncio.wait_for(serve, timeout=2)
+
+        assert harness.executor._lease.unit_id == str(prior_unit)
+        assert harness.executor._lease.lease_token == 4
+        assert harness.executor._lease.lost is prior_lost_event
+        assert not prior_lost_event.is_set()
+        assert not harness.calls["attach"]
+        assert not harness.calls["release"]
+        assert not harness.calls["complete"]
+
+    @pytest.mark.asyncio
     async def test_heartbeat_loss_aborts_without_release(self, harness, monkeypatch):
         monkeypatch.setattr(te, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
         harness.heartbeat_result = None  # renewal finds no leased row
