@@ -2,8 +2,7 @@
 -- description:   Durable per-thread state that must survive a stateless
 --                persistent-session claim handoff: the interactive task list,
 --                memory-extraction cursor, and cloud citation anchors.
--- depends-on:    0130_jobs_verification_dedupe.sql (0131/0132 are independent
---                .notx index transitions and the runner applies them last)
+-- depends-on:    0132_jobs_verification_uniq.notx.sql
 -- expected:      < 1s. Three new empty tables and their primary keys only.
 -- locks:         AccessExclusiveLock on the new tables only.
 -- transactional: yes
