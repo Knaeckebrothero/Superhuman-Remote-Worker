@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import posixpath
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
     Callable,
     Deque,
     Dict,
@@ -232,6 +234,13 @@ class ToolContext:
     # drift fingerprint (etag, file_sha256) + best-effort live pointer
     # (backend, path, webdav_url) captured when a cloud file is read, so
     # cite_* can persist it onto the source's metadata.cloud block.
+    cloud_anchor_persist_callback: Optional[
+        Callable[[str, Dict[str, Any]], Awaitable[None]]
+    ] = (
+        None  # Persistent sessions bind this to a per-thread Postgres upsert.
+        # Pinned workers and focused tests may leave it unset and retain the
+        # historical claim-local anchor cache.
+    )
     _inaccessible_sources: Dict[str, str] = field(
         default_factory=dict
     )  # url -> error message
@@ -562,33 +571,56 @@ class ToolContext:
         return self.citation_engine
 
     @staticmethod
-    def _normalize_anchor_key(local_path: str) -> str:
-        """Normalize a local path to the absolute form ``add_doc_source`` uses."""
+    def _normalize_anchor_key(path: str) -> str:
+        """Normalize a local or workspace-relative citation path."""
         try:
-            return str(Path(local_path).resolve())
+            candidate = Path(path)
+            if candidate.is_absolute():
+                return str(candidate.resolve())
+            # Workspace paths are POSIX-like on every backend, including flat
+            # object-store keys. Do not anchor them to this pod's cwd.
+            return posixpath.normpath(path)
         except (OSError, ValueError, RuntimeError):
-            return str(local_path)
+            return str(path)
 
-    def record_cloud_anchor(self, local_path: str, anchor: Dict[str, Any]) -> None:
+    def record_cloud_anchor(self, file_path: str, anchor: Dict[str, Any]) -> None:
         """Stash a cloud snapshot-anchor for a downloaded file (Phase 3, D7).
 
         Called by cloud read tools (e.g. ``webdav_read``) once a file lands in
         the workspace, so a later ``cite_*`` on that path can persist the anchor
-        onto the source's ``metadata.cloud`` block. Keyed by the resolved
-        absolute path (matching how the engine resolves sources).
+        onto the source's ``metadata.cloud`` block. The key may be a real local
+        path or a workspace-relative backend path; producers and consumers use
+        the same normalized identity.
         """
-        if not local_path or not anchor:
+        if not file_path or not anchor:
             return
-        self._cloud_anchors[self._normalize_anchor_key(local_path)] = anchor
+        self._cloud_anchors[self._normalize_anchor_key(file_path)] = anchor
 
-    def get_cloud_anchor(self, local_path: str) -> Optional[Dict[str, Any]]:
-        """Return the stashed cloud snapshot-anchor for a local path, if any."""
-        if not local_path:
+    def get_cloud_anchor(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Return the stashed cloud anchor for a local or workspace path."""
+        if not file_path:
             return None
-        return self._cloud_anchors.get(self._normalize_anchor_key(local_path))
+        return self._cloud_anchors.get(self._normalize_anchor_key(file_path))
+
+    async def persist_cloud_anchor(
+        self,
+        file_path: str,
+        anchor: Dict[str, Any],
+    ) -> None:
+        """Record an anchor locally and await its optional durable sink.
+
+        The callback seam lets persistent sessions bind a thread-scoped
+        Postgres upsert without coupling datasource tools to the database.
+        Callback errors propagate: a configured durable lane must not report a
+        successful cloud read while silently dropping its provenance anchor.
+        """
+        self.record_cloud_anchor(file_path, anchor)
+        callback = self.cloud_anchor_persist_callback
+        if callback is not None:
+            await callback(file_path, anchor)
 
     async def snapshot_cloud_source_bytes(
-        self, local_path: str, anchor: Dict[str, Any]
+        self, file_path: str, anchor: Dict[str, Any]
     ) -> Optional[str]:
         """Persist a cited cloud file's original bytes to the snapshot store (D7).
 
@@ -599,25 +631,37 @@ class ToolContext:
         a re-cite of the same file doesn't re-upload, and so the source is
         registered with the key already present (Phase 3b).
 
-        Best-effort: returns the key, or ``None`` when there's no orchestrator
-        client, the file can't be read, or the upload fails — the extracted-text
-        copy remains the citation's verification anchor either way.
+        ``file_path`` may be a local path or a workspace-relative backend path.
+        The latter is materialized with ``WorkspaceManager.local_copy`` before
+        byte access. Best-effort: returns the key, or ``None`` when there's no
+        orchestrator client, the file can't be read, or the upload fails — the
+        extracted-text copy remains the citation's verification anchor either
+        way.
         """
         if anchor.get("snapshot_blob_key"):
             return anchor["snapshot_blob_key"]
         client = self.orchestrator_client
         if client is None:
             return None
+
+        def _read_bytes() -> bytes:
+            if self.workspace_manager is not None and not os.path.exists(file_path):
+                with self.workspace_manager.local_copy(
+                    file_path.lstrip("/")
+                ) as local_path:
+                    return local_path.read_bytes()
+            return Path(file_path).read_bytes()
+
         try:
-            data = await asyncio.to_thread(Path(local_path).read_bytes)
-        except OSError as e:
-            logger.debug("Cloud snapshot read failed for %s: %s", local_path, e)
+            data = await asyncio.to_thread(_read_bytes)
+        except Exception as e:
+            logger.debug("Cloud snapshot read failed for %s: %s", file_path, e)
             return None
         content_type = anchor.get("content_type") or "application/octet-stream"
         try:
             key = await client.save_citation_snapshot(data, content_type=content_type)
         except Exception as e:  # never let a snapshot upload break citation creation
-            logger.debug("Cloud snapshot upload failed for %s: %s", local_path, e)
+            logger.debug("Cloud snapshot upload failed for %s: %s", file_path, e)
             return None
         if key:
             anchor["snapshot_blob_key"] = key

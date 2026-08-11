@@ -6,7 +6,6 @@ databases, deduplicate results, and download available papers.
 
 import asyncio
 import logging
-import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -241,8 +240,9 @@ async def _download_available_papers(
     Only attempts download for papers with known PDF URLs or arXiv IDs.
     Limits concurrent downloads to avoid rate limiting.
 
-    For remote workspaces, downloads to a local temp dir first, then
-    transfers each file to the workspace via the backend.
+    Downloads always use a local operation-scoped temp directory, then write
+    each completed file through the workspace backend. A backend path is not a
+    reliable local-filesystem path, even when ``backend.host`` is ``None``.
 
     Returns:
         List of result messages for each download attempt
@@ -251,14 +251,6 @@ async def _download_available_papers(
 
     results = []
     backend = context.workspace_manager.backend
-    remote = backend.host is not None
-
-    if remote:
-        dest_dir = Path(tempfile.mkdtemp(prefix="paper_dl_"))
-        backend.mkdir("documents")
-    else:
-        dest_dir = context.workspace_manager.get_path("documents")
-        dest_dir.mkdir(parents=True, exist_ok=True)
 
     downloadable = [
         p
@@ -271,7 +263,9 @@ async def _download_available_papers(
     if not downloadable:
         return ["No open access papers available for download."]
 
-    try:
+    backend.mkdir("documents")
+    with tempfile.TemporaryDirectory(prefix="paper_dl_") as temp_dir:
+        dest_dir = Path(temp_dir)
         for paper in downloadable[:5]:  # Limit to 5 downloads per research call
             try:
                 if paper.arxiv_id:
@@ -284,18 +278,13 @@ async def _download_available_papers(
                     continue
 
                 if result:
-                    # Transfer to workspace if remote
-                    if remote:
-                        ws_rel = f"documents/{result.name}"
-                        backend.write_file(ws_rel, result.read_bytes())
-                        display_path = ws_rel
-                    else:
-                        display_path = str(result)
+                    ws_rel = f"documents/{result.name}"
+                    backend.write_file(ws_rel, result.read_bytes())
 
                     # Register as citation source
                     try:
                         await context.get_or_register_doc_source(
-                            display_path, name=paper.title
+                            ws_rel, name=paper.title
                         )
                     except Exception:
                         pass
@@ -306,9 +295,6 @@ async def _download_available_papers(
             except Exception as e:
                 logger.debug(f"Download failed for {paper.title}: {e}")
                 results.append(f"  Failed: {paper.title} ({e})")
-    finally:
-        if remote:
-            shutil.rmtree(dest_dir, ignore_errors=True)
 
     return results
 
