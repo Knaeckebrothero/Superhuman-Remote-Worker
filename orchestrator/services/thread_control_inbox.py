@@ -5,7 +5,10 @@ row, making ``request_seq`` commit ordered, inserts the request, and wakes the
 stateless queue in one transaction. Admission deliberately does not persist the
 desired scalar: doing so would let a REST snapshot expose a control before the
 serving owner applied and journalled it. The owner makes the scalar visible only
-while finalizing its durable journal receipt.
+while finalizing its durable journal receipt. Workspace undo is a
+stateless-sandbox-only effect: admission requires an idle queue so it cannot
+race a live turn, and the claimant records an idempotency marker in Git before
+writing the same owner-fenced journal receipt.
 """
 
 from __future__ import annotations
@@ -46,6 +49,9 @@ class ControlAdmissionNotReady(ControlAdmissionError):
     """The exact serving owner is not ready yet; a same-UUID retry is safe."""
 
 
+WORKSPACE_UNDO_VERB = "workspace.undo"
+
+
 def _json_object(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -56,6 +62,28 @@ def _json_object(value: Any) -> dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def _stateless_session_class_refusal(thread: dict[str, Any]) -> str | None:
+    """Reject pinned-only class bits from the authoritative locked row.
+
+    Creation materializes the fully resolved officer/conference booleans into
+    ``metadata.config_override.officer``.  The route's earlier thread snapshot
+    is only a fast preflight; this check is the write-boundary authority and
+    prevents a concurrent config/class change from admitting a stateless
+    control onto pinned-only lifecycle machinery.
+    """
+
+    metadata = _json_object(thread.get("metadata"))
+    config_override = _json_object(metadata.get("config_override"))
+    officer = config_override.get("officer") or {}
+    if not isinstance(officer, dict):
+        return "session class metadata is invalid"
+    if officer.get("conference") in (True, "true", "True", 1):
+        return "conference sessions require pinned lifecycle wakes"
+    if officer.get("enabled") in (True, "true", "True", 1):
+        return "officer sessions require the pinned watchdog and wake drain"
+    return None
 
 
 async def find_existing_thread_control(
@@ -117,11 +145,13 @@ async def admit_thread_control(
     payload: dict[str, Any],
     requested_by: str,
 ) -> AdmittedControl:
-    """Admit one already-authorized ``mode.set``/``narration.set`` request.
+    """Admit one already-authorized session-control request.
 
     The caller owns schema validation and the permission-mode grant check. This
     function owns the atomicity/fencing boundary and rechecks owner, lane,
     lifecycle and reciprocal pinned binding under the thread row lock.
+    ``workspace.undo`` is deliberately absent from the pinned REST lane: the
+    existing live WebSocket behavior remains authoritative there.
     """
     tid = UUID(str(thread_id))
     uid = UUID(str(owner_user_id)) if owner_user_id is not None else None
@@ -166,8 +196,20 @@ async def admit_thread_control(
                 raise ControlAdmissionError(
                     "Session is not currently able to consume controls"
                 )
+            if verb == WORKSPACE_UNDO_VERB and payload != {}:
+                # Route validation is not an authorization boundary. Keeping
+                # this effect payload empty also makes same-UUID equivalence
+                # exact and leaves the Git marker as its only mutable input.
+                raise ControlAdmissionError(
+                    "workspace.undo does not accept a control payload"
+                )
 
             lane = str(thread["execution_lane"] or "")
+            if verb == WORKSPACE_UNDO_VERB and lane != LANE_STATELESS:
+                raise ControlAdmissionError(
+                    "Workspace undo uses the live session transport on the "
+                    "pinned execution lane"
+                )
             accepted_agent_id: UUID | None
             if lane == LANE_PINNED:
                 accepted_agent_id = thread["agent_id"]
@@ -189,22 +231,33 @@ async def admit_thread_control(
                         "Session is not ready to accept controls"
                     )
             elif lane == LANE_STATELESS:
-                _backend, workspace_refusal = stateless_lite_workspace_check(
+                class_refusal = _stateless_session_class_refusal(dict(thread))
+                if class_refusal is not None:
+                    raise ControlAdmissionError(
+                        "Stateless execution does not support this session class "
+                        f"({class_refusal})"
+                    )
+                backend, workspace_refusal = stateless_lite_workspace_check(
                     dict(thread)
                 )
                 if workspace_refusal is not None:
                     raise ControlAdmissionError(
-                        "Stateless execution currently supports only lite "
-                        "workspace backends (virtual/none); this session's "
-                        "workspace tier is not yet supported"
+                        "Stateless execution does not support this session's "
+                        f"workspace binding ({workspace_refusal})"
                     )
                 if thread["agent_id"] is not None:
                     raise ControlAdmissionError(
                         "Stateless session has an incompatible agent binding"
                     )
+                if verb == WORKSPACE_UNDO_VERB and backend != "sandbox":
+                    raise ControlAdmissionError(
+                        "Workspace undo is supported only for sandbox sessions; "
+                        "this workspace tier fails closed"
+                    )
                 accepted_agent_id = None
                 queue = await conn.fetchrow(
-                    "SELECT unit_kind, state FROM run_queue "
+                    "SELECT unit_kind, state, input_seq, consumed_seq "
+                    "FROM run_queue "
                     "WHERE unit_id = $1 FOR UPDATE",
                     tid,
                 )
@@ -217,6 +270,28 @@ async def admit_thread_control(
                     raise ControlAdmissionError(
                         "Session queue is parked; unpark it before sending controls"
                     )
+                if verb == WORKSPACE_UNDO_VERB and queue_state == STATE_LEASED:
+                    # Unlike scalar controls, undo changes the workspace tree.
+                    # Never wake the mid-turn watcher and race an active tool;
+                    # 425 directs the caller to retry this UUID once the current
+                    # owner has released the turn lease.
+                    raise ControlAdmissionNotReady(
+                        "Session is completing a turn; retry workspace undo"
+                    )
+                if verb == WORKSPACE_UNDO_VERB and queue is not None:
+                    input_seq = queue["input_seq"]
+                    consumed_seq = queue["consumed_seq"]
+                    if input_seq is not None and (
+                        consumed_seq is None or int(input_seq) > int(consumed_seq)
+                    ):
+                        # Controls drain before the human turn.  An effectful
+                        # undo admitted here would otherwise overtake an input
+                        # that was committed first.  A queued row with equal
+                        # watermarks is control-only and remains admissible.
+                        raise ControlAdmissionNotReady(
+                            "Session has pending input; retry workspace undo "
+                            "after that turn completes"
+                        )
                 if queue_state not in {
                     None,
                     STATE_QUEUED,
@@ -238,7 +313,7 @@ async def admit_thread_control(
                 raise ControlAdmissionError("Session execution lane is unavailable")
 
             request_seq = int(thread["control_seq_hwm"] or 0) + 1
-            if verb not in {"mode.set", "narration.set"}:
+            if verb not in {"mode.set", "narration.set", WORKSPACE_UNDO_VERB}:
                 # Caller validation is not an authorization boundary.
                 raise ControlAdmissionError("Unsupported control verb")
             await conn.execute(

@@ -7,7 +7,6 @@ such as workspace managers, database connections, and configuration.
 import asyncio
 import hashlib
 import logging
-import os
 import posixpath
 import re
 from collections import deque
@@ -234,6 +233,11 @@ class ToolContext:
     # drift fingerprint (etag, file_sha256) + best-effort live pointer
     # (backend, path, webdav_url) captured when a cloud file is read, so
     # cite_* can persist it onto the source's metadata.cloud block.
+    _cloud_anchor_write_locks: Dict[str, asyncio.Lock] = field(
+        default_factory=dict
+    )  # Per-canonical-path serialization for the workspace write + durable
+    # anchor update. Without this, concurrent downloads to the same target can
+    # leave bytes from one source paired with the other source's provenance.
     cloud_anchor_persist_callback: Optional[
         Callable[[str, Dict[str, Any]], Awaitable[None]]
     ] = (
@@ -570,9 +574,10 @@ class ToolContext:
 
         return self.citation_engine
 
-    @staticmethod
-    def _normalize_anchor_key(path: str) -> str:
+    def _normalize_anchor_key(self, path: str) -> str:
         """Normalize a local or workspace-relative citation path."""
+        if self.workspace_manager is not None:
+            return self.workspace_manager.workspace_relative_path(path)
         try:
             candidate = Path(path)
             if candidate.is_absolute():
@@ -602,6 +607,21 @@ class ToolContext:
             return None
         return self._cloud_anchors.get(self._normalize_anchor_key(file_path))
 
+    def cloud_anchor_write_lock(self, file_path: str) -> asyncio.Lock:
+        """Return the claim-local lock for one canonical workspace path.
+
+        Datasource tools hold this across both the backend write and
+        ``persist_cloud_anchor``. ``ToolContext`` is event-loop-local, so lock
+        creation cannot interleave before the dictionary entry is published.
+        """
+
+        workspace_path = self._normalize_anchor_key(file_path)
+        lock = self._cloud_anchor_write_locks.get(workspace_path)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._cloud_anchor_write_locks[workspace_path] = lock
+        return lock
+
     async def persist_cloud_anchor(
         self,
         file_path: str,
@@ -614,10 +634,11 @@ class ToolContext:
         Callback errors propagate: a configured durable lane must not report a
         successful cloud read while silently dropping its provenance anchor.
         """
-        self.record_cloud_anchor(file_path, anchor)
+        workspace_path = self._normalize_anchor_key(file_path)
+        self.record_cloud_anchor(workspace_path, anchor)
         callback = self.cloud_anchor_persist_callback
         if callback is not None:
-            await callback(file_path, anchor)
+            await callback(workspace_path, anchor)
 
     async def snapshot_cloud_source_bytes(
         self, file_path: str, anchor: Dict[str, Any]
@@ -645,10 +666,14 @@ class ToolContext:
             return None
 
         def _read_bytes() -> bytes:
-            if self.workspace_manager is not None and not os.path.exists(file_path):
-                with self.workspace_manager.local_copy(
-                    file_path.lstrip("/")
-                ) as local_path:
+            if self.workspace_manager is not None:
+                # Workspace identity is authoritative whenever a workspace is
+                # bound.  A same-named file in the agent CWD/image must never
+                # substitute for remote/virtual workspace bytes.
+                workspace_path = self.workspace_manager.workspace_relative_path(
+                    file_path
+                )
+                with self.workspace_manager.local_copy(workspace_path) as local_path:
                     return local_path.read_bytes()
             return Path(file_path).read_bytes()
 
@@ -694,36 +719,32 @@ class ToolContext:
         Raises:
             FileNotFoundError: If document doesn't exist
         """
-        if file_path in self._source_registry:
-            return self._source_registry[file_path]
+        source_key = self._normalize_anchor_key(file_path)
+        if source_key in self._source_registry:
+            return self._source_registry[source_key]
 
         if cloud_metadata is None:
-            cloud_metadata = self.get_cloud_anchor(file_path)
+            cloud_metadata = self.get_cloud_anchor(source_key)
 
         metadata = {"cloud": cloud_metadata} if cloud_metadata else None
 
         engine = self.get_citation_engine()
-        # The engine does local filesystem I/O (os.path.exists / fitz.open / open).
-        # On a remote workspace backend the file lives on the workspace pod, not on
-        # this agent host, so materialize a local copy first — mirroring the read
-        # tools (workspace.local_copy in files.py / filesystem.py). A path that is
-        # already present locally (e.g. the agent-side auto-register glob) is passed
-        # through unchanged.
-        if self.workspace_manager is not None and not os.path.exists(file_path):
-            # local_copy resolves relative to the workspace root; the backend
-            # rejects absolute/leading-slash paths, so normalize first.
-            rel = file_path.lstrip("/")
-            with self.workspace_manager.local_copy(rel) as local_path:
+        # The engine performs local filesystem I/O, while this value identifies
+        # a workspace object.  Always materialize through the workspace backend:
+        # host ``os.path.exists`` is not a locality signal and a CWD/image decoy
+        # with the same relative name must not replace remote/virtual bytes.
+        if self.workspace_manager is not None:
+            with self.workspace_manager.local_copy(source_key) as local_path:
                 source = await engine.add_doc_source(
                     str(local_path),
-                    name=name or os.path.basename(file_path),
+                    name=name or posixpath.basename(source_key),
                     metadata=metadata,
                 )
         else:
             source = await engine.add_doc_source(
                 file_path, name=name, metadata=metadata
             )
-        self._source_registry[file_path] = source.id
+        self._source_registry[source_key] = source.id
         return source.id
 
     async def get_or_register_web_source(

@@ -333,8 +333,8 @@ def _resume_thread_row(**overrides) -> dict:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("execution_lane", ["stateless", "future-lane"])
-async def test_resume_refuses_every_non_pinned_lane(execution_lane):
-    """Resume must never provision a pinned executor under a queue lane."""
+async def test_resume_refuses_unavailable_non_pinned_lane(execution_lane):
+    """Malformed stateless and unknown lanes fail before lifecycle mutation."""
     from main import resume_thread
 
     thread = _resume_thread_row(execution_lane=execution_lane)
@@ -353,6 +353,69 @@ async def test_resume_refuses_every_non_pinned_lane(execution_lane):
 
     assert exc.value.status_code == 409
     db.resume_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_workspace():
+    """A valid queue-lane resume is topology-neutral and restores only state."""
+    from main import resume_thread
+
+    generation = "11111111-1111-4111-8111-111111111111"
+    thread = _resume_thread_row(
+        execution_lane="stateless",
+        main_cloud_session_handle="existing-session-folder",
+        main_cloud_share_handle="existing-share",
+        metadata={
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.42.0.25",
+                "port": 30022,
+                "pod_name": "ws-thread-111111111111",
+                "namespace": "agent-workspaces",
+                "_canvas_workspace_generation": generation,
+                "_runtime_incarnation": "22222222-2222-4222-8222-222222222222",
+            },
+            "_workspace_binding": {
+                "generation": generation,
+                "kind": "remote",
+                "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+                "ssh_host_key_fingerprint": "SHA256:trusted",
+            },
+        },
+    )
+    user = {"id": "user-1"}
+    db = MagicMock()
+    db.resume_thread = AsyncMock()
+    db.list_thread_mounts = AsyncMock(return_value=[])
+    agent_provisioner = MagicMock(is_available=True)
+    agent_provisioner.provision_agent = AsyncMock()
+    persistent_provisioner = MagicMock(is_available=True)
+    persistent_provisioner.create_agent_pod = AsyncMock()
+    find_idle = AsyncMock()
+    ensure_workspace = AsyncMock()
+
+    with (
+        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
+        patch("main.postgres_db", db),
+        patch("main._thread_project_ids", AsyncMock(return_value=[])),
+        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
+        patch("main._revalidate_thread_datasource_ids", AsyncMock(return_value=[])),
+        patch("main.agent_provisioner", agent_provisioner),
+        patch("main.persistent_provisioner", persistent_provisioner),
+        patch("main._find_idle_persistent_agent", find_idle),
+        patch("main.ensure_session_workspace", ensure_workspace),
+    ):
+        result = await resume_thread("thread-1", object())
+        await asyncio.sleep(0)
+
+    assert result == {"status": "created", "thread_id": "thread-1"}
+    db.resume_thread.assert_awaited_once_with("thread-1")
+    find_idle.assert_not_awaited()
+    agent_provisioner.provision_agent.assert_not_awaited()
+    persistent_provisioner.create_agent_pod.assert_not_awaited()
+    ensure_workspace.assert_awaited_once()
 
 
 @pytest.mark.asyncio

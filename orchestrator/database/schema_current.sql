@@ -7217,6 +7217,27 @@ COMMENT ON COLUMN public.thread_client_presence.expires_at IS 'Database-clock pr
 
 
 --
+-- Name: thread_cloud_citation_anchors; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_cloud_citation_anchors (
+    thread_id uuid NOT NULL,
+    workspace_path text NOT NULL,
+    anchor jsonb NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT thread_cloud_anchor_object CHECK ((jsonb_typeof(anchor) = 'object'::text)),
+    CONSTRAINT thread_cloud_anchor_path_nonempty CHECK ((btrim(workspace_path) <> ''::text))
+);
+
+
+--
+-- Name: TABLE thread_cloud_citation_anchors; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_cloud_citation_anchors IS 'Latest cloud provenance/version anchor per logical workspace path. A WebDAV read commits this metadata before returning; later claimants hydrate it before citation registration.';
+
+
+--
 -- Name: thread_cloud_sync_generations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -7746,6 +7767,54 @@ CREATE TABLE public.thread_rewinds (
 --
 
 COMMENT ON TABLE public.thread_rewinds IS 'One row per session rewind: the audit trail, un-tombstone metadata, and the workspace SHAs of the forward-restore. Append-only.';
+
+
+--
+-- Name: thread_session_runtime_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_session_runtime_state (
+    thread_id uuid NOT NULL,
+    memory_extraction_turn integer DEFAULT 0 NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT thread_session_memory_cursor_nonnegative CHECK ((memory_extraction_turn >= 0))
+);
+
+
+--
+-- Name: TABLE thread_session_runtime_state; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_session_runtime_state IS 'Small durable cursors for persistent-session work that is otherwise process-local. memory_extraction_turn prevents a successor claim from repeating interval extraction already claimed by its predecessor.';
+
+
+--
+-- Name: thread_session_tasks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_session_tasks (
+    thread_id uuid NOT NULL,
+    task_number integer NOT NULL,
+    description text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    priority text DEFAULT 'medium'::text NOT NULL,
+    notes text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT thread_session_tasks_completion_shape CHECK ((((status = 'completed'::text) AND (completed_at IS NOT NULL)) OR ((status <> 'completed'::text) AND (completed_at IS NULL)))),
+    CONSTRAINT thread_session_tasks_description_nonempty CHECK ((btrim(description) <> ''::text)),
+    CONSTRAINT thread_session_tasks_number_positive CHECK ((task_number > 0)),
+    CONSTRAINT thread_session_tasks_priority_value CHECK ((priority = ANY (ARRAY['high'::text, 'medium'::text, 'low'::text]))),
+    CONSTRAINT thread_session_tasks_status_value CHECK ((status = ANY (ARRAY['pending'::text, 'in_progress'::text, 'completed'::text])))
+);
+
+
+--
+-- Name: TABLE thread_session_tasks; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_session_tasks IS 'Authoritative persistent-session checklist keyed by thread. The runtime hydrates it on every attach; task_number is rendered as task_<N> and is allocated while the parent thread row is locked.';
 
 
 --
@@ -9392,6 +9461,14 @@ ALTER TABLE ONLY public.thread_client_presence
 
 
 --
+-- Name: thread_cloud_citation_anchors thread_cloud_citation_anchors_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_cloud_citation_anchors
+    ADD CONSTRAINT thread_cloud_citation_anchors_pkey PRIMARY KEY (thread_id, workspace_path);
+
+
+--
 -- Name: thread_cloud_sync_generations thread_cloud_sync_generations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -9461,6 +9538,22 @@ ALTER TABLE ONLY public.thread_permission_requests
 
 ALTER TABLE ONLY public.thread_rewinds
     ADD CONSTRAINT thread_rewinds_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: thread_session_runtime_state thread_session_runtime_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_session_runtime_state
+    ADD CONSTRAINT thread_session_runtime_state_pkey PRIMARY KEY (thread_id);
+
+
+--
+-- Name: thread_session_tasks thread_session_tasks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_session_tasks
+    ADD CONSTRAINT thread_session_tasks_pkey PRIMARY KEY (thread_id, task_number);
 
 
 --
@@ -12828,6 +12921,14 @@ ALTER TABLE ONLY public.thread_client_presence
 
 
 --
+-- Name: thread_cloud_citation_anchors thread_cloud_citation_anchors_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_cloud_citation_anchors
+    ADD CONSTRAINT thread_cloud_citation_anchors_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
 -- Name: thread_cloud_sync_generations thread_cloud_sync_generations_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -12913,6 +13014,22 @@ ALTER TABLE ONLY public.thread_notifications
 
 ALTER TABLE ONLY public.thread_permission_requests
     ADD CONSTRAINT thread_permission_requests_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_session_runtime_state thread_session_runtime_state_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_session_runtime_state
+    ADD CONSTRAINT thread_session_runtime_state_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_session_tasks thread_session_tasks_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_session_tasks
+    ADD CONSTRAINT thread_session_tasks_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
 
 
 --

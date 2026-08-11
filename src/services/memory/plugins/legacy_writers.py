@@ -126,8 +126,16 @@ class PersistentIntervalExtractor:
         interval = runtime.memory_config.observer_interval
         if not (runtime.recall_store and runtime.auxiliary_llm and interval > 0):
             return
-        if (event.turn_count - self._last_extraction_turn) < interval:
-            return
+        claim_interval = runtime.extra.get("claim_persistent_extraction_interval")
+        if claim_interval is not None:
+            # Migration 0133 makes this cursor authoritative across pod/claim
+            # handoffs.  The claim advances before auxiliary work, matching the
+            # historical local cursor's at-most-once scheduling semantics.
+            if not await claim_interval(event.turn_count, interval):
+                return
+        else:
+            if (event.turn_count - self._last_extraction_turn) < interval:
+                return
 
         self._last_extraction_turn = event.turn_count
 

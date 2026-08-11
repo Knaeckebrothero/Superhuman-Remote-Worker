@@ -3932,6 +3932,17 @@ class TestHandlePersistentWebsocketReadiness:
         session.messages = []
         session.config.llm.model = "gpt-test"
         session.config.llm.temperature = 0.1
+        session.session_task_manager.to_dict_list.return_value = [
+            {
+                "id": "task_4",
+                "description": "Survive pinned reattach",
+                "status": "in_progress",
+                "priority": "high",
+                "notes": "hydrated",
+                "created_at": "2026-08-10T08:30:00+00:00",
+                "completed_at": None,
+            }
+        ]
 
         with (
             patch("src.api.persistent_app._session", session),
@@ -3956,6 +3967,18 @@ class TestHandlePersistentWebsocketReadiness:
         )
         assert welcome["params"]["turn_count"] == 7
         assert welcome["params"]["turn_in_flight"] is True
+        assert welcome["params"]["tasks"] == [
+            {
+                "id": "task_4",
+                "description": "Survive pinned reattach",
+                "status": "in_progress",
+                "priority": "high",
+                "notes": "hydrated",
+                "created_at": "2026-08-10T08:30:00+00:00",
+                "completed_at": None,
+            }
+        ]
+        session.session_task_manager.to_dict_list.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_reattach_flag_closes_at_transcript_terminal_edge(self):

@@ -480,9 +480,10 @@ agent:
   # plane: the pods carry distinct class labels so the agent Service/PDB,
   # reap/scale sweeps, and per-session routing never touch them.
   stateless:
-    # -- DEFAULT OFF (prod-safe). The stateless lane is an S1 build in
-    # progress; enable on dev/local overlays only until the executor mode
-    # ships and the lane flag flips.
+    # -- DEFAULT OFF (prod-safe). This renders the executor pool and opens
+    # stateless admission for supported session workspace tiers. Disabled
+    # preserves pinned session behavior. VM/remote tiers remain pinned/refused
+    # even when enabled.
     enabled: false
     # -- Warm floor of executor pods (§5.8: interactive floor ≥ 2). KEDA/HPA
     # autoscaling is a later, separately-gated addition.

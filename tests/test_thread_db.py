@@ -130,6 +130,32 @@ class TestCreateThread:
         assert call_args[0][4] == "supervised"  # permission_mode
         assert call_args[0][5] == "auto"  # narration_mode
         assert call_args[0][6] == "Untitled Session"  # title
+        assert call_args[0][8] == "pinned"  # execution_lane
+
+    @pytest.mark.asyncio
+    async def test_explicit_stateless_lane_is_written_in_creation_insert(self):
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(
+            return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")}
+        )
+        db = _make_db_with_conn(conn)
+
+        await db.create_thread(execution_lane="stateless")
+
+        sql, *params = conn.fetchrow.call_args.args
+        assert "metadata, execution_lane" in sql
+        assert "$7::jsonb, $8" in sql
+        assert params[7] == "stateless"
+
+    @pytest.mark.asyncio
+    async def test_unknown_execution_lane_fails_before_database_access(self):
+        conn = _mock_conn()
+        db = _make_db_with_conn(conn)
+
+        with pytest.raises(ValueError, match="Unsupported thread execution lane"):
+            await db.create_thread(execution_lane="future-lane")
+
+        conn.fetchrow.assert_not_awaited()
 
 
 # =============================================================================

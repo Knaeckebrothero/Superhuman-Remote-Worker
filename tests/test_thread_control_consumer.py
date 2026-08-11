@@ -88,12 +88,42 @@ def _receipt(
     )
 
 
+def _undo_request(request_id: UUID = REQUEST_1, seq: int = 1) -> ControlRequest:
+    return ControlRequest(
+        id=request_id,
+        thread_id=THREAD_ID,
+        request_seq=seq,
+        client_request_id=UUID(int=seq),
+        verb="workspace.undo",
+        payload={},
+        accepted_agent_id=None,
+    )
+
+
+def _undo_receipt(request: ControlRequest) -> ControlReceipt:
+    return ControlReceipt(
+        epoch=6,
+        seq=44,
+        kind="files.restored",
+        payload={
+            "request_id": str(request.id),
+            "client_request_id": str(request.client_request_id),
+            "request_seq": request.request_seq,
+            "method": "workspace.undo",
+            "paths": ["kept.txt", "new.txt"],
+            "restored_to_sha": "1" * 40,
+            "restore_commit_sha": "2" * 40,
+        },
+    )
+
+
 @pytest.fixture
 def stateless_owner(monkeypatch):
     session = SimpleNamespace(
         postgres_conn=_pool(),
         permission_mode="supervised",
         narration_mode="auto",
+        undo_turn=AsyncMock(),
     )
     monkeypatch.setattr(pa, "_session", session)
     monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
@@ -180,6 +210,146 @@ async def test_drain_journals_and_finalizes_before_synchronous_ram_apply(
     ] == [(str(REQUEST_1), 9, None), (str(REQUEST_2), 9, None)]
     assert [call.args[0].request_seq for call in apply_mock.call_args_list] == [1, 2]
     adopt.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_workspace_undo_effect_precedes_owner_fenced_journal_and_finalize(
+    stateless_owner,
+):
+    request = _undo_request()
+    fetch_next = AsyncMock(side_effect=[request, None])
+    order: list[str] = []
+
+    async def undo(**_kwargs):
+        order.append("undo")
+        return {
+            "paths": ["kept.txt", "new.txt"],
+            "restored_to_sha": "1" * 40,
+            "restore_commit_sha": "2" * 40,
+        }
+
+    async def journal(*_args, **_kwargs):
+        order.append("journal")
+        return 6, 44
+
+    async def finalize(*_args, **_kwargs):
+        order.append("finalize")
+        return "applied"
+
+    stateless_owner.undo_turn.side_effect = undo
+    journal_mock = AsyncMock(side_effect=journal)
+    finalize_mock = AsyncMock(side_effect=finalize)
+    with (
+        patch(
+            "src.shared.thread_controls.owner_fence_current",
+            AsyncMock(return_value=True),
+        ),
+        patch(
+            "src.shared.thread_controls.adopt_next_pinned_control_request",
+            AsyncMock(return_value=False),
+        ),
+        patch("src.shared.thread_controls.fetch_next_control_request", fetch_next),
+        patch(
+            "src.shared.thread_controls.fetch_control_receipt",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(pa, "_broadcast_durable", journal_mock),
+        patch.object(pa, "_finalize_durable_control", finalize_mock),
+    ):
+        assert await pa._drain_thread_controls(lease_token=9) == 1
+
+    assert order == ["undo", "journal", "finalize"]
+    stateless_owner.undo_turn.assert_awaited_once_with(
+        control_request_id=str(REQUEST_1)
+    )
+    journal_mock.assert_awaited_once_with(
+        "files.restored",
+        {
+            "request_id": str(REQUEST_1),
+            "client_request_id": str(request.client_request_id),
+            "request_seq": 1,
+            "method": "workspace.undo",
+            "paths": ["kept.txt", "new.txt"],
+            "restored_to_sha": "1" * 40,
+            "restore_commit_sha": "2" * 40,
+        },
+        control_request_id=str(REQUEST_1),
+        lease_token=9,
+        agent_id=None,
+    )
+    finalize_mock.assert_awaited_once_with(
+        request,
+        lease_token=9,
+        agent_id=None,
+        outcome="applied",
+        error_code=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_workspace_undo_receipt_recovery_never_repeats_git_effect(
+    stateless_owner,
+):
+    request = _undo_request()
+    receipt = _undo_receipt(request)
+    with (
+        patch(
+            "src.shared.thread_controls.owner_fence_current",
+            AsyncMock(return_value=True),
+        ),
+        patch(
+            "src.shared.thread_controls.adopt_next_pinned_control_request",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            "src.shared.thread_controls.fetch_next_control_request",
+            AsyncMock(side_effect=[request, None]),
+        ),
+        patch(
+            "src.shared.thread_controls.fetch_control_receipt",
+            AsyncMock(return_value=receipt),
+        ),
+        patch.object(pa, "_broadcast_durable", AsyncMock()) as journal,
+        patch.object(
+            pa, "_finalize_durable_control", AsyncMock(return_value="applied")
+        ),
+    ):
+        assert await pa._drain_thread_controls(lease_token=9) == 1
+
+    stateless_owner.undo_turn.assert_not_awaited()
+    journal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_workspace_undo_retryable_effect_is_not_journaled(stateless_owner):
+    request = _undo_request()
+    stateless_owner.undo_turn.side_effect = pa.WorkspaceUndoRetryable(
+        "push is ambiguous"
+    )
+    journal = AsyncMock()
+    with (
+        patch(
+            "src.shared.thread_controls.owner_fence_current",
+            AsyncMock(return_value=True),
+        ),
+        patch(
+            "src.shared.thread_controls.adopt_next_pinned_control_request",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            "src.shared.thread_controls.fetch_next_control_request",
+            AsyncMock(return_value=request),
+        ),
+        patch(
+            "src.shared.thread_controls.fetch_control_receipt",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(pa, "_broadcast_durable", journal),
+    ):
+        with pytest.raises(pa.ControlInboxBlocked, match="remains retryable"):
+            await pa._drain_thread_controls(lease_token=9)
+
+    journal.assert_not_awaited()
 
 
 @pytest.mark.asyncio

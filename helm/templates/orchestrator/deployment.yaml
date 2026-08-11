@@ -404,9 +404,15 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: CHECKPOINTER_BACKEND
-            # Worker-job stateless admission is independent from the executor
-            # Deployment gate. The batch floor comes from the same ConfigMap
-            # so admission and execution observe one rendered configuration.
+            # Session admission reads the exact gate that renders the generic
+            # executor Deployment, so an admitted session always has a pool.
+            # Worker-job admission remains independent. All values come from
+            # one ConfigMap so the control and execution planes agree.
+            - name: STATELESS_SESSION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: STATELESS_SESSION_ENABLED
             - name: STATELESS_WORKER_ENABLED
               valueFrom:
                 configMapKeyRef:

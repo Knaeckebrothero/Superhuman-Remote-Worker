@@ -1354,6 +1354,71 @@ class TestControlFinalization:
             == STATE_DONE
         )
 
+    async def test_workspace_undo_receipt_finalizes_without_scalar_mutation(self, conn):
+        thread_id = uuid4()
+        owner_id = uuid4()
+        request_id = uuid4()
+        client_request_id = uuid4()
+        await conn.execute(
+            "INSERT INTO threads (id, user_id, execution_lane) "
+            "VALUES ($1, $2, 'stateless')",
+            thread_id,
+            owner_id,
+        )
+        await record_control_seq(
+            conn,
+            unit_id=thread_id,
+            unit_kind=SESSION,
+            control_seq=1,
+            baseline_input_seq=0,
+            fair_key=str(owner_id),
+        )
+        claim = await claim_unit(conn, unit_kind=SESSION, pod_name="undo-owner")
+        await conn.execute(
+            "INSERT INTO thread_control_requests ("
+            "id, thread_id, request_seq, client_request_id, verb, payload, "
+            "requested_by"
+            ") VALUES ($1, $2, 1, $3, 'workspace.undo', '{}'::jsonb, 'owner')",
+            request_id,
+            thread_id,
+            client_request_id,
+        )
+        await conn.execute(
+            "INSERT INTO thread_events ("
+            "thread_id, epoch, seq, kind, payload, control_request_id"
+            ") VALUES ($1, 2, 3, 'files.restored', $2::jsonb, $3)",
+            thread_id,
+            json.dumps(
+                {
+                    "request_id": str(request_id),
+                    "client_request_id": str(client_request_id),
+                    "request_seq": 1,
+                    "method": "workspace.undo",
+                    "paths": ["kept.txt", "new.txt"],
+                    "restored_to_sha": "1" * 40,
+                    "restore_commit_sha": "2" * 40,
+                }
+            ),
+            request_id,
+        )
+
+        async with conn.transaction():
+            result = await finalize_control_request(
+                conn,
+                request_id=request_id,
+                lease_token=claim.lease_token,
+            )
+
+        assert result == "applied"
+        assert (
+            await conn.fetchval(
+                "SELECT permission_mode FROM threads WHERE id = $1", thread_id
+            )
+            == "supervised"
+        )
+        row = await _row(conn, thread_id)
+        assert (row["control_input_seq"], row["control_consumed_seq"]) == (1, 1)
+
     async def test_control_receipt_is_unique_and_constraints_are_validated(self, conn):
         thread_id, request_id, _claim = await self._stateless_request_with_receipt(conn)
 
