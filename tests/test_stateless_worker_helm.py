@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import signal
 import shutil
 import subprocess
+import time
 
 import pytest
 import yaml
@@ -36,6 +39,13 @@ def _render(*settings: str, show_only: str | None = None) -> list[dict]:
 
 def _only_kind(documents: list[dict], kind: str) -> dict:
     matches = [document for document in documents if document.get("kind") == kind]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _stateless_agent_container(deployment: dict) -> dict:
+    containers = deployment["spec"]["template"]["spec"]["containers"]
+    matches = [container for container in containers if container["name"] == "agent"]
     assert len(matches) == 1
     return matches[0]
 
@@ -105,6 +115,93 @@ def test_stateless_executor_grace_exceeds_shutdown_and_abort_budget() -> None:
     assert (
         deployment["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] == 180
     )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_stateless_executor_execs_python_as_pid1() -> None:
+    deployment = _only_kind(
+        _render(
+            "agent.stateless.enabled=true",
+            show_only="templates/agent/stateless-deployment.yaml",
+        ),
+        "Deployment",
+    )
+
+    assert _stateless_agent_container(deployment)["command"] == [
+        "sh",
+        "-c",
+        (
+            "exec python agent.py --mode stateless --config worker_base "
+            "--port 8001 --host 0.0.0.0 --loop"
+        ),
+    ]
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_rendered_stateless_shell_delivers_sigterm_to_agent(
+    tmp_path: Path,
+) -> None:
+    deployment = _only_kind(
+        _render(
+            "agent.stateless.enabled=true",
+            show_only="templates/agent/stateless-deployment.yaml",
+        ),
+        "Deployment",
+    )
+    command = _stateless_agent_container(deployment)["command"]
+    ready_path = tmp_path / "ready"
+    term_path = tmp_path / "term"
+    (tmp_path / "agent.py").write_text(
+        """\
+import os
+from pathlib import Path
+import signal
+
+
+def stop(signum, _frame):
+    Path(os.environ["TERM_PATH"]).write_text(str(signum))
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, stop)
+Path(os.environ["READY_PATH"]).write_text(str(os.getpid()))
+signal.pause()
+"""
+    )
+    environment = {
+        **os.environ,
+        "READY_PATH": str(ready_path),
+        "TERM_PATH": str(term_path),
+    }
+    process = subprocess.Popen(
+        command,
+        cwd=tmp_path,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    try:
+        deadline = time.monotonic() + 5
+        while not ready_path.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+
+        assert ready_path.exists(), (
+            f"probe did not become ready (returncode={process.poll()})"
+        )
+        # `exec` replaces the shell rather than leaving Python as a child.
+        assert int(ready_path.read_text()) == process.pid
+
+        process.terminate()
+        assert process.wait(timeout=5) == 0
+        assert term_path.read_text() == str(signal.SIGTERM.value)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
