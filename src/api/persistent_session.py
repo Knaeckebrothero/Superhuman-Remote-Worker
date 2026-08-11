@@ -565,6 +565,10 @@ class PersistentSession:
 
         effective_backend = (workspace_override or {}).get("backend") or ws_data.backend
         remote_cfg = (workspace_override or {}).get("remote") or ws_data.remote
+        workspace_generation = (workspace_override or {}).get("workspace_generation")
+        workspace_runtime_incarnation = (workspace_override or {}).get(
+            "workspace_runtime_incarnation"
+        )
 
         # No-workspace tiers (virtual/none): no SSH workspace pod. Build the
         # lite backend directly, with git off (§8 — lite tiers have no git).
@@ -609,6 +613,13 @@ class PersistentSession:
                 "No workspace configured. Persistent sessions require "
                 "an isolated workspace (sandbox or vm) with SSH credentials."
             )
+        if self.shell_owner_token is not None and (
+            not workspace_generation or not workspace_runtime_incarnation
+        ):
+            raise WorkspaceUnavailableError(
+                "A stateless physical session requires an orchestrator-attested "
+                "workspace backing and runtime incarnation"
+            )
 
         from ..core.backends.remote import RemoteBackend
 
@@ -639,6 +650,16 @@ class PersistentSession:
                         "retry_timeouts_as_booting", False
                     ),
                     sudo_action=shell_config.get("sudo_action", "freeze"),
+                    workspace_generation=(
+                        workspace_generation
+                        if self.shell_owner_token is not None
+                        else None
+                    ),
+                    runtime_incarnation=(
+                        workspace_runtime_incarnation
+                        if self.shell_owner_token is not None
+                        else None
+                    ),
                 )
                 if self.shell_owner_token is not None:
                     workspace_backend.set_shell_owner_token(self.shell_owner_token)
@@ -2657,6 +2678,7 @@ class PersistentSession:
             preserve_workspace_daemons = False
 
         backend_for_cleanup = None
+        shell_retirement_error: Exception | None = None
         if self.workspace_manager:
             from ..core.virtual_dirs import unwrap_backend
 
@@ -2714,7 +2736,19 @@ class PersistentSession:
             try:
                 self.shell_manager.cleanup()
             except Exception as e:
-                logger.warning(f"Shell cleanup error: {e}")
+                if self.shell_owner_token is not None:
+                    # Stateless terminal teardown is an acknowledged remote
+                    # mutation, not best-effort local cleanup. Keep the backend
+                    # retryable and surface failure after the remaining local
+                    # resources have been made inert. A successor can also
+                    # reconcile the fenced record if lifecycle teardown removes
+                    # this runtime before the retry lands.
+                    shell_retirement_error = e
+                    logger.error(
+                        "Stateless shell retirement was not acknowledged: %s", e
+                    )
+                else:
+                    logger.warning(f"Shell cleanup error: {e}")
         elif self.shell_manager:
             logger.info(
                 "Preserving remote shell for session handoff: thread=%s",
@@ -2743,7 +2777,25 @@ class PersistentSession:
         # claim/session handoff.
         if self.workspace_manager:
             backend = backend_for_cleanup
-            if hasattr(backend, "retire"):
+            if shell_retirement_error is not None:
+                retire_claim_resource_owner = getattr(
+                    backend, "retire_claim_resource_owner", None
+                )
+                if retire_claim_resource_owner is not None:
+                    try:
+                        retire_claim_resource_owner()
+                    except Exception as e:
+                        logger.warning(f"Claim-resource retirement error: {e}")
+                # Do not call retire(): it permanently prevents the same session
+                # object from reconnecting for a terminal-retirement retry.
+                # Shell admission and claim-resource admission are already
+                # closed, so a transport reset is sufficient local containment.
+                if hasattr(backend, "disconnect"):
+                    try:
+                        backend.disconnect()
+                    except Exception as e:
+                        logger.warning(f"Backend disconnect error: {e}")
+            elif hasattr(backend, "retire"):
                 try:
                     backend.retire()
                     logger.info("Remote workspace backend retired")
@@ -2758,3 +2810,7 @@ class PersistentSession:
                     logger.warning(f"Backend disconnect error: {e}")
 
         logger.info(f"PersistentSession cleaned up: thread={self.thread_id}")
+        if shell_retirement_error is not None:
+            raise WorkspaceUnavailableError(
+                "Stateless session shell retirement remains unacknowledged"
+            ) from shell_retirement_error

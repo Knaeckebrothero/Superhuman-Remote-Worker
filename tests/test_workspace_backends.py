@@ -6,9 +6,11 @@ entirely to avoid requiring SSH infrastructure.
 
 import errno
 import io
+import os
 import re
 import socket
 import stat as stat_module
+import subprocess
 import threading
 from contextlib import contextmanager
 import sys
@@ -299,6 +301,8 @@ from src.core.backends.remote import (  # noqa: E402
     _TMUX_SETUP_OPTION,
     _TMUX_SETUP_PENDING,
     _TMUX_TAB_TYPE_OPTION,
+    _TMUX_RUNTIME_INCARNATION_OPTION,
+    _TMUX_WORKSPACE_GENERATION_OPTION,
     _TMUX_WINDOW_SETUP_OPTION,
     _TCP_KEEPALIVE_COUNT,
     _TCP_KEEPALIVE_IDLE_SECONDS,
@@ -308,6 +312,10 @@ from src.core.backends.remote import (  # noqa: E402
     _parse_shell_completion_record,
     _validate_private_key,
 )
+
+
+_WORKSPACE_GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_RUNTIME_INCARNATION = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
 
 def _tmux_window_row(
@@ -466,6 +474,21 @@ class TestRemoteBackendInit:
     def test_session_name_without_job_id(self):
         backend = RemoteBackend(host="host", workspace_path="/ws", job_id="")
         assert backend._session_name == "agent_remote"
+
+    @pytest.mark.parametrize(
+        ("workspace_generation", "runtime_incarnation"),
+        [(_WORKSPACE_GENERATION, None), (None, _RUNTIME_INCARNATION)],
+    )
+    def test_workspace_authority_must_be_supplied_as_a_pair(
+        self, workspace_generation, runtime_incarnation
+    ):
+        with pytest.raises(ValueError, match="must be supplied together"):
+            RemoteBackend(
+                host="host",
+                workspace_path="/ws",
+                workspace_generation=workspace_generation,
+                runtime_incarnation=runtime_incarnation,
+            )
 
 
 class TestRemoteBackendConnect:
@@ -1689,6 +1712,20 @@ class TestRemoteBackendExec:
 class TestRemoteBackendTmuxFences:
     """The durable tmux protocol fails closed across owner handoffs."""
 
+    @staticmethod
+    def _incarnation_backend(
+        token: int = 21, runtime_incarnation: str = _RUNTIME_INCARNATION
+    ) -> RemoteBackend:
+        backend = RemoteBackend(
+            host="workspace.test",
+            workspace_path="/home/agent-host/workspace",
+            job_id="aaaa-bbbb-cccc-dddd",
+            workspace_generation=_WORKSPACE_GENERATION,
+            runtime_incarnation=runtime_incarnation,
+        )
+        backend.set_shell_owner_token(token)
+        return backend
+
     def test_pinned_claim_resource_exec_preserves_plain_command(self, remote_backend):
         backend, _, _ = remote_backend
         with patch.object(backend, "exec_command", return_value="ok") as execute:
@@ -1827,6 +1864,161 @@ class TestRemoteBackendTmuxFences:
         recreate = command.index("tmux new-session", reset)
         assert creating_branch < reset < recreate
 
+    def test_incarnation_fence_binds_stable_backing_and_current_pod(self):
+        backend = self._incarnation_backend()
+
+        with patch.object(
+            backend, "_tmux_exec_checked", return_value="existing"
+        ) as execute:
+            assert backend._stateless_create_or_observe_tmux_session() == "existing"
+
+        command = execute.call_args.args[0]
+        assert f"2|{backend._tmux_owner_digest}|{_WORKSPACE_GENERATION}|" in command
+        assert f"|{_RUNTIME_INCARNATION}|%s|%s|%s" in command
+        assert _TMUX_WORKSPACE_GENERATION_OPTION in command
+        assert _TMUX_RUNTIME_INCARNATION_OPTION in command
+        assert f'"$_srw_runtime_incarnation" = {_RUNTIME_INCARNATION}' in command
+        assert f'"$_srw_tmux_runtime_incarnation" = {_RUNTIME_INCARNATION}' in command
+
+    def test_replacement_runtime_supersedes_stale_marker_only_without_live_tmux(self):
+        backend = self._incarnation_backend(token=22)
+
+        with patch.object(
+            backend, "_tmux_exec_checked", return_value="created"
+        ) as execute:
+            assert backend._stateless_create_or_observe_tmux_session() == "created"
+
+        command = execute.call_args.args[0]
+        stale_branch = command.rindex('elif [ "$_srw_marker" = present ]; then')
+        live_conflict = command.index("tmux has-session", stale_branch)
+        reject = command.index("exit 80", live_conflict)
+        recreate = command.index("tmux new-session", reject)
+        assert stale_branch < live_conflict < reject < recreate
+
+    @staticmethod
+    def _run_generated_tmux_command_without_session(
+        backend: RemoteBackend, command: str, tmp_path: Path
+    ) -> subprocess.CompletedProcess[str]:
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_tmux = fake_bin / "tmux"
+        fake_tmux.write_text(
+            '#!/bin/sh\nif [ "$1" = "has-session" ]; then exit 1; fi\nexit 0\n'
+        )
+        fake_tmux.chmod(0o755)
+        env = dict(os.environ)
+        env["HOME"] = str(tmp_path)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        return subprocess.run(
+            ["bash", "-c", command],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_replacement_runtime_rewrites_older_marker_on_shared_backing(
+        self, tmp_path
+    ):
+        old_runtime = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        backend = self._incarnation_backend(token=22)
+        with patch.object(
+            backend, "_tmux_exec_checked", return_value="created"
+        ) as execute:
+            backend._stateless_create_or_observe_tmux_session()
+        command = execute.call_args.args[0]
+        state_dir = tmp_path / ".srw" / "tmux"
+        state_dir.mkdir(parents=True)
+        state_file = state_dir / backend._tmux_state_filename
+        state_file.write_text(
+            f"2|{backend._tmux_owner_digest}|{_WORKSPACE_GENERATION}|"
+            f"{old_runtime}|active|21|{'a' * 32}\n"
+        )
+
+        completed = self._run_generated_tmux_command_without_session(
+            backend, command, tmp_path
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout == "created"
+        fields = state_file.read_text().strip().split("|")
+        assert fields[:6] == [
+            "2",
+            backend._tmux_owner_digest,
+            _WORKSPACE_GENERATION,
+            _RUNTIME_INCARNATION,
+            "active",
+            "22",
+        ]
+        assert re.fullmatch(r"[0-9a-f]{32}", fields[6])
+
+    def test_stale_runtime_cannot_overwrite_newer_claim_marker(self, tmp_path):
+        old_runtime = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        backend = self._incarnation_backend(token=21, runtime_incarnation=old_runtime)
+        with patch.object(
+            backend, "_tmux_exec_checked", return_value="created"
+        ) as execute:
+            backend._stateless_create_or_observe_tmux_session()
+        command = execute.call_args.args[0]
+        state_dir = tmp_path / ".srw" / "tmux"
+        state_dir.mkdir(parents=True)
+        state_file = state_dir / backend._tmux_state_filename
+        successor_state = (
+            f"2|{backend._tmux_owner_digest}|{_WORKSPACE_GENERATION}|"
+            f"{_RUNTIME_INCARNATION}|active|22|{'b' * 32}\n"
+        )
+        state_file.write_text(successor_state)
+
+        completed = self._run_generated_tmux_command_without_session(
+            backend, command, tmp_path
+        )
+
+        assert completed.returncode == 75
+        assert state_file.read_text() == successor_state
+
+    def test_stale_runtime_cleanup_cannot_retire_newer_claim_marker(self, tmp_path):
+        old_runtime = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        backend = self._incarnation_backend(token=21, runtime_incarnation=old_runtime)
+        with patch.object(backend, "_tmux_exec_checked") as execute:
+            backend.shell_cleanup()
+        command = execute.call_args.args[0]
+        state_dir = tmp_path / ".srw" / "tmux"
+        state_dir.mkdir(parents=True)
+        state_file = state_dir / backend._tmux_state_filename
+        successor_state = (
+            f"2|{backend._tmux_owner_digest}|{_WORKSPACE_GENERATION}|"
+            f"{_RUNTIME_INCARNATION}|active|22|{'b' * 32}\n"
+        )
+        state_file.write_text(successor_state)
+
+        completed = self._run_generated_tmux_command_without_session(
+            backend, command, tmp_path
+        )
+
+        assert completed.returncode == 75
+        assert state_file.read_text() == successor_state
+
+    def test_legacy_live_session_migration_installs_both_authority_options(self):
+        backend = self._incarnation_backend(token=23)
+
+        with patch.object(
+            backend, "_tmux_exec_checked", return_value="existing"
+        ) as execute:
+            backend._stateless_create_or_observe_tmux_session()
+
+        command = execute.call_args.args[0]
+        legacy_branch = command.index('[ -z "$_srw_workspace_generation" ] &&')
+        workspace_set = command.index(
+            f"{_TMUX_WORKSPACE_GENERATION_OPTION} {_WORKSPACE_GENERATION}",
+            legacy_branch,
+        )
+        runtime_set = command.index(
+            f"{_TMUX_RUNTIME_INCARNATION_OPTION} {_RUNTIME_INCARNATION}",
+            workspace_set,
+        )
+        rewrite = command.index("_srw_write_state active", runtime_set)
+        assert legacy_branch < workspace_set < runtime_set < rewrite
+
     def test_stateless_cleanup_writes_tombstone_before_kill(self, remote_backend):
         backend, _, _ = remote_backend
         backend.set_shell_owner_token(14)
@@ -1842,6 +2034,41 @@ class TestRemoteBackendTmuxFences:
         assert '"$_srw_token" -le 14' in command
         assert _TMUX_GENERATION_OPTION in command
         assert execute.call_args.kwargs["allow_shell_retired"] is True
+
+    def test_incarnation_cleanup_is_strict_and_checks_both_authorities(self):
+        backend = self._incarnation_backend(token=24)
+
+        with patch.object(backend, "_tmux_exec_checked") as execute:
+            backend.shell_cleanup()
+
+        command = execute.call_args.args[0]
+        assert _WORKSPACE_GENERATION in command
+        assert _RUNTIME_INCARNATION in command
+        assert _TMUX_WORKSPACE_GENERATION_OPTION in command
+        assert _TMUX_RUNTIME_INCARNATION_OPTION in command
+        assert command.index("_srw_write_state retired") < command.index(
+            "tmux kill-session"
+        )
+
+    def test_incarnation_cleanup_surfaces_missing_remote_ack(self):
+        backend = self._incarnation_backend(token=25)
+        backend._shell_initialized = True
+
+        with (
+            patch.object(
+                backend,
+                "_tmux_exec_checked",
+                side_effect=WorkspaceUnavailableError("response lost"),
+            ),
+            pytest.raises(
+                WorkspaceUnavailableError,
+                match="terminal retirement was not acknowledged",
+            ),
+        ):
+            backend.shell_cleanup()
+
+        assert backend._shell_initialized is False
+        assert backend._tabs == {}
 
     def test_exact_tmux_targets_do_not_change_raw_create_name(self, remote_backend):
         backend, _, _ = remote_backend

@@ -1631,6 +1631,8 @@ class TestPollWorkspaceReady:
         client.get_thread_workspace.return_value = {
             "status": "ready",
             "pod_ip": "172.16.0.10",
+            "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
             "git_remote_url": "http://gitea/repo",
             "canvas_presentation_available": True,
             "canvas_live_apps_available": True,
@@ -1643,6 +1645,11 @@ class TestPollWorkspaceReady:
         assert result["backend"] == "sandbox"
         assert result["remote"]["host"] == "172.16.0.10"
         assert result["remote"]["port"] == 30022
+        assert result["workspace_generation"] == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        assert (
+            result["workspace_runtime_incarnation"]
+            == "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        )
         assert result["canvas_presentation_available"] is True
         assert result["canvas_live_apps_available"] is True
         assert result["canvas_shared_browser_available"] is True
@@ -2621,6 +2628,7 @@ class TestHandleVmUpgrade:
 class TestHandleWorkspaceUpgradeVm:
     def _session_with_backend(self, backend):
         sess = MagicMock()
+        sess.shell_owner_token = None
         sess.config.extra = {"shell": {}}
         sess.workspace_manager.backend = backend
         return sess
@@ -2813,6 +2821,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         client.get_thread_workspace.return_value = {}
         old_backend = SimpleNamespace(supports_shell=False)
         session = MagicMock()
+        session.shell_owner_token = None
         session.config.extra = {"shell": {}}
         session.workspace_manager.backend = old_backend
         session.swap_backend = MagicMock()
@@ -2864,6 +2873,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
             supports_canvas_shared_browser=True,
         )
         session = MagicMock()
+        session.shell_owner_token = None
         session.config.extra = {"shell": {}}
         session.workspace_manager.backend = old_backend
         session.swap_backend = MagicMock()
@@ -2891,6 +2901,54 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         assert new_backend.supports_canvas_shared_browser is False
         session.swap_backend.assert_called_once_with(new_backend)
         session.resetup_tools_for_backend.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stateless_live_swap_claims_paired_runtime_before_exposure(self):
+        import sys
+
+        ws = AsyncMock()
+        client = AsyncMock()
+        client.request_thread_workspace_upgrade.return_value = True
+        client.get_thread_workspace.return_value = {}
+        session = MagicMock()
+        session.shell_owner_token = 73
+        session.config.extra = {"shell": {}}
+        session.workspace_manager.backend = SimpleNamespace(supports_shell=False)
+        session.swap_backend = MagicMock()
+        session.resetup_tools_for_backend = MagicMock()
+        new_backend = MagicMock()
+        remote_module = MagicMock()
+        remote_module.RemoteBackend.return_value = new_backend
+        workspace = {
+            "backend": "sandbox",
+            "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "remote": {"host": "workspace.test", "port": 30022},
+        }
+
+        with (
+            patch("src.api.persistent_app._session", session),
+            patch("src.api.persistent_app._orchestrator_client", client),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch(
+                "src.api.persistent_app._poll_workspace_ready",
+                new_callable=AsyncMock,
+                return_value=workspace,
+            ),
+            patch.dict(sys.modules, {"src.core.backends.remote": remote_module}),
+            patch("src.core.backends.seed.seed_workspace", return_value=1),
+        ):
+            await _handle_workspace_upgrade(ws, target_tier="sandbox")
+
+        kwargs = remote_module.RemoteBackend.call_args.kwargs
+        assert kwargs["workspace_generation"] == workspace["workspace_generation"]
+        assert (
+            kwargs["runtime_incarnation"] == workspace["workspace_runtime_incarnation"]
+        )
+        new_backend.set_shell_owner_token.assert_called_once_with(73)
+        new_backend.connect.assert_called_once_with()
+        new_backend.claim_shell_owner.assert_called_once_with()
+        session.swap_backend.assert_called_once_with(new_backend)
 
 
 # ---------------------------------------------------------------------------

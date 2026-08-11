@@ -32,6 +32,7 @@ from src.shared.cloud_sync_generations import (
 
 THREAD_ID = "11111111-1111-4111-8111-111111111111"
 WORKSPACE_GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+WORKSPACE_RUNTIME_INCARNATION = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 LEASE_TOKEN = 47
 SCOPE_SHA256 = "a" * 64
 MOUNT_ID = "mount:logical-destination"
@@ -406,6 +407,7 @@ async def test_workspace_poll_preserves_generation(
     workspace_response: dict, expected_backend: str
 ):
     workspace_response["workspace_generation"] = WORKSPACE_GENERATION
+    workspace_response["workspace_runtime_incarnation"] = WORKSPACE_RUNTIME_INCARNATION
     client = SimpleNamespace(
         get_thread_workspace=AsyncMock(return_value=workspace_response)
     )
@@ -415,6 +417,7 @@ async def test_workspace_poll_preserves_generation(
     assert result is not None
     assert result["backend"] == expected_backend
     assert result["workspace_generation"] == WORKSPACE_GENERATION
+    assert result["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME_INCARNATION
 
 
 @pytest.mark.asyncio
@@ -430,6 +433,7 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
                 "status": "ready",
                 "pod_ip": "10.0.0.8",
                 "_canvas_workspace_generation": WORKSPACE_GENERATION,
+                "_runtime_incarnation": WORKSPACE_RUNTIME_INCARNATION,
             },
             "_workspace_binding": {
                 "generation": WORKSPACE_GENERATION,
@@ -492,6 +496,27 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
         response = await orch_main._agent_get_thread_workspace_locked(THREAD_ID)
 
     assert response["workspace_generation"] == WORKSPACE_GENERATION
+    assert response["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME_INCARNATION
+
+
+def test_owner_payload_redacts_private_workspace_runtime_incarnation():
+    import orchestrator.main as orch_main
+
+    record = {
+        "metadata": {
+            "workspace_container": {
+                "status": "ready",
+                "_canvas_workspace_generation": WORKSPACE_GENERATION,
+                "_runtime_incarnation": WORKSPACE_RUNTIME_INCARNATION,
+            }
+        }
+    }
+
+    redacted = orch_main._redact_nested_workspace_state(record, field="metadata")
+
+    workspace = redacted["metadata"]["workspace_container"]
+    assert "_canvas_workspace_generation" not in workspace
+    assert "_runtime_incarnation" not in workspace
 
 
 async def _internal_workspace_response_for_lite_thread(

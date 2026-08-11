@@ -2702,8 +2702,8 @@ async def test_k8s_trusted_identity_tracks_pvc_not_replacement_pod(monkeypatch) 
 
     from services import container_provisioner as module
 
-    pod_uid = ["pod-one"]
-    pvc_uid = ["claim-one"]
+    pod_uid = ["11111111-1111-4111-8111-111111111111"]
+    pvc_uid = ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
 
     class CoreAPI:
         connect_get_namespaced_pod_exec = object()
@@ -2725,26 +2725,77 @@ async def test_k8s_trusted_identity_tracks_pvc_not_replacement_pod(monkeypatch) 
     provisioner._core_api = CoreAPI()
     provisioner._namespace = "agent-workspaces"
 
-    pod_backing, fingerprint = await provisioner._trusted_pod_ssh_identity(
+    pod_backing, fingerprint, pod_runtime = await provisioner._trusted_pod_ssh_identity(
         "workspace-pod"
     )
-    assert pod_backing == "k8s-pod:agent-workspaces:pod-one"
+    assert (
+        pod_backing == "k8s-pod:agent-workspaces:11111111-1111-4111-8111-111111111111"
+    )
     assert fingerprint == "SHA256:provisioner-trusted"
+    assert pod_runtime == pod_uid[0]
 
-    first_claim, _ = await provisioner._trusted_pod_ssh_identity(
+    first_claim, _, first_runtime = await provisioner._trusted_pod_ssh_identity(
         "workspace-pod", pvc_name="workspace-claim"
     )
-    pod_uid[0] = "pod-two"
-    same_claim, _ = await provisioner._trusted_pod_ssh_identity(
+    pod_uid[0] = "22222222-2222-4222-8222-222222222222"
+    same_claim, _, replacement_runtime = await provisioner._trusted_pod_ssh_identity(
         "replacement-pod", pvc_name="workspace-claim"
     )
     assert same_claim == first_claim
+    assert replacement_runtime != first_runtime
+    assert replacement_runtime == pod_uid[0]
 
-    pvc_uid[0] = "claim-two"
-    replacement_claim, _ = await provisioner._trusted_pod_ssh_identity(
+    pvc_uid[0] = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    replacement_claim, _, same_runtime = await provisioner._trusted_pod_ssh_identity(
         "replacement-pod", pvc_name="workspace-claim"
     )
     assert replacement_claim != first_claim
+    assert same_runtime == replacement_runtime
+
+
+@pytest.mark.asyncio
+async def test_k8s_ready_context_pairs_backing_generation_with_pod_uid(
+    monkeypatch,
+) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    from services import container_provisioner as module
+    from services.workspace_lifecycle import WorkspaceOwner
+
+    runtime_incarnation = "22222222-2222-4222-8222-222222222222"
+    provisioner = module.ContainerProvisioner()
+    provisioner._k8s_available = True
+    provisioner._namespace = "agent-workspaces"
+    provisioner._db = AsyncMock()
+    provisioner._db.bind_thread_workspace_backing.return_value = {
+        "workspace_generation": str(GENERATION)
+    }
+    provisioner._core_api = MagicMock()
+    monkeypatch.setattr(
+        provisioner, "_wait_for_ready", AsyncMock(return_value="10.42.0.8")
+    )
+    monkeypatch.setattr(
+        provisioner,
+        "_trusted_pod_ssh_identity",
+        AsyncMock(
+            return_value=(
+                "k8s-pvc:agent-workspaces:claim-uid",
+                "SHA256:trusted",
+                runtime_incarnation,
+            )
+        ),
+    )
+
+    assert await provisioner.create_workspace(WorkspaceOwner.session(THREAD_ID)) is True
+
+    updates = [
+        call.args[1]
+        for call in provisioner._db.merge_thread_workspace_context.await_args_list
+    ]
+    assert updates[0]["_canvas_workspace_generation"] is None
+    assert updates[0][module.WORKSPACE_RUNTIME_INCARNATION_KEY] is None
+    assert updates[-1]["_canvas_workspace_generation"] == str(GENERATION)
+    assert updates[-1][module.WORKSPACE_RUNTIME_INCARNATION_KEY] == runtime_incarnation
 
 
 def test_vm_clones_regenerate_host_keys_but_canvas_remains_fail_closed() -> None:

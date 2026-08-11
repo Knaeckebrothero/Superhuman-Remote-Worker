@@ -839,6 +839,13 @@ class TestSetupWorkspace:
         mock_remote.claim_shell_owner.side_effect = lambda: order.append(
             ("claim", None)
         )
+        remote_constructor = MagicMock(return_value=mock_remote)
+        workspace_override = {
+            "backend": "sandbox",
+            "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+            "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+        }
 
         with (
             patch("src.api.persistent_session.WorkspaceManager") as MockWM,
@@ -847,16 +854,58 @@ class TestSetupWorkspace:
                 "sys.modules",
                 {
                     "src.core.backends.remote": MagicMock(
-                        RemoteBackend=MagicMock(return_value=mock_remote)
+                        RemoteBackend=remote_constructor
                     )
                 },
             ),
         ):
             MockWM.return_value.path = "/tmp/test"
             MockWM.return_value.initialize = MagicMock()
-            await session._setup_workspace()
+            await session._setup_workspace(workspace_override=workspace_override)
 
         assert order == [("token", 23), ("connect", None), ("claim", None)]
+        assert remote_constructor.call_args.kwargs["workspace_generation"] == (
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        )
+        assert remote_constructor.call_args.kwargs["runtime_incarnation"] == (
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "workspace_override",
+        [
+            {
+                "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            },
+            {
+                "workspace_runtime_incarnation": (
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                ),
+            },
+        ],
+        ids=["missing-runtime", "missing-backing"],
+    )
+    async def test_stateless_remote_attach_requires_paired_workspace_authority(
+        self, workspace_override
+    ):
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+        )
+        session = _make_session(config=cfg)
+        session.shell_owner_token = 24
+        workspace_override = {
+            "backend": "sandbox",
+            "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+            **workspace_override,
+        }
+
+        with pytest.raises(
+            WorkspaceUnavailableError,
+            match="orchestrator-attested workspace backing and runtime incarnation",
+        ):
+            await session._setup_workspace(workspace_override=workspace_override)
 
     @pytest.mark.asyncio
     async def test_attested_sandbox_override_enables_canvas_presentation(self):
@@ -867,9 +916,13 @@ class TestSetupWorkspace:
         session = _make_session(config=cfg)
         mock_remote = MagicMock()
         mock_remote.connect = MagicMock()
+        remote_constructor = MagicMock(return_value=mock_remote)
         workspace_override = {
             "backend": "sandbox",
             "remote": {"host": "paired.test", "port": 30022},
+            # A pinned attach during rollout may see the pre-existing durable
+            # backing generation before its pod context carries the new UID.
+            "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "canvas_presentation_available": True,
             "canvas_live_apps_available": True,
             "canvas_shared_browser_available": True,
@@ -882,7 +935,7 @@ class TestSetupWorkspace:
                 "sys.modules",
                 {
                     "src.core.backends.remote": MagicMock(
-                        RemoteBackend=MagicMock(return_value=mock_remote)
+                        RemoteBackend=remote_constructor
                     )
                 },
             ),
@@ -894,6 +947,8 @@ class TestSetupWorkspace:
         assert mock_remote.supports_canvas_presentation is True
         assert mock_remote.supports_canvas_live_apps is True
         assert mock_remote.supports_canvas_shared_browser is True
+        assert remote_constructor.call_args.kwargs["workspace_generation"] is None
+        assert remote_constructor.call_args.kwargs["runtime_incarnation"] is None
 
     @pytest.mark.asyncio
     async def test_vm_remote_backend_disables_canvas_presentation(self):
@@ -3363,6 +3418,34 @@ class TestCleanup:
 
         # Should not raise
         await session.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_stateless_terminal_cleanup_requires_remote_ack_and_is_retryable(
+        self,
+    ):
+        session = _make_session(shell_owner_token=52)
+        backend = MagicMock()
+        session.workspace_manager = MagicMock(backend=backend)
+        session.shell_manager = MagicMock()
+        session.shell_manager.cleanup.side_effect = [
+            WorkspaceUnavailableError("SSH response lost"),
+            None,
+        ]
+
+        with pytest.raises(
+            WorkspaceUnavailableError,
+            match="shell retirement remains unacknowledged",
+        ):
+            await session.cleanup()
+
+        backend.retire_claim_resource_owner.assert_called_once_with()
+        backend.disconnect.assert_called_once_with()
+        backend.retire.assert_not_called()
+
+        await session.cleanup()
+
+        assert session.shell_manager.cleanup.call_count == 2
+        backend.retire.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_cleanup_retires_remote_backend(self):
