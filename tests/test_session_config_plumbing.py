@@ -70,6 +70,11 @@ async def _noop_thread_datasource_lock():
     yield
 
 
+@asynccontextmanager
+async def _owned_workspace_lifecycle_lock(*_args, **_kwargs):
+    yield True
+
+
 @pytest.fixture(autouse=True)
 def _patch_thread_datasource_delivery_lock():
     with patch.object(
@@ -1443,6 +1448,107 @@ class TestEndedSessionKeepsItsVolume:
         assert result == {"status": "deleted"}
         assert seen["reclaim_volume"] is True
         db.delete_thread.assert_awaited_once_with("t1")
+
+    @pytest.mark.asyncio
+    async def test_stateless_end_refuses_unattested_workspace_before_cleanup(self):
+        """Legacy rows cannot enter terminal cleanup without runtime authority."""
+        thread = {
+            "id": "t1",
+            "user_id": "u1",
+            "agent_id": None,
+            "execution_lane": "stateless",
+            "metadata": {
+                "config_override": {"workspace": {"backend": "sandbox"}},
+                "workspace_container": {
+                    "status": "ready",
+                    "provisioner": "k8s",
+                },
+            },
+        }
+
+        db = SimpleNamespace(
+            begin_stateless_thread_workspace_retirement=AsyncMock(),
+            get_thread=AsyncMock(return_value=thread),
+            stateless_session_workspace_ensure_lock=MagicMock(
+                side_effect=_owned_workspace_lifecycle_lock
+            ),
+        )
+        with (
+            patch.object(
+                orch_main,
+                "require_thread_owner",
+                AsyncMock(return_value=({"sub": "u1"}, thread)),
+            ),
+            patch.object(orch_main, "_conclude_conference_if_any", AsyncMock()),
+            patch.object(
+                orch_main, "_release_thread_resources", AsyncMock()
+            ) as release,
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(
+                orch_main, "snapshot_service", SimpleNamespace(is_available=False)
+            ),
+            patch.object(
+                orch_main, "gitea_client", SimpleNamespace(is_initialized=False)
+            ),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await orch_main.end_thread(
+                "t1", SimpleNamespace(), permanent=False, force=True
+            )
+
+        assert exc.value.status_code == 409
+        db.begin_stateless_thread_workspace_retirement.assert_not_awaited()
+        release.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_waiting_duplicate_end_does_not_retire_freshly_resumed_thread(self):
+        initial = {
+            "id": "t1",
+            "user_id": "u1",
+            "agent_id": None,
+            "status": "ended",
+            "execution_lane": "stateless",
+            "metadata": {
+                "config_override": {"workspace": {"backend": "sandbox"}},
+                "workspace_container": {
+                    "status": "ready",
+                    "provisioner": "k8s",
+                },
+            },
+        }
+        resumed = {**initial, "status": "created"}
+        begin = AsyncMock(return_value=True)
+        release = AsyncMock()
+        db = SimpleNamespace(
+            begin_stateless_thread_workspace_retirement=begin,
+            finish_stateless_thread_workspace_retirement=AsyncMock(return_value=True),
+            get_thread=AsyncMock(return_value=resumed),
+            merge_thread_config_override=AsyncMock(),
+            stateless_session_workspace_ensure_lock=MagicMock(
+                side_effect=_owned_workspace_lifecycle_lock
+            ),
+        )
+        with (
+            patch.object(
+                orch_main,
+                "require_thread_owner",
+                AsyncMock(return_value=({"sub": "u1"}, initial)),
+            ),
+            patch.object(
+                orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            ),
+            patch.object(orch_main, "_conclude_conference_if_any", AsyncMock()),
+            patch.object(orch_main, "_release_thread_resources", release),
+            patch.object(orch_main, "postgres_db", db),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await orch_main.end_thread(
+                "t1", SimpleNamespace(), permanent=False, force=True
+            )
+
+        assert exc.value.status_code == 409
+        begin.assert_not_awaited()
+        release.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_release_defaults_to_keeping_the_volume(self):

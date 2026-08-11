@@ -206,9 +206,13 @@ from src.shared.thread_presence import (  # noqa: E402
     promote_expired_stateless_pauses,
     refresh_thread_presence,
 )
+from src.shared.session_retirement import (  # noqa: E402
+    STATELESS_STOP_KEYS,
+    stateless_stop_markers,
+)
 from services.stateless_workspace_gate import (  # noqa: E402
     declared_thread_workspace_backend,
-    stateless_workspace_check,
+    stateless_session_workspace_check,
     thread_metadata_object,
 )
 from services.stale_verification_sweeper import (  # noqa: E402
@@ -478,7 +482,10 @@ from services.lifecycle import (  # noqa: E402
     VMInstanceManager,
     WorkspaceInstanceManager,
 )
-from services.workspace_suspension import workspace_suspension_service  # noqa: E402
+from services.workspace_suspension import (  # noqa: E402
+    WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY,
+    workspace_suspension_service,
+)
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
 from services.ide_proxy import ide_proxy_service  # noqa: E402
@@ -1896,6 +1903,49 @@ async def ro_reader_reconciler_loop(shutdown_event: asyncio.Event) -> None:
             pass
 
     logger.info("RO reader reconciler stopped")
+
+
+_stateless_workspace_ensure_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+def _schedule_stateless_workspace_ensure(thread_id: str) -> asyncio.Task[None]:
+    """Single-flight a stateless workspace reconcile.
+
+    Input and resume must stay durable/fast, while the internal workspace poll
+    is allowed to observe provisioning over the already-heartbeating queue
+    lease. Repeated user input and two-second agent polls therefore converge on
+    one background create/adopt operation instead of starting task storms.
+    """
+    current = _stateless_workspace_ensure_tasks.get(thread_id)
+    if current is not None and not current.done():
+        return current
+
+    async def _ensure() -> None:
+        try:
+            # The service owns the cross-replica advisory lock because direct
+            # resume/prepare and periodic-reconcile callers share this path.
+            await ensure_session_workspace(
+                thread_id,
+                db=postgres_db,
+                provisioner=container_provisioner,
+                suspension=workspace_suspension_service,
+            )
+        except Exception:
+            logger.exception(
+                "Stateless workspace reconcile failed for thread %s", thread_id
+            )
+
+    task = asyncio.create_task(
+        _ensure(), name=f"stateless-workspace-ensure-{thread_id[:8]}"
+    )
+    _stateless_workspace_ensure_tasks[thread_id] = task
+
+    def _forget(finished: asyncio.Task[None]) -> None:
+        if _stateless_workspace_ensure_tasks.get(thread_id) is finished:
+            _stateless_workspace_ensure_tasks.pop(thread_id, None)
+
+    task.add_done_callback(_forget)
+    return task
 
 
 async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
@@ -4941,14 +4991,21 @@ def _thread_workspace_backend(thread: Any) -> Optional[str]:
 def _stateless_session_class_refusal(config: Any) -> str | None:
     """Return why this session class still requires its pinned wake plane."""
     if not isinstance(config, dict):
+        return "session class configuration is malformed"
+    officer = config.get("officer")
+    if officer is None:
         return None
-    officer = config.get("officer") or {}
     if not isinstance(officer, dict):
-        return None
-    if officer.get("conference") in (True, "true", "True", 1):
-        return "conference sessions still use pinned lifecycle wakes"
-    if officer.get("enabled") in (True, "true", "True", 1):
-        return "officer sessions still use the pinned watchdog and wake drain"
+        return "session class configuration is malformed"
+    for field, reason in (
+        ("conference", "conference sessions still use pinned lifecycle wakes"),
+        ("enabled", "officer sessions still use the pinned watchdog and wake drain"),
+    ):
+        if field not in officer or officer[field] is False:
+            continue
+        if officer[field] is True:
+            return reason
+        return "session class configuration is malformed"
     return None
 
 
@@ -4963,14 +5020,22 @@ def _materialized_session_class_override(
     stable across later expert/account edits and gives every synchronous
     stateless admission boundary an authoritative value in thread metadata.
     """
-    officer = (
-        effective_config.get("officer") if isinstance(effective_config, dict) else None
-    )
-    if not isinstance(officer, dict):
+    if not isinstance(effective_config, dict):
+        raise HTTPException(status_code=400, detail="Session config is malformed")
+    officer = effective_config.get("officer")
+    if officer is None:
         officer = {}
+    if not isinstance(officer, dict):
+        raise HTTPException(status_code=400, detail="Officer config is malformed")
+    for field in ("enabled", "conference"):
+        if field in officer and type(officer[field]) is not bool:
+            raise HTTPException(
+                status_code=400,
+                detail=f"officer.{field} must be a boolean",
+            )
     return {
-        "enabled": officer.get("enabled") in (True, "true", "True", 1),
-        "conference": officer.get("conference") in (True, "true", "True", 1),
+        "enabled": officer.get("enabled") is True,
+        "conference": officer.get("conference") is True,
     }
 
 
@@ -4984,22 +5049,7 @@ def _require_stateless_workspace(thread: dict[str, Any]) -> str:
     closed. Officer/conference sessions remain pinned until their background
     wake machinery becomes queue-aware.
     """
-    metadata = thread_metadata_object(thread)
-    class_refusal = _stateless_session_class_refusal(
-        metadata.get("config_override") or {}
-    )
-    if class_refusal is not None:
-        logger.warning(
-            "Stateless session refused before attach: thread=%s class=%s",
-            thread.get("id"),
-            class_refusal,
-        )
-        raise HTTPException(
-            status_code=409,
-            detail=f"Stateless execution is unavailable: {class_refusal}",
-        )
-
-    backend, refusal_reason = stateless_workspace_check(thread)
+    backend, refusal_reason = stateless_session_workspace_check(thread)
     if refusal_reason is not None:
         logger.warning(
             "Stateless session refused before attach: thread=%s "
@@ -7167,6 +7217,16 @@ async def _suspend_thread_resources(thread_id: str) -> None:
 
 
 async def _suspend_thread_resources_inner(thread_id: str) -> None:
+    thread = await postgres_db.get_thread(thread_id)
+    if thread is not None and thread.get("execution_lane") == "stateless":
+        # Queue-served physical sessions require the terminal claimant /
+        # resident / runtime protocol. Legacy suspension must not fall through
+        # to name-only agent deletion when the central service refuses it.
+        logger.info(
+            "Skipping legacy resource suspension for stateless thread %s",
+            thread_id,
+        )
+        return
     suspended = False
     try:
         if workspace_suspension_service.is_enabled:
@@ -19955,6 +20015,34 @@ def _is_browser_navigation(request: Request) -> bool:
     return "text/html" in request.headers.get("accept", "")
 
 
+async def _require_stateless_ide_lifecycle(entity_id: str) -> None:
+    """Refuse IDE admission once stateless terminal/loss fencing begins."""
+
+    thread = await postgres_db.get_thread(entity_id)
+    if thread is None or str(thread.get("execution_lane") or "") != "stateless":
+        return
+    try:
+        stopped = bool(stateless_stop_markers(thread.get("metadata")))
+    except RuntimeError:
+        stopped = True
+    backend, workspace_refusal = stateless_session_workspace_check(thread)
+    if (
+        str(thread.get("status") or "") not in {"created", "active", "awaiting_user"}
+        or stopped
+        or backend != "sandbox"
+        or workspace_refusal is not None
+    ):
+        ide_proxy_service.evict(entity_id)
+        raise HTTPException(
+            status_code=409,
+            detail="Stateless workspace lifecycle is not admitting IDE traffic",
+        )
+    # The proxy cache is keyed only by entity ID. A completed retirement can
+    # replace U1/IP1 with U2/IP2 under that same ID, so every fresh stateless
+    # lifecycle check invalidates the old coordinate before resolution/use.
+    ide_proxy_service.evict(entity_id)
+
+
 @app.api_route(
     "/api/ide/{job_id}/proxy/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
@@ -19998,6 +20086,8 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
         )
         raise HTTPException(status_code=403, detail="IDE access denied")
 
+    await _require_stateless_ide_lifecycle(job_id)
+
     pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
     if not pod_ip:
         raise HTTPException(status_code=503, detail="IDE session not active")
@@ -20035,6 +20125,23 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
     client = _get_ide_http_client()
 
     try:
+        # Recheck at the upstream credential/use boundary. A request that
+        # passed authorization before End waited on unrelated work must never
+        # reach the code-server after the terminal marker is durable.
+        await _require_stateless_ide_lifecycle(job_id)
+        pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
+        if not pod_ip:
+            raise HTTPException(status_code=503, detail="IDE session not active")
+        if not orchestrator_can_reach(pod_ip):
+            raise HTTPException(
+                status_code=503,
+                detail="IDE is not yet available for VM-backed workspaces.",
+            )
+        host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
+        upstream_url = f"http://{host}/{path}"
+        if request.url.query:
+            upstream_url += f"?{request.url.query}"
+        upstream_headers["host"] = host
         upstream_resp = await client.request(
             method=request.method,
             url=upstream_url,
@@ -20102,6 +20209,12 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
         await ws.close(code=4403, reason="IDE access denied")
         return
 
+    try:
+        await _require_stateless_ide_lifecycle(job_id)
+    except HTTPException:
+        await ws.close(code=4409, reason="Workspace lifecycle fenced")
+        return
+
     pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
     if not pod_ip:
         await ws.close(code=4503, reason="IDE session not active")
@@ -20114,15 +20227,26 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
         await ws.close(code=4503, reason="IDE not available for VM workspaces")
         return
 
-    await ws.accept()
-
-    # Build upstream WS URL (pod_ip may include port for Docker Compose)
-    ws_host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
-    upstream_url = f"ws://{ws_host}/{path}"
-    if ws.url.query:
-        upstream_url += f"?{ws.url.query}"
-
     try:
+        try:
+            await _require_stateless_ide_lifecycle(job_id)
+        except HTTPException:
+            await ws.close(code=4409, reason="Workspace lifecycle fenced")
+            return
+        pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
+        if not pod_ip:
+            await ws.close(code=4503, reason="IDE session not active")
+            return
+        if not orchestrator_can_reach(pod_ip):
+            await ws.close(code=4503, reason="IDE not available for VM workspaces")
+            return
+        # Resolve again only after the final lifecycle check/cache eviction, so
+        # an End U1 -> Resume U2 transition cannot route this handshake to IP1.
+        ws_host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
+        upstream_url = f"ws://{ws_host}/{path}"
+        if ws.url.query:
+            upstream_url += f"?{ws.url.query}"
+        await ws.accept()
         async with websockets.connect(
             upstream_url,
             max_size=16 * 1024 * 1024,  # 16 MB max message
@@ -26866,8 +26990,176 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
     vm = metadata.get("vm") or {}
     binding = metadata.get("_workspace_binding") or {}
     workspace_backend = _thread_workspace_backend(thread)
+    if thread.get("execution_lane") == "stateless" and workspace_backend == "sandbox":
+        workspace_status = str(ws.get("status") or "")
+        restore_marker_present = WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY in ws
+        raw_restore_required = ws.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY)
+        if restore_marker_present and type(raw_restore_required) is not bool:
+            # This response carries SSH/cloud credentials. A malformed
+            # present-only lifecycle sentinel is neither "no debt" nor safe
+            # restore intent; refuse it before probing or scheduling effects.
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless snapshot restore authority is malformed",
+            )
+        snapshot_restore_required = raw_restore_required is True
+        if snapshot_restore_required:
+            # Container creation publishes its attested endpoint before a
+            # snapshot restore has finished extracting into that endpoint.
+            # The durable restore-intent bit is therefore part of readiness:
+            # never hand a claimant an empty/partial tree while extraction is
+            # still running (or after it failed).  The serialized lifecycle
+            # owner clears this bit only after a successful reattach/extract.
+            _schedule_stateless_workspace_ensure(thread_id)
+            ws = {
+                **ws,
+                "status": "restoring",
+                "pod_ip": None,
+                "host": None,
+                "port": None,
+                "pod_port": None,
+                "_canvas_workspace_generation": None,
+                WORKSPACE_RUNTIME_INCARNATION_KEY: None,
+            }
+        elif workspace_status == "ready":
+            # This internal poll is the physical attach credential boundary. A
+            # cached Ready row is only evidence about the Pod UID that authored
+            # it; a 404 or same-name replacement must not hand its stale SSH
+            # endpoint to the claimant. Unknown control-plane health also fails
+            # closed locally, but does not recreate anything until
+            # absence/drift is confirmed.
+            expected_runtime: str | None
+            try:
+                expected_runtime = str(
+                    UUID(str(ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY)))
+                )
+            except (TypeError, ValueError):
+                expected_runtime = None
+            if expected_runtime is None:
+                exact_pod_live: bool | None = False
+            else:
+                exact_pod_live = await container_provisioner.workspace_pod_live(
+                    WorkspaceOwner.session(thread_id),
+                    expected_runtime_incarnation=expected_runtime,
+                )
+            if exact_pod_live is True:
+                # The Kubernetes read crossed an await point while workspace
+                # lifecycle writers remained free to replace/invalidate the
+                # row. Re-read and compare the complete endpoint attestation;
+                # a delayed True for U1 must never authorize credentials after
+                # durable state has moved to U2/non-ready.
+                refreshed_thread = await postgres_db.get_thread(thread_id)
+                if refreshed_thread is None:
+                    raise HTTPException(status_code=404, detail="Thread not found")
+                refreshed_metadata = thread_metadata_object(refreshed_thread)
+                refreshed_ws = refreshed_metadata.get("workspace_container") or {}
+                refreshed_binding = refreshed_metadata.get("_workspace_binding") or {}
+                refreshed_backend = _thread_workspace_backend(refreshed_thread)
+                if (
+                    refreshed_thread.get("execution_lane") != "stateless"
+                    or refreshed_backend != "sandbox"
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Workspace authority changed during attach",
+                    )
+                if refreshed_ws != ws or refreshed_binding != binding:
+                    logger.info(
+                        "Stateless workspace attestation changed during probe: "
+                        "thread=%s old_runtime=%s new_runtime=%s",
+                        thread_id,
+                        expected_runtime,
+                        refreshed_ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY),
+                    )
+                    thread = refreshed_thread
+                    metadata = refreshed_metadata
+                    ws = refreshed_ws
+                    vm = metadata.get("vm") or {}
+                    binding = refreshed_binding
+                    workspace_backend = refreshed_backend
+                    refreshed_status = str(ws.get("status") or "")
+                    if refreshed_status in {
+                        "",
+                        "none",
+                        "deleted",
+                        "failed",
+                        "suspended",
+                        "restoring",
+                        "created",
+                        "creating",
+                        "pending",
+                    }:
+                        _schedule_stateless_workspace_ensure(thread_id)
+                    ws = {
+                        **ws,
+                        "status": (
+                            "creating"
+                            if refreshed_status == "ready"
+                            else refreshed_status
+                        ),
+                        "pod_ip": None,
+                        "host": None,
+                        "port": None,
+                        "pod_port": None,
+                        "_canvas_workspace_generation": None,
+                        WORKSPACE_RUNTIME_INCARNATION_KEY: None,
+                    }
+                    # The refreshed U2/non-ready row has not been probed by
+                    # this request. Do not reuse U1's result or start a Ready-U2
+                    # ensure; the next poll will attest U2 directly.
+                    exact_pod_live = None
+            if exact_pod_live is not True:
+                if exact_pod_live is False:
+                    _schedule_stateless_workspace_ensure(thread_id)
+                logger.info(
+                    "Stateless workspace attestation pending: thread=%s probe=%r",
+                    thread_id,
+                    exact_pod_live,
+                )
+                # Response-local invalidation only. The single-flight ensure
+                # owns durable lifecycle writes; meanwhile the agent keeps this
+                # leased claim alive and polls again instead of accepting stale
+                # SSH bytes.
+                ws = {
+                    **ws,
+                    "status": "creating",
+                    "pod_ip": None,
+                    "host": None,
+                    "port": None,
+                    "pod_port": None,
+                    "_canvas_workspace_generation": None,
+                    WORKSPACE_RUNTIME_INCARNATION_KEY: None,
+                }
+        elif workspace_status in {
+            "",
+            "none",
+            "deleted",
+            "failed",
+            "suspended",
+            "restoring",
+            "created",
+            "creating",
+            "pending",
+        }:
+            # A claimant can arrive after the original input-side ensure has
+            # failed, or after a lifecycle sweep changed stale Ready evidence
+            # to deleted. The durable input already exists, so this polling
+            # boundary is the retry trigger; no second user action is required.
+            # The required-runtime lifecycle arm also re-adopts a live
+            # in-progress pod whose original readiness waiter was interrupted.
+            _schedule_stateless_workspace_ensure(thread_id)
+            ws = {
+                **ws,
+                "pod_ip": None,
+                "host": None,
+                "port": None,
+                "pod_port": None,
+                "_canvas_workspace_generation": None,
+                WORKSPACE_RUNTIME_INCARNATION_KEY: None,
+            }
     workspace_generation: str | None = None
     workspace_runtime_incarnation: str | None = None
+    workspace_ssh_host_key_fingerprint: str | None = None
     if isinstance(binding, dict):
         try:
             candidate_generation = str(UUID(str(binding.get("generation"))))
@@ -26901,13 +27193,31 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
             # A remote binding alone is historical evidence. Pair it with the
             # exact ready endpoint generation before cloud sync may call those
             # workspace bytes the source of an acknowledged generation.
-            workspace_generation = candidate_generation
             try:
-                workspace_runtime_incarnation = str(
+                candidate_runtime_incarnation = str(
                     UUID(str(ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY)))
                 )
             except (TypeError, ValueError):
-                workspace_runtime_incarnation = None
+                candidate_runtime_incarnation = None
+            if thread.get("execution_lane") == "stateless":
+                # For a movable claimant the complete ready authority is one
+                # indivisible tuple. The fingerprint is the use-side fence:
+                # stable Service DNS must not carry U1 authority onto a U2 pod
+                # between this response and Paramiko's key exchange.
+                if (
+                    candidate_runtime_incarnation is not None
+                    and remote_canvas_presentation_available(metadata, ws)
+                ):
+                    workspace_generation = candidate_generation
+                    workspace_runtime_incarnation = candidate_runtime_incarnation
+                    workspace_ssh_host_key_fingerprint = binding[
+                        "ssh_host_key_fingerprint"
+                    ]
+            else:
+                # Pinned sessions retain their historical generation/runtime
+                # response contract and their existing SSH trust policy.
+                workspace_generation = candidate_generation
+                workspace_runtime_incarnation = candidate_runtime_incarnation
     if (
         thread.get("execution_lane") == "stateless"
         and workspace_backend == "virtual"
@@ -27057,15 +27367,19 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         # its generation across pod replacement, while this Kubernetes Pod UID
         # changes and fences the prior runtime's shell ownership record.
         "workspace_runtime_incarnation": workspace_runtime_incarnation,
+        # Internal stateless-attach authority only. It is emitted iff the exact
+        # ready generation/runtime tuple above is accepted, and is consumed as
+        # an exact Paramiko host-key pin before any SFTP, exec, or tmux claim.
+        "workspace_ssh_host_key_fingerprint": (workspace_ssh_host_key_fingerprint),
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
         "pod_ip": ws.get("pod_ip") or ws.get("host"),
         "pod_name": ws.get("pod_name"),
         "pod_port": ws.get("pod_port") or ws.get("port"),
         "namespace": ws.get("namespace"),
         "git_remote_url": ws.get("git_remote_url"),
-        # Public capability only: private generation/fingerprint material stays
-        # in metadata. A ready endpoint without a paired trusted binding must
-        # not cause the agent to advertise Canvas tools which can never work.
+        # Public capability only. A ready endpoint without a paired trusted
+        # binding must not cause the agent to advertise Canvas tools which can
+        # never work.
         "canvas_presentation_available": canvas_presentation_available,
         "canvas_live_apps_available": canvas_live_apps_available,
         "canvas_shared_browser_available": canvas_shared_browser_available,
@@ -27699,6 +28013,19 @@ async def agent_update_thread_status(
             status_code=400,
             detail=f"Status must be one of: {valid_statuses}",
         )
+    lane_thread = await postgres_db.get_thread(thread_id)
+    if (
+        lane_thread is not None
+        and lane_thread.get("execution_lane") == "stateless"
+        and body.agent_id is None
+    ):
+        # Queue-served lifecycle/presence writes carry an exact lease and use
+        # src.shared.session_retirement. A generic pod request has no owner
+        # credential and must never resurrect an ended/retiring thread.
+        raise HTTPException(
+            status_code=409,
+            detail="Stateless status updates require exact lease authority",
+        )
     if body.agent_id is not None:
         if body.status != "ended":
             raise HTTPException(
@@ -27905,6 +28232,12 @@ async def agent_suspend_thread(request: Request, thread_id: str) -> dict[str, An
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
     status = thread.get("status")
+    if thread.get("execution_lane") == "stateless":
+        return {
+            "suspended": False,
+            "status": status,
+            "reason": "stateless_terminal_protocol_required",
+        }
     if status == "suspended":
         # Idempotent — a retried call after a lost response must not fail.
         return {"suspended": True, "status": "suspended"}
@@ -27957,7 +28290,11 @@ async def agent_release_thread_agent(
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    await postgres_db.resume_thread(thread_id)
+    if not await postgres_db.resume_thread(thread_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Thread workspace retirement is still in progress",
+        )
     return {"status": "released"}
 
 
@@ -29573,23 +29910,13 @@ async def create_thread(
             workspace_backend=thread_backend,
             effective_config=effective_create_config,
         )
+        if request_body.protected_cloud:
+            # Protected-cloud overlay staging is not yet lease/runtime fenced;
+            # keep it on the dedicated plane even when ordinary sandbox
+            # sessions are admitted to the stateless pool.
+            execution_lane = "pinned"
 
-        thread_id = await postgres_db.create_thread(
-            user_id=str(user["id"]),
-            project_id=primary_project_id,
-            config_name=config_name,
-            permission_mode=effective_permission_mode,
-            narration_mode=effective_narration_mode,
-            title=request_body.title,
-            datasource_ids=selected_thread_datasource_ids,
-            datasource_selection_provenance=thread_selection_provenance,
-            datasource_policy_revisions=selected_thread_datasource_revisions,
-            authority_user_id=str(user["id"]),
-            authority_project_ids=effective_project_ids,
-            execution_lane=execution_lane,
-        )
-
-        # Store config_override + datasource_ids in thread metadata. Project
+        # Store config_override + datasource ids in thread metadata. Project
         # attachment is the canonical concern of ``thread_mounts`` (Phase 1
         # of cloud_collaboration_model.md §9) — the legacy
         # ``metadata.project_ids`` JSONB key is no longer written.
@@ -29608,7 +29935,54 @@ async def create_thread(
             )
         if request_body.protected_cloud:
             metadata_patch["protected_cloud"] = True
-        if metadata_patch:
+
+        # Decide physical actuation before the INSERT. Every stateless thread
+        # commits its materialized class/tier in that transaction; a K8s thread
+        # additionally commits its one-shot create nonce. A crash after INSERT
+        # can then be reconciled safely instead of leaving an unclassified or
+        # ambiguous markerless row.
+        lite_session = thread_backend in LITE_BACKENDS
+        vm_session = thread_backend == "vm"
+        use_k8s = (
+            not lite_session
+            and not vm_session
+            and container_provisioner.is_available
+            and (
+                container_provisioner.in_cluster or not docker_provisioner.is_available
+            )
+        )
+        stateless_initial_metadata = execution_lane == "stateless"
+        if stateless_initial_metadata and use_k8s:
+            metadata_patch["workspace_container"] = {
+                "status": "pending",
+                "provisioner": "k8s",
+                "_stateless_runtime_creation": {
+                    "generation": str(uuid4()),
+                    "mode": "create",
+                    "attempted": False,
+                    "replaces_uid": None,
+                },
+            }
+
+        create_kwargs = dict(
+            user_id=str(user["id"]),
+            project_id=primary_project_id,
+            config_name=config_name,
+            permission_mode=effective_permission_mode,
+            narration_mode=effective_narration_mode,
+            title=request_body.title,
+            datasource_ids=selected_thread_datasource_ids,
+            datasource_selection_provenance=thread_selection_provenance,
+            datasource_policy_revisions=selected_thread_datasource_revisions,
+            authority_user_id=str(user["id"]),
+            authority_project_ids=effective_project_ids,
+            execution_lane=execution_lane,
+        )
+        if stateless_initial_metadata:
+            create_kwargs["initial_metadata"] = metadata_patch
+        thread_id = await postgres_db.create_thread(**create_kwargs)
+
+        if metadata_patch and not stateless_initial_metadata:
             async with postgres_db.acquire() as conn:
                 await conn.execute(
                     """
@@ -29679,16 +30053,6 @@ async def create_thread(
         # Lite (virtual/none) sessions run with no workspace pod — skip every
         # provisioning path below (no_workspace_agent_mode.md §4). The session
         # agent builds its lite backend from the mounts injected at attach.
-        lite_session = _backend_from_override(config_override) in LITE_BACKENDS
-        vm_session = _backend_from_override(config_override) == "vm"
-        use_k8s = (
-            not lite_session
-            and not vm_session
-            and container_provisioner.is_available
-            and (
-                container_provisioner.in_cluster or not docker_provisioner.is_available
-            )
-        )
         if lite_session:
             logger.info(
                 "Thread %s: lite workspace backend — no workspace pod provisioned",
@@ -29743,27 +30107,30 @@ async def create_thread(
                 _provision_thread_vm(thread_id, _vm_cpu, _vm_mem, _vm_agent_config)
             )
         elif use_k8s:
-            # Signal both lifecycle and provisioner authority synchronously.
-            # A stateless input can be admitted as soon as create returns; it
-            # must never confuse this in-flight K8s workspace with a Docker
-            # pool lease before create_workspace publishes its first update.
-            await postgres_db.merge_thread_workspace_context(
-                thread_id, {"status": "pending", "provisioner": "k8s"}
-            )
-
-            # Kubernetes mode: create pod on demand
-            async def _provision_thread_workspace(tid: str) -> None:
-                ok = await container_provisioner.create_workspace(
-                    WorkspaceOwner.session(tid)
+            if execution_lane == "stateless":
+                # Stateless create shares the same distributed lifecycle owner
+                # as input, resume, attach-poll recovery, and terminal cleanup.
+                # A direct provisioner task could otherwise outlive a public
+                # End and recreate/publish a pod after retirement completed.
+                _schedule_stateless_workspace_ensure(thread_id)
+            else:
+                await postgres_db.merge_thread_workspace_context(
+                    thread_id, {"status": "pending", "provisioner": "k8s"}
                 )
-                if not ok:
-                    logger.error(
-                        "Thread %s: workspace container provisioning failed. "
-                        "Check image availability, RBAC, and node resources.",
-                        tid,
-                    )
 
-            asyncio.create_task(_provision_thread_workspace(thread_id))
+                # Pinned keeps its historical direct provisioning path.
+                async def _provision_thread_workspace(tid: str) -> None:
+                    ok = await container_provisioner.create_workspace(
+                        WorkspaceOwner.session(tid)
+                    )
+                    if not ok:
+                        logger.error(
+                            "Thread %s: workspace container provisioning failed. "
+                            "Check image availability, RBAC, and node resources.",
+                            tid,
+                        )
+
+                asyncio.create_task(_provision_thread_workspace(thread_id))
         elif docker_provisioner.is_available:
             await postgres_db.merge_thread_workspace_context(
                 thread_id, {"status": "pending"}
@@ -31593,6 +31960,636 @@ async def _thread_turn_in_flight(thread: dict) -> bool:
         return False
 
 
+def _stateless_retirement_marker(thread: dict[str, Any]) -> dict[str, Any]:
+    from src.shared.session_retirement import stateless_retirement_authority
+
+    marker = stateless_retirement_authority(thread_metadata_object(thread))
+    if marker is None:
+        raise RuntimeError("stateless retirement marker is absent")
+    return marker
+
+
+async def _reconcile_stateless_thread_retirement(
+    thread_id: str,
+    *,
+    force: bool,
+    permanent: bool,
+) -> dict[str, Any]:
+    """Converge one already-serialized stateless terminal lifecycle.
+
+    Queue closure is the first durable effect. Claimant quiescence, exact
+    remote shell retirement, snapshot/delete, and marker clearance then occur
+    in that order. Every ambiguous boundary leaves the ended thread + closed
+    queue marker intact so End or soft Resume can retry the same token.
+    """
+
+    from services.stateless_session_retirement import (
+        ShellRetirementUnavailable,
+        retire_stateless_session_shell,
+        retire_stateless_workspace_residents,
+        verify_stateless_workspace_residents_retired,
+    )
+    from src.shared.session_retirement import (
+        mark_session_claim_eviction_requested,
+        stateless_retirement_release_authorized,
+    )
+
+    # A transitional/legacy Kubernetes row can lack its immutable Pod UID.
+    # There is no safe absence proof for that shape: Pod creation precedes DB
+    # binding/runtime publication, so even a backing-less 404 can follow a
+    # crash plus force deletion while the partitioned process still runs.
+    workspace_absence_proven = False
+    preflight_thread = await postgres_db.get_thread(thread_id)
+    if preflight_thread is None:
+        return {"state": "missing"}
+    preflight_metadata = thread_metadata_object(preflight_thread)
+    preflight_workspace = preflight_metadata.get("workspace_container") or {}
+    preflight_binding = preflight_metadata.get("_workspace_binding") or {}
+    if isinstance(preflight_workspace, dict) and isinstance(preflight_binding, dict):
+        preflight_backing = str(preflight_binding.get("backing_id") or "")
+        preflight_physical = bool(
+            preflight_workspace.get("provisioner") == "k8s"
+            or preflight_backing.startswith("k8s-")
+        )
+        preflight_runtime = preflight_workspace.get("_runtime_incarnation")
+        settled_present = (
+            "_stateless_workspace_retirement_settled" in preflight_metadata
+        )
+        pending_authority = preflight_metadata.get("_stateless_claim_retirement")
+        pending_retains_runtime = bool(
+            isinstance(pending_authority, dict)
+            and pending_authority.get("runtime_incarnation")
+        )
+        if (
+            preflight_physical
+            and not preflight_runtime
+            and not settled_present
+            and not pending_retains_runtime
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Stateless workspace runtime identity is unavailable; "
+                    "workspace reconciliation must publish an exact UID first"
+                ),
+            )
+        restore_marker_present = "_snapshot_restore_required" in preflight_workspace
+        restore_required = preflight_workspace.get("_snapshot_restore_required", False)
+        if restore_marker_present and type(restore_required) is not bool:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace restore authority is malformed",
+            )
+        creation_pending = "_stateless_runtime_creation" in preflight_workspace
+        restore_pending = (
+            preflight_thread.get("status") != "ended" and restore_required is True
+        )
+        if creation_pending or restore_pending:
+            # Cancellation after the one-shot Pod call may leave a published
+            # UID but no Ready binding/fingerprint. Terminal retirement cannot
+            # infer those fields or mutate the thread to ended first: doing so
+            # would make exact continuation reject the lifecycle forever.
+            # A restore retry has a second edge: exact UID continuation can
+            # publish Ready while deliberately leaving the snapshot debt for a
+            # later extraction pass. Under the already-held distributed
+            # lifecycle lock, drive one exact reconciliation pass and then
+            # require *both* creation and restore authority to be clear before
+            # Begin. If another pass is needed, leave thread and queue lifecycle
+            # untouched and let the caller retry End.
+            await ensure_session_workspace(
+                thread_id,
+                db=postgres_db,
+                provisioner=container_provisioner,
+                suspension=workspace_suspension_service,
+                _workspace_lifecycle_lock_held=True,
+            )
+            preflight_thread = await postgres_db.get_thread(thread_id)
+            if preflight_thread is None:
+                return {"state": "missing"}
+            _, creation_refusal = stateless_session_workspace_check(preflight_thread)
+            preflight_metadata = thread_metadata_object(preflight_thread)
+            preflight_workspace = preflight_metadata.get("workspace_container") or {}
+            preflight_binding = preflight_metadata.get("_workspace_binding") or {}
+            post_restore_present = (
+                isinstance(preflight_workspace, dict)
+                and "_snapshot_restore_required" in preflight_workspace
+            )
+            post_restore_required = (
+                preflight_workspace.get("_snapshot_restore_required", False)
+                if isinstance(preflight_workspace, dict)
+                else None
+            )
+            post_restore_malformed = bool(
+                post_restore_present and type(post_restore_required) is not bool
+            )
+            post_restore_pending = bool(
+                preflight_thread.get("status") != "ended"
+                and post_restore_required is True
+            )
+            if (
+                creation_refusal is not None
+                or not isinstance(preflight_workspace, dict)
+                or preflight_workspace.get("status") != "ready"
+                or "_stateless_runtime_creation" in preflight_workspace
+                or post_restore_malformed
+                or post_restore_pending
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Stateless workspace creation and restore must reach "
+                        "exact Ready authority before retirement"
+                    ),
+                )
+
+    async def _begin_retirement(*, requested_force: bool) -> dict[str, Any]:
+        try:
+            return await postgres_db.begin_stateless_thread_workspace_retirement(
+                thread_id,
+                force=requested_force,
+                permanent=permanent,
+                workspace_absence_proven=workspace_absence_proven,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless retirement authority is malformed or changed",
+            ) from exc
+
+    closure = await _begin_retirement(requested_force=force)
+    state = str(closure.get("state") or "")
+    if state == "missing":
+        return {"state": "missing"}
+    if state == "busy":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "stateless_end_busy", **closure},
+        )
+    if state in {
+        "incompatible",
+        "unsafe_missing_queue",
+        "needs_runtime_preflight",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "stateless_retirement_unsafe", **closure},
+        )
+    if state == "settled":
+        if closure.get("permanent") is not permanent:
+            raise HTTPException(
+                status_code=503,
+                detail="Settled stateless retirement intent is malformed",
+            )
+        if permanent:
+            backing_id = closure.get("backing_id")
+            runtime_incarnation = closure.get("runtime_incarnation")
+            if isinstance(backing_id, str) and backing_id.startswith("k8s-"):
+                # Soft End already proved process zero and removed the exact
+                # Pod. Permanent upgrade only reclaims any retained PVC and
+                # idempotently removes the Service; it never reruns shell or
+                # snapshot effects or mints another queue token.
+                if not runtime_incarnation:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=("Settled workspace runtime authority is unavailable"),
+                    )
+                released = await container_provisioner.release_absent_workspace(
+                    WorkspaceOwner.session(thread_id),
+                    reclaim_volume=True,
+                    expected_runtime_incarnation=str(runtime_incarnation),
+                    strict=True,
+                )
+                if not released:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Settled workspace permanent cleanup is incomplete",
+                    )
+        return {
+            "state": "settled",
+            "thread": await postgres_db.get_thread(thread_id),
+            "closure": closure,
+        }
+    if state != "closed":
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless retirement could not close its queue",
+        )
+    if closure.get("retry") and closure.get("permanent") is not permanent:
+        raise HTTPException(
+            status_code=409,
+            detail="A different stateless retirement intent is still pending",
+        )
+
+    terminal_token = int(closure.get("terminal_token") or 0)
+    deadline = time.monotonic() + float(
+        os.environ.get("STATELESS_TERMINAL_CLAIM_ACK_TIMEOUT_S", "25")
+    )
+    while not closure.get("claimant_quiesced"):
+        raw_losses = closure.get("claim_losses") or []
+        if not isinstance(raw_losses, list) or not raw_losses or terminal_token <= 0:
+            raise HTTPException(
+                status_code=503,
+                detail="Terminal claimant-loss authority is incomplete",
+            )
+        for raw_loss in raw_losses:
+            if not isinstance(raw_loss, dict):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Terminal claimant-loss authority is malformed",
+                )
+            pod_name = str(raw_loss.get("pod") or "")
+            pod_uid = str(raw_loss.get("pod_uid") or "")
+            previous_token = int(raw_loss.get("lease_token") or 0)
+            if not pod_name or not pod_uid or previous_token <= 0:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Terminal claimant identity is incomplete",
+                )
+            authority = await agent_provisioner.agent_pod_authority(
+                pod_name,
+                expected_pod_uid=pod_uid,
+            )
+            if authority == "exact_terminal":
+                await postgres_db.acknowledge_stateless_thread_claimant_absent(
+                    thread_id,
+                    terminal_token=terminal_token,
+                    previous_lease_token=previous_token,
+                    previous_leased_by=pod_name,
+                    previous_pod_uid=pod_uid,
+                )
+            elif authority == "exact_live":
+                if await mark_session_claim_eviction_requested(
+                    postgres_db,
+                    thread_id=thread_id,
+                    previous_lease_token=previous_token,
+                    leased_by=pod_name,
+                    pod_uid=pod_uid,
+                ):
+                    await agent_provisioner.delete_agent_pod_exact(
+                        pod_name,
+                        expected_pod_uid=pod_uid,
+                    )
+        closure = await _begin_retirement(requested_force=True)
+        if closure.get("claimant_quiesced"):
+            break
+        if time.monotonic() >= deadline:
+            raise HTTPException(
+                status_code=503,
+                detail="Terminal claimant quiescence is not yet acknowledged",
+            )
+        await asyncio.sleep(0.25)
+
+    terminal_cloud_mount_cfg: dict[str, Any] | None = None
+    if closure.get("resident_cleanup_required") and not closure.get(
+        "resident_acknowledged"
+    ):
+        current = await postgres_db.get_thread(thread_id)
+        if current is None:
+            return {"state": "missing"}
+        metadata = thread_metadata_object(current)
+        workspace = metadata.get("workspace_container") or {}
+        marker = _stateless_retirement_marker(current)
+        runtime_incarnation = marker.get("runtime_incarnation")
+        if not runtime_incarnation:
+            raise HTTPException(
+                status_code=503,
+                detail="Resident cleanup runtime identity is unavailable",
+            )
+        runtime_authority = await container_provisioner.workspace_pod_authority(
+            WorkspaceOwner.session(thread_id),
+            expected_runtime_incarnation=str(runtime_incarnation),
+        )
+        if runtime_authority == "exact_terminal":
+            # Exact UID plus all containers observed terminated proves both
+            # shell and resident processes stopped. API-object absence alone
+            # is not proof: a partitioned kubelet may keep the old process
+            # running after a force deletion removes the object.
+            acknowledged = await postgres_db.acknowledge_stateless_thread_shell_absent(
+                thread_id,
+                terminal_token=terminal_token,
+                runtime_incarnation=str(runtime_incarnation),
+            )
+            if not acknowledged:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Absent resident retirement proof was not durable",
+                )
+        elif runtime_authority == "exact_live" and workspace.get("status") == "ready":
+            terminal_cloud_mount_cfg = await _build_agent_cloud_mount(
+                current,
+                mount_rows=await postgres_db.list_thread_mounts(thread_id),
+                metadata=metadata,
+            )
+            try:
+                proof = await retire_stateless_workspace_residents(
+                    current,
+                    terminal_token=terminal_token,
+                    cloud_mount_cfg=terminal_cloud_mount_cfg,
+                )
+            except ShellRetirementUnavailable as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace resident retirement is not yet acknowledged",
+                ) from exc
+            acknowledged = (
+                await postgres_db.acknowledge_stateless_thread_resident_retirement(
+                    thread_id,
+                    terminal_token=terminal_token,
+                    workspace_generation=proof.authority.workspace_generation,
+                    endpoint_generation=proof.authority.workspace_generation,
+                    runtime_incarnation=proof.authority.runtime_incarnation,
+                    host_key_fingerprint=proof.authority.host_key_fingerprint,
+                    proof=proof.as_dict(),
+                )
+            )
+            if not acknowledged:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace resident retirement acknowledgement was ambiguous",
+                )
+        else:
+            raise HTTPException(
+                status_code=503,
+                detail="Workspace resident runtime authority changed or is ambiguous",
+            )
+        closure = await _begin_retirement(requested_force=True)
+
+    if closure.get("shell_retirement_required") and not closure.get(
+        "remote_acknowledged"
+    ):
+        current = await postgres_db.get_thread(thread_id)
+        if current is None:
+            return {"state": "missing"}
+        metadata = thread_metadata_object(current)
+        workspace = metadata.get("workspace_container") or {}
+        marker = _stateless_retirement_marker(current)
+        runtime_incarnation = marker.get("runtime_incarnation")
+        if not runtime_incarnation:
+            raise HTTPException(
+                status_code=503,
+                detail="Remote shell runtime identity is unavailable",
+            )
+        runtime_authority = await container_provisioner.workspace_pod_authority(
+            WorkspaceOwner.session(thread_id),
+            expected_runtime_incarnation=str(runtime_incarnation),
+        )
+        if runtime_authority == "exact_live" and workspace.get("status") == "ready":
+            if (
+                closure.get("resident_cleanup_required")
+                and terminal_cloud_mount_cfg is None
+            ):
+                terminal_cloud_mount_cfg = await _build_agent_cloud_mount(
+                    current,
+                    mount_rows=await postgres_db.list_thread_mounts(thread_id),
+                    metadata=metadata,
+                )
+            try:
+                authority = await retire_stateless_session_shell(
+                    current,
+                    terminal_token=terminal_token,
+                )
+                if closure.get("resident_cleanup_required"):
+                    # Shell kill is a second mutation boundary. Re-scan under
+                    # the exact retired-T marker so a pane/background process
+                    # cannot repopulate the snapshot after the pre-kill proof.
+                    await verify_stateless_workspace_residents_retired(
+                        current,
+                        terminal_token=terminal_token,
+                        cloud_mount_cfg=terminal_cloud_mount_cfg,
+                    )
+            except ShellRetirementUnavailable as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Remote shell retirement is not yet acknowledged",
+                ) from exc
+            acknowledged = (
+                await postgres_db.acknowledge_stateless_thread_shell_retirement(
+                    thread_id,
+                    terminal_token=terminal_token,
+                    workspace_generation=authority.workspace_generation,
+                    endpoint_generation=authority.workspace_generation,
+                    runtime_incarnation=authority.runtime_incarnation,
+                    host_key_fingerprint=authority.host_key_fingerprint,
+                )
+            )
+        elif runtime_authority == "exact_terminal":
+            acknowledged = await postgres_db.acknowledge_stateless_thread_shell_absent(
+                thread_id,
+                terminal_token=terminal_token,
+                runtime_incarnation=str(runtime_incarnation),
+            )
+        else:
+            acknowledged = False
+        if not acknowledged:
+            raise HTTPException(
+                status_code=503,
+                detail="Remote shell retirement acknowledgement was ambiguous",
+            )
+
+    # The remote effects above and workspace destruction below are separate
+    # authority boundaries.  Re-lock/re-read the terminal row before *any*
+    # snapshot, Pod, Service, or PVC effect and require exact claimant,
+    # resident, and shell proofs.  The shared parser also rejects malformed
+    # JSON booleans/ACK tuples and post-ACK incarnation drift.
+    closure = await _begin_retirement(requested_force=True)
+    if str(closure.get("state") or "") != "closed":
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless retirement authority changed before workspace release",
+        )
+
+    current = await postgres_db.get_thread(thread_id)
+    if current is None:
+        return {"state": "missing"}
+    metadata = thread_metadata_object(current)
+    try:
+        release_authority = stateless_retirement_release_authorized(metadata)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless retirement proofs are incomplete or malformed",
+        ) from exc
+    if int(release_authority["terminal_token"]) != terminal_token:
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless retirement token changed before workspace release",
+        )
+    workspace = metadata.get("workspace_container") or {}
+    marker = _stateless_retirement_marker(current)
+    binding = metadata.get("_workspace_binding") or {}
+    backing_id = str(binding.get("backing_id") or "")
+    runtime_incarnation = marker.get("runtime_incarnation")
+    runtime_authority = "not_applicable"
+    if workspace.get("provisioner") == "k8s" and runtime_incarnation:
+        runtime_authority = await container_provisioner.workspace_pod_authority(
+            WorkspaceOwner.session(thread_id),
+            expected_runtime_incarnation=str(runtime_incarnation),
+        )
+    physical_workspace = bool(
+        workspace.get("provisioner") == "k8s"
+        or backing_id.startswith("k8s-")
+        or runtime_incarnation
+    )
+    if physical_workspace and not (
+        backing_id.startswith("k8s-pod:") or backing_id.startswith("k8s-pvc:")
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless workspace backing authority is incomplete",
+        )
+    requires_snapshot = bool(not permanent and backing_id.startswith("k8s-pod:"))
+    raw_snapshot_proof = workspace.get("_snapshot_restore_required", False)
+    if type(raw_snapshot_proof) is not bool:
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless snapshot proof is malformed",
+        )
+    snapshot_already_captured = raw_snapshot_proof is True
+    if runtime_authority in {"replacement", "unknown"}:
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless workspace runtime authority changed or is ambiguous",
+        )
+    if runtime_authority == "exact_absent":
+        if requires_snapshot and not snapshot_already_captured:
+            raise HTTPException(
+                status_code=503,
+                detail="Required emptyDir snapshot was not durably captured",
+            )
+        released = await container_provisioner.release_absent_workspace(
+            WorkspaceOwner.session(thread_id),
+            reclaim_volume=permanent,
+            expected_runtime_incarnation=str(runtime_incarnation),
+            strict=True,
+        )
+        if not released:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless absent workspace cleanup remains incomplete",
+            )
+    elif physical_workspace:
+        if not runtime_incarnation:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace runtime identity is unavailable",
+            )
+        if runtime_authority == "exact_terminal":
+            if requires_snapshot and not snapshot_already_captured:
+                # An emptyDir whose runtime is already terminal cannot be
+                # archived now. Do not destroy its object or clear retirement
+                # authority without a previously committed snapshot proof.
+                raise HTTPException(
+                    status_code=503,
+                    detail="Required emptyDir snapshot was not durably captured",
+                )
+            # Exact observed container termination is durable process-zero
+            # proof. Delete that immutable Pod object first; a subsequent
+            # exact-absence pass owns Service/PVC cleanup. If API deletion is
+            # still converging, leave the marker for retry.
+            if not await container_provisioner.delete_workspace(
+                WorkspaceOwner.session(thread_id),
+                expected_runtime_incarnation=str(runtime_incarnation),
+                wait_for_exact_absence=True,
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Terminal workspace Pod deletion remains incomplete",
+                )
+            released = await container_provisioner.release_absent_workspace(
+                WorkspaceOwner.session(thread_id),
+                reclaim_volume=permanent,
+                expected_runtime_incarnation=str(runtime_incarnation),
+                strict=True,
+            )
+            if not released:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Terminal workspace cleanup remains incomplete",
+                )
+        elif runtime_authority != "exact_live":
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace runtime identity is unavailable",
+            )
+        else:
+            expected_runtime = str(runtime_incarnation)
+            expected_fingerprint = (
+                str(marker.get("host_key_fingerprint"))
+                if marker.get("host_key_fingerprint")
+                else None
+            )
+
+            async def _snapshot_ack() -> bool:
+                return (
+                    await postgres_db.mark_stateless_thread_snapshot_restore_required(
+                        thread_id,
+                        terminal_token=terminal_token,
+                    )
+                )
+
+            try:
+                released = await asyncio.wait_for(
+                    container_provisioner.release_workspace(
+                        WorkspaceOwner.session(thread_id),
+                        reclaim_volume=permanent,
+                        require_snapshot=(
+                            requires_snapshot and not snapshot_already_captured
+                        ),
+                        expected_runtime_incarnation=expected_runtime,
+                        expected_host_key_fingerprint=expected_fingerprint,
+                        on_snapshot_captured=(
+                            _snapshot_ack
+                            if requires_snapshot and not snapshot_already_captured
+                            else None
+                        ),
+                        capture_snapshot=(
+                            requires_snapshot and not snapshot_already_captured
+                        ),
+                        strict_terminal_snapshot=True,
+                        strict=True,
+                    ),
+                    timeout=float(
+                        os.environ.get("STATELESS_TERMINAL_RELEASE_TIMEOUT_S", "300")
+                    ),
+                )
+            except asyncio.TimeoutError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless workspace retirement timed out",
+                ) from exc
+            if not released:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless workspace retirement remains incomplete",
+                )
+    elif workspace.get("provisioner") == "k8s":
+        # Missing context is not proof that the deterministic pod name is free.
+        # A never-provisioned sandbox may finish only after Kubernetes confirms
+        # no physical runtime exists; ambiguity keeps the marker retryable.
+        released = await container_provisioner.release_absent_workspace(
+            WorkspaceOwner.session(thread_id),
+            reclaim_volume=permanent,
+            strict=True,
+        )
+        if not released:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace absence could not be established",
+            )
+
+    if (
+        not permanent
+        and not await postgres_db.finish_stateless_thread_workspace_retirement(
+            thread_id
+        )
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless workspace retirement proofs did not settle",
+        )
+    return {"state": "settled", "thread": current, "closure": closure}
+
+
 @app.delete("/api/persistent/threads/{thread_id}")
 async def end_thread(
     thread_id: str,
@@ -31610,104 +32607,223 @@ async def end_thread(
                down an active session mid-turn, destroying its in-memory
                input queue (docs/issues/session_silent_failure_audit.md #11).
     """
-    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    _user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    stateless = thread.get("execution_lane") == "stateless"
+    initial_status = thread.get("status")
+    initial_stateless_authority: dict[str, Any] | None = None
 
-    if not force and await _thread_turn_in_flight(thread):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "turn_in_flight: the agent is mid-turn on this session. "
-                "Retry with ?force=true to end it anyway."
-            ),
-        )
+    async def _stand_down(authoritative_thread: dict[str, Any]) -> None:
+        """Run End-owned side effects only after lifecycle authority is held."""
 
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    ws_ctx = metadata.get("workspace_container") or {}
+        authoritative_metadata = thread_metadata_object(authoritative_thread)
+        officer_meta = (authoritative_metadata.get("config_override") or {}).get(
+            "officer"
+        ) or {}
+        if isinstance(officer_meta, dict) and officer_meta.get("enabled") in (
+            True,
+            "true",
+            "True",
+            1,
+        ):
+            try:
+                await postgres_db.merge_thread_config_override(
+                    thread_id, {"officer": {"enabled": False}}
+                )
+            except Exception:
+                logger.warning(
+                    "Officer stand-down merge failed for thread %s", thread_id
+                )
+        await _conclude_conference_if_any(authoritative_thread)
 
-    # Officer retirement (centurion.md §4): a deliberately ended officer must
-    # not be resurrected by the watchdog — lower the flag before teardown.
-    # Crash-ended officers (agent-side 'ended') keep the flag and are paged
-    # instead of auto-resurrected.
-    officer_meta = (metadata.get("config_override") or {}).get("officer") or {}
-    if isinstance(officer_meta, dict) and officer_meta.get("enabled") in (
-        True,
-        "true",
-        "True",
-        1,
-    ):
-        try:
-            await postgres_db.merge_thread_config_override(
-                thread_id, {"officer": {"enabled": False}}
-            )
-        except Exception:
-            logger.warning("Officer stand-down merge failed for thread %s", thread_id)
+    async def _delete_auxiliary_state(
+        authoritative_thread: dict[str, Any],
+    ) -> None:
+        """Best-effort external records removed only for permanent End."""
 
-    # Conference end (centurion.md §4): release the officer's hold and
-    # enqueue the brief wake before teardown. Never raises; no-op for
-    # ordinary sessions.
-    await _conclude_conference_if_any(thread)
-
-    # Snapshot + tear down workspace container/VM and agent pod. The workspace
-    # VOLUME only dies on ?permanent=true: a soft end leaves the thread in
-    # 'ended', which resume_thread accepts, so reclaiming the PVC here would
-    # hand the user back an empty workspace on resume (the same reasoning that
-    # keeps the Gitea repo and cloud folder alive below).
-    await _release_thread_resources(thread_id, reclaim_volume=permanent)
-
-    # Destructive cleanup of user-visible resources runs ONLY on permanent
-    # delete. A soft "end" keeps the Gitea repo and the cloud session folder
-    # around so resume restores the thread with its data intact — the workspace
-    # container is already snapshotted to S3 above, so the file tree survives
-    # there either way.
-    if permanent:
-        # Log-archive objects die with the thread (retention:
-        # docs/features/job_log_archive.md). Re-read metadata —
-        # _release_thread_resources above just deleted the agent pod, which
-        # stamps fresh log_archive_keys onto the row.
+        authoritative_metadata = thread_metadata_object(authoritative_thread)
+        authoritative_ws = authoritative_metadata.get("workspace_container") or {}
         if snapshot_service.is_available:
             try:
                 fresh = await postgres_db.get_thread(thread_id) or {}
-                fmeta = fresh.get("metadata") or {}
-                if isinstance(fmeta, str):
-                    fmeta = json.loads(fmeta)
-                for key in fmeta.get("log_archive_keys") or []:
+                for key in thread_metadata_object(fresh).get("log_archive_keys") or []:
                     await snapshot_service.delete_blob(str(key))
-            except Exception as e:
+            except Exception as exc:
                 logger.warning(
-                    f"Log archive cleanup failed for deleted thread {thread_id}: {e}"
+                    "Log archive cleanup failed for deleted thread %s: %s",
+                    thread_id,
+                    exc,
                 )
 
-        repo_name = ws_ctx.get("repo_name")
+        repo_name = authoritative_ws.get("repo_name")
         if repo_name and gitea_client.is_initialized:
             await gitea_client.delete_repo(repo_name)
 
-        session_handle_str = thread.get("main_cloud_session_handle") or thread.get(
-            "nc_session_folder"
-        )
+        session_handle_str = authoritative_thread.get(
+            "main_cloud_session_handle"
+        ) or authoritative_thread.get("nc_session_folder")
         if session_handle_str:
-            backend = main_cloud_router.for_thread(thread)
+            backend = main_cloud_router.for_thread(authoritative_thread)
             if backend.is_initialized:
                 try:
                     session_handle = SessionFolderHandle.from_db(
                         session_handle_str, backend=backend.backend_id
                     )
                     await backend.delete_session_folder(session_handle)
-                except Exception as e:
+                except Exception as exc:
                     logger.warning(
-                        f"Failed to delete main-cloud session folder for "
-                        f"thread {thread_id}: {e}"
+                        "Failed to delete main-cloud session folder for thread %s: %s",
+                        thread_id,
+                        exc,
                     )
 
-        await postgres_db.delete_thread(thread_id)
-        return {"status": "deleted"}
+    if not stateless:
+        # Pinned behavior is unchanged: its resident agent remains the in-flight
+        # authority and the legacy resource cleanup retains best-effort semantics.
+        if not force and await _thread_turn_in_flight(thread):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "turn_in_flight: the agent is mid-turn on this session. "
+                    "Retry with ?force=true to end it anyway."
+                ),
+            )
+        await _stand_down(thread)
+        await _release_thread_resources(thread_id, reclaim_volume=permanent)
+        if permanent:
+            await _delete_auxiliary_state(thread)
+            await postgres_db.delete_thread(thread_id)
+            return {"status": "deleted"}
+        await postgres_db.end_thread(thread_id)
+        return {"status": "ended"}
 
-    await postgres_db.end_thread(thread_id)
-    return {"status": "ended"}
+    # Every stateless tier uses the queue lifecycle, including lite sessions.
+    # The validator keeps VM/unknown tiers refused while admitting only the
+    # narrowed sandbox and lite authority shapes.
+    _require_stateless_workspace(thread)
+    initial_stateless_authority = (
+        await postgres_db.get_stateless_thread_lifecycle_authority(thread_id)
+    )
+    if initial_stateless_authority is None:
+        raise HTTPException(status_code=409, detail="Thread lifecycle changed")
+    try:
+        async with postgres_db.stateless_session_workspace_ensure_lock(
+            thread_id, wait=True
+        ) as cleanup_owner:
+            if not cleanup_owner:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless workspace lifecycle lock unavailable",
+                )
+            fresh_thread = await postgres_db.get_thread(thread_id)
+            if fresh_thread is None:
+                return {"status": "deleted"}
+            _require_stateless_workspace(fresh_thread)
+            fresh_authority = (
+                await postgres_db.get_stateless_thread_lifecycle_authority(thread_id)
+            )
+            if fresh_authority != initial_stateless_authority:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Thread lifecycle generation changed while waiting for "
+                        "cleanup ownership"
+                    ),
+                )
+            fresh_metadata = thread_metadata_object(fresh_thread)
+            marker_pending = bool(
+                "_stateless_workspace_retirement_pending" in fresh_metadata
+            )
+            fresh_status = fresh_thread.get("status")
+            if (
+                fresh_status != initial_status
+                and not (permanent and fresh_status == "ended")
+                and not marker_pending
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Thread lifecycle changed while waiting for cleanup ownership"
+                    ),
+                )
+
+            result = await _reconcile_stateless_thread_retirement(
+                thread_id,
+                force=force,
+                permanent=permanent,
+            )
+            if result.get("state") == "missing":
+                return {"status": "deleted"}
+
+            # These side effects are serialized after the fresh-state check;
+            # a stale End can no longer mutate a thread that End->Resume reopened.
+            await _stand_down(fresh_thread)
+            if permanent:
+                closure = result.get("closure") or {}
+                terminal_thread = result.get("thread") or fresh_thread
+                terminal_metadata = thread_metadata_object(terminal_thread)
+                terminal_binding = terminal_metadata.get("_workspace_binding") or {}
+                terminal_workspace = terminal_metadata.get("workspace_container") or {}
+                terminal_backing_id = (
+                    closure.get("backing_id")
+                    if isinstance(closure, dict) and closure.get("backing_id")
+                    else (
+                        terminal_binding.get("backing_id")
+                        if isinstance(terminal_binding, dict)
+                        else None
+                    )
+                )
+                terminal_snapshot_exists = bool(
+                    isinstance(closure, dict)
+                    and (
+                        closure.get("snapshot_restore_required") is True
+                        or (
+                            isinstance(terminal_workspace, dict)
+                            and terminal_workspace.get("_snapshot_restore_required")
+                            is True
+                        )
+                        or (str(terminal_backing_id or "").startswith("k8s-pod:"))
+                    )
+                )
+                if terminal_snapshot_exists and not snapshot_service.is_available:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Terminal workspace snapshot cleanup is unavailable",
+                    )
+                if (
+                    snapshot_service.is_available
+                    and not await snapshot_service.delete_snapshot(
+                        thread_id,
+                        entity_type="threads",
+                    )
+                ):
+                    # The thread/queue tombstone remains retryable. Never
+                    # delete the only ownership row while its terminal S3
+                    # prefix may survive indefinitely.
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Terminal workspace snapshot cleanup is incomplete",
+                    )
+                if declared_thread_workspace_backend(terminal_thread) == "virtual":
+                    from services.thread_uploads import (
+                        purge_attested_stateless_virtual_workspace,
+                    )
+
+                    if not await purge_attested_stateless_virtual_workspace(
+                        terminal_thread
+                    ):
+                        raise HTTPException(
+                            status_code=503,
+                            detail=("Terminal virtual workspace cleanup is incomplete"),
+                        )
+                await _delete_auxiliary_state(fresh_thread)
+                await postgres_db.delete_thread(thread_id)
+                return {"status": "deleted"}
+            return {"status": "ended"}
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless workspace lifecycle lock acquisition timed out",
+        ) from exc
 
 
 # Resume-time session-folder provisioning is fire-and-forget so /resume stays
@@ -31819,7 +32935,76 @@ async def resume_thread(
     await _revalidate_thread_project_ids(thread, await _thread_project_ids(thread_id))
     await _revalidate_thread_datasource_ids(thread, metadata.get("datasource_ids"))
 
-    await postgres_db.resume_thread(thread_id)
+    if execution_lane == LANE_STATELESS:
+        try:
+            async with postgres_db.stateless_session_workspace_ensure_lock(
+                thread_id, wait=True
+            ) as resume_owner:
+                if not resume_owner:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Stateless workspace lifecycle lock unavailable",
+                    )
+                locked_thread = await postgres_db.get_thread(thread_id)
+                if not locked_thread:
+                    raise HTTPException(status_code=404, detail="Thread not found")
+                _require_stateless_workspace(locked_thread)
+                locked_metadata = thread_metadata_object(locked_thread)
+                if locked_thread.get("status") != "ended":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Thread lifecycle changed before resume",
+                    )
+                if "_stateless_workspace_retirement_pending" in locked_metadata:
+                    try:
+                        marker = _stateless_retirement_marker(locked_thread)
+                    except RuntimeError as exc:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Stateless retirement authority is malformed",
+                        ) from exc
+                    if marker.get("permanent") is True:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="A permanent thread deletion is still in progress",
+                        )
+                # Reconcile every ended stateless row, not only explicit
+                # in-progress markers. Legacy/pre-protocol rows may be ended
+                # while a Ready workspace and shell still exist; reopening one
+                # without a terminal ACK would bypass the lifecycle fence.
+                await _reconcile_stateless_thread_retirement(
+                    thread_id,
+                    force=True,
+                    permanent=False,
+                )
+                locked_thread = await postgres_db.get_thread(thread_id)
+                if not locked_thread:
+                    raise HTTPException(status_code=404, detail="Thread not found")
+                locked_metadata = thread_metadata_object(locked_thread)
+                if "_stateless_workspace_retirement_pending" in locked_metadata:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Stateless workspace retirement remains incomplete",
+                    )
+                if not await postgres_db.resume_thread(thread_id):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Thread could not be resumed while workspace cleanup is active"
+                        ),
+                    )
+                thread = await postgres_db.get_thread(thread_id) or locked_thread
+                metadata = thread_metadata_object(thread)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace lifecycle lock acquisition timed out",
+            ) from exc
+    elif not await postgres_db.resume_thread(thread_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Thread could not be resumed while workspace cleanup is active",
+        )
 
     # Reopening a conference re-establishes the officer's hold (centurion.md
     # §4) — the single-writer rule spans the meeting's whole lifetime, not
@@ -32092,15 +33277,20 @@ async def resume_thread(
     # Ensure the session workspace is provisioned/restored (idempotent): restores
     # a suspended workspace, recreates a failed/missing one. Fire-and-forget so
     # resume stays fast — the agent tolerates a not-yet-ready workspace and the
-    # periodic reconcile retries on failure.
-    asyncio.create_task(
-        ensure_session_workspace(
-            thread_id,
-            db=postgres_db,
-            provisioner=container_provisioner,
-            suspension=workspace_suspension_service,
+    # periodic reconcile retries on failure. Queue-served sessions share the
+    # input/poll single-flight so a rapid resume + input cannot spawn competing
+    # create/adopt operations.
+    if execution_lane == LANE_STATELESS:
+        _schedule_stateless_workspace_ensure(thread_id)
+    else:
+        asyncio.create_task(
+            ensure_session_workspace(
+                thread_id,
+                db=postgres_db,
+                provisioner=container_provisioner,
+                suspension=workspace_suspension_service,
+            )
         )
-    )
 
     return {"status": "created", "thread_id": thread_id}
 
@@ -32391,6 +33581,53 @@ async def _resolve_thread_for_forwarding(
     # Fail-closed for orphans (user_id IS NULL); admins bypass.
     if not user.get("is_admin") and str(thread.get("user_id") or "") != str(user["id"]):
         raise HTTPException(status_code=403, detail="Not your thread")
+
+    if thread.get("execution_lane") == "stateless":
+        # Stateless restore/create is owned by the distributed nonce/UID
+        # lifecycle. Never fall through to the legacy name-based suspension
+        # restore below, even if an upstream forwarding route regresses its
+        # lane split.
+        _, refusal = stateless_session_workspace_check(thread)
+        if refusal is not None:
+            raise HTTPException(status_code=409, detail=refusal)
+        await ensure_session_workspace(
+            thread_id,
+            db=postgres_db,
+            provisioner=container_provisioner,
+            suspension=workspace_suspension_service,
+        )
+        thread = await postgres_db.get_thread(thread_id)
+        if not thread:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        if thread.get("execution_lane") != "stateless":
+            raise HTTPException(
+                status_code=409,
+                detail="Thread execution lane changed during workspace reconciliation",
+            )
+        if not user.get("is_admin") and str(thread.get("user_id") or "") != str(
+            user["id"]
+        ):
+            raise HTTPException(status_code=403, detail="Not your thread")
+        _, refusal = stateless_session_workspace_check(thread)
+        if refusal is not None:
+            raise HTTPException(status_code=409, detail=refusal)
+        fresh_metadata = thread.get("metadata") or {}
+        if isinstance(fresh_metadata, str):
+            try:
+                fresh_metadata = json.loads(fresh_metadata)
+            except (json.JSONDecodeError, TypeError):
+                fresh_metadata = {}
+        fresh_workspace = fresh_metadata.get("workspace_container") or {}
+        if (
+            not isinstance(fresh_workspace, dict)
+            or fresh_workspace.get("status") != "ready"
+            or fresh_workspace.get("_snapshot_restore_required") is True
+            or "_stateless_runtime_creation" in fresh_workspace
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace is still reconciling",
+            )
 
     # Restore suspended workspace before forwarding (mirrors persistent_ws_proxy)
     metadata = thread.get("metadata") or {}
@@ -32897,7 +34134,7 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
                     detail="Thread is no longer eligible for stateless admission",
                 )
             locked_thread_dict = dict(locked_thread)
-            _require_stateless_workspace(locked_thread_dict)
+            locked_backend = _require_stateless_workspace(locked_thread_dict)
             locked_status = str(locked_thread["status"] or "")
             if locked_status not in {
                 "created",
@@ -32912,13 +34149,25 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
                         f"(status={locked_status or 'unknown'})"
                     ),
                 )
-            locked_metadata = thread_metadata_object(locked_thread_dict)
-            workspace_status = str(
-                (locked_metadata.get("workspace_container") or {}).get("status") or ""
-            )
-            needs_workspace_ensure = locked_status == "suspended" or (
-                workspace_status in {"suspended", "deleted", "failed"}
-            )
+            needs_workspace_ensure = locked_backend == "sandbox"
+            if locked_status == "suspended":
+                # Wake and enqueue are one lifecycle transaction. Workspace
+                # restore remains a post-commit side effect, but no claimant
+                # can observe a runnable queue paired with a still-suspended
+                # thread (the claim/credential boundary correctly refuses
+                # suspended rows).
+                woke = await conn.fetchval(
+                    "UPDATE threads SET status = 'created', "
+                    "agent_id = NULL, control_admission_agent_id = NULL, "
+                    "awaiting_user_since = NULL, extend_count = 0 "
+                    "WHERE id = $1::uuid AND execution_lane = 'stateless' "
+                    "AND status = 'suspended' RETURNING id",
+                    thread_id,
+                )
+                if woke is None:
+                    raise RuntimeError(
+                        "stateless suspended-input wake lost thread authority"
+                    )
             turn_number = int(locked_thread["total_turns"] or 0) + 1
             fair_key = (
                 str(locked_thread["user_id"])
@@ -32956,19 +34205,12 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
             )
 
         if needs_workspace_ensure:
-            # Queue admission must commit before this side effect starts. The
-            # claimant may arrive first and poll; ensure converges a suspended,
-            # deleted or failed Kubernetes workspace without ever creating a
-            # pinned agent.
-            asyncio.create_task(
-                ensure_session_workspace(
-                    thread_id,
-                    db=postgres_db,
-                    provisioner=container_provisioner,
-                    suspension=workspace_suspension_service,
-                ),
-                name=f"stateless-workspace-wake-{thread_id[:8]}",
-            )
+            # Queue admission commits before this side effect. The claimant may
+            # arrive first, but its internal workspace poll independently
+            # suppresses cached Ready credentials until the exact Pod UID is
+            # live. Always schedule sandbox reconciliation: a DB-Ready row can
+            # be stale even though its lifecycle string looks terminally good.
+            _schedule_stateless_workspace_ensure(thread_id)
         # Post-commit watermark read (same conn): §5.3.1 response parity —
         # queue_depth comes from unconsumed watermarks, not a process queue.
         wm = await queue_depth_for(conn, unit_id=thread_id)
@@ -33193,7 +34435,11 @@ async def thread_interrupt(
 
 @app.get("/internal/units/{unit_id}/claim-bundle")
 async def internal_unit_claim_bundle(
-    unit_id: str, request: Request, lease_token: int
+    unit_id: str,
+    request: Request,
+    lease_token: int,
+    pod_name: str,
+    pod_uid: str,
 ) -> dict[str, Any]:
     """Claim bundle for a leased stateless unit — internal (agent executor).
 
@@ -33231,8 +34477,12 @@ async def internal_unit_claim_bundle(
     _t_start = time.perf_counter()
     async with postgres_db.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT unit_kind, state, lease_token, input_seq, consumed_seq "
-            "FROM run_queue WHERE unit_id = $1::uuid",
+            "SELECT queue.unit_kind, queue.state, queue.lease_token, "
+            "queue.leased_by, "
+            "queue.input_seq, queue.consumed_seq, thread.status AS thread_status, "
+            "thread.execution_lane AS thread_lane, thread.metadata AS thread_metadata "
+            "FROM run_queue AS queue LEFT JOIN threads AS thread "
+            "ON thread.id = queue.unit_id WHERE queue.unit_id = $1::uuid",
             unit_id,
         )
     if row is None:
@@ -33346,6 +34596,30 @@ async def internal_unit_claim_bundle(
 
     if row["unit_kind"] != UNIT_KIND_SESSION_TURN:
         raise HTTPException(status_code=409, detail="Unit kind carries no attach")
+    claimant_pod = str(pod_name or "").strip()
+    claimant_uid = str(pod_uid or "").strip()
+    if (
+        not claimant_pod
+        or not claimant_uid
+        or str(row["leased_by"] or "") != claimant_pod
+    ):
+        raise HTTPException(status_code=403, detail="Lease validation failed")
+    initial_metadata = row["thread_metadata"]
+    if isinstance(initial_metadata, str):
+        try:
+            initial_metadata = json.loads(initial_metadata)
+        except (TypeError, ValueError):
+            initial_metadata = None
+    try:
+        initial_stop_markers = stateless_stop_markers(initial_metadata)
+    except RuntimeError:
+        initial_stop_markers = STATELESS_STOP_KEYS
+    if (
+        str(row["thread_lane"] or "") != LANE_STATELESS
+        or str(row["thread_status"] or "") not in {"created", "active", "awaiting_user"}
+        or bool(initial_stop_markers)
+    ):
+        raise HTTPException(status_code=403, detail="Lease validation failed")
     _t_lease = time.perf_counter()
 
     # unit_id == thread_id for session_turn units.
@@ -33400,17 +34674,104 @@ async def internal_unit_claim_bundle(
     # stores for longer than the queue lease.  Recheck immediately before the
     # response crosses the credential boundary, exactly like worker bundles:
     # token N may have been reaped/stolen while the payload was being built.
+    from src.shared.session_retirement import (
+        ClaimantAuthority,
+        active_claim_authority,
+        unresolved_claim_losses,
+    )
+
+    lease_still_current = False
     async with postgres_db.acquire() as conn:
-        lease_still_current = bool(
-            await conn.fetchval(
-                "SELECT EXISTS (SELECT 1 FROM run_queue "
-                "WHERE unit_id = $1::uuid "
-                "AND unit_kind = 'session_turn' "
-                "AND state = 'leased' AND lease_token = $2::bigint)",
+        async with conn.transaction():
+            final_thread = await conn.fetchrow(
+                "SELECT status::text AS status, execution_lane, metadata "
+                "FROM threads WHERE id = $1::uuid FOR UPDATE",
                 unit_id,
-                lease_token,
             )
-        )
+            if final_thread is not None:
+                _final_backend, final_class_or_workspace_refusal = (
+                    stateless_session_workspace_check(final_thread)
+                )
+                final_metadata = final_thread["metadata"]
+                if isinstance(final_metadata, str):
+                    try:
+                        final_metadata = json.loads(final_metadata)
+                    except (TypeError, ValueError):
+                        final_metadata = None
+                try:
+                    losses = unresolved_claim_losses(final_metadata)
+                    active_claim = active_claim_authority(final_metadata)
+                    final_stop_markers = stateless_stop_markers(final_metadata)
+                except RuntimeError:
+                    losses = {0: ClaimantAuthority("invalid", "invalid")}
+                    active_claim = None
+                    final_stop_markers = STATELESS_STOP_KEYS
+                final_queue = await conn.fetchrow(
+                    "SELECT state, lease_token, leased_by FROM run_queue "
+                    "WHERE unit_id = $1::uuid AND unit_kind = 'session_turn' "
+                    "FOR UPDATE",
+                    unit_id,
+                )
+                expected_authority = ClaimantAuthority(claimant_pod, claimant_uid)
+                active_compatible = active_claim is None or (
+                    int(active_claim[0]) < int(lease_token)
+                    or (
+                        int(active_claim[0]) == int(lease_token)
+                        and active_claim[1] == expected_authority
+                    )
+                )
+                lease_still_current = bool(
+                    str(final_thread["execution_lane"] or "") == LANE_STATELESS
+                    and str(final_thread["status"] or "")
+                    in {"created", "active", "awaiting_user"}
+                    and final_class_or_workspace_refusal is None
+                    and isinstance(final_metadata, dict)
+                    and not final_stop_markers
+                    and not losses
+                    and final_metadata.get("protected_cloud") in (None, False)
+                    and active_compatible
+                    and final_queue is not None
+                    and str(final_queue["state"] or "") == "leased"
+                    and int(final_queue["lease_token"] or 0) == int(lease_token)
+                    and str(final_queue["leased_by"] or "") == claimant_pod
+                )
+                if lease_still_current:
+                    stamped = await conn.fetchval(
+                        """
+                        UPDATE threads
+                        SET metadata = jsonb_set(
+                            COALESCE(metadata, '{}'::jsonb),
+                            '{_stateless_active_claim}',
+                            jsonb_build_object(
+                                'lease_token', $2::bigint,
+                                'pod', $3::text,
+                                'pod_uid', $4::text,
+                                'credential_bound_at', to_jsonb(now())
+                            ),
+                            true
+                        )
+                        WHERE id = $1::uuid
+                          AND execution_lane = 'stateless'
+                          AND status IN
+                              ('created', 'active', 'awaiting_user')
+                          AND NOT (COALESCE(metadata, '{}'::jsonb)
+                                   ? '_stateless_workspace_retirement_pending')
+                          AND NOT (COALESCE(metadata, '{}'::jsonb)
+                                   ? '_stateless_claim_retirement')
+                          AND NOT (COALESCE(metadata, '{}'::jsonb)
+                                   ? '_stateless_claim_losses')
+                          AND NOT (COALESCE(metadata, '{}'::jsonb)
+                                   ? '_stateless_claim_loss_hold')
+                          AND COALESCE(metadata->'protected_cloud', 'false'::jsonb)
+                              = 'false'::jsonb
+                        RETURNING id
+                        """,
+                        unit_id,
+                        int(lease_token),
+                        claimant_pod,
+                        claimant_uid,
+                    )
+                    lease_still_current = bool(stamped)
     if not lease_still_current:
         raise HTTPException(status_code=403, detail="Lease validation failed")
     _t_end = time.perf_counter()
@@ -33467,7 +34828,32 @@ async def admin_run_queue_unpark(unit_id: str, request: Request) -> dict[str, An
     except (ValueError, TypeError):
         raise HTTPException(status_code=404, detail="Unit is not parked") from None
     async with postgres_db.acquire() as conn:
-        ok = await unpark_unit(conn, unit_id=unit_id)
+        async with conn.transaction():
+            authority = await conn.fetchrow(
+                "SELECT execution_lane, metadata FROM threads "
+                "WHERE id = $1::uuid FOR UPDATE",
+                unit_id,
+            )
+            if (
+                authority is not None
+                and str(authority["execution_lane"] or "") == "stateless"
+            ):
+                metadata = authority["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        metadata = None
+                try:
+                    stopped = bool(stateless_stop_markers(metadata))
+                except RuntimeError:
+                    stopped = True
+                if stopped:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Unit is awaiting claimant quiescence",
+                    )
+            ok = await unpark_unit(conn, unit_id=unit_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Unit is not parked")
     logger.info("run_queue unpark: unit=%s", unit_id)
@@ -34779,6 +36165,7 @@ async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
                         "FROM threads t "
                         "LEFT JOIN users u ON u.id = t.user_id "
                         "WHERE t.status = 'awaiting_user' "
+                        "  AND t.execution_lane <> 'stateless' "
                         "  AND t.awaiting_user_since IS NOT NULL "
                         # Officer sessions never sleep via attention-sleep —
                         # their lifecycle belongs to the officer watchdog
@@ -34944,41 +36331,106 @@ async def upload_files_to_thread(
     from services.thread_uploads import (
         ThreadUploadError,
         resolve_thread_upload_destination,
+        upload_files_to_attested_stateless_workspace,
         upload_files_to_thread_workspace,
     )
+    from src.shared.run_queue import LANE_STATELESS
 
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
 
-    # Decide the destination before materializing bodies. FastAPI has already
-    # parsed the multipart by now, so this saves the second in-memory copy
-    # rather than the transfer — but it also keeps a tier that can never accept
-    # files from looking like a transient failure.
-    try:
-        destination = resolve_thread_upload_destination(thread)
-    except ThreadUploadError as e:
-        logger.warning(
-            "Thread upload refused for %s: %d %s", thread_id, e.status_code, e.detail
-        )
-        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
-
-    payloads: list[tuple[str, bytes, str]] = []
-    for f in files:
-        contents = await f.read()
-        payloads.append(
-            (
-                f.filename or "unnamed",
-                contents,
-                f.content_type or "application/octet-stream",
+    async def _materialize_payloads() -> list[tuple[str, bytes, str]]:
+        payloads: list[tuple[str, bytes, str]] = []
+        for item in files:
+            payloads.append(
+                (
+                    item.filename or "unnamed",
+                    await item.read(),
+                    item.content_type or "application/octet-stream",
+                )
             )
-        )
+        return payloads
 
     try:
-        results = await upload_files_to_thread_workspace(
-            thread, payloads, destination=destination
-        )
+        if thread.get("execution_lane") != LANE_STATELESS:
+            destination = resolve_thread_upload_destination(thread)
+            results = await upload_files_to_thread_workspace(
+                thread,
+                await _materialize_payloads(),
+                destination=destination,
+            )
+        else:
+            # Serialize the entire body materialization + remote write against
+            # End/Resume. A marker-first upload never opens SFTP; a write-first
+            # End waits until the final exact-runtime proof and byte commit.
+            try:
+                async with postgres_db.stateless_session_workspace_ensure_lock(
+                    thread_id,
+                    wait=True,
+                ) as upload_owner:
+                    if not upload_owner:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Stateless workspace lifecycle lock unavailable",
+                        )
+                    fresh = await postgres_db.get_thread(thread_id)
+                    if fresh is None:
+                        raise HTTPException(status_code=404, detail="Thread not found")
+                    metadata = thread_metadata_object(fresh)
+                    try:
+                        stopped = bool(stateless_stop_markers(fresh.get("metadata")))
+                    except RuntimeError:
+                        stopped = True
+                    if (
+                        fresh.get("execution_lane") != LANE_STATELESS
+                        or fresh.get("status")
+                        not in {"created", "active", "awaiting_user"}
+                        or stopped
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Stateless session is not accepting uploads",
+                        )
+                    backend = _require_stateless_workspace(fresh)
+                    destination = resolve_thread_upload_destination(fresh)
+                    payloads = await _materialize_payloads()
+                    if backend == "virtual":
+                        results = await upload_files_to_thread_workspace(
+                            fresh,
+                            payloads,
+                            destination=destination,
+                        )
+                    else:
+                        workspace = metadata.get("workspace_container") or {}
+                        binding = metadata.get("_workspace_binding") or {}
+                        generation = str(binding.get("generation") or "")
+                        runtime_incarnation = str(
+                            workspace.get("_runtime_incarnation") or ""
+                        )
+                        fingerprint = str(binding.get("ssh_host_key_fingerprint") or "")
+
+                        async def _probe_runtime() -> str:
+                            return await container_provisioner.workspace_pod_authority(
+                                WorkspaceOwner.session(thread_id),
+                                expected_runtime_incarnation=runtime_incarnation,
+                            )
+
+                        results = await upload_files_to_attested_stateless_workspace(
+                            fresh,
+                            payloads,
+                            destination=destination,
+                            expected_workspace_generation=generation,
+                            expected_runtime_incarnation=runtime_incarnation,
+                            expected_host_key_fingerprint=fingerprint,
+                            authority_probe=_probe_runtime,
+                        )
+            except TimeoutError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless workspace lifecycle lock timed out",
+                ) from exc
     except ThreadUploadError as e:
         logger.warning(
             "Thread upload failed for %s: %d %s", thread_id, e.status_code, e.detail

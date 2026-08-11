@@ -84,6 +84,7 @@ from ..shared.run_queue import (
     open_interrupt_admission,
     release_unit,
 )
+from ..shared.session_retirement import acknowledge_session_claim_quiesced
 from ..shared.worker_queue import (
     WorkerClaim,
     WorkerRenewal,
@@ -316,6 +317,7 @@ class StatelessTurnExecutor:
         self,
         *,
         pod_name: Optional[str] = None,
+        pod_uid: Optional[str] = None,
         idle_poll_seconds: float = IDLE_POLL_SECONDS,
         idle_backoff_seconds: float = IDLE_POLL_BACKOFF_SECONDS,
         idle_polls_before_backoff: int = IDLE_POLLS_BEFORE_BACKOFF,
@@ -328,6 +330,7 @@ class StatelessTurnExecutor:
         self._pod_name = (
             pod_name or os.getenv("POD_NAME") or socket.gethostname() or "agent"
         )
+        self._pod_uid = str(pod_uid or os.getenv("POD_UID") or "").strip()
         self._idle_poll_seconds = idle_poll_seconds
         self._idle_backoff_seconds = idle_backoff_seconds
         self._idle_polls_before_backoff = idle_polls_before_backoff
@@ -357,6 +360,10 @@ class StatelessTurnExecutor:
         self._lease = LeaseHandle()
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        # Full-settle close evidence survives cancellation into the claim's
+        # finally block. Cleanup must never downgrade an atomic
+        # close+checkpoint retry into a gate-only close.
+        self._pending_settled_close: tuple[str, int, int, int] | None = None
 
     # ------------------------------------------------------------------
     # Plumbing
@@ -1417,6 +1424,8 @@ class StatelessTurnExecutor:
                 claim.consumed_seq,
                 state,
             )
+            if state is None:
+                await self._ack_terminal_claim_loss(claim)
             self._mark_warm(claim)
             return
 
@@ -1428,8 +1437,12 @@ class StatelessTurnExecutor:
             self._heartbeat_loop(claim, claim_lost),
             name=f"lease-heartbeat-{unit_id[:8]}",
         )
+        cancelled = False
         try:
             await self._serve_claim_inner(pa, claim, unit_id, token, claim_lost)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
             # Belt for every exception/cancellation path. Normal completion
             # and release paths stop it earlier, before mutating the queue;
@@ -1466,6 +1479,72 @@ class StatelessTurnExecutor:
                 await heartbeat_task
             pa._turn_start_external_hook = None
             pa._turn_complete_external_hook = None
+            if cancelled:
+                # SIGTERM's hard-cancel is still an ownership transition. Do
+                # not leave a live exact claim to expire after this Pod object
+                # disappears: first drain every local/SFTP/background writer,
+                # then release the exact token while this process is alive. A
+                # concurrent End/reaper steal turns release into a no-op and
+                # is acknowledged against its exact loss ledger below.
+                await self._shutdown_dispose_cancelled_claim(claim)
+            if claim_lost.is_set() or self._exact_claim_handle_lost(claim):
+                if not await self._ack_terminal_claim_loss(claim):
+                    # A pod that cannot durably settle its exact claimant debt
+                    # must never return to the claim loop.  The reaper's
+                    # UID-preconditioned eviction/absence path is the only
+                    # safe successor owner from here.
+                    self.request_stop()
+
+    async def _shutdown_dispose_cancelled_claim(self, claim: ClaimedUnit) -> None:
+        """Quiesce and durably dispose one SIGTERM-cancelled session claim."""
+
+        try:
+            await self._detach_physical_before_transition("shutdown_cancelled_claim")
+        except BaseException:
+            logger.critical(
+                "shutdown could not quiesce exact stateless claimant; keeping "
+                "the executor task alive for the Pod grace window "
+                "(unit=%s token=%d)",
+                claim.unit_id,
+                claim.lease_token,
+                exc_info=True,
+            )
+            raise
+
+        last_error: BaseException | None = None
+        for attempt in range(1, COMPLETE_RETRY_ATTEMPTS + 1):
+            try:
+                state = await release_unit(
+                    self._db,
+                    unit_id=claim.unit_id,
+                    lease_token=claim.lease_token,
+                    error=True,
+                )
+                if state is not None:
+                    logger.info(
+                        "run_queue release: unit=%s token=%d "
+                        "reason=shutdown_cancelled state=%s",
+                        claim.unit_id,
+                        claim.lease_token,
+                        state,
+                    )
+                    return
+                # End/reaper won. Its thread->queue transaction publishes any
+                # credential-bearing claimant debt before this SELECT can see
+                # the advanced token; exact post-detach ACK is therefore safe.
+                await self._ack_terminal_claim_loss(claim)
+                return
+            except asyncio.CancelledError:
+                # The outer task is already cancelled; cleanup itself must be
+                # cancellation-resistant until it has a durable disposition.
+                continue
+            except BaseException as exc:
+                last_error = exc
+                if attempt < COMPLETE_RETRY_ATTEMPTS:
+                    await asyncio.sleep(0.5 * attempt)
+        raise RuntimeError(
+            "shutdown could not durably release its exact stateless claim"
+        ) from last_error
 
     async def _serve_claim_inner(
         self,
@@ -1696,6 +1775,8 @@ class StatelessTurnExecutor:
                 fallback,
                 state,
             )
+            if state is None:
+                await self._ack_terminal_claim_loss(claim)
             self._mark_warm(claim)
             return
 
@@ -1733,6 +1814,8 @@ class StatelessTurnExecutor:
                 target["seq"],
                 state,
             )
+            if state is None:
+                await self._ack_terminal_claim_loss(claim)
             self._mark_warm(claim)
             return
 
@@ -1821,16 +1904,32 @@ class StatelessTurnExecutor:
                 )
                 await self._detach_cached_session("interrupt_identity_missing")
                 return
+            # The transcript, memory, Git mapping, and workspace effects have
+            # settled, but a protected-cloud generation may still be flushing.
+            # Keep the exact interrupt gate open until that PUT reaches a
+            # terminal outcome: consumed_seq must never become the no-replay
+            # authority while an external writer is still live.
+            t0 = time.perf_counter()
+            await self._await_cloud_push(pa)
+            timing["push"] = time.perf_counter() - t0
+            self._pending_settled_close = (
+                str(claim.unit_id),
+                int(token),
+                int(interrupt_turn_id),
+                int(target["seq"]),
+            )
             try:
                 interrupt_closed = await self._close_interrupt_window(
                     pa,
                     claim,
                     target_turn_id=int(interrupt_turn_id),
+                    completed_input_seq=int(target["seq"]),
                 )
             except Exception:
                 self._lease.mark_lost()
                 logger.error(
-                    "interrupt final drain failed after turn completion; "
+                    "atomic input checkpoint/final interrupt drain failed after "
+                    "turn completion; "
                     "leaving lease to expire (unit=%s token=%d)",
                     unit_id,
                     token,
@@ -1846,10 +1945,8 @@ class StatelessTurnExecutor:
                     token,
                 )
                 await self._detach_cached_session("interrupt_close_lost_lease")
+                await self._ack_terminal_claim_loss(claim)
                 return
-            t0 = time.perf_counter()
-            await self._await_cloud_push(pa)
-            timing["push"] = time.perf_counter() - t0
             # Close the owner-consumption window before completion. A control
             # committed after this point advances control_input_seq; the
             # completion statement observes it and requeues atomically.
@@ -1873,6 +1970,7 @@ class StatelessTurnExecutor:
                     token,
                 )
                 await self._detach_cached_session("lease_lost_completion")
+                await self._ack_terminal_claim_loss(claim)
                 return
             logger.info(
                 "run_queue complete: unit=%s consumed_seq=%d state=%s",
@@ -1930,6 +2028,11 @@ class StatelessTurnExecutor:
             # Discard; the next claim rebuilds from thread_messages (§5.2
             # torn-turn invariant).
             await self._detach_cached_session("lease_lost")
+            # A fenced message/event/interrupt persist can signal the shared
+            # LeaseHandle before the heartbeat observes the stolen row. ACK
+            # directly after full unwind+detach; the exact marker matcher makes
+            # this a no-op for ordinary reaper loss.
+            await self._ack_terminal_claim_loss(claim)
         else:  # loop_died
             logger.warning(
                 "persistent loop ended mid-turn for unit %s (%s) — releasing",
@@ -2046,22 +2149,63 @@ class StatelessTurnExecutor:
         claim: ClaimedUnit,
         *,
         target_turn_id: int,
+        completed_input_seq: int | None = None,
     ) -> bool:
-        """Close admission, stop the watcher, then drain the committed tail."""
+        """Close admission, optionally checkpoint, then drain committed tail."""
 
         token = claim.lease_token
+        pending_close = self._pending_settled_close
+        if (
+            completed_input_seq is None
+            and pending_close is not None
+            and pending_close[:3]
+            == (str(claim.unit_id), int(token), int(target_turn_id))
+        ):
+            completed_input_seq = pending_close[3]
+        attempts = 0
         try:
-            closed = await close_interrupt_admission(
-                self._db,
-                unit_id=claim.unit_id,
-                lease_token=token,
-                turn_id=int(target_turn_id),
-            )
+            while True:
+                try:
+                    closed = await close_interrupt_admission(
+                        self._db,
+                        unit_id=claim.unit_id,
+                        lease_token=token,
+                        turn_id=int(target_turn_id),
+                        completed_input_seq=completed_input_seq,
+                    )
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if completed_input_seq is None:
+                        raise
+                    attempts += 1
+                    logger.warning(
+                        "atomic completed-input checkpoint failed; retrying "
+                        "under live lease (unit=%s token=%d turn=%d attempt=%d)",
+                        claim.unit_id,
+                        token,
+                        target_turn_id,
+                        attempts,
+                        exc_info=attempts <= COMPLETE_RETRY_ATTEMPTS,
+                    )
+                    # A transport exception may be an ambiguous commit. The
+                    # SQL's already-consumed arm makes every retry idempotent;
+                    # do not detach or expose a successor merely because a
+                    # finite retry budget elapsed while heartbeat still owns
+                    # this row.
+                    await asyncio.sleep(0.5 * min(attempts, COMPLETE_RETRY_ATTEMPTS))
         except BaseException:
             self._lease.mark_lost()
             with contextlib.suppress(BaseException):
                 await pa._stop_thread_interrupt_watcher()
             raise
+        if pending_close is not None and pending_close[:3] == (
+            str(claim.unit_id),
+            int(token),
+            int(target_turn_id),
+        ):
+            self._pending_settled_close = None
         await pa._stop_thread_interrupt_watcher()
         if not closed:
             self._lease.mark_lost()
@@ -2288,6 +2432,8 @@ class StatelessTurnExecutor:
                 claim.lease_token,
                 reason,
             )
+            if self._exact_claim_handle_lost(claim):
+                await self._ack_terminal_claim_loss(claim)
             return
         # Exact lifecycle boundary: no consumer may survive the state change
         # from leased back to queued, even on an error path.
@@ -2318,6 +2464,7 @@ class StatelessTurnExecutor:
                 claim.lease_token,
                 reason,
             )
+            await self._ack_terminal_claim_loss(claim)
         else:
             logger.info(
                 "run_queue release: unit=%s token=%d reason=%s state=%s",
@@ -2333,6 +2480,58 @@ class StatelessTurnExecutor:
         if session is None or session.stateless_warm_reuse_safe:
             return
         await self._detach_cached_session(reason)
+
+    def _exact_claim_handle_lost(self, claim: ClaimedUnit) -> bool:
+        """Bind the shared mutable loss event to the claim being unwound."""
+
+        return bool(
+            self._lease.unit_id == str(claim.unit_id)
+            and self._lease.lease_token == int(claim.lease_token)
+            and self._lease.lost.is_set()
+        )
+
+    async def _ack_terminal_claim_loss(
+        self,
+        claim: ClaimedUnit,
+    ) -> bool:
+        """Acknowledge public-End fencing only after local I/O is quiescent.
+
+        Reaper steals and ordinary lifecycle races reach this method too; the
+        shared DB helper returns False unless an exact End marker names this
+        old token and pod.  Physical sessions are detached once more as an
+        idempotent belt so attach/bundle loss paths receive the same guarantee
+        as the normal mid-turn unwind path.
+        """
+
+        pa = _pa()
+        if pa._thread_id == str(claim.unit_id) and pa._session is not None:
+            await self._detach_cached_session("terminal_claim_fenced")
+        try:
+            acknowledged = await acknowledge_session_claim_quiesced(
+                self._db,
+                thread_id=claim.unit_id,
+                previous_lease_token=claim.lease_token,
+                leased_by=self._pod_name,
+                pod_uid=self._pod_uid,
+            )
+        except Exception:
+            logger.warning(
+                "terminal claimant-quiescence acknowledgement failed: "
+                "unit=%s token=%d pod=%s",
+                claim.unit_id,
+                claim.lease_token,
+                self._pod_name,
+                exc_info=True,
+            )
+            return False
+        if acknowledged:
+            logger.info(
+                "terminal claimant quiesced: unit=%s token=%d pod=%s",
+                claim.unit_id,
+                claim.lease_token,
+                self._pod_name,
+            )
+        return bool(acknowledged)
 
     async def _detach_cached_session(self, reason: str) -> None:
         """Drop the cached session (and the affinity that pointed at it).
@@ -2353,42 +2552,22 @@ class StatelessTurnExecutor:
             # (dual_app precedent) — clear it so the next claim starts clean.
             pa._thread_id = None
             return
-        session = pa._session
-        preserve_workspace_daemons = not session.stateless_warm_reuse_safe
-        try:
-            await pa._terminate_session(
-                reason,
-                mark_thread=False,
-                preserve_shell=True,
-                preserve_workspace_daemons=preserve_workspace_daemons,
+        # Queue-claim detach retires only this Python/SFTP owner. Workspace
+        # rclone/overlay residents are durable handoff state and may still be
+        # flushing VFS bytes; destroying them on every claim boundary can lose
+        # writeback. Public End owns a separate exact remote resident-retirement
+        # acknowledgement before any emptyDir snapshot.
+        preserve_workspace_daemons = True
+        await pa._terminate_session(
+            reason,
+            mark_thread=False,
+            preserve_shell=True,
+            preserve_workspace_daemons=preserve_workspace_daemons,
+        )
+        if pa._session is not None:
+            raise RuntimeError(
+                "physical stateless session detach did not retire its owner"
             )
-        except Exception:
-            logger.warning(
-                "session detach (%s) failed — force-clearing session globals",
-                reason,
-                exc_info=True,
-            )
-            # A teardown exception must not leave a cancelled sync tool holding
-            # an admitted/reconnectable physical backend after the queue moves.
-            # Retry the session-local cleanup directly so refresh/overlay
-            # controller tasks and Keycloak clients cannot survive a failure
-            # in an earlier terminate step.  The handoff disposition performs
-            # no workspace-side unmount or token write.
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await session.cleanup(
-                    preserve_shell=True,
-                    preserve_workspace_daemons=preserve_workspace_daemons,
-                )
-            with contextlib.suppress(Exception):
-                session.retire_shell_owner()
-            with contextlib.suppress(Exception):
-                backend = session._unwrapped_backend()
-                retire = getattr(backend, "retire", None)
-                if retire is not None:
-                    retire()
-            # Last resort: never let a wedged teardown brick the claim loop.
-            pa._session = None
-            pa._thread_id = None
 
     def _scrub_process_residue(self) -> None:
         """§5.6 scrub-on-claim, executor half (deliverable D).

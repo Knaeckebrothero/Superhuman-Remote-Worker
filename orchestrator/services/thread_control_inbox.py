@@ -28,7 +28,7 @@ from src.shared.run_queue import (
     UNIT_KIND_SESSION_TURN,
     record_control_seq,
 )
-from services.stateless_workspace_gate import stateless_lite_workspace_check
+from services.stateless_workspace_gate import stateless_session_workspace_check
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,28 +62,6 @@ def _json_object(value: Any) -> dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
-
-
-def _stateless_session_class_refusal(thread: dict[str, Any]) -> str | None:
-    """Reject pinned-only class bits from the authoritative locked row.
-
-    Creation materializes the fully resolved officer/conference booleans into
-    ``metadata.config_override.officer``.  The route's earlier thread snapshot
-    is only a fast preflight; this check is the write-boundary authority and
-    prevents a concurrent config/class change from admitting a stateless
-    control onto pinned-only lifecycle machinery.
-    """
-
-    metadata = _json_object(thread.get("metadata"))
-    config_override = _json_object(metadata.get("config_override"))
-    officer = config_override.get("officer") or {}
-    if not isinstance(officer, dict):
-        return "session class metadata is invalid"
-    if officer.get("conference") in (True, "true", "True", 1):
-        return "conference sessions require pinned lifecycle wakes"
-    if officer.get("enabled") in (True, "true", "True", 1):
-        return "officer sessions require the pinned watchdog and wake drain"
-    return None
 
 
 async def find_existing_thread_control(
@@ -231,13 +209,7 @@ async def admit_thread_control(
                         "Session is not ready to accept controls"
                     )
             elif lane == LANE_STATELESS:
-                class_refusal = _stateless_session_class_refusal(dict(thread))
-                if class_refusal is not None:
-                    raise ControlAdmissionError(
-                        "Stateless execution does not support this session class "
-                        f"({class_refusal})"
-                    )
-                backend, workspace_refusal = stateless_lite_workspace_check(
+                backend, workspace_refusal = stateless_session_workspace_check(
                     dict(thread)
                 )
                 if workspace_refusal is not None:

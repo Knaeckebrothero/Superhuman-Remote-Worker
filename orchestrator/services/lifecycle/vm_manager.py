@@ -136,6 +136,21 @@ def _coerce_jsonb(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _is_stateless_instance(inst: Instance) -> bool:
+    """Whether a VM is owned by an exact stateless job or thread row.
+
+    Stateless physical-instance retirement is acknowledged by its terminal/loss
+    protocol.  The older generic lifecycle manager has no such acknowledgement,
+    so it must stay observational for these rows.  Exact matching deliberately
+    leaves pinned, missing, malformed, and future lane values on their existing
+    path.
+    """
+    return (
+        inst.metadata.get("scope") in ("job", "thread")
+        and inst.metadata.get("execution_lane") == "stateless"
+    )
+
+
 class VMInstanceManager:
     """Lifecycle manager for the vm kind."""
 
@@ -190,6 +205,10 @@ class VMInstanceManager:
         return instances
 
     async def is_healthy(self, inst: Instance) -> bool:
+        if _is_stateless_instance(inst):
+            # Suppress the reconciler's immediate unhealthy-delete shortcut;
+            # terminal/loss retirement is the sole physical cleanup owner.
+            return True
         # VMs report status in their own context. ``failed`` (a provisioning
         # failure) is now filtered out in _row_to_instance (_PARKED_VM_STATUSES)
         # so the dispatcher can hold it parked without the reconciler force-
@@ -202,6 +221,8 @@ class VMInstanceManager:
         return True
 
     async def is_idle(self, inst: Instance) -> bool:
+        if _is_stateless_instance(inst):
+            return False
         if inst.metadata.get("has_live_shared_child"):
             return False
         ide_session_status = inst.metadata.get("ide_session_status")
@@ -252,6 +273,8 @@ class VMInstanceManager:
         ``_live_shared_child_exists`` and
         docs/issues/reviewing_parent_pod_reaped_under_critic.md.
         """
+        if _is_stateless_instance(inst):
+            return False
         if inst.metadata.get("has_live_shared_child"):
             return False
         ide_session_status = inst.metadata.get("ide_session_status")
@@ -359,6 +382,8 @@ class VMInstanceManager:
 
     async def record_attempt(self, inst: Instance) -> None:
         """Persist an incremented snapshot-attempt counter to the bound VM ctx."""
+        if _is_stateless_instance(inst):
+            return
         if self._db is None:
             return
         bound = inst.bound_to
@@ -388,6 +413,8 @@ class VMInstanceManager:
         disk is still a dataVolumeTemplate the VM owns and cascade-deletes, so
         this degrades to the old behaviour rather than breaking.
         """
+        if _is_stateless_instance(inst):
+            return
         await self.delete(inst, grace_s, purge_disk=False)
         bound = inst.bound_to
         if not bound:
@@ -403,6 +430,8 @@ class VMInstanceManager:
             logger.exception("Failed to record kept rootdisk for VM %s", inst.id)
 
     async def snapshot(self, inst: Instance) -> str | None:
+        if _is_stateless_instance(inst):
+            return None
         if self._snapshot is None or not getattr(self._snapshot, "is_available", False):
             return None
         ssh_host = inst.metadata.get("ssh_host")
@@ -461,11 +490,15 @@ class VMInstanceManager:
 
     async def drain(self, inst: Instance, grace_s: int) -> None:
         # Drift drain wants a fresh image, so the old disk is not worth keeping.
+        if _is_stateless_instance(inst):
+            return
         await self.delete(inst, grace_s, purge_disk=True)
 
     async def delete(
         self, inst: Instance, grace_s: int, purge_disk: bool = True
     ) -> None:
+        if _is_stateless_instance(inst):
+            return
         if not self._provisioner_available():
             return
         bound = inst.bound_to
@@ -581,10 +614,11 @@ class VMInstanceManager:
             async with self._db.acquire() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT id::text AS id
+                    SELECT id::text AS id, execution_lane
                     FROM jobs
                     WHERE status = ANY($1::text[])
                       AND context->'vm'->>'rootdisk' = 'kept'
+                      AND execution_lane IS DISTINCT FROM 'stateless'
                     LIMIT 100
                     """,
                     list(_TERMINAL_JOB_STATUSES),
@@ -595,6 +629,10 @@ class VMInstanceManager:
 
         purged = 0
         for row in rows or []:
+            # SQL owns the normal filter; retain an exact application-side
+            # belt for mocked/stale readers and future query refactors.
+            if row.get("execution_lane") == "stateless":
+                continue
             job_id = row["id"] if isinstance(row, dict) else row.get("id")
             if not job_id:
                 continue
@@ -633,6 +671,7 @@ class VMInstanceManager:
                 job_rows = await conn.fetch(
                     """
                     SELECT id, status, context, updated_at, freeze_data,
+                           execution_lane,
                            (assigned_agent_id IS NULL) AS unassigned,
                            (freeze_data IS NULL) AS freeze_free
                     FROM jobs
@@ -642,7 +681,7 @@ class VMInstanceManager:
                 )
                 thread_rows = await conn.fetch(
                     """
-                    SELECT id, status, total_turns, metadata
+                    SELECT id, status, execution_lane, total_turns, metadata
                     FROM threads
                     WHERE metadata->'vm' IS NOT NULL
                       AND metadata->'vm' <> '{}'::jsonb
@@ -671,6 +710,7 @@ class VMInstanceManager:
                     "bound_id": str(r["id"]),
                     "owner_status": r.get("status"),
                     "owner_updated_at": r.get("updated_at"),
+                    "execution_lane": r.get("execution_lane"),
                     "job_dispatchable": dispatchable,
                     # Carried for the infra_transient reap carve-out: a job
                     # paused for a DB-blip retry must keep its VM, or the retry
@@ -693,6 +733,7 @@ class VMInstanceManager:
                     "scope": "thread",
                     "bound_id": str(r["id"]),
                     "owner_status": r.get("status"),
+                    "execution_lane": r.get("execution_lane"),
                     "vm_ctx": vm_ctx,
                     "ide_session_status": _coerce_jsonb(md.get("ide_session")).get(
                         "status"
@@ -724,6 +765,7 @@ class VMInstanceManager:
         version = _extract_sha(vm_ctx.get("vm_image"))
         metadata: dict[str, Any] = {
             "scope": scope,
+            "execution_lane": row.get("execution_lane"),
             # Backend-native id (None if only the synthesized fallback exists) —
             # the live-child guard matches critic subjobs on it. A critic
             # inherits the parent's context.vm, so its native id equals this

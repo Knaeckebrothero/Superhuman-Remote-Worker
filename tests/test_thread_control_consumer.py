@@ -647,7 +647,9 @@ async def test_writer_fences_stateless_control_on_event_immutable_lease_token():
     )
 
     assert await writer._write_batch([event]) == 1
+    thread_fence_sql, _thread_fence_args = conn.calls[0]
     queue_fence_sql, queue_fence_args = conn.calls[1]
+    assert "FOR NO KEY UPDATE" in thread_fence_sql
     assert "state = 'leased'" in queue_fence_sql
     assert queue_fence_args == (str(THREAD_ID), 9)
     assert queue_fence_args[1] != warm_handle.lease_token
@@ -678,6 +680,7 @@ async def test_writer_fences_pinned_control_on_event_immutable_agent_id():
     agent_fence_sql, agent_fence_args = conn.calls[1]
     request_lock_sql, request_lock_args = conn.calls[2]
     assert "execution_lane = 'pinned'" in thread_fence_sql
+    assert "FOR NO KEY UPDATE" in thread_fence_sql
     assert thread_fence_args == (str(THREAD_ID), agent_id)
     assert "thread_id = $2::uuid" in agent_fence_sql
     assert agent_fence_args == (agent_id, str(THREAD_ID))

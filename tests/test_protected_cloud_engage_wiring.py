@@ -9,6 +9,7 @@ must still boot (with no cloud mount), never fall back to a live mount.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -26,6 +27,11 @@ import main
 # test's side_effect raises, silently mis-testing the refusal path (it fell
 # through to the generic ``except Exception`` branch instead).
 from services.cloud.ro_engage import RoEngageRefused
+
+
+@asynccontextmanager
+async def _owned_workspace_lifecycle_lock(*_args, **_kwargs):
+    yield True
 
 
 @pytest.mark.asyncio
@@ -368,14 +374,12 @@ async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_works
         metadata={
             "config_override": {"workspace": {"backend": "sandbox"}},
             "workspace_container": {
-                "status": "ready",
+                "status": "deleted",
                 "provisioner": "k8s",
-                "pod_ip": "10.42.0.25",
-                "port": 30022,
-                "pod_name": "ws-thread-111111111111",
-                "namespace": "agent-workspaces",
+                "pod_ip": None,
                 "_canvas_workspace_generation": generation,
-                "_runtime_incarnation": "22222222-2222-4222-8222-222222222222",
+                "_runtime_incarnation": None,
+                "_snapshot_restore_required": False,
             },
             "_workspace_binding": {
                 "generation": generation,
@@ -383,11 +387,35 @@ async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_works
                 "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
                 "ssh_host_key_fingerprint": "SHA256:trusted",
             },
+            "_stateless_workspace_retirement_settled": {
+                "terminal_token": 8,
+                "cleanup_complete": True,
+                "permanent": False,
+                "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+                "runtime_incarnation": "22222222-2222-4222-8222-222222222222",
+                "snapshot_restore_required": False,
+            },
         },
     )
     user = {"id": "user-1"}
     db = MagicMock()
-    db.resume_thread = AsyncMock()
+    db.resume_thread = AsyncMock(return_value=True)
+    db.get_thread = AsyncMock(return_value=thread)
+    db.stateless_session_workspace_ensure_lock = MagicMock(
+        side_effect=_owned_workspace_lifecycle_lock
+    )
+    db.begin_stateless_thread_workspace_retirement = AsyncMock(
+        return_value={
+            "state": "settled",
+            "terminal_token": 8,
+            "permanent": False,
+            "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+            "runtime_incarnation": "22222222-2222-4222-8222-222222222222",
+            "snapshot_restore_required": False,
+            "workspace_absence_proven": False,
+            "retry": True,
+        }
+    )
     db.list_thread_mounts = AsyncMock(return_value=[])
     agent_provisioner = MagicMock(is_available=True)
     agent_provisioner.provision_agent = AsyncMock()
@@ -416,6 +444,78 @@ async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_works
     agent_provisioner.provision_agent.assert_not_awaited()
     persistent_provisioner.create_agent_pod.assert_not_awaited()
     ensure_workspace.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stateless_resume_refuses_retirement_marker_before_mutation():
+    from main import resume_thread
+
+    thread = _resume_thread_row(
+        execution_lane="stateless",
+        metadata={
+            "_stateless_workspace_retirement_pending": True,
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.42.0.25",
+                "port": 30022,
+                "pod_name": "ws-thread-111111111111",
+                "namespace": "agent-workspaces",
+                "_canvas_workspace_generation": (
+                    "11111111-1111-4111-8111-111111111111"
+                ),
+                "_runtime_incarnation": "22222222-2222-4222-8222-222222222222",
+            },
+            "_workspace_binding": {
+                "generation": "11111111-1111-4111-8111-111111111111",
+                "kind": "remote",
+                "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+                "ssh_host_key_fingerprint": "SHA256:trusted",
+            },
+        },
+    )
+    db = MagicMock()
+    db.resume_thread = AsyncMock(return_value=True)
+    db.get_thread = AsyncMock(return_value=thread)
+    db.stateless_session_workspace_ensure_lock = MagicMock(
+        side_effect=_owned_workspace_lifecycle_lock
+    )
+
+    with (
+        patch("main.require_thread_owner", AsyncMock(return_value=({}, thread))),
+        patch("main.postgres_db", db),
+        patch("main._thread_project_ids", AsyncMock(return_value=[])),
+        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
+        patch("main._revalidate_thread_datasource_ids", AsyncMock(return_value=[])),
+        pytest.raises(main.HTTPException) as exc,
+    ):
+        await resume_thread("thread-1", object())
+
+    assert exc.value.status_code == 503
+    db.resume_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_cas_loss_to_retirement_fails_closed():
+    from main import resume_thread
+
+    thread = _resume_thread_row(metadata={})
+    db = MagicMock()
+    db.resume_thread = AsyncMock(return_value=False)
+    db.list_thread_mounts = AsyncMock(return_value=[])
+
+    with (
+        patch("main.require_thread_owner", AsyncMock(return_value=({}, thread))),
+        patch("main.postgres_db", db),
+        patch("main._thread_project_ids", AsyncMock(return_value=[])),
+        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
+        patch("main._revalidate_thread_datasource_ids", AsyncMock(return_value=[])),
+        pytest.raises(main.HTTPException) as exc,
+    ):
+        await resume_thread("thread-1", object())
+
+    assert exc.value.status_code == 409
 
 
 @pytest.mark.asyncio

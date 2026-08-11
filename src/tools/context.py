@@ -1368,10 +1368,13 @@ class ToolContext:
     async def browser_exec(self, action: str, **args: Any) -> Dict[str, Any]:
         """Run one browser action on the workspace via the browser-exec helper.
 
-        Drives Chromium on the workspace over SSH (``exec_command``) rather
-        than speaking CDP across the pod boundary. The workspace daemon holds
-        the persistent session so element refs survive between calls. Returns
-        the parsed JSON result, or an ``{"error": ...}`` dict on any failure.
+        Drives Chromium on the workspace over SSH rather than speaking CDP
+        across the pod boundary. The workspace daemon holds the persistent
+        session so element refs survive between calls. Stateless workspaces
+        route the command through the same exact-claim resource fence as other
+        workspace-resident daemons; the base implementation preserves the
+        historical unfenced behavior for pinned/custom backends. Returns the
+        parsed JSON result, or an ``{"error": ...}`` dict on any failure.
 
         See docs/features/browser_workspace_executor.md.
         """
@@ -1391,8 +1394,21 @@ class ToolContext:
         payload = _json.dumps(args)
         cmd = f"browser-exec {shlex.quote(action)} --json {shlex.quote(payload)}"
         try:
-            # exec_command is blocking SSH; keep the event loop responsive.
-            out = await asyncio.to_thread(backend.exec_command, cmd, 200)
+            # Workspace command execution is blocking; keep the event loop
+            # responsive.  Every production WorkspaceBackend exposes the
+            # claim-resource seam.  The callable fallback retains support for
+            # older/custom duck-typed backends without silently bypassing the
+            # stateless RemoteBackend fence.
+            claim_exec = getattr(backend, "exec_claim_resource", None)
+            if callable(claim_exec):
+                out = await asyncio.to_thread(
+                    claim_exec,
+                    cmd,
+                    200,
+                    operation=f"browser-exec {action}",
+                )
+            else:
+                out = await asyncio.to_thread(backend.exec_command, cmd, 200)
         except Exception as e:
             return {"error": f"browser-exec call failed: {e}"}
 
@@ -1405,12 +1421,26 @@ class ToolContext:
         except Exception:
             return {"error": f"browser-exec returned non-JSON: {out[:500]}"}
 
-    async def close_browser(self) -> None:
-        """Shut down the workspace browser-exec daemon. Called on job/session end."""
+    async def close_browser(self, *, strict: bool = False) -> None:
+        """Shut down the workspace browser-exec daemon.
+
+        Normal tool cleanup retains the historical best-effort behavior.
+        Terminal stateless retirement passes ``strict=True`` and requires the
+        workspace client to attest that its daemon and exact-profile Chromium
+        processes are absent before snapshot/release may continue.
+        """
         if not self.has_workspace():
             return
         try:
-            await self.browser_exec("shutdown")
+            result = await self.browser_exec("shutdown")
+            if strict and (
+                not isinstance(result, dict)
+                or result.get("ok") is not True
+                or result.get("shutdown_complete") is not True
+            ):
+                raise RuntimeError("browser-exec shutdown was not acknowledged")
         except Exception as e:
+            if strict:
+                raise
             logger.debug(f"browser-exec shutdown failed: {e}")
         logger.info("Browser cleaned up")

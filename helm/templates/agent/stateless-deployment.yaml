@@ -77,7 +77,11 @@ spec:
       # turn/batch → release the lease. The executor implements this on
       # SIGTERM itself, so there is no preStop exec hook — just a grace
       # period generous enough to finish + persist + release one unit.
-      terminationGracePeriodSeconds: 120
+      # Executor shutdown allows 120s for the in-flight unit, then a 15s
+      # interrupt/unwind window. Keep additional room for authoritative
+      # backend/task drain and the exact claimant-quiescence acknowledgement;
+      # Kubernetes must not SIGKILL the process before that proof is durable.
+      terminationGracePeriodSeconds: 180
       securityContext:
         seccompProfile:
           type: RuntimeDefault

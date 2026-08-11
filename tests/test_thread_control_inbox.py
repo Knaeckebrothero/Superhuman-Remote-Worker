@@ -584,6 +584,9 @@ async def test_exact_pinned_ended_status_refuses_successor_binding():
     conn.fetchval = AsyncMock()
     db = MagicMock()
     db.acquire = lambda: _AsyncContext(conn)
+    db.get_thread = AsyncMock(
+        return_value={"execution_lane": "pinned", "status": "active"}
+    )
 
     with (
         patch.object(orchestrator_main, "require_internal", AsyncMock()),
@@ -779,6 +782,38 @@ async def test_locked_stateless_workspace_refusal_precedes_every_admission_write
 
 
 @pytest.mark.asyncio
+async def test_locked_stateless_protected_cloud_refusal_precedes_every_write():
+    """The protected marker is authoritative at the locked write boundary."""
+    conn = _ControlConn(
+        thread=_thread(
+            metadata={
+                "config_override": {"workspace": {"backend": "virtual"}},
+                "protected_cloud": True,
+            }
+        ),
+        queue_state="done",
+    )
+
+    with pytest.raises(ControlAdmissionError, match="workspace binding"):
+        await admit_thread_control(
+            _ControlDB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="narration.set",
+            payload={"mode": "verbose"},
+            requested_by=str(OWNER_ID),
+        )
+
+    locked_read = _calls(conn, "fetchrow", "FROM threads WHERE id")
+    assert len(locked_read) == 1
+    assert "metadata" in locked_read[0][1]
+    assert "FOR UPDATE" in locked_read[0][1]
+    assert not _calls(conn, "fetchrow", "FROM run_queue")
+    assert not [call for call in conn.calls if call[0] in {"execute", "fetchval"}]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("class_flag", ["enabled", "conference"])
 async def test_locked_stateless_session_class_refusal_precedes_every_write(class_flag):
     """The locked materialized class bits, not route preflight, are authority."""
@@ -795,7 +830,42 @@ async def test_locked_stateless_session_class_refusal_precedes_every_write(class
         queue_state="done",
     )
 
-    with pytest.raises(ControlAdmissionError, match="session class"):
+    with pytest.raises(ControlAdmissionError, match="workspace binding"):
+        await admit_thread_control(
+            _ControlDB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="narration.set",
+            payload={"mode": "verbose"},
+            requested_by=str(OWNER_ID),
+        )
+
+    assert not _calls(conn, "fetchrow", "FROM run_queue")
+    assert not [call for call in conn.calls if call[0] in {"execute", "fetchval"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("class_flag", ["enabled", "conference"])
+@pytest.mark.parametrize("value", [None, 0, "", [], {}, "false", 1])
+async def test_locked_stateless_malformed_session_class_refuses_before_every_write(
+    class_flag, value
+):
+    """The locked admission gate must match central malformed-class refusal."""
+
+    conn = _ControlConn(
+        thread=_thread(
+            metadata={
+                "config_override": {
+                    "workspace": {"backend": "virtual"},
+                    "officer": {class_flag: value},
+                }
+            }
+        ),
+        queue_state="done",
+    )
+
+    with pytest.raises(ControlAdmissionError, match="session_class_malformed"):
         await admit_thread_control(
             _ControlDB(conn),
             thread_id=THREAD_ID,
@@ -1076,7 +1146,7 @@ async def test_workspace_undo_admits_only_idle_stateless_sandbox():
     )
 
     with patch(
-        "orchestrator.services.thread_control_inbox.stateless_lite_workspace_check",
+        "orchestrator.services.thread_control_inbox.stateless_session_workspace_check",
         return_value=("sandbox", None),
     ):
         result = await admit_thread_control(
@@ -1107,7 +1177,7 @@ async def test_workspace_undo_refuses_live_turn_before_any_write():
 
     with (
         patch(
-            "orchestrator.services.thread_control_inbox.stateless_lite_workspace_check",
+            "orchestrator.services.thread_control_inbox.stateless_session_workspace_check",
             return_value=("sandbox", None),
         ),
         pytest.raises(ControlAdmissionNotReady, match="completing a turn"),
@@ -1139,7 +1209,7 @@ async def test_workspace_undo_cannot_overtake_earlier_human_input():
 
     with (
         patch(
-            "orchestrator.services.thread_control_inbox.stateless_lite_workspace_check",
+            "orchestrator.services.thread_control_inbox.stateless_session_workspace_check",
             return_value=("sandbox", None),
         ),
         pytest.raises(ControlAdmissionNotReady, match="pending input"),
@@ -1171,7 +1241,7 @@ async def test_workspace_undo_allows_queued_control_only_row():
     )
 
     with patch(
-        "orchestrator.services.thread_control_inbox.stateless_lite_workspace_check",
+        "orchestrator.services.thread_control_inbox.stateless_session_workspace_check",
         return_value=("sandbox", None),
     ):
         result = await admit_thread_control(

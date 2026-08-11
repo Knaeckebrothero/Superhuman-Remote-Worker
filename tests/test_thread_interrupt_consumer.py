@@ -881,8 +881,10 @@ async def test_writer_uses_interrupt_events_immutable_lease_token():
     )
 
     assert await writer._write_batch([event]) == 1
+    thread_fence_sql, _thread_fence_args = conn.calls[0]
     queue_fence_sql, queue_fence_args = conn.calls[1]
     request_lock_sql, request_lock_args = conn.calls[2]
+    assert "FOR NO KEY UPDATE" in thread_fence_sql
     assert "state = 'leased'" in queue_fence_sql
     assert queue_fence_args == (str(THREAD_ID), 9)
     assert "accepted_lease_token = $3::bigint" in request_lock_sql

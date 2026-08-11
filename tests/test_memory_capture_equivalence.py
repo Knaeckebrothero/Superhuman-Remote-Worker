@@ -16,6 +16,7 @@ is unaffected (args are computed at trigger time either way), and the
 writers are awaited through capture() by design.
 """
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -757,3 +758,37 @@ class TestCaptureNowaitAndDrain:
     async def test_drain_background_empty_is_zero(self):
         manager = MemoryManager(make_runtime(), writers=[])
         assert await manager.drain_background(timeout=1.0) == 0
+
+    @pytest.mark.asyncio
+    async def test_close_background_cancels_joins_and_closes_admission(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        class BlockingWriter:
+            event_kinds = frozenset({"pre_compaction"})
+
+            async def on_event(self, _event):
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+
+        manager = MemoryManager(
+            make_runtime(),
+            writers=[("blocking", BlockingWriter())],
+        )
+        task = manager.capture_nowait(precompact_event(make_messages()))
+        await started.wait()
+
+        assert (
+            await manager.close_background(
+                drain_timeout=0.0,
+                cancel_timeout=1.0,
+            )
+            == 1
+        )
+        assert task.done()
+        assert cancelled.is_set()
+        with pytest.raises(RuntimeError, match="background capture is closed"):
+            manager.capture_nowait(precompact_event(make_messages()))

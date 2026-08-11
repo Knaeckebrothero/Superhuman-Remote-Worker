@@ -47,7 +47,10 @@ from ..core.skill_resolution import (
     skill_bundle_digest,
 )
 from ..core.workspace import WorkspaceManager, WorkspaceManagerConfig
-from ..core.workspace_backend import WorkspaceUnavailableError
+from ..core.workspace_backend import (
+    WorkspaceAuthenticationError,
+    WorkspaceUnavailableError,
+)
 from ..tools import ToolContext, load_tools, apply_instruction_enforcement
 from ..tools.context import SessionRuntimeFacts
 from ..tools.description_manager import apply_description_overrides
@@ -246,6 +249,9 @@ class PersistentSession:
     # behind memory.manager.enabled; None keeps the legacy direct-store
     # paths in persistent_graph.py and persistent_app.py.
     memory_service: Optional[Any] = None
+    # Set only after every detached memory/citation writer has been terminally
+    # joined.  Queue transitions and claimant-loss ACKs depend on this proof.
+    _background_tasks_quiesced: bool = False
     # B11 double-extraction guard: set after a manager-path session_end/
     # idle_archive capture so _terminate_session doesn't re-extract.
     final_memory_extracted: bool = False
@@ -619,6 +625,9 @@ class PersistentSession:
         workspace_runtime_incarnation = (workspace_override or {}).get(
             "workspace_runtime_incarnation"
         )
+        workspace_ssh_host_key_fingerprint = (workspace_override or {}).get(
+            "workspace_ssh_host_key_fingerprint"
+        )
 
         # No-workspace tiers (virtual/none): no SSH workspace pod. Build the
         # lite backend directly, with git off (§8 — lite tiers have no git).
@@ -664,11 +673,13 @@ class PersistentSession:
                 "an isolated workspace (sandbox or vm) with SSH credentials."
             )
         if self.shell_owner_token is not None and (
-            not workspace_generation or not workspace_runtime_incarnation
+            not workspace_generation
+            or not workspace_runtime_incarnation
+            or not workspace_ssh_host_key_fingerprint
         ):
             raise WorkspaceUnavailableError(
                 "A stateless physical session requires an orchestrator-attested "
-                "workspace backing and runtime incarnation"
+                "workspace backing, runtime incarnation, and SSH host identity"
             )
 
         from ..core.backends.remote import RemoteBackend
@@ -710,6 +721,11 @@ class PersistentSession:
                         if self.shell_owner_token is not None
                         else None
                     ),
+                    expected_host_key_fingerprint=(
+                        workspace_ssh_host_key_fingerprint
+                        if self.shell_owner_token is not None
+                        else None
+                    ),
                 )
                 if self.shell_owner_token is not None:
                     workspace_backend.set_shell_owner_token(self.shell_owner_token)
@@ -741,6 +757,12 @@ class PersistentSession:
                 )
                 break
             except Exception as e:
+                if self.shell_owner_token is not None and isinstance(
+                    e, WorkspaceAuthenticationError
+                ):
+                    raise WorkspaceUnavailableError(
+                        f"Stateless workspace SSH identity attestation failed: {e}"
+                    ) from e
                 elapsed = time.monotonic() - start
                 if elapsed >= max_duration:
                     raise WorkspaceUnavailableError(
@@ -2732,6 +2754,45 @@ class PersistentSession:
             f"({getattr(new_backend, '_host', 'local')})"
         )
 
+    async def quiesce_background_tasks(self) -> None:
+        """Close every session-scoped detached writer before owner release.
+
+        The persistent process can attach a different thread immediately after
+        cleanup.  CitationEngine copies its callback and MemoryManager retains
+        pre-compaction tasks, so clearing ToolContext fields alone is not a
+        boundary.  This method is idempotent and deliberately propagates an
+        unjoinable-task failure for stateless callers: the queue lease must stay
+        held until the reaper fences the claimant.
+        """
+
+        if self._background_tasks_quiesced:
+            return
+
+        if self.tool_context is not None:
+            citation_engine = getattr(self.tool_context, "citation_engine", None)
+            if citation_engine is not None:
+                close_engine = getattr(citation_engine, "aclose", None)
+                if close_engine is None:
+                    if self.shell_owner_token is not None:
+                        raise RuntimeError(
+                            "stateless citation engine lacks terminal close"
+                        )
+                else:
+                    await close_engine()
+                # aclose disarms and joins first; only now may the cached
+                # engine/source registry be released.
+                self.tool_context.close_citation_engine()
+
+        if self.memory_service is not None:
+            close_memory = getattr(self.memory_service, "close_background", None)
+            if close_memory is None:
+                if self.shell_owner_token is not None:
+                    raise RuntimeError("stateless memory manager lacks terminal close")
+            else:
+                await close_memory()
+
+        self._background_tasks_quiesced = True
+
     async def cleanup(
         self,
         *,
@@ -2767,6 +2828,15 @@ class PersistentSession:
 
         backend_for_cleanup = None
         shell_retirement_error: Exception | None = None
+        backend_retirement_error: Exception | None = None
+        resident_cleanup_error: Exception | None = None
+        local_handoff_error: Exception | None = None
+        strict_local_handoff = bool(
+            self.shell_owner_token is not None and preserve_workspace_daemons
+        )
+        strict_resident_cleanup = bool(
+            self.shell_owner_token is not None and not preserve_workspace_daemons
+        )
         if self.workspace_manager:
             from ..core.virtual_dirs import unwrap_backend
 
@@ -2781,6 +2851,11 @@ class PersistentSession:
                 # another tmux command during the handoff.
                 retire_shell_owner()
 
+        # Belt for partial-attach and non-standard cleanup call sites. The
+        # ordinary app teardown invokes this before its journal closes; this
+        # idempotent call ensures no alternate path can skip the RAM barrier.
+        await self.quiesce_background_tasks()
+
         if self.tool_context is not None:
             self.tool_context.citation_verdict_callback = None
             self.tool_context.canvas_event_callback = None
@@ -2793,9 +2868,14 @@ class PersistentSession:
                 await self._cloud_overlay_monitor_task
             except asyncio.CancelledError:
                 pass
-            except Exception:
-                logger.debug("cloud overlay monitor task exit", exc_info=True)
-            self._cloud_overlay_monitor_task = None
+            except Exception as exc:
+                if strict_local_handoff:
+                    local_handoff_error = exc
+                    logger.error("Stateless overlay monitor did not stop: %s", exc)
+                else:
+                    logger.debug("cloud overlay monitor task exit", exc_info=True)
+            if local_handoff_error is None:
+                self._cloud_overlay_monitor_task = None
 
         if self.overlay_mount_manager is not None:
             try:
@@ -2805,20 +2885,56 @@ class PersistentSession:
                     self.overlay_mount_manager.detach_local()
                 else:
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, self.overlay_mount_manager.unmount)
-            except Exception:
-                logger.debug("overlay cleanup failed", exc_info=True)
-            self.overlay_mount_manager = None
+                    if strict_resident_cleanup:
+                        await loop.run_in_executor(
+                            None,
+                            lambda: self.overlay_mount_manager.unmount(strict=True),
+                        )
+                    else:
+                        await loop.run_in_executor(
+                            None, self.overlay_mount_manager.unmount
+                        )
+                self.overlay_mount_manager = None
+            except Exception as exc:
+                if strict_resident_cleanup:
+                    resident_cleanup_error = exc
+                    logger.error("Stateless overlay resident did not retire: %s", exc)
+                elif strict_local_handoff:
+                    local_handoff_error = exc
+                    logger.error("Stateless overlay controller did not detach: %s", exc)
+                else:
+                    logger.debug("overlay cleanup failed", exc_info=True)
+                    self.overlay_mount_manager = None
 
         if self.cloud_mount_manager:
-            try:
-                if preserve_workspace_daemons:
-                    await self.cloud_mount_manager.detach_for_handoff()
-                else:
-                    await self.cloud_mount_manager.aclose()
-            except Exception as e:
-                logger.warning(f"Cloud mount cleanup error: {e}")
-            self.cloud_mount_manager = None
+            if strict_resident_cleanup and resident_cleanup_error is not None:
+                logger.error(
+                    "Skipping rclone retirement because the dependent overlay "
+                    "is still resident"
+                )
+            else:
+                try:
+                    if preserve_workspace_daemons:
+                        await self.cloud_mount_manager.detach_for_handoff()
+                    elif strict_resident_cleanup:
+                        await self.cloud_mount_manager.aclose(strict=True)
+                    else:
+                        await self.cloud_mount_manager.aclose()
+                    self.cloud_mount_manager = None
+                except Exception as exc:
+                    if strict_resident_cleanup:
+                        resident_cleanup_error = exc
+                        logger.error(
+                            "Stateless rclone resident did not retire: %s", exc
+                        )
+                    elif strict_local_handoff:
+                        local_handoff_error = exc
+                        logger.error(
+                            "Stateless rclone controller did not detach: %s", exc
+                        )
+                    else:
+                        logger.warning(f"Cloud mount cleanup error: {exc}")
+                        self.cloud_mount_manager = None
 
         if self.shell_manager and not preserve_shell:
             try:
@@ -2863,7 +2979,11 @@ class PersistentSession:
         # Retire remote backend instances terminally. Merely disconnecting is a
         # transport reset and would let cancelled sync work reconnect after the
         # claim/session handoff.
-        if self.workspace_manager:
+        if (
+            self.workspace_manager
+            and resident_cleanup_error is None
+            and local_handoff_error is None
+        ):
             backend = backend_for_cleanup
             if shell_retirement_error is not None:
                 retire_claim_resource_owner = getattr(
@@ -2888,17 +3008,43 @@ class PersistentSession:
                     backend.retire()
                     logger.info("Remote workspace backend retired")
                 except Exception as e:
-                    logger.warning(f"Backend retirement error: {e}")
+                    if self.shell_owner_token is not None:
+                        backend_retirement_error = e
+                        logger.error(
+                            "Stateless backend retirement was not acknowledged: %s",
+                            e,
+                        )
+                    else:
+                        logger.warning(f"Backend retirement error: {e}")
             elif hasattr(backend, "disconnect") and hasattr(backend, "is_connected"):
                 try:
                     if backend.is_connected():
                         backend.disconnect()
                         logger.info("Remote workspace backend disconnected")
                 except Exception as e:
-                    logger.warning(f"Backend disconnect error: {e}")
+                    if self.shell_owner_token is not None:
+                        backend_retirement_error = e
+                        logger.error(
+                            "Stateless backend disconnect was not acknowledged: %s",
+                            e,
+                        )
+                    else:
+                        logger.warning(f"Backend disconnect error: {e}")
 
         logger.info(f"PersistentSession cleaned up: thread={self.thread_id}")
         if shell_retirement_error is not None:
             raise WorkspaceUnavailableError(
                 "Stateless session shell retirement remains unacknowledged"
             ) from shell_retirement_error
+        if resident_cleanup_error is not None:
+            raise WorkspaceUnavailableError(
+                "Stateless workspace residents remain active"
+            ) from resident_cleanup_error
+        if local_handoff_error is not None:
+            raise WorkspaceUnavailableError(
+                "Stateless local workspace controllers remain active"
+            ) from local_handoff_error
+        if backend_retirement_error is not None:
+            raise WorkspaceUnavailableError(
+                "Stateless session backend retirement remains unacknowledged"
+            ) from backend_retirement_error

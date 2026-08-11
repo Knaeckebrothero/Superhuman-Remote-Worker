@@ -6,6 +6,32 @@
 
 set -e
 
+# Cooperative process-retirement identity.  Code-server terminals and other
+# workspace residents inherit this exact owner+Pod-UID tag; public stateless
+# End scans it after stopping the known parents so nohup/setsid descendants
+# cannot keep mutating a snapshot. Static/pinned Docker workspaces predate this
+# authority and provide none of the three fields; retain that legacy untagged
+# mode, but refuse any partial or malformed authority set.
+if [ -z "${SRW_WORKSPACE_OWNER_KIND:-}" ] \
+    && [ -z "${SRW_WORKSPACE_OWNER_ID:-}" ] \
+    && [ -z "${SRW_WORKSPACE_RUNTIME_UID:-}" ]; then
+    unset SRW_WORKSPACE_PROCESS_TAG
+else
+    case "${SRW_WORKSPACE_OWNER_KIND:-}" in job|session) ;;
+        *) echo "workspace owner kind is unavailable" >&2; exit 78 ;;
+    esac
+    canonical_uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    if ! printf '%s\n' "${SRW_WORKSPACE_OWNER_ID:-}" | grep -Eq "$canonical_uuid_re"; then
+        echo "workspace owner identity is unavailable" >&2
+        exit 78
+    fi
+    if ! printf '%s\n' "${SRW_WORKSPACE_RUNTIME_UID:-}" | grep -Eq "$canonical_uuid_re"; then
+        echo "workspace runtime identity is unavailable" >&2
+        exit 78
+    fi
+    export SRW_WORKSPACE_PROCESS_TAG="v1:${SRW_WORKSPACE_OWNER_KIND}:${SRW_WORKSPACE_OWNER_ID}:${SRW_WORKSPACE_RUNTIME_UID}"
+fi
+
 # ---------------------------------------------------------------------------
 # 1. Seed dotfiles from skeleton (idempotent)
 #    Volume mounts shadow everything baked into /home/agent-host by the
@@ -110,11 +136,16 @@ fi
 #    paint. --user-data-dir and --extensions-dir outside home keep the IDE
 #    file explorer clean. Opens /home/agent-host/workspace as the root.
 # ---------------------------------------------------------------------------
-su -c 'code-server \
+if [ -n "${SRW_WORKSPACE_PROCESS_TAG:-}" ]; then
+    CODE_SERVER_PROCESS_PREFIX="exec env SRW_WORKSPACE_PROCESS_TAG=$SRW_WORKSPACE_PROCESS_TAG"
+else
+    CODE_SERVER_PROCESS_PREFIX="exec"
+fi
+su -s /bin/sh agent-host -c "$CODE_SERVER_PROCESS_PREFIX code-server \
     --bind-addr 0.0.0.0:38080 \
     --user-data-dir /var/lib/code-server \
     --extensions-dir /var/lib/code-server/extensions \
-    /home/agent-host/workspace' agent-host &
+    /home/agent-host/workspace" &
 
 # ---------------------------------------------------------------------------
 # 4. Keep the container alive, anchored to SSHD (PID exits → container exits,

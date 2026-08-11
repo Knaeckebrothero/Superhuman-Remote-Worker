@@ -1458,6 +1458,46 @@ class TestEarlyTitleFromPrompt:
 
         mock_conn_ctx.execute.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_blocked_old_draft_cannot_write_or_broadcast_successor(self):
+        import src.api.persistent_app as papp
+
+        old_session, old_conn, old_conn_ctx = self._mock_session()
+        new_session, _, _ = self._mock_session()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_get(_thread_id):
+            started.set()
+            await release.wait()
+            return {"title": "Untitled Session"}
+
+        old_conn.get_thread = AsyncMock(side_effect=blocked_get)
+        with (
+            patch.object(papp, "_session", old_session),
+            patch.object(papp, "_thread_id", "thread-a"),
+            patch.object(papp, "_session_generation", 41),
+            patch.object(papp, "_draft_title_value", None),
+            patch.object(papp, "_broadcast") as broadcast,
+        ):
+            task = asyncio.create_task(
+                _early_title_from_prompt(
+                    "a titleable prompt from the old claimant",
+                    expected_session=old_session,
+                    expected_thread_id="thread-a",
+                    expected_generation=41,
+                )
+            )
+            await started.wait()
+            papp._session = new_session
+            papp._thread_id = "thread-b"
+            papp._session_generation = 42
+            release.set()
+            await task
+
+        old_conn_ctx.execute.assert_not_called()
+        broadcast.assert_not_called()
+
 
 class TestDraftTitleFromPrompt:
     def test_takes_leading_words(self):
@@ -1623,6 +1663,7 @@ class TestPollWorkspaceReady:
         assert result["canvas_presentation_available"] is False
         assert result["canvas_live_apps_available"] is False
         assert result["canvas_shared_browser_available"] is False
+        assert result["workspace_ssh_host_key_fingerprint"] is None
 
     @pytest.mark.asyncio
     async def test_returns_container_config_when_ready(self):
@@ -1633,6 +1674,7 @@ class TestPollWorkspaceReady:
             "pod_ip": "172.16.0.10",
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
             "git_remote_url": "http://gitea/repo",
             "canvas_presentation_available": True,
             "canvas_live_apps_available": True,
@@ -1650,6 +1692,7 @@ class TestPollWorkspaceReady:
             result["workspace_runtime_incarnation"]
             == "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         )
+        assert result["workspace_ssh_host_key_fingerprint"] == "SHA256:trusted"
         assert result["canvas_presentation_available"] is True
         assert result["canvas_live_apps_available"] is True
         assert result["canvas_shared_browser_available"] is True
@@ -1660,12 +1703,14 @@ class TestPollWorkspaceReady:
         client.get_thread_workspace.return_value = {
             "status": "ready",
             "pod_ip": "172.16.0.10",
+            "workspace_ssh_host_key_fingerprint": "SHA256:orphaned",
         }
 
         result = await _poll_workspace_ready(client, "tid", timeout=5)
 
         assert result is not None
         assert result["backend"] == "sandbox"
+        assert result["workspace_ssh_host_key_fingerprint"] is None
         assert result["canvas_presentation_available"] is False
         assert result["canvas_live_apps_available"] is False
         assert result["canvas_shared_browser_available"] is False
@@ -2923,6 +2968,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
             "backend": "sandbox",
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
             "remote": {"host": "workspace.test", "port": 30022},
         }
 
@@ -2944,6 +2990,10 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         assert kwargs["workspace_generation"] == workspace["workspace_generation"]
         assert (
             kwargs["runtime_incarnation"] == workspace["workspace_runtime_incarnation"]
+        )
+        assert (
+            kwargs["expected_host_key_fingerprint"]
+            == (workspace["workspace_ssh_host_key_fingerprint"])
         )
         new_backend.set_shell_owner_token.assert_called_once_with(73)
         new_backend.connect.assert_called_once_with()
@@ -3227,8 +3277,13 @@ class TestTerminateSession:
         mod._terminating = False
         mod._max_sessions_per_process = 0
         fake_session = MagicMock()
+        fake_session.shell_owner_token = 31
         fake_session.workspace_sync = None
         fake_session.workspace_manager = None
+        fake_session.messages = [HumanMessage(content="do not re-extract me")]
+        fake_session.final_memory_extracted = False
+        fake_session.memory_service = SimpleNamespace(capture=AsyncMock())
+        fake_session.quiesce_background_tasks = AsyncMock()
         fake_session.cleanup = AsyncMock()
         mod._session = fake_session
 
@@ -3241,6 +3296,8 @@ class TestTerminateSession:
             preserve_shell=True,
             preserve_workspace_daemons=False,
         )
+        fake_session.memory_service.capture.assert_not_awaited()
+        fake_session.quiesce_background_tasks.assert_awaited_once_with()
 
     @pytest.mark.asyncio
     async def test_stateless_physical_handoff_preserves_workspace_daemons(self):

@@ -69,6 +69,8 @@ class FakeConn:
         self.calls.append(("fetchval", q, a, self.txn_depth))
         if "INSERT INTO thread_messages" in q:
             return self._message_seq
+        if "status = 'created'" in q and "status = 'suspended'" in q:
+            return THREAD_ID
         if "run_queue" in q:
             # record_input_seq's one-statement CTE
             return self._admit_state
@@ -171,6 +173,8 @@ async def test_stateless_input_single_transaction_and_response_parity(monkeypatc
     conn = FakeConn(message_seq=41)
     db = FakeDB(_stateless_thread(), conn)
     _patch_common(monkeypatch, orch_main, db)
+    schedule = MagicMock()
+    monkeypatch.setattr(orch_main, "_schedule_stateless_workspace_ensure", schedule)
 
     out = await orch_main.thread_input(
         THREAD_ID,
@@ -222,6 +226,7 @@ async def test_stateless_input_single_transaction_and_response_parity(monkeypatc
     assert out["queue"]["state"] == "queued"
     assert out["queue"]["queue_depth"] == 1
     assert out["queue"]["input_seq"] == 41
+    schedule.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -304,6 +309,14 @@ async def test_stateless_input_accepts_attested_k8s_sandbox(monkeypatch):
         conn,
     )
     _patch_common(monkeypatch, orch_main, db)
+    schedule = MagicMock()
+
+    def _after_commit(thread_id):
+        assert thread_id == THREAD_ID
+        assert conn.txn_depth == 0
+
+    schedule.side_effect = _after_commit
+    monkeypatch.setattr(orch_main, "_schedule_stateless_workspace_ensure", schedule)
 
     out = await orch_main.thread_input(
         THREAD_ID,
@@ -313,6 +326,34 @@ async def test_stateless_input_accepts_attested_k8s_sandbox(monkeypatch):
 
     assert out["accepted"] is True
     assert conn.txn_enters == 1
+    schedule.assert_called_once_with(THREAD_ID)
+
+
+@pytest.mark.asyncio
+async def test_awaiting_user_sandbox_input_commits_before_workspace_ensure(monkeypatch):
+    """A waiting thread is admitted durably, then wakes the physical workspace."""
+    from orchestrator import main as orch_main
+
+    thread = _stateless_thread(status="awaiting_user", metadata=_k8s_sandbox_metadata())
+    conn = FakeConn()
+    db = FakeDB(thread, conn)
+    _patch_common(monkeypatch, orch_main, db)
+    observed_depths = []
+    schedule = MagicMock(
+        side_effect=lambda _thread_id: observed_depths.append(conn.txn_depth)
+    )
+    monkeypatch.setattr(orch_main, "_schedule_stateless_workspace_ensure", schedule)
+
+    out = await orch_main.thread_input(
+        THREAD_ID,
+        orch_main.ThreadInputRequest(content="continue from approval"),
+        MagicMock(),
+    )
+
+    assert out["accepted"] is True
+    assert observed_depths == [0]
+    admit = next(c for c in conn.calls if c[0] == "fetchval" and "run_queue" in c[1])
+    assert admit[3] == 1
 
 
 @pytest.mark.asyncio
@@ -348,6 +389,74 @@ async def test_stateless_input_rechecks_locked_workspace_before_any_write(monkey
     assert "FROM threads" in locked_read[1]
     assert "FOR UPDATE" in locked_read[1]
     assert locked_read[3] == 1
+
+
+@pytest.mark.asyncio
+async def test_stateless_input_rechecks_locked_protected_cloud_before_any_write(
+    monkeypatch,
+):
+    """A protected marker landing after preflight cannot enter run_queue."""
+    from fastapi import HTTPException
+
+    from orchestrator import main as orch_main
+
+    preflight = _stateless_thread()
+    locked_metadata = _k8s_sandbox_metadata()
+    locked_metadata["protected_cloud"] = True
+    conn = FakeConn(
+        locked_thread=_stateless_thread(metadata=locked_metadata),
+    )
+    db = FakeDB(preflight, conn)
+    _patch_common(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.thread_input(
+            THREAD_ID,
+            orch_main.ThreadInputRequest(content="must remain pinned"),
+            MagicMock(),
+        )
+
+    assert exc.value.status_code == 409
+    assert conn.txn_enters == 1
+    assert len(conn.calls) == 1
+    locked_read = conn.calls[0]
+    assert locked_read[0] == "fetchrow"
+    assert "FROM threads" in locked_read[1]
+    assert "FOR UPDATE" in locked_read[1]
+    assert locked_read[3] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["enabled", "conference"])
+@pytest.mark.parametrize("value", [None, 0, "", [], {}, "yes", 1])
+async def test_stateless_input_refuses_malformed_session_class_before_writes(
+    monkeypatch,
+    field,
+    value,
+):
+    from fastapi import HTTPException
+
+    from orchestrator import main as orch_main
+
+    metadata = {
+        "config_override": {
+            "workspace": {"backend": "virtual"},
+            "officer": {field: value},
+        }
+    }
+    conn = FakeConn()
+    db = FakeDB(_stateless_thread(metadata=metadata), conn)
+    _patch_common(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.thread_input(
+            THREAD_ID,
+            orch_main.ThreadInputRequest(content="must remain pinned"),
+            MagicMock(),
+        )
+
+    assert exc.value.status_code == 409
+    assert conn.calls == []
 
 
 @pytest.mark.asyncio
@@ -400,6 +509,19 @@ async def test_suspended_sandbox_input_commits_then_schedules_workspace_restore(
     await asyncio.sleep(0)
 
     assert out["accepted"] is True
+    wake = next(
+        c
+        for c in conn.calls
+        if c[0] == "fetchval"
+        and "status = 'created'" in c[1]
+        and "status = 'suspended'" in c[1]
+    )
+    assert wake[3] == 1
+    assert conn.calls.index(wake) < next(
+        index
+        for index, call in enumerate(conn.calls)
+        if call[0] == "fetchval" and "INSERT INTO thread_messages" in call[1]
+    )
     ensure_workspace.assert_awaited_once_with(
         THREAD_ID,
         db=db,
@@ -422,6 +544,8 @@ async def test_stateless_input_accepts_none_workspace(monkeypatch):
         conn,
     )
     _patch_common(monkeypatch, orch_main, db)
+    schedule = MagicMock()
+    monkeypatch.setattr(orch_main, "_schedule_stateless_workspace_ensure", schedule)
 
     out = await orch_main.thread_input(
         THREAD_ID, orch_main.ThreadInputRequest(content="lite"), MagicMock()
@@ -429,6 +553,37 @@ async def test_stateless_input_accepts_none_workspace(monkeypatch):
 
     assert out["accepted"] is True
     assert conn.txn_enters == 1
+    schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stateless_workspace_ensure_scheduler_is_single_flight(monkeypatch):
+    import asyncio
+
+    from orchestrator import main as orch_main
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    ensure = AsyncMock()
+
+    async def _ensure(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+
+    ensure.side_effect = _ensure
+    monkeypatch.setattr(orch_main, "ensure_session_workspace", ensure)
+    orch_main._stateless_workspace_ensure_tasks.pop(THREAD_ID, None)
+
+    first = orch_main._schedule_stateless_workspace_ensure(THREAD_ID)
+    await started.wait()
+    second = orch_main._schedule_stateless_workspace_ensure(THREAD_ID)
+
+    assert second is first
+    ensure.assert_awaited_once()
+    release.set()
+    await first
+    await asyncio.sleep(0)
+    assert THREAD_ID not in orch_main._stateless_workspace_ensure_tasks
 
 
 @pytest.mark.asyncio

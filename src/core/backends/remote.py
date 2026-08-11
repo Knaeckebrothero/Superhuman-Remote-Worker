@@ -12,6 +12,7 @@ import base64
 import errno
 import fnmatch
 import hashlib
+import hmac
 import logging
 import os
 import posixpath
@@ -159,8 +160,62 @@ def _validate_private_key(key_path: Optional[str]) -> str:
             "workspace.remote.key_path is invalid or passphrase-protected"
         ) from exc
 
-    digest = hashlib.sha256(private_key.asbytes()).digest()
+    return _sha256_public_key_fingerprint(private_key)
+
+
+def _sha256_public_key_fingerprint(key: Any) -> str:
+    """Return the OpenSSH SHA256 fingerprint for a Paramiko public key."""
+
+    digest = hashlib.sha256(key.asbytes()).digest()
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _validated_expected_host_key_fingerprint(value: Optional[str]) -> Optional[str]:
+    """Validate an orchestrator-pinned OpenSSH SHA256 host identity."""
+
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", value) is None
+    ):
+        raise WorkspaceAuthenticationError(
+            "Expected workspace SSH host key fingerprint must be exactly an "
+            "OpenSSH SHA256 fingerprint"
+        )
+    return value
+
+
+class WorkspaceHostIdentityMismatch(WorkspaceAuthenticationError):
+    """The endpoint presented a host key other than its exact attestation.
+
+    This remains an authentication failure on an initial attach: accepting a
+    different key would cross the credential boundary.  On a previously live
+    backend, however, the same signal means stable workspace DNS has moved to a
+    replacement pod.  ``_ensure_connected`` translates that reconnect-only
+    case to ``WorkspaceUnavailableError`` so the claim is handed off for a
+    fresh orchestrator attestation instead of being terminally classified as a
+    bad user credential.
+    """
+
+
+class _ExactSHA256HostKeyPolicy:
+    """Paramiko host-key policy which accepts one exact SHA256 identity."""
+
+    def __init__(self, expected_fingerprint: str):
+        self._expected_fingerprint = expected_fingerprint
+
+    def missing_host_key(self, client: Any, hostname: str, key: Any) -> None:
+        observed = _sha256_public_key_fingerprint(key)
+        if hmac.compare_digest(observed, self._expected_fingerprint):
+            return
+        try:
+            client.close()
+        finally:
+            raise WorkspaceHostIdentityMismatch(
+                "Workspace SSH host key fingerprint mismatch for "
+                f"{hostname}: expected {self._expected_fingerprint}, got {observed}"
+            )
 
 
 # Tab name validation
@@ -179,8 +234,9 @@ _TMUX_OWNER_TOKEN_OPTION = "@srw_owner_token"
 _TMUX_GENERATION_OPTION = "@srw_generation"
 _TMUX_WORKSPACE_GENERATION_OPTION = "@srw_workspace_generation"
 _TMUX_RUNTIME_INCARNATION_OPTION = "@srw_runtime_incarnation"
+_TMUX_PROCESS_TAG_OPTION = "@srw_process_tag"
 _TMUX_PROTOCOL_OPTION = "@srw_shell_protocol"
-_TMUX_PROTOCOL_VERSION = "2"
+_TMUX_PROTOCOL_VERSION = "3"
 _TMUX_SETUP_OPTION = "@srw_setup_state"
 _TMUX_SETUP_PENDING = "pending"
 _TMUX_SETUP_COMPLETE = "complete"
@@ -194,7 +250,10 @@ _TMUX_PANE_ID_PATTERN = re.compile(r"^%(?:0|[1-9][0-9]*)$")
 _TMUX_PENDING_PATTERN = re.compile(r"^__DONE_[0-9a-f]{12}__$")
 _TMUX_PROMPT_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _TMUX_STATE_VERSION = "1"
-_TMUX_INCARNATION_STATE_VERSION = "2"
+_TMUX_LEGACY_INCARNATION_STATE_VERSION = "2"
+_TMUX_INCARNATION_STATE_VERSION = "3"
+_WORKSPACE_PROCESS_TAG_ENV = "SRW_WORKSPACE_PROCESS_TAG"
+_SHELL_PROCESS_TAG_ENV = "SRW_SHELL_PROCESS_TAG"
 
 # Default blocked commands
 DEFAULT_BLOCKED_COMMANDS = frozenset(
@@ -291,6 +350,7 @@ class RemoteBackend(WorkspaceBackend):
         sudo_block_message: Optional[str] = None,
         workspace_generation: Optional[str] = None,
         runtime_incarnation: Optional[str] = None,
+        expected_host_key_fingerprint: Optional[str] = None,
     ):
         if paramiko is None:
             raise ImportError(
@@ -333,6 +393,9 @@ class RemoteBackend(WorkspaceBackend):
             raise ValueError(
                 "workspace generation and runtime incarnation must be supplied together"
             )
+        self._expected_host_key_fingerprint = _validated_expected_host_key_fingerprint(
+            expected_host_key_fingerprint
+        )
 
         if blocked_commands is None:
             self._blocked_commands = DEFAULT_BLOCKED_COMMANDS
@@ -492,6 +555,178 @@ class RemoteBackend(WorkspaceBackend):
             and self._runtime_incarnation is not None
         )
 
+    def _workspace_process_tag(self) -> str:
+        """Exact cooperative process identity inherited by workspace residents."""
+
+        if not self.workspace_incarnation_fenced or not self._job_id:
+            raise AssertionError("workspace process tag requires exact session runtime")
+        assert self._runtime_incarnation is not None
+        return f"v1:session:{self._job_id}:{self._runtime_incarnation}"
+
+    def _shell_process_tag(self, generation: str) -> str:
+        if not self.workspace_incarnation_fenced or not self._job_id:
+            raise AssertionError("shell process tag requires exact session runtime")
+        assert self._workspace_generation is not None
+        assert self._runtime_incarnation is not None
+        return (
+            f"v1:{self._job_id}:{self._workspace_generation}:"
+            f"{self._runtime_incarnation}:{generation}"
+        )
+
+    def _stateless_process_env_export(self) -> str:
+        if self._shell_generation is None:
+            raise WorkspaceUnavailableError(
+                "Stateless shell process generation is unavailable"
+            )
+        return (
+            f"export {_WORKSPACE_PROCESS_TAG_ENV}="
+            f"{shlex.quote(self._workspace_process_tag())} "
+            f"{_SHELL_PROCESS_TAG_ENV}="
+            f"{shlex.quote(self._shell_process_tag(self._shell_generation))}"
+        )
+
+    def _stateless_process_env_export_for_loaded_generation(self) -> str:
+        """Tag terminal resource commands with the remotely loaded generation."""
+
+        if not self.workspace_incarnation_fenced or not self._job_id:
+            raise AssertionError(
+                "terminal process tags require exact runtime authority"
+            )
+        assert self._workspace_generation is not None
+        assert self._runtime_incarnation is not None
+        shell_prefix = shlex.quote(
+            f"v1:{self._job_id}:{self._workspace_generation}:"
+            f"{self._runtime_incarnation}:"
+        )
+        return (
+            f"export {_WORKSPACE_PROCESS_TAG_ENV}="
+            f"{shlex.quote(self._workspace_process_tag())} "
+            f'{_SHELL_PROCESS_TAG_ENV}={shell_prefix}"$_srw_generation"'
+        )
+
+    def _stateless_tmux_process_tag_check_shell(
+        self,
+        target: str,
+        *,
+        indent: str = "",
+    ) -> str:
+        """Validate tmux option+environment against the loaded generation."""
+
+        if not self.workspace_incarnation_fenced:
+            raise AssertionError("tmux process tags require exact runtime authority")
+        assert self._workspace_generation is not None
+        assert self._runtime_incarnation is not None
+        prefix = shlex.quote(
+            f"v1:{self._job_id}:{self._workspace_generation}:"
+            f"{self._runtime_incarnation}:"
+        )
+        workspace_env = shlex.quote(
+            _WORKSPACE_PROCESS_TAG_ENV + "=" + self._workspace_process_tag()
+        )
+        lines = (
+            f'_srw_expected_shell_tag={prefix}"$_srw_generation"\n'
+            "_srw_tmux_process_tag=$(tmux display-message -p "
+            f"-t {target} '#{{{_TMUX_PROCESS_TAG_OPTION}}}')\n"
+            '[ "$_srw_tmux_process_tag" = "$_srw_expected_shell_tag" ] '
+            "|| exit 81\n"
+            "_srw_tmux_workspace_env=$(tmux show-environment -t "
+            f"{target} {_WORKSPACE_PROCESS_TAG_ENV} 2>/dev/null || true)\n"
+            f'[ "$_srw_tmux_workspace_env" = {workspace_env} ] || exit 81\n'
+            "_srw_tmux_shell_env=$(tmux show-environment -t "
+            f"{target} {_SHELL_PROCESS_TAG_ENV} 2>/dev/null || true)\n"
+            f'[ "$_srw_tmux_shell_env" = "{_SHELL_PROCESS_TAG_ENV}='
+            '$_srw_expected_shell_tag" ] || exit 81\n'
+        )
+        if not indent:
+            return lines
+        return "".join(f"{indent}{line}\n" for line in lines.splitlines())
+
+    def _stateless_workspace_process_zero_shell(self, *, terminate: bool) -> str:
+        """Kill/verify exact runtime-tagged descendants, excluding this SSH chain."""
+
+        tag = self._workspace_process_tag()
+        mode = "terminate" if terminate else "verify"
+        # Python avoids spawning grep/tr children whose inherited environment
+        # could match the very tag being scanned. It also handles /proc stat
+        # names with spaces and excludes the complete verifier ancestor chain
+        # (entrypoint/sshd/flock/sh), while still finding disowned siblings.
+        return f"""
+python3 - {shlex.quote(tag)} {mode} <<'__SRW_PROCESS_ZERO_PY__'
+import os
+import signal
+import sys
+import time
+
+tag = ({_WORKSPACE_PROCESS_TAG_ENV!r} + "=" + sys.argv[1]).encode()
+terminate = sys.argv[2] == "terminate"
+
+ancestors = set()
+pid = os.getpid()
+while pid > 1 and pid not in ancestors:
+    ancestors.add(pid)
+    try:
+        stat = open(f"/proc/{{pid}}/stat", "rb").read()
+        pid = int(stat.rsplit(b") ", 1)[1].split(None, 2)[1])
+    except (OSError, ValueError, IndexError):
+        break
+
+def matching():
+    found = []
+    ambiguous = False
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        candidate = int(name)
+        if candidate in ancestors:
+            continue
+        try:
+            values = open(f"/proc/{{name}}/environ", "rb").read().split(b"\\0")
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            try:
+                status = open(f"/proc/{{name}}/status", "rt").read().splitlines()
+                uid_line = next(line for line in status if line.startswith("Uid:"))
+                process_uid = int(uid_line.split()[1])
+            except FileNotFoundError:
+                continue
+            except (OSError, StopIteration, ValueError, IndexError):
+                raise SystemExit(86)
+            if process_uid == os.geteuid():
+                ambiguous = True
+            continue
+        except OSError:
+            raise SystemExit(86)
+        if tag in values:
+            found.append(candidate)
+    return found, ambiguous
+
+targets, ambiguous = matching()
+if terminate:
+    for candidate in targets:
+        try:
+            os.kill(candidate, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and matching()[0]:
+        time.sleep(0.1)
+    for candidate in matching()[0]:
+        try:
+            os.kill(candidate, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and matching()[0]:
+        time.sleep(0.05)
+remaining, final_ambiguous = matching()
+if remaining:
+    raise SystemExit(85)
+if ambiguous or final_ambiguous:
+    raise SystemExit(86)
+__SRW_PROCESS_ZERO_PY__
+"""
+
     def retire_claim_resource_owner(self) -> None:
         """Wait out admitted resource I/O, then reject later local callers."""
 
@@ -526,7 +761,16 @@ class RemoteBackend(WorkspaceBackend):
                 raise WorkspaceUnavailableError(
                     "Workspace claim-resource owner has been retired from this backend"
                 )
-            inner = self._stateless_tmux_fence_shell() + command
+            process_tag = (
+                self._stateless_process_env_export()
+                if self.workspace_incarnation_fenced
+                else ""
+            )
+            inner = (
+                self._stateless_tmux_fence_shell()
+                + (process_tag + "\n" if process_tag else "")
+                + command
+            )
             output, exit_code = self._exec_with_status(
                 self._tmux_lock_command(inner),
                 timeout=timeout,
@@ -535,6 +779,89 @@ class RemoteBackend(WorkspaceBackend):
             if exit_code != 0:
                 raise WorkspaceUnavailableError(
                     f"Claim-fenced {operation} failed with exit code {exit_code}"
+                )
+            return output
+
+    def exec_terminal_claim_resource(
+        self,
+        command: str,
+        timeout: int = 120,
+        *,
+        operation: str = "terminal workspace resource cleanup",
+    ) -> str:
+        """Run terminal resident cleanup after the queue token was advanced.
+
+        Public End owns token ``T = N + 1`` while the durable workspace record
+        normally still carries the losing claimant's token ``N``.  Ordinary
+        :meth:`exec_claim_resource` deliberately requires exact equality and
+        therefore cannot be used at this boundary.  This terminal-only
+        primitive instead takes the same durable flock, validates the exact
+        thread/backing/runtime owner, monotonically adopts ``T`` in every
+        *existing* record, and then runs the caller's strict cleanup command.
+
+        It never creates a missing tmux session.  A missing marker is accepted
+        only when the exact tmux name is also absent; an active marker with a
+        missing tmux is promoted in place so resident daemons can still be
+        drained.  The record remains ``active`` at ``T`` on success (and on a
+        command failure), allowing :meth:`shell_cleanup` to be the sole writer
+        of the terminal ``retired`` acknowledgement afterward.
+        """
+
+        if self._shell_owner_token is None or not self.workspace_incarnation_fenced:
+            raise WorkspaceUnavailableError(
+                "Terminal resource cleanup requires an exact stateless runtime fence"
+            )
+        with self._claim_resource_io_lock:
+            if self._claim_resource_retired:
+                raise WorkspaceUnavailableError(
+                    "Workspace claim-resource owner has been retired from this backend"
+                )
+            inner = (
+                self._stateless_terminal_resource_adoption_shell()
+                + self._stateless_process_env_export_for_loaded_generation()
+                + "\n"
+                + command
+            )
+            with self._shell_io_lock:
+                output, exit_code = self._exec_with_status(
+                    self._tmux_lock_command(inner),
+                    timeout=timeout,
+                    retain_tail=True,
+                )
+            if exit_code != 0:
+                raise WorkspaceUnavailableError(
+                    f"Terminal-fenced {operation} failed with exit code {exit_code}"
+                )
+            return output
+
+    def verify_terminal_claim_resources_retired(
+        self,
+        command: str,
+        timeout: int = 60,
+        *,
+        operation: str = "post-shell terminal resource verification",
+    ) -> str:
+        """Run a read-only zero proof under the exact retired remote record."""
+
+        if self._shell_owner_token is None or not self.workspace_incarnation_fenced:
+            raise WorkspaceUnavailableError(
+                "Retired resource verification requires an exact stateless fence"
+            )
+        with self._claim_resource_io_lock:
+            if self._claim_resource_retired:
+                raise WorkspaceUnavailableError(
+                    "Workspace claim-resource owner has been retired from this backend"
+                )
+            inner = self._stateless_retired_resource_fence_shell() + command
+            with self._shell_io_lock:
+                output, exit_code = self._exec_with_status(
+                    self._tmux_lock_command(inner),
+                    timeout=timeout,
+                    retain_tail=True,
+                )
+            if exit_code != 0:
+                raise WorkspaceUnavailableError(
+                    f"Terminal-fenced {operation} failed with exit code {exit_code}"
                 )
             return output
 
@@ -635,10 +962,25 @@ class RemoteBackend(WorkspaceBackend):
         while True:
             attempt += 1
             self._ssh = paramiko.SSHClient()
-            self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            if self._expected_host_key_fingerprint is None:
+                # Direct/pinned/VM endpoints retain their historical behavior.
+                self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            else:
+                self._ssh.set_missing_host_key_policy(
+                    _ExactSHA256HostKeyPolicy(self._expected_host_key_fingerprint)
+                )
             try:
                 self._ssh.connect(**connect_kwargs)
                 break
+            except WorkspaceAuthenticationError:
+                # A host-key mismatch is deterministic and must never consume
+                # the boot retry budget or leave a half-open transport usable.
+                try:
+                    self._ssh.close()
+                except Exception:
+                    pass
+                self._ssh = None
+                raise
             except (paramiko.SSHException, socket.error, OSError) as e:
                 bucket = _classify_connect_error(e)
                 if bucket == "authentication":
@@ -797,9 +1139,17 @@ class RemoteBackend(WorkspaceBackend):
         # then tears down SSH/SFTP.
         with self._claim_resource_io_lock:
             self._claim_resource_retired = True
-            with self._connection_lock:
-                self._retired = True
-                self.disconnect()
+            # File tools use the persistent SFTP channel rather than the tmux
+            # flock.  Wait for any already-admitted read/write to leave its
+            # channel before declaring this Python owner retired; otherwise a
+            # terminal lifecycle ACK could race a late write into the snapshot
+            # that follows. New callers fail at _ensure_connected once the bit
+            # below is published (a caller that passed the pre-lock check can
+            # only reach a closed channel after us, never mutate it).
+            with self._sftp_lock:
+                with self._connection_lock:
+                    self._retired = True
+                    self.disconnect()
 
     def is_connected(self) -> bool:
         if self._ssh is None:
@@ -835,7 +1185,18 @@ class RemoteBackend(WorkspaceBackend):
         # value derived through the old SFTP transport is invalid even when the
         # configured host string is unchanged.
         self._home_dir = None
-        self.connect()
+        try:
+            self.connect()
+        except WorkspaceHostIdentityMismatch as exc:
+            # Stable Service DNS resolving to a different exact host key after
+            # this backend was already live is a workspace-incarnation change,
+            # not a suddenly-invalid private key.  This object only carries the
+            # old orchestrator attestation, so it must fail as recoverable
+            # workspace loss and let the stateless driver obtain a fresh bundle.
+            raise WorkspaceUnavailableError(
+                "Workspace SSH host identity changed during reconnect; "
+                "fresh workspace attestation is required"
+            ) from exc
         if shell_was_initialized and self._shell_owner_token is not None:
             # The next shell operation must re-check the remote tmux identity
             # and rebuild tab state. A same-workspace reconnect preserves tmux;
@@ -1513,13 +1874,19 @@ class RemoteBackend(WorkspaceBackend):
                 '  if [ "$_srw_version" = '
                 f"{_TMUX_STATE_VERSION} ]; then\n"
                 '    [ -z "$_srw_field6$_srw_field7" ] || exit 78\n'
+                "    _srw_process_tagged=false\n"
                 '    _srw_workspace_generation=""\n'
                 '    _srw_runtime_incarnation=""\n'
                 '    _srw_status="$_srw_field3"\n'
                 '    _srw_token="$_srw_field4"\n'
                 '    _srw_generation="$_srw_field5"\n'
                 '  elif [ "$_srw_version" = '
+                f"{_TMUX_LEGACY_INCARNATION_STATE_VERSION} ] || "
+                '[ "$_srw_version" = '
                 f"{_TMUX_INCARNATION_STATE_VERSION} ]; then\n"
+                '    if [ "$_srw_version" = '
+                f"{_TMUX_INCARNATION_STATE_VERSION} ]; then "
+                "_srw_process_tagged=true; else _srw_process_tagged=false; fi\n"
                 '    _srw_workspace_generation="$_srw_field3"\n'
                 '    _srw_runtime_incarnation="$_srw_field4"\n'
                 '    _srw_status="$_srw_field5"\n'
@@ -1616,6 +1983,7 @@ class RemoteBackend(WorkspaceBackend):
             expected_workspace = shlex.quote(self._workspace_generation)
             expected_runtime = shlex.quote(self._runtime_incarnation)
             workspace_state_check = (
+                '[ "$_srw_process_tagged" = true ] || exit 81\n'
                 f'[ "$_srw_workspace_generation" = {expected_workspace} ] '
                 "|| exit 80\n"
                 f'[ "$_srw_runtime_incarnation" = {expected_runtime} ] '
@@ -1629,11 +1997,12 @@ class RemoteBackend(WorkspaceBackend):
                 "_srw_tmux_runtime_incarnation=$(tmux display-message -p "
                 f"-t {target} '#{{{_TMUX_RUNTIME_INCARNATION_OPTION}}}')\n"
                 f'[ "$_srw_tmux_runtime_incarnation" = {expected_runtime} ] '
-                "|| exit 80\n"
+                "|| exit 80\n" + self._stateless_tmux_process_tag_check_shell(target)
             )
         return (
             self._tmux_state_shell()
             + "_srw_load_state || exit 78\n"
+            + '[ "$_srw_process_tagged" = true ] || exit 81\n'
             + workspace_state_check
             + '[ "$_srw_status" = active ] || exit 75\n'
             + f'[ "$_srw_token" = {shlex.quote(token)} ] || exit 75\n'
@@ -1648,6 +2017,98 @@ class RemoteBackend(WorkspaceBackend):
             + f"-t {target} '#{{{_TMUX_GENERATION_OPTION}}}')\n"
             + '[ "$_srw_tmux_generation" = "$_srw_generation" ] || exit 79\n'
             + workspace_tmux_check
+        )
+
+    def _stateless_terminal_resource_adoption_shell(self) -> str:
+        """Validate an older remote owner and monotonically adopt End's token."""
+
+        if (
+            self._shell_owner_token is None
+            or self._workspace_generation is None
+            or self._runtime_incarnation is None
+        ):
+            raise AssertionError(
+                "terminal resource adoption requires token, backing, and runtime"
+            )
+        token = shlex.quote(str(self._shell_owner_token))
+        expected_owner = shlex.quote(self._job_id or self._session_name)
+        expected_workspace = shlex.quote(self._workspace_generation)
+        expected_runtime = shlex.quote(self._runtime_incarnation)
+        target = self._tmux_target()
+        fallback_generation = shlex.quote(uuid.uuid4().hex)
+        return (
+            self._tmux_state_shell()
+            + "if _srw_load_state; then\n"
+            + "  _srw_marker=present\n"
+            + '  [ "$_srw_process_tagged" = true ] || exit 81\n'
+            + f'  [ "$_srw_workspace_generation" = {expected_workspace} ] '
+            + "|| exit 80\n"
+            + f'  [ "$_srw_runtime_incarnation" = {expected_runtime} ] '
+            + "|| exit 80\n"
+            + '  [ "$_srw_status" = active ] || '
+            + '[ "$_srw_status" = creating ] || exit 75\n'
+            + f'  [ "$_srw_token" -le {token} ] || exit 75\n'
+            + "else\n"
+            + '  _srw_rc=$?; [ "$_srw_rc" -eq 1 ] || exit "$_srw_rc"\n'
+            + "  _srw_marker=absent\n"
+            + f"  _srw_generation={fallback_generation}\n"
+            + "fi\n"
+            + f"if tmux has-session -t {target} 2>/dev/null; then\n"
+            + '  [ "$_srw_marker" = present ] || exit 79\n'
+            + "  _srw_tmux_owner=$(tmux display-message -p "
+            + f"-t {target} '#{{{_TMUX_OWNER_ID_OPTION}}}')\n"
+            + f'  [ "$_srw_tmux_owner" = {expected_owner} ] || exit 73\n'
+            + "  _srw_tmux_token=$(tmux display-message -p "
+            + f"-t {target} '#{{{_TMUX_OWNER_TOKEN_OPTION}}}')\n"
+            + '  case "$_srw_tmux_token" in "" ) _srw_tmux_token=0 ;; '
+            + "*[!0-9]* ) exit 76 ;; esac\n"
+            + f'  [ "$_srw_tmux_token" -le {token} ] || exit 75\n'
+            + "  _srw_tmux_generation=$(tmux display-message -p "
+            + f"-t {target} '#{{{_TMUX_GENERATION_OPTION}}}')\n"
+            + '  [ "$_srw_tmux_generation" = "$_srw_generation" ] || exit 79\n'
+            + "  _srw_tmux_workspace_generation=$(tmux display-message -p "
+            + f"-t {target} '#{{{_TMUX_WORKSPACE_GENERATION_OPTION}}}')\n"
+            + f'  [ "$_srw_tmux_workspace_generation" = {expected_workspace} ] '
+            + "|| exit 80\n"
+            + "  _srw_tmux_runtime_incarnation=$(tmux display-message -p "
+            + f"-t {target} '#{{{_TMUX_RUNTIME_INCARNATION_OPTION}}}')\n"
+            + f'  [ "$_srw_tmux_runtime_incarnation" = {expected_runtime} ] '
+            + "|| exit 80\n"
+            + self._stateless_tmux_process_tag_check_shell(target, indent="  ")
+            + f"  tmux set-option -t {target} {_TMUX_OWNER_TOKEN_OPTION} "
+            + f"{token} || exit 77\n"
+            + 'elif [ "$_srw_marker" = absent ]; then\n'
+            + "  :\n"
+            + "fi\n"
+            + f'_srw_write_state active {token} "$_srw_generation"\n'
+        )
+
+    def _stateless_retired_resource_fence_shell(self) -> str:
+        """Require the exact terminal tombstone and prove tmux remains absent."""
+
+        if (
+            self._shell_owner_token is None
+            or self._workspace_generation is None
+            or self._runtime_incarnation is None
+        ):
+            raise AssertionError(
+                "retired resource verification requires token, backing, and runtime"
+            )
+        token = shlex.quote(str(self._shell_owner_token))
+        expected_workspace = shlex.quote(self._workspace_generation)
+        expected_runtime = shlex.quote(self._runtime_incarnation)
+        target = self._tmux_target()
+        return (
+            self._tmux_state_shell()
+            + "_srw_load_state || exit 78\n"
+            + f'[ "$_srw_workspace_generation" = {expected_workspace} ] '
+            + "|| exit 80\n"
+            + f'[ "$_srw_runtime_incarnation" = {expected_runtime} ] '
+            + "|| exit 80\n"
+            + '[ "$_srw_status" = retired ] || exit 75\n'
+            + f'[ "$_srw_token" = {token} ] || exit 75\n'
+            + f"! tmux has-session -t {target} 2>/dev/null || exit 79\n"
+            + self._stateless_workspace_process_zero_shell(terminate=False)
         )
 
     def _tmux_exec_checked(
@@ -1868,6 +2329,7 @@ class RemoteBackend(WorkspaceBackend):
         raw_session_name = shlex.quote(self._session_name)
         expected_owner = shlex.quote(self._job_id or self._session_name)
         workspace_option = ""
+        creation_env = ""
         if self.workspace_incarnation_fenced:
             assert self._workspace_generation is not None
             assert self._runtime_incarnation is not None
@@ -1878,12 +2340,27 @@ class RemoteBackend(WorkspaceBackend):
                 f"tmux set-option -t {session} "
                 f"{_TMUX_RUNTIME_INCARNATION_OPTION} "
                 f"{shlex.quote(self._runtime_incarnation)} || exit 77\n"
+                f"tmux set-option -t {session} {_TMUX_PROCESS_TAG_OPTION} "
+                f"{shlex.quote(self._shell_process_tag(generation))} || exit 77\n"
+                f"tmux set-environment -t {session} {_WORKSPACE_PROCESS_TAG_ENV} "
+                f"{shlex.quote(self._workspace_process_tag())} || exit 77\n"
+                f"tmux set-environment -t {session} {_SHELL_PROCESS_TAG_ENV} "
+                f"{shlex.quote(self._shell_process_tag(generation))} || exit 77\n"
+            )
+            # tmux must inject both tags into the *first* pane at exec time.
+            # Setting the session environment afterward leaves a .bashrc
+            # startup-hook interval in which a disowned child is untagged.
+            creation_env = (
+                f"-e {_WORKSPACE_PROCESS_TAG_ENV}="
+                f"{shlex.quote(self._workspace_process_tag())} "
+                f"-e {_SHELL_PROCESS_TAG_ENV}="
+                f"{shlex.quote(self._shell_process_tag(generation))} "
             )
         return (
             f"_srw_write_state creating {shlex.quote(token)} "
             f"{shlex.quote(generation)}\n"
             f"tmux new-session -d -s {raw_session_name} "
-            "-x 200 -y 30 -n default || exit 77\n"
+            f"{creation_env}-x 200 -y 30 -n default || exit 77\n"
             f"tmux set-option -t {session} {_TMUX_OWNER_ID_OPTION} "
             f"{expected_owner} || exit 77\n"
             f"tmux set-option -t {session} {_TMUX_OWNER_TOKEN_OPTION} "
@@ -2047,6 +2524,7 @@ class RemoteBackend(WorkspaceBackend):
         )
 
         current_record = (
+            '  [ "$_srw_process_tagged" = true ] || exit 81\n'
             '  if [ "$_srw_status" = active ]; then\n'
             f'    [ "$_srw_token" -le {shlex.quote(token)} ] || exit 75\n'
             f"    if tmux has-session -t {target} 2>/dev/null; then\n"
@@ -2104,6 +2582,7 @@ class RemoteBackend(WorkspaceBackend):
         )
 
         legacy_record = (
+            "  exit 81\n"
             f'  [ "$_srw_token" -le {shlex.quote(token)} ] || exit 75\n'
             f'  if [ "$_srw_status" = retired ] && '
             f'[ {shlex.quote(token)} -le "$_srw_token" ]; then exit 75; fi\n'
@@ -2567,6 +3046,16 @@ class RemoteBackend(WorkspaceBackend):
                         )
                     self._promote_tmux_owner_token()
                 setup_state = _TMUX_SETUP_PENDING
+            if (
+                self._shell_owner_token is not None
+                and self.workspace_incarnation_fenced
+            ):
+                generation = self._read_tmux_session_option(_TMUX_GENERATION_OPTION)
+                if not re.fullmatch(r"[0-9a-f]{32}", generation):
+                    raise WorkspaceUnavailableError(
+                        "Remote tmux process generation is malformed"
+                    )
+                self._shell_generation = generation
             self._attest_tmux_owner()
             self._ensure_prompt_token()
             stored_protocol = self._read_tmux_session_option(_TMUX_PROTOCOL_OPTION)
@@ -2602,6 +3091,11 @@ class RemoteBackend(WorkspaceBackend):
                 # output. Only the creator runs it: reattach must preserve cwd,
                 # exported variables and foreground/background processes.
                 setup = NONINTERACTIVE_ENV_EXPORT
+                if (
+                    self._shell_owner_token is not None
+                    and self.workspace_incarnation_fenced
+                ):
+                    setup = f"{self._stateless_process_env_export()}; {setup}"
                 if self._sandbox_cwd:
                     setup += f"; cd {self._sandbox_cwd}"
                 self._send_and_wait("default", setup)
@@ -3298,6 +3792,11 @@ class RemoteBackend(WorkspaceBackend):
             # Non-interactive env + working directory (shell/process tabs only).
             if tab_type in ("shell", "process"):
                 setup = NONINTERACTIVE_ENV_EXPORT
+                if (
+                    self._shell_owner_token is not None
+                    and self.workspace_incarnation_fenced
+                ):
+                    setup = f"{self._stateless_process_env_export()}; {setup}"
                 if self._sandbox_cwd:
                     setup += f"; cd {self._sandbox_cwd}"
                 self._send_and_wait(name, setup)
@@ -3421,6 +3920,7 @@ class RemoteBackend(WorkspaceBackend):
                     expected_runtime = shlex.quote(self._runtime_incarnation)
                     load_for_retirement = (
                         "if _srw_load_state; then\n"
+                        '  [ "$_srw_process_tagged" = true ] || exit 81\n'
                         '  if [ -z "$_srw_workspace_generation" ] && '
                         '[ -z "$_srw_runtime_incarnation" ]; then\n'
                         "    _srw_retire_incarnation=legacy\n"
@@ -3463,6 +3963,10 @@ class RemoteBackend(WorkspaceBackend):
                         f'[ "$_srw_tmux_runtime_incarnation" = '
                         f"{expected_runtime} ] || exit 80\n"
                         "  fi\n"
+                        + self._stateless_tmux_process_tag_check_shell(
+                            target,
+                            indent="  ",
+                        )
                     )
                 inner = (
                     self._tmux_state_shell()
@@ -3496,7 +4000,12 @@ class RemoteBackend(WorkspaceBackend):
                     + "else\n"
                     + f"  _srw_write_state retired {shlex.quote(token)} "
                     + '"$_srw_generation"\n'
-                    + "fi"
+                    + "fi\n"
+                    + (
+                        self._stateless_workspace_process_zero_shell(terminate=True)
+                        if self.workspace_incarnation_fenced
+                        else ""
+                    )
                 )
                 self._tmux_exec_checked(
                     self._tmux_lock_command(inner),

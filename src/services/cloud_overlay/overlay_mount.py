@@ -191,16 +191,44 @@ class OverlayMountManager:
             self.merged,
         )
 
-    def unmount(self) -> None:
+    def unmount(self, *, strict: bool = False) -> None:
+        """Unmount the resident overlay.
+
+        Pinned teardown retains its historical best-effort behavior. A
+        stateless physical claimant uses ``strict=True`` because End may treat
+        return as permission to snapshot emptyDir bytes; the script must prove
+        that the FUSE mount is actually gone.
+        """
+
         try:
             self._run(
                 "overlay_unmount.sh",
-                self._unmount_script(),
+                self._unmount_script(strict=strict),
                 timeout=45,
-                require_ok=False,
+                require_ok=strict,
             )
         finally:
             self._active = False
+
+    async def retire_existing(self) -> dict[str, int]:
+        """Retire the exact resident overlay without mounting an absent one."""
+
+        execute = getattr(self.workspace_backend, "exec_terminal_claim_resource", None)
+        if not callable(execute):
+            raise OverlayMountError(
+                "terminal overlay cleanup requires a terminal-fenced backend"
+            )
+        loop = __import__("asyncio").get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: self._run_terminal(
+                "terminal_overlay_unmount.sh",
+                self._terminal_unmount_script(),
+                timeout=60,
+            ),
+        )
+        self._active = False
+        return {"overlay_mounts": 0, "overlay_processes": 0}
 
     def refresh(self, refresh_lower: Callable[[], None]) -> None:
         """Refresh the frozen lower without losing the upperdir (design §11.2).
@@ -473,9 +501,17 @@ ln -sfn {merged} "${{entry}}"
 echo "{_OVERLAY_OK}"
 """
 
-    def _unmount_script(self) -> str:
+    def _unmount_script(self, *, strict: bool = False) -> str:
         merged = shlex.quote(self.merged)
         identity = shlex.quote(self._identity_path)
+        terminal_check = (
+            f'''if mountpoint -q {merged}; then
+  echo "{_OVERLAY_FAILED} rc=6 (overlay remained mounted)"
+  exit 6
+fi'''
+            if strict
+            else ""
+        )
         return f"""#!/usr/bin/env bash
 set +e
 if mountpoint -q {merged}; then
@@ -487,6 +523,120 @@ fi
 if ! mountpoint -q {merged}; then
   rm -f -- {identity}
 fi
+{terminal_check}
+echo "{_OVERLAY_OK}"
+"""
+
+    def _terminal_unmount_script(self) -> str:
+        """Validate exact identity, retire FUSE, and prove mount/process zero."""
+
+        identity = shlex.quote(self._identity_path)
+        active_identity = shlex.quote(self._identity_value("active"))
+        creating_identity = shlex.quote(self._identity_value("creating"))
+        lower = shlex.quote(self.lower)
+        upper = shlex.quote(self.upper)
+        work = shlex.quote(self.work)
+        merged = shlex.quote(self.merged)
+        return f"""#!/usr/bin/env bash
+set -euo pipefail
+identity={identity}
+lower={lower}
+upper={upper}
+work={work}
+merged={merged}
+_srw_mount_present() {{
+  if command -v findmnt >/dev/null 2>&1; then
+    findmnt -rn -C -M "$merged" >/dev/null 2>&1
+  else
+    mountpoint -q "$merged"
+  fi
+}}
+_srw_exact_overlay_pids() {{
+  for _srw_cmdline in /proc/[0-9]*/cmdline; do
+    if [ ! -r "$_srw_cmdline" ]; then
+      _srw_proc=${{_srw_cmdline%/cmdline}}
+      [ ! -e "$_srw_proc" ] && continue
+      _srw_uid=$(awk '/^Uid:/{{print $2; exit}}' "$_srw_proc/status" 2>/dev/null) || exit 86
+      [ "$_srw_uid" = "$(id -u)" ] && exit 86
+      continue
+    fi
+    _srw_args=$(tr '\\0' '\\n' < "$_srw_cmdline" 2>/dev/null) || {{ [ ! -e "${{_srw_cmdline%/cmdline}}" ] && continue; exit 86; }}
+    printf '%s\n' "$_srw_args" | grep -Fqx -- fuse-overlayfs || continue
+    printf '%s\n' "$_srw_args" | grep -F -- "lowerdir=$lower" >/dev/null || continue
+    printf '%s\n' "$_srw_args" | grep -F -- "upperdir=$upper" >/dev/null || continue
+    printf '%s\n' "$_srw_args" | grep -F -- "workdir=$work" >/dev/null || continue
+    printf '%s\n' "$_srw_args" | grep -Fqx -- "$merged" || continue
+    basename "$(dirname "$_srw_cmdline")"
+  done
+}}
+_srw_any_merged_overlay() {{
+  for _srw_cmdline in /proc/[0-9]*/cmdline; do
+    if [ ! -r "$_srw_cmdline" ]; then
+      _srw_proc=${{_srw_cmdline%/cmdline}}
+      [ ! -e "$_srw_proc" ] && continue
+      _srw_uid=$(awk '/^Uid:/{{print $2; exit}}' "$_srw_proc/status" 2>/dev/null) || exit 86
+      [ "$_srw_uid" = "$(id -u)" ] && exit 86
+      continue
+    fi
+    _srw_args=$(tr '\\0' '\\n' < "$_srw_cmdline" 2>/dev/null) || {{ [ ! -e "${{_srw_cmdline%/cmdline}}" ] && continue; exit 86; }}
+    printf '%s\n' "$_srw_args" | grep -Fqx -- fuse-overlayfs || continue
+    printf '%s\n' "$_srw_args" | grep -Fqx -- "$merged" && return 0
+  done
+  return 1
+}}
+if [ ! -f "$identity" ]; then
+  ! _srw_mount_present || exit 87
+  ! _srw_any_merged_overlay || exit 85
+  echo "{_OVERLAY_OK}"
+  exit 0
+fi
+[ "$(wc -l < "$identity")" -eq 1 ] || exit 84
+identity_value=$(cat "$identity")
+[ "$identity_value" = {active_identity} ] || [ "$identity_value" = {creating_identity} ] || exit 84
+if _srw_any_merged_overlay && [ -z "$(_srw_exact_overlay_pids)" ]; then
+  exit 85
+fi
+for _srw_pid in $(_srw_exact_overlay_pids); do kill "$_srw_pid" 2>/dev/null || true; done
+for _srw_i in $(seq 1 20); do [ -z "$(_srw_exact_overlay_pids)" ] && break; sleep 0.1; done
+for _srw_pid in $(_srw_exact_overlay_pids); do kill -9 "$_srw_pid" 2>/dev/null || true; done
+for _srw_i in $(seq 1 20); do [ -z "$(_srw_exact_overlay_pids)" ] && break; sleep 0.1; done
+[ -z "$(_srw_exact_overlay_pids)" ] || exit 85
+timeout 10 fusermount3 -u "$merged" >/dev/null 2>&1 || timeout 10 fusermount -u "$merged" >/dev/null 2>&1 || true
+if _srw_mount_present; then
+  timeout 10 fusermount3 -uz "$merged" >/dev/null 2>&1 || timeout 10 fusermount -uz "$merged" >/dev/null 2>&1 || true
+fi
+if _srw_mount_present; then
+  timeout 10 sudo -n umount -l -- "$merged" >/dev/null 2>&1 || true
+fi
+! _srw_mount_present || exit 88
+! _srw_any_merged_overlay || exit 85
+rm -f -- "$identity"
+echo "{_OVERLAY_OK}"
+"""
+
+    def _terminal_zero_script(self) -> str:
+        identity = shlex.quote(self._identity_path)
+        merged = shlex.quote(self.merged)
+        return f"""#!/usr/bin/env bash
+set -euo pipefail
+[ ! -e {identity} ] || exit 84
+if command -v findmnt >/dev/null 2>&1; then
+  ! findmnt -rn -C -M {merged} >/dev/null 2>&1 || exit 88
+else
+  ! mountpoint -q {merged} || exit 88
+fi
+for _srw_cmdline in /proc/[0-9]*/cmdline; do
+  if [ ! -r "$_srw_cmdline" ]; then
+    _srw_proc=${{_srw_cmdline%/cmdline}}
+    [ ! -e "$_srw_proc" ] && continue
+    _srw_uid=$(awk '/^Uid:/{{print $2; exit}}' "$_srw_proc/status" 2>/dev/null) || exit 86
+    [ "$_srw_uid" = "$(id -u)" ] && exit 86
+    continue
+  fi
+  _srw_args=$(tr '\\0' '\\n' < "$_srw_cmdline" 2>/dev/null) || {{ [ ! -e "${{_srw_cmdline%/cmdline}}" ] && continue; exit 86; }}
+  printf '%s\n' "$_srw_args" | grep -Fqx -- fuse-overlayfs || continue
+  printf '%s\n' "$_srw_args" | grep -Fqx -- {merged} && exit 85
+done
 echo "{_OVERLAY_OK}"
 """
 
@@ -639,5 +789,27 @@ echo "{_OVERLAY_OK}"
             # both lanes; pinned mode forwards unchanged to exec_command.
             output = self.workspace_backend.exec_command(command, timeout=timeout)
         if require_ok and (_OVERLAY_OK not in output or _OVERLAY_FAILED in output):
+            raise OverlayMountError(f"{name} did not report OK:\n{output}")
+        return output
+
+    def _run_terminal(self, name: str, script: str, *, timeout: int) -> str:
+        rel = (
+            f".cache/srw/overlay/{self.thread_id}/scripts/{self._controller_id}/{name}"
+        )
+        self.workspace_backend.write_home_file(rel, script)
+        script_path = self.workspace_backend.resolve_home_path(rel)
+        command = (
+            f"chmod 700 {shlex.quote(script_path)} && bash {shlex.quote(script_path)}; "
+            f"rc=$?; rm -f {shlex.quote(script_path)}; exit $rc"
+        )
+        execute = getattr(self.workspace_backend, "exec_terminal_claim_resource", None)
+        if not callable(execute):
+            raise OverlayMountError("terminal overlay cleanup has no resource fence")
+        output = execute(
+            command,
+            timeout=timeout,
+            operation="terminal cloud overlay cleanup",
+        )
+        if _OVERLAY_OK not in output or _OVERLAY_FAILED in output:
             raise OverlayMountError(f"{name} did not report OK:\n{output}")
         return output
