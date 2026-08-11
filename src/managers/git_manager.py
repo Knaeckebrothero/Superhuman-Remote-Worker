@@ -13,6 +13,8 @@ Usage:
         git_mgr.tag("phase-1-tactical-complete")
 """
 
+import base64
+import binascii
 import hashlib
 import logging
 import posixpath
@@ -357,6 +359,65 @@ class GitManager:
             and all(char in "0123456789abcdef" for char in value)
         )
 
+    def _undo_marked_commits(self, marker: str) -> list[tuple[str, str]]:
+        """Return ``(commit SHA, message)`` pairs matching an undo marker.
+
+        Do not encode record boundaries with ``%x00`` here. Remote Git runs
+        through the tmux-backed workspace shell, whose line-oriented capture
+        drops NUL bytes. Concatenating ``%H`` and ``%B`` across that transport
+        made an existing preparation look absent and let a retry append a
+        second commit for the same request UUID.
+
+        Candidate SHAs are therefore fetched one-per-line, then each message
+        is read in its own command. Full object IDs make the boundary
+        unambiguous without relying on any byte the transport may normalize.
+        A transport/inspection failure is an invariant failure, not an empty
+        result: callers must retry rather than create another idempotency
+        marker on uncertain history.
+        """
+
+        try:
+            result = self._run_git(
+                [
+                    "log",
+                    "HEAD",
+                    "--format=%H",
+                    "--fixed-strings",
+                    f"--grep={marker}",
+                ]
+            )
+        except Exception as exc:
+            raise WorkspaceUndoInvariantViolation(
+                f"could not inspect Git history for undo marker {marker}"
+            ) from exc
+        if result.returncode != 0:
+            raise WorkspaceUndoInvariantViolation(
+                f"could not inspect Git history for undo marker {marker}"
+            )
+
+        commit_shas = [line.strip() for line in result.stdout.splitlines() if line]
+        if any(not self._full_git_oid(commit_sha) for commit_sha in commit_shas):
+            raise WorkspaceUndoInvariantViolation(
+                f"Git returned a malformed commit for undo marker {marker}"
+            )
+
+        commits: list[tuple[str, str]] = []
+        for commit_sha in commit_shas:
+            try:
+                message_result = self._run_git(
+                    ["show", "--no-patch", "--format=%B", commit_sha]
+                )
+            except Exception as exc:
+                raise WorkspaceUndoInvariantViolation(
+                    f"could not inspect undo marker commit {commit_sha}"
+                ) from exc
+            if message_result.returncode != 0:
+                raise WorkspaceUndoInvariantViolation(
+                    f"could not inspect undo marker commit {commit_sha}"
+                )
+            commits.append((commit_sha, message_result.stdout))
+        return commits
+
     def trees_match(self, first_ref: str, second_ref: str) -> bool:
         """Return whether two refs resolve to the exact same Git tree."""
 
@@ -405,14 +466,11 @@ class GitManager:
         try:
             worktree = self._run_git(["diff", "--quiet", ref, "--"])
             index = self._run_git(["diff", "--cached", "--quiet", ref, "--"])
-            untracked = self._run_git(
+            untracked = self._run_git_nul_records(
                 ["ls-files", "--others", "--exclude-standard", "-z"]
             )
             return (
-                worktree.returncode == 0
-                and index.returncode == 0
-                and untracked.returncode == 0
-                and not untracked.stdout
+                worktree.returncode == 0 and index.returncode == 0 and untracked == []
             )
         except Exception:
             return False
@@ -463,26 +521,9 @@ class GitManager:
             return None
 
         marker = f"{_UNDO_PREPARE_TRAILER}: {canonical_request_id}"
-        try:
-            result = self._run_git(
-                [
-                    "log",
-                    "HEAD",
-                    "--format=%H%x00%B%x00",
-                    "--fixed-strings",
-                    f"--grep={marker}",
-                ]
-            )
-        except Exception:
-            return None
-        if result.returncode != 0 or not result.stdout:
-            return None
-
-        chunks = result.stdout.split("\x00")
         recovered: list[WorkspaceUndoPreparation] = []
-        for index in range(0, len(chunks) - 1, 2):
-            commit_sha = chunks[index].strip()
-            message = chunks[index + 1]
+        recovered_trees: list[str] = []
+        for commit_sha, message in self._undo_marked_commits(marker):
             prepare_values = [
                 line[len(f"{_UNDO_PREPARE_TRAILER}: ") :]
                 for line in message.splitlines()
@@ -500,7 +541,7 @@ class GitManager:
                 or len(target_values) != 1
                 or not self._full_git_oid(commit_sha)
                 or not self._full_git_oid(target_values[0])
-                or self.resolve_tree(commit_sha) is None
+                or (commit_tree := self.resolve_tree(commit_sha)) is None
                 or self.resolve_tree(target_values[0]) is None
             ):
                 raise WorkspaceUndoInvariantViolation(
@@ -514,11 +555,22 @@ class GitManager:
                     target_sha=target_values[0],
                 )
             )
+            recovered_trees.append(commit_tree)
 
         if len(recovered) > 1:
-            raise WorkspaceUndoInvariantViolation(
-                f"multiple Git preparations for workspace undo {canonical_request_id}"
-            )
+            # A buggy remote lookup could append the same preparation again.
+            # This is safe to converge only when every reachable marker names
+            # the exact same request/target and snapshots the identical tree.
+            # ``git log`` is newest-first, so retain the newest reachable
+            # preparation. Any target or tree disagreement remains ambiguous.
+            if (
+                len({preparation.target_sha for preparation in recovered}) != 1
+                or len(set(recovered_trees)) != 1
+            ):
+                raise WorkspaceUndoInvariantViolation(
+                    "conflicting Git preparations for workspace undo "
+                    f"{canonical_request_id}"
+                )
         return recovered[0] if recovered else None
 
     def commit_workspace_undo(
@@ -580,26 +632,8 @@ class GitManager:
             return None
 
         marker = f"{_UNDO_REQUEST_TRAILER}: {canonical_request_id}"
-        try:
-            result = self._run_git(
-                [
-                    "log",
-                    "HEAD",
-                    "--format=%H%x00%B%x00",
-                    "--fixed-strings",
-                    f"--grep={marker}",
-                ]
-            )
-        except Exception:
-            return None
-        if result.returncode != 0 or not result.stdout:
-            return None
-
-        chunks = result.stdout.split("\x00")
         recovered: list[WorkspaceUndoCommit] = []
-        for index in range(0, len(chunks) - 1, 2):
-            commit_sha = chunks[index].strip()
-            message = chunks[index + 1]
+        for commit_sha, message in self._undo_marked_commits(marker):
             trailers: dict[str, list[str]] = {}
             for line in message.splitlines():
                 for key in (
@@ -655,25 +689,9 @@ class GitManager:
 
         if not self.is_active:
             return None
-        try:
-            result = self._run_git(
-                [
-                    "log",
-                    "HEAD",
-                    "--format=%H%x00%B%x00",
-                    "--fixed-strings",
-                    f"--grep={_UNDO_REQUEST_TRAILER}:",
-                ]
-            )
-        except Exception:
-            return None
-        if result.returncode != 0 or not result.stdout:
-            return None
-
-        chunks = result.stdout.split("\x00")
-        for index in range(0, len(chunks) - 1, 2):
-            commit_sha = chunks[index].strip()
-            message = chunks[index + 1]
+        for commit_sha, message in self._undo_marked_commits(
+            f"{_UNDO_REQUEST_TRAILER}:"
+        ):
             request_values = [
                 line[len(f"{_UNDO_REQUEST_TRAILER}: ") :]
                 for line in message.splitlines()
@@ -823,11 +841,13 @@ class GitManager:
         if not self.is_active:
             return []
         try:
-            result = self._run_git(["diff", "--name-only", "-z", str(ref1), str(ref2)])
-            if result.returncode != 0:
-                logger.warning("git diff --name-only failed: %s", result.stderr)
+            paths = self._run_git_nul_records(
+                ["diff", "--name-only", "-z", str(ref1), str(ref2)]
+            )
+            if paths is None:
+                logger.warning("git diff --name-only failed")
                 return []
-            return [path for path in result.stdout.split("\0") if path]
+            return paths
         except Exception as e:
             logger.warning("Failed to list changed paths: %s", e)
             return []
@@ -1733,6 +1753,62 @@ class GitManager:
             return subprocess.CompletedProcess(
                 cmd, returncode=1, stdout="", stderr=str(e)
             )
+
+    def _run_git_nul_records(
+        self,
+        args: List[str],
+        timeout: int = DEFAULT_TIMEOUT,
+    ) -> Optional[list[str]]:
+        """Run Git and decode its NUL-delimited path records losslessly.
+
+        Git's ``-z`` formats are required for filenames containing newlines.
+        The tmux-backed remote shell is line-oriented, though, and strips raw
+        NUL bytes. On a backend, base64 therefore wraps the byte stream before
+        it crosses that transport; GitManager decodes it locally and validates
+        the terminal record delimiter. The local subprocess path retains its
+        historical direct ``-z`` behavior.
+
+        Returns ``None`` on command/transport/decoding failure, otherwise the
+        exact path records (with embedded newlines preserved).
+        """
+
+        if not self._use_backend:
+            result = self._run_git(args, timeout=timeout)
+            if result.returncode != 0:
+                return None
+            payload = result.stdout
+        else:
+            cmd_str = "git " + " ".join(shlex.quote(arg) for arg in args)
+            encoded_cmd = f"set -o pipefail; {cmd_str} | base64"
+            try:
+                output = self._backend.shell_run(
+                    encoded_cmd,
+                    timeout=timeout,
+                    tab_name="git",
+                    working_dir=self._remote_cwd,
+                )
+                encoded_result = self._parse_shell_run_output(output, args)
+            except Exception as exc:
+                logger.error("Backend Git path command failed: %s", exc)
+                return None
+            if encoded_result.returncode != 0:
+                return None
+            encoded = "".join(encoded_result.stdout.split())
+            if not encoded:
+                return []
+            try:
+                raw_payload = base64.b64decode(encoded, validate=True)
+                payload = raw_payload.decode("utf-8", errors="surrogateescape")
+            except (binascii.Error, UnicodeDecodeError, ValueError):
+                logger.error("Backend Git path output was not valid base64")
+                return None
+
+        if not payload:
+            return []
+        if not payload.endswith("\x00"):
+            logger.error("Git -z path output ended without its record delimiter")
+            return None
+        return payload[:-1].split("\x00")
 
     def _parse_shell_run_output(
         self, output: str, args: Optional[List[str]] = None
