@@ -637,22 +637,28 @@ async def _process_orchestrator_job(
         result = final_state or {}
         logger.info(f"Orchestrator job {job_id} completed: {result.get('should_stop')}")
 
-        # Mark agent as available BEFORE reporting completion.
+        # Report completion FIRST, then mark the agent available. The reverse
+        # order was a live race: a ready(job_id=None) heartbeat lets
+        # recover_orphaned_jobs pause this still-'processing' job ("agent says
+        # ready" — no current_job_id check, no grace), after which the
+        # completion report is DISCARDED with a 400 (the rescue path is
+        # failed-only) and the dispatcher re-runs the finished job. The 30s
+        # dispatcher cooldown means slot availability is not on the critical
+        # path, so reporting first costs nothing.
+        # docs/research/stateless_agents/gate3_adversarial_review.md (B8).
         _current_job_id = None
+        if _orchestrator_client:
+            try:
+                await _orchestrator_client.report_completion(job_id, result)
+            except Exception as e:
+                logger.error(f"Failed to report completion for job {job_id}: {e}")
+
         if _orchestrator_client and _orchestrator_client.agent_id:
             await _orchestrator_client.heartbeat(
                 status="ready",
                 job_id=None,
                 metrics=_get_agent_metrics(),
             )
-
-        # Report completion to orchestrator — it is the single authority
-        # for DB status, verification, critic verdicts, curation, and dispatch.
-        if _orchestrator_client:
-            try:
-                await _orchestrator_client.report_completion(job_id, result)
-            except Exception as e:
-                logger.error(f"Failed to report completion for job {job_id}: {e}")
 
     except asyncio.CancelledError:
         logger.info(f"Orchestrator job {job_id} was cancelled")
@@ -1190,16 +1196,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     f"Resumed job {request.job_id} completed: {result.get('should_stop')}"
                 )
 
-                # Mark agent as available BEFORE reporting completion
+                # Report completion FIRST, then mark available — same race as
+                # the primary job path (see the comment there; review B8).
                 _current_job_id = None
-                if _orchestrator_client and _orchestrator_client.agent_id:
-                    await _orchestrator_client.heartbeat(
-                        status="ready",
-                        job_id=None,
-                        metrics=_get_agent_metrics(),
-                    )
-
-                # Report completion to orchestrator
                 if _orchestrator_client:
                     try:
                         await _orchestrator_client.report_completion(
@@ -1209,6 +1208,13 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                         logger.error(
                             f"Failed to report completion for resumed job {request.job_id}: {e}"
                         )
+
+                if _orchestrator_client and _orchestrator_client.agent_id:
+                    await _orchestrator_client.heartbeat(
+                        status="ready",
+                        job_id=None,
+                        metrics=_get_agent_metrics(),
+                    )
 
             except asyncio.CancelledError:
                 logger.info(f"Resumed job {request.job_id} was cancelled")
