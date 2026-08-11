@@ -3331,3 +3331,202 @@ tombstones remain.
 
 The production two-Deployment/KEDA split, per-claim job log, Job Bench A/B
 performance gate and Gate 3 multi-effect finalizer remain unbuilt.
+
+# Session 12 — S2 close-out: sandbox admission and durable lifecycle (2026-08-11/12)
+
+Branch: `feature/stateless-agents`; not pushed. `develop` remained untouched.
+This session completed the S2 workspace lane, removed the sandbox admission
+gate, ran repository and live acceptance, and repaired every P0/P1 found by the
+final adversarial/live passes. Section 5.4.5 of the feature design was not
+changed.
+
+## Scope, admission and migration
+
+Stateless session admission now accepts exact `virtual`/`none` and an in-cluster
+Kubernetes `sandbox`. It still refuses VM, Docker-backed physical,
+protected-cloud, officer/conference, unknown and malformed classes. The same
+combined class/workspace decision is repeated at input, control, interrupt,
+upload, IDE/browser/Canvas and final claim-bundle credential boundaries under
+the fresh thread/lifecycle lock. All four stop-marker keys fail closed by key
+presence; load-bearing booleans require exact JSON booleans.
+
+Migration **0133** added the durable session-task tables, memory-extraction
+cursor and path-scoped citation anchors. A canonical disposable replay applied
+all **133** app migrations (115 transactional and 18 non-transactional) and
+matched the committed **13,125-line** schema snapshot byte for byte. Migration
+0133's recorded checksum is
+`7f088fc7eb7a17290f8947fff681839177bdec93880c669e0035e0e2573c9735`.
+The changed-SQL group passed **141 tests** and migration ordering/head passed
+**3**; Squawk reported zero issues. App-schema head is 0133 and 0134–0139 are
+unused.
+
+## Durable state and path dispositions
+
+Tasks are PostgreSQL-owned and hydrate on every attach. Memory extraction uses
+the migration-0133 durable interval cursor rather than a process-local last
+turn. Citation delivery uses a per-path durable anchor. Sandbox undo is one
+durable control request plus one linked receipt, backed by the remote Git/turn
+ledger; virtual and `none` sessions reject undo as unsupported. Claim-local
+read-before-write stamps and sync caches are deliberately disposable, forcing a
+fresh authoritative read after handoff. WebDAV and research downloads stage in
+operation-scoped temporary storage and write through the workspace backend.
+
+RAM teardown now joins the loop/watchers, title/stage work, CitationEngine and
+MemoryManager admission/drain before any queue transition or claim-loss ACK.
+Routine stateless detach does not run a duplicate `session_end` extraction.
+The remaining semantic gap is public End's exact final memory tail: a crash can
+leave **0–4 turns** after the five-turn interval uncaptured. Closing it requires
+a same-transaction durable terminal effect/outbox; a cleanup-side retry cannot
+provide authority or crash idempotence.
+
+## Workspace incarnation and retirement authority
+
+One durable `{generation, mode, attempted, replaces_uid}` marker owns each
+Kubernetes creation. Only the exact false-to-true `attempted` CAS winner may
+issue Pod create. A continuation validates full owner labels, opposite-owner
+absence, generation, immutable Pod UID, workspace storage binding, seed
+ConfigMap, PVC and Service identities on every read through Ready publication.
+Exact-terminal recreation persists replacement authority before a UID-
+preconditioned delete and waits for the old name to reach 404 before rotating.
+404, replacement and API ambiguity are never process-zero proof.
+
+Remote shell, tmux, IDE-terminal, browser, rclone and overlay processes carry
+the exact workspace/runtime tag. Terminal cleanup closes the SFTP subsystem,
+retires every resident/controller, scans all same-UID processes fail closed,
+and writes resident/shell acknowledgements bound to terminal token, workspace
+and endpoint generations, runtime UID and host-key fingerprint. Soft End
+requires a strict checksum-manifest snapshot for emptyDir and leaves a settled
+resume tombstone; permanent End converges external and DB resources before row
+deletion. Legacy suspension and generic workspace/VM lifecycle reapers refuse
+stateless rows.
+
+The remote markers/flocks remain workload-user writable. This is accepted for
+sandbox v1 as a cooperative correctness protocol, not a hostile same-user
+security boundary. PostgreSQL/Kubernetes identity remains the admission and
+persistence fence.
+
+## Failure-driven repairs and milestone commits
+
+The implementation landed as explicit milestones:
+
+- `f3885df7` — route session paths through workspace backends;
+- `291c56a1` — bind shells to workspace incarnations;
+- `0fc23b5a` — open sandbox session admission;
+- `9d2ee44d` — preserve the already-applied S2 migration checksum;
+- `eab430bd` and `8f025dc3` — preserve/frame remote undo and Git records;
+- `df70ab6b` — consolidate the durable sandbox lifecycle;
+- `d2dd1f68` — align the pinned inventory fixture with the new DB authority;
+- `4594ea50` — run fenced resident/zero scripts under Bash;
+- `f5c4a471` — strict rclone drain, SFTP close and retry-safe retirement;
+- `d4ed907e` — retain the non-null parked retry deadline;
+- `d34ada8f` — bind claim-loss JSON paths as canonical text;
+- `5e60a644` — `exec` Python as PID 1 so SIGTERM reaches Uvicorn;
+- `77d6909a` — materialize eviction provenance before Pod deletion;
+- `e17418bd` — restore JSON-held deadlines through asyncpg text/timestamp casts.
+
+The final four were live-fault discoveries. The first controlled steal proved
+`run_after` was correctly retained, then exposed asyncpg rejecting an integer
+JSON-path argument. A rollout exposed the Helm PID-1 shell swallowing SIGTERM.
+The next controlled steal showed `jsonb_set(..., false)` returning a row without
+creating `eviction_requested_at`. A rollback-only real-PostgreSQL run then
+found ISO strings being bound directly as asyncpg `timestamptz` arguments.
+Each repair was narrow and independently reviewed; malformed/null/wrong-token
+authority still fails closed.
+
+## Verification
+
+Repository-wide pytest completed in **843.10 s** with **16,681 passed, 156
+skipped, 11 failed and 53 warnings**. The eleven failures are the established
+local environment baseline: one unavailable local PostgreSQL check, seven
+MCP/Python-3.14 transport/wiring cases and three optional arXiv/provider cases.
+Ruff check and format check covered **1,092 files**. Both Helm value sets
+linted. Cockpit passed **119/119 files and 1,835/1,835 tests**, the production
+build, and the **2,455-key** i18n check. The final claim-loss/End/TurnExecutor/
+Helm delta passed **212** tests; the final timestamp/eviction group passed
+**163**.
+
+An independent high-risk integration union passed **599** tests; full
+TurnExecutor/PersistentSession passed **176**, and PersistentApp passed **292**
+with two nonblocking AsyncMock hygiene warnings. The exact frozen implementation
+review found P0=0/P1=0 before live rollout; each later live repair received a
+fresh bounded review. The final combined `d34ada8f`/`5e60a644`/`77d6909a`/
+`e17418bd` verdict is GO with no remaining P0/P1.
+
+## Live sandbox, virtual, rollout and pinned evidence
+
+The headline sandbox fixture `d52bbbd7-…` crossed two executor pods while
+preserving four tmux windows, cwd, environment, files and two durable tasks
+(one completed, one pending). Turn B changed an exact file from A to B; one
+idle undo request produced one receipt and restored the A bytes plus two
+40-character Git SHAs. One hard interrupt produced one linked receipt and zero
+forbidden AI answer.
+
+A safe workspace replacement first terminated the exact observable UID, then
+created a different UID while retaining the same PVC bytes and rejecting the
+old tmux runtime. Soft End at token **13** and Resume created a third workspace
+UID; the successor answered exactly once at token **14**. Permanent End at
+token **15** returned two expected 503 responses while physical and auxiliary
+retirement converged, then 200. Final proof: **28** thread-id relations zero,
+threads/queue zero, K8s Pod/Service/PVC/ConfigMap zero, virtual and snapshot
+objects zero, repository 404 and owner state 404.
+
+Fresh virtual fixture `825b51bc-…` had no physical workspace, persisted one
+15-byte upload, completed an exact token-1 turn, soft-ended/resumed, then
+completed token 3 with the prior durable marker in context. Before deletion it
+held four messages and 35 objects/56,688 bytes. Final permanent DELETE returned
+200; all **31** checked application relations, the virtual prefix, repository
+and K8s fixture resources were zero, and public state returned 404.
+
+Natural termination fixture `77d388fa-…` claimed input sequence **2662** at
+token 1 on pod `s8pph` (UID `7e5da300-…`). Python PID 1 logged shutdown
+immediately, renewed its lease through bounded completion, and committed
+exactly one AI marker **99 s** later. The queue ended `done` with
+`input_seq=consumed_seq=2662`, attempts 0 and no loss/hold. Public permanent
+delete left thread, queue, messages and snapshot prefix at zero. A synthetic
+outer-rollback real-PostgreSQL proof then materialized the eviction leaf and
+ran ACK end to end in **5.0 ms**: loss/hold cleared, parked became queued, token,
+attempts, `run_after` and `queued_at` stayed exact, and rollback left 0 thread /
+0 queue rows.
+
+Pinned parity fixture `83202843-…` remained on the dedicated plane. One control
+was applied in **53 ms**; replay of the same UUID returned the one stored row
+with HWM 1. An ordinary response arrived in about 12 s and no `run_queue` row
+was created. Public DELETE returned 200 in **12.819 s** and removed DB/K8s/
+Gitea/Nextcloud authorities, but exposed pre-existing pinned cleanup debt: two
+snapshot objects totaling **99,094,250 bytes** and one stale unbound agent row.
+Those exact disposable artifacts (2 objects, 1 row) were removed under guarded
+cleanup; the generic pinned path was not broadened.
+
+## Accepted boundaries and remaining debt
+
+- Public End exact final memory capture remains blocked on the generic durable
+  effect/outbox (0–4-turn tail described above).
+- A caller passing displayed tool-call `.id` rather than canonical UUID
+  `.approval_id` receives 500/DataError; the canonical field returned 200. This
+  is P2 validation debt, not an authority bypass.
+- The pinned snapshot/agent-retention issue is pre-existing and remains a
+  separate pinned-lifecycle cleanup item.
+- Full two-editor Monaco/EventSource auth-expiry UX, server-side conditional
+  object-store writes and generic Canvas invalidation remain open.
+- S3 worker admission stays default off; the production two-Deployment/KEDA
+  split, per-claim log, Job Bench and Gate 3 finalizer remain unbuilt.
+
+## Guarded disposable-fixture cleanup
+
+Five same-day acceptance/fault fixtures were removed under their exact
+stateless-session lifecycle locks. The guarded pass deleted **24,119 database
+rows** across 31 checked relations, including five queue rows, five thread rows
+and 16 explicit non-FK turn commits. It also removed two Services, two PVCs and
+two PVs (zero Pods), four snapshot objects/198,189,808 bytes, 35 virtual
+objects/56,688 bytes, five Gitea repositories and five Nextcloud folders and
+shares. Total object-store removal was **39 objects / 198,246,496 bytes**; the
+operator operations took **41.303 s** in aggregate.
+
+Three fixtures intentionally carried pre-fix parked claim-loss evidence. Each
+was reasserted twice under the lifecycle lock with its exact queue, hold, loss
+ledger and original `quiesced:false` metadata. Cleanup performed **zero
+claimant-ACK writes** and did not update a marker, fabricate a UID or treat Pod
+absence as quiescence. Final independent inventory found zero residue for all
+five UUIDs in every checked DB relation, Kubernetes resource class,
+object-store prefix, repository and cloud path. The unrelated 2026-08-07
+baseline fixture `9a756800-…` was explicitly excluded and remained unchanged.
