@@ -8,6 +8,8 @@ import yaml
 
 import src.core.loader as loader
 from src.core.loader import (
+    CONTEXT_THRESHOLD_FRACTION,
+    MESSAGE_COUNT_MIN_FRACTION,
     LLMConfig,
     PhaseLLMOverride,
     _apply_settings_matrix,
@@ -19,14 +21,15 @@ from src.core.loader import (
 )
 from src.core.model_registry import family_of
 
-# Limit-leaf fractions mirror the *_FRACTION constants in src/core/loader.py.
+# Limit-leaf fractions are IMPORTED from src/core/loader.py rather than
+# re-pinned here, so this table can never drift from the derivation it checks.
 # The derived leaves are int(base * fraction); model_max_context_tokens is
 # the base itself. Tests assert this relationship rather than hand-pinned magics.
 # Summarization budgets are deliberately NOT here — they derive from the
 # auxiliary model's window at call time (src/core/summarizer.py).
 FRACTIONS = {
-    "context_threshold_tokens": 0.80,
-    "message_count_min_tokens": 0.40,
+    "context_threshold_tokens": CONTEXT_THRESHOLD_FRACTION,
+    "message_count_min_tokens": MESSAGE_COUNT_MIN_FRACTION,
 }
 
 
@@ -106,7 +109,9 @@ class TestGlmFamily:
         assert data["llm"]["model_max_context_tokens"] == 1000000
         assert data["limits"]["model_max_context_tokens"] == 1000000
         assert data["limits"]["context_threshold_tokens"] == 800000  # 1000000 * 0.80
-        assert data["limits"]["message_count_min_tokens"] == 400000  # 1000000 * 0.40
+        assert data["limits"]["message_count_min_tokens"] == int(
+            1000000 * MESSAGE_COUNT_MIN_FRACTION
+        )
 
     def test_glm_limits_end_to_end(self, tmp_path):
         expert = {
@@ -123,7 +128,9 @@ class TestGlmFamily:
         assert config.llm.top_p == 0.95
         assert config.limits.model_max_context_tokens == 1000000
         assert config.limits.context_threshold_tokens == 800000  # 1000000 * 0.80
-        assert config.limits.message_count_min_tokens == 400000  # 1000000 * 0.40
+        assert config.limits.message_count_min_tokens == int(
+            1000000 * MESSAGE_COUNT_MIN_FRACTION
+        )
 
 
 class TestGpt56Family:
@@ -146,7 +153,9 @@ class TestGpt56Family:
         assert data["llm"]["model_max_context_tokens"] == 1000000
         assert data["limits"]["model_max_context_tokens"] == 1000000
         assert data["limits"]["context_threshold_tokens"] == 800000  # 1000000 * 0.80
-        assert data["limits"]["message_count_min_tokens"] == 400000  # 1000000 * 0.40
+        assert data["limits"]["message_count_min_tokens"] == int(
+            1000000 * MESSAGE_COUNT_MIN_FRACTION
+        )
 
 
 # =============================================================================
@@ -622,7 +631,9 @@ class TestSettingsMatrixIntegration:
         # Derived from the minimax base (204800 = its true max) via the fractions.
         assert config.limits.model_max_context_tokens == 204800
         assert config.limits.context_threshold_tokens == 163840  # 204800 * 0.80
-        assert config.limits.message_count_min_tokens == 81920  # 204800 * 0.40
+        assert config.limits.message_count_min_tokens == int(
+            204800 * MESSAGE_COUNT_MIN_FRACTION
+        )
 
     def test_unknown_model_gets_default_limits(self, tmp_path):
         """Unknown model family gets default entry limits."""
@@ -642,7 +653,9 @@ class TestSettingsMatrixIntegration:
 
         assert config.limits.model_max_context_tokens == 128000
         assert config.limits.context_threshold_tokens == 102400  # 128000 * 0.80
-        assert config.limits.message_count_min_tokens == 51200  # 128000 * 0.40
+        assert config.limits.message_count_min_tokens == int(
+            128000 * MESSAGE_COUNT_MIN_FRACTION
+        )
 
     def test_load_agent_config_with_deployment_dir_matrix(self, tmp_path):
         """Expert directory with model_config_matrix.yaml flows through load_agent_config."""
@@ -1131,7 +1144,9 @@ class TestContextWindowBaseResolution:
         assert config.llm.model_max_context_tokens == 32000
         assert config.limits.model_max_context_tokens == 32000
         assert config.limits.context_threshold_tokens == 25600  # 32000 * 0.80
-        assert config.limits.message_count_min_tokens == 12800  # 32000 * 0.40
+        assert config.limits.message_count_min_tokens == int(
+            32000 * MESSAGE_COUNT_MIN_FRACTION
+        )
 
 
 # =============================================================================
