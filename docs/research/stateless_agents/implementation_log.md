@@ -3100,3 +3100,234 @@ binding, agent and Kubernetes residue were all zero.
 
 The S2 sandbox tier gate remains closed. No stateless admission, worker queue
 unit, command/effect schema or finalization protocol was added in this step.
+
+# Session 11 — S3 driver: worker jobs on the stateless lane (2026-08-11)
+
+## Scope and admission
+
+This slice implements the worker driver under §5.4.5's 2026-08-10 scope
+correction. A batch rotation is a queue transition and makes **zero** calls to
+`POST /api/jobs/{id}/complete`; only a genuine terminal or human-facing stop
+uses that endpoint at pinned frequency. The completion command/effect redesign
+is not a hidden dependency of rotation.
+
+Admission is independently chart-gated by
+`agent.stateless.worker.enabled=false`, and enabling it also requires the
+existing stateless executor pool. An explicit stateless root is accepted only
+for an in-cluster Kubernetes pod workspace. A VM request remains pinned, an
+omitted root remains pinned, and a child whose lane is omitted inherits its
+authoritative parent's lane. The pinned dispatcher and its recovery sweeps
+remain exact-`pinned` predicates.
+
+No schema change was necessary. App migration head remains **0132** and no file
+in the allocated **0133–0139** range exists. Gate 3 step 2 was not built: there
+is no command table, polymorphic effect table, completion high-water mark or
+finalizer.
+
+## Core driver and queue protocol
+
+The existing stateless executor is now a session-first shared local pool. It
+always polls `session_turn` first and polls `worker_batch` only when no session
+claim is available and the worker gate is on. Worker claim is a queue-first
+transaction: it takes the `run_queue` lease, locks the jobs row, and CASes
+`created`, `paused`, or the expected reclaim state `processing` to
+`processing`. `assigned_agent_id` remains NULL. A pinned, assigned, terminal or
+otherwise ineligible jobs row is consumed to queue `done` instead of being
+release-looped into a poison head.
+
+The claim endpoint reuses the pinned dispatch builder for the canonical
+`JobStartRequest`, including its existing config and credential resolution. It
+validates `(unit_id, lease_token)` before assembly and again after the slow
+assembly so a stolen claimant cannot receive the bundle. Worker state uses a
+process-wide psycopg checkpoint pool and an exact-token fenced saver. Every
+checkpoint put/write proves the current worker generation; the saver never
+uses pipeline mode. The persisted wire stack is pinned exactly at
+`langgraph==1.2.10`, `langgraph-checkpoint==4.1.1`,
+`langgraph-checkpoint-postgres==3.1.1` and `psycopg-pool==3.3.1`, with
+`LANGGRAPH_STRICT_MSGPACK=true` required at startup.
+
+The driver arms the existing wall-clock-first `batch_boundary` envelope for
+each claim. Production retains its 300-second floor; the explicit Tilt overlay
+uses 60 seconds so a handoff is observable. At the boundary the graph reaches
+END, bounded teardown drains memory and closes the checkpointer, and the S2
+remote-shell substrate leaves ownership-fenced tmux state available to the
+successor. A resume hydrates TodoManager from graph state on **every**
+checkpoint path, not only one END branch. It also restores the safe durable
+instruction-read receipts introduced after the first live handoff exposed that
+those enforcement stamps had otherwise remained pod-local. A configured
+instruction receipt carries its phase/turn and content hash across repeated
+handoffs and FIFO churn, and fails closed if the instruction bytes change;
+ordinary read-before-write authorization is intentionally not restored. The
+resumed audited-tools node also restores the checkpointed phase before applying
+phase-scoped enforcement.
+
+Rotation uses the prescribed **complete-and-requeue** composition. While the
+old generation still holds and locks the row, it advances the synthetic input
+watermark and then completes the old consumed watermark. The completion CASE
+atomically leaves the row queued and runnable now, resets
+`attempts_since_completion`, and preserves `last_leased_by` affinity. Ordinary
+release was rejected for successful rotation because it preserves the failure
+counter, clears affinity and adds attempt-scaled backoff. The stable log
+contract, asserted by the runtime test and observed in the live run, is:
+
+```text
+worker_batch rotate: unit=<id> token=<n> queue_verb=complete_and_requeue queue_state=queued input_seq=<old> next_input_seq=<new> complete_calls=0 http_complete_calls=0
+```
+
+Recoverable infrastructure stops use queue release/backoff and never report.
+A terminal or human-facing stop reports while the heartbeat still owns the
+lease; after a 2xx it completes the exact queue watermark to `done`, while a
+failed/ambiguous report releases for a successor to re-report from the END
+checkpoint. `JobCompleteRequest` now carries an optional lease token. Before
+the handler's status guard or any side effect, the stateless arm requires exact
+equality with the worker row's current token, regardless of queue state. A
+missing or stale token returns 409; pinned reports remain tokenless and follow
+their historical path.
+
+## Verbs, steering and lifecycle repair
+
+Resume, approve and feedback now select by lane. Their stateless arm acquires
+queue before jobs, stamps a durable resume/delivery generation, resets a parked
+attempt budget when appropriate, and re-enqueues the worker instead of leaving
+it paused for a dispatcher which excludes it. Queued guidance/replies carry
+stable delivery keys reconstructed from the checkpoint. The live owner writes
+their acknowledgement only from a post-checkpoint hook, after the absorbing
+fenced checkpoint is durable.
+
+Cancel hard-closes the worker queue first; a leased holder observes the jobs
+status through the renewal companion read and stops without relying on a
+registered-agent heartbeat. Cancellation retains a durable cleanup marker
+until strict checkpoint and workspace cleanup complete under one per-job
+PostgreSQL advisory single-flight. Permanent DELETE first hard-closes and, if
+needed, bumps the leased worker generation, marks the jobs row non-runnable,
+strictly prunes and proves the checkpoint thread empty, then performs external
+cleanup before atomically removing the queue and job anchors. The final lock
+order is queue row, Docker advisory lock where applicable, then jobs row.
+Stale stateless verification critics use the same queue-first cancellation and
+strict checkpoint cleanup; a marker-bearing cancelled critic remains live to
+parent-review convergence until that cleanup finishes.
+
+This lifecycle work was prompted by the first full live core run: its normal
+DELETE removed the job and external resources but initially left **49
+checkpoints / 85 checkpoint blobs / 247 checkpoint writes** plus the queue
+tombstone. Retention later compacted that residue, which did not make deletion
+correct. At the final exact pre-cleanup check, **3 checkpoints / 25 blobs / 8
+writes** remained. The new strict production helper removed those **36** rows,
+the exact tombstone was removed, and jobs, queue, checkpoints, blobs and writes
+all proved zero.
+
+## Verification
+
+* A disposable PostgreSQL 16 acceptance suite passed **10/10**. It includes
+  **32 simultaneous claim races**, **25 consecutive rotations**, saver fencing,
+  saver-before-DELETE and DELETE-before-saver interleavings, strict pruning and
+  a stale live verification-critic hard fence.
+* The focused affected matrix passed **484/484**. The broader worker/lifecycle
+  matrix passed **702 tests with 2 skips**.
+* Repository-wide pytest completed in **818.99 s** with **15,659 passed / 155
+  skipped / 11 failed / 51 warnings**. The eleven failures are exactly the
+  standing environment baseline: one unavailable localhost PostgreSQL test,
+  seven MCP transport/wiring tests and three optional arXiv/provider tests.
+* Repository-wide Ruff check and Ruff format check passed for **1,078 files**.
+  Both Helm lint value sets passed. The app schema replay and head check passed
+  through frozen migration 0132, with no 0133–0139 migration to lint or
+  snapshot. Dependency checking proved the four exact checkpoint pins above,
+  and the strict-msgpack checkpoint round trip passed.
+
+## Live evidence
+
+### Earlier full core run, before the final cleanup repair
+
+Fixture `b7cce761-…` supplied the full feature-path fault proof. Pod A held token
+**12** and was force-deleted mid-batch; after reaper recovery pod B reclaimed at
+token **14**. The successor restored Todo state, instruction-read receipts,
+tmux panes, shell cwd/environment and the workspace marker from the checkpoint
+plus S2 substrate. A deliberately late token-12 completion POST returned
+**409**, and a before/after read proved pod B's authoritative row unchanged.
+Rotations produced the zero-call log contract above. The genuine final stop
+made exactly **one** successful `/complete` request (**200**) and reached the
+expected `pending_review` state. This run predates the strict DELETE/cancel
+repair described above; it is the run that exposed the orphaned checkpoint
+rows, not evidence that the old cleanup path was acceptable.
+
+### Current final-byte rotation, resume and deletion
+
+Fixture `264228ba-…` cleanly rotated from pod A token **2** to queued and was
+claimed by pod B at token **3** in about **2.3 seconds**. Rotation reset the
+attempt counter; the successor claim then recorded attempt **1**. It restored
+**4 Todo entries**, **2 tmux tabs**, cwd/environment and the remote marker.
+The pre-terminal `/complete` count was exactly **0**.
+
+The retained, verbatim pod-A line is:
+
+```text
+2026-08-11 01:36:25 - src.api.turn_executor - INFO - worker_batch rotate: unit=264228ba-9705-4324-8c36-7d0bf5106b2d token=***REDACTED*** queue_verb=complete_and_requeue queue_state=queued input_seq=1 next_input_seq=2 complete_calls=0 http_complete_calls=0
+```
+
+The logger deliberately redacts the token. The correlated committed-row watcher
+recorded token **2**, `state=queued`, `attempts=0`, `input=2`, `consumed=1` at
+`01:35:43.740055Z`; the successor then claimed token 3. All **8** retained
+rotations carried `complete_calls=0 http_complete_calls=0`, and the
+orchestrator access log contained zero completion requests before the first
+controlled terminal transition.
+
+Because the model continued looping, terminal placement was intentionally
+controlled through the normal exact-token endpoint; it was **not** a natural
+model-selected terminal. The token-**8** request reached `pending_review`, and
+the queue closed at token **9**. A public `POST /resume` returned **200**; pod B
+claimed token **10** within about **3 seconds**, with prior status `paused`,
+attempt **1**, input/consumed watermarks **9/8**, and the same canonical
+checkpoint, four Todos and two tmux tabs.
+
+A second controlled exact-token callback placed the resumed job back in
+`pending_review`; the DELETE was deliberately issued while token 10 was still
+leased so it exercised the saver/delete race rather than waiting for ordinary
+driver teardown. At **01:45:56**, the checkpoint tables held **45 checkpoints
+/ 78 blobs / 230 writes**. DELETE returned **200 in 0.183 seconds**. The
+immediate proof found zero jobs, queue rows, checkpoints, blobs and writes; all
+six vector-table fixture counts were zero; both snapshot objects and the
+isolated Gitea repository were gone. The late saver logged lease loss and
+recreated nothing. The worker pod was gone by the response, and its Service/PVC
+counts reached zero about **39 seconds** later. This is the current-byte proof
+of queue fencing, strict pruning, public resume and deletion during a live
+successor lease; it is not presented as a natural terminal-callback count.
+
+The final-byte queued-cancel fixture `0ddcc619-…` began
+`created/worker_batch/queued`, token 0, with no checkpoint. Public cancel
+returned **200 in 3.686 seconds** and left the job `cancelled`, the queue `done`,
+no cleanup marker and no checkpoint or Kubernetes residue. Its subsequent
+authenticated DELETE returned **200 in 0.133 seconds** and removed both job and
+queue rows.
+
+The omitted-lane README General Worker fixture `3cde7045-…` proved pinned
+parity on the same final bytes: the database lane was `pinned`, the legacy
+dispatcher assigned dedicated pod `srw-agent-j-8ab0fd07`, and the natural agent
+callback made exactly one completion POST (**200 in 37 ms**) into the configured
+`pending_review` state. Public approval returned **200 in 1.057 seconds**, moved
+the job to `completed`, and stamped
+`completed_at=2026-08-11 02:03:32.688762+00`. Public DELETE returned **200 in
+194 ms** and left job, queue, Kubernetes and vector residue at zero.
+
+That pinned DELETE exposed a pre-existing pinned-lifecycle debt: after the job
+row was gone, its canonical checkpoint thread still contained **12 checkpoints
+/ 33 blobs / 48 writes**. The S3 change deliberately did not alter the pinned
+path. The deployed strict helper removed exactly those **93** disposable-fixture
+rows and the final five-table proof was zero; no other row was touched. A
+general pinned permanent-delete checkpoint cleanup remains outside this S3
+slice.
+
+A disposable pinned canary also archived its agent log after its job had
+already been deleted, leaving one exact late object. Its provenance was proved,
+the deployed blob helper removed only that key (**HEAD 200 -> 404**), and no S3
+worker code was broadened to address the pre-existing pinned archive race.
+
+Final cleanup across all seven disposable fixture ids proved job, queue and all
+three checkpoint-table counts zero; all six vector-table counts zero; exact
+snapshot/log objects and Gitea repositories absent; Kubernetes pod, Service and
+PVC counts zero; and no agent current-job references. Both disposable dedicated
+pinned-agent rows were offline and unbound, then removed through the normal
+authenticated agent DELETE endpoint. Only their expected unowned metering
+tombstones remain.
+
+The production two-Deployment/KEDA split, per-claim job log, Job Bench A/B
+performance gate and Gate 3 multi-effect finalizer remain unbuilt.

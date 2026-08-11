@@ -11,7 +11,7 @@ keyed to a completed todo, with a wall-clock floor for the stuck case.
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -29,8 +29,9 @@ def make_config(max_wait=300):
     )
 
 
-def make_context(workspace=None):
+def make_context(workspace=None, *, stateless=False):
     ctx = ToolContext(workspace_manager=workspace or MagicMock())
+    ctx._stateless_worker = stateless
     return ctx
 
 
@@ -273,6 +274,24 @@ class TestDelivery:
         body = result["messages"][0].content
         assert "a" in body and "b" in body
 
+    def test_stateless_reply_waits_for_checkpoint_ack(self, monkeypatch, acks, written):
+        reply = {
+            "id": "reply-1",
+            "thread_id": "t1",
+            "message": "checkpoint me",
+            "timestamp": iso(5),
+        }
+        set_inbox(monkeypatch, [reply])
+        ctx = make_context(stateless=True)
+        ctx.request_reply_drain()
+        result = {"messages": []}
+
+        _deliver_queued_replies("job-1", ctx, make_config(), result)
+
+        assert len(result["messages"]) == 1
+        assert result["delivered_reply_keys"] == ["id:reply-1"]
+        assert acks == [], "stateless ack must wait for fenced aput commit"
+
 
 class TestTodoCompleteSetsTheBreak:
     def _tool(self, context):
@@ -308,11 +327,22 @@ class TestBoundaryBackstop:
     def _node(self, tool_context, monkeypatch, returned):
         from unittest.mock import MagicMock
 
-        from src.graph import create_handle_transition_node
+        from src.graph import _reply_key, create_handle_transition_node
         from src.managers.todo import TodoManager
 
-        async def fake_process(job_id, workspace, postgres_db):
-            return list(returned)
+        async def fake_process(
+            job_id,
+            workspace,
+            postgres_db,
+            *,
+            delivered_reply_keys=None,
+        ):
+            return [
+                reply
+                for reply in returned
+                if not delivered_reply_keys
+                or _reply_key(reply) not in delivered_reply_keys
+            ]
 
         monkeypatch.setattr("src.graph._process_queued_replies", fake_process)
 
@@ -366,6 +396,34 @@ class TestBoundaryBackstop:
 
         bodies = [getattr(m, "content", "") for m in result.get("messages", [])]
         assert not any("already seen" in b for b in bodies)
+
+    @pytest.mark.asyncio
+    async def test_checkpointed_reply_is_filtered_before_workspace_write(
+        self, monkeypatch
+    ):
+        from src.graph import _process_queued_replies, _reply_key
+
+        reply = {
+            "id": "reply-committed-before-ack",
+            "thread_id": "t1",
+            "message": "already absorbed",
+            "timestamp": iso(5),
+        }
+        postgres_db = SimpleNamespace(
+            fetchrow=AsyncMock(return_value={"context": {"queued_replies": [reply]}})
+        )
+        write_files = MagicMock()
+        monkeypatch.setattr("src.graph._write_reply_files", write_files)
+
+        result = await _process_queued_replies(
+            "job-1",
+            MagicMock(),
+            postgres_db,
+            delivered_reply_keys={_reply_key(reply)},
+        )
+
+        assert result == []
+        write_files.assert_not_called()
 
 
 class TestInboxContract:

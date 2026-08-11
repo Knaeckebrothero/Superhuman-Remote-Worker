@@ -1438,6 +1438,13 @@ AUTO_ASSIGN_ENABLED = os.environ.get("AUTO_ASSIGN_ENABLED", "true").lower() in (
     "yes",
 )
 
+# Worker jobs remain pinned unless this independent admission gate is opened.
+# Session-pool enablement is intentionally not sufficient: worker rollout and
+# rollback have different safety gates and capacity requirements.
+STATELESS_WORKER_ENABLED = os.environ.get(
+    "STATELESS_WORKER_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+
 # Dispatcher lock prevents concurrent dispatch (double-assignment)
 _dispatch_lock = asyncio.Lock()
 
@@ -3581,34 +3588,23 @@ async def _inject_dispatch_credentials(
     return config_override
 
 
-async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
-    """Start a new job on an agent. Returns True on success.
+async def _build_job_start_request(
+    job: dict,
+    *,
+    persist_dispatch_state: bool = True,
+) -> "JobStartRequest | None":
+    """Build the canonical credential-complete worker start bundle.
 
-    Extracted from assign_job_to_agent() endpoint. Handles datasource resolution,
-    config overrides, HTTP POST to agent pod, and status updates.
+    Both the pinned push dispatcher and stateless claim-bundle endpoint use
+    this exact seam. It deliberately performs no delivery or assignment;
+    callers retain their lane-specific authority. Pinned dispatch preserves
+    the historical status/cache writes on a refused bundle. Stateless claim
+    assembly disables those writes because credential resolution can outlive
+    its queue lease; the final exact-token recheck then makes the whole build
+    read-only from a stale claimant's point of view.
     """
-
     job_id = str(job["id"])
-    agent_id = str(agent["id"])
-
-    # Defense in depth for callers that bypass get_dispatchable_jobs (notably
-    # the manual admin assignment endpoint). A stateless row must never be
-    # POSTed to a pinned agent; its sole claim authority is run_queue (§5.4.4).
-    # Missing is treated as pinned only for pre-0118/mocked job dictionaries;
-    # the production column is NOT NULL and defaults to pinned.
-    if job.get("execution_lane", "pinned") != "pinned":
-        logger.warning(
-            "Dispatch: refusing pinned start for %s job %s",
-            job.get("execution_lane"),
-            job_id,
-        )
-        return False
-
-    if not agent.get("pod_ip"):
-        logger.warning(f"Agent {agent_id} has no pod IP — skipping dispatch")
-        return False
-
-    _log_token = bind_log_context(job_id=job_id, agent_id=agent_id)
+    _log_token = bind_log_context(job_id=job_id)
     try:
         # Extract upload IDs from context if present
         job_context = job.get("context") or {}
@@ -3686,12 +3682,13 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             logger.warning(
                 "Dispatch: connector_unavailable for job %s", job_id, exc_info=True
             )
-            await postgres_db.update_job_status(
-                job_id,
-                status="failed",
-                error_message="connector_unavailable",
-            )
-            return False
+            if persist_dispatch_state:
+                await postgres_db.update_job_status(
+                    job_id,
+                    status="failed",
+                    error_message="connector_unavailable",
+                )
+            return None
 
         has_knowledge_scope = bool(job.get("project_id")) or any(
             str(ds.get("type") or "").lower() == "kb" for ds in (resolved_ds or [])
@@ -3787,20 +3784,22 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     "backend='sandbox' or 'vm', or detach the repository."
                 )
                 logger.error("Dispatch: job %s rejected — %s", job_id, msg)
-                await postgres_db.update_job_status(
-                    job_id=job_id, status="failed", error_message=msg
-                )
-                return False
+                if persist_dispatch_state:
+                    await postgres_db.update_job_status(
+                        job_id=job_id, status="failed", error_message=msg
+                    )
+                return None
             try:
                 config_override = _inject_lite_workspace_config(
                     config_override, prefix=f"jobs/{job_id}/"
                 )
             except LiteWorkspaceConfigError as exc:
                 logger.error("Dispatch: job %s lite-config error: %s", job_id, exc)
-                await postgres_db.update_job_status(
-                    job_id=job_id, status="failed", error_message=str(exc)
-                )
-                return False
+                if persist_dispatch_state:
+                    await postgres_db.update_job_status(
+                        job_id=job_id, status="failed", error_message=str(exc)
+                    )
+                return None
             logger.info(
                 "Dispatch: job %s using lite workspace (backend=%s, no pod)",
                 job_id,
@@ -3838,10 +3837,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 "was not ready; it should be held until ready rather than dispatched."
             )
             logger.error("Dispatch: job %s refused — %s", job_id, msg)
-            await postgres_db.update_job_status(
-                job_id=job_id, status="failed", error_message=msg
-            )
-            return False
+            if persist_dispatch_state:
+                await postgres_db.update_job_status(
+                    job_id=job_id, status="failed", error_message=msg
+                )
+            return None
 
         # Orchestrator-resolved config (supersedes agent-side Decision 6): when
         # experts are enabled, resolve the full config here with the same loader
@@ -3914,9 +3914,10 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         include_kb_profile=has_knowledge_scope,
                     ),
                 )
-                await postgres_db.store_resolved_config(
-                    job_id, redact_config_override(resolved_config)
-                )
+                if persist_dispatch_state:
+                    await postgres_db.store_resolved_config(
+                        job_id, redact_config_override(resolved_config)
+                    )
                 logger.info(
                     "Dispatch: resolved config for job %s (expert_id=%s)",
                     job_id,
@@ -3924,12 +3925,13 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 )
             except GrantDenied as gd:
                 logger.warning("Dispatch denied for job %s: %s", job_id, gd)
-                await postgres_db.update_job_status(
-                    job_id,
-                    status="failed",
-                    error_message=_grant_violations_detail(gd.violations),
-                )
-                return False
+                if persist_dispatch_state:
+                    await postgres_db.update_job_status(
+                        job_id,
+                        status="failed",
+                        error_message=_grant_violations_detail(gd.violations),
+                    )
+                return None
             except Exception:
                 logger.exception(
                     "Dispatch: resolve_config failed for job %s; falling back "
@@ -3974,10 +3976,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     job_id,
                     _unrouted,
                 )
-                await postgres_db.update_job_status(
-                    job_id, status="failed", error_message=msg
-                )
-                return False
+                if persist_dispatch_state:
+                    await postgres_db.update_job_status(
+                        job_id, status="failed", error_message=msg
+                    )
+                return None
 
         # Build job start request. resolved_config and config_override are
         # mutually exclusive on the wire: a delivered blob is complete, so we
@@ -4003,42 +4006,83 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             project_id=str(job["project_id"]) if job.get("project_id") else None,
         )
 
-        # Send to agent pod
+        return job_start
+
+    except Exception as e:
+        logger.error(
+            "Dispatch: failed to build start bundle for job %s: %s",
+            job_id,
+            e,
+            exc_info=True,
+        )
+        return None
+    finally:
+        reset_log_context(_log_token)
+
+
+async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
+    """Build and push a fresh job to a registered pinned agent."""
+    job_id = str(job["id"])
+    agent_id = str(agent["id"])
+
+    # Defense in depth for callers that bypass get_dispatchable_jobs (notably
+    # the manual admin assignment endpoint). A stateless row must never be
+    # POSTed to a pinned agent; its sole claim authority is run_queue (§5.4.4).
+    if job.get("execution_lane", "pinned") != "pinned":
+        logger.warning(
+            "Dispatch: refusing pinned start for %s job %s",
+            job.get("execution_lane"),
+            job_id,
+        )
+        return False
+    if not agent.get("pod_ip"):
+        logger.warning("Agent %s has no pod IP — skipping dispatch", agent_id)
+        return False
+
+    _log_token = bind_log_context(job_id=job_id, agent_id=agent_id)
+    try:
+        job_start = await _build_job_start_request(job)
+        if job_start is None:
+            return False
+
         agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/start"
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 agent_url,
                 json=job_start.model_dump(exclude_none=True),
             )
-
         if response.status_code not in (200, 202):
             logger.warning(
-                f"Dispatch: agent {agent_id} rejected job {job_id}: {response.text}"
+                "Dispatch: agent %s rejected job %s: %s",
+                agent_id,
+                job_id,
+                response.text,
             )
             return False
 
-        # Update job status and assign to agent
         await postgres_db.update_job_status(
             job_id=job_id,
             status="processing",
             assigned_agent_id=agent_id,
         )
-
-        # Update agent status via heartbeat simulation
         await postgres_db.heartbeat(
             agent_id=agent_id,
             status="working",
             current_job_id=job_id,
         )
-
         logger.info(
-            f"Dispatch: assigned job {job_id} (priority={job.get('priority', '?')}) to agent {agent_id}"
+            "Dispatch: assigned job %s (priority=%s) to agent %s",
+            job_id,
+            job.get("priority", "?"),
+            agent_id,
         )
         return True
-
-    except Exception as e:
+    except Exception as exc:
         logger.error(
-            f"Dispatch: failed to assign job {job_id} to agent {agent_id}: {e}",
+            "Dispatch: failed to assign job %s to agent %s: %s",
+            job_id,
+            agent_id,
+            exc,
             exc_info=True,
         )
         return False
@@ -5677,6 +5721,45 @@ def _job_needs_sandbox(job: dict) -> bool:
     return container_provisioner.is_available or docker_provisioner.is_available
 
 
+def _resolve_requested_job_execution_lane(
+    requested_lane: Literal["pinned", "stateless"] | None,
+    *,
+    needs_vm: bool,
+    needs_sandbox: bool,
+) -> Literal["pinned", "stateless"] | None:
+    """Apply the default-off, k8s-sandbox-only worker admission gate.
+
+    ``None`` is preserved so Postgres can distinguish an omitted root (pinned)
+    from an omitted child (authoritative parent-lane inheritance).
+    """
+    if needs_vm:
+        # This is a capability decision, not a silent arbitrary lane flip: the
+        # first stateless worker pool intentionally has no VM mesh sidecar.
+        return "pinned"
+    if requested_lane != "stateless":
+        return requested_lane
+    if not STATELESS_WORKER_ENABLED:
+        raise HTTPException(
+            status_code=409, detail="Stateless worker admission is disabled"
+        )
+    if not (container_provisioner.is_available and container_provisioner.in_cluster):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Stateless workers require an in-cluster Kubernetes "
+                "workspace provisioner"
+            ),
+        )
+    if not needs_sandbox:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Stateless workers currently require a Kubernetes sandbox workspace"
+            ),
+        )
+    return "stateless"
+
+
 def _get_container_context(job: dict) -> dict:
     """Extract the workspace_container sub-dict from job context."""
     ctx = job.get("context") or {}
@@ -5905,10 +5988,6 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
 
     own_container = ctx.get("workspace_container") or {}
     own_vm = ctx.get("vm") or {}
-    # Flag set but the copied snapshot hasn't landed on context yet — nothing to
-    # resolve this tick; the branches below key off which backend was inherited.
-    if not own_container and not own_vm:
-        return ("proceed", None)
 
     try:
         parent = await postgres_db.get_job(str(parent_id))
@@ -5936,11 +6015,19 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
             parent_ctx = {}
     parent_container = parent_ctx.get("workspace_container") or {}
     parent_vm = parent_ctx.get("vm") or {}
+    # The inherit flag is authoritative even if an explicit reprovision resume
+    # shed the child's stale copied snapshot. Infer the inherited backend from
+    # the parent's current live context in that case; never let a flag-only
+    # child fall through to self-provisioning or a bundle with no remote.
+    inherit_container = bool(own_container) or (not own_vm and bool(parent_container))
+    inherit_vm = bool(own_vm) or (
+        not own_container and not parent_container and bool(parent_vm)
+    )
 
     # Parent's workspace is ready → overlay the live context and dispatch. All
     # downstream machinery (_job_needs_sandbox/_job_needs_vm, the dispatch-time
     # injectors) then keys off the ready context and injects workspace.remote.
-    if own_container and parent_container.get("status") == "ready":
+    if inherit_container and parent_container.get("status") == "ready":
         ctx["workspace_container"] = parent_container
         job["context"] = ctx
         logger.info(
@@ -5951,7 +6038,7 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
             parent_container.get("host") or parent_container.get("pod_ip"),
         )
         return ("proceed", None)
-    if own_vm and parent_vm.get("status") == "ready":
+    if inherit_vm and parent_vm.get("status") == "ready":
         ctx["vm"] = parent_vm
         job["context"] = ctx
         logger.info(
@@ -6035,7 +6122,25 @@ async def _fail_subjob_and_unblock_parent(job: dict, message: str) -> None:
     failure is self-healing, not just today's inherit-timeout.
     """
     job_id = str(job["id"])
-    await postgres_db.update_job_status(job_id, status="failed", error_message=message)
+    stateless_worker = job.get("execution_lane") == "stateless"
+    updated = await postgres_db.update_job_status(
+        job_id,
+        status="failed",
+        error_message=message,
+        expected_status=(str(job.get("status")) if stateless_worker else None),
+    )
+    if stateless_worker and not updated:
+        # The dispatcher row is a stale snapshot. A control verb may have
+        # cancelled/completed the child while workspace inheritance was being
+        # resolved; never overwrite that winner or unblock the parent from a
+        # failure disposition that did not commit.
+        logger.info(
+            "Dispatcher: skipped stale stateless subjob failure for %s "
+            "(expected_status=%s)",
+            job_id,
+            job.get("status"),
+        )
+        return
     # The unblock handlers classify the outcome from job['status']; the in-memory
     # row still holds the pre-fail status, so sync it before delegating. Each
     # handler is a no-op for the wrong subjob type (scholar_target / creation_order
@@ -7415,13 +7520,24 @@ async def _try_dispatch_pending_jobs() -> None:
     registers as ready. Jobs with a ready VM get workspace config injected
     into config_override before dispatch.
     """
-    if not AUTO_ASSIGN_ENABLED:
+    if not AUTO_ASSIGN_ENABLED and not STATELESS_WORKER_ENABLED:
         return
 
     async with _dispatch_lock:
         try:
-            # Get pending jobs (created + paused, priority ordered)
-            pending_jobs = await postgres_db.get_dispatchable_jobs(limit=50)
+            # Both lanes retain the same leader-owned workspace preflight. The
+            # pinned set proceeds to registered-agent matching; a ready
+            # stateless set is admitted to run_queue and never reaches that
+            # half of this function.
+            pending_jobs = (
+                await postgres_db.get_dispatchable_jobs(limit=50)
+                if AUTO_ASSIGN_ENABLED
+                else []
+            )
+            if STATELESS_WORKER_ENABLED:
+                pending_jobs.extend(
+                    await postgres_db.get_admittable_stateless_jobs(limit=50)
+                )
             if not pending_jobs:
                 return
 
@@ -7429,6 +7545,91 @@ async def _try_dispatch_pending_jobs() -> None:
             dispatchable_jobs = []
             for job in pending_jobs:
                 job_id = str(job["id"])
+                stateless_worker = job.get("execution_lane") == "stateless"
+
+                # Defense for inherited/operator-created rows. An explicit VM
+                # request is the one supported plane transition: pin it before
+                # provisioning so the VM-mesh registered-agent path owns it.
+                if stateless_worker and _job_needs_vm(job):
+                    moved_to_pinned = False
+                    async with postgres_db.acquire() as conn:
+                        async with conn.transaction():
+                            await conn.fetchrow(
+                                "SELECT state FROM run_queue "
+                                "WHERE unit_id = $1::uuid "
+                                "AND unit_kind = 'worker_batch' FOR UPDATE",
+                                job_id,
+                            )
+                            moved = await conn.fetchrow(
+                                "UPDATE jobs SET execution_lane = 'pinned', "
+                                "updated_at = CURRENT_TIMESTAMP "
+                                "WHERE id = $1::uuid "
+                                "AND execution_lane = 'stateless' "
+                                "AND status::text = $2::text "
+                                "RETURNING id",
+                                job_id,
+                                str(job.get("status") or ""),
+                            )
+                            if moved is not None:
+                                moved_to_pinned = True
+                                await conn.execute(
+                                    "UPDATE run_queue SET state = 'done', "
+                                    "lease_token = lease_token + 1, "
+                                    "leased_by = NULL, last_leased_by = NULL, "
+                                    "leased_until = NULL, run_after = now(), "
+                                    "queued_at = now() "
+                                    "WHERE unit_id = $1::uuid "
+                                    "AND unit_kind = 'worker_batch'",
+                                    job_id,
+                                )
+                    if moved_to_pinned:
+                        logger.info(
+                            "Dispatcher: moved VM job %s from stateless to pinned lane",
+                            job_id,
+                        )
+                    else:
+                        logger.debug(
+                            "Dispatcher: VM lane repair lost the status CAS for job %s",
+                            job_id,
+                        )
+                    continue
+                _stateless_container = _get_container_context(job)
+                _stateless_has_k8s_workspace = (
+                    _stateless_container.get("status") == "ready"
+                    and _stateless_container.get("provisioner") == "k8s"
+                    and bool(
+                        _stateless_container.get("host")
+                        or _stateless_container.get("pod_ip")
+                    )
+                )
+                if stateless_worker and not (
+                    _job_needs_sandbox(job) or _stateless_has_k8s_workspace
+                ):
+                    logger.error(
+                        "Dispatcher: refusing stateless job %s without a sandbox "
+                        "workspace",
+                        job_id,
+                    )
+                    await postgres_db.update_job_status(
+                        job_id,
+                        status="failed",
+                        error_message=(
+                            "Stateless workers currently require a Kubernetes "
+                            "sandbox workspace"
+                        ),
+                        expected_status=str(job.get("status")),
+                    )
+                    continue
+                if stateless_worker and not (
+                    container_provisioner.is_available
+                    and container_provisioner.in_cluster
+                ):
+                    logger.warning(
+                        "Dispatcher: stateless job %s waiting for the in-cluster "
+                        "Kubernetes workspace provisioner",
+                        job_id,
+                    )
+                    continue
 
                 # Subjobs (scholar / critic) share their parent's workspace but
                 # copy its context by value at spawn time — stale when the parent
@@ -7900,7 +8101,12 @@ async def _try_dispatch_pending_jobs() -> None:
                             msg,
                         )
                         await postgres_db.update_job_status(
-                            job_id, status="failed", error_message=msg
+                            job_id,
+                            status="failed",
+                            error_message=msg,
+                            expected_status=(
+                                str(job.get("status")) if stateless_worker else None
+                            ),
                         )
                         continue
                     if res.outcome is EnsureOutcome.PENDING:
@@ -7940,6 +8146,29 @@ async def _try_dispatch_pending_jobs() -> None:
                             "Dispatcher: job %s — no workspace provisioner needed",
                             job_id,
                         )
+                if stateless_worker:
+                    (
+                        admitted,
+                        queue_result,
+                    ) = await postgres_db.admit_stateless_worker_job(
+                        job_id,
+                        fair_key=(str(job["user_id"]) if job.get("user_id") else None),
+                        priority=int(job.get("priority") or 0),
+                    )
+                    if not admitted:
+                        logger.warning(
+                            "Dispatcher: stateless admission CAS lost for job %s; "
+                            "workspace/lane/status changed after preflight",
+                            job_id,
+                        )
+                        continue
+                    logger.info(
+                        "Dispatcher: admitted stateless worker job %s "
+                        "(queue=%s, workspace=k8s-ready)",
+                        job_id,
+                        queue_result,
+                    )
+                    continue
                 dispatchable_jobs.append(job)
 
             if not dispatchable_jobs:
@@ -8107,7 +8336,11 @@ async def auto_assign_dispatcher(shutdown_event: asyncio.Event) -> None:
     Runs every 30 seconds as a catch-all. Event-driven triggers (job creation,
     agent heartbeat) also call _try_dispatch_pending_jobs() for faster response.
     """
-    logger.info("Auto-assign dispatcher started (enabled=%s)", AUTO_ASSIGN_ENABLED)
+    logger.info(
+        "Auto-assign dispatcher started (pinned=%s, stateless_workers=%s)",
+        AUTO_ASSIGN_ENABLED,
+        STATELESS_WORKER_ENABLED,
+    )
     while not shutdown_event.is_set():
         try:
             await _try_dispatch_pending_jobs()
@@ -8133,7 +8366,7 @@ def _trigger_dispatch() -> None:
     """
     from services.leader_election import is_leader
 
-    if AUTO_ASSIGN_ENABLED and is_leader.is_set():
+    if (AUTO_ASSIGN_ENABLED or STATELESS_WORKER_ENABLED) and is_leader.is_set():
         asyncio.create_task(_try_dispatch_pending_jobs())
 
 
@@ -8468,6 +8701,14 @@ class JobCreate(BaseModel):
     delegation_context: str | None = Field(
         None, description="Shared context string from parent delegation"
     )
+    execution_lane: Literal["pinned", "stateless"] | None = Field(
+        None,
+        description=(
+            "Execution plane opt-in. Omitted root jobs remain pinned; omitted "
+            "child jobs inherit their authoritative parent lane. Stateless "
+            "worker admission is deployment-gated and Kubernetes-sandbox only."
+        ),
+    )
 
     @model_validator(mode="after")
     def reject_null_datasource_selection(self) -> "JobCreate":
@@ -8530,6 +8771,13 @@ class JobCompleteRequest(BaseModel):
     error: dict[str, Any] | None = Field(None, description="Error dict if job failed")
     freeze_data: dict[str, Any] | None = Field(
         None, description="Freeze data from the graph state"
+    )
+    lease_token: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "Current worker_batch fencing token. Required only for stateless jobs."
+        ),
     )
 
 
@@ -10313,7 +10561,13 @@ async def lifespan(app: FastAPI):
     # priority-10 dispatchable jobs and parasitically preempt real work. See
     # docs/done/preemption_before_first_checkpoint_replays_job_opening.md.
     stale_verification_sweeper_task = asyncio.create_task(
-        stale_verification_sweeper_loop(postgres_db, _shutdown_event)
+        stale_verification_sweeper_loop(
+            postgres_db,
+            _shutdown_event,
+            stateless_cancel_fn=(
+                postgres_db.cancel_and_settle_stale_stateless_verification_subjob
+            ),
+        )
     )
     # Backstop for session wakes: deliver any completion notice whose
     # opportunistic post-commit send was lost, or whose terminal path has no
@@ -11531,6 +11785,25 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     creator = None
             await _check_vm_permission(creator, job_needs_vm=True)
 
+        # Stateless worker admission is an explicit, independently gated
+        # opt-in. The first slice can reach only Kubernetes workspace pods;
+        # VM jobs keep their established pinned lane because the stateless
+        # worker Deployment has no mesh sidecar. Omitted children are resolved
+        # from the authoritative parent lane inside PostgresDB.create_job, so a
+        # stateless parent cannot silently revive the registered-agent plane.
+        execution_lane = _resolve_requested_job_execution_lane(
+            job.execution_lane,
+            needs_vm=needs_vm,
+            needs_sandbox=_job_needs_sandbox(
+                {"context": context, "config_override": config_override}
+            ),
+        )
+        if job.execution_lane == "stateless" and execution_lane == "pinned":
+            logger.info(
+                "Job create: VM request keeps job on pinned lane "
+                "(stateless worker opt-in ignored)"
+            )
+
         # Capability PEP on the merged override — same fail-fast rationale as
         # the VM gate above, so an over-reaching override is refused here
         # instead of dying at dispatch. See the helper for what it deliberately
@@ -11703,6 +11976,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             datasource_policy_revisions=selected_ds_revisions,
             authority_user_id=(str(effective_user_id) if effective_user_id else None),
             authority_project_ids=(target_project_ids if effective_user_id else None),
+            execution_lane=execution_lane,
         )
 
         # Create Gitea repo/branch + grant creator access + seed the Mode A
@@ -11788,6 +12062,19 @@ async def delete_job(request: Request, job_id: str) -> dict[str, str]:
                 detail="Job has child jobs; delete them first",
             )
 
+        # A stateless saver is authorized by its run_queue generation, not by
+        # the continued existence of the jobs row. Permanently fence that
+        # generation and prove the canonical checkpoint thread empty before
+        # workspace teardown; pruning after row deletion would let a live
+        # predecessor recreate orphaned checkpoints.
+        if job.get("execution_lane") == "stateless":
+            prepared = await postgres_db.prepare_stateless_job_for_delete(job_id)
+            if not prepared:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Stateless job changed while deletion was being prepared",
+                )
+
         # Tear down workspace/VM resources while the row still exists — the
         # provisioners resolve them through the job's context, and once the
         # row is gone the lifecycle reconciler refuses to reap the pod
@@ -11872,7 +12159,15 @@ async def delete_job(request: Request, job_id: str) -> dict[str, str]:
         except Exception as e:
             logger.warning(f"Failed to clean up vector DB tables for job {job_id}: {e}")
 
-        success = await postgres_db.delete_job(job_id)
+        if job.get("execution_lane") == "stateless":
+            success = await postgres_db.delete_job(
+                job_id,
+                prepared_stateless=True,
+            )
+        else:
+            # Pinned deletion keeps its historical collaborator signature and
+            # behavior; only stateless checkpoints need the queue fence above.
+            success = await postgres_db.delete_job(job_id)
         if not success:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
         return {"status": "deleted"}
@@ -11916,7 +12211,7 @@ async def subjob_merge(request: Request, job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-async def _cascade_cancel_to_children(job_id: str) -> None:
+async def _cascade_cancel_to_children(job_id: str) -> bool:
     """Cancel all non-terminal descendant jobs of a parent.
 
     Fetches the full descendant tree (recursive), signals processing agents
@@ -11924,7 +12219,7 @@ async def _cascade_cancel_to_children(job_id: str) -> None:
     """
     children = await postgres_db.get_descendant_jobs(job_id)
     if not children:
-        return
+        return True
 
     # Signal processing agents concurrently
     async def _signal_cancel(child: dict) -> None:
@@ -11958,28 +12253,76 @@ async def _cascade_cancel_to_children(job_id: str) -> None:
         except Exception as e:
             logger.warning(f"Workspace cleanup failed for child {child_id}: {e}")
 
+    pinned_children = [c for c in children if c.get("execution_lane") != "stateless"]
+    stateless_children = [c for c in children if c.get("execution_lane") == "stateless"]
+
     await asyncio.gather(
-        *[_signal_cancel(c) for c in children],
-        *[_cleanup_child(c) for c in children],
+        *[_signal_cancel(c) for c in pinned_children],
+        *[_cleanup_child(c) for c in pinned_children],
         return_exceptions=True,
     )
 
-    # Bulk cancel in DB
-    child_ids = [str(c["id"]) for c in children]
-    async with postgres_db.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE jobs
-            SET status = 'cancelled',
-                assigned_agent_id = NULL,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ANY($1::uuid[])
-              AND status NOT IN ('completed', 'cancelled')
-            """,
-            child_ids,
-        )
+    async def _cancel_stateless_child(child: dict) -> bool:
+        child_id = str(child["id"])
+        cancelled, _queue_closed = await postgres_db.cancel_stateless_job(child_id)
+        if cancelled:
+            return await _wait_for_stateless_cancel_settle(child_id)
+        refreshed = await postgres_db.get_job(child_id)
+        if not refreshed:
+            return True
+        if refreshed.get("status") in ("completed", "failed"):
+            return True
+        if refreshed.get("status") != "cancelled":
+            return False
+        refreshed_context = refreshed.get("context") or {}
+        if isinstance(refreshed_context, str):
+            try:
+                refreshed_context = json.loads(refreshed_context)
+            except (TypeError, ValueError):
+                refreshed_context = {}
+        if refreshed_context.get("_stateless_cancel_cleanup_pending") is True:
+            return await _wait_for_stateless_cancel_settle(child_id)
+        return True
 
-    logger.info(f"Cascade-cancelled {len(child_ids)} descendant(s) of job {job_id}")
+    stateless_results = await asyncio.gather(
+        *[_cancel_stateless_child(c) for c in stateless_children],
+        return_exceptions=True,
+    )
+    stateless_settled = True
+    for child, result in zip(stateless_children, stateless_results, strict=True):
+        if result is True:
+            continue
+        stateless_settled = False
+        if isinstance(result, BaseException):
+            logger.error(
+                "Cascade cancellation could not settle stateless child %s",
+                child.get("id"),
+                exc_info=(type(result), result, result.__traceback__),
+            )
+        else:
+            logger.error(
+                "Cascade cancellation timed out with stateless child %s still live",
+                child.get("id"),
+            )
+
+    # Bulk cancel in DB
+    pinned_ids = [str(c["id"]) for c in pinned_children]
+    if pinned_ids:
+        async with postgres_db.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'cancelled',
+                    assigned_agent_id = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ANY($1::uuid[])
+                  AND status NOT IN ('completed', 'cancelled')
+                """,
+                pinned_ids,
+            )
+
+    logger.info(f"Cascade-cancelled {len(children)} descendant(s) of job {job_id}")
+    return stateless_settled
 
 
 async def _cascade_pause_to_children(job_id: str) -> None:
@@ -11993,6 +12336,12 @@ async def _cascade_pause_to_children(job_id: str) -> None:
     processing = [c for c in children if c["status"] == "processing"]
     if not processing:
         return
+    pinned_processing = [
+        c for c in processing if c.get("execution_lane") != "stateless"
+    ]
+    stateless_processing = [
+        c for c in processing if c.get("execution_lane") == "stateless"
+    ]
 
     async def _signal_pause(child: dict) -> None:
         child_id = str(child["id"])
@@ -12019,13 +12368,93 @@ async def _cascade_pause_to_children(job_id: str) -> None:
         await postgres_db.pause_job(child_id)
 
     await asyncio.gather(
-        *[_signal_pause(c) for c in processing],
+        *[_signal_pause(c) for c in pinned_processing],
         return_exceptions=True,
     )
+    for child in stateless_processing:
+        await postgres_db.pause_stateless_job(str(child["id"]))
 
     logger.info(
         f"Cascade-paused {len(processing)} processing descendant(s) of job {job_id}"
     )
+
+
+async def _wait_for_stateless_cancel_settle(
+    job_id: str,
+    *,
+    timeout_seconds: float = 130.0,
+    poll_seconds: float = 0.5,
+) -> bool:
+    """Wait for a cancelled worker owner to teardown, then prune/archive.
+
+    The status write is the preemption signal and must happen first. A live
+    holder discovers it on renewal, tears down local/tmux ownership, then
+    closes its exact queue lease. A killed holder is reclaimed within the
+    queue TTL/reaper horizon. Only after that boundary is it safe to delete the
+    shared checkpoint and workspace underneath the former owner.
+    """
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            async with postgres_db.stateless_cancel_cleanup_lock(
+                job_id
+            ) as cleanup_owner:
+                if not cleanup_owner:
+                    settled = False
+                else:
+                    cleanup_pending = (
+                        await postgres_db.stateless_cancel_cleanup_pending(job_id)
+                    )
+                    if cleanup_pending is False:
+                        # A prior owner already cleared the durable marker (or
+                        # permanent DELETE removed the row). Never repeat the
+                        # destructive workspace cleanup after Resume can run.
+                        return True
+                    if cleanup_pending is None:
+                        settled = False
+                    else:
+                        settled = await postgres_db.finalize_cancelled_stateless_job(
+                            job_id
+                        )
+                    if settled:
+                        workspace_clean = True
+                        try:
+                            await _archive_and_cleanup_workspace(job_id)
+                        except Exception as exc:
+                            workspace_clean = False
+                            logger.warning(
+                                "Workspace cleanup failed for cancelled stateless "
+                                "job %s: %s",
+                                job_id,
+                                exc,
+                            )
+                        if workspace_clean:
+                            cleanup_completed = (
+                                await postgres_db.complete_stateless_cancel_cleanup(
+                                    job_id
+                                )
+                            )
+                            if cleanup_completed:
+                                return True
+                            settled = False
+                        else:
+                            # Keep the durable Resume block until workspace teardown
+                            # has actually returned successfully. Clearing it after an
+                            # exception would let a new claim attach while cancellation's
+                            # destructive cleanup is only half complete.
+                            settled = False
+        except Exception:
+            logger.warning(
+                "Stateless cancel settle check failed for job %s; retrying",
+                job_id,
+                exc_info=True,
+            )
+            settled = False
+
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(max(0.01, poll_seconds), remaining))
 
 
 @app.put("/api/jobs/{job_id}/cancel")
@@ -12039,6 +12468,73 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
     """
     _, job = await require_internal_or_job_access(request, postgres_db, job_id)
     try:
+        if job.get("execution_lane") == "stateless":
+            success, _queue_closed = await postgres_db.cancel_stateless_job(job_id)
+            if not success:
+                refreshed = await postgres_db.get_job(job_id)
+                if refreshed and refreshed.get("execution_lane") == "pinned":
+                    # The defensive VM repair may have won the queue lock and
+                    # moved this legacy row after our initial lane read. Fall
+                    # through to the established pinned cancellation path.
+                    job = refreshed
+                elif (
+                    refreshed
+                    and (refreshed.get("context") or {}).get(
+                        "_stateless_delete_pending"
+                    )
+                    is True
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Job deletion is already in progress",
+                    )
+                elif not refreshed or refreshed.get("status") != "cancelled":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Job cannot be cancelled (already completed or cancelled)"
+                        ),
+                    )
+
+            if job.get("execution_lane") == "stateless":
+                # Publish descendant cancellation before any root-workspace
+                # teardown. Stateless children can share this exact parent pod;
+                # waiting below must include their live holders or cleanup could
+                # pull the workspace out from under a still-running critic/scholar.
+                descendants_settled = await _cascade_cancel_to_children(job_id)
+
+                if descendants_settled:
+                    # The current token remains live so renewal can return the
+                    # cancelled status. Wait through the same bounded cooperative
+                    # stop horizon as the pinned cancel route, then clean up only
+                    # after the exact holder has closed (or the reaper reconciled)
+                    # the queue row.
+                    settled = await _wait_for_stateless_cancel_settle(job_id)
+                    if not settled:
+                        logger.error(
+                            "Stateless cancel cleanup timed out for job %s; terminal "
+                            "workspace lifecycle remains the teardown backstop",
+                            job_id,
+                        )
+                else:
+                    logger.error(
+                        "Stateless cancel left root workspace %s intact because a "
+                        "descendant worker was not proven quiescent",
+                        job_id,
+                    )
+
+                job["status"] = "cancelled"
+                try:
+                    await _handle_scholar_completion(job, [])
+                except Exception as exc:
+                    logger.warning(
+                        "Error handling scholar cancellation for %s: %s", job_id, exc
+                    )
+                await maybe_wake_session(postgres_db, job_id, "cancelled")
+                _kick_session_wake_drain(postgres_db)
+                _trigger_dispatch()
+                return {"status": "cancelled"}
+
         # If job is assigned to an agent, send cancel request to agent pod
         assigned_agent_id = job.get("assigned_agent_id")
         if assigned_agent_id:
@@ -12150,6 +12646,17 @@ async def pause_job(request: Request, job_id: str) -> dict[str, str]:
                 detail=f"Job cannot be paused (status: {job['status']})",
             )
 
+        if job.get("execution_lane") == "stateless":
+            success = await postgres_db.pause_stateless_job(job_id)
+            if not success:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Job cannot be paused (status may have changed)",
+                )
+            await maybe_wake_session(postgres_db, job_id, "paused")
+            await _cascade_pause_to_children(job_id)
+            return {"status": "paused", "job_id": job_id}
+
         # Send pause request to agent pod
         assigned_agent_id = job.get("assigned_agent_id")
         if assigned_agent_id:
@@ -12255,6 +12762,11 @@ class MessageSendRequest(BaseModel):
     )
     project_id: str | None = Field(
         None, description="Project ID for member resolution (auto-filled from job)"
+    )
+    lease_token: int | None = Field(
+        None,
+        ge=1,
+        description="Exact stateless worker lease; ignored for pinned jobs",
     )
 
 
@@ -12493,11 +13005,51 @@ async def send_agent_message(
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "job_id": job_id,
             }
-            await postgres_db.update_job_status(
-                job_id=job_id,
-                status="waiting_for_reply",
-                freeze_data=freeze_data,
-            )
+            if job.get("execution_lane") == "stateless":
+                if request.lease_token is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Blocking message does not hold the worker lease",
+                    )
+                async with postgres_db.acquire() as conn:
+                    async with conn.transaction():
+                        queue = await conn.fetchrow(
+                            "SELECT state, lease_token FROM run_queue "
+                            "WHERE unit_id = $1::uuid "
+                            "AND unit_kind = 'worker_batch' FOR UPDATE",
+                            job_id,
+                        )
+                        exact_lease = bool(
+                            queue
+                            and queue["state"] == "leased"
+                            and int(queue["lease_token"]) == int(request.lease_token)
+                        )
+                        if not exact_lease:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Blocking message does not hold the worker lease",
+                            )
+                        updated = await conn.fetchrow(
+                            "UPDATE jobs SET status = 'waiting_for_reply', "
+                            "freeze_data = $1::jsonb, "
+                            "updated_at = CURRENT_TIMESTAMP "
+                            "WHERE id = $2::uuid "
+                            "AND execution_lane = 'stateless' "
+                            "AND status = 'processing' RETURNING id",
+                            json.dumps(freeze_data),
+                            job_id,
+                        )
+                        if updated is None:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Job changed before blocking message was committed",
+                            )
+            else:
+                await postgres_db.update_job_status(
+                    job_id=job_id,
+                    status="waiting_for_reply",
+                    freeze_data=freeze_data,
+                )
 
         file_path = f"messages/{thread_id}/{sequence:03d}_sent.md"
 
@@ -12851,6 +13403,7 @@ async def _route_inbound_reply(
     await postgres_db.append_queued_reply(
         job_id,
         {
+            "id": str(uuid4()),
             "thread_id": thread_id,
             "message": message,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -12933,6 +13486,25 @@ class GuidanceAckRequest(BaseModel):
         description="thread ids whose context.queued_replies were drained "
         "at a phase boundary",
     )
+    reply_keys: list[str] = Field(
+        default_factory=list,
+        description="exact durable identities of queued replies absorbed by "
+        "a stateless-worker checkpoint",
+    )
+    feedback_keys: list[str] = Field(
+        default_factory=list,
+        description="exact generations of queued feedback absorbed by a "
+        "stateless-worker checkpoint",
+    )
+    delegation_keys: list[str] = Field(
+        default_factory=list,
+        description="exact generations of delegation results absorbed by a "
+        "stateless-worker checkpoint",
+    )
+    checkpoint_id: str | None = Field(
+        default=None,
+        description="durable LangGraph checkpoint proving stateless delivery",
+    )
 
 
 @app.post("/api/jobs/{job_id}/guidance/ack")
@@ -12942,9 +13514,12 @@ async def ack_job_guidance(
     """Ack delivered supervisor guidance / drained queued replies.
     **Internal** (P4b) — requires ``X-Internal-Key``.
 
-    The agent calls this after the entries reached LLM-visible context.
+    The pinned agent calls this after entries reached LLM-visible context. A
+    stateless worker calls it only after the checkpoint that absorbed those
+    entries committed; ``checkpoint_id`` is verified before anything moves.
     Entries move atomically ``context.pending_guidance`` (by id) /
-    ``context.queued_replies`` (by thread id) → ``context.consumed_replies``
+    ``context.queued_replies`` (by exact key for stateless workers, legacy
+    thread id for pinned workers) → ``context.consumed_replies``
     with a ``consumed_at`` stamp — which stops heartbeat redelivery /
     boundary re-materialization, and lets the sender confirm delivery by
     reading job context. At-least-once by design: a lost ack just means
@@ -12956,9 +13531,15 @@ async def ack_job_guidance(
             job_id,
             guidance_ids=body.guidance_ids,
             reply_threads=body.reply_threads,
+            reply_keys=body.reply_keys,
+            feedback_keys=body.feedback_keys,
+            delegation_keys=body.delegation_keys,
+            checkpoint_id=body.checkpoint_id,
         )
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     if moved is None:
@@ -13912,6 +14493,25 @@ async def resume_job(
             )
 
     try:
+        resume_context = job.get("context") or {}
+        if isinstance(resume_context, str):
+            try:
+                resume_context = json.loads(resume_context)
+            except (TypeError, ValueError):
+                resume_context = {}
+        if (
+            job.get("execution_lane") == "stateless"
+            and isinstance(resume_context, dict)
+            and (
+                resume_context.get("_stateless_delete_pending") is True
+                or resume_context.get("_stateless_cancel_cleanup_pending") is True
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Job lifecycle cleanup is already in progress",
+            )
+
         # Allow resuming jobs in any status except completed
         # This handles cancelled jobs (user wants to retry) and cases where
         # agents disappear without marking jobs as failed
@@ -13930,7 +14530,12 @@ async def resume_job(
             else "An operator explicitly resumed this job with the feedback below."
         )
 
-        async def _queue_for_dispatch(message: str) -> dict[str, str]:
+        async def _queue_for_dispatch(
+            message: str,
+            *,
+            workspace_preflight_required: bool = False,
+            workspace_context_key: str | None = None,
+        ) -> dict[str, str]:
             """Park the job as 'paused' (dispatchable, unassigned) and kick the
             auto-dispatcher. Used both when no agent is ready and when the
             picked agent rejects the resume (its DB 'ready' was stale). Stashes
@@ -13940,15 +14545,98 @@ async def resume_job(
             (``get_dispatchable_jobs`` requires ``freeze_data IS NULL``).
             """
             feedback = request.feedback if request else None
-            await postgres_db.queue_job_for_resume(
-                job_id,
+            context_merge = (
                 {
                     "queued_feedback": feedback,
                     "queued_feedback_reason": feedback_reason,
                 }
                 if feedback
-                else None,
+                else None
             )
+            expected_status = str(job["status"])
+            if (
+                job.get("execution_lane") == "stateless"
+                and workspace_preflight_required
+            ):
+                if workspace_context_key is None:
+                    raise RuntimeError(
+                        "stateless workspace preflight requires a context key"
+                    )
+                queued = await postgres_db.prepare_stateless_job_for_workspace_resume(
+                    job_id,
+                    workspace_context_key,
+                    context_merge,
+                    expected_status=expected_status,
+                )
+            elif job.get("execution_lane") == "stateless":
+                queued = await postgres_db.queue_stateless_job_for_resume(
+                    job_id,
+                    context_merge,
+                    priority=int(job.get("priority") or 0),
+                    fair_key=(str(job["user_id"]) if job.get("user_id") else None),
+                    expected_status=expected_status,
+                )
+            else:
+                # Missing stateless workspaces deliberately return through the
+                # leader preflight before any queue row becomes runnable.
+                queued = await postgres_db.queue_job_for_resume(
+                    job_id,
+                    context_merge,
+                    expected_status=expected_status,
+                )
+            if not queued and job.get("execution_lane") == "stateless":
+                # A legacy/operator-created VM row may be repaired to the
+                # pinned lane while this request waits for the queue lock.
+                # Refresh exactly once and retry the historical pinned verb;
+                # its status CAS still prevents a concurrent terminal control
+                # from being resurrected.
+                refreshed = await postgres_db.get_job(job_id)
+                if (
+                    refreshed
+                    and refreshed.get("execution_lane") == "pinned"
+                    and str(refreshed.get("status") or "") == expected_status
+                ):
+                    if workspace_preflight_required:
+                        if workspace_context_key is None:
+                            raise RuntimeError(
+                                "workspace preflight requires a context key"
+                            )
+                        await postgres_db.shed_workspace_context(
+                            job_id, workspace_context_key
+                        )
+                    queued = await postgres_db.queue_job_for_resume(
+                        job_id,
+                        context_merge,
+                        expected_status=expected_status,
+                    )
+                    if queued:
+                        job.update(refreshed)
+            if not queued:
+                refreshed = await postgres_db.get_job(job_id)
+                refreshed_context = (refreshed or {}).get("context") or {}
+                if isinstance(refreshed_context, str):
+                    try:
+                        refreshed_context = json.loads(refreshed_context)
+                    except (TypeError, ValueError):
+                        refreshed_context = {}
+                if (
+                    refreshed
+                    and refreshed.get("execution_lane") == "stateless"
+                    and isinstance(refreshed_context, dict)
+                    and (
+                        refreshed_context.get("_stateless_delete_pending") is True
+                        or refreshed_context.get("_stateless_cancel_cleanup_pending")
+                        is True
+                    )
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Job lifecycle cleanup is already in progress",
+                    )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Job changed while it was being queued for resume",
+                )
             logger.info(
                 f"Queued job {job_id} for auto-dispatch (previous status: "
                 f"{job['status']}, feedback: {bool(feedback)})"
@@ -13967,12 +14655,20 @@ async def resume_job(
         # a job the dispatcher will actually re-provision rather than re-park.
         missing_workspace = _resume_missing_workspace(job)
         if missing_workspace:
-            await postgres_db.shed_workspace_context(
-                job_id, _WORKSPACE_CONTEXT_KEYS[missing_workspace]
-            )
+            workspace_context_key = _WORKSPACE_CONTEXT_KEYS[missing_workspace]
+            if job.get("execution_lane") != "stateless":
+                await postgres_db.shed_workspace_context(job_id, workspace_context_key)
             return await _queue_for_dispatch(
-                f"No live {missing_workspace} workspace — queued for re-provisioning"
+                f"No live {missing_workspace} workspace — queued for re-provisioning",
+                workspace_preflight_required=True,
+                workspace_context_key=workspace_context_key,
             )
+
+        # Stateless jobs never select or POST to a registered agent. A live
+        # k8s workspace is already proven above; the Class-A resume write and
+        # worker_batch enqueue commit together in queue-first order.
+        if job.get("execution_lane") == "stateless":
+            return await _queue_for_dispatch("Stateless job queued for worker claim")
 
         # Determine which agent to use
         # Convert to string since DB returns asyncpg UUID objects
@@ -14171,18 +14867,31 @@ async def approve_job(
             # Phase boundary or VM upgrade freeze: approve to continue execution
             # (not complete). For vm_upgrade_required, this is the "resume without
             # VM" path — the agent continues in the container and adapts.
-            # Remove job_frozen.json from local workspace
             local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
-            if local_frozen.exists():
-                local_frozen.unlink()
-
-            # Update DB: status → processing, clear freeze_data
-            async with postgres_db.acquire() as conn:
-                await conn.execute(
-                    "UPDATE jobs SET status = 'processing', freeze_data = NULL, "
-                    "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
+            if job.get("execution_lane") == "stateless":
+                queued = await postgres_db.queue_stateless_job_for_resume(
                     job_id,
+                    priority=int(job.get("priority") or 0),
+                    fair_key=(str(job["user_id"]) if job.get("user_id") else None),
+                    expected_status=str(job["status"]),
                 )
+                if not queued:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Job changed while approval was re-enqueuing it",
+                    )
+            else:
+                if local_frozen.exists():
+                    local_frozen.unlink()
+                # Pinned agent is still parked in-process and resumes directly.
+                async with postgres_db.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE jobs SET status = 'processing', freeze_data = NULL, "
+                        "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
+                        job_id,
+                    )
+            if job.get("execution_lane") == "stateless" and local_frozen.exists():
+                local_frozen.unlink()
 
             msg = (
                 f"Job {job_id} phase boundary approved (resume execution)"
@@ -14212,6 +14921,35 @@ async def approve_job(
 
         completion_json = json.dumps(completion_data, indent=2, ensure_ascii=False)
 
+        stateless_approval_committed = False
+        if job.get("execution_lane") == "stateless":
+            # Linearize the stateless approval before any durable artifact
+            # advertises completion. Cancel/resume take the same queue->jobs
+            # lock order, so a stale verb fails without deleting the frozen
+            # evidence or writing job_completion.json.
+            async with postgres_db.acquire() as conn:
+                async with conn.transaction():
+                    await conn.fetchrow(
+                        "SELECT state FROM run_queue WHERE unit_id = $1::uuid "
+                        "AND unit_kind = 'worker_batch' FOR UPDATE",
+                        job_id,
+                    )
+                    updated = await conn.fetchrow(
+                        "UPDATE jobs SET status = 'completed', freeze_data = NULL, "
+                        "completed_at = CURRENT_TIMESTAMP, "
+                        "updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = $1::uuid AND execution_lane = 'stateless' "
+                        "AND status::text = $2::text RETURNING id",
+                        job_id,
+                        str(job["status"]),
+                    )
+                    if updated is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Job changed while approval was being committed",
+                        )
+            stateless_approval_committed = True
+
         # 4. Write job_completion.json and remove job_frozen.json
         wrote_to_gitea = False
         if gitea_client.is_initialized:
@@ -14239,13 +14977,14 @@ async def approve_job(
                 frozen_path.unlink()
 
         # 5. Update DB: status → completed, clear freeze_data, set completed_at
-        async with postgres_db.acquire() as conn:
-            await conn.execute(
-                "UPDATE jobs SET status = 'completed', freeze_data = NULL, "
-                "completed_at = CURRENT_TIMESTAMP, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
-                job_id,
-            )
+        if not stateless_approval_committed:
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET status = 'completed', freeze_data = NULL, "
+                    "completed_at = CURRENT_TIMESTAMP, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
+                    job_id,
+                )
 
         logger.info(f"Job {job_id} approved (gitea={wrote_to_gitea})")
 
@@ -14396,27 +15135,60 @@ async def _upgrade_job_to_vm_internal(job_id: str) -> dict[str, Any]:
             "upgrade_command": frozen_data.get("command", ""),
         }
 
-        # 5. Remove freeze file from local workspace
-        local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
-        if local_frozen.exists():
-            local_frozen.unlink()
-
-        # 6. Update DB in ONE statement: merge the VM keys into context.vm, clear
+        # 5. Update DB in ONE statement: merge the VM keys into context.vm, clear
         #    freeze, set status to paused (dispatchable), unassign agent. Fused so
         #    the context is visible the instant the status flips — a split would
         #    open a dispatch window on half-written context.
         async with postgres_db.acquire() as conn:
-            await conn.execute(
-                "UPDATE jobs SET context = jsonb_set("
-                "        COALESCE(context, '{}'::jsonb), '{vm}', "
-                "        COALESCE(context->'vm', '{}'::jsonb) || $1::jsonb"
-                "    ), "
-                "    status = 'paused', freeze_data = NULL, "
-                "    assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
-                "WHERE id = $2::uuid",
-                json.dumps(vm_updates),
-                job_id,
-            )
+            async with conn.transaction():
+                if job.get("execution_lane") == "stateless":
+                    # Queue-first handoff: the VM lane belongs to registered
+                    # agents in this slice. Closing the durable worker row and
+                    # flipping execution_lane commit together, so neither
+                    # execution plane can observe a runnable half-transition.
+                    await conn.fetchrow(
+                        "SELECT state FROM run_queue "
+                        "WHERE unit_id = $1::uuid "
+                        "AND unit_kind = 'worker_batch' FOR UPDATE",
+                        job_id,
+                    )
+                updated = await conn.fetchrow(
+                    "UPDATE jobs SET context = jsonb_set("
+                    "        COALESCE(context, '{}'::jsonb), '{vm}', "
+                    "        COALESCE(context->'vm', '{}'::jsonb) || $1::jsonb"
+                    "    ), "
+                    "    status = 'paused', freeze_data = NULL, "
+                    "    assigned_agent_id = NULL, execution_lane = 'pinned', "
+                    "    updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = $2::uuid AND status::text = $3::text "
+                    "AND execution_lane = $4::text RETURNING id",
+                    json.dumps(vm_updates),
+                    job_id,
+                    str(job["status"]),
+                    str(job.get("execution_lane") or "pinned"),
+                )
+                if updated is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Job changed while it was being upgraded to a VM",
+                    )
+                if job.get("execution_lane") == "stateless":
+                    await conn.execute(
+                        "UPDATE run_queue SET state = 'done', "
+                        "lease_token = lease_token + 1, leased_by = NULL, "
+                        "last_leased_by = NULL, leased_until = NULL, "
+                        "run_after = now(), queued_at = now() "
+                        "WHERE unit_id = $1::uuid "
+                        "AND unit_kind = 'worker_batch'",
+                        job_id,
+                    )
+
+        # Only remove the local freeze after the queue-first status/lane CAS
+        # commits. A concurrent cancel must not lose its operator evidence to
+        # an upgrade request that no longer owns the job transition.
+        local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
+        if local_frozen.exists():
+            local_frozen.unlink()
 
         logger.info(
             f"Job {job_id} approved for VM upgrade "
@@ -14545,23 +15317,42 @@ async def _resume_job_without_vm_internal(
         "decided_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Remove local freeze artifact (parity with the upgrade arm)
+    # Remove local freeze artifact (parity with the upgrade arm). Stateless
+    # waits until its queue/status CAS succeeds below; a stale control request
+    # must leave the operator evidence intact.
     local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
-    if local_frozen.exists():
+    if job.get("execution_lane") != "stateless" and local_frozen.exists():
         local_frozen.unlink()
 
     # ONE statement: sticky denial + queued feedback + clear freeze + unassign
     # + paused (dispatchable) — fused so the dispatcher can never observe a
     # half-written decision.
-    async with postgres_db.acquire() as conn:
-        await conn.execute(
-            "UPDATE jobs SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
-            "status = 'paused', freeze_data = NULL, "
-            "assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
-            "WHERE id = $2::uuid",
-            json.dumps({"sudo_denial": sudo_denial, "queued_feedback": feedback}),
+    resume_context = {"sudo_denial": sudo_denial, "queued_feedback": feedback}
+    if job.get("execution_lane") == "stateless":
+        queued = await postgres_db.queue_stateless_job_for_resume(
             job_id,
+            resume_context,
+            priority=int(job.get("priority") or 0),
+            fair_key=(str(job["user_id"]) if job.get("user_id") else None),
+            expected_status=str(job["status"]),
         )
+        if not queued:
+            raise HTTPException(
+                status_code=409,
+                detail="Job changed while it was being re-enqueued without a VM",
+            )
+        if local_frozen.exists():
+            local_frozen.unlink()
+    else:
+        async with postgres_db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
+                "status = 'paused', freeze_data = NULL, "
+                "assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = $2::uuid",
+                json.dumps(resume_context),
+                job_id,
+            )
 
     logger.info(
         f"Job {job_id} resumed without VM "
@@ -14585,7 +15376,11 @@ async def _resume_job_without_vm_internal(
 
 
 async def _internal_resume_job(
-    job_id: str, feedback: str, reason: str | None = None
+    job_id: str,
+    feedback: str,
+    reason: str | None = None,
+    *,
+    expected_status: str | None = None,
 ) -> None:
     """Queue a job for resume via the auto-dispatcher.
 
@@ -14611,11 +15406,64 @@ async def _internal_resume_job(
     updates: dict[str, Any] = {"queued_feedback": feedback}
     if reason:
         updates["queued_feedback_reason"] = reason
-    if not await postgres_db.queue_job_for_resume(job_id, updates):
+    job = await postgres_db.get_job(job_id)
+    if not job:
         logger.warning(f"_internal_resume_job: job {job_id} not found")
         return
+    observed_status = str(job.get("status") or "")
+    if expected_status is not None and observed_status != expected_status:
+        logger.warning(
+            "_internal_resume_job: expected status %s but job %s is %s",
+            expected_status,
+            job_id,
+            observed_status,
+        )
+        return
+    if observed_status in ("completed", "failed", "cancelled"):
+        logger.warning(
+            "_internal_resume_job: refusing to resurrect terminal job %s (%s)",
+            job_id,
+            observed_status,
+        )
+        return
 
-    logger.info(f"Queued job {job_id} for auto-dispatch with feedback")
+    if job.get("execution_lane") == "stateless":
+        queued = await postgres_db.queue_stateless_job_for_resume(
+            job_id,
+            updates,
+            priority=int(job.get("priority") or 0),
+            fair_key=(str(job["user_id"]) if job.get("user_id") else None),
+            expected_status=observed_status,
+        )
+        if not queued:
+            refreshed = await postgres_db.get_job(job_id)
+            if (
+                refreshed
+                and refreshed.get("execution_lane") == "pinned"
+                and str(refreshed.get("status") or "") == observed_status
+            ):
+                queued = await postgres_db.queue_job_for_resume(
+                    job_id,
+                    updates,
+                    expected_status=observed_status,
+                )
+                if queued:
+                    job = refreshed
+    else:
+        queued = await postgres_db.queue_job_for_resume(
+            job_id,
+            updates,
+            expected_status=observed_status,
+        )
+    if not queued:
+        logger.warning("_internal_resume_job: queue CAS lost for job %s", job_id)
+        return
+
+    logger.info(
+        "Queued job %s for %s resume with feedback",
+        job_id,
+        job.get("execution_lane", "pinned"),
+    )
     _trigger_dispatch()
 
 
@@ -15033,10 +15881,26 @@ async def _handle_scholar_completion(
         logger.info(f"Scholar {job_id} completed — unblocking parent {target_id}")
         actions.append(f"scholar {job_id} completed, parent {target_id} unblocked")
 
-    await postgres_db.merge_job_context(target_id, ctx_delta)
-    await postgres_db.update_job_status(
-        target_id, status="created", assigned_agent_id=""
-    )
+    if parent.get("execution_lane") == "stateless":
+        resumed = await postgres_db.queue_stateless_job_for_resume(
+            target_id,
+            ctx_delta,
+            priority=int(parent.get("priority") or 0),
+            fair_key=(str(parent["user_id"]) if parent.get("user_id") else None),
+            expected_status="waiting",
+        )
+        if not resumed:
+            logger.debug(
+                "Scholar %s parent %s changed before stateless unblock",
+                job_id,
+                target_id,
+            )
+            return
+    else:
+        await postgres_db.merge_job_context(target_id, ctx_delta)
+        await postgres_db.update_job_status(
+            target_id, status="created", assigned_agent_id=""
+        )
     _trigger_dispatch()
 
 
@@ -15127,26 +15991,31 @@ async def _handle_delegation_child_completion(
             }
         )
 
-    # Store results in the parent context for resume injection. Whole-key merge —
-    # a bounded rebuild from DB children, so a concurrent sibling writer is a
-    # harmless duplicate write, never a lost update.
-    await postgres_db.merge_job_context(
-        target_id, {"delegation_results": child_results}
-    )
-
-    # Unblock parent: waiting → paused (dispatcher picks it up via /job/resume,
-    # preserving checkpoint state from before delegation). The CAS claim also
-    # clears the delegation freeze — get_dispatchable_jobs requires
-    # freeze_data IS NULL, so update_job_status (which cannot clear it) would
-    # leave the re-queued parent dispatcher-invisible forever
-    # (docs/issues/delegation_freeze_lifecycle_gaps.md, Gap 1).
-    if not await postgres_db.claim_delegation_resume(target_id):
+    delegation_context = {"delegation_results": child_results}
+    if parent.get("execution_lane") == "stateless":
+        # Queue-first re-enqueue + jobs-row transition. The context value and
+        # its one-shot delivery id land in the same transaction, so a failed
+        # enqueue cannot expose an unclaimable delivery generation.
+        resumed = await postgres_db.queue_stateless_job_for_resume(
+            target_id,
+            delegation_context,
+            priority=int(parent.get("priority") or 0),
+            fair_key=(str(parent["user_id"]) if parent.get("user_id") else None),
+            expected_status="waiting",
+        )
+    else:
+        # Pinned parity: store the bounded rebuild before the historical
+        # waiting→paused CAS, then wake its registered-agent dispatcher.
+        await postgres_db.merge_job_context(target_id, delegation_context)
+        resumed = await postgres_db.claim_delegation_resume(target_id)
+        if resumed:
+            _trigger_dispatch()
+    if not resumed:
         logger.debug(
             f"Delegation child {job_id}: parent {target_id} already re-queued "
             "by a concurrent writer — skipping duplicate unblock"
         )
         return
-    _trigger_dispatch()
 
     completed_count = sum(1 for c in child_results if c["status"] == "completed")
     total_count = len(child_results)
@@ -15210,7 +16079,8 @@ async def _check_delegation_timeouts() -> int:
         async with postgres_db.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, freeze_data, config_override, context
+                SELECT id, freeze_data, config_override, context,
+                       execution_lane, priority, user_id
                 FROM jobs
                 WHERE status = 'waiting'
                   AND freeze_data IS NOT NULL
@@ -15279,17 +16149,60 @@ async def _check_delegation_timeouts() -> int:
 
             # Cancel non-terminal children
             cancelled_count = 0
+            children_settled = True
             for child in children:
                 child_status = child.get("status", "")
-                if child_status not in ("completed", "failed", "cancelled"):
-                    child_id = str(child["id"])
-                    try:
-                        await postgres_db.cancel_job(child_id)
-                        cancelled_count += 1
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to cancel timed-out child {child_id}: {e}"
-                        )
+                if child_status in ("completed", "failed"):
+                    continue
+                child_id = str(child["id"])
+                try:
+                    if child.get("execution_lane") == "stateless":
+                        if child_status == "cancelled":
+                            child_context = child.get("context") or {}
+                            if isinstance(child_context, str):
+                                try:
+                                    child_context = json.loads(child_context)
+                                except (TypeError, ValueError):
+                                    child_context = {}
+                            settled = child_context.get(
+                                "_stateless_cancel_cleanup_pending"
+                            ) is not True or await _wait_for_stateless_cancel_settle(
+                                child_id
+                            )
+                        else:
+                            (
+                                cancelled,
+                                _queue_closed,
+                            ) = await postgres_db.cancel_stateless_job(child_id)
+                            settled = bool(
+                                cancelled
+                                and await _wait_for_stateless_cancel_settle(child_id)
+                            )
+                            if cancelled:
+                                cancelled_count += 1
+                        if not settled:
+                            children_settled = False
+                            logger.error(
+                                "Delegation timeout cannot resume parent %s: "
+                                "stateless child %s still owns its worker lease",
+                                job_id,
+                                child_id,
+                            )
+                            continue
+                    elif child_status != "cancelled":
+                        cancelled = await postgres_db.cancel_job(child_id)
+                        if cancelled:
+                            cancelled_count += 1
+                except Exception as e:
+                    children_settled = False
+                    logger.warning(f"Failed to cancel timed-out child {child_id}: {e}")
+
+            if not children_settled:
+                # The parent and its children share one workspace. Releasing
+                # the parent while a stateless child still has a fenced writer
+                # would allow two pods to mutate that workspace concurrently.
+                # Leave the waiting parent for the next sweep.
+                continue
 
             # Build partial results and resume parent
             # Re-trigger the completion handler by faking an "all done" state
@@ -15331,33 +16244,31 @@ async def _check_delegation_timeouts() -> int:
                     }
                 )
 
-            # Whole-key merge (bounded rebuild from DB children) — same contract
-            # as the sibling completion writer; concurrent writers are harmless
-            # duplicates. Written before the status flip below so the dispatcher
-            # always resumes with delegation_results present.
-            await postgres_db.merge_job_context(
-                job_id,
-                {
-                    "delegation_results": child_results,
-                    "delegation_timed_out": True,
-                },
-            )
-
-            # Atomically re-queue the parent (waiting → paused). Under the
-            # transient dual-leader window two sweepers can both reach here for
-            # the same parent; the CAS ensures exactly one re-queues it, so the
-            # parent is never resumed twice with partial results. The loser
-            # skips the dispatch trigger. (Context is written before this flip
-            # so the dispatcher always resumes with delegation_results present.)
-            claimed = await postgres_db.claim_delegation_resume(job_id)
+            delegation_context = {
+                "delegation_results": child_results,
+                "delegation_timed_out": True,
+            }
+            if row.get("execution_lane") == "stateless":
+                claimed = await postgres_db.queue_stateless_job_for_resume(
+                    job_id,
+                    delegation_context,
+                    priority=int(row.get("priority") or 0),
+                    fair_key=(str(row["user_id"]) if row.get("user_id") else None),
+                    expected_status="waiting",
+                )
+            else:
+                # Historical pinned path: context first, then the HA-safe
+                # waiting→paused CAS and dispatcher wake.
+                await postgres_db.merge_job_context(job_id, delegation_context)
+                claimed = await postgres_db.claim_delegation_resume(job_id)
+                if claimed:
+                    _trigger_dispatch()
             if not claimed:
                 logger.debug(
                     f"Delegation timeout for {job_id} already handled by "
                     f"another sweeper; skipping resume"
                 )
                 continue
-            _trigger_dispatch()
-
             logger.info(
                 f"Delegation timeout handled for {job_id}: "
                 f"cancelled {cancelled_count} children, parent re-queued"
@@ -17643,6 +18554,34 @@ async def complete_job(
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+        completion_entry_status = str(job.get("status") or "")
+        stateless_completion = job.get("execution_lane", "pinned") == "stateless"
+
+        # Thin S3 entry fence. Rotation never reaches this route; a genuine
+        # terminal stateless report must prove the exact live worker lease.
+        # Keep the check before the terminal-status early return and every
+        # mutation/side effect. Pinned callers remain tokenless.
+        if stateless_completion:
+            from src.shared.worker_queue import worker_lease_is_current
+
+            lease_current = False
+            if body.lease_token is not None:
+                async with postgres_db.acquire() as conn:
+                    lease_current = await worker_lease_is_current(
+                        conn,
+                        job_id=job_id,
+                        lease_token=body.lease_token,
+                    )
+            if not lease_current:
+                logger.warning(
+                    "Stateless completion fence rejected job=%s lease_token=%s",
+                    job_id,
+                    body.lease_token,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Completion report does not hold the current worker lease",
+                )
 
         # Post-execution handoff states are monotonic.  The agent that reported
         # one may still be unwinding while this handler archives its workspace
@@ -17670,7 +18609,34 @@ async def complete_job(
                 "actions": [f"late callback ignored; job already {job['status']}"],
             }
 
-        result = body.model_dump()
+        # Stateless END checkpoints are intentionally re-reported after an
+        # ambiguous HTTP failure. Several human/tool paths publish their final
+        # status before the report (waiting/waiting_for_reply), and the handler
+        # itself may have committed paused/failed/cancelled before its response
+        # was lost. The exact queue token above makes these benign callbacks
+        # safe; return 2xx so the holder can close the queue instead of
+        # release/re-report looping forever. Pinned behavior stays unchanged.
+        if stateless_completion and job["status"] in (
+            "paused",
+            "failed",
+            "cancelled",
+            "waiting",
+            "waiting_for_reply",
+        ):
+            logger.info(
+                "Job %s: accepting exact-token stateless terminal retry while "
+                "status is %s",
+                job_id,
+                job["status"],
+            )
+            return {
+                "status": "handled",
+                "job_id": job_id,
+                "new_status": job["status"],
+                "actions": [f"exact-token terminal retry; job already {job['status']}"],
+            }
+
+        result = body.model_dump(exclude={"lease_token"})
         actions: list[str] = []
 
         if job["status"] not in (
@@ -17751,7 +18717,7 @@ async def complete_job(
 
         # Clear any remaining queued_replies from job context on completion.
         # The agent may have consumed them during phase transitions.
-        if result.get("should_stop"):
+        if result.get("should_stop") and not stateless_completion:
             try:
                 async with postgres_db.acquire() as conn:
                     await conn.execute(
@@ -18136,13 +19102,27 @@ async def complete_job(
         # docs/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C.
         from services.completion import apply_deliverable_gate
 
+        async def _queue_deliverable_gate_resume(
+            resume_job_id: str,
+            feedback: str,
+            reason: str | None = None,
+        ) -> None:
+            await _internal_resume_job(
+                resume_job_id,
+                feedback,
+                reason,
+                expected_status=(
+                    completion_entry_status if stateless_completion else None
+                ),
+            )
+
         new_status, _gate_actions, _gate_bounced = await apply_deliverable_gate(
             job,
             result,
             new_status,
             db=postgres_db,
             gitea=gitea_client,
-            queue_resume=_internal_resume_job,
+            queue_resume=_queue_deliverable_gate_resume,
             vector_db=vector_db,
         )
         actions.extend(_gate_actions)
@@ -18314,7 +19294,24 @@ async def complete_job(
                         kwargs["stash_and_clear_freeze"] = True
                         kwargs["freeze_data"] = fd_row
 
-            await postgres_db.update_job_status(job_id, **kwargs)
+            if stateless_completion:
+                kwargs["expected_status"] = completion_entry_status
+            disposition_updated = await postgres_db.update_job_status(job_id, **kwargs)
+            if stateless_completion and not disposition_updated:
+                current = await postgres_db.get_job(job_id)
+                current_status = str((current or {}).get("status") or "unknown")
+                logger.warning(
+                    "Stateless completion disposition lost control race "
+                    "job=%s lease_token=%s entry_status=%s current_status=%s",
+                    job_id,
+                    body.lease_token,
+                    completion_entry_status,
+                    current_status,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Completion report lost an out-of-band job control race",
+                )
             actions.append(f"status -> {new_status}")
             logger.info(f"Job {job_id} status set to '{new_status}'")
 
@@ -31986,7 +32983,11 @@ async def internal_unit_claim_bundle(
     on the stateless lane, or attach assembly refused (generic reason).
     """
     await require_internal(request)
-    from src.shared.run_queue import LANE_STATELESS, UNIT_KIND_SESSION_TURN
+    from src.shared.run_queue import (
+        LANE_STATELESS,
+        UNIT_KIND_SESSION_TURN,
+        UNIT_KIND_WORKER_BATCH,
+    )
 
     try:
         UUID(str(unit_id))
@@ -32006,6 +33007,109 @@ async def internal_unit_claim_bundle(
         # ONE generic detail for both cases — stale token and not-leased are
         # deliberately indistinguishable to the caller.
         raise HTTPException(status_code=403, detail="Lease validation failed")
+    if row["unit_kind"] == UNIT_KIND_WORKER_BATCH:
+        job = await postgres_db.get_job(unit_id)
+        if not job or job.get("execution_lane") != LANE_STATELESS:
+            raise HTTPException(
+                status_code=409, detail="Job is not on the stateless lane"
+            )
+
+        # Inheriting scholar/critic/delegation jobs deliberately keep only a
+        # snapshot of their parent's workspace in their own row. Resolve the
+        # parent's live endpoint through the same helper as pinned dispatch so
+        # a recreated shared pod cannot send this claimant to a stale address.
+        inherit_action, _ = await _resolve_subjob_inherited_workspace(job)
+        if inherit_action != "proceed":
+            raise HTTPException(
+                status_code=409,
+                detail="Stateless worker parent workspace is not ready",
+            )
+
+        container_ctx = _get_container_context(job)
+        if not (
+            container_ctx.get("status") == "ready"
+            and container_ctx.get("provisioner") == "k8s"
+            and bool(container_ctx.get("host") or container_ctx.get("pod_ip"))
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Stateless worker workspace is not Kubernetes-ready",
+            )
+
+        job_start = await _build_job_start_request(
+            job,
+            persist_dispatch_state=False,
+        )
+        if job_start is None:
+            raise HTTPException(status_code=409, detail="Job bundle assembly refused")
+
+        # Credential assembly can take seconds. Recheck the exact lease after
+        # that slow work so a stolen zombie never receives the response body.
+        async with postgres_db.acquire() as conn:
+            lease_still_current = bool(
+                await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM run_queue "
+                    "WHERE unit_id = $1::uuid "
+                    "AND unit_kind = 'worker_batch' "
+                    "AND state = 'leased' AND lease_token = $2::bigint)",
+                    unit_id,
+                    lease_token,
+                )
+            )
+        if not lease_still_current:
+            raise HTTPException(status_code=403, detail="Lease validation failed")
+
+        context = job.get("context") or {}
+        if isinstance(context, str):
+            try:
+                context = json.loads(context)
+            except (TypeError, ValueError):
+                context = {}
+        batch_context = context.get("worker_batch") or {}
+        if not isinstance(batch_context, dict):
+            batch_context = {}
+
+        def _positive_float(value: Any, fallback: float) -> float:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return fallback
+            return parsed if parsed > 0 else fallback
+
+        min_wall_seconds = _positive_float(
+            os.environ.get("WORKER_BATCH_MIN_WALL_SECONDS"), 300.0
+        )
+        target_wall_seconds = _positive_float(
+            batch_context.get(
+                "target_wall_seconds",
+                context.get("worker_batch_target_wall_seconds", 300.0),
+            ),
+            300.0,
+        )
+        target_wall_seconds = max(target_wall_seconds, min_wall_seconds)
+        iteration_cap_raw = batch_context.get(
+            "iteration_cap", context.get("worker_batch_iteration_cap")
+        )
+        try:
+            iteration_cap = int(iteration_cap_raw)
+        except (TypeError, ValueError):
+            iteration_cap = None
+        if iteration_cap is not None and iteration_cap <= 0:
+            iteration_cap = None
+
+        return {
+            "unit_id": unit_id,
+            "job_id": unit_id,
+            "unit_kind": UNIT_KIND_WORKER_BATCH,
+            "execution_lane": LANE_STATELESS,
+            "job": job_start.model_dump(exclude_none=True),
+            "batch": {
+                "target_wall_seconds": target_wall_seconds,
+                "iteration_cap": iteration_cap,
+                "min_wall_seconds": min_wall_seconds,
+            },
+        }
+
     if row["unit_kind"] != UNIT_KIND_SESSION_TURN:
         raise HTTPException(status_code=409, detail="Unit kind carries no attach")
     _t_lease = time.perf_counter()

@@ -55,6 +55,30 @@ class TestSweepTick:
         notifier.notify_review_returned_to_manual.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_routes_stateless_candidates_through_queue_aware_callback(self):
+        db = AsyncMock()
+        db.cancel_stale_verification_subjobs = AsyncMock(return_value=2)
+        db.list_stale_stateless_verification_subjobs = AsyncMock(
+            return_value=["critic-a", "critic-b"]
+        )
+        db.unstick_reviewing_parents = AsyncMock(return_value=[])
+        cancel_stateless = AsyncMock(side_effect=(True, False))
+
+        cancelled, unstuck = await _sweep_tick(
+            db,
+            stale_hours=9,
+            grace_minutes=30,
+            notifier=AsyncMock(),
+            stateless_cancel_fn=cancel_stateless,
+        )
+
+        assert (cancelled, unstuck) == (3, 0)
+        db.list_stale_stateless_verification_subjobs.assert_awaited_once_with(9)
+        assert cancel_stateless.await_args_list[0].args == ("critic-a",)
+        assert cancel_stateless.await_args_list[0].kwargs == {"stale_hours": 9}
+        assert cancel_stateless.await_args_list[1].args == ("critic-b",)
+
+    @pytest.mark.asyncio
     async def test_notifies_each_unstuck_parent(self):
         db = AsyncMock()
         db.cancel_stale_verification_subjobs = AsyncMock(return_value=0)
@@ -230,6 +254,7 @@ def test_unstick_no_longer_requires_all_children_failed():
     sql = PostgresDB._UNSTICK_REVIEWING_SQL
     assert "status NOT IN ('failed', 'cancelled')" not in sql
     assert "verification_rounds" in sql
+    assert "_stateless_cancel_cleanup_pending" in sql
 
 
 class TestUnstickReviewingParentsWallclock:
@@ -270,6 +295,11 @@ class TestUnstickReviewingParentsWallclock:
         live_set = "'created', 'processing', 'paused', 'waiting',"
         assert live_set in PostgresDB._UNSTICK_REVIEWING_SQL
         assert live_set in PostgresDB._UNSTICK_REVIEWING_WALLCLOCK_SQL
+        assert "_stateless_cancel_cleanup_pending" in PostgresDB._UNSTICK_REVIEWING_SQL
+        assert (
+            "_stateless_cancel_cleanup_pending"
+            in PostgresDB._UNSTICK_REVIEWING_WALLCLOCK_SQL
+        )
 
     @pytest.mark.asyncio
     async def test_tick_runs_wallclock_arm_when_enabled(self):
@@ -337,3 +367,4 @@ def test_sweeper_reaps_waiting_critics_and_still_reaps_paused():
     sql = PostgresDB._CANCEL_STALE_VERIFICATION_SQL
     assert "'waiting'" in sql
     assert "'paused'" in sql
+    assert "execution_lane = 'pinned'" in sql

@@ -765,6 +765,24 @@ class TestOrchestratorClientReportCompletion:
         assert payload["should_stop"] is True
         assert payload["goal_achieved"] is True
         assert payload["freeze_data"]["freeze_type"] == "job_complete"
+        assert "lease_token" not in payload
+        assert call_kwargs["timeout"] == 60.0
+
+    @pytest.mark.asyncio
+    async def test_stateless_completion_sends_token_with_wide_timeout(self, client):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"new_status": "completed", "actions": []}
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            await client.report_completion(
+                "job-123", {"should_stop": True}, lease_token=17
+            )
+
+        call_kwargs = mock_http.post.call_args.kwargs
+        assert call_kwargs["json"]["lease_token"] == 17
+        assert call_kwargs["timeout"] == 300.0
 
     @pytest.mark.asyncio
     async def test_sends_error(self, client):

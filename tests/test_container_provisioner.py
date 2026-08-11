@@ -859,6 +859,12 @@ class TestCreateWorkspace:
         mock_core_api.create_namespaced_pod.assert_called_once()
         # Verify context was updated (created + ready)
         assert provisioner._db.merge_workspace_container_context.call_count == 2
+        context_updates = [
+            call.args[1]
+            for call in provisioner._db.merge_workspace_container_context.call_args_list
+        ]
+        assert [update["status"] for update in context_updates] == ["created", "ready"]
+        assert all(update["provisioner"] == "k8s" for update in context_updates)
 
     @pytest.mark.asyncio
     async def test_create_workspace_not_available(self):

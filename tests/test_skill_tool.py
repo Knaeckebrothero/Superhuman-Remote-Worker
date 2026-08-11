@@ -5,6 +5,8 @@ filesystem test backend, mirroring how other workspace-tool tests build a
 WorkspaceManager + ToolContext.
 """
 
+from unittest.mock import patch
+
 from tests._fs_backend import FilesystemTestBackend
 from src.core.workspace import WorkspaceManager
 from src.tools.context import ToolContext
@@ -39,6 +41,19 @@ def test_use_skill_returns_body(tmp_path):
     out = use_skill.invoke({"skill_name": "hello-skill"})
     assert "BODY-HERE" in out
     assert "hello-skill" in out
+
+
+def test_use_skill_records_the_exact_instruction_version(tmp_path):
+    ws, use_skill = _use_skill(tmp_path)
+    body = "---\nname: hello-skill\n---\nVERSIONED-BODY"
+    ws.backend.mkdir("skills/hello-skill")
+    ws.write_file("skills/hello-skill/SKILL.md", body)
+
+    with patch.object(ToolContext, "record_file_read", autospec=True) as record:
+        out = use_skill.invoke({"skill_name": "hello-skill"})
+
+    assert "VERSIONED-BODY" in out
+    assert record.call_args.args[1:] == ("skills/hello-skill/SKILL.md", body)
 
 
 def test_use_skill_missing_is_friendly(tmp_path):
