@@ -6,6 +6,7 @@ tags:
   - keycloak
   - branding
   - ux
+  - accessibility
 aliases:
   - branded emails
   - keycloak login theme
@@ -20,38 +21,56 @@ related:
 
 # Email + Keycloak login theme alignment
 
-> Bring the two remaining unbranded surfaces — transactional email and the Keycloak login page — onto the Imperial design system. Emails move off the retired Catppuccin palette onto Travertine and gain a shared layout module. Keycloak gets a CSS-only child theme (`srw`) covering both its login pages and its own transactional email, delivered as a ConfigMap so we stay on the upstream image.
+> Bring the two remaining unbranded surfaces — transactional email and the Keycloak login page — onto the Imperial design system. Emails move off the retired Catppuccin palette onto Travertine via a shared layout module. Keycloak gets a CSS-only child theme (`srw`) covering both login and its own transactional email, delivered as a ConfigMap so we stay on the upstream image.
 
-**Status:** Design approved 2026-08-11. Not yet implemented.
-**Triggered by:** Both surfaces still carry pre-Imperial design. The email templates use Catppuccin Mocha — the palette `cockpit/src/styles/README.md` explicitly calls "the Catppuccin era" and migrates localStorage away from. Keycloak still serves the stock `keycloak` login theme.
-**Scope:** Three SRW application emails, a shared email layout module, a Keycloak `srw` login theme, a Keycloak `srw` email theme, and unpinning the hardcoded Keycloak SMTP port. **Does not** replace Keycloak's login pages with cockpit-native ones (see [[cockpit_owned_auth_ui]]), change any email copy, touch plaintext email bodies, or add MFA/registration flows.
+**Status:** Design approved 2026-08-11. Revised the same day after a research pass; **not yet implemented**.
+**Triggered by:** Both surfaces still carry pre-Imperial design. The email templates use Catppuccin Mocha — the palette `cockpit/src/styles/README.md` calls "the Catppuccin era" and migrates localStorage away from. Keycloak still serves the stock, now-deprecated `keycloak` login theme.
+**Scope:** Three SRW application emails, a shared brand/palette module, an email layout module, a Keycloak `srw` login theme, a Keycloak `srw` email theme, the Catppuccin magic-link landing pages, and unpinning the hardcoded Keycloak SMTP port. **Does not** replace Keycloak's login pages with cockpit-native ones (see [[cockpit_owned_auth_ui]]), change email copy, brand plaintext email, or add MFA/registration flows.
 
 ## TL;DR
 
 | Layer | Change |
 |---|---|
-| **Email module** | New `orchestrator/services/email_layout.py` — one `render_email()` used by all three send-sites. Travertine palette, table-based, no web fonts. |
-| **Email call sites** | `send_system_notification` (currently unstyled), `send_agent_message`, and the headless permission mail all collapse onto the shared renderer. |
-| **KC login** | New `srw` theme, `parent=keycloak.v2`, one stylesheet + one logo. Zero FreeMarker. Overrides PatternFly v5 custom properties with Imperial tokens. Light/dark both filled. |
-| **KC email** | Same `srw` theme, `email/html/template.ftl` only — the 6-line wrapper macro every KC email imports. Verify/reset/invite all inherit branding. |
-| **Delivery** | Theme source in `helm/keycloak-theme/srw/`, rendered into a ConfigMap and mounted at `/opt/keycloak/themes/srw`. docker-compose bind-mounts the same directory. Upstream image unchanged. |
+| **Brand module** | New `orchestrator/services/brand.py` — the Travertine palette as Python constants. Single source for emails **and** the magic-link landing pages. |
+| **Email module** | New `orchestrator/services/email_layout.py` — one `render_email()` for all three send-sites. Escapes text params, entity-encodes non-ASCII. |
+| **Email call sites** | `send_system_notification` (currently unstyled), `send_agent_message`, and the headless permission mail collapse onto the shared renderer. Fixes a live HTML injection. |
+| **Landing pages** | `_magic_link_confirmation_page` / `_magic_link_result_page` (32 Catppuccin hexes) re-skinned from the brand module, so the email→click journey stays on-brand. |
+| **KC login** | New `srw` theme, `parent=keycloak.v2`, one versioned stylesheet + logo + self-hosted display font. Zero FreeMarker. |
+| **KC email** | Same theme, `parent=base`, `email/html/template.ftl` only. Logo hosted externally and parameterized. |
+| **Delivery** | Theme source in `helm/keycloak-theme/srw/`, ConfigMap-mounted at `/opt/keycloak/themes/srw`, with a checksum annotation forcing a pod roll. |
 | **Chart fix** | `smtpServer.port` stops being hardcoded to `1025`. |
 
-**Estimated effort:** ~1 day. Three independently-shippable slices; the email slice ships without touching the chart at all.
+**Estimated effort:** ~1.5 days across three slices, up from ~1 day — the research pass added real work (accessibility fix, landing pages, cache handling).
 
 ## Why not cockpit-owned auth pages
 
 [[cockpit_owned_auth_ui]] evaluated theming Keycloak and rejected it — its option 2 was *"Keycloak theme heavily customized … ~3-5d to make it look acceptable and we'd still want to redo it later."*
 
-That costing assumed a **FreeMarker rewrite**. This design does not touch FreeMarker on the login side at all: a child theme that declares `parent=keycloak.v2` and ships only a stylesheet inherits every template from the parent. That is hours, not days, and it is deliberately disposable — when cockpit-owned auth lands, `helm/keycloak-theme/srw/login/` is deleted and `loginTheme` reverts. Nothing else depends on it.
+That costing assumed a **FreeMarker rewrite**. This design touches no FreeMarker on the login side: a child theme declaring `parent=keycloak.v2` and shipping only a stylesheet inherits every template from the parent. It is deliberately disposable — when cockpit-owned auth lands, `helm/keycloak-theme/srw/login/` is deleted and `loginTheme` reverts. Nothing else depends on it.
 
-So this design does not overturn the prior decision. It fills the gap until that decision gets implemented, at a cost low enough that throwing it away is not painful.
+## Verification performed
+
+Everything below was checked against a running `quay.io/keycloak/keycloak:26.2`, in both dev and production mode, not inferred from docs.
+
+**Confirmed working:**
+- A theme mounted read-only at `/opt/keycloak/themes/srw` is discovered with **no image rebuild and no `kc.sh build`** — in production mode, with a kubelet-faithful ConfigMap projection. `FolderThemeProvider` does a live `listFiles()` per lookup.
+- `styles=css/styles.css css/srw.css` resolves the first up the parent chain and the second from our theme; both were served 200. `stylesCommon` (PatternFly v5) is inherited without redeclaring.
+- A single `email/html/template.ftl` override rebranded a **real** Keycloak email — an `execute-actions` mail captured in mailpit carried our wrapper, card and accent stripe, with Keycloak's message body passing through untouched.
+- The **plaintext part is still generated** when only the HTML template is overridden. There is no `email/text/template.ftl` to override.
+- Every one of the 16 HTML email templates in `base/email/html/` begins `<#import "template.ftl" as layout>`, so the wrapper covers all types, including ones added in future releases.
+- Keycloak's default CSP is only `frame-src 'self'; frame-ancestors 'self'; object-src 'none';` — no `style-src` or `font-src`.
+- `darkMode=true` is inherited by a child theme automatically.
+- `parent=keycloak.v2` is the right target: v1 is formally deprecated as of KC 26.0, and `keycloak.v2/login/theme.properties` is byte-identical across 26.2.0, 26.7.1 and `main`. No 27.x exists yet; no deprecation signal for v2 anywhere.
+
+**Observed failure modes:**
+- `ERROR [DefaultThemeManager] Failed to find EMAIL theme srw, using built-in themes` — a bad or unresolvable theme name does **not** fail the deploy. Branding silently vanishes with one log line.
+- ConfigMap keys cannot contain `/` (rejected by a real API server), so a flat projection yields no theme directory and the theme never appears.
 
 ## Current state
 
 ### Email
 
-Three send-sites, each hand-rolling complete HTML inline. No shared layer, so they have already drifted apart:
+Three send-sites, each hand-rolling complete HTML inline. No shared layer, so they have already drifted:
 
 | Site | Purpose | Today |
 |---|---|---|
@@ -59,71 +78,32 @@ Three send-sites, each hand-rolling complete HTML inline. No shared layer, so th
 | `orchestrator/services/email.py:307` | `send_agent_message` | Catppuccin Mocha card |
 | `orchestrator/services/headless_notifications.py:323` | Permission request (Approve/Deny) | Catppuccin Mocha card |
 
-The two styled ones use `#1e1e2e` background, `#cdd6f4` text, `#cba6f7` headings, `#a6e3a1` / `#f38ba8` action buttons, and 12px/6px border radii. Every one of those values is two design generations old, and the rounded corners contradict the Roman shape pass (`--radius-sm: 0`).
+**The blast radius is larger than the templates.** The permission email's Approve/Deny buttons land on `_magic_link_confirmation_page` (`orchestrator/main.py:31470`) and `_magic_link_result_page` (`:31568`), which carry **32 Catppuccin hexes** between them. `orchestrator/mcp/templates/consent.html` carries 11 more. Restyling only the email produces a branded mail that opens a Catppuccin page.
+
+**There is a live HTML injection.** In both files the message body is escaped but the surrounding fields are not:
+
+```python
+# email.py:307 — message_md IS escaped above; these are not
+Job: {job_description[:80]}
+&nbsp;&bull;&nbsp; Agent: {config_name}
+
+# email.py:212
+f"<p>Hello {to_name},</p>"
+```
+
+`job_description` is user-supplied at job creation. Not scriptable in mail clients, but it permits injected markup and forged links in outbound email. The refactor must fix this rather than carry it forward.
 
 ### Keycloak
 
-`loginTheme` is `"keycloak"` in three places:
+`loginTheme` is `"keycloak"` in `docker/keycloak/realm-export.json:548`, `helm/templates/services/keycloak.yaml:531`, and `deployment/legacy/18-keycloak.yaml:425`. No custom theme exists; no `.ftl` files in the repo. `emailTheme` is unset.
 
-- `docker/keycloak/realm-export.json:548`
-- `helm/templates/services/keycloak.yaml:531`
-- `deployment/legacy/18-keycloak.yaml:425`
-
-No custom theme exists; there are no `.ftl` files anywhere in the repo. `emailTheme` is unset, so Keycloak's own mail renders on the stock template.
-
-Worth stating plainly: `"keycloak"` is the **legacy** login theme. Verified against the shipped image, it loads PatternFly **v3 + v4**, while `keycloak.v2` — also present in the same image — loads PatternFly **v5** and declares `darkMode=true`. Part of the improvement here is simply no longer being on the deprecated page.
-
-## Verification performed during design
-
-All of the following were checked against `quay.io/keycloak/keycloak:26.2` directly, not assumed:
-
-- Bundled themes are exactly `base`, `keycloak`, `keycloak.v2`. Built-in themes live inside `org.keycloak.keycloak-themes-26.2.5.jar`, not on disk — `/opt/keycloak/themes/` contains only a README, which is why mounting a theme directory there is safe and non-destructive.
-- `keycloak.v2/login/theme.properties` declares `parent=base`, `styles=css/styles.css`, `stylesCommon=vendor/patternfly-v5/…`, and `darkMode=true`, with `kcDarkModeClass=pf-v5-theme-dark`.
-- `base/login/theme.properties` declares **no** `styles` key, so the concrete theme owns the list. A child declaring `styles=css/styles.css css/srw.css` resolves the first up the parent chain and the second from itself. `stylesCommon` is inherited untouched.
-- The PatternFly v5 custom properties the design overrides all exist in the shipped vendor CSS with the expected names.
-- `base/email/html/template.ftl` is a 6-line macro, and `password-reset.ftl` / `email-verification.ftl` import it — so overriding that one file rebrands every Keycloak email.
-- `keycloak/email/theme.properties` contains only `parent=base`, confirming the stock email theme adds nothing we would lose.
-- The Keycloak container runs `start` (production mode), so **themes are cached** and a ConfigMap edit alone will not take effect.
+`"keycloak"` is the **deprecated v1 theme** (PatternFly v3/v4). `keycloak.v2` — in the same image — is PatternFly v5 with `darkMode=true`. Part of the win is simply leaving a deprecated page.
 
 ## Design
 
-### 1. Shared email layout module
+### 1. Brand module
 
-New file `orchestrator/services/email_layout.py`. Pure functions, no I/O, no dependency on `EmailService` — so it tests without a mail server.
-
-```python
-@dataclass(frozen=True)
-class Action:
-    label: str
-    url: str
-    variant: str = "primary"   # "primary" | "danger" | "neutral"
-
-def render_email(
-    *,
-    title: str,
-    body_html: str,
-    subtitle: str | None = None,
-    actions: Sequence[Action] = (),
-    footer_note: str | None = None,
-) -> str:
-    ...
-```
-
-**`body_html` is trusted, caller-escaped HTML.** The existing `html.escape` calls on tool name and arguments in `headless_notifications.py` stay exactly where they are. `render_email` is a layout function, not a sanitizing boundary, and its docstring must say so — otherwise a future caller will assume it escapes and introduce an injection.
-
-#### Email-specific constraints
-
-These are not the cockpit's CSS rules, and the differences are deliberate:
-
-- **Table-based layout.** Outlook renders through the Word engine and collapses `div` + `max-width`. The current templates use `div`s and are already broken there.
-- **No web fonts.** Mail clients do not reliably load them. Cinzel's role is filled by `Georgia, 'Times New Roman', serif` with uppercase and letter-spacing — a widely-available serif that preserves the Roman inscriptional intent. Body text uses a system sans stack approximating Inter.
-- **`border-radius: 0`** — matches the Roman shape language and is what Outlook renders anyway.
-- **`<meta name="color-scheme" content="light">`** plus `supported-color-schemes`, to stop Apple Mail and Outlook force-inverting a light card into mud.
-- **A `<style>` block in `<head>`** for `a { color: … }`. Links do not inherit colour from an inline-styled ancestor, and Gmail has supported head `<style>` since 2016. Structural styling stays inline; only link colour and a couple of resets go in the block.
-
-#### Palette
-
-Travertine only, per the light/dark decision below. Values mirror `$travertine-theme` in `cockpit/src/styles/themes/_theme-config.scss`:
+New `orchestrator/services/brand.py`, holding the Travertine palette as Python constants. **Not** inside `email_layout.py` — the magic-link landing pages consume it too, which is what makes the drift guard meaningful across the whole user journey.
 
 | Role | Token | Hex |
 |---|---|---|
@@ -137,36 +117,89 @@ Travertine only, per the light/dark decision below. Values mirror `$travertine-t
 | Links, primary action | `accent-color` | `#9c2832` |
 | Approve action | `success` | `#446b3e` |
 | Deny action | `danger` | `#9c2832` |
-| Text on filled action | `on-accent` | `#fff` |
+| Text on filled action | `on-accent` | `#ffffff` |
 
-Approve stays green (Laurel) and Deny becomes Blood red. Per `design/themes/README.md`, Laurel is reserved for *"real completion … only outcomes"* — an approval decision qualifies. Blood legitimately covers both brand and destructive states, so Deny reads correctly in it.
+Hardcoding is **required, not a compromise**: CSS custom properties sit at ~45% email support, and Gmail supports `var()` but not variable *declaration*. Colors must be literal hexes at render time. `docker/Dockerfile.orchestrator` also copies only `orchestrator/`, `src/`, `config/` — the runtime cannot read the SCSS even in principle.
 
-#### Drift guard
+### 2. Email layout module
 
-The hexes are hardcoded in Python: the orchestrator image does not contain `cockpit/src`, so runtime cannot read the SCSS. To stop this rotting the way Catppuccin did, a unit test parses `_theme-config.scss` and asserts the Python constants still match. The test runs from the repo, where both trees exist. ~20 lines, and it is the only mechanism preventing a repeat of exactly the problem this design exists to fix.
+New `orchestrator/services/email_layout.py`:
+
+```python
+@dataclass(frozen=True)
+class Action:
+    label: str
+    url: str
+    variant: str = "primary"   # "primary" | "danger" | "neutral"
+
+def render_email(
+    *,
+    title: str,                 # PLAIN TEXT — escaped internally
+    body_html: str,             # TRUSTED HTML — caller escapes
+    subtitle: str | None = None,# PLAIN TEXT — escaped internally
+    actions: Sequence[Action] = (),
+    footer_note: str | None = None,
+) -> str:
+```
+
+`title` and `subtitle` are plain text and `html.escape()`d inside. Only `body_html` is trusted. Getting this boundary right in the API is what kills the existing injection; mirroring the current signature would preserve it.
+
+The three hand-rolled `.replace("&","&amp;")…` chains become `html.escape()`.
+
+#### Email HTML rules
+
+These are not the cockpit's CSS rules. Each has a specific reason:
+
+- **Table layout, 600px, `role="presentation"`.** Outlook's Word engine doesn't support `width` on `<div>` at all. Microsoft commits to classic Outlook **until at least 2029** — the widely-repeated "Word engine dies October 2026" claim is Office LTSC 2021's EOL, not the engine's.
+- **Buttons are padded `<td>`s, never padded `<a>`s.** Outlook Windows doesn't support `display`, so an `<a>` is permanently an inline box and vertical padding cannot expand the line. Because our buttons are square, **no VML is needed**.
+- **Link colors inline on every `<a>`.** The list of clients stripping `<head><style>` is *growing* — GMX, WEB.DE, SFR and LaPoste all regressed between 2023 and 2025. The `<style>` block is enhancement only. Inside it: never `a:link` (unsupported on every Gmail platform), never `url()` (Gmail drops the entire style tag), and stay under Gmail's 16KB style cap.
+- **Font/color set inline on the containing `<td>`** so inherited `<p>`/`<a>` fragments still render sanely with zero CSS applied.
+- **Entity-encode all non-ASCII output.** Gmail clips on non-ASCII characters *independently of size* — documented repros on `©`, `é`, and an en-dash in a tiny email. An editorial serif language reaches for `—` and curly quotes constantly. One line: `body.encode("ascii", "xmlcharrefreplace").decode("ascii")`. (The famous 102KB limit is folklore; measured clipping is ~99.5KB and irrelevant at our size.)
+- **Uppercase via CSS, never in the emitted string.** Screen readers read the source and spell all-caps tokens as initialisms. Emit sentence case with `text-transform: uppercase`. Never fake tracking with literal spaces. `letter-spacing` in `px`, not `em`.
+- **No `border-radius`.** It is a no-op at zero in the Word engine, so emitting it is pure bytes against the style cap.
+- **No web fonts.** Headings use `Georgia, 'Times New Roman', serif`. Note that Android aliases *both* names to `serif`, so Gmail Android renders Noto Serif — the layout must not depend on Georgia's metrics. Quote every multi-word font name, and ship the `<!--[if mso]>` Arial override.
+- **`<meta name="color-scheme" content="light">` *plus* `:root { color-scheme: light }`** in the style block — the meta tag alone is inert on every Apple Mail since 2019.
+- **`lang`/`dir` on a body wrapper `<div role="article">`**, not only `<html>` — webmail clients strip `<html>`. Avoid `<header>`/`<main>`/`<footer>`: unsupported in Outlook, and Gmail replaces them with `<u></u>`.
+
+#### Accessibility: Approve and Deny must not differ by hue alone
+
+Measured against the Travertine card:
+
+| Pair | Ratio | |
+|---|---|---|
+| Approve `#446b3e` vs card | 5.70:1 | passes as a control |
+| Deny `#9c2832` vs card | 7.06:1 | passes |
+| **Approve vs Deny** | **1.24:1** | **fails WCAG 1.4.1** |
+
+Two same-size, same-shape rectangles differing only in red vs green — the most common colour-vision-deficiency axis — on the highest-stakes action in the product. The current Catppuccin pair measures 1.56:1, so the naive port is a *regression*.
+
+**Approve stays solid; Deny becomes a ghost button** (card-coloured fill, `#9c2832` border and text). The two fills then differ by 5.70:1 and are distinguishable by **form**, not hue. Labels remain real text, which also preserves meaning under dark-mode inversion — where `#9c2832` inverts toward cyan-green and `#446b3e` toward magenta, potentially swapping their apparent semantics.
 
 #### Call-site migration
 
 | Site | After |
 |---|---|
-| `email.py:200` `send_system_notification` | `render_email(title="Superhuman Remote Worker", body_html=…)` — largest visual change, it is currently unstyled |
-| `email.py:294` `send_agent_message` | `render_email(title=…, body_html=message_html)` |
-| `headless_notifications.py:293` `_build_permission_email_bodies` | `render_email(title="Permission requested", subtitle=…, body_html=<tool + args>, actions=[Approve, Deny], footer_note=…)` |
+| `email.py:200` | `render_email(title="Superhuman Remote Worker", body_html=…)` |
+| `email.py:294` | `render_email(title=…, subtitle=job/agent/phase, body_html=message_html)` |
+| `headless_notifications.py:293` | `render_email(…, actions=[Approve solid, Deny ghost], footer_note=…)` |
 
-Plaintext bodies are unchanged. The function keeps returning `(text, html)`.
+Plaintext bodies unchanged; the function keeps returning `(text, html)`.
 
-### 2. Keycloak `srw` login theme
+### 3. Magic-link landing pages
 
-Source lives at `helm/keycloak-theme/srw/`.
+`_magic_link_confirmation_page` and `_magic_link_result_page` are pure `str`-returning functions, so re-skinning them from `brand.py` is self-contained. `consent.html` is a static template and can follow in the same slice or trail it.
 
-**Why inside the chart:** Helm cannot read files outside its own directory, so `.Files.Glob` requires the theme to sit under `helm/`. docker-compose bind-mounts the same path from the repo root, keeping one source of truth for both deployment modes.
+### 4. Keycloak `srw` login theme
+
+Source at `helm/keycloak-theme/srw/` — **inside the chart, because Helm cannot read files outside its own directory**. docker-compose bind-mounts the same path.
 
 ```
 helm/keycloak-theme/srw/
   login/
     theme.properties
-    resources/css/srw.css
-    resources/img/logo.svg
+    resources/css/srw.<datestamp>.css
+    resources/img/srw-logo.svg
+    resources/fonts/cinzel-600.woff2
   email/
     theme.properties
     html/template.ftl
@@ -176,15 +209,27 @@ helm/keycloak-theme/srw/
 
 ```properties
 parent=keycloak.v2
-import=common/keycloak
-styles=css/styles.css css/srw.css
+styles=css/styles.css css/srw.20260811.css
 ```
 
-`css/styles.css` resolves up the chain to keycloak.v2's own stylesheet; `css/srw.css` is ours. `stylesCommon` (the PatternFly v5 vendor bundle) is inherited and must not be redeclared.
+**Do not carry `import=common/keycloak`.** It is inherited — `DefaultThemeManager.loadTheme()` processes imports for every theme in the chain — and redeclaring it inserts `common/keycloak` twice, shifting property-merge order so it lands *after* `keycloak.v2`. Verified: PatternFly still loads with the line removed.
 
-`srw.css` overrides PatternFly v5 global custom properties. Light values under `:root`, dark values under both `.pf-v5-theme-dark` and `@media (prefers-color-scheme: dark)` — keycloak.v2 already ships the dark-mode plumbing, so we only supply values:
+**The stylesheet filename is versioned.** Theme resources are served with `Cache-Control: max-age=2592000` (30 days), and the `/resources/<tag>/` segment is the `MIGRATION_MODEL` row id — it moves only on a version migration, never on a theme edit. Bumping the filename is the only lever that doesn't require a global cache-policy change.
 
-| PF5 token | Travertine | Senate |
+#### Token overrides — specificity is the trap
+
+PatternFly v5 wraps **every** dark-mode token redefinition in `:where(.pf-v5-theme-dark)`, and `:where()` has **zero specificity by spec**. A `:root` block (0,1,0) therefore beats it unconditionally, regardless of load order. Supplying light under `:root` and dark under a media query yields **light in both modes**.
+
+Dark values go on the bare class, after the `:root` block:
+
+```css
+:root { --pf-v5-global--primary-color--100: #9c2832; … }
+.pf-v5-theme-dark { --pf-v5-global--primary-color--100: #cc4647; … }
+```
+
+Do **not** use `@media (prefers-color-scheme: dark)` for these tokens — it desyncs from the class Keycloak actually toggles. The class is applied by JS to `<html>` (`document.documentElement`), the opposite of the cockpit's body-scoped convention.
+
+| PF5 token | Travertine (`:root`) | Senate (`.pf-v5-theme-dark`) |
 |---|---|---|
 | `--pf-v5-global--primary-color--100` | `#9c2832` | `#cc4647` |
 | `--pf-v5-global--BackgroundColor--100` | `#fbf6ec` | `#1c1c22` |
@@ -194,110 +239,155 @@ styles=css/styles.css css/srw.css
 | `--pf-v5-global--BorderColor--100` | `#dccfb6` | `#33333d` |
 | `--pf-v5-global--link--Color` | `#9c2832` | `#cc4647` |
 | `--pf-v5-global--BorderRadius--sm` | `0` | `0` |
-| `--pf-v5-global--FontFamily--text` | `'Inter', …` | `'Inter', …` |
-| `--pf-v5-global--FontFamily--heading` | `'Cinzel', Georgia, serif` | `'Cinzel', Georgia, serif` |
+| `--keycloak-card-top-color` | `#9c2832` | `#cc4647` |
 
-Fonts load from Google Fonts, matching what `cockpit/src/index.html:40` already does. Air-gapped installs degrade to the system stack — the same behaviour the cockpit already has, so this introduces no new class of failure.
+`--keycloak-card-top-color` is the 4px stripe atop the login card, currently PatternFly blue — the highest-visibility single token on the page.
 
-Beyond tokens, the stylesheet applies the Roman shape pass to the login card: sharp corners, and the Inset Stamp treatment on the primary submit button.
+`#kc-header-wrapper` sets `color: … !important` (keycloak.v2 gets away with it via a dark background image). Overriding the background to cream without countering this yields white-on-white; `srw.css` loads later, so an equal-specificity `!important` wins.
 
-Realm config sets `"loginTheme": "srw"` in all three locations listed under *Current state*.
+#### Logo
 
-### 3. Keycloak `srw` email theme
+`--keycloak-logo-url` works **only in combination with realm config**. keycloak.v2 renders the header as `${kcSanitize(msg("loginTitleHtml",(realm.displayNameHtml!'')))}` — text, not an `<img>`. The master realm's logo appears only because it ships `displayNameHtml` as `<div class="kc-logo-text"><span>Keycloak</span></div>`, which the stylesheet converts to an image.
 
-`email/theme.properties` is one line, `parent=keycloak`. `email/html/template.ftl` replaces the stock wrapper:
+Our realm currently sets `displayNameHtml` to `<strong>Superhuman Remote Worker</strong>`, which has no such hook. Both changes are required:
 
-```ftl
-<#macro emailLayout>
-<html lang="${locale.language}" dir="${(ltr)?then('ltr','rtl')}">
-<body>
-    <#nested>
-</body>
-</html>
-</#macro>
+```jsonc
+"displayNameHtml": "<div class=\"kc-logo-text\"><span>Superhuman Remote Worker</span></div>"
+```
+```css
+:root { --keycloak-logo-url: url('../img/srw-logo.svg');
+        --keycloak-logo-width: 300px; --keycloak-logo-height: 63px; }
 ```
 
-…with the same Travertine card the SRW emails use, wrapping `<#nested>`. Because every Keycloak email imports this macro, verify-address, password-reset, org-invite and the event notifications all inherit branding from this single file.
+Do not set `displayNameHtml` directly to an `<img>` — it survives the sanitizer but requires hardcoding `/resources/<tag>/…`, which breaks on every migration.
 
-The message bodies themselves come from Keycloak's `messages_*.properties` as raw HTML fragments containing `<p>` and `<a>`. They are **not** overridden — no copy changes, no `messages/` directory, no i18n surface to maintain. This is precisely why the wrapper needs its head `<style>` block: it is the only way to reach those inherited `<a>` tags.
+#### Fonts — self-hosted, and reduced in scope
 
-Plaintext (`text/`) templates are untouched.
+**Decision: self-host Cinzel only; use the system sans stack for body text.** The login page is the one page that must work when everything else is broken, so it should not depend on `fonts.googleapis.com`. An `@import` also serializes into a render-blocking chain, and it leaks every login attempt's IP to Google — a live GDPR argument on an EU-facing auth page. Cinzel is the brand signature and is used sparsely (headings, button labels), so one subset weight is enough; Inter versus a system sans is a subtle difference not worth the ConfigMap weight.
 
-Realm config gains `"emailTheme": "srw"`.
+This diverges from `cockpit/src/index.html:40`, which loads both from Google. That is deliberate: the app can degrade to a system stack mid-session, an auth page cannot.
 
-### 4. Theme delivery
+#### Also reachable without FreeMarker
 
-A ConfigMap rendered from `helm/keycloak-theme/**`, mounted read-only at `/opt/keycloak/themes/srw`. Insertion points in `helm/templates/services/keycloak.yaml`: `volumeMounts` at line 1169, `volumes` at line 1198.
+Page `<title>` (via realm display name or `login/messages/messages_en.properties`), favicon (`login/resources/img/favicon.ico` — must be a real `.ico`, so `binaryData` in the ConfigMap), and the page background (`--keycloak-bg-logo-url`). Genuinely requiring FreeMarker: footer links and any structural markup change. There is no "Powered by Keycloak" footer in keycloak.v2.
 
-**Key collision.** `login/theme.properties` and `email/theme.properties` share a basename, so `.AsConfig` cannot be used — it keys by basename and one would silently overwrite the other. Keys must be path-mangled (`login_theme.properties`, `email_html_template.ftl`, …) and mapped back through `items[].path`, which accepts subdirectories:
+### 5. Keycloak `srw` email theme
+
+`email/theme.properties`:
+
+```properties
+parent=base
+brandName=Superhuman Remote Worker
+logoUrl=${env.SRW_EMAIL_LOGO_URL:https://srw.works/img/email-logo.png}
+```
+
+**`parent=base`, not `parent=keycloak`.** `keycloak/email/` contains only `theme.properties` (verified), so they are identical today — but the extra layer is one Red Hat can add files to in any patch release, silently altering our mail. Theme properties support `${env.VAR:default}` substitution, which also gives per-environment branding with no rebuild.
+
+`email/html/template.ftl` replaces the stock 6-line macro with the Travertine card, wrapping `<#nested>`. Constraints:
+
+- **Guard `ltr`:** `${(ltr!true)?then('ltr','rtl')}`. The variable only exists from 26.2; on older versions an unguarded reference makes **every email fail to send**. We pin 26.2, but customer installs may not.
+- **Guard `url`:** optional from 26.4 — unguarded references break scheduled-task emails.
+- **Never use `${url.resourcesCommonUrl}`** — the current keycloak.org docs recommend it for email images, but it does not exist in 26.2 and throws.
+- **Never serve the logo from theme resources.** Those URLs embed the migration tag; emails are archival, so on the next Keycloak upgrade every logo in every previously-sent mail 404s. Base64 data-URIs are stripped by Gmail and Outlook; CID embedding is an open feature request. Host externally, parameterized as above.
+- **Only reference variables guaranteed for every email type** — `realmName`, `properties`, `msg`, `user`, `locale`, `kcSanitize`. `link`, `event`, `code` and friends are per-type; referencing them in the wrapper breaks the types that don't set them.
+- Our wrapper markup is **not** sanitized — `kcSanitize` applies only to message-bundle content.
+
+Realm gains `"emailTheme": "srw"`.
+
+**Plaintext stays unbranded** — there is no `text/template.ftl` to override, and multipart remains valid. Worth knowing because plaintext is what spam filters preview.
+
+### 6. Theme delivery
+
+A ConfigMap mounted read-only at `/opt/keycloak/themes/srw`. Insertion points in `helm/templates/services/keycloak.yaml`: `volumeMounts` at line 1169, `volumes` at line 1198.
+
+**ConfigMap keys cannot contain `/`** — a real API server rejects them. Keys are path-mangled and mapped back through `items[].path`, which *does* accept slashes:
 
 ```yaml
 volumes:
-  - name: kc-theme
+  - name: srw-theme
     configMap:
       name: {{ include "srw.fullname" . }}-keycloak-theme
       items:
-        - key: login_theme.properties
-          path: login/theme.properties
-        - key: login_resources_css_srw.css
-          path: login/resources/css/srw.css
-        - key: login_resources_img_logo.svg
-          path: login/resources/img/logo.svg
-        - key: email_theme.properties
-          path: email/theme.properties
-        - key: email_html_template.ftl
-          path: email/html/template.ftl
+        - {key: login_theme.properties,  path: login/theme.properties}
+        - {key: login_srw.css,           path: login/resources/css/srw.20260811.css}
+        - {key: login_srw-logo.svg,      path: login/resources/img/srw-logo.svg}
+        - {key: email_theme.properties,  path: email/theme.properties}
+        - {key: email_template.ftl,      path: email/html/template.ftl}
 ```
 
-**Cache busting is mandatory, not optional.** Keycloak runs `start` (production mode), which caches themes, and updating a ConfigMap does not restart pods. Without a `checksum/keycloak-theme: {{ … | sha256sum }}` annotation on the pod template, theme edits will appear to do nothing. This is the single most likely way to lose an hour on this feature.
+Every file must be enumerated by hand; adding one to the ConfigMap without an `items` entry is a silent no-op. Note `login/` and `email/` both contain `theme.properties`, so `.AsConfig` cannot be used — it keys by basename and one would overwrite the other.
 
-docker-compose mounts the same directory directly:
+**A checksum annotation is mandatory.** Three independent staleness traps exist in production:
+
+1. `cacheThemes` caches the resolved theme, so `theme.properties` edits never reload.
+2. `cacheTemplates` caches **compiled FreeMarker** — this is the one that makes `template.ftl` edits appear to do nothing.
+3. The **gzip cache** writes a `.gz` on first request and only regenerates if the file is *absent* — no mtime or content check. Browsers send `Accept-Encoding: gzip` and receive stale CSS while `curl` shows it fresh. Gzip engages only when theme caching is on, so this failure mode **does not exist in dev**.
+
+```yaml
+annotations:
+  checksum/theme: {{ include (print $.Template.BasePath "/keycloak-theme-configmap.yaml") . | sha256sum | quote }}
+```
+
+Our `/opt/keycloak/data` is an `emptyDir`, so a pod roll does clear the gzip cache. (Had it been a PVC, stale CSS would survive restarts indefinitely.)
+
+Dev environments should set `KC_SPI_THEME_CACHE_THEMES=false`, `KC_SPI_THEME_CACHE_TEMPLATES=false`, `KC_SPI_THEME_STATIC_MAX_AGE=-1` — runtime options, no `kc.sh build`. Never in production.
+
+docker-compose bind-mounts the source directly:
 
 ```yaml
 volumes:
   - ./helm/keycloak-theme/srw:/opt/keycloak/themes/srw:ro
 ```
 
-### 5. SMTP port fix
+### 7. SMTP port fix
 
-`helm/templates/services/keycloak.yaml:914` hardcodes `-s "smtpServer.port=1025"` — a dev mail-catcher port — while `values.yaml:1918` exposes `email.smtp.port` as configurable. Any operator pointing the chart at a real relay on 587 gets a Keycloak that still dials 1025.
+`helm/templates/services/keycloak.yaml:914` hardcodes `-s "smtpServer.port=1025"` — a dev mail-catcher port — while `values.yaml:1918` exposes `email.smtp.port`. Any operator pointing the chart at a real relay on 587 gets a Keycloak that still dials 1025.
 
-Fix: `{{ .Values.email.smtp.port | default "1025" }}`, and derive `smtpServer.starttls` from `.Values.email.smtp.useTls`. Defaults preserve current behaviour exactly, so existing installs see no change.
-
-Implicit TLS (port 465, requiring `smtpServer.ssl=true`) is **out of scope** — it needs a separate values key and has no current consumer. Noted here so the omission is deliberate rather than forgotten.
+Fix: `{{ .Values.email.smtp.port | default "1025" }}`, with `smtpServer.starttls` from `.Values.email.smtp.useTls`. Defaults preserve current behaviour. Implicit TLS (465, needing `smtpServer.ssl=true`) is **out of scope** — it needs a separate values key and has no current consumer.
 
 ## Decisions
 
-**Light emails, auto login.** Emails are Travertine-only. Dark HTML mail is the fragile case — Gmail on Android and Outlook.com force-invert it, and `design/themes/README.md` scopes Travertine to *"formal or print-adjacent contexts,"* which is exactly email's register. The login page instead honours `prefers-color-scheme`, mirroring the cockpit's own `system` default, so the front door behaves like the app behind it.
+**Light emails, auto login.** Emails are Travertine-only. Dark HTML mail is the fragile case, and Travertine is scoped to "formal, print-adjacent" contexts. Light-only survives *full* inversion at 5.4–14.9:1. The login page follows `prefers-color-scheme` via Keycloak's own class toggle.
 
-**ConfigMap over a custom image.** A custom Keycloak image would give cleaner runtime semantics and proper theme caching, but it makes us the owner of Keycloak's patch cadence — every KC CVE becomes our rebuild. Staying on the upstream tag means security patches land for free. The theme is text-only (SVG logo included), so the 1MB ConfigMap limit is not a constraint.
+**Hand-rolled HTML, no email framework.** At three templates a framework isn't justified, and — decisively — **no framework would have prevented the original problem**. The failure was *drift*, not rendering: MJML would have held the same stale `#1e1e2e`. The real cause was three duplicated call sites with no shared layer, which is what this fixes. Reconsider around 10–15 templates, multiple authors, or i18n.
 
-**Rejected: per-message Keycloak email templates.** Overriding `password-reset.ftl` et al. would allow bespoke layouts per message type, at the cost of owning ~16 templates across the i18n surface. The single wrapper gets essentially all the visual benefit for one file.
+**Hardcoded palette + drift test, not a generator.** Both need the same SCSS parser; a generator is the test plus a `write()`. At ~11 hexes changing once per rebrand, the extra machinery isn't worth it. Revisit at ~30 tokens or 3+ consuming languages.
+
+**ConfigMap over a custom image.** A custom image gives cleaner caching but makes us the owner of Keycloak's patch cadence — every CVE becomes our rebuild.
+
+**Rejected: per-message Keycloak email templates.** Overriding `password-reset.ftl` et al. means owning ~16 templates for essentially the same visual result as one wrapper.
 
 ## Testing
 
 **Email**
-- Unit tests on `render_email`: title/subtitle render, actions become anchors with correct `href` and variant colours, empty `actions` omits the footer band, `body_html` passes through unescaped.
-- The palette drift test against `_theme-config.scss`.
-- Existing tests were checked and assert on semantics, not colour — `tests/test_headless_notifications_phase4.py:495-501` looks for `"run_command"`, the approve/deny URLs, and HTML escaping. All survive a restyle. `tests/test_email_service.py` passes `body_html` as a fixture and does not inspect it.
-- Visual: render all three to disk, open in a browser, and send through the dev mailpit catcher on 1025.
+- Unit tests on `render_email`: escaping of `title`/`subtitle`, `body_html` passthrough, action variants, non-ASCII entity encoding, empty-actions case.
+- **Palette drift test** — must scope parsing to the `$travertine-theme` block (both maps define `accent-color`, at `#9c2832` and `#cc4647`), normalize `#fff`/`#ffffff`, and **fail closed**: assert the file exists and that *every expected key was found*, or a rename makes it pass green — the exact rot it exists to prevent. On failure it should print the corrected constants block. Use the `Path(__file__).resolve().parents[1]` idiom from `tests/test_canvas_office_infra.py`; parse-and-assert across this boundary is established house style (4 precedents).
+- **Unmanaged-hex guard** — assert every `#rrggbb` literal in `email_layout.py` and the landing-page functions is a member of the palette dict. The equality test catches "the palette changed"; this catches "someone added a one-off hex," which is how drift actually starts.
+- Existing tests assert on semantics, not colour (`tests/test_headless_notifications_phase4.py:495-501` checks `"run_command"`, the approve/deny URLs, escaping) and survive a restyle.
+- A dev `/emails` preview route rendering all three, borrowed from Zulip — cheaper than render-to-disk and it doesn't rot.
+- **The one render worth looking at manually: Yahoo desktop dark mode** against `#f3ece0`/`#fbf6ec`, where modelling predicts body text at 2.08–2.54:1.
 
 **Keycloak**
-- `helm template` to confirm the ConfigMap and mounts render, then `kubectl apply --dry-run=server` — mocked clients validate nothing about manifest shape.
-- Playwright against local k3d: login page in both colour schemes, plus a password-reset mail captured in mailpit.
-- Confirm the checksum annotation actually rolls the pod when the theme changes. This is the assertion that proves the delivery mechanism works, and it is easy to skip.
+- `helm template`, then `kubectl apply --dry-run=server`.
+- **Startup smoke test**: assert `srw` appears in `GET /admin/serverinfo` → `themes.login[]`, and that the versioned CSS returns 200. A mistyped `items[].path` fails silently until someone tries to log in.
+- Admin console → Realm Settings → Email → **Test connection** exercises `email-test.ftl`, which imports our wrapper — the fastest end-to-end email loop.
+- Playwright against local k3d for login in both colour schemes.
+- Confirm the checksum annotation rolls the pod, and re-fetch the CSS **with `Accept-Encoding: gzip`** — testing with `curl` alone will not reveal the stale-gzip failure.
 
 ## Risks
 
-1. **Theme cache** — covered above. If the login page looks unchanged after a deploy, this is why.
-2. **`Deployment` strategic-merge** — Keycloak is a `Deployment` (`keycloak.yaml:540`). Adding volumes has previously triggered the `env[N].valueFrom` strategic-merge patch bug in this chart; remedy is delete + recreate the Deployment.
-3. **Google Fonts availability** — degrades to system stack; acceptable and consistent with existing cockpit behaviour.
-4. **`keycloak.v2` is not `keycloak`** — moving parent themes changes the underlying PatternFly major version (v3/v4 → v5). Markup and class names differ, so the login page will restructure somewhat even before our CSS applies. This is intended, but it means the "before" screenshot will differ more than a pure recolour would suggest.
+1. **Three caches, one of them invisible in dev.** The gzip cache is the dangerous one; the checksum annotation is the mitigation.
+2. **Silent theme fallback.** A bad theme name or a missing `items[].path` logs one ERROR and serves built-in themes. Hence the startup smoke test.
+3. **`Deployment` strategic-merge.** Keycloak is a `Deployment` (`keycloak.yaml:540`); adding volumes has previously tripped the `env[N].valueFrom` patch bug here. Remedy is delete + recreate.
+4. **`:where()` specificity.** Dark-mode tokens must go on the bare class, never `:root` or a media query.
+5. **1 MiB ConfigMap ceiling.** CSS + SVG + one woff2 fits; base64 inflates by 33%. Adding a favicon, background image and more weights approaches the limit, and the mechanism does not degrade gracefully — crossing it means switching to a baked image.
+6. **PatternFly major bumps.** PF3→PF5 in KC 24 broke every child theme. Our `--pf-v5-*` overrides carry that risk at the next major. Nothing in 26.x or `main` signals it.
+7. **Floating image tag.** `values.yaml:1197` pins `26.2`, not a patch. Worth pinning exactly — a repull can move the migration tag and silently invalidate every browser's theme cache.
 
 ## Slices
 
-Independently shippable, in dependency order:
+1. **Brand module + email layout + three call sites + magic-link landing pages.** No chart changes; includes the injection fix and the Approve/Deny accessibility fix. Ships alone.
+2. **Keycloak login theme + ConfigMap delivery + checksum annotation + smoke test.** All chart work lands here, plus the realm `displayNameHtml` change.
+3. **Keycloak email theme + SMTP port fix.** Reuses slice 2's delivery; the port fix is what makes slice 3 observable outside dev.
 
-1. **Email module + three call sites.** No chart changes, no deploy coupling. Ships alone.
-2. **Keycloak login theme + ConfigMap delivery + checksum annotation.** The chart work lands here.
-3. **Keycloak email theme + SMTP port fix.** Reuses slice 2's delivery mechanism; the port fix is what makes slice 3 observable outside dev.
+Given ~10 days to alpha and that slices 2–3 touch a chart with a known strategic-merge hazard, **slice 1 is the one to ship before alpha**; 2–3 can follow.
