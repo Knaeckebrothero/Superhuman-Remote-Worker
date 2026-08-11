@@ -2311,6 +2311,44 @@ class TestRemoteBackendTmuxFences:
         assert '"$_srw_token" -le 14' in command
         assert _TMUX_GENERATION_OPTION in command
         assert execute.call_args.kwargs["allow_shell_retired"] is True
+        assert execute.call_args.kwargs["close_sftp"] is True
+
+    def test_terminal_tmux_proof_closes_own_sftp_before_exec(self):
+        backend = self._incarnation_backend(token=14)
+        sftp = MagicMock()
+        backend._sftp = sftp
+        events = []
+        sftp.close.side_effect = lambda: events.append("sftp.close")
+
+        with (
+            patch.object(
+                backend,
+                "_ensure_connected",
+                side_effect=lambda: events.append("ensure"),
+            ) as ensure_connected,
+            patch.object(
+                backend,
+                "_exec_with_status",
+                side_effect=lambda *_args, **_kwargs: (
+                    events.append("exec") or ("retired", 0)
+                ),
+            ) as execute,
+        ):
+            assert (
+                backend._tmux_exec_checked(
+                    "terminal-proof",
+                    operation="terminal proof",
+                    allow_shell_retired=True,
+                    close_sftp=True,
+                )
+                == "retired"
+            )
+
+        ensure_connected.assert_called_once_with()
+        sftp.close.assert_called_once_with()
+        assert backend._sftp is None
+        execute.assert_called_once_with("terminal-proof", retain_tail=True)
+        assert events == ["ensure", "sftp.close", "exec"]
 
     def test_incarnation_cleanup_is_strict_and_checks_both_authorities(self):
         backend = self._incarnation_backend(token=24)

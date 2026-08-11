@@ -175,6 +175,48 @@ def _retirement_metadata() -> dict:
     }
 
 
+def test_missing_retired_by_fields_are_recovered_from_exact_ack_kinds():
+    metadata = _retirement_metadata()
+    marker = metadata["_stateless_claim_retirement"]
+    del marker["residents_retired_by"]
+    del marker["remote_retired_by"]
+
+    parsed = stateless_retirement_authority(metadata)
+
+    assert parsed is not None
+    assert parsed["residents_retired_by"] == "protocol"
+    assert parsed["remote_retired_by"] == "protocol"
+
+
+@pytest.mark.parametrize(
+    ("retired_by_key", "ack_key"),
+    [
+        ("residents_retired_by", "_stateless_resident_retirement_ack"),
+        ("remote_retired_by", "_stateless_shell_retirement_ack"),
+    ],
+)
+def test_present_null_retired_by_is_not_inferred(retired_by_key, ack_key):
+    metadata = _retirement_metadata()
+    metadata["_stateless_claim_retirement"][retired_by_key] = None
+    assert metadata[ack_key]["kind"] == "protocol"
+
+    with pytest.raises(RuntimeError, match="acknowledgement is malformed"):
+        stateless_retirement_authority(metadata)
+
+
+def test_inferred_protocol_kind_still_enforces_workspace_drift_checks():
+    metadata = _retirement_metadata()
+    marker = metadata["_stateless_claim_retirement"]
+    del marker["residents_retired_by"]
+    del marker["remote_retired_by"]
+    metadata["workspace_container"]["_runtime_incarnation"] = (
+        "33333333-3333-4333-8333-333333333333"
+    )
+
+    with pytest.raises(RuntimeError, match="workspace authority changed"):
+        stateless_retirement_authority(metadata)
+
+
 @pytest.mark.parametrize("malformed", [None, 0, 1, "false", "yes", [], {}])
 @pytest.mark.parametrize(
     "field",
