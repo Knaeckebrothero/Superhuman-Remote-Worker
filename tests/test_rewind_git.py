@@ -1,5 +1,7 @@
 """GitManager.restore_tree — forward restore of a full tree, deletions included."""
 
+import base64
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,9 +43,19 @@ class _LinewiseShellBackend:
 
     supports_shell = True
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        temp_dir: Path | None = None,
+        drop_first_encoded_line: bool = False,
+    ) -> None:
         self.root = str(root)
         self.commands: list[str] = []
+        self.temp_dir = temp_dir
+        self.drop_first_encoded_line = drop_first_encoded_line
+        self.dropped_encoded_line: str | None = None
+        self.retained_encoded_payload: str | None = None
 
     def exists(self, path: str) -> bool:
         return (Path(self.root) / path).exists()
@@ -59,6 +71,9 @@ class _LinewiseShellBackend:
         del tab_name
         self.commands.append(command)
         cwd = Path(self.root) / working_dir if working_dir else Path(self.root)
+        env = dict(os.environ)
+        if self.temp_dir is not None:
+            env["TMPDIR"] = str(self.temp_dir)
         completed = subprocess.run(
             ["bash", "-lc", command],
             cwd=cwd,
@@ -66,11 +81,27 @@ class _LinewiseShellBackend:
             text=True,
             timeout=timeout,
             check=False,
+            env=env,
         )
         # The real tmux transport reconstructs command output line-by-line;
         # embedded NUL record separators do not reach GitManager.
-        merged = (completed.stdout + completed.stderr).replace("\x00", "")
-        linewise = "\n".join(merged.splitlines())
+        merged_lines = (
+            (completed.stdout + completed.stderr).replace("\x00", "").splitlines()
+        )
+        if self.drop_first_encoded_line and any(
+            line.startswith("SRW-Git-NUL-Integrity ") for line in merged_lines
+        ):
+            for index, line in enumerate(merged_lines):
+                if line and not line.startswith("SRW-Git-NUL-Integrity "):
+                    self.dropped_encoded_line = merged_lines.pop(index)
+                    self.retained_encoded_payload = "".join(
+                        value
+                        for value in merged_lines
+                        if value and not value.startswith("SRW-Git-NUL-Integrity ")
+                    )
+                    self.drop_first_encoded_line = False
+                    break
+        linewise = "\n".join(merged_lines)
         return (
             f"Exit code: {completed.returncode}\nCWD: {cwd}\n--- stdout ---\n{linewise}"
         )
@@ -148,6 +179,31 @@ def test_changed_paths_reports_files_across_turn_commits(tmp_path):
     second = _git(repo, "rev-parse", "HEAD").strip()
 
     assert GitManager(repo).changed_paths(first, second) == ["keep.txt", "new.txt"]
+
+
+def test_local_changed_paths_preserves_raw_git_filename_bytes(tmp_path):
+    repo = _make_repo(tmp_path)
+    (repo / "state.txt").write_text("A")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "state A")
+    target = _git(repo, "rev-parse", "HEAD")
+
+    raw_names = [
+        b"carriage\rreturn.txt",
+        b"crlf\r\nname.txt",
+        b"non-utf8-\xff.txt",
+    ]
+    for raw_name in raw_names:
+        raw_path = os.fsencode(repo) + b"/" + raw_name
+        with open(raw_path, "wb") as stream:
+            stream.write(b"bytes")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add raw-byte paths")
+    source = _git(repo, "rev-parse", "HEAD")
+
+    assert GitManager(repo).changed_paths(target, source) == [
+        os.fsdecode(raw_name) for raw_name in raw_names
+    ]
 
 
 def test_workspace_undo_commit_is_idempotently_recoverable(tmp_path):
@@ -271,6 +327,66 @@ def test_conflicting_duplicate_undo_preparations_fail_closed(tmp_path, conflict)
 
     with pytest.raises(WorkspaceUndoInvariantViolation, match="conflicting"):
         manager.find_workspace_undo_preparation(UNDO_REQUEST_ID)
+
+
+def test_remote_nul_integrity_rejects_dropped_leading_base64_line(tmp_path):
+    repo = _make_repo(tmp_path)
+    (repo / "state.txt").write_text("A")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "state A")
+    target = _git(repo, "rev-parse", "HEAD")
+    (repo / "state.txt").write_text("B")
+    changed_names = [f"changed-{index:03d}-{'x' * 24}.txt" for index in range(100)]
+    for name in changed_names:
+        (repo / name).write_text(name)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "state B")
+    source = _git(repo, "rev-parse", "HEAD")
+
+    transport_temp = tmp_path / "transport-temp"
+    transport_temp.mkdir()
+    backend = _LinewiseShellBackend(
+        repo,
+        temp_dir=transport_temp,
+        drop_first_encoded_line=True,
+    )
+    manager = GitManager(repo, backend=backend)
+    args = ["diff", "--name-only", "-z", target, source]
+
+    assert manager._run_git_nul_records(args) is None
+    assert backend.dropped_encoded_line is not None
+    assert len(backend.dropped_encoded_line) == 76
+    assert backend.retained_encoded_payload is not None
+    retained_raw = base64.b64decode(
+        backend.retained_encoded_payload,
+        validate=True,
+    )
+    # The retained suffix is independently valid base64 and still ends at a
+    # complete NUL record. Only the end-retained length/hash frame detects the
+    # missing leading data line.
+    assert retained_raw.endswith(b"\x00")
+    assert list(transport_temp.iterdir()) == []
+
+    # A complete retry decodes normally, and a Git failure also removes its
+    # operation-scoped spool file before surfacing failure.
+    complete_paths = manager._run_git_nul_records(args)
+    assert complete_paths is not None
+    assert complete_paths == [*changed_names, "state.txt"]
+    assert (
+        manager._run_git_nul_records(
+            ["diff", "--name-only", "-z", "missing-ref", source]
+        )
+        is None
+    )
+    assert list(transport_temp.iterdir()) == []
+    framed_commands = [
+        command for command in backend.commands if "SRW-Git-NUL-Integrity" in command
+    ]
+    assert framed_commands
+    assert all(
+        command.startswith("( ") and command.endswith("; )")
+        for command in framed_commands
+    )
 
 
 @pytest.mark.asyncio
