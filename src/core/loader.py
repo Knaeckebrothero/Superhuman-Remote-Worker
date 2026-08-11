@@ -2887,8 +2887,27 @@ def load_agent_config_from_dict(
         "officer",
         "autonomy",
         "image_quality",
+        # Both are emitted by ``dataclasses.asdict(AgentConfig)`` and are
+        # therefore present whenever a caller round-trips a live config (the
+        # session ``config.update`` path does exactly that). Without them here
+        # the comprehension below treats them as ordinary unknown keys: the
+        # whole namespace is re-buried as ``extra["extra"]``, so
+        # ``config.extra["shell"]`` — and every other extra key — vanishes from
+        # the rebuilt config. That is the root cause of
+        # docs/issues/live_config_update_buries_extra_and_empties_the_shell_group.md;
+        # ``_deployment_dir`` is plumbing the caller passes as an argument.
+        "extra",
+        "_deployment_dir",
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
+
+    # A serialized ``extra`` sub-dict rehydrates as itself. Top-level unknown
+    # keys still win, preserving the precedence a caller gets today when it
+    # hands us a hand-built dict that spells extras at the top level.
+    nested_extra = data.get("extra")
+    if isinstance(nested_extra, dict):
+        for key, value in nested_extra.items():
+            extra.setdefault(key, value)
 
     # Parse interactive config
     interactive_data = data.get("interactive", {})

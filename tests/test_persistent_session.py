@@ -2902,6 +2902,95 @@ class TestResetupToolsForBackend:
         assert session.tools is None
 
 
+class TestConfiguredButUnboundToolsAreReported:
+    """A configured tool name that does not instantiate must be logged.
+
+    The bind filter is an intersection: a name survives only if it is BOTH
+    configured and produced by its category factory. When the two disagree a
+    category can empty itself with nothing in the log — that is how
+    ``docs/issues/live_config_update_buries_extra_and_empties_the_shell_group.md``
+    stayed invisible while the shell group silently bound only ``shell_read``.
+    Backend-filtered names are excluded on purpose: dropping shell on a
+    no-shell tier is the capability gate working, not an anomaly.
+    """
+
+    @staticmethod
+    def _run_setup(session, requested, missing=frozenset()):
+        """``_setup_tools`` appends its own floors (task tools, product guide,
+        fleet group) to the requested list, so the factory stub must build
+        everything it is handed EXCEPT the names this test is withholding —
+        modelling a category factory that produced a different set than the
+        name list asked for."""
+        with (
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=list(requested),
+            ),
+            patch(
+                "src.api.persistent_session.load_tools",
+                side_effect=lambda names, ctx: [
+                    _named_tool(n) for n in names if n not in missing
+                ],
+            ),
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+            patch("src.api.persistent_session.ToolContext"),
+            patch(
+                "src.api.persistent_session.supports_parallel_tool_calls",
+                return_value=False,
+            ),
+            patch(
+                "src.services.guardrails.apply_guardrails_to_tools",
+                side_effect=lambda tools, model=None: tools,
+            ),
+        ):
+            session._setup_tools(None)
+
+    def test_warns_naming_each_configured_tool_that_never_bound(self, caplog):
+        """The exact live failure: run_command configured, only shell_read built."""
+        session = _make_session()
+        session.workspace_manager = _SwappableWM(
+            SimpleNamespace(supports_shell=True, supports_file_tools=True)
+        )
+        session._llm = MagicMock()
+
+        with caplog.at_level("WARNING", logger="src.api.persistent_session"):
+            self._run_setup(
+                session,
+                requested=["run_command", "cancel_command", "shell_read"],
+                missing={"run_command", "cancel_command"},
+            )
+
+        warnings = "\n".join(
+            r.message for r in caplog.records if r.levelname == "WARNING"
+        )
+        assert "run_command" in warnings
+        assert "cancel_command" in warnings
+
+    def test_silent_when_every_configured_tool_binds(self, caplog):
+        """No delta ⇒ no warning, so the signal stays worth reading."""
+        session = _make_session()
+        session.workspace_manager = _SwappableWM(
+            SimpleNamespace(supports_shell=True, supports_file_tools=True)
+        )
+        session._llm = MagicMock()
+
+        with caplog.at_level("WARNING", logger="src.api.persistent_session"):
+            self._run_setup(session, requested=["run_command", "shell_read"])
+
+        assert not [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING" and "did not bind" in r.message
+        ]
+
+
 @pytest.mark.parametrize(
     ("backend", "expected"),
     [
