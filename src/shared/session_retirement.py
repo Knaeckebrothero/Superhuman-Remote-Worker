@@ -564,7 +564,7 @@ async def acknowledge_session_claim_quiesced(
                 RETURNING id
                 """,
                 tid,
-                token,
+                str(token),
                 json.dumps(next_metadata, sort_keys=True, separators=(",", ":")),
                 owner,
                 owner_uid,
@@ -665,7 +665,7 @@ async def mark_session_claim_eviction_requested(
                 RETURNING id
                 """,
                 tid,
-                token,
+                str(token),
                 owner,
                 owner_uid,
             )
