@@ -369,7 +369,10 @@ async def test_exact_uid_ack_removes_debt_and_restores_intended_state():
         "2026-08-11T12:00:03+00:00",
         "2026-08-11T12:00:00+00:00",
     )
-    assert "run_after = COALESCE($5::timestamptz, run_after)" in queue_update.args[0]
+    assert (
+        "run_after = COALESCE($5::text::timestamptz, run_after)" in queue_update.args[0]
+    )
+    assert "ELSE $6::text::timestamptz END" in queue_update.args[0]
     assert "THEN NULL" not in queue_update.args[0]
 
 
