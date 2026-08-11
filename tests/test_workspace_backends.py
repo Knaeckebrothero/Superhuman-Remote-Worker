@@ -1912,10 +1912,80 @@ class TestRemoteBackendTmuxFences:
 
         command = execute.call_args.args[0]
         assert "flock -o -w 30" in command
+        assert "bash -c" in command
         assert '"$_srw_token" = 44 ] || exit 75' in command
         assert '"$_srw_tmux_token" = 44 ] || exit 75' in command
         assert "touch /cloud/state" in command
         assert execute.call_args.kwargs == {"timeout": 19, "retain_tail": True}
+
+    def test_claim_resource_lock_uses_bash_for_pipefail_scripts(self, tmp_path):
+        backend = self._incarnation_backend()
+        command = backend._tmux_lock_command(
+            "set -euo pipefail\nprintf '__SRW_PIPEFAIL_OK__\\n'",
+            shell="bash",
+        )
+
+        completed = subprocess.run(
+            ["/bin/sh", "-c", command],
+            env={**os.environ, "HOME": str(tmp_path)},
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout == "__SRW_PIPEFAIL_OK__\n"
+
+    def test_terminal_claim_resource_uses_bash_for_cleanup_script(self):
+        backend = self._incarnation_backend(token=47)
+        with patch.object(
+            backend, "_exec_with_status", return_value=("terminal-ok", 0)
+        ) as execute:
+            assert (
+                backend.exec_terminal_claim_resource(
+                    "set -euo pipefail\nprintf '__SRW_TERMINAL_CLEANUP__\\n'",
+                    timeout=23,
+                    operation="resident cleanup",
+                )
+                == "terminal-ok"
+            )
+
+        command = execute.call_args.args[0]
+        assert "flock -o -w 30" in command
+        assert "bash -c" in command
+        assert "__SRW_TERMINAL_CLEANUP__" in command
+        assert execute.call_args.kwargs == {"timeout": 23, "retain_tail": True}
+
+    def test_retired_resource_verification_uses_bash_for_zero_script(self):
+        backend = self._incarnation_backend(token=48)
+        with patch.object(
+            backend, "_exec_with_status", return_value=("zero-ok", 0)
+        ) as execute:
+            assert (
+                backend.verify_terminal_claim_resources_retired(
+                    "set -euo pipefail\nprintf '__SRW_RESOURCE_ZERO__\\n'",
+                    timeout=29,
+                    operation="resident zero proof",
+                )
+                == "zero-ok"
+            )
+
+        command = execute.call_args.args[0]
+        assert "flock -o -w 30" in command
+        assert "bash -c" in command
+        assert "__SRW_RESOURCE_ZERO__" in command
+        assert execute.call_args.kwargs == {"timeout": 29, "retain_tail": True}
+
+    def test_tmux_lock_command_defaults_to_sh_and_rejects_other_shells(self):
+        backend = self._incarnation_backend()
+
+        command = backend._tmux_lock_command("printf default-shell")
+
+        assert " sh -c " in command
+        assert "bash -c" not in command
+        with pytest.raises(ValueError, match="must be sh or bash"):
+            backend._tmux_lock_command("true", shell="zsh")
 
     def test_stateless_resource_nonzero_rejects_stale_mutation(self, remote_backend):
         backend, _, _ = remote_backend
