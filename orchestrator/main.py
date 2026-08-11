@@ -208,7 +208,8 @@ from src.shared.thread_presence import (  # noqa: E402
 )
 from services.stateless_workspace_gate import (  # noqa: E402
     declared_thread_workspace_backend,
-    stateless_lite_workspace_check,
+    stateless_workspace_check,
+    thread_metadata_object,
 )
 from services.stale_verification_sweeper import (  # noqa: E402
     stale_verification_sweeper_loop,
@@ -1440,6 +1441,13 @@ AUTO_ASSIGN_ENABLED = os.environ.get("AUTO_ASSIGN_ENABLED", "true").lower() in (
     "1",
     "yes",
 )
+
+# Session admission reads the same default-off gate that renders the generic
+# stateless executor Deployment. Helm supplies this explicitly to the
+# orchestrator; an unset/local process preserves pinned behavior.
+STATELESS_SESSION_ENABLED = os.environ.get(
+    "STATELESS_SESSION_ENABLED", "false"
+).lower() in ("true", "1", "yes")
 
 # Worker jobs remain pinned unless this independent admission gate is opened.
 # Session-pool enablement is intentionally not sufficient: worker rollout and
@@ -4930,25 +4938,72 @@ def _thread_workspace_backend(thread: Any) -> Optional[str]:
     return declared_thread_workspace_backend(thread)
 
 
-def _require_stateless_lite_workspace(thread: dict[str, Any]) -> str:
-    """Fail closed while S2 workspace-session support is incomplete.
+def _stateless_session_class_refusal(config: Any) -> str | None:
+    """Return why this session class still requires its pinned wake plane."""
+    if not isinstance(config, dict):
+        return None
+    officer = config.get("officer") or {}
+    if not isinstance(officer, dict):
+        return None
+    if officer.get("conference") in (True, "true", "True", 1):
+        return "conference sessions still use pinned lifecycle wakes"
+    if officer.get("enabled") in (True, "true", "True", 1):
+        return "officer sessions still use the pinned watchdog and wake drain"
+    return None
 
-    A stateless claimant currently tears down ``RemoteBackend`` at every claim
-    edge.  Admitting a sandbox/VM thread would therefore appear to work while
-    silently destroying its deterministic tmux session.  Thread creation
-    materializes the effective physical workspace backend in
-    ``metadata.config_override``; accept only the two no-workspace-pod tiers
-    until S2's tmux, sync-ordering and agent-local-state gates have passed.
 
-    Keep this as an exact whitelist: missing, malformed and future backend
-    values, plus stale declarations with physical workspace evidence, must not
-    inherit the lite path by accident.
+def _materialized_session_class_override(
+    effective_config: Any,
+) -> dict[str, bool]:
+    """Freeze lifecycle-affecting class bits into the request layer.
+
+    Experts and account defaults are deliberately mutable for ordinary config,
+    but ``officer`` and ``conference`` select a pinned-only background wake
+    plane.  Materializing both booleans at creation makes that topology choice
+    stable across later expert/account edits and gives every synchronous
+    stateless admission boundary an authoritative value in thread metadata.
     """
-    backend, refusal_reason = stateless_lite_workspace_check(thread)
+    officer = (
+        effective_config.get("officer") if isinstance(effective_config, dict) else None
+    )
+    if not isinstance(officer, dict):
+        officer = {}
+    return {
+        "enabled": officer.get("enabled") in (True, "true", "True", 1),
+        "conference": officer.get("conference") in (True, "true", "True", 1),
+    }
+
+
+def _require_stateless_workspace(thread: dict[str, Any]) -> str:
+    """Require an exact stateless-supported workspace and session class.
+
+    Lite workspaces remain supported. Sandbox support is intentionally narrow:
+    the row must carry the orchestrator-owned Kubernetes lifecycle evidence,
+    and a ready endpoint must be paired with its backing generation, pinned SSH
+    identity, and runtime incarnation. VM, Docker and unknown/future states fail
+    closed. Officer/conference sessions remain pinned until their background
+    wake machinery becomes queue-aware.
+    """
+    metadata = thread_metadata_object(thread)
+    class_refusal = _stateless_session_class_refusal(
+        metadata.get("config_override") or {}
+    )
+    if class_refusal is not None:
+        logger.warning(
+            "Stateless session refused before attach: thread=%s class=%s",
+            thread.get("id"),
+            class_refusal,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=f"Stateless execution is unavailable: {class_refusal}",
+        )
+
+    backend, refusal_reason = stateless_workspace_check(thread)
     if refusal_reason is not None:
         logger.warning(
             "Stateless session refused before attach: thread=%s "
-            "workspace_backend=%r reason=%s (S2 lite-only gate)",
+            "workspace_backend=%r reason=%s",
             thread.get("id"),
             backend,
             refusal_reason,
@@ -4956,9 +5011,9 @@ def _require_stateless_lite_workspace(thread: dict[str, Any]) -> str:
         raise HTTPException(
             status_code=409,
             detail=(
-                "Stateless execution currently supports only lite workspace "
-                "backends (virtual/none); this session's workspace tier is "
-                "not yet supported"
+                "Stateless execution requires an attested Kubernetes sandbox "
+                "or a supported lite workspace (virtual/none); this session's "
+                f"workspace is unavailable ({refusal_reason})"
             ),
         )
     return backend
@@ -5009,6 +5064,43 @@ SESSION_DEFAULT_WORKSPACE_BACKEND = "virtual"
 # per-session opt-in only and is excluded from the default chain
 # (_default_session_workspace_backend) and the settings-PATCH validator.
 SESSION_CREATE_WORKSPACE_BACKENDS = SESSION_WORKSPACE_BACKENDS + ("vm",)
+
+
+def _resolve_thread_execution_lane(
+    *,
+    workspace_backend: str | None,
+    effective_config: dict[str, Any],
+) -> Literal["pinned", "stateless"]:
+    """Resolve topology-neutral session admission with pinned fallback.
+
+    The public create contract does not expose the execution plane. When the
+    default-off pool gate is enabled, an ordinary supported workspace uses the
+    stateless lane; unsupported infrastructure and pinned-only session classes
+    retain the existing dedicated-agent path.
+    """
+
+    class_refusal = _stateless_session_class_refusal(effective_config)
+    if class_refusal is not None:
+        return "pinned"
+
+    if not STATELESS_SESSION_ENABLED:
+        return "pinned"
+
+    if workspace_backend == "sandbox":
+        if container_provisioner.is_available and container_provisioner.in_cluster:
+            return "stateless"
+        return "pinned"
+
+    if workspace_backend == "virtual":
+        virtual_spec = _virtual_workspace_rclone_spec()
+        if virtual_spec and virtual_spec.get("type") != "memory":
+            return "stateless"
+        return "pinned"
+
+    if workspace_backend == "none":
+        return "stateless"
+
+    return "pinned"
 
 
 def _default_session_workspace_backend(user_settings: dict[str, Any] | None) -> str:
@@ -27928,21 +28020,49 @@ async def _apply_thread_config_update(
     internal ones — the recorded path distinguishes the two).
     """
     if thread_row and thread_row.get("execution_lane") == "stateless":
-        # S2 safety gate: generic config mutation is not the workspace-upgrade
-        # protocol. Preserve lite-only admission and refuse an already-drifted
-        # row before any config/datasource write below.
-        _require_stateless_lite_workspace(thread_row)
+        # Generic config mutation is not the workspace-upgrade protocol. Refuse
+        # an already-drifted row and allow only same-tier workspace tuning.
+        current_backend = _require_stateless_workspace(thread_row)
+        if "officer" in config_override:
+            # Runtime PATCH historically accepted this block without the
+            # create-time validator. Normalize booleans and reject unknown
+            # fields before evaluating the proposed immutable session class.
+            normalized_officer = _validated_session_officer_override(config_override)
+            config_override["officer"] = normalized_officer or {}
+
+        metadata = thread_metadata_object(thread_row)
+        persisted_override = metadata.get("config_override") or {}
+        if not isinstance(persisted_override, dict):
+            persisted_override = {}
+        proposed_override = _deep_merge_dicts(
+            persisted_override,
+            config_override,
+        )
+        class_refusal = _stateless_session_class_refusal(proposed_override)
+        if class_refusal is not None:
+            # Creation materializes the fully resolved class booleans into the
+            # request layer, so this merge is authoritative even if the expert
+            # or account default changes later. Never persist a fragment that
+            # would move a live queue-served thread onto pinned-only wake
+            # machinery without an atomic lane-transition protocol.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A stateless session cannot enable pinned-only lifecycle "
+                    f"behavior ({class_refusal})"
+                ),
+            )
         if "workspace" in config_override:
             workspace_patch = config_override.get("workspace")
             if not isinstance(workspace_patch, dict) or (
                 "backend" in workspace_patch
-                and workspace_patch.get("backend") not in LITE_BACKENDS
+                and workspace_patch.get("backend") != current_backend
             ):
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        "Stateless execution currently supports only lite "
-                        "workspace backends (virtual/none)"
+                        "A stateless session cannot change its workspace tier "
+                        "through generic config mutation"
                     ),
                 )
 
@@ -28899,6 +29019,16 @@ class ThreadCreateRequest(BaseModel):
         ),
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_execution_lane_selector(cls, value: Any) -> Any:
+        """Keep session creation topology-neutral at the public boundary."""
+        if isinstance(value, dict) and "execution_lane" in value:
+            raise ValueError(
+                "execution_lane is orchestrator-managed and cannot be selected"
+            )
+        return value
+
     @model_validator(mode="after")
     def reject_null_datasource_selection(self) -> "ThreadCreateRequest":
         if "datasource_ids" in self.model_fields_set and self.datasource_ids is None:
@@ -29297,28 +29427,6 @@ async def create_thread(
         if req_officer:
             config_override.setdefault("officer", {}).update(req_officer)
 
-        # Conference embodiment (centurion.md §2/S9): needs one unambiguous
-        # project (identity is project-scoped), and at most ONE open
-        # conference per project — the single-writer rule; reattach instead
-        # of minting a rival embodiment.
-        if (config_override.get("officer") or {}).get("conference") is True:
-            if not primary_project_id:
-                raise HTTPException(
-                    status_code=400,
-                    detail="A conference session needs exactly one project — "
-                    "the officer's identity is project-scoped.",
-                )
-            _open_conf = await _find_open_conference_thread(primary_project_id)
-            if _open_conf:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "conference_open: this project already has an open "
-                        f"conference session ({_open_conf['id']}) — resume it "
-                        "instead of opening a second one."
-                    ),
-                )
-
         # Resolve the complete create-time policy view.  This is also the source
         # for infrastructure-affecting values and grants, preventing the create
         # path from validating only a thin request fragment while attach sees a
@@ -29341,6 +29449,37 @@ async def create_thread(
         effective_backend = _backend_from_override(effective_create_config)
         if effective_backend:
             config_override.setdefault("workspace", {})["backend"] = effective_backend
+
+        # Officer/conference selects pinned-only lifecycle machinery. Freeze
+        # the fully resolved booleans into the highest-priority request layer
+        # just like the physical workspace tier above. Later expert/account
+        # edits can still update ordinary config, but cannot silently move an
+        # existing stateless thread onto a different wake plane.
+        config_override.setdefault("officer", {}).update(
+            _materialized_session_class_override(effective_create_config)
+        )
+
+        # Conference embodiment (centurion.md §2/S9): validate the MATERIALIZED
+        # effective class, not only the user's explicit fragment. An expert or
+        # account default may select conference too, and must obey the same
+        # single-project/single-writer rules.
+        if (config_override.get("officer") or {}).get("conference") is True:
+            if not primary_project_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A conference session needs exactly one project — "
+                    "the officer's identity is project-scoped.",
+                )
+            _open_conf = await _find_open_conference_thread(primary_project_id)
+            if _open_conf:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "conference_open: this project already has an open "
+                        f"conference session ({_open_conf['id']}) — resume it "
+                        "instead of opening a second one."
+                    ),
+                )
 
         # Materialize one complete selection with the thread row. Cockpit sends
         # a reviewed array (including []); omission is temporarily gated for
@@ -29430,6 +29569,11 @@ async def create_thread(
             effective_create_config.get("interactive") or {}
         ).get("narration_mode") or "auto"
 
+        execution_lane = _resolve_thread_execution_lane(
+            workspace_backend=thread_backend,
+            effective_config=effective_create_config,
+        )
+
         thread_id = await postgres_db.create_thread(
             user_id=str(user["id"]),
             project_id=primary_project_id,
@@ -29442,6 +29586,7 @@ async def create_thread(
             datasource_policy_revisions=selected_thread_datasource_revisions,
             authority_user_id=str(user["id"]),
             authority_project_ids=effective_project_ids,
+            execution_lane=execution_lane,
         )
 
         # Store config_override + datasource_ids in thread metadata. Project
@@ -29598,10 +29743,12 @@ async def create_thread(
                 _provision_thread_vm(thread_id, _vm_cpu, _vm_mem, _vm_agent_config)
             )
         elif use_k8s:
-            # Signal that workspace provisioning is starting so the agent
-            # keeps polling instead of falling back to local mode immediately.
+            # Signal both lifecycle and provisioner authority synchronously.
+            # A stateless input can be admitted as soon as create returns; it
+            # must never confuse this in-flight K8s workspace with a Docker
+            # pool lease before create_workspace publishes its first update.
             await postgres_db.merge_thread_workspace_context(
-                thread_id, {"status": "pending"}
+                thread_id, {"status": "pending", "provisioner": "k8s"}
             )
 
             # Kubernetes mode: create pod on demand
@@ -29763,7 +29910,14 @@ async def create_thread(
         use_k8s_agent = agent_provisioner.is_available and (
             agent_provisioner.in_cluster or not docker_provisioner.is_available
         )
-        if use_k8s_agent:
+        if execution_lane == "stateless":
+            logger.info(
+                "Thread %s: admitted to stateless session pool "
+                "(workspace_backend=%s); dedicated agent provisioning skipped",
+                thread_id,
+                thread_backend,
+            )
+        elif use_k8s_agent:
             # Kubernetes mode: create agent pod on demand, with pool fallback
             effective_config = config_name
 
@@ -30595,18 +30749,21 @@ async def get_thread_session_state(
 
 
 class ThreadControlRequest(BaseModel):
-    """Strict public envelope for the first durable control-inbox subset."""
+    """Strict public envelope for the durable control-inbox subset."""
 
     client_request_id: UUID
-    method: Literal["mode.set", "narration.set"]
-    mode: Literal[
-        "supervised",
-        "auto_accept",
-        "autonomous",
-        "silent",
-        "verbose",
-        "auto",
-    ]
+    method: Literal["mode.set", "narration.set", "workspace.undo"]
+    mode: (
+        Literal[
+            "supervised",
+            "auto_accept",
+            "autonomous",
+            "silent",
+            "verbose",
+            "auto",
+        ]
+        | None
+    ) = None
 
     @model_validator(mode="after")
     def validate_method_mode_pair(self) -> "ThreadControlRequest":
@@ -30616,7 +30773,14 @@ class ThreadControlRequest(BaseModel):
             raise ValueError("mode.set requires a permission mode")
         if self.method == "narration.set" and self.mode not in narration_modes:
             raise ValueError("narration.set requires a narration mode")
+        if self.method == "workspace.undo" and self.mode is not None:
+            raise ValueError("workspace.undo does not accept a mode")
         return self
+
+    def control_payload(self) -> dict[str, Any]:
+        """Canonical payload used for idempotency and durable admission."""
+
+        return {} if self.method == "workspace.undo" else {"mode": self.mode}
 
 
 @app.post(
@@ -30641,6 +30805,7 @@ async def submit_thread_control(
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     thread_owner_id = thread.get("user_id")
     policy_user_id = str(thread_owner_id or user["id"])
+    control_payload = body.control_payload()
 
     try:
         existing = await find_existing_thread_control(
@@ -30649,17 +30814,17 @@ async def submit_thread_control(
             owner_user_id=thread_owner_id,
             client_request_id=body.client_request_id,
             verb=body.method,
-            payload={"mode": body.mode},
+            payload=control_payload,
         )
     except ControlAdmissionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    # S2 safety gate: a new stateless control can create a control-only queue
-    # claim just like human input.  Refuse non-lite workspaces before that
-    # durable admission can wake an executor.  Exact idempotent retries remain
-    # observable even if the thread's lane/tier changed after their commit.
+    # A new stateless control can create a control-only queue claim just like
+    # human input. Refuse unsupported workspace bindings before that durable
+    # admission can wake an executor. Exact idempotent retries remain observable
+    # even if the thread's lane/tier changed after their commit.
     if existing is None and thread.get("execution_lane") == LANE_STATELESS:
-        _require_stateless_lite_workspace(thread)
+        _require_stateless_workspace(thread)
 
     if body.method == "mode.set" and existing is None:
         # Same PDP as create/attach/config.update. A stale or direct client
@@ -30684,7 +30849,7 @@ async def submit_thread_control(
                     owner_user_id=thread_owner_id,
                     client_request_id=body.client_request_id,
                     verb=body.method,
-                    payload={"mode": body.mode},
+                    payload=control_payload,
                 )
             except ControlAdmissionError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -30699,7 +30864,7 @@ async def submit_thread_control(
             owner_user_id=thread_owner_id,
             client_request_id=body.client_request_id,
             verb=body.method,
-            payload={"mode": body.mode},
+            payload=control_payload,
             requested_by=actor_id,
         )
     except ControlAdmissionNotReady as exc:
@@ -31622,15 +31787,19 @@ async def resume_thread(
     calling this, where the orchestrator will provision or wait for an agent.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
-    from src.shared.run_queue import LANE_PINNED
+    from src.shared.run_queue import LANE_PINNED, LANE_STATELESS
 
-    if thread.get("execution_lane") != LANE_PINNED:
-        # Resume is a pinned-pod provisioning entry.  Queue-served threads do
-        # not bind agents, and unknown future lanes must fail closed instead
-        # of silently inheriting this control plane.
+    execution_lane = thread.get("execution_lane")
+    if execution_lane == LANE_STATELESS:
+        # Resume is topology-neutral for a queue-served thread: validate the
+        # workspace/class before mutating, then reset lifecycle state without
+        # binding or provisioning a dedicated agent below.
+        _require_stateless_workspace(thread)
+    elif execution_lane != LANE_PINNED:
+        # Unknown future lanes must never inherit either current control plane.
         raise HTTPException(
             status_code=409,
-            detail="Session execution lane does not support pinned resume",
+            detail="Session execution lane does not support resume",
         )
     if thread.get("status") != "ended":
         raise HTTPException(
@@ -31711,8 +31880,8 @@ async def resume_thread(
         async def _late_cloud_setup(
             tid: str, usr: dict, existing_handle: str | None
         ) -> None:
-            # Pinned: this thread already exists and carries its origin
-            # backend in main_cloud_backend. Dispatch via for_thread so a
+            # This thread already exists and carries its origin backend in
+            # main_cloud_backend. Dispatch via for_thread so a
             # later active-backend swap can't re-provision it on the wrong
             # cloud (Issue 16). Mirrors the delete path above (~:12339).
             backend = main_cloud_router.for_thread(thread)
@@ -31773,8 +31942,10 @@ async def resume_thread(
             # what the agent can resolve.
             _register_late_cloud_setup(thread_id, _setup_task)
 
-    # Re-provision agent pod and restore workspace if suspended
-    if agent_provisioner.is_available:
+    # Only the exact pinned lane receives a registered agent. Queue-served
+    # sessions restore/recreate their workspace below and wait for user input
+    # to create the next run_queue turn.
+    if execution_lane == LANE_PINNED and agent_provisioner.is_available:
         config_name = canonical_config_name(thread.get("config_name", "session_base"))
 
         async def _reprovision(tid: str, cfg: str) -> None:
@@ -31901,7 +32072,7 @@ async def resume_thread(
                 )
 
         asyncio.create_task(_reprovision(thread_id, config_name))
-    elif persistent_provisioner.is_available:
+    elif execution_lane == LANE_PINNED and persistent_provisioner.is_available:
         config_name = canonical_config_name(thread.get("config_name", "session_base"))
 
         async def _reprovision_legacy(tid: str, cfg: str) -> None:
@@ -31956,6 +32127,17 @@ async def rewind_thread_detached(
     authority is live and a DB-only sweep would diverge it → 409.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    from src.shared.run_queue import LANE_STATELESS
+
+    if thread.get("execution_lane") == LANE_STATELESS:
+        # Stateless threads intentionally have agent_id=NULL even while their
+        # session_turn is queued/leased.  This detached DB-only workflow has no
+        # queue/turn fence and can race a live claimant, so fail closed until
+        # rewind is modeled as a durable stateless control request.
+        raise HTTPException(
+            status_code=409,
+            detail="Stateless session rewind requires a connected session",
+        )
     # mark_orphaned_threads_ended and agent_update_thread_status's ended
     # branch both leave a stale agent_id on real ended threads — status must
     # gate the check too, mirroring update_thread_config's established
@@ -32685,10 +32867,9 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
         record_input_seq,
     )
 
-    # S2 safety gate must precede every write below.  A sandbox/VM thread can
-    # be moved onto the lane by an operator edit today; queueing it would let
-    # the current attach/detach path silently destroy its remote tmux state.
-    _require_stateless_lite_workspace(thread)
+    # The unlocked preflight provides a fast refusal. The locked copy below is
+    # authoritative against lane/tier/lifecycle changes before message commit.
+    _require_stateless_workspace(thread)
 
     thread_id = str(thread["id"])
     # Mirror the agent's accept-time mint exactly; the row id is the same
@@ -32715,7 +32896,29 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
                     status_code=409,
                     detail="Thread is no longer eligible for stateless admission",
                 )
-            _require_stateless_lite_workspace(dict(locked_thread))
+            locked_thread_dict = dict(locked_thread)
+            _require_stateless_workspace(locked_thread_dict)
+            locked_status = str(locked_thread["status"] or "")
+            if locked_status not in {
+                "created",
+                "active",
+                "awaiting_user",
+                "suspended",
+            }:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Thread is not currently accepting stateless input "
+                        f"(status={locked_status or 'unknown'})"
+                    ),
+                )
+            locked_metadata = thread_metadata_object(locked_thread_dict)
+            workspace_status = str(
+                (locked_metadata.get("workspace_container") or {}).get("status") or ""
+            )
+            needs_workspace_ensure = locked_status == "suspended" or (
+                workspace_status in {"suspended", "deleted", "failed"}
+            )
             turn_number = int(locked_thread["total_turns"] or 0) + 1
             fair_key = (
                 str(locked_thread["user_id"])
@@ -32750,6 +32953,21 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
                 unit_kind=UNIT_KIND_SESSION_TURN,
                 input_seq=int(seq),
                 fair_key=fair_key,
+            )
+
+        if needs_workspace_ensure:
+            # Queue admission must commit before this side effect starts. The
+            # claimant may arrive first and poll; ensure converges a suspended,
+            # deleted or failed Kubernetes workspace without ever creating a
+            # pinned agent.
+            asyncio.create_task(
+                ensure_session_workspace(
+                    thread_id,
+                    db=postgres_db,
+                    provisioner=container_provisioner,
+                    suspension=workspace_suspension_service,
+                ),
+                name=f"stateless-workspace-wake-{thread_id[:8]}",
             )
         # Post-commit watermark read (same conn): §5.3.1 response parity —
         # queue_depth comes from unconsumed watermarks, not a process queue.
@@ -33141,7 +33359,7 @@ async def internal_unit_claim_bundle(
     # rows and direct DB/operator mistakes.  Public input/control admission
     # performs the same check before writing, but correctness cannot depend on
     # every producer having done so.
-    _require_stateless_lite_workspace(thread)
+    _require_stateless_workspace(thread)
 
     # Derive the assembly inputs exactly the way the resume dispatcher does
     # (resume_thread._reprovision): the stored override from metadata (secrets
@@ -33177,6 +33395,24 @@ async def internal_unit_claim_bundle(
     if attach is None:
         # Generic by design — refusal reasons live in the server log only.
         raise HTTPException(status_code=409, detail="Attach assembly refused")
+
+    # Credential/datasource assembly can block on connector locks and external
+    # stores for longer than the queue lease.  Recheck immediately before the
+    # response crosses the credential boundary, exactly like worker bundles:
+    # token N may have been reaped/stolen while the payload was being built.
+    async with postgres_db.acquire() as conn:
+        lease_still_current = bool(
+            await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM run_queue "
+                "WHERE unit_id = $1::uuid "
+                "AND unit_kind = 'session_turn' "
+                "AND state = 'leased' AND lease_token = $2::bigint)",
+                unit_id,
+                lease_token,
+            )
+        )
+    if not lease_still_current:
+        raise HTTPException(status_code=403, detail="Lease validation failed")
     _t_end = time.perf_counter()
     logger.info(
         "claim-bundle timing: unit=%s lease=%.3fs creds=%.3fs assemble=%.3fs "
@@ -33719,13 +33955,16 @@ async def magic_link_post(token: str) -> HTMLResponse:
             status_code=409,
         )
 
-    # Phase 5: if the thread is suspended (attention-sleep watchdog fired
-    # since the email was sent), kick off restore + agent-pod re-creation.
-    # The agent's wake path (_loop_permission_check select-first guard)
-    # will pick up this UPDATE's decision once the new pod is alive — no
-    # second click required.
+    # Phase 5: if attention sleep fired since the email was sent, wake through
+    # the thread's existing execution plane. Pinned sessions retain workspace
+    # restore + agent-pod re-creation. Stateless sessions retain their exact
+    # queued/leased turn and converge the workspace without binding a pod. The
+    # permission-row id is the wake task's freshness fence.
     asyncio.create_task(
-        _phase5_wake_if_suspended(str(permission_row["thread_id"])),
+        _phase5_wake_if_suspended(
+            str(permission_row["thread_id"]),
+            permission_request_id=str(permission_row["id"]),
+        ),
         name=f"phase5-wake-{str(permission_row['thread_id'])[:8]}",
     )
 
@@ -33880,19 +34119,196 @@ async def magic_link_extend(token: str) -> HTMLResponse:
     return HTMLResponse(page)
 
 
-async def _phase5_wake_if_suspended(thread_id: str) -> None:
-    """Restore a suspended thread's workspace + agent pod after a magic-link
-    decision. Fire-and-forget — the HTTP response has already returned.
+async def _phase5_wake_stateless_if_suspended(
+    thread_id: str,
+    *,
+    permission_request_id: str | None,
+) -> None:
+    """Wake one queue-served permission continuation without binding a pod.
 
-    Pattern mirrors resume_persistent_thread (main.py:10640) — restore the
-    workspace from S3, then spawn the agent pod if the persistent
-    provisioner is wired. Idempotent: status checks short-circuit when the
-    workspace is already alive (e.g. a cockpit tab is open and the click
-    came from email anyway).
+    A magic-link task can run well after its originating request was resolved.
+    Revalidate every authority under the global ``threads -> run_queue`` lock
+    order: exact stateless lane/class/tier, no pinned-agent binding, the exact
+    terminal permission row, and a queued/leased session turn whose human input
+    is still unconsumed.  ``done`` is deliberately not revived: no durable
+    permission-continuation watermark exists yet, so a done row would hit the
+    executor's skip-if-answered edge and falsely claim the tool resumed.
+
+    The queue row itself is left untouched.  A live lease keeps ownership; a
+    queued retry keeps its token/fairness/affinity.  Workspace convergence uses
+    the owner-keyed session provisioner, which restores a Kubernetes sandbox,
+    refreshes a virtual binding, and is a no-op for ``none``.  It never creates
+    a persistent agent pod.
+    """
+    from src.shared.run_queue import (
+        LANE_STATELESS,
+        STATE_LEASED,
+        STATE_QUEUED,
+        UNIT_KIND_SESSION_TURN,
+    )
+
+    if permission_request_id is None:
+        logger.warning(
+            "magic-link wake: refusing unfenced stateless wake for thread %s",
+            thread_id,
+        )
+        return
+
+    should_ensure_workspace = False
+    async with postgres_db.acquire() as conn:
+        async with conn.transaction():
+            locked_thread = await conn.fetchrow(
+                "SELECT id, execution_lane, agent_id, status, metadata "
+                "FROM threads WHERE id = $1::uuid FOR UPDATE",
+                thread_id,
+            )
+            if locked_thread is None:
+                return
+            thread = dict(locked_thread)
+            if (
+                thread.get("execution_lane") != LANE_STATELESS
+                or thread.get("agent_id") is not None
+            ):
+                logger.warning(
+                    "magic-link wake: stateless authority moved for thread %s "
+                    "(lane=%r agent_id=%r)",
+                    thread_id,
+                    thread.get("execution_lane"),
+                    thread.get("agent_id"),
+                )
+                return
+            try:
+                _require_stateless_workspace(thread)
+            except HTTPException as exc:
+                logger.warning(
+                    "magic-link wake: refusing stateless workspace/class for "
+                    "thread %s: %s",
+                    thread_id,
+                    exc.detail,
+                )
+                return
+
+            # Keep the repository-wide threads -> run_queue lock order.  The
+            # lock makes the pending-input test atomic with a concurrent claim,
+            # completion, release or reaper steal.
+            queue = await conn.fetchrow(
+                "SELECT state, input_seq, consumed_seq "
+                "FROM run_queue "
+                "WHERE unit_id = $1::uuid AND unit_kind = $2 "
+                "FOR UPDATE",
+                thread_id,
+                UNIT_KIND_SESSION_TURN,
+            )
+            if queue is None:
+                logger.warning(
+                    "magic-link wake: no session queue authority for thread %s",
+                    thread_id,
+                )
+                return
+            queue_state = str(queue["state"] or "")
+            input_seq = queue["input_seq"]
+            consumed_seq = queue["consumed_seq"]
+            has_unconsumed_input = input_seq is not None and (
+                consumed_seq is None or int(input_seq) > int(consumed_seq)
+            )
+            if (
+                queue_state not in {STATE_QUEUED, STATE_LEASED}
+                or not has_unconsumed_input
+            ):
+                logger.warning(
+                    "magic-link wake: refusing stale stateless continuation for "
+                    "thread %s (queue_state=%s input_seq=%r consumed_seq=%r)",
+                    thread_id,
+                    queue_state,
+                    input_seq,
+                    consumed_seq,
+                )
+                return
+
+            decision = await conn.fetchval(
+                "SELECT status FROM thread_permission_requests "
+                "WHERE id = $2::uuid AND thread_id = $1::uuid "
+                "  AND status IN ('approved', 'denied')",
+                thread_id,
+                permission_request_id,
+            )
+            if decision not in {"approved", "denied"}:
+                logger.warning(
+                    "magic-link wake: exact permission fence rejected thread %s "
+                    "request %s",
+                    thread_id,
+                    permission_request_id,
+                )
+                return
+
+            thread_status = str(thread.get("status") or "")
+            if thread_status not in {"active", "awaiting_user", "suspended"}:
+                logger.warning(
+                    "magic-link wake: thread %s is not resumable (status=%r)",
+                    thread_id,
+                    thread_status,
+                )
+                return
+
+            if thread_status in {"awaiting_user", "suspended"}:
+                updated = await conn.fetchval(
+                    "UPDATE threads "
+                    "SET status = 'active', "
+                    "    awaiting_user_since = NULL, "
+                    "    extend_count = 0, "
+                    "    control_admission_agent_id = NULL "
+                    "WHERE id = $1::uuid "
+                    "  AND execution_lane = $2 "
+                    "  AND agent_id IS NULL "
+                    "  AND status IN ('suspended', 'awaiting_user') "
+                    "RETURNING id",
+                    thread_id,
+                    LANE_STATELESS,
+                )
+                if updated is None:
+                    return
+            should_ensure_workspace = True
+
+    if not should_ensure_workspace:
+        return
+    # Queue/lifecycle admission commits before this potentially slow side
+    # effect.  A claimant may arrive first, but its attach path polls the same
+    # durable workspace lifecycle until it is ready.
+    await ensure_session_workspace(
+        thread_id,
+        db=postgres_db,
+        provisioner=container_provisioner,
+        suspension=workspace_suspension_service,
+    )
+    logger.info(
+        "magic-link wake: stateless permission continuation admitted for "
+        "thread %s request %s",
+        thread_id,
+        permission_request_id,
+    )
+
+
+async def _phase5_wake_if_suspended(
+    thread_id: str,
+    *,
+    permission_request_id: str | None = None,
+) -> None:
+    """Wake a suspended thread after a magic-link decision.
+
+    Fire-and-forget — the HTTP response has already returned. Stateless
+    sessions delegate to the queue-fenced, topology-neutral helper above.
+    Pinned sessions preserve the historical resume pattern: restore from S3,
+    then spawn the agent pod if the persistent provisioner is wired.
     """
     try:
         thread = await postgres_db.get_thread(thread_id)
         if not thread:
+            return
+        if thread.get("execution_lane") == "stateless":
+            await _phase5_wake_stateless_if_suspended(
+                thread_id,
+                permission_request_id=permission_request_id,
+            )
             return
         if not _thread_uses_pinned_execution(thread):
             logger.warning(

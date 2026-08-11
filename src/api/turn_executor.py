@@ -1423,12 +1423,13 @@ class StatelessTurnExecutor:
         # (c) Independent heartbeat — spawned BEFORE the bundle fetch/attach,
         # which can themselves outlast the 60s lease TTL (MCP connect_all,
         # message-tail restore). Never an astream hook.
+        claim_lost = asyncio.Event()
         heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(claim),
+            self._heartbeat_loop(claim, claim_lost),
             name=f"lease-heartbeat-{unit_id[:8]}",
         )
         try:
-            await self._serve_claim_inner(pa, claim, unit_id, token)
+            await self._serve_claim_inner(pa, claim, unit_id, token, claim_lost)
         finally:
             # Belt for every exception/cancellation path. Normal completion
             # and release paths stop it earlier, before mutating the queue;
@@ -1467,7 +1468,12 @@ class StatelessTurnExecutor:
             pa._turn_complete_external_hook = None
 
     async def _serve_claim_inner(
-        self, pa: Any, claim: ClaimedUnit, unit_id: str, token: int
+        self,
+        pa: Any,
+        claim: ClaimedUnit,
+        unit_id: str,
+        token: int,
+        claim_lost: asyncio.Event,
     ) -> None:
         # (d) Claim bundle — the pinned contract. On failure the token-guarded
         # release below is a no-op when the lease is genuinely gone (401/403 =
@@ -1498,6 +1504,19 @@ class StatelessTurnExecutor:
             await self._release(claim, reason="bundle_error")
             return
 
+        # The heartbeat starts before the slow credential bundle.  Its loss
+        # signal is claim-local because the shared LeaseHandle may still point
+        # at the previous warm session until that session is safely detached.
+        # Never erase a loss by installing a fresh handle/event afterwards.
+        if claim_lost.is_set():
+            logger.warning(
+                "lease lost during claim bundle: unit=%s token=%d; "
+                "discarding credentials without attach or release",
+                unit_id,
+                token,
+            )
+            return
+
         timing["bundle"] = time.perf_counter() - t0
         attach = bundle.get("attach") or {}
         # Watermarks: the claim's values were read atomically inside the claim
@@ -1521,6 +1540,9 @@ class StatelessTurnExecutor:
             # Physical sessions deliberately miss this path: detach retires
             # their old backend before a fresh object receives the new token.
             self._lease.update(unit_id, token)
+            if claim_lost.is_set():
+                self._lease.mark_lost()
+                return
             logger.info(
                 "session reuse (affinity): unit=%s fingerprint=%s",
                 unit_id,
@@ -1545,6 +1567,9 @@ class StatelessTurnExecutor:
             timing["detach"] = time.perf_counter() - t0
             self._scrub_process_residue()
             self._lease.update(unit_id, token)
+            if claim_lost.is_set():
+                self._lease.mark_lost()
+                return
             t0 = time.perf_counter()
             try:
                 await pa._attach_session(**attach)
@@ -1558,6 +1583,10 @@ class StatelessTurnExecutor:
             self._attached_fingerprint = fingerprint
             self._attached_bundle = attach
             fresh_attach = True
+        if claim_lost.is_set():
+            self._lease.mark_lost()
+            await self._detach_cached_session("lease_lost_during_attach")
+            return
         timing["attach"] = time.perf_counter() - t0
 
         # Bind every remote tmux mutation to this monotonic queue token before
@@ -1772,8 +1801,10 @@ class StatelessTurnExecutor:
             {"content": target["content"], "id": target["id"]}
         )
 
-        # (i) Wait for the turn's completion hook (event, not a poll), the
-        # lease-lost signal, or the loop dying under us.
+        # (i) Wait for the full-turn settlement hook (event, not a poll), the
+        # lease-lost signal, or the loop dying under us. PersistentApp publishes
+        # it only after transcript persistence and Git push/turn-ledger mapping,
+        # so detach cannot cancel a half-recorded workspace turn.
         t0 = time.perf_counter()
         outcome = await self._await_turn(turn_done, loop_task)
         timing["turn"] = time.perf_counter() - t0
@@ -2070,7 +2101,9 @@ class StatelessTurnExecutor:
             for r in rows
         ]
 
-    async def _heartbeat_loop(self, claim: ClaimedUnit) -> None:
+    async def _heartbeat_loop(
+        self, claim: ClaimedUnit, claim_lost: asyncio.Event | None = None
+    ) -> None:
         """Renew every HEARTBEAT_INTERVAL_SECONDS; on a lost lease, signal the
         driver via the shared handle. Independent of the graph loop by
         construction (its own task — a long tool call cannot starve it)."""
@@ -2100,7 +2133,15 @@ class StatelessTurnExecutor:
                     unit_id,
                     token,
                 )
-                self._lease.mark_lost()
+                if claim_lost is not None:
+                    claim_lost.set()
+                # Do not poison a previous warm claim's handle while its
+                # teardown still runs. Once this identity is installed, signal
+                # both the shared writers and _await_turn directly.
+                if self._lease.unit_id == str(
+                    unit_id
+                ) and self._lease.lease_token == int(token):
+                    self._lease.mark_lost()
                 return
 
     async def _await_turn(

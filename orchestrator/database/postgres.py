@@ -8281,13 +8281,21 @@ class PostgresDB:
         datasource_policy_revisions: Dict[str, int] | None = None,
         authority_user_id: str | None = None,
         authority_project_ids: list[str] | None = None,
+        execution_lane: str = "pinned",
     ) -> str:
         """Create a thread with its complete connector selection in one row.
 
         The ``datasource_ids`` metadata key is always present, including for an
         empty selection, so inheritance can distinguish authoritative ``[]``
         from historical threads that predate materialized selections.
+
+        ``execution_lane`` is written in the creation INSERT so callers never
+        expose a newly created thread to pinned provisioning before a separate
+        lane update can commit. Unknown lanes fail closed before touching the
+        database.
         """
+        if execution_lane not in ("pinned", "stateless"):
+            raise ValueError(f"Unsupported thread execution lane: {execution_lane!r}")
         selected_uuids = _uuid_list(datasource_ids)
         authority_project_uuids = _uuid_list(authority_project_ids)
         selected_ids = [str(value) for value in selected_uuids]
@@ -8331,9 +8339,9 @@ class PostgresDB:
                     """
                     INSERT INTO threads (
                         user_id, project_id, config_name, permission_mode,
-                        narration_mode, title, metadata
+                        narration_mode, title, metadata, execution_lane
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) RETURNING id
+                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8) RETURNING id
                     """,
                     user_id,
                     project_id,
@@ -8342,6 +8350,7 @@ class PostgresDB:
                     narration_mode,
                     title,
                     json.dumps(metadata),
+                    execution_lane,
                 )
         return str(row["id"])
 
@@ -9228,13 +9237,13 @@ class PostgresDB:
         """Detached (conversation-only) rewind, orchestrator-side.
 
         One advisory-locked transaction: tombstone sweep, thread_rewinds
-        ledger, events_epoch bump (so any open SSE viewer takes the
-        gone_beyond_horizon repaint), and a rewind.done thread_events row in
-        the NEW epoch (so those viewers also clear their IndexedDB message
-        cache — the repaint alone merges append-only and would keep showing
-        the swept rows). Writing thread_events here is safe precisely
-        because the thread is detached: there is no agent event-writer to
-        collide with.
+        ledger, durable memory-extraction cursor clamp, events_epoch bump (so
+        any open SSE viewer takes the gone_beyond_horizon repaint), and a
+        rewind.done thread_events row in the NEW epoch (so those viewers also
+        clear their IndexedDB message cache — the repaint alone merges
+        append-only and would keep showing the swept rows). Writing
+        thread_events here is safe precisely because the thread is detached:
+        there is no agent event-writer to collide with.
 
         Epoch bump + frame go through the shared ``src.shared.event_journal``
         helpers (single implementation with the agent runtime and the
@@ -9288,6 +9297,22 @@ class PostgresDB:
                       AND role NOT IN ('summary', 'error')
                     """,
                     thread_id,
+                )
+                # Keep the durable extraction cursor on the surviving
+                # transcript in this same commit. An absent row means no
+                # extraction has ever been claimed and deliberately remains
+                # absent (the implicit zero baseline).
+                await conn.execute(
+                    """
+                    UPDATE thread_session_runtime_state
+                    SET memory_extraction_turn = LEAST(
+                            memory_extraction_turn, $2
+                        ),
+                        updated_at = now()
+                    WHERE thread_id = $1
+                    """,
+                    thread_id,
+                    int(surviving_turn or 0),
                 )
                 await bump_epoch(conn, thread_id=thread_id)
                 await append_system_frame(

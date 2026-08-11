@@ -112,12 +112,15 @@ def test_apply_thread_rewind_locks_sweeps_bumps_and_journals():
     class _FakeConn:
         def __init__(self):
             self.calls = []
+            self.memory_cursor = 10
 
         def transaction(self):
             return _FakeTxn()
 
         async def execute(self, q, *a):
             self.calls.append(q)
+            if "UPDATE thread_session_runtime_state" in q:
+                self.memory_cursor = min(self.memory_cursor, int(a[1]))
 
         async def fetchrow(self, q, *a):
             self.calls.append(q)
@@ -158,10 +161,13 @@ def test_apply_thread_rewind_locks_sweeps_bumps_and_journals():
     assert out["swept"] == 5
     assert out["rewind_id"] == "33333333-3333-3333-3333-333333333333"
     assert out["surviving_turn"] == 2
+    assert conn.memory_cursor == 2
     blob = " ".join(conn.calls)
     assert "pg_advisory_xact_lock" in blob
     assert "SET rewound_at = now()" in blob
     assert "INSERT INTO thread_rewinds" in blob
+    assert "UPDATE thread_session_runtime_state" in blob
+    assert "memory_extraction_turn = LEAST(" in blob
     assert "events_epoch = events_epoch + 1" in blob
     # The port's fix: the bump resets the seq high-water mark atomically.
     assert "events_seq_hwm = 0" in blob
@@ -185,6 +191,40 @@ async def test_rewind_endpoint_rejects_live_agent(monkeypatch):
             orch_main.ThreadRewindRequest(message_id="m1", mode="conversation"),
         )
     assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_detached_rewind_rejects_stateless_thread_without_agent_id(monkeypatch):
+    """agent_id=NULL is not proof that a stateless queue owner is idle."""
+
+    from fastapi import HTTPException
+    from orchestrator import main as orch_main
+
+    fake_db = MagicMock()
+
+    async def _fake_owner(request, db, thread_id):
+        return (
+            {"id": "user-1"},
+            {
+                "id": thread_id,
+                "agent_id": None,
+                "execution_lane": "stateless",
+                "status": "active",
+            },
+        )
+
+    monkeypatch.setattr(orch_main, "require_thread_owner", _fake_owner)
+    monkeypatch.setattr(orch_main, "postgres_db", fake_db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.rewind_thread_detached(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            MagicMock(),
+            orch_main.ThreadRewindRequest(message_id="m1", mode="conversation"),
+        )
+
+    assert exc.value.status_code == 409
+    fake_db.get_live_thread_message.assert_not_called()
 
 
 @pytest.mark.asyncio

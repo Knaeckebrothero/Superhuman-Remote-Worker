@@ -49,6 +49,10 @@ from ..core.tool_policy import (
     validate_tool_override_fragment,
 )
 from ..core.workspace_backend import WorkspaceUnavailableError
+from ..services.workspace_undo import (
+    WorkspaceUndoRetryable,
+    WorkspaceUndoUnavailable,
+)
 from .lease_context import LeaseLostError
 from .lease_context import current_lease as _current_lease_var
 from ..shared import event_journal as _event_journal
@@ -257,13 +261,13 @@ _cloud_sync_retry_pending: bool = False
 # docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
 _pending_cloud_push_task: Optional[asyncio.Task] = None
 
-# M3 turn-completion seam for the stateless executor (turn_executor.py): a
-# synchronous callable invoked at the END of _loop_on_turn_complete — after the
-# turn-end reconcile has been awaited and the background cloud push (if any)
-# has been spawned. The executor installs a closure that sets an asyncio.Event
-# per claim; the pinned lane leaves this None. Invoked in a finally so a
-# teardown race (session nulled mid-callback) can never strand the executor's
-# turn wait.
+# M3 full-turn-settlement seam for the stateless executor (turn_executor.py): a
+# synchronous callable invoked by ``_loop_on_turn_settled`` only after the
+# transcript reconcile, turn-owned memory work, and Git commit/push/ledger
+# mapping. The executor installs a closure that sets an asyncio.Event per claim;
+# the pinned lane leaves this None. Publishing this at transcript completion is
+# too early: the executor can detach/cancel the loop and strand an unmapped Git
+# commit, breaking cross-pod undo.
 _turn_complete_external_hook: Optional[Callable[[int], None]] = None
 
 # S2 turn-start seam for the stateless executor. Unlike the completion seam,
@@ -661,6 +665,7 @@ def _ensure_persistent_loop_started(
             on_workspace_commit=_loop_on_workspace_commit,
             on_context_compacted=_loop_on_context_compacted,
             persist_message=_loop_persist_message,
+            on_turn_settled=_loop_on_turn_settled,
             archive_llm_call=_loop_archive_llm_call,
             on_usage=_loop_on_usage,
             hard_interrupt_event=_hard_interrupt_event,
@@ -699,6 +704,18 @@ def _ensure_persistent_loop_started(
                 get_current_system_prompt=lambda: _session.system_prompt,
                 memory_extraction_prompt=_session.memory_extraction_prompt,
                 memory_service=_session.memory_service,
+                claim_memory_extraction_interval=(
+                    (
+                        lambda turn_count,
+                        interval: _session.postgres_conn.claim_memory_extraction_interval(
+                            _session.thread_id,
+                            turn_count=turn_count,
+                            interval=interval,
+                        )
+                    )
+                    if _session.postgres_conn is not None
+                    else None
+                ),
             ),
             name="persistent-loop",
         )
@@ -3811,6 +3828,8 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
         durable_permission_mode,
         durable_narration_mode,
     ) = await _durable_session_control_modes()
+    task_manager = _session.session_task_manager
+    session_tasks = task_manager.to_dict_list() if task_manager is not None else []
     await _ws_send(
         ws,
         "session.state",
@@ -3829,6 +3848,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             "temperature": _session.config.llm.temperature,
             "running_tool": running_tool,
             "pending_permissions": await _pending_permission_requests(),
+            "tasks": session_tasks,
         },
     )
 
@@ -3967,22 +3987,42 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                         {"message": "Session no longer active"},
                     )
                     continue
-                turn_id = data.get("turn_id")
-                restored = _session.undo_turn(turn_id)
-                if restored:
+                if _session.shell_owner_token is not None:
                     await _ws_send(
                         ws,
-                        "files.restored",
+                        "error",
                         {
-                            "paths": restored,
-                            "turn_id": turn_id,
+                            "code": "control_transport_required",
+                            "message": "Use the session control REST endpoint",
+                        },
+                    )
+                    continue
+                turn_id = data.get("turn_id")
+                try:
+                    restored = await _session.undo_turn(turn_id)
+                except WorkspaceUndoUnavailable as exc:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {
+                            "code": exc.code,
+                            "message": str(exc),
+                        },
+                    )
+                except WorkspaceUndoRetryable as exc:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {
+                            "code": "workspace_undo_retryable",
+                            "message": str(exc),
                         },
                     )
                 else:
                     await _ws_send(
                         ws,
-                        "error",
-                        {"message": "No checkpoints available to undo"},
+                        "files.restored",
+                        {**restored, "turn_id": turn_id},
                     )
 
             elif method == "rewind":
@@ -5156,6 +5196,8 @@ def _describe_control_request(request: Any) -> tuple[str, str, Optional[str]]:
         return "mode.changed", "applied", None
     if request.verb == "narration.set" and mode in {"silent", "verbose", "auto"}:
         return "narration.changed", "applied", None
+    if request.verb == "workspace.undo" and request.payload == {}:
+        return "files.restored", "applied", None
     return "control.rejected", "rejected", "unsupported_control"
 
 
@@ -5470,14 +5512,46 @@ async def _drain_thread_controls(
                 continue
 
             event_kind, outcome, error_code = _describe_control_request(request)
+            effect_params: Dict[str, Any] = {}
+            if outcome == "applied" and request.verb == "workspace.undo":
+                if _session is None:
+                    raise ControlInboxBlocked(
+                        f"workspace undo lost its session: {request.id}"
+                    )
+                try:
+                    effect_params = await _session.undo_turn(
+                        control_request_id=str(request.id)
+                    )
+                except WorkspaceUndoUnavailable as exc:
+                    # Tier/history refusal is known before any mutation and can
+                    # therefore receive a durable rejected acknowledgement.
+                    event_kind = "control.rejected"
+                    outcome = "rejected"
+                    error_code = exc.code
+                except WorkspaceUndoRetryable as exc:
+                    # Git may already contain the effect marker. Leave the
+                    # request pending so this or a successor claimant recovers
+                    # it; never journal a rejection after possible mutation.
+                    raise ControlInboxBlocked(
+                        f"workspace undo remains retryable: {request.id}"
+                    ) from exc
+                except Exception as exc:
+                    raise ControlInboxBlocked(
+                        f"workspace undo failed before acknowledgement: {request.id}"
+                    ) from exc
             params: Dict[str, Any] = {
                 "request_id": str(request.id),
                 "client_request_id": str(request.client_request_id),
                 "request_seq": request.request_seq,
                 "method": request.verb,
             }
-            if outcome == "applied":
+            if outcome == "applied" and request.verb in {
+                "mode.set",
+                "narration.set",
+            }:
                 params["mode"] = str(request.payload.get("mode") or "")
+            elif outcome == "applied" and request.verb == "workspace.undo":
+                params.update(effect_params)
             else:
                 params["error_code"] = error_code
 
@@ -8461,22 +8535,28 @@ async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -
     # a reattach during turn-end persistence never reopens an already-completed
     # assistant bubble merely because the broader loop is not parked yet.
     _turn_event_open = False
-    try:
-        await _loop_on_turn_complete_body(turn_id, metrics)
-    finally:
-        # M3 stateless seam: signal the turn executor AFTER the turn-end
-        # reconcile has been awaited (and the background cloud push, if any,
-        # was spawned). In a finally so a teardown race inside the body can
-        # never strand the executor's completion wait.
-        hook = _turn_complete_external_hook
-        if hook is not None:
-            try:
-                hook(turn_id)
-            except Exception:
-                logger.warning(
-                    "External turn-complete hook failed (non-fatal)",
-                    exc_info=True,
-                )
+    await _loop_on_turn_complete_body(turn_id, metrics)
+
+
+async def _loop_on_turn_settled(turn_id: int) -> None:
+    """Publish the physical-executor edge after all turn-owned work settles.
+
+    ``_loop_on_turn_complete`` persists the transcript before the Git mapping,
+    so it cannot be the detach authorization for a stateless claimant.  The
+    persistent loop invokes this callback in a ``finally`` after memory,
+    commit, push, and turn-ledger mapping; only then may the executor cancel or
+    reuse the loop on another pod/claim.
+    """
+
+    hook = _turn_complete_external_hook
+    if hook is not None:
+        try:
+            hook(turn_id)
+        except Exception:
+            logger.warning(
+                "External turn-settled hook failed (non-fatal)",
+                exc_info=True,
+            )
 
 
 async def _loop_on_turn_complete_body(

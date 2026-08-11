@@ -44,6 +44,7 @@ def _only_kind(documents: list[dict], kind: str) -> dict:
 def test_stateless_worker_gate_is_independent_and_default_off() -> None:
     config_map = _only_kind(_render(show_only="templates/configmap.yaml"), "ConfigMap")
 
+    assert config_map["data"]["STATELESS_SESSION_ENABLED"] == "false"
     assert config_map["data"]["STATELESS_WORKER_ENABLED"] == "false"
     assert config_map["data"]["WORKER_BATCH_MIN_WALL_SECONDS"] == "300"
     assert config_map["data"]["LANGGRAPH_STRICT_MSGPACK"] == "true"
@@ -74,6 +75,21 @@ def test_worker_gate_requires_a_stateless_executor_pool() -> None:
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_generic_pool_opens_sessions_without_opening_worker_admission() -> None:
+    config_map = _only_kind(
+        _render(
+            "agent.stateless.enabled=true",
+            "agent.stateless.worker.enabled=false",
+            show_only="templates/configmap.yaml",
+        ),
+        "ConfigMap",
+    )
+
+    assert config_map["data"]["STATELESS_SESSION_ENABLED"] == "true"
+    assert config_map["data"]["STATELESS_WORKER_ENABLED"] == "false"
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_stateless_worker_local_budget_override_reaches_both_planes() -> None:
     settings = (
         "agent.stateless.enabled=true",
@@ -90,6 +106,7 @@ def test_stateless_worker_local_budget_override_reaches_both_planes() -> None:
     config_map_name = config_map["metadata"]["name"]
 
     assert config_map["data"]["STATELESS_WORKER_ENABLED"] == "true"
+    assert config_map["data"]["STATELESS_SESSION_ENABLED"] == "true"
     assert config_map["data"]["WORKER_BATCH_MIN_WALL_SECONDS"] == "60"
 
     deployments = {
@@ -107,7 +124,11 @@ def test_stateless_worker_local_budget_override_reaches_both_planes() -> None:
         if container["name"] == "orchestrator"
     )
     env_by_name = {entry["name"]: entry for entry in orchestrator["env"]}
-    for key in ("STATELESS_WORKER_ENABLED", "WORKER_BATCH_MIN_WALL_SECONDS"):
+    for key in (
+        "STATELESS_SESSION_ENABLED",
+        "STATELESS_WORKER_ENABLED",
+        "WORKER_BATCH_MIN_WALL_SECONDS",
+    ):
         assert env_by_name[key]["valueFrom"]["configMapKeyRef"] == {
             "name": config_map_name,
             "key": key,

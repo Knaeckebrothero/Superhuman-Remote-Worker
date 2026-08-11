@@ -174,19 +174,22 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
                     logger.debug("Could not build cloud anchor for %s: %s", path, e)
                     anchor = None
 
-                # A backend path may be an object key or a path on another pod.
-                # Only the operation-scoped staging path above is local.
+            # A backend path may be an object key or a path on another pod.
+            # Only the operation-scoped staging path above is local. Keep the
+            # backend write and its provenance update in one per-target
+            # critical section so parallel reads cannot cross their ordering.
+            async with context.cloud_anchor_write_lock(workspace_path):
                 await asyncio.to_thread(
                     workspace.backend.write_file,
                     workspace_path,
                     data,
                 )
 
-            if anchor:
-                # Persistent sessions bind this seam to a durable per-thread
-                # upsert. Await it before reporting success so provenance cannot
-                # silently disappear at the next claim.
-                await context.persist_cloud_anchor(workspace_path, anchor)
+                if anchor:
+                    # Persistent sessions bind this seam to a durable
+                    # per-thread upsert. Await it before reporting success so
+                    # provenance cannot silently disappear at the next claim.
+                    await context.persist_cloud_anchor(workspace_path, anchor)
 
             return f"Downloaded {path} → {workspace_path} ({_human_size(len(data))})"
         except Exception as e:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -31,6 +32,7 @@ class _SnapshotConn:
         lifecycle: dict | None = None,
         running: dict | None = None,
         permissions: list[dict] | None = None,
+        tasks: list[dict] | None = None,
         control_receipts: list[dict] | None = None,
         message_count: int = 0,
         live_turn_count: int = 0,
@@ -39,6 +41,7 @@ class _SnapshotConn:
         self.lifecycle = lifecycle
         self.running = running
         self.permissions = permissions or []
+        self.tasks = tasks or []
         self.control_receipts = control_receipts or []
         self.message_count = message_count
         self.live_turn_count = live_turn_count
@@ -70,6 +73,9 @@ class _SnapshotConn:
         self.calls.append((sql, args))
         if "FROM thread_permission_requests" in sql:
             return self.permissions
+        if "FROM thread_session_tasks" in sql:
+            assert "ORDER BY task_number ASC" in sql
+            return self.tasks
         if "FROM thread_control_requests" in sql:
             # Model the query's partial read rather than handing finalized
             # history to the snapshot builder. Keeping ``outcome`` on these
@@ -233,6 +239,7 @@ async def test_snapshot_has_full_lane_free_shape_and_normalizes_durable_rows():
                 "args": {},
             },
         ],
+        "tasks": [],
         "event_cursor": {"epoch": 3, "seq": 41},
         "replay_cursor": {"epoch": 3, "seq": 38},
         "snapshot_source": "durable_journal",
@@ -251,6 +258,65 @@ async def test_snapshot_has_full_lane_free_shape_and_normalizes_durable_rows():
         "turn.interrupted",
         "turn.parked",
         "ready",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_hydrates_tasks_older_than_the_replay_floor():
+    created = datetime(2026, 8, 10, 8, 30, tzinfo=timezone.utc)
+    completed = datetime(2026, 8, 10, 9, 15, tzinfo=timezone.utc)
+    conn = _SnapshotConn(
+        thread=_thread(events_seq_hwm=81, execution_lane="stateless"),
+        lifecycle={
+            "latest_kind": "turn.completed",
+            "latest_turn_id": "6",
+            "latest_turn_start_seq": 78,
+        },
+        tasks=[
+            {
+                "task_number": 2,
+                "description": "Survive the next pod",
+                "status": "in_progress",
+                "priority": "high",
+                "notes": "claimed on pod A",
+                "created_at": created,
+                "completed_at": None,
+            },
+            {
+                "task_number": 7,
+                "description": "Verify the handoff",
+                "status": "completed",
+                "priority": "medium",
+                "notes": "observed on pod B",
+                "created_at": created,
+                "completed_at": completed,
+            },
+        ],
+    )
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["replay_cursor"] == {"epoch": 3, "seq": 77}
+    assert result["tasks"] == [
+        {
+            "id": "task_2",
+            "description": "Survive the next pod",
+            "status": "in_progress",
+            "priority": "high",
+            "notes": "claimed on pod A",
+            "created_at": "2026-08-10T08:30:00+00:00",
+            "completed_at": None,
+        },
+        {
+            "id": "task_7",
+            "description": "Verify the handoff",
+            "status": "completed",
+            "priority": "medium",
+            "notes": "observed on pod B",
+            "created_at": "2026-08-10T08:30:00+00:00",
+            "completed_at": "2026-08-10T09:15:00+00:00",
+        },
     ]
 
 
