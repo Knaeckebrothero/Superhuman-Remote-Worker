@@ -650,7 +650,7 @@ async def mark_session_claim_eviction_requested(
                     ARRAY['_stateless_claim_losses', $2::text,
                           'eviction_requested_at'],
                     to_jsonb(now()),
-                    false
+                    true
                 )
                 WHERE id = $1::uuid
                   AND metadata #>> ARRAY[

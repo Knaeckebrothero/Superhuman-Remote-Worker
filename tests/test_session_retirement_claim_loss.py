@@ -59,6 +59,34 @@ def _db(metadata, queue):
     return conn
 
 
+def _eviction_materializing_db(metadata, queue):
+    """Simulate PostgreSQL's jsonb_set create-if-missing behavior."""
+
+    conn = _db(metadata, queue)
+
+    async def _fetchval(sql, *_args):
+        if "UPDATE threads" not in sql:
+            raise AssertionError(sql)
+        token, owner, owner_uid = _args[1:4]
+        entry = metadata.get("_stateless_claim_losses", {}).get(token)
+        if (
+            not isinstance(entry, dict)
+            or entry.get("pod") != owner
+            or entry.get("pod_uid") != owner_uid
+            or "eviction_requested_at" in entry
+        ):
+            return None
+        normalized_sql = " ".join(sql.split())
+        if "to_jsonb(now()), true )" in normalized_sql:
+            entry["eviction_requested_at"] = "2026-08-11T12:00:01+00:00"
+        # PostgreSQL returns the row even when jsonb_set(..., false) silently
+        # leaves an absent final path unchanged.
+        return THREAD_ID
+
+    conn.fetchval = AsyncMock(side_effect=_fetchval)
+    return conn
+
+
 def _metadata(*, uid="uid-a", intended="queued"):
     return {
         "kept": True,
@@ -346,10 +374,14 @@ async def test_exact_uid_ack_removes_debt_and_restores_intended_state():
 
 
 @pytest.mark.asyncio
-async def test_same_name_replacement_uid_cannot_ack_old_claim():
+@pytest.mark.parametrize(
+    "operation",
+    [acknowledge_session_claim_quiesced, mark_session_claim_eviction_requested],
+)
+async def test_same_name_replacement_uid_cannot_write_old_claim(operation):
     conn = _db(_metadata(), _queue())
 
-    assert not await acknowledge_session_claim_quiesced(
+    assert not await operation(
         conn,
         thread_id=THREAD_ID,
         previous_lease_token=8,
@@ -376,8 +408,9 @@ async def test_new_human_while_held_requeues_an_intended_done_row():
 
 
 @pytest.mark.asyncio
-async def test_exact_uid_eviction_marker_binds_json_path_token_as_text():
-    conn = _db(_metadata(), _queue())
+async def test_exact_uid_eviction_marker_materializes_absent_json_leaf():
+    metadata = _metadata()
+    conn = _eviction_materializing_db(metadata, _queue())
 
     assert await mark_session_claim_eviction_requested(
         conn,
@@ -389,6 +422,42 @@ async def test_exact_uid_eviction_marker_binds_json_path_token_as_text():
 
     thread_update = conn.fetchval.await_args
     assert thread_update.args[2] == "8"
+    assert "to_jsonb(now()), true )" in " ".join(thread_update.args[0].split())
+    assert unresolved_claim_losses(metadata)[8].eviction_requested is True
+
+
+@pytest.mark.asyncio
+async def test_duplicate_eviction_marker_is_idempotent_without_update():
+    metadata = _metadata()
+    metadata["_stateless_claim_losses"]["8"]["eviction_requested_at"] = (
+        "2026-08-11T12:00:01+00:00"
+    )
+    conn = _eviction_materializing_db(metadata, _queue())
+
+    assert await mark_session_claim_eviction_requested(
+        conn,
+        thread_id=THREAD_ID,
+        previous_lease_token=8,
+        leased_by="pod-a",
+        pod_uid="uid-a",
+    )
+    conn.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_present_null_eviction_marker_fails_closed_without_overwrite():
+    metadata = _metadata()
+    metadata["_stateless_claim_losses"]["8"]["eviction_requested_at"] = None
+    conn = _eviction_materializing_db(metadata, _queue())
+
+    assert not await mark_session_claim_eviction_requested(
+        conn,
+        thread_id=THREAD_ID,
+        previous_lease_token=8,
+        leased_by="pod-a",
+        pod_uid="uid-a",
+    )
+    assert metadata["_stateless_claim_losses"]["8"]["eviction_requested_at"] is None
 
 
 @pytest.mark.asyncio
