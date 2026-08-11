@@ -242,6 +242,24 @@ def _pod_volume_is_ephemeral(pod: Any) -> bool:
     return True
 
 
+def _is_stateless_thread_instance(inst: Instance) -> bool:
+    """Whether ``inst`` belongs to the acknowledged stateless session lane.
+
+    The generic lifecycle reconciler predates stateless session ownership.  It
+    must never snapshot or tear down one of those workspaces: terminal/loss
+    retirement owns the physical instance and records the durable acknowledgement
+    that makes cleanup safe.  Match both the thread ownership label and the exact
+    lane value so job workspaces and legacy/future lanes retain their established
+    lifecycle behavior.
+    """
+    labels = inst.metadata.get("labels")
+    return (
+        isinstance(labels, dict)
+        and "srw/thread-id" in labels
+        and inst.metadata.get("execution_lane") == "stateless"
+    )
+
+
 class WorkspaceInstanceManager:
     """Lifecycle manager for the workspace kind."""
 
@@ -304,6 +322,7 @@ class WorkspaceInstanceManager:
                     metadata["bound_row_missing"] = True
                 else:
                     metadata["thread_status"] = row.get("status")
+                    metadata["execution_lane"] = row.get("execution_lane")
                     metadata["total_turns"] = row.get("total_turns") or 0
                     md = row.get("metadata") or {}
                     if isinstance(md, str):
@@ -362,6 +381,11 @@ class WorkspaceInstanceManager:
         return instances
 
     async def is_healthy(self, inst: Instance) -> bool:
+        if _is_stateless_thread_instance(inst):
+            # Only the terminal/loss protocol may classify and retire a
+            # stateless session workspace.  In particular, a Failed pod must
+            # not take the reconciler's immediate unhealthy-delete shortcut.
+            return True
         # Phase 2a: phase Running is the cheap signal. Phase 2b adds a
         # crash detector that catches Unknown/Failed pods explicitly.
         return inst.metadata.get("pod_phase") in (None, "Running", "Pending")
@@ -374,6 +398,8 @@ class WorkspaceInstanceManager:
         no-traffic). For drift detection we want to react as soon as the
         bound work is in a quiescent state, regardless of how long.
         """
+        if _is_stateless_thread_instance(inst):
+            return False
         if inst.metadata.get("has_live_shared_child"):
             return False
         job_status = inst.metadata.get("job_status")
@@ -410,6 +436,8 @@ class WorkspaceInstanceManager:
         reaping would strand the child. See ``_live_shared_child_exists`` and
         docs/issues/reviewing_parent_pod_reaped_under_critic.md.
         """
+        if _is_stateless_thread_instance(inst):
+            return False
         if inst.metadata.get("has_live_shared_child"):
             return False
         if inst.metadata.get("bound_row_missing"):
@@ -574,6 +602,8 @@ class WorkspaceInstanceManager:
 
     async def record_attempt(self, inst: Instance) -> None:
         """Persist an incremented snapshot-attempt counter to the bound row."""
+        if _is_stateless_thread_instance(inst):
+            return
         if self._db is None:
             return
         bound = inst.bound_to
@@ -609,6 +639,8 @@ class WorkspaceInstanceManager:
         question is "does anyone still need a running pod", not "may the volume
         die". Branch (a): see workspace_pvc_branch_a_implementation.md.
         """
+        if _is_stateless_thread_instance(inst):
+            return
         bound = inst.bound_to
         if not bound:
             return
@@ -634,6 +666,8 @@ class WorkspaceInstanceManager:
         SnapshotService keys by job/thread id), or ``None`` if the
         snapshot path isn't usable for this instance.
         """
+        if _is_stateless_thread_instance(inst):
+            return None
         if self._snapshot is None or not getattr(self._snapshot, "is_available", False):
             return None
         ssh_host = inst.metadata.get("pod_ip")
@@ -713,9 +747,13 @@ class WorkspaceInstanceManager:
         delete calls (via the orchestrator's ad-hoc paths) still go
         through the existing services and don't pass through here.
         """
+        if _is_stateless_thread_instance(inst):
+            return
         await self.delete(inst, grace_s)
 
     async def delete(self, inst: Instance, grace_s: int) -> None:
+        if _is_stateless_thread_instance(inst):
+            return
         if not self._provisioner_ready():
             return
         bound = inst.bound_to
@@ -785,7 +823,10 @@ class WorkspaceInstanceManager:
             "volume_ephemeral", True
         ):
             try:
-                await self._provisioner.delete_workspace_pvc(owner)
+                await self._provisioner.delete_workspace_pvc(
+                    owner,
+                    require_exact_owner=True,
+                )
                 logger.info(
                     "Workspace PVC reclaimed for %s %s (work is gone, not merely idle)",
                     owner.kind,
@@ -799,7 +840,10 @@ class WorkspaceInstanceManager:
             # at the recreated pod), and recreating a Service is a 409-idempotent
             # no-op anyway, so keeping one costs nothing.
             try:
-                await self._provisioner._delete_service(owner)
+                await self._provisioner._delete_service(
+                    owner,
+                    require_exact_owner=True,
+                )
             except Exception:
                 logger.exception("Failed to delete reclaimable Service for %s", inst.id)
 
@@ -909,7 +953,10 @@ class WorkspaceInstanceManager:
                 if exists is not False:
                     continue
                 try:
-                    if await self._provisioner._delete_pvc(name):
+                    if await self._provisioner._delete_pvc(
+                        name,
+                        expected_owner=WorkspaceOwner.session(thread_ref),
+                    ):
                         reaped += 1
                         logger.info(
                             "Orphan session PVC reaped: %s (thread=%s gone)",
@@ -922,7 +969,8 @@ class WorkspaceInstanceManager:
                     services_reclaimed.add(thread_ref)
                     try:
                         await self._provisioner._delete_service(
-                            WorkspaceOwner.session(thread_ref)
+                            WorkspaceOwner.session(thread_ref),
+                            require_exact_owner=True,
                         )
                     except Exception:
                         logger.exception(
@@ -954,7 +1002,10 @@ class WorkspaceInstanceManager:
             if row is not None and status not in _TERMINAL_JOB_STATUSES:
                 continue  # job still active → keep its volume
             try:
-                if await self._provisioner._delete_pvc(name):
+                if await self._provisioner._delete_pvc(
+                    name,
+                    expected_owner=WorkspaceOwner.job(job_id),
+                ):
                     reaped += 1
                     logger.info(
                         "Orphan workspace PVC reaped: %s (job=%s status=%s)",
@@ -967,7 +1018,10 @@ class WorkspaceInstanceManager:
             # Reclaim the stable-DNS Service for the same orphan (shares the PVC
             # lifecycle). The Service name == the workspace pod name.
             try:
-                await self._provisioner._delete_service(WorkspaceOwner.job(job_id))
+                await self._provisioner._delete_service(
+                    WorkspaceOwner.job(job_id),
+                    require_exact_owner=True,
+                )
             except Exception:
                 logger.exception("Orphan Service delete failed for job %s", job_id)
         if reaped:
@@ -1016,7 +1070,8 @@ class WorkspaceInstanceManager:
         try:
             async with self._db.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT id, status, ended_at, agent_id, total_turns, metadata "
+                    "SELECT id, status, ended_at, agent_id, execution_lane, "
+                    "total_turns, metadata "
                     "FROM threads WHERE id = $1",
                     thread_id,
                 )

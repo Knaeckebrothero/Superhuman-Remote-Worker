@@ -734,6 +734,127 @@ class TestLaunchHygiene:
         assert BE._clean_user_agent() is None
 
 
+class TestShutdownProtocol:
+    def test_request_connects_unix_socket_once(self, monkeypatch):
+        class FakeSocket:
+            def __init__(self):
+                self.connects = []
+                self.sent = []
+                self.reads = [b'{"ok":true}\n']
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def settimeout(self, timeout):
+                assert timeout == 2.0
+
+            def connect(self, path):
+                self.connects.append(path)
+
+            def sendall(self, data):
+                self.sent.append(data)
+
+            def shutdown(self, how):
+                assert how == BE.socket.SHUT_WR
+
+            def recv(self, _size):
+                return self.reads.pop(0) if self.reads else b""
+
+        sock = FakeSocket()
+        monkeypatch.setattr(BE.socket, "socket", lambda *_args: sock)
+        monkeypatch.setattr(BE, "SOCKET_PATH", "/tmp/test-browser-exec.sock")
+
+        result = BE._request(b'{"action":"snapshot"}\n', 2.0)
+
+        assert result == b'{"ok":true}\n'
+        assert sock.connects == ["/tmp/test-browser-exec.sock"]
+
+    def test_shutdown_when_absent_never_spawns(self, monkeypatch, capsys):
+        monkeypatch.setattr(BE, "_ping", lambda _path: False)
+        monkeypatch.setattr(BE, "_browser_resident_pids", lambda: {})
+        monkeypatch.setattr(
+            BE,
+            "_spawn_daemon",
+            lambda: (_ for _ in ()).throw(AssertionError("shutdown must not spawn")),
+        )
+
+        rc = BE.run_client("shutdown", {}, 1.0)
+
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == {
+            "ok": True,
+            "shutdown_complete": True,
+            "already_stopped": True,
+            "forced": False,
+        }
+
+    def test_shutdown_discards_daemon_early_reply_for_physical_ack(
+        self, monkeypatch, capsys
+    ):
+        ack = {
+            "ok": True,
+            "shutdown_complete": True,
+            "already_stopped": False,
+            "forced": False,
+        }
+        monkeypatch.setattr(BE, "_ping", lambda _path: True)
+        monkeypatch.setattr(BE, "_request", lambda *_args: b'{"ok":true,"pid":7}\n')
+        monkeypatch.setattr(BE, "_complete_shutdown", lambda: dict(ack))
+
+        rc = BE.run_client("shutdown", {}, 1.0)
+
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == ack
+
+    def test_shutdown_ack_follows_exact_resident_absence(self, monkeypatch):
+        waits = iter([{123: "chromium-profile"}, {}])
+        signals = []
+        monkeypatch.setattr(
+            BE, "_browser_resident_pids", lambda: {123: "chromium-profile"}
+        )
+        monkeypatch.setattr(
+            BE, "_wait_for_browser_shutdown", lambda _timeout: next(waits)
+        )
+        monkeypatch.setattr(
+            BE,
+            "_signal_browser_residents",
+            lambda residents, sig: signals.append((dict(residents), sig)),
+        )
+        monkeypatch.setattr(BE, "_ping", lambda _path: False)
+        monkeypatch.setattr(BE.os, "unlink", lambda _path: None)
+
+        result = BE._complete_shutdown()
+
+        assert result == {
+            "ok": True,
+            "shutdown_complete": True,
+            "already_stopped": False,
+            "forced": True,
+        }
+        assert len(signals) == 1
+        assert signals[0][0] == {123: "chromium-profile"}
+
+    def test_session_stop_failure_is_not_silently_acknowledged(self):
+        async def run():
+            daemon = BE.BrowserDaemon()
+
+            class BrokenSession:
+                async def stop(self):
+                    raise RuntimeError("stuck chromium")
+
+            daemon._session = BrokenSession()
+            response = await daemon.handle({"action": "shutdown", "args": {}})
+
+            assert response == {"error": "browser shutdown required forced cleanup"}
+            assert daemon.should_exit is True
+            assert daemon._session is None
+
+        asyncio.run(run())
+
+
 class TestColdOpenStartPage:
     def test_cold_stream_info_lands_on_start_page(self):
         async def run():

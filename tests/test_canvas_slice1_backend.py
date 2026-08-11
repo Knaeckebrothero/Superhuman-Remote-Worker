@@ -2738,9 +2738,18 @@ async def test_k8s_trusted_identity_tracks_pvc_not_replacement_pod(monkeypatch) 
         "workspace-pod", pvc_name="workspace-claim"
     )
     pod_uid[0] = "22222222-2222-4222-8222-222222222222"
+    (
+        replacement_pod_backing,
+        _,
+        replacement_pod_runtime,
+    ) = await provisioner._trusted_pod_ssh_identity("replacement-pod")
     same_claim, _, replacement_runtime = await provisioner._trusted_pod_ssh_identity(
         "replacement-pod", pvc_name="workspace-claim"
     )
+    # emptyDir identity follows the Pod and therefore rotates both backing and
+    # runtime; PVC identity remains stable while only the runtime UID rotates.
+    assert replacement_pod_backing != pod_backing
+    assert replacement_pod_runtime == pod_uid[0]
     assert same_claim == first_claim
     assert replacement_runtime != first_runtime
     assert replacement_runtime == pod_uid[0]
@@ -2757,20 +2766,64 @@ async def test_k8s_trusted_identity_tracks_pvc_not_replacement_pod(monkeypatch) 
 async def test_k8s_ready_context_pairs_backing_generation_with_pod_uid(
     monkeypatch,
 ) -> None:
+    from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock
 
     from services import container_provisioner as module
     from services.workspace_lifecycle import WorkspaceOwner
 
     runtime_incarnation = "22222222-2222-4222-8222-222222222222"
+
+    class _PinnedSessionDB:
+        def __init__(self):
+            self.bind_thread_workspace_backing = AsyncMock(
+                return_value={"workspace_generation": str(GENERATION)}
+            )
+            self.merge_thread_workspace_context = AsyncMock(return_value=True)
+
+        async def stateless_thread_workspace_creation_requires_authority(
+            self, _thread_id
+        ):
+            return False
+
+        async def get_workspace_network_tier(self, *_args):
+            return "internet-only"
+
+        async def get_thread(self, *_args):
+            return None
+
     provisioner = module.ContainerProvisioner()
     provisioner._k8s_available = True
     provisioner._namespace = "agent-workspaces"
-    provisioner._db = AsyncMock()
-    provisioner._db.bind_thread_workspace_backing.return_value = {
-        "workspace_generation": str(GENERATION)
-    }
+    provisioner._db = _PinnedSessionDB()
     provisioner._core_api = MagicMock()
+    owner = WorkspaceOwner.session(THREAD_ID)
+
+    def create_pod(**kwargs):
+        body = kwargs["body"]
+        return SimpleNamespace(
+            metadata=SimpleNamespace(
+                name=body["metadata"]["name"],
+                namespace=body["metadata"]["namespace"],
+                uid=runtime_incarnation,
+                labels=dict(body["metadata"]["labels"]),
+                annotations=dict(body["metadata"].get("annotations") or {}),
+                deletion_timestamp=None,
+            ),
+            spec=SimpleNamespace(
+                volumes=list(body["spec"]["volumes"]),
+                containers=list(body["spec"]["containers"]),
+                init_containers=[],
+                ephemeral_containers=[],
+            ),
+            status=SimpleNamespace(
+                phase="Running",
+                pod_ip="10.42.0.8",
+                container_statuses=[SimpleNamespace(ready=True)],
+            ),
+        )
+
+    provisioner._core_api.create_namespaced_pod.side_effect = create_pod
     monkeypatch.setattr(
         provisioner, "_wait_for_ready", AsyncMock(return_value="10.42.0.8")
     )
@@ -2786,14 +2839,14 @@ async def test_k8s_ready_context_pairs_backing_generation_with_pod_uid(
         ),
     )
 
-    assert await provisioner.create_workspace(WorkspaceOwner.session(THREAD_ID)) is True
+    assert await provisioner.create_workspace(owner) is True
 
     updates = [
         call.args[1]
         for call in provisioner._db.merge_thread_workspace_context.await_args_list
     ]
     assert updates[0]["_canvas_workspace_generation"] is None
-    assert updates[0][module.WORKSPACE_RUNTIME_INCARNATION_KEY] is None
+    assert updates[0][module.WORKSPACE_RUNTIME_INCARNATION_KEY] == runtime_incarnation
     assert updates[-1]["_canvas_workspace_generation"] == str(GENERATION)
     assert updates[-1][module.WORKSPACE_RUNTIME_INCARNATION_KEY] == runtime_incarnation
 

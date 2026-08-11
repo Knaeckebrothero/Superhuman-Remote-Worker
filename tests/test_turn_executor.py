@@ -195,13 +195,16 @@ class Harness:
             )
             return True
 
-        async def fake_close_interrupt(db, *, unit_id, lease_token, turn_id):
+        async def fake_close_interrupt(
+            db, *, unit_id, lease_token, turn_id, completed_input_seq=None
+        ):
             harness.interrupt_order.append("close")
             harness.calls["interrupt_close"].append(
                 {
                     "unit_id": unit_id,
                     "lease_token": lease_token,
                     "turn_id": turn_id,
+                    "completed_input_seq": completed_input_seq,
                 }
             )
             return True
@@ -714,7 +717,7 @@ class TestTurnError:
         ]
 
     @pytest.mark.asyncio
-    async def test_failed_terminate_still_retires_local_handoff_controllers(
+    async def test_failed_terminate_keeps_claimant_attached_and_blocks_transition(
         self, harness
     ):
         backend = MagicMock()
@@ -732,16 +735,14 @@ class TestTurnError:
             "_terminate_session",
             new=AsyncMock(side_effect=RuntimeError("journal drain failed")),
         ):
-            await harness.executor._detach_cached_session("turn_error")
+            with pytest.raises(RuntimeError, match="journal drain failed"):
+                await harness.executor._detach_cached_session("turn_error")
 
-        session.cleanup.assert_awaited_once_with(
-            preserve_shell=True,
-            preserve_workspace_daemons=True,
-        )
-        session.retire_shell_owner.assert_called_once_with()
-        backend.retire.assert_called_once_with()
-        assert pa._session is None
-        assert pa._thread_id is None
+        session.cleanup.assert_not_awaited()
+        session.retire_shell_owner.assert_not_called()
+        backend.retire.assert_not_called()
+        assert pa._session is session
+        assert pa._thread_id == "physical-thread"
 
     @pytest.mark.asyncio
     async def test_loop_death_releases_with_error(self, harness):
@@ -765,6 +766,104 @@ class TestTurnError:
         assert harness.calls["terminate"]
         assert all(t["mark_thread"] is False for t in harness.calls["terminate"])
         assert all(t["preserve_shell"] is True for t in harness.calls["terminate"])
+
+
+class TestShutdownCancellation:
+    @pytest.mark.asyncio
+    async def test_cancelled_stalled_bundle_quiesces_then_exact_releases(self, harness):
+        entered = asyncio.Event()
+
+        async def _blocked_bundle(_unit_id, _token):
+            entered.set()
+            await asyncio.sleep(3600)
+
+        claim = make_claim(token=41)
+        order: list[str] = []
+
+        async def _detach(reason):
+            assert reason == "shutdown_cancelled_claim"
+            order.append("detach")
+
+        async def _release(*_args, **kwargs):
+            assert kwargs["lease_token"] == 41
+            assert kwargs["error"] is True
+            order.append("release")
+            return "queued"
+
+        with (
+            patch.object(harness.executor, "_fetch_bundle", _blocked_bundle),
+            patch.object(
+                harness.executor,
+                "_detach_physical_before_transition",
+                _detach,
+            ),
+            patch.object(te, "release_unit", _release),
+        ):
+            serving = asyncio.create_task(harness.executor._serve_claim(claim))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            serving.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await serving
+
+        assert order == ["detach", "release"]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_stalled_turn_detaches_before_queue_release(self, harness):
+        harness.loop_behavior = "hang"
+        harness.stateless_warm_reuse_safe = False
+        row_id = str(uuid4())
+        claim = make_claim(token=42, input_seq=4)
+        harness.db.pending_rows = [{"id": row_id, "seq": 4, "content": "blocked"}]
+
+        serving = asyncio.create_task(harness.executor._serve_claim(claim))
+        deadline = asyncio.get_running_loop().time() + 2
+        while not harness.calls["interrupt_open"]:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        serving.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await serving
+        await _finish(harness)
+
+        assert harness.calls["terminate"]
+        assert harness.calls["terminate"][-1]["mark_thread"] is False
+        assert harness.calls["release"] == [
+            {
+                "unit_id": claim.unit_id,
+                "lease_token": 42,
+                "backoff_seconds": 0.0,
+                "error": True,
+            }
+        ]
+        assert not harness.calls["complete"]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_claim_acks_exact_loss_when_end_won_release(self, harness):
+        entered = asyncio.Event()
+
+        async def _blocked_bundle(_unit_id, _token):
+            entered.set()
+            await asyncio.sleep(3600)
+
+        claim = make_claim(token=43)
+        ack = AsyncMock(return_value=True)
+        with (
+            patch.object(harness.executor, "_fetch_bundle", _blocked_bundle),
+            patch.object(
+                harness.executor,
+                "_detach_physical_before_transition",
+                new=AsyncMock(),
+            ),
+            patch.object(te, "release_unit", new=AsyncMock(return_value=None)),
+            patch.object(harness.executor, "_ack_terminal_claim_loss", ack),
+        ):
+            serving = asyncio.create_task(harness.executor._serve_claim(claim))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            serving.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await serving
+
+        ack.assert_awaited_once_with(claim)
 
     @pytest.mark.asyncio
     async def test_attach_failure_releases_and_clears(self, harness):
@@ -1296,6 +1395,10 @@ class _FenceConn:
             return self.fence_row
         return {"id": args[0] if args else "x", "seq": 42}
 
+    async def fetchval(self, sql, *args):
+        self.sql_log.append(sql)
+        return args[0] if args else 1
+
     async def execute(self, sql, *args):
         self.sql_log.append(sql)
         return "UPDATE 1"
@@ -1323,12 +1426,13 @@ class TestFencedPersistence:
         conn = _FenceConn(fence_row=None)
         db = _db_with_conn(conn)
         handle = LeaseHandle()
-        handle.update(str(uuid4()), 5)
+        thread_id = str(uuid4())
+        handle.update(thread_id, 5)
         token = current_lease.set(handle)
         try:
             with pytest.raises(LeaseLostError):
                 await db.save_thread_message(
-                    thread_id=str(uuid4()), role="human", content="x"
+                    thread_id=thread_id, role="human", content="x"
                 )
             assert handle.lost.is_set()
             # The fence ran and nothing else did inside the transaction.
@@ -1342,11 +1446,12 @@ class TestFencedPersistence:
         conn = _FenceConn(fence_row={"?column?": 1})
         db = _db_with_conn(conn)
         handle = LeaseHandle()
-        handle.update(str(uuid4()), 5)
+        thread_id = str(uuid4())
+        handle.update(thread_id, 5)
         token = current_lease.set(handle)
         try:
             result = await db.save_thread_message(
-                thread_id=str(uuid4()), role="human", content="x"
+                thread_id=thread_id, role="human", content="x"
             )
             assert result["seq"] == 42
             assert any("FROM run_queue" in s for s in conn.sql_log)
@@ -1391,7 +1496,17 @@ class TestWriterLeaseFence:
     def _writer(self, lease):
         recorded = []
 
+        class _Txn:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
         class _Conn:
+            def transaction(self):
+                return _Txn()
+
             async def fetchval(self, sql, *args):
                 recorded.append((sql, args))
                 return 1
@@ -1406,7 +1521,7 @@ class TestWriterLeaseFence:
         pool = SimpleNamespace(acquire=lambda: _Acquire())
         writer = pa._OrderedPersistentEventWriter(
             postgres_conn=pool,
-            thread_id="thread-1",
+            thread_id=lease.unit_id if lease is not None else "thread-1",
             epoch=0,
             on_terminal_failure=lambda events, reason: None,
             lease=lease,
@@ -1422,14 +1537,16 @@ class TestWriterLeaseFence:
         event = pa._QueuedPersistentEvent(epoch=0, seq=1, kind="token", payload={})
 
         await writer._write_batch([event])
-        sql, args = recorded[0]
+        assert "FROM threads" in recorded[0][0]
+        assert "FROM run_queue" in recorded[1][0]
+        sql, args = recorded[2]
         assert "run_queue" in sql and "FOR SHARE" in sql
         assert args[3] == unit and args[4] == 3
 
         # Affinity re-claim: same writer, handle repointed → new token flows.
         handle.update(unit, 4)
         await writer._write_batch([event])
-        assert recorded[1][1][4] == 4
+        assert recorded[5][1][4] == 4
 
     @pytest.mark.asyncio
     async def test_pinned_writer_keeps_four_arg_shape(self):

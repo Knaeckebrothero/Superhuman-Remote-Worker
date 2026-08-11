@@ -96,6 +96,86 @@ async def test_advisory_lock_releases_connection_on_exception():
     assert exit_called, "transaction __aexit__ must run even on exception"
 
 
+@pytest.mark.asyncio
+async def test_stateless_workspace_lock_uses_dedicated_session_and_unlocks(monkeypatch):
+    """Slow provisioning must not reserve a slot from the ordinary DB pool."""
+    from orchestrator.database import postgres as postgres_module
+    from orchestrator.database.postgres import PostgresDB
+
+    db = PostgresDB.__new__(PostgresDB)
+    db._connection_string = "postgresql://scratch/test"
+    db._command_timeout = 60
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(side_effect=[True, True])
+    conn.close = AsyncMock()
+    conn.terminate = MagicMock()
+    connect = AsyncMock(return_value=conn)
+    monkeypatch.setattr(postgres_module.asyncpg, "connect", connect)
+
+    async with db.stateless_session_workspace_ensure_lock("thread-xyz") as owner:
+        assert owner is True
+
+    sql = [" ".join(call.args[0].split()) for call in conn.fetchval.await_args_list]
+    assert sql == [
+        "SELECT pg_try_advisory_lock($1)",
+        "SELECT pg_advisory_unlock($1)",
+    ]
+    assert (
+        conn.fetchval.await_args_list[0].args[1]
+        == conn.fetchval.await_args_list[1].args[1]
+    )
+    connect.assert_awaited_once_with(
+        db._connection_string,
+        timeout=5,
+        command_timeout=60,
+    )
+    conn.close.assert_awaited_once_with(timeout=5)
+    conn.terminate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stateless_terminal_workspace_lock_waits_for_reconcile_owner(monkeypatch):
+    from orchestrator.database import postgres as postgres_module
+    from orchestrator.database.postgres import PostgresDB
+
+    db = PostgresDB.__new__(PostgresDB)
+    db._connection_string = "postgresql://scratch/test"
+    db._command_timeout = 60
+    conn = MagicMock()
+    conn.execute = AsyncMock(return_value=None)
+    conn.fetchval = AsyncMock(return_value=True)
+    conn.close = AsyncMock()
+    conn.terminate = MagicMock()
+    monkeypatch.setattr(
+        postgres_module.asyncpg,
+        "connect",
+        AsyncMock(return_value=conn),
+    )
+
+    async with db.stateless_session_workspace_ensure_lock(
+        "thread-xyz", wait=True
+    ) as owner:
+        assert owner is True
+
+    lock_sql = " ".join(conn.execute.await_args.args[0].split())
+    unlock_sql = " ".join(conn.fetchval.await_args.args[0].split())
+    assert lock_sql == "SELECT pg_advisory_lock($1)"
+    assert unlock_sql == "SELECT pg_advisory_unlock($1)"
+    assert conn.execute.await_args.args[1] == conn.fetchval.await_args.args[1]
+
+
+def test_stateless_workspace_lock_canonicalizes_uuid_spelling():
+    from orchestrator.database.postgres import (
+        _stateless_session_workspace_ensure_lock_key,
+    )
+
+    lower = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+    upper = "3FA85F64-5717-4562-B3FC-2C963F66AFA6"
+    assert _stateless_session_workspace_ensure_lock_key(lower) == (
+        _stateless_session_workspace_ensure_lock_key(upper)
+    )
+
+
 # ---------------------------------------------------------------------------
 # merge_thread_config_override — locked read-modify-write + merge semantics
 # (live_session_settings.md P0.4)

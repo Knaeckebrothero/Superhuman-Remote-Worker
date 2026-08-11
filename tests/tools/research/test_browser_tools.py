@@ -543,22 +543,59 @@ class TestToolContextBrowserExec:
         from src.tools.context import ToolContext
 
         fake = MagicMock()
-        fake.workspace_manager.backend.exec_command = MagicMock(
+        backend = MagicMock(spec=["exec_command"])
+        backend.exec_command = MagicMock(
             return_value='{"dom": "x", "url": "https://e.com", "title": "E"}'
         )
+        fake.workspace_manager.backend = backend
         result = await ToolContext.browser_exec(fake, "navigate", url="https://e.com")
         assert result["url"] == "https://e.com"
-        cmd = fake.workspace_manager.backend.exec_command.call_args[0][0]
+        cmd = backend.exec_command.call_args[0][0]
         assert cmd.startswith("browser-exec navigate --json")
+
+    @pytest.mark.asyncio
+    async def test_stateless_backend_uses_claim_resource_fence(self):
+        from src.tools.context import ToolContext
+
+        fake = MagicMock()
+        backend = MagicMock(spec=["exec_command", "exec_claim_resource"])
+        backend.exec_claim_resource = MagicMock(return_value='{"url": "u"}')
+        fake.workspace_manager.backend = backend
+
+        result = await ToolContext.browser_exec(fake, "snapshot")
+
+        assert result == {"url": "u"}
+        backend.exec_command.assert_not_called()
+        command, timeout = backend.exec_claim_resource.call_args.args
+        assert command.startswith("browser-exec snapshot --json")
+        assert timeout == 200
+        assert backend.exec_claim_resource.call_args.kwargs == {
+            "operation": "browser-exec snapshot"
+        }
+
+    @pytest.mark.asyncio
+    async def test_claim_fence_failure_never_falls_back_to_plain_exec(self):
+        from src.tools.context import ToolContext
+
+        fake = MagicMock()
+        backend = MagicMock(spec=["exec_command", "exec_claim_resource"])
+        backend.exec_claim_resource = MagicMock(side_effect=RuntimeError("stale claim"))
+        fake.workspace_manager.backend = backend
+
+        result = await ToolContext.browser_exec(fake, "snapshot")
+
+        assert "error" in result
+        assert "stale claim" in result["error"]
+        backend.exec_command.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_json_becomes_error(self):
         from src.tools.context import ToolContext
 
         fake = MagicMock()
-        fake.workspace_manager.backend.exec_command = MagicMock(
-            return_value="Traceback: boom"
-        )
+        backend = MagicMock(spec=["exec_command"])
+        backend.exec_command = MagicMock(return_value="Traceback: boom")
+        fake.workspace_manager.backend = backend
         result = await ToolContext.browser_exec(fake, "snapshot")
         assert "error" in result
 
@@ -567,7 +604,9 @@ class TestToolContextBrowserExec:
         from src.tools.context import ToolContext
 
         fake = MagicMock()
-        fake.workspace_manager.backend.exec_command = MagicMock(return_value="")
+        backend = MagicMock(spec=["exec_command"])
+        backend.exec_command = MagicMock(return_value="")
+        fake.workspace_manager.backend = backend
         result = await ToolContext.browser_exec(fake, "snapshot")
         assert "error" in result
 
@@ -576,11 +615,47 @@ class TestToolContextBrowserExec:
         from src.tools.context import ToolContext
 
         fake = MagicMock()
-        fake.workspace_manager.backend.exec_command = MagicMock(
+        backend = MagicMock(spec=["exec_command"])
+        backend.exec_command = MagicMock(
             return_value='noise on stdout\n{"url": "u", "dom": "d"}'
         )
+        fake.workspace_manager.backend = backend
         result = await ToolContext.browser_exec(fake, "snapshot")
         assert result["url"] == "u"
+
+    @pytest.mark.asyncio
+    async def test_strict_close_requires_physical_shutdown_ack(self):
+        from src.tools.context import ToolContext
+
+        fake = MagicMock()
+        fake.has_workspace.return_value = True
+        fake.browser_exec = AsyncMock(
+            return_value={"ok": True, "shutdown_complete": True}
+        )
+
+        await ToolContext.close_browser(fake, strict=True)
+
+        fake.browser_exec.assert_awaited_once_with("shutdown")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "result",
+        [
+            {"error": "shutdown failed"},
+            {"ok": True},
+            {},
+            "not-an-object",
+        ],
+    )
+    async def test_strict_close_rejects_unacknowledged_shutdown(self, result):
+        from src.tools.context import ToolContext
+
+        fake = MagicMock()
+        fake.has_workspace.return_value = True
+        fake.browser_exec = AsyncMock(return_value=result)
+
+        with pytest.raises(RuntimeError, match="shutdown was not acknowledged"):
+            await ToolContext.close_browser(fake, strict=True)
 
 
 class TestBrowserDirectDispatch:

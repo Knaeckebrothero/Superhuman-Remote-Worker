@@ -681,7 +681,15 @@ class OrchestratorClient:
         if not self._client:
             await self.connect()
         url = f"{self.orchestrator_url}/internal/units/{unit_id}/claim-bundle"
-        response = await self._client.get(url, params={"lease_token": int(lease_token)})
+        response = await self._client.get(
+            url,
+            params={
+                "lease_token": int(lease_token),
+                "pod_name": os.environ.get("POD_NAME")
+                or os.environ.get("HOSTNAME", ""),
+                "pod_uid": os.environ.get("POD_UID", ""),
+            },
+        )
         if response.status_code == 200:
             return response.json()
         detail = ""

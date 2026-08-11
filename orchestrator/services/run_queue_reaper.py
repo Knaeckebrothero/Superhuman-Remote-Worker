@@ -38,6 +38,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -51,6 +52,14 @@ from src.shared.run_queue import (
     StolenUnit,
     reap_expired,
 )
+from src.shared.session_retirement import (
+    ACTIVE_CLAIM_KEY,
+    CLAIM_LOSS_HOLD_KEY,
+    CLAIM_LOSS_LEDGER_KEY,
+    ClaimantAuthority,
+    active_claim_authority,
+    unresolved_claim_losses,
+)
 from src.shared.thread_interrupts import (
     consume_applied_interrupt_input_idle,
     interrupt_receipt_result,
@@ -60,6 +69,7 @@ logger = logging.getLogger(__name__)
 
 
 STALE_INTERRUPT_RETRY_MAX_THREADS = 25
+CLAIM_LOSS_RECONCILE_MAX_THREADS = 25
 
 
 class JournalStealResult(str, Enum):
@@ -82,7 +92,7 @@ class InterruptReconcileResult:
 
 
 _LOCK_THREAD_SQL = """
-SELECT execution_lane, agent_id
+SELECT execution_lane, agent_id, metadata
 FROM threads
 WHERE id = $1::uuid
 FOR UPDATE
@@ -90,11 +100,58 @@ FOR UPDATE
 
 _LOCK_QUEUE_UNIT_SQL = """
 SELECT unit_kind, state, lease_token, leased_by, last_leased_by,
-       attempts_since_completion, input_seq, consumed_seq,
+       leased_until, max_attempts, attempts_since_completion,
+       queued_at, run_after,
+       input_seq, consumed_seq,
        control_input_seq, control_consumed_seq
+       , interrupt_admission_lease_token, interrupt_admission_turn_id
 FROM run_queue
 WHERE unit_id = $1::uuid
 FOR UPDATE
+"""
+
+
+_STEAL_LOCKED_SESSION_SQL = """
+UPDATE run_queue SET
+    lease_token = lease_token + 1,
+    state = CASE WHEN attempts_since_completion >= max_attempts
+                 THEN 'parked' ELSE 'queued' END,
+    leased_by = NULL,
+    last_leased_by = NULL,
+    leased_until = NULL,
+    interrupt_admission_lease_token = NULL,
+    interrupt_admission_turn_id = NULL,
+    queued_at = now(),
+    run_after = now() + make_interval(secs => $3::float8)
+WHERE unit_id = $1::uuid
+  AND unit_kind = 'session_turn'
+  AND state = 'leased'
+  AND lease_token = $2::bigint
+  AND leased_until < now() - make_interval(secs => $4::float8)
+RETURNING unit_id, unit_kind, state, attempts_since_completion, lease_token
+"""
+
+
+_STORE_CLAIM_LOSS_HOLD_SQL = """
+UPDATE threads
+SET metadata = $2::jsonb
+WHERE id = $1::uuid
+  AND execution_lane = 'stateless'
+  AND agent_id IS NULL
+RETURNING id
+"""
+
+
+_PARK_CLAIM_LOSS_HOLD_SQL = """
+UPDATE run_queue
+SET state = 'parked', run_after = NULL,
+    leased_by = NULL, last_leased_by = NULL, leased_until = NULL
+WHERE unit_id = $1::uuid
+  AND unit_kind = 'session_turn'
+  AND lease_token = $2::bigint
+  AND leased_by IS NULL
+  AND state IN ('queued', 'parked', 'done')
+RETURNING unit_id
 """
 
 
@@ -129,6 +186,8 @@ WHERE (request.outcome IS NULL
                     ? 'consumed_input_seq')))
   AND thread.execution_lane = 'stateless'
   AND thread.agent_id IS NULL
+  AND NOT (COALESCE(thread.metadata, '{}'::jsonb)
+           ? '_stateless_claim_losses')
   AND queue.unit_kind = 'session_turn'
   AND queue.lease_token > request.accepted_lease_token
   AND queue.leased_by IS NULL
@@ -159,6 +218,17 @@ WHERE request.thread_id = $1::uuid
   AND thread.agent_id IS NULL
 ORDER BY request.requested_at, request.id
 FOR UPDATE OF request
+"""
+
+
+_CLAIM_LOSS_HOLD_CANDIDATES_SQL = """
+SELECT id, metadata
+FROM threads
+WHERE execution_lane = 'stateless'
+  AND agent_id IS NULL
+  AND COALESCE(metadata, '{}'::jsonb) ? '_stateless_claim_losses'
+ORDER BY last_activity, id
+LIMIT $1::integer
 """
 
 _TERMINALIZE_STOLEN_INTERRUPT_SQL = """
@@ -252,6 +322,8 @@ async def _reconcile_interrupt_rows(
     thread_id: str,
     current_lease_token: int,
     pending: Any,
+    owner_loss_reason: str = "lease_expired",
+    terminal_queue: bool = False,
 ) -> InterruptReconcileResult:
     """Reconcile already-locked request rows from their durable receipts."""
     reconciled = 0
@@ -302,7 +374,7 @@ async def _reconcile_interrupt_rows(
                 "applied": True,
                 "mode": mode,
                 "reason": "owner_lost",
-                "owner_loss_reason": "lease_expired",
+                "owner_loss_reason": owner_loss_reason,
             }
             receipt = await append_system_frame(
                 conn,
@@ -356,6 +428,7 @@ async def _reconcile_interrupt_rows(
             accepted_lease_token=accepted_lease_token,
             target_turn_id=target_turn_id,
             request_id=request_id,
+            terminal=terminal_queue,
         )
         if consumed is None:
             raise RuntimeError(
@@ -381,10 +454,11 @@ def _turn_frame_payload(
     stolen_from: str | None,
     interrupts: InterruptReconcileResult,
     fallback_target_turn_id: int | None = None,
+    reason: str = "lease_expired",
 ) -> dict[str, Any]:
     """Correlate a steal frame with the exact interrupted turn when known."""
     payload: dict[str, Any] = {
-        "reason": "lease_expired",
+        "reason": reason,
         "attempts": int(attempts),
         "stolen_from": stolen_from,
     }
@@ -432,6 +506,7 @@ async def _append_turn_frames(
     stolen_from: str | None,
     interrupts: InterruptReconcileResult,
     fallback_target_turn_id: int | None = None,
+    reason: str = "lease_expired",
 ) -> None:
     """Append exact-target terminal frames, failing the enclosing transaction."""
     for frame_interrupts in _turn_frame_slices(interrupts):
@@ -444,12 +519,151 @@ async def _append_turn_frames(
                 stolen_from=stolen_from,
                 interrupts=frame_interrupts,
                 fallback_target_turn_id=fallback_target_turn_id,
+                reason=reason,
             ),
         )
         if frame is None:
             raise RuntimeError(
                 f"thread disappeared while journaling lifecycle {thread_id}"
             )
+
+
+async def reconcile_terminal_interrupts(
+    conn: Any,
+    *,
+    thread_id: str,
+    previous_lease_token: int,
+    terminal_lease_token: int,
+    leased_by: str | None,
+    attempts: int,
+    active_turn_id: int | None = None,
+    reason: str = "force_end",
+) -> InterruptReconcileResult:
+    """Settle exact old-lease interrupts after public End steals ownership.
+
+    The caller already holds ``threads -> run_queue`` locks in an explicit
+    transaction and has moved the queue to a writer-free ``queued``/``parked``
+    state at ``terminal_lease_token``. Reuse the same durable receipt recovery,
+    hard-stop acknowledgement, and exact human-input settlement as the expiry
+    reaper.  All unresolved generations below the terminal token are included:
+    an earlier reaper may have published a parked token and then crashed before
+    its journal transaction.
+
+    When End fenced a turn with an open admission window, ``active_turn_id``
+    is the durable identity of the input that may already have workspace side
+    effects.  Settle that one exact human row even if no explicit interrupt
+    request existed.  Inputs admitted after it remain pending for Resume.
+    """
+
+    old_token = int(previous_lease_token)
+    terminal_token = int(terminal_lease_token)
+    if old_token <= 0 or terminal_token != old_token + 1:
+        raise ValueError("terminal interrupt recovery requires one exact token bump")
+    if reason not in {"force_end", "user_end"}:
+        raise ValueError("terminal interrupt reason is invalid")
+    pending = await conn.fetch(
+        _PENDING_STALE_INTERRUPT_RETRY_SQL,
+        thread_id,
+        terminal_token,
+    )
+    turn_id = int(active_turn_id) if active_turn_id is not None else None
+    if turn_id is not None and turn_id <= 0:
+        raise ValueError("active terminal turn id must be positive")
+    if not pending and turn_id is None:
+        return InterruptReconcileResult(0, (), ())
+
+    # This is also the fence for an old claimant's journal allocator.  One
+    # bump covers every stale receipt and the synthetic force-End frame in the
+    # enclosing transaction.
+    await bump_epoch(conn, thread_id=thread_id)
+    interrupts = await _reconcile_interrupt_rows(
+        conn,
+        thread_id=thread_id,
+        current_lease_token=terminal_token,
+        pending=pending,
+        owner_loss_reason=reason,
+        terminal_queue=True,
+    )
+    if pending:
+        await _append_turn_frames(
+            conn,
+            thread_id=thread_id,
+            kind="turn.interrupted",
+            attempts=int(attempts),
+            stolen_from=leased_by,
+            interrupts=interrupts,
+            reason=reason,
+        )
+
+    if turn_id is not None:
+        humans = await conn.fetch(
+            "SELECT seq FROM thread_messages "
+            "WHERE thread_id = $1::uuid AND role = 'human' "
+            "AND rewound_at IS NULL AND turn_number = $2::integer "
+            "ORDER BY seq FOR SHARE",
+            thread_id,
+            turn_id,
+        )
+        if len(humans) != 1:
+            raise RuntimeError(
+                "terminal active turn must map to exactly one live human input"
+            )
+        active_input_seq = int(humans[0]["seq"])
+        queue = await conn.fetchrow(
+            "SELECT consumed_seq FROM run_queue "
+            "WHERE unit_id = $1::uuid AND unit_kind = 'session_turn' "
+            "AND lease_token = $2::bigint AND state IN ('queued', 'parked') "
+            "AND leased_by IS NULL AND leased_until IS NULL FOR UPDATE",
+            thread_id,
+            terminal_token,
+        )
+        if queue is None:
+            raise RuntimeError("terminal active-input settlement lost queue owner")
+        consumed = queue["consumed_seq"]
+        needs_settlement = consumed is None or int(consumed) < active_input_seq
+        if needs_settlement:
+            next_unanswered = await conn.fetchval(
+                "SELECT min(seq) FROM thread_messages "
+                "WHERE thread_id = $1::uuid AND role = 'human' "
+                "AND rewound_at IS NULL "
+                "AND seq > COALESCE($2::bigint, -1)",
+                thread_id,
+                consumed,
+            )
+            if next_unanswered is None or int(next_unanswered) != active_input_seq:
+                raise RuntimeError(
+                    "terminal active turn is not the next unanswered human input"
+                )
+            updated = await conn.fetchval(
+                "UPDATE run_queue "
+                "SET consumed_seq = GREATEST(COALESCE(consumed_seq, -1), $3::bigint), "
+                "    attempts_since_completion = 0 "
+                "WHERE unit_id = $1::uuid AND unit_kind = 'session_turn' "
+                "AND lease_token = $2::bigint AND state IN ('queued', 'parked') "
+                "AND leased_by IS NULL AND leased_until IS NULL "
+                "RETURNING consumed_seq",
+                thread_id,
+                terminal_token,
+                active_input_seq,
+            )
+            if updated is None:
+                raise RuntimeError("terminal active-input settlement lost its fence")
+        if turn_id not in interrupts.target_turn_ids:
+            # The active gate is lifecycle evidence even when a racing live
+            # interrupt finalizer already consumed the target and therefore
+            # left no unresolved request in ``pending``. End's epoch bump must
+            # still publish the exact terminal edge.
+            await _append_turn_frames(
+                conn,
+                thread_id=thread_id,
+                kind="turn.interrupted",
+                attempts=int(attempts),
+                stolen_from=leased_by,
+                interrupts=InterruptReconcileResult(0, (), ()),
+                fallback_target_turn_id=turn_id,
+                reason=reason,
+            )
+    return interrupts
 
 
 def _post_steal_queue_result(
@@ -477,6 +691,218 @@ def _post_steal_queue_result(
     ):
         return JournalStealResult.SKIPPED_QUEUE_CHANGED
     return JournalStealResult.WRITTEN
+
+
+def _json_timestamp(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _metadata_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return dict(parsed)
+    raise RuntimeError("stateless thread metadata is malformed")
+
+
+async def _steal_session_with_claim_loss(
+    conn: Any,
+    *,
+    candidate: Any,
+    backoff_seconds: float,
+    grace_seconds: float,
+) -> StolenUnit | None:
+    """Atomically fence one expired session claimant and record its I/O debt.
+
+    A queue token prevents new durable writes, but it cannot cancel a Paramiko
+    SFTP call that already passed the old claimant's local admission lock.  The
+    unresolved-only thread ledger therefore commits in the same
+    ``threads -> run_queue`` transaction as the token bump.  End must drain
+    every ledger entry before touching workspace bytes; the exact old claimant
+    (or a Kubernetes absence proof) removes its own entry later.
+    """
+
+    thread_id = str(candidate["unit_id"])
+    previous_token = int(candidate["lease_token"])
+    previous_owner = str(candidate["leased_by"] or "").strip()
+    if previous_token <= 0 or not previous_owner:
+        raise RuntimeError("expired session lease lacks exact claimant authority")
+
+    async with conn.transaction():
+        thread = await conn.fetchrow(_LOCK_THREAD_SQL, thread_id)
+        if (
+            thread is None
+            or str(thread["execution_lane"] or "") != "stateless"
+            or thread["agent_id"] is not None
+        ):
+            return None
+        # Validate every already-unresolved generation and the credential-bound
+        # claimant before advancing the queue.  A claim that never reached the
+        # final bundle boundary has no workspace credentials and therefore
+        # creates no local-I/O debt when fenced.
+        losses = unresolved_claim_losses(thread["metadata"])
+        if previous_token in losses:
+            raise RuntimeError("expired session token already has claimant-loss debt")
+        active_claim = active_claim_authority(thread["metadata"])
+        current_authority: ClaimantAuthority | None = None
+        if active_claim is not None:
+            active_token, active_authority = active_claim
+            if active_token > previous_token:
+                raise RuntimeError("active claimant generation is ahead of its lease")
+            if active_token == previous_token:
+                if active_authority.pod != previous_owner:
+                    raise RuntimeError("active claimant disagrees with queue owner")
+                current_authority = active_authority
+
+        queue = await conn.fetchrow(_LOCK_QUEUE_UNIT_SQL, thread_id)
+        if (
+            queue is None
+            or str(queue["unit_kind"] or "") != UNIT_KIND_SESSION_TURN
+            or str(queue["state"] or "") != "leased"
+            or int(queue["lease_token"] or 0) != previous_token
+            or str(queue["leased_by"] or "") != previous_owner
+        ):
+            return None
+
+        updated = await conn.fetchrow(
+            _STEAL_LOCKED_SESSION_SQL,
+            thread_id,
+            previous_token,
+            float(backoff_seconds),
+            float(grace_seconds),
+        )
+        if updated is None:
+            # A heartbeat renewed the row after candidate discovery. No thread
+            # metadata has changed, so the transaction may commit as a no-op.
+            return None
+        admission_turn = None
+        if (
+            queue["interrupt_admission_lease_token"] is not None
+            and int(queue["interrupt_admission_lease_token"]) == previous_token
+            and queue["interrupt_admission_turn_id"] is not None
+        ):
+            admission_turn = int(queue["interrupt_admission_turn_id"])
+        unit = StolenUnit(
+            unit_id=updated["unit_id"],
+            unit_kind=updated["unit_kind"],
+            state=updated["state"],
+            attempts_since_completion=int(updated["attempts_since_completion"]),
+            leased_by=previous_owner,
+            lease_token=int(updated["lease_token"]),
+            previous_lease_token=previous_token,
+            interrupt_admission_turn_id=admission_turn,
+            lifecycle_journaled=True,
+        )
+        # The epoch edge, interrupt receipts, input settlement, and claimant
+        # loss provenance are one atomic owner-loss fact.  Publishing only the
+        # queue bump would leave an unrecoverable claim-loss gap after a crash.
+        await bump_epoch(conn, thread_id=thread_id)
+        interrupts = await _reconcile_stolen_interrupts(
+            conn,
+            thread_id=thread_id,
+            unit=unit,
+        )
+        kind = (
+            "turn.interrupted"
+            if unit.state == STATE_QUEUED
+            or interrupts.settled_queue_state in {"done", "queued"}
+            else "turn.parked"
+        )
+        await _append_turn_frames(
+            conn,
+            thread_id=thread_id,
+            kind=kind,
+            attempts=unit.attempts_since_completion,
+            stolen_from=unit.leased_by,
+            interrupts=interrupts,
+            fallback_target_turn_id=unit.interrupt_admission_turn_id,
+        )
+
+        # Interrupt settlement may have changed queued -> done (or preserved
+        # max-attempt parked). Capture that authoritative post-settlement state
+        # before installing the physical quiescence hold.
+        settled_queue = await conn.fetchrow(_LOCK_QUEUE_UNIT_SQL, thread_id)
+        if (
+            settled_queue is None
+            or int(settled_queue["lease_token"] or 0) != int(unit.lease_token)
+            or settled_queue["leased_by"] is not None
+            or str(settled_queue["state"] or "") not in {"queued", "parked", "done"}
+        ):
+            raise RuntimeError("session steal lost its post-settlement queue row")
+
+        metadata = _metadata_object(thread["metadata"] or {})
+        metadata.pop(ACTIVE_CLAIM_KEY, None)
+        raw_ledger = dict(metadata.get(CLAIM_LOSS_LEDGER_KEY) or {})
+        if current_authority is not None:
+            raw_ledger[str(previous_token)] = {
+                "pod": current_authority.pod,
+                "pod_uid": current_authority.pod_uid,
+                "quiesced": False,
+            }
+        if raw_ledger:
+            metadata[CLAIM_LOSS_LEDGER_KEY] = raw_ledger
+            metadata[CLAIM_LOSS_HOLD_KEY] = {
+                "lease_token": int(unit.lease_token),
+                "intended_state": str(settled_queue["state"]),
+                "attempts_since_completion": int(
+                    settled_queue["attempts_since_completion"] or 0
+                ),
+                "queued_at": _json_timestamp(settled_queue["queued_at"]),
+                "run_after": _json_timestamp(settled_queue["run_after"]),
+            }
+        else:
+            metadata.pop(CLAIM_LOSS_LEDGER_KEY, None)
+            metadata.pop(CLAIM_LOSS_HOLD_KEY, None)
+
+        stored = await conn.fetchval(
+            _STORE_CLAIM_LOSS_HOLD_SQL,
+            thread_id,
+            json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+        )
+        if stored is None:
+            raise RuntimeError("session steal failed to store claimant authority")
+        if raw_ledger:
+            held = await conn.fetchrow(
+                _PARK_CLAIM_LOSS_HOLD_SQL,
+                thread_id,
+                int(unit.lease_token),
+            )
+            if held is None:
+                raise RuntimeError("session steal failed to park claimant-loss debt")
+        return unit
+
+
+async def _try_steal_session_with_claim_loss(
+    conn: Any,
+    *,
+    candidate: Any,
+    backoff_seconds: float,
+    grace_seconds: float,
+) -> StolenUnit | None:
+    """Contain one corrupt/session-journal failure without aborting the pass."""
+
+    try:
+        return await _steal_session_with_claim_loss(
+            conn,
+            candidate=candidate,
+            backoff_seconds=backoff_seconds,
+            grace_seconds=grace_seconds,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "run_queue reaper: atomic session steal failed for unit %s "
+            "(contained; lease left unchanged)",
+            candidate["unit_id"],
+        )
+        return None
 
 
 async def _journal_steal(conn: Any, unit: StolenUnit) -> JournalStealResult:
@@ -558,6 +984,8 @@ async def _retry_stale_interrupt_thread(
             or thread["agent_id"] is not None
         ):
             return 0
+        if unresolved_claim_losses(thread["metadata"]):
+            return 0
         queue = await conn.fetchrow(_LOCK_QUEUE_UNIT_SQL, thread_id)
         if not _queue_allows_stale_retry(queue):
             return 0
@@ -637,6 +1065,78 @@ async def retry_stale_interrupt_requests(
     return reconciled
 
 
+async def reconcile_claim_loss_holds(
+    conn: Any,
+    *,
+    max_threads: int = CLAIM_LOSS_RECONCILE_MAX_THREADS,
+) -> int:
+    """Evict/settle immutable claimant Pods before restoring held work.
+
+    Candidate discovery holds no DB lock while Kubernetes is contacted.  The
+    exact ACK then reacquires ``threads -> run_queue`` and removes only the
+    same ``(token, pod, uid)`` debt. A same-name replacement proves the old UID
+    gone but is never itself deleted.
+    """
+
+    if max_threads <= 0:
+        return 0
+    from services.agent_provisioner import agent_provisioner
+    from src.shared.session_retirement import (
+        acknowledge_session_claim_quiesced,
+        mark_session_claim_eviction_requested,
+    )
+
+    candidates = await conn.fetch(_CLAIM_LOSS_HOLD_CANDIDATES_SQL, int(max_threads))
+    settled = 0
+    for candidate in candidates:
+        thread_id = str(candidate["id"])
+        try:
+            losses = unresolved_claim_losses(candidate["metadata"])
+            for token, authority in sorted(losses.items()):
+                pod_state = await agent_provisioner.agent_pod_authority(
+                    authority.pod,
+                    expected_pod_uid=authority.pod_uid,
+                )
+                if pod_state == "exact_live":
+                    if await mark_session_claim_eviction_requested(
+                        conn,
+                        thread_id=thread_id,
+                        previous_lease_token=token,
+                        leased_by=authority.pod,
+                        pod_uid=authority.pod_uid,
+                    ):
+                        await agent_provisioner.delete_agent_pod_exact(
+                            authority.pod,
+                            expected_pod_uid=authority.pod_uid,
+                        )
+                    continue
+                if pod_state != "exact_terminal":
+                    # Kubernetes API-object absence (including a same-name
+                    # replacement) cannot prove that a partitioned kubelet
+                    # stopped the old credential-bearing process.  Only the
+                    # claimant's local drain ACK or an observed exact UID with
+                    # all containers terminated may clear this debt.
+                    continue
+                if await acknowledge_session_claim_quiesced(
+                    conn,
+                    thread_id=thread_id,
+                    previous_lease_token=token,
+                    leased_by=authority.pod,
+                    pod_uid=authority.pod_uid,
+                    quiesced_by="pod_absent",
+                ):
+                    settled += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "run_queue reaper: claimant-loss reconciliation failed for %s "
+                "(contained)",
+                thread_id,
+            )
+    return settled
+
+
 async def reap_cycle(
     conn: Any,
     *,
@@ -650,7 +1150,11 @@ async def reap_cycle(
     opens its own transaction. Per-row errors are contained so one bad unit
     never blocks the rest of the pass.
     """
-    stolen = await reap_expired(conn, grace_seconds=grace_seconds)
+    stolen = await reap_expired(
+        conn,
+        grace_seconds=grace_seconds,
+        session_steal=_try_steal_session_with_claim_loss,
+    )
     for unit in stolen:
         # Greppable ops line — one per steal (M6 fault-injection anchors on it).
         logger.info(
@@ -663,6 +1167,8 @@ async def reap_cycle(
         )
         if unit.unit_kind != UNIT_KIND_SESSION_TURN:
             # Reap only — no journal for non-session kinds (S3).
+            continue
+        if unit.lifecycle_journaled:
             continue
         try:
             result = await _journal_steal(conn, unit)
@@ -682,6 +1188,7 @@ async def reap_cycle(
                 unit.unit_id,
             )
     await retry_stale_interrupt_requests(conn)
+    await reconcile_claim_loss_holds(conn)
     return len(stolen)
 
 

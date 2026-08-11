@@ -16,13 +16,19 @@ import pytest
 from fastapi import HTTPException
 
 UNIT_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+POD_NAME = "stateless-agent-1"
+POD_UID = "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"
 
 LEASED_ROW = {
     "unit_kind": "session_turn",
     "state": "leased",
     "lease_token": 7,
+    "leased_by": POD_NAME,
     "input_seq": 41,
     "consumed_seq": 12,
+    "thread_status": "created",
+    "thread_lane": "stateless",
+    "thread_metadata": {},
 }
 
 
@@ -43,7 +49,18 @@ class FakeDB:
         self._thread = thread
         self._job = job
         self.conn = MagicMock()
-        self.conn.fetchrow = AsyncMock(return_value=run_queue_row)
+        self.conn.transaction = lambda: _AsyncCM()
+
+        async def _fetchrow(sql, *_args):
+            if "FROM run_queue AS queue LEFT JOIN threads" in sql:
+                return self._row
+            if "SELECT status::text AS status, execution_lane, metadata" in sql:
+                return self._thread
+            if "SELECT state, lease_token, leased_by FROM run_queue" in sql:
+                return self._row
+            raise AssertionError(f"unexpected fetchrow SQL: {sql}")
+
+        self.conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         self.conn.fetchval = AsyncMock(return_value=True)
         self.datasource_lock_calls = []
 
@@ -67,6 +84,7 @@ def _thread(**over):
         "user_id": "user-1",
         "project_id": None,
         "execution_lane": "stateless",
+        "status": "created",
         "config_name": "session_base",
         "metadata": {
             "config_override": {
@@ -113,11 +131,13 @@ async def test_happy_path_returns_watermarks_and_shared_assembly(monkeypatch):
     db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
     inject, assembly = _patch(monkeypatch, orch_main, db)
 
-    out = await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+    out = await orch_main.internal_unit_claim_bundle(
+        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    )
 
     # One SELECT validated the lease AND carried the watermarks.
-    db.conn.fetchrow.assert_awaited_once()
-    assert "run_queue" in db.conn.fetchrow.await_args.args[0]
+    assert db.conn.fetchrow.await_count == 3
+    assert "run_queue" in db.conn.fetchrow.await_args_list[0].args[0]
     assert out["unit_id"] == UNIT_ID
     assert out["thread_id"] == UNIT_ID
     assert out["unit_kind"] == "session_turn"
@@ -159,7 +179,7 @@ async def test_session_bundle_stolen_during_slow_assembly_is_rejected(monkeypatc
 
     assembly.side_effect = _slow_assembly
     request_task = asyncio.create_task(
-        orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+        orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID)
     )
     await asyncio.wait_for(entered.wait(), timeout=2)
     # The reaper/successor owns a newer token by the time assembly returns.
@@ -175,6 +195,92 @@ async def test_session_bundle_stolen_during_slow_assembly_is_rejected(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_protected_cloud_flip_during_assembly_blocks_final_credentials(
+    monkeypatch,
+):
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    _, assembly = _patch(monkeypatch, orch_main, db)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_assembly(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return {"thread_id": UNIT_ID, "datasources": {"secret": "in-flight"}}
+
+    assembly.side_effect = _slow_assembly
+    request_task = asyncio.create_task(
+        orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID)
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    db._thread["metadata"] = {
+        **db._thread["metadata"],
+        "protected_cloud": True,
+    }
+    release.set()
+
+    with pytest.raises(HTTPException) as exc:
+        await request_task
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Lease validation failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["enabled", "conference"])
+@pytest.mark.parametrize("value", [None, 0, "", [], {}, "yes", 1, True])
+async def test_malformed_or_pinned_session_class_refuses_claim_credentials(
+    monkeypatch,
+    field,
+    value,
+):
+    from orchestrator import main as orch_main
+
+    thread = _thread()
+    thread["metadata"]["config_override"]["officer"] = {field: value}
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=thread)
+    _patch(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+    assert exc.value.status_code in {403, 409}
+    db.conn.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_class_flip_during_assembly_blocks_final_credentials(
+    monkeypatch,
+):
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    _, assembly = _patch(monkeypatch, orch_main, db)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_assembly(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return {"thread_id": UNIT_ID, "datasources": {"secret": "in-flight"}}
+
+    assembly.side_effect = _slow_assembly
+    request_task = asyncio.create_task(
+        orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID)
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    db._thread["metadata"]["config_override"]["officer"] = {"enabled": "yes"}
+    release.set()
+
+    with pytest.raises(HTTPException) as exc:
+        await request_task
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Lease validation failed"
+
+
+@pytest.mark.asyncio
 async def test_token_mismatch_and_not_leased_are_one_generic_403(monkeypatch):
     from orchestrator import main as orch_main
 
@@ -182,7 +288,9 @@ async def test_token_mismatch_and_not_leased_are_one_generic_403(monkeypatch):
     db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
     _patch(monkeypatch, orch_main, db)
     with pytest.raises(HTTPException) as exc_token:
-        await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 6)
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 6, POD_NAME, POD_UID
+        )
     assert exc_token.value.status_code == 403
 
     # Right token but the row is no longer leased (stolen/completed).
@@ -190,11 +298,43 @@ async def test_token_mismatch_and_not_leased_are_one_generic_403(monkeypatch):
     db2 = FakeDB(run_queue_row=row, thread=_thread())
     _patch(monkeypatch, orch_main, db2)
     with pytest.raises(HTTPException) as exc_state:
-        await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
     assert exc_state.value.status_code == 403
 
     # Single generic detail: the two cases must be indistinguishable.
     assert exc_token.value.detail == exc_state.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "marker_key",
+    [
+        "_stateless_workspace_retirement_pending",
+        "_stateless_claim_retirement",
+        "_stateless_claim_loss_hold",
+        "_stateless_claim_losses",
+    ],
+)
+@pytest.mark.parametrize("value", [None, False, 0, "", [], {}])
+async def test_present_falsey_stop_marker_refuses_credentials(
+    monkeypatch, marker_key, value
+):
+    from orchestrator import main as orch_main
+
+    row = dict(
+        LEASED_ROW,
+        thread_metadata={marker_key: value},
+    )
+    db = FakeDB(run_queue_row=row, thread=_thread())
+    _patch(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+    assert exc.value.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -204,12 +344,16 @@ async def test_absent_unit_row_404(monkeypatch):
     db = FakeDB(run_queue_row=None, thread=_thread())
     _patch(monkeypatch, orch_main, db)
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
     assert exc.value.status_code == 404
 
     # Malformed unit id short-circuits to the same 404 (no DataError 500).
     with pytest.raises(HTTPException) as exc2:
-        await orch_main.internal_unit_claim_bundle("not-a-uuid", MagicMock(), 7)
+        await orch_main.internal_unit_claim_bundle(
+            "not-a-uuid", MagicMock(), 7, POD_NAME, POD_UID
+        )
     assert exc2.value.status_code == 404
 
 
@@ -221,14 +365,18 @@ async def test_wrong_lane_and_non_session_kind_409(monkeypatch):
     db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread(execution_lane="pinned"))
     _patch(monkeypatch, orch_main, db)
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
     assert exc.value.status_code == 409
 
     # Vanished thread → same 409 family.
     db2 = FakeDB(run_queue_row=dict(LEASED_ROW), thread=None)
     _patch(monkeypatch, orch_main, db2)
     with pytest.raises(HTTPException) as exc2:
-        await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
     assert exc2.value.status_code == 409
 
     # Non-session unit kinds carry no attach bundle.
@@ -236,7 +384,9 @@ async def test_wrong_lane_and_non_session_kind_409(monkeypatch):
     db3 = FakeDB(run_queue_row=row, thread=_thread())
     _patch(monkeypatch, orch_main, db3)
     with pytest.raises(HTTPException) as exc3:
-        await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
     assert exc3.value.status_code == 409
 
 
@@ -267,7 +417,9 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
     inherit = AsyncMock(return_value=("proceed", None))
     monkeypatch.setattr(orch_main, "_resolve_subjob_inherited_workspace", inherit)
 
-    out = await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+    out = await orch_main.internal_unit_claim_bundle(
+        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    )
 
     inherit.assert_awaited_once_with(job)
     builder.assert_awaited_once_with(job, persist_dispatch_state=False)
@@ -327,7 +479,9 @@ async def test_worker_bundle_stolen_during_assembly_is_rejected(monkeypatch):
     )
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
 
     assert exc.value.status_code == 403
     assert exc.value.detail == "Lease validation failed"
@@ -377,7 +531,9 @@ async def test_non_lite_workspace_refused_before_attach_assembly(monkeypatch, ba
     inject, assembly = _patch(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
 
     assert exc.value.status_code == 409
     assert "virtual/none" in str(exc.value.detail)
@@ -410,7 +566,9 @@ async def test_upgraded_lite_claim_refused_before_credentials_or_assembly(
     inject, assembly = _patch(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
 
     assert exc.value.status_code == 409
     assert "virtual/none" in str(exc.value.detail)
@@ -426,7 +584,9 @@ async def test_assembly_refusal_is_generic_409(monkeypatch):
     db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
     _patch(monkeypatch, orch_main, db, attach=None)
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
     assert exc.value.status_code == 409
     # Generic reason — must not leak which fail-closed rule refused.
     assert "grant" not in str(exc.value.detail).lower()
@@ -445,6 +605,8 @@ async def test_internal_auth_failure_is_401_before_any_lookup(monkeypatch):
     request = MagicMock()
     request.headers = {"X-Internal-Key": ""}
     with pytest.raises(HTTPException) as exc:
-        await orch_main.internal_unit_claim_bundle(UNIT_ID, request, 7)
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, request, 7, POD_NAME, POD_UID
+        )
     assert exc.value.status_code == 401
     db.conn.fetchrow.assert_not_awaited()

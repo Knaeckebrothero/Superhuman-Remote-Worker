@@ -1,4 +1,6 @@
+import asyncio
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -14,7 +16,7 @@ from services.session_provisioner import (  # noqa: E402
     ensure_session_workspace,
     reconcile_session_workspaces,
 )
-from services.workspace_lifecycle import EnsureOutcome  # noqa: E402
+from services.workspace_lifecycle import EnsureOutcome, WorkspaceOwner  # noqa: E402
 
 
 @pytest.mark.asyncio
@@ -79,6 +81,57 @@ async def test_ensure_handles_str_metadata_ready():
     )
     assert res.outcome == EnsureOutcome.READY
     prov.create_workspace.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stateless_ready_workspace_holds_same_name_replacement_uid():
+    runtime_uid = "11111111-1111-4111-8111-111111111111"
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=_stateless_sandbox_thread("ready"))
+    prov = AsyncMock()
+    prov.workspace_pod_authority = AsyncMock(return_value="replacement")
+    prov.create_workspace = AsyncMock(return_value=True)
+
+    res = await ensure_session_workspace(
+        "t1", db=db, provisioner=prov, suspension=AsyncMock()
+    )
+
+    assert res.outcome == EnsureOutcome.PENDING
+    prov.workspace_pod_authority.assert_awaited_once()
+    assert prov.workspace_pod_authority.await_args.kwargs == {
+        "expected_runtime_incarnation": runtime_uid
+    }
+    prov.create_workspace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pinned_ready_workspace_keeps_phase_only_drift_probe():
+    """The stateless runtime fence must not change pinned workspace admission."""
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        return_value={
+            "id": "t1",
+            "status": "active",
+            "execution_lane": "pinned",
+            "metadata": {
+                "config_override": {"workspace": {"backend": "sandbox"}},
+                "workspace_container": {
+                    "status": "ready",
+                    "provisioner": "k8s",
+                    "_runtime_incarnation": ("11111111-1111-4111-8111-111111111111"),
+                },
+            },
+        }
+    )
+    prov = AsyncMock()
+    prov.workspace_pod_authority = AsyncMock(return_value="exact_live")
+
+    res = await ensure_session_workspace(
+        "t1", db=db, provisioner=prov, suspension=AsyncMock()
+    )
+
+    assert res.outcome == EnsureOutcome.READY
+    prov.workspace_pod_live.assert_awaited_once_with(WorkspaceOwner.session("t1"))
 
 
 @pytest.mark.asyncio
@@ -429,3 +482,301 @@ async def test_container_thread_with_no_vm_context_is_untouched():
     # unchanged: falls through to ensure_workspace, which recreates
     prov.create_workspace.assert_awaited()
     assert res is not None
+
+
+def _stateless_sandbox_thread(status: str, *, restore_required: bool = False):
+    runtime_uid = "11111111-1111-4111-8111-111111111111"
+    workspace_generation = "22222222-2222-4222-8222-222222222222"
+    workspace = {
+        "status": status,
+        "provisioner": "k8s",
+        "_runtime_incarnation": runtime_uid,
+    }
+    binding = None
+    if status == "ready":
+        workspace.update(
+            {
+                "pod_ip": "10.42.0.7",
+                "port": 30022,
+                "pod_name": "ws-thread-t1",
+                "namespace": "agent-workspaces",
+                "_canvas_workspace_generation": workspace_generation,
+            }
+        )
+        binding = {
+            "generation": workspace_generation,
+            "kind": "remote",
+            "backing_id": f"k8s-pod:agent-workspaces:{runtime_uid}",
+            "ssh_host_key_fingerprint": "SHA256:trusted",
+        }
+    if restore_required:
+        workspace["_snapshot_restore_required"] = True
+    return {
+        "id": "t1",
+        "status": "awaiting_user",
+        "execution_lane": "stateless",
+        "metadata": {
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "workspace_container": workspace,
+            **({"_workspace_binding": binding} if binding is not None else {}),
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda thread: thread["metadata"]["config_override"].update({"officer": []}),
+        lambda thread: thread["metadata"]["config_override"].update(
+            {"officer": {"enabled": True}}
+        ),
+        lambda thread: thread["metadata"].update({"protected_cloud": True}),
+        lambda thread: thread["metadata"].update({"vm": {"status": "ready"}}),
+        lambda thread: thread["metadata"]["workspace_container"].update(
+            {"provisioner": "docker"}
+        ),
+        lambda thread: thread["metadata"]["workspace_container"].update(
+            {"_stateless_runtime_creation": None}
+        ),
+    ],
+    ids=[
+        "malformed-officer",
+        "officer-enabled",
+        "protected-cloud",
+        "vm-evidence",
+        "docker-workspace",
+        "malformed-create-marker",
+    ],
+)
+async def test_stateless_ensure_combined_classifier_refuses_before_effects(mutate):
+    thread = _stateless_sandbox_thread("pending")
+    mutate(thread)
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    provisioner = AsyncMock()
+    suspension = AsyncMock()
+
+    result = await ensure_session_workspace(
+        "t1", db=db, provisioner=provisioner, suspension=suspension
+    )
+
+    assert result is not None and result.outcome == EnsureOutcome.PENDING
+    provisioner.create_workspace.assert_not_awaited()
+    provisioner.workspace_pod_authority.assert_not_awaited()
+    suspension.restore.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["deleted", "failed", "created", "ready"])
+async def test_failed_stateless_snapshot_restore_retries_extract_not_create(status):
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        return_value=_stateless_sandbox_thread(status, restore_required=True)
+    )
+    prov = AsyncMock()
+    prov.workspace_pod_authority = AsyncMock(return_value="exact_live")
+    susp = AsyncMock()
+    susp.restore = AsyncMock(return_value=False)
+
+    res = await ensure_session_workspace("t1", db=db, provisioner=prov, suspension=susp)
+
+    assert res is not None and res.status == "failed"
+    susp.restore.assert_awaited_once_with(
+        WorkspaceOwner.session("t1"),
+        expected_runtime_incarnation="11111111-1111-4111-8111-111111111111",
+    )
+    prov.create_workspace.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [None, 0, "", [], {}, "true", 1])
+async def test_malformed_restore_marker_blocks_background_ensure_effects(malformed):
+    thread = _stateless_sandbox_thread("deleted")
+    workspace = thread["metadata"]["workspace_container"]
+    workspace.pop("_runtime_incarnation")
+    workspace["_snapshot_restore_required"] = malformed
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    provisioner = AsyncMock()
+    suspension = AsyncMock()
+
+    result = await ensure_session_workspace(
+        "t1", db=db, provisioner=provisioner, suspension=suspension
+    )
+
+    assert result is not None and result.outcome == EnsureOutcome.PENDING
+    provisioner.create_workspace.assert_not_awaited()
+    provisioner.workspace_pod_authority.assert_not_awaited()
+    suspension.restore.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stateless_workspace_restore_is_single_owner_across_replicas():
+    """A second HA caller cannot concurrently extract the same snapshot."""
+
+    class _LockingDB:
+        def __init__(self):
+            self.thread = _stateless_sandbox_thread("suspended", restore_required=True)
+            self.lock = asyncio.Lock()
+
+        async def get_thread(self, _thread_id):
+            return self.thread
+
+        @asynccontextmanager
+        async def stateless_session_workspace_ensure_lock(self, _thread_id):
+            if self.lock.locked():
+                yield False
+                return
+            await self.lock.acquire()
+            try:
+                yield True
+            finally:
+                self.lock.release()
+
+    db = _LockingDB()
+    entered_restore = asyncio.Event()
+    release_restore = asyncio.Event()
+
+    async def _restore(_owner, **_kwargs):
+        entered_restore.set()
+        await release_restore.wait()
+        db.thread = _stateless_sandbox_thread("ready")
+        return True
+
+    susp = AsyncMock()
+    susp.restore = AsyncMock(side_effect=_restore)
+    prov = AsyncMock()
+    prov.workspace_pod_authority = AsyncMock(return_value="exact_live")
+
+    winner = asyncio.create_task(
+        ensure_session_workspace("t1", db=db, provisioner=prov, suspension=susp)
+    )
+    await entered_restore.wait()
+    loser = await ensure_session_workspace(
+        "t1", db=db, provisioner=prov, suspension=susp
+    )
+
+    assert loser is not None and loser.outcome == EnsureOutcome.PENDING
+    susp.restore.assert_awaited_once()
+    release_restore.set()
+    await winner
+
+    settled = await ensure_session_workspace(
+        "t1", db=db, provisioner=prov, suspension=susp
+    )
+    assert settled is not None and settled.outcome == EnsureOutcome.READY
+    susp.restore.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stateless_create_gives_up_when_thread_ends_during_actuation():
+    before = _stateless_sandbox_thread("deleted")
+    before_workspace = before["metadata"]["workspace_container"]
+    before_workspace.pop("_runtime_incarnation")
+    generation = "33333333-3333-4333-8333-333333333333"
+    before_workspace["_stateless_runtime_creation"] = {
+        "generation": generation,
+        "mode": "create",
+        "attempted": False,
+        "replaces_uid": None,
+    }
+    ended = _stateless_sandbox_thread("ready")
+    ended["status"] = "ended"
+
+    class _CreationDB:
+        def __init__(self):
+            self.rows = iter([before, before, ended])
+
+        async def get_thread(self, _thread_id):
+            return next(self.rows)
+
+        @asynccontextmanager
+        async def stateless_session_workspace_ensure_lock(self, _thread_id):
+            yield True
+
+        async def prepare_stateless_thread_workspace_creation(self, *_args, **_kwargs):
+            return {
+                "state": "pending",
+                "creation": {
+                    "generation": generation,
+                    "mode": "create",
+                    "attempted": False,
+                    "replaces_uid": None,
+                },
+            }
+
+    db = _CreationDB()
+    prov = AsyncMock()
+    prov.create_workspace = AsyncMock(return_value=True)
+    prov.release_workspace = AsyncMock(return_value=True)
+
+    res = await ensure_session_workspace(
+        "t1", db=db, provisioner=prov, suspension=AsyncMock()
+    )
+
+    assert res is None
+    prov.create_workspace.assert_awaited_once_with(
+        WorkspaceOwner.session("t1"),
+        stateless_creation_generation=generation,
+        allow_stateless_create=True,
+    )
+    prov.release_workspace.assert_awaited_once_with(
+        WorkspaceOwner.session("t1"), reclaim_volume=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_markerless_stateless_physical_row_never_mints_or_creates():
+    thread = _stateless_sandbox_thread("pending")
+    thread["metadata"]["workspace_container"].pop("_runtime_incarnation")
+
+    class _DB:
+        def __init__(self):
+            self.prepare_calls = 0
+
+        async def get_thread(self, _thread_id):
+            return thread
+
+        @asynccontextmanager
+        async def stateless_session_workspace_ensure_lock(self, _thread_id):
+            yield True
+
+        async def prepare_stateless_thread_workspace_creation(self, *_args, **_kwargs):
+            self.prepare_calls += 1
+            raise AssertionError("markerless recovery must not mint authority")
+
+    db = _DB()
+    provisioner = AsyncMock()
+
+    result = await ensure_session_workspace(
+        "t1", db=db, provisioner=provisioner, suspension=AsyncMock()
+    )
+
+    assert result is not None and result.outcome == EnsureOutcome.PENDING
+    assert db.prepare_calls == 0
+    provisioner.create_workspace.assert_not_awaited()
+    provisioner.workspace_pod_authority.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stateless_suspended_wake_keeps_its_successfully_restored_workspace():
+    before = _stateless_sandbox_thread("suspended", restore_required=True)
+    restored = _stateless_sandbox_thread("ready")
+    restored["status"] = "suspended"
+    db = AsyncMock()
+    db.get_thread = AsyncMock(side_effect=[before, restored])
+    prov = AsyncMock()
+    prov.workspace_pod_authority = AsyncMock(return_value="exact_live")
+    prov.release_workspace = AsyncMock(return_value=True)
+    susp = AsyncMock()
+    susp.restore = AsyncMock(return_value=True)
+
+    res = await ensure_session_workspace("t1", db=db, provisioner=prov, suspension=susp)
+
+    assert res is not None and res.status == "restoring"
+    susp.restore.assert_awaited_once_with(
+        WorkspaceOwner.session("t1"),
+        expected_runtime_incarnation="11111111-1111-4111-8111-111111111111",
+    )
+    prov.release_workspace.assert_not_awaited()

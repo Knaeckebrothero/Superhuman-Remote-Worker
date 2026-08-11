@@ -33,6 +33,7 @@ from src.shared.cloud_sync_generations import (
 THREAD_ID = "11111111-1111-4111-8111-111111111111"
 WORKSPACE_GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 WORKSPACE_RUNTIME_INCARNATION = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+WORKSPACE_SSH_HOST_KEY_FINGERPRINT = "SHA256:trusted"
 LEASE_TOKEN = 47
 SCOPE_SHA256 = "a" * 64
 MOUNT_ID = "mount:logical-destination"
@@ -355,10 +356,13 @@ async def test_teardown_skips_raw_sync_only_for_stateless(stateless: bool):
     )
     session = SimpleNamespace(
         memory_service=None,
+        final_memory_extracted=False,
         messages=[],
+        shell_owner_token=None,
         workspace_sync=sync,
         workspace_manager=None,
         retire_shell_owner=MagicMock(),
+        quiesce_background_tasks=AsyncMock(),
         cleanup=AsyncMock(),
     )
 
@@ -408,6 +412,9 @@ async def test_workspace_poll_preserves_generation(
 ):
     workspace_response["workspace_generation"] = WORKSPACE_GENERATION
     workspace_response["workspace_runtime_incarnation"] = WORKSPACE_RUNTIME_INCARNATION
+    workspace_response["workspace_ssh_host_key_fingerprint"] = (
+        WORKSPACE_SSH_HOST_KEY_FINGERPRINT
+    )
     client = SimpleNamespace(
         get_thread_workspace=AsyncMock(return_value=workspace_response)
     )
@@ -418,6 +425,9 @@ async def test_workspace_poll_preserves_generation(
     assert result["backend"] == expected_backend
     assert result["workspace_generation"] == WORKSPACE_GENERATION
     assert result["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME_INCARNATION
+    assert result["workspace_ssh_host_key_fingerprint"] == (
+        WORKSPACE_SSH_HOST_KEY_FINGERPRINT if expected_backend == "sandbox" else None
+    )
 
 
 @pytest.mark.asyncio
@@ -497,6 +507,7 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
 
     assert response["workspace_generation"] == WORKSPACE_GENERATION
     assert response["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME_INCARNATION
+    assert response["workspace_ssh_host_key_fingerprint"] is None
 
 
 def test_owner_payload_redacts_private_workspace_runtime_incarnation():
@@ -524,14 +535,18 @@ async def _internal_workspace_response_for_lite_thread(
     *,
     cloud_mount=None,
     cloud_sync=None,
+    thread_reads=None,
 ):
     import orchestrator.main as orch_main
 
+    get_thread = AsyncMock(return_value=thread)
+    if thread_reads is not None:
+        get_thread.side_effect = thread_reads
     with (
         patch.object(
             orch_main.postgres_db,
             "get_thread",
-            AsyncMock(return_value=thread),
+            get_thread,
         ),
         patch.object(
             orch_main.postgres_db,
@@ -582,6 +597,293 @@ async def _internal_workspace_response_for_lite_thread(
         ),
     ):
         return await orch_main._agent_get_thread_workspace_locked(THREAD_ID)
+
+
+def _stateless_sandbox_thread() -> dict:
+    return {
+        "id": THREAD_ID,
+        "user_id": None,
+        "project_id": None,
+        "execution_lane": "stateless",
+        "metadata": {
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.42.0.25",
+                "port": 30022,
+                "pod_name": "ws-thread-111111111111",
+                "namespace": "agent-workspaces",
+                "_canvas_workspace_generation": WORKSPACE_GENERATION,
+                "_runtime_incarnation": WORKSPACE_RUNTIME_INCARNATION,
+            },
+            "_workspace_binding": {
+                "generation": WORKSPACE_GENERATION,
+                "kind": "remote",
+                "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+                "ssh_host_key_fingerprint": WORKSPACE_SSH_HOST_KEY_FINGERPRINT,
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_ready_requires_exact_live_runtime_uid():
+    import orchestrator.main as orch_main
+
+    probe = AsyncMock(return_value=True)
+    schedule = MagicMock()
+    with (
+        patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
+        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+    ):
+        response = await _internal_workspace_response_for_lite_thread(
+            _stateless_sandbox_thread()
+        )
+
+    probe.assert_awaited_once()
+    assert probe.await_args.kwargs == {
+        "expected_runtime_incarnation": WORKSPACE_RUNTIME_INCARNATION
+    }
+    schedule.assert_not_called()
+    assert response["status"] == "ready"
+    assert response["pod_ip"] == "10.42.0.25"
+    assert response["workspace_generation"] == WORKSPACE_GENERATION
+    assert response["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME_INCARNATION
+    assert response["workspace_ssh_host_key_fingerprint"] == (
+        WORKSPACE_SSH_HOST_KEY_FINGERPRINT
+    )
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_restore_intent_suppresses_ready_credentials():
+    """A newly created pod is not attachable until snapshot extraction acks."""
+    import orchestrator.main as orch_main
+
+    thread = _stateless_sandbox_thread()
+    thread["metadata"]["workspace_container"]["_snapshot_restore_required"] = True
+    schedule = MagicMock()
+    probe = AsyncMock(side_effect=AssertionError("restore intent precedes UID probe"))
+    with (
+        patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
+        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+    ):
+        response = await _internal_workspace_response_for_lite_thread(thread)
+
+    schedule.assert_called_once_with(THREAD_ID)
+    probe.assert_not_awaited()
+    assert response["status"] == "restoring"
+    assert response["pod_ip"] is None
+    assert response["workspace_generation"] is None
+    assert response["workspace_runtime_incarnation"] is None
+    assert response["workspace_ssh_host_key_fingerprint"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [None, 0, "", [], {}, "false", 1])
+async def test_internal_workspace_malformed_restore_marker_refuses_credentials(
+    malformed,
+):
+    import orchestrator.main as orch_main
+
+    thread = _stateless_sandbox_thread()
+    thread["metadata"]["workspace_container"]["_snapshot_restore_required"] = malformed
+    schedule = MagicMock()
+    probe = AsyncMock(side_effect=AssertionError("malformed marker precedes probe"))
+    with (
+        patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
+        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+    ):
+        with pytest.raises(orch_main.HTTPException) as exc_info:
+            await _internal_workspace_response_for_lite_thread(thread)
+
+    assert exc_info.value.status_code == 503
+    schedule.assert_not_called()
+    probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_ready_authority_requires_host_fingerprint():
+    import orchestrator.main as orch_main
+
+    thread = _stateless_sandbox_thread()
+    thread["metadata"]["_workspace_binding"].pop("ssh_host_key_fingerprint")
+    with patch.object(
+        orch_main.container_provisioner,
+        "workspace_pod_live",
+        AsyncMock(return_value=True),
+    ):
+        response = await _internal_workspace_response_for_lite_thread(thread)
+
+    assert response["status"] == "ready"
+    assert response["workspace_generation"] is None
+    assert response["workspace_runtime_incarnation"] is None
+    assert response["workspace_ssh_host_key_fingerprint"] is None
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_stale_ready_is_local_nonready_and_single_flight():
+    import asyncio
+
+    import orchestrator.main as orch_main
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _ensure(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+
+    probe = AsyncMock(return_value=False)
+    ensure = AsyncMock(side_effect=_ensure)
+    orch_main._stateless_workspace_ensure_tasks.pop(THREAD_ID, None)
+    with (
+        patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
+        patch.object(orch_main, "ensure_session_workspace", ensure),
+    ):
+        first = await _internal_workspace_response_for_lite_thread(
+            _stateless_sandbox_thread()
+        )
+        await started.wait()
+        task = orch_main._stateless_workspace_ensure_tasks[THREAD_ID]
+        second = await _internal_workspace_response_for_lite_thread(
+            _stateless_sandbox_thread()
+        )
+
+        ensure.assert_awaited_once()
+        assert probe.await_count == 2
+        for response in (first, second):
+            assert response["status"] == "creating"
+            assert response["pod_ip"] is None
+            assert response["pod_port"] is None
+            assert response["workspace_generation"] is None
+            assert response["workspace_runtime_incarnation"] is None
+            assert response["workspace_ssh_host_key_fingerprint"] is None
+
+        release.set()
+        await task
+        await asyncio.sleep(0)
+
+    assert THREAD_ID not in orch_main._stateless_workspace_ensure_tasks
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_unknown_probe_never_returns_cached_endpoint():
+    import orchestrator.main as orch_main
+
+    schedule = MagicMock()
+    with (
+        patch.object(
+            orch_main.container_provisioner,
+            "workspace_pod_live",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+    ):
+        response = await _internal_workspace_response_for_lite_thread(
+            _stateless_sandbox_thread()
+        )
+
+    schedule.assert_not_called()
+    assert response["status"] == "creating"
+    assert response["pod_ip"] is None
+    assert response["workspace_generation"] is None
+    assert response["workspace_runtime_incarnation"] is None
+    assert response["workspace_ssh_host_key_fingerprint"] is None
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_rechecks_row_after_delayed_live_probe():
+    """A delayed U1 probe cannot publish U1 after durable state moved to U2."""
+    import copy
+
+    import orchestrator.main as orch_main
+
+    old = _stateless_sandbox_thread()
+    replacement = copy.deepcopy(old)
+    replacement_ws = replacement["metadata"]["workspace_container"]
+    replacement_ws.update(
+        {
+            "pod_ip": "10.42.0.99",
+            "_runtime_incarnation": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        }
+    )
+    schedule = MagicMock()
+    with (
+        patch.object(
+            orch_main.container_provisioner,
+            "workspace_pod_live",
+            AsyncMock(return_value=True),
+        ),
+        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+    ):
+        response = await _internal_workspace_response_for_lite_thread(
+            old,
+            thread_reads=[old, replacement],
+        )
+
+    # U2 has not itself been probed yet, so this response is deliberately
+    # non-ready and carries neither U1 nor U2 endpoint credentials.
+    assert response["status"] == "creating"
+    assert response["pod_ip"] is None
+    assert response["workspace_generation"] is None
+    assert response["workspace_runtime_incarnation"] is None
+    assert response["workspace_ssh_host_key_fingerprint"] is None
+    schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "workspace_status",
+    ["deleted", "failed", "suspended", "restoring", "created", "creating", "pending"],
+)
+async def test_internal_workspace_nonready_claim_restarts_reconcile_without_endpoint(
+    workspace_status,
+):
+    """A durable pending input needs no second user action after lifecycle drift."""
+    import orchestrator.main as orch_main
+
+    thread = _stateless_sandbox_thread()
+    thread["metadata"]["workspace_container"]["status"] = workspace_status
+    schedule = MagicMock()
+    probe = AsyncMock(side_effect=AssertionError("non-ready rows need no live probe"))
+    with (
+        patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
+        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+    ):
+        response = await _internal_workspace_response_for_lite_thread(thread)
+
+    schedule.assert_called_once_with(THREAD_ID)
+    probe.assert_not_awaited()
+    assert response["status"] == workspace_status
+    assert response["pod_ip"] is None
+    assert response["pod_port"] is None
+    assert response["workspace_generation"] is None
+    assert response["workspace_runtime_incarnation"] is None
+    assert response["workspace_ssh_host_key_fingerprint"] is None
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_pinned_sandbox_keeps_historical_ready_contract():
+    import orchestrator.main as orch_main
+
+    thread = _stateless_sandbox_thread()
+    thread["execution_lane"] = "pinned"
+    probe = AsyncMock(side_effect=AssertionError("pinned route must not attest UID"))
+    schedule = MagicMock()
+    with (
+        patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
+        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+    ):
+        response = await _internal_workspace_response_for_lite_thread(thread)
+
+    probe.assert_not_awaited()
+    schedule.assert_not_called()
+    assert response["status"] == "ready"
+    assert response["pod_ip"] == "10.42.0.25"
+    assert response["workspace_generation"] == WORKSPACE_GENERATION
+    assert response["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME_INCARNATION
+    assert response["workspace_ssh_host_key_fingerprint"] is None
 
 
 @pytest.mark.asyncio

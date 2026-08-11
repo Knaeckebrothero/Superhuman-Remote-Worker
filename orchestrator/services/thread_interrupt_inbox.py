@@ -15,6 +15,9 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
+from services.stateless_workspace_gate import stateless_session_workspace_check
+from src.shared.session_retirement import stateless_stop_markers
+
 
 @dataclass(frozen=True, slots=True)
 class AdmittedInterrupt:
@@ -108,7 +111,7 @@ async def admit_thread_interrupt(
     async with db.acquire() as conn:
         async with conn.transaction():
             thread = await conn.fetchrow(
-                "SELECT id, user_id, execution_lane, agent_id "
+                "SELECT id, user_id, execution_lane, agent_id, status, metadata "
                 "FROM threads WHERE id = $1 FOR UPDATE",
                 tid,
             )
@@ -136,6 +139,35 @@ async def admit_thread_interrupt(
             ):
                 raise InterruptAdmissionError(
                     "Session execution lane is unavailable for queued interrupt"
+                )
+
+            if str(thread["status"] or "") not in {
+                "created",
+                "active",
+                "awaiting_user",
+            }:
+                raise InterruptAdmissionError(
+                    "Session is not currently able to accept interrupts"
+                )
+
+            _backend, workspace_refusal = stateless_session_workspace_check(
+                dict(thread)
+            )
+            if workspace_refusal is not None:
+                raise InterruptAdmissionError(
+                    "Stateless execution does not support this session's "
+                    f"workspace binding ({workspace_refusal})"
+                )
+
+            try:
+                stop_markers = stateless_stop_markers(thread["metadata"])
+            except RuntimeError as exc:
+                raise InterruptAdmissionError(
+                    "Session lifecycle metadata is malformed"
+                ) from exc
+            if stop_markers:
+                raise InterruptAdmissionError(
+                    "Session is not currently able to accept interrupts"
                 )
 
             queue = await conn.fetchrow(

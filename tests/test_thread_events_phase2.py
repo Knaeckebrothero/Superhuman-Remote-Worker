@@ -415,6 +415,80 @@ class TestOrderedPersistentEventWriter:
         assert all(row["epoch"] == 4 for row in calls[0])
 
     @pytest.mark.asyncio
+    async def test_stateless_flush_locks_epoch_thread_then_bound_queue(self):
+        import src.api.persistent_app as mod
+        from src.api.lease_context import LeaseHandle
+
+        thread_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        calls = []
+
+        class _Txn:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, _exc_type, _exc, _tb):
+                return False
+
+        class _Conn:
+            def transaction(self):
+                return _Txn()
+
+            async def fetchval(self, sql, *args):
+                calls.append((sql, args))
+                if "INSERT INTO thread_events" in sql:
+                    return 1
+                return 1
+
+        lease = LeaseHandle()
+        lease.update(thread_id, 17)
+        writer = mod._OrderedPersistentEventWriter(
+            postgres_conn=self._pool(_Conn()),
+            thread_id=thread_id,
+            epoch=4,
+            on_terminal_failure=lambda _events, _reason: None,
+            lease=lease,
+        )
+
+        inserted = await writer._write_batch(
+            [mod._QueuedPersistentEvent(4, 1, "token", {"content": "one"})]
+        )
+
+        assert inserted == 1
+        assert len(calls) == 3
+        assert "FROM threads" in calls[0][0]
+        assert "events_epoch" in calls[0][0]
+        assert "FOR NO KEY UPDATE" in calls[0][0]
+        assert calls[0][1] == (thread_id, 4)
+        assert "FROM run_queue" in calls[1][0]
+        assert "lease_token" in calls[1][0]
+        assert calls[1][1] == (thread_id, 17)
+        assert "INSERT INTO thread_events" in calls[2][0]
+        assert calls[2][1][3:] == (thread_id, 17)
+
+    @pytest.mark.asyncio
+    async def test_stateless_flush_rejects_repointed_unit_before_sql(self):
+        import src.api.persistent_app as mod
+        from src.api.lease_context import LeaseHandle
+
+        lease = LeaseHandle()
+        lease.update("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 18)
+        pool = MagicMock()
+        writer = mod._OrderedPersistentEventWriter(
+            postgres_conn=pool,
+            thread_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            epoch=4,
+            on_terminal_failure=lambda _events, _reason: None,
+            lease=lease,
+        )
+
+        inserted = await writer._write_batch(
+            [mod._QueuedPersistentEvent(4, 1, "token", {"content": "one"})]
+        )
+
+        assert inserted == 0
+        pool.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_canvas_failure_retries_then_sends_unjournaled_reconcile(self):
         import src.api.persistent_app as mod
 

@@ -9,6 +9,7 @@ Connect with: websocat ws://localhost:8001/ws/chat
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -60,6 +61,7 @@ from ..shared.thread_presence import (
     expire_permission_if_untethered,
     mark_stateless_natural_pause,
 )
+from ..shared.session_retirement import update_stateless_claim_status
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
@@ -113,7 +115,7 @@ _awaiting_input: bool = False
 _ws_connected_event: Optional[asyncio.Event] = None
 _watchdog_tasks: list[asyncio.Task] = []
 
-# Re-entrancy guard for _terminate_session. Out-of-band teardown (drain,
+# Awaitable single-flight for _terminate_session. Out-of-band teardown (drain,
 # watchdog, REST detach) cancels the loop task and awaits it — but
 # run_persistent_loop swallows CancelledError during the input wait and
 # returns CLEANLY, so the loop's completion-handler wrapper observes a
@@ -121,8 +123,11 @@ _watchdog_tasks: list[asyncio.Task] = []
 # outer teardown is still in progress. Historically that just duplicated
 # work (double sync/cleanup, duplicate 'ended' writes); under drain-suspend
 # the inner call's 'ended' write would defeat the orchestrator's
-# 'suspended' transition, so the second caller now returns immediately.
+# 'suspended' transition. The loop task itself remains a non-awaiting
+# re-entrant caller (otherwise outer teardown and cancelled loop deadlock),
+# while every independent caller awaits the same authoritative cleanup result.
 _terminating: bool = False
+_termination_task: Optional[asyncio.Task[None]] = None
 
 # Reference to the currently running persistent-loop task. Set by ws_chat when
 # it spawns the loop, cleared when _terminate_session runs. _terminate_session()
@@ -228,6 +233,55 @@ _rewind_lock: asyncio.Lock = asyncio.Lock()
 # if the pod restarts between the two passes the draft simply sticks, which is a
 # fine title — not worth a DB column.
 _draft_title_value: Optional[str] = None
+# Session-local fire-and-forget work must not survive pool reuse.  Every task
+# captures an immutable attach generation and is terminally joined during
+# teardown before the event writer or claimant lease is released.
+_session_generation: int = 0
+_session_side_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _track_session_side_task(task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+    _session_side_tasks.add(task)
+    task.add_done_callback(_session_side_tasks.discard)
+    return task
+
+
+def _session_identity_matches(
+    session: Any,
+    thread_id: str,
+    generation: int,
+) -> bool:
+    return bool(
+        _session is session
+        and _thread_id == thread_id
+        and _session_generation == generation
+    )
+
+
+async def _quiesce_session_side_tasks() -> None:
+    """Cancel and join title/stage tasks before process-global identity reuse."""
+
+    pending = {
+        task
+        for task in _session_side_tasks
+        if task is not asyncio.current_task() and not task.done()
+    }
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    done, pending = await asyncio.wait(
+        pending,
+        timeout=float(os.environ.get("SESSION_SIDE_TASK_CLOSE_TIMEOUT_S", "5")),
+    )
+    for task in done:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            pass
+    if pending:
+        raise RuntimeError(f"{len(pending)} session side task(s) ignored cancellation")
+
 
 # True while a tool call is mid-`ainvoke`. Read by POST /api/interrupt to
 # pick hard vs graceful mode. Set in _loop_on_tool_start, cleared in
@@ -2075,7 +2129,7 @@ async def _attach_session(
     base instead of the pod's boot config when provided.
     """
     global _session, _thread_id, _events_epoch, _next_seq, _tool_inflight
-    global _turn_event_open
+    global _turn_event_open, _session_generation, _draft_title_value
     global _event_writer, _cloud_sync_retry_pending
 
     _cloud_sync_retry_pending = False
@@ -2085,6 +2139,14 @@ async def _attach_session(
         raise RuntimeError(
             f"Cannot attach thread {thread_id}: already attached to {_thread_id}"
         )
+
+    stale_side_tasks = {task for task in _session_side_tasks if not task.done()}
+    if stale_side_tasks:
+        raise RuntimeError(
+            "Cannot attach a new thread while prior session tasks remain active"
+        )
+    _session_generation += 1
+    _draft_title_value = None
 
     # A normal detach always closes and clears the prior writer. Recover from a
     # stale writer defensively before a pool-mode reattach so no event can land
@@ -2783,8 +2845,11 @@ async def _attach_session(
     await _restore_session_messages()
     logger.info("attach step: message restore %.2fs", time.perf_counter() - _t_step)
 
-    # Mark thread as active
-    await _update_thread_status("active")
+    # Mark thread as active. Stateless attach is an authorization boundary:
+    # End may have fenced the queue after claim-bundle returned, so a failed
+    # exact-lease CAS must abort before loop/tool admission.
+    if not await _update_thread_status("active"):
+        raise LeaseLostError("stateless attach lost lifecycle authority")
 
     # Initialize headless loop primitives. These survive WS reconnect so that
     # the loop can keep reading input / responding to interrupts across
@@ -2874,24 +2939,46 @@ async def _terminate_session(
     "idle_timeout", "loop_crash", "loop_complete", "shutdown", "rest_detach",
     "thread_ended_oob", "boot_ws_timeout", "legacy".
     """
-    global _terminating
+    global _terminating, _termination_task
+    active = _termination_task
+    if active is not None and not active.done():
+        if asyncio.current_task() is _loop_task:
+            # The active owner cancels and awaits this loop task. Awaiting the
+            # owner here would form a cycle; this is the one safe no-op
+            # re-entry. Every independent release/complete caller waits below.
+            logger.debug("Terminate(%s) re-entered from the loop being joined", reason)
+            return
+        await asyncio.shield(active)
+        return
     if not _session:
         return
-    if _terminating:
-        logger.debug(
-            "Terminate(%s) skipped — session teardown already in progress", reason
-        )
-        return
-    _terminating = True
+
+    async def _run() -> None:
+        global _terminating, _termination_task
+        _terminating = True
+        try:
+            await _terminate_session_inner(
+                reason,
+                mark_thread=mark_thread,
+                preserve_shell=preserve_shell,
+                preserve_workspace_daemons=preserve_workspace_daemons,
+            )
+        finally:
+            _terminating = False
+            if _termination_task is asyncio.current_task():
+                _termination_task = None
+
+    task = asyncio.create_task(
+        _run(),
+        name=f"session-terminate-{str(_thread_id or 'detached')[:12]}",
+    )
+    _termination_task = task
     try:
-        await _terminate_session_inner(
-            reason,
-            mark_thread=mark_thread,
-            preserve_shell=preserve_shell,
-            preserve_workspace_daemons=preserve_workspace_daemons,
-        )
-    finally:
-        _terminating = False
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Teardown continues as the single owner. Propagate caller
+        # cancellation without publishing a false completion signal.
+        raise
 
 
 async def _terminate_session_inner(
@@ -2906,7 +2993,7 @@ async def _terminate_session_inner(
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
     global _hard_interrupt_event
     global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
-    global _event_writer, _cloud_sync_retry_pending
+    global _event_writer, _cloud_sync_retry_pending, _draft_title_value
 
     if not _session:
         return
@@ -3004,6 +3091,11 @@ async def _terminate_session_inner(
     await _stop_thread_interrupt_watcher()
     await _stop_thread_control_watcher()
 
+    # Join process-global side tasks while the captured session/thread identity
+    # and event writer are still authoritative.  A delayed title or protected
+    # cloud ping must never observe the next pool attachment.
+    await _quiesce_session_side_tasks()
+
     # B11: final memory capture for ALL terminate reasons — the ✕-button
     # detach (and drain, watchdog, shutdown, …) historically skipped
     # extraction entirely. Manager-mode only; the flag-off path keeps
@@ -3015,6 +3107,7 @@ async def _terminate_session_inner(
         _session.memory_service is not None
         and not _session.final_memory_extracted
         and _session.messages
+        and not (_session.shell_owner_token is not None and not mark_thread)
     ):
         try:
             from ..services.memory import CaptureEvent
@@ -3026,6 +3119,23 @@ async def _terminate_session_inner(
             logger.info("Terminate(%s): final memory capture complete", reason)
         except Exception as e:
             logger.warning(f"Terminate memory capture failed (non-fatal): {e}")
+
+    # capture_nowait(pre_compaction) and asynchronous citation verification
+    # both carry session-scoped write/callback authority. Disarm and join them
+    # before the journal closes and before a queue claimant can be released.
+    try:
+        quiesce_result = _session.quiesce_background_tasks()
+        if inspect.isawaitable(quiesce_result):
+            await quiesce_result
+        elif isinstance(_session, PersistentSession):
+            raise RuntimeError("PersistentSession RAM quiescence is not awaitable")
+    except Exception:
+        if _session.shell_owner_token is not None:
+            raise
+        logger.warning(
+            "Pinned session background-task quiescence failed (contained)",
+            exc_info=True,
+        )
 
     # Final cloud sync + drop secrets. No more background polling to stop:
     # Phase 1 moved sync to turn boundaries via the coordinator. The last
@@ -3101,6 +3211,7 @@ async def _terminate_session_inner(
     _loop_interrupt_flag = None
     _hard_interrupt_event = None
     _loop_last_user_content = [""]
+    _draft_title_value = None
     _clear_all_canvas_awareness()
     _subscribers.clear()
 
@@ -3495,7 +3606,20 @@ async def _accept_user_input(content: str, *, role: str = "human") -> str:
     # Injected input is excluded: a wake landing in a young session would
     # retitle the whole thread after the job-completion text.
     if not injected and _session is not None and _session.turn_count <= 2:
-        asyncio.create_task(_early_title_from_prompt(content))
+        title_session = _session
+        title_thread_id = str(_thread_id or "")
+        title_generation = _session_generation
+        _track_session_side_task(
+            asyncio.create_task(
+                _early_title_from_prompt(
+                    content,
+                    expected_session=title_session,
+                    expected_thread_id=title_thread_id,
+                    expected_generation=title_generation,
+                ),
+                name=f"early-title-{title_thread_id[:12]}",
+            )
+        )
     return msg.id
 
 
@@ -4269,6 +4393,23 @@ class _OrderedPersistentEventWriter:
                       AND run_queue.lease_token = $5::bigint
                     FOR SHARE
                   )"""
+    # Ordinary stateless frames retain the relaxed trailing-flush token rule,
+    # but must establish the same threads -> run_queue lock order as public
+    # End before their INSERT takes an implicit thread FK lock and updates the
+    # event HWM.  Acquire that mutation's FOR NO KEY UPDATE strength up front:
+    # it conflicts with public End's FOR UPDATE and serializes concurrent HWM
+    # writers.  A weaker prelock lets two writers both reach the guarded HWM
+    # UPDATE and deadlock while converting their parent-row locks.
+    _LOCK_STATELESS_EVENT_THREAD_SQL = """
+        SELECT 1 FROM threads
+        WHERE id = $1::uuid AND events_epoch = $2::integer
+        FOR NO KEY UPDATE
+    """
+    _LOCK_STATELESS_EVENT_QUEUE_SQL = """
+        SELECT 1 FROM run_queue
+        WHERE unit_id = $1::uuid AND lease_token = $2::bigint
+        FOR SHARE
+    """
     # Durable control batches use an explicit transaction and acquire these
     # locks in the same threads -> queue/agent -> request order as admission.
     # The ordinary stateless writer intentionally keeps its relaxed trailing
@@ -4278,14 +4419,14 @@ class _OrderedPersistentEventWriter:
         WHERE id = $1::uuid
           AND execution_lane = 'stateless'
           AND agent_id IS NULL
-        FOR SHARE
+        FOR NO KEY UPDATE
     """
     _LOCK_PINNED_CONTROL_THREAD_SQL = """
         SELECT 1 FROM threads
         WHERE id = $1::uuid
           AND execution_lane = 'pinned'
           AND agent_id = $2::uuid
-        FOR SHARE
+        FOR NO KEY UPDATE
     """
     _LOCK_STATELESS_CONTROL_QUEUE_SQL = """
         SELECT 1 FROM run_queue
@@ -4716,6 +4857,20 @@ class _OrderedPersistentEventWriter:
             elif interrupt_accepted_lease_token != interrupt_lease_token:
                 return 0
 
+        ordinary_lease_unit_id: Optional[str] = None
+        ordinary_lease_token: Optional[int] = None
+        if not control_events and not interrupt_events and self._lease is not None:
+            # Snapshot the warm handle before the first await.  A later claim
+            # may repoint the shared handle, but one flush must authorize one
+            # coherent (unit_id, token) pair, and a handle for another thread
+            # is never authority to write this writer's journal.
+            ordinary_lease_unit_id = self._lease.unit_id
+            ordinary_lease_token = int(self._lease.lease_token)
+            if ordinary_lease_unit_id is None or str(ordinary_lease_unit_id) != str(
+                self.thread_id
+            ):
+                return 0
+
         async with self.postgres_conn.acquire() as conn:
             if control_events:
                 request_ids = [
@@ -4806,11 +4961,35 @@ class _OrderedPersistentEventWriter:
             else:
                 insert_sql = self._insert_sql
                 ordinary_args = list(args)
-                if self._lease is not None:
+                if self._lease is None:
+                    # Pinned lane keeps the exact pre-stateless autocommit
+                    # statement and three-argument call shape.
+                    inserted = await conn.fetchval(insert_sql, *ordinary_args)
+                else:
                     # Ordinary trailing journal frames retain the M3 rule:
-                    # read the warm handle's current token at flush time.
-                    ordinary_args.extend([self._lease.unit_id, self._lease.lease_token])
-                inserted = await conn.fetchval(insert_sql, *ordinary_args)
+                    # token equality is sufficient after completion, but the
+                    # exact unit remains bound to this writer.  Lock/validate
+                    # thread epoch first, then queue identity, then perform the
+                    # existing guarded INSERT/HWM update in one transaction.
+                    if ordinary_lease_unit_id is None or ordinary_lease_token is None:
+                        return 0
+                    ordinary_args.extend([ordinary_lease_unit_id, ordinary_lease_token])
+                    async with conn.transaction():
+                        thread_fenced = await conn.fetchval(
+                            self._LOCK_STATELESS_EVENT_THREAD_SQL,
+                            self.thread_id,
+                            self.epoch,
+                        )
+                        if thread_fenced is None:
+                            return 0
+                        queue_fenced = await conn.fetchval(
+                            self._LOCK_STATELESS_EVENT_QUEUE_SQL,
+                            ordinary_lease_unit_id,
+                            ordinary_lease_token,
+                        )
+                        if queue_fenced is None:
+                            return 0
+                        inserted = await conn.fetchval(insert_sql, *ordinary_args)
         return int(inserted or 0)
 
     @staticmethod
@@ -7287,6 +7466,64 @@ async def _insert_permission_request(
         return None
     try:
         async with _session.postgres_conn.acquire() as conn:
+            if _stateless_mode():
+                # Permission admission is part of the exact serving claim.  A
+                # plain INSERT can wait behind public End's thread lock and
+                # then create a fresh pending approval after End has expired
+                # the old cards.  Serialize in the global threads -> queue
+                # order and hold both locks through the INSERT so End observes
+                # either the card (and expires it) or the completed fence.
+                handle = _current_lease_var.get()
+                if (
+                    handle is None
+                    or not handle.active
+                    or handle.lost.is_set()
+                    or str(handle.unit_id) != str(_thread_id)
+                    or int(handle.lease_token) <= 0
+                ):
+                    if handle is not None:
+                        handle.mark_lost()
+                    return None
+                async with conn.transaction():
+                    thread_live = await conn.fetchval(
+                        "SELECT id FROM threads WHERE id = $1::uuid "
+                        "AND execution_lane = 'stateless' "
+                        "AND status IN ('created', 'active', 'awaiting_user', "
+                        "               'suspended') "
+                        "AND NOT (COALESCE(metadata, '{}'::jsonb) "
+                        "         ? '_stateless_workspace_retirement_pending') "
+                        "FOR UPDATE",
+                        _thread_id,
+                    )
+                    queue_live = None
+                    if thread_live is not None:
+                        queue_live = await conn.fetchval(
+                            "SELECT unit_id FROM run_queue "
+                            "WHERE unit_id = $1::uuid "
+                            "AND unit_kind = 'session_turn' "
+                            "AND state = 'leased' "
+                            "AND lease_token = $2::bigint "
+                            "FOR SHARE",
+                            _thread_id,
+                            int(handle.lease_token),
+                        )
+                    if queue_live is None:
+                        handle.mark_lost()
+                        return None
+                    row_id = await conn.fetchval(
+                        "INSERT INTO thread_permission_requests "
+                        "(thread_id, tool_call_id, tool_name, tool_args) "
+                        "VALUES ($1, $2, $3, $4::jsonb) "
+                        "RETURNING id",
+                        _thread_id,
+                        tool_call_id,
+                        tool_name,
+                        json.dumps(_safe_serialize(tool_args)),
+                    )
+                return str(row_id) if row_id is not None else None
+
+            # Pinned permission admission retains its existing statement and
+            # autocommit shape.
             row_id = await conn.fetchval(
                 "INSERT INTO thread_permission_requests "
                 "(thread_id, tool_call_id, tool_name, tool_args) "
@@ -8494,7 +8731,7 @@ def _should_notify_cloud_stage() -> bool:
     return overlay is not None and overlay.active
 
 
-async def _notify_cloud_stage() -> None:
+async def _notify_cloud_stage(thread_id: str | None = None) -> None:
     """Fire-and-forget turn-end staging ping (protected cloud, Slice C).
 
     Never raises — staging failure must not touch the turn. Mirrors the
@@ -8506,10 +8743,13 @@ async def _notify_cloud_stage() -> None:
     internal_key = os.getenv("MCP_INTERNAL_KEY", "")
     if internal_key:
         headers["X-Internal-Key"] = internal_key
+    target_thread_id = str(thread_id or _thread_id or "")
+    if not target_thread_id:
+        return
     try:
         async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
             await client.post(
-                f"{orchestrator_url}/api/agents/threads/{_thread_id}/cloud-stage"
+                f"{orchestrator_url}/api/agents/threads/{target_thread_id}/cloud-stage"
             )
     except Exception as e:
         logger.debug(f"cloud-stage ping failed (non-fatal): {e}")
@@ -8641,7 +8881,18 @@ async def _loop_on_turn_complete_body(
     # session's upperdir diff to S3. Fire-and-forget — never blocks the next
     # turn on a slow SSH+tar+upload round-trip.
     if _should_notify_cloud_stage():
-        asyncio.create_task(_notify_cloud_stage())
+        if _stateless_mode():
+            # Protected-cloud stages are deliberately pinned for S2. A legacy
+            # malformed stateless row must fail closed rather than leave an
+            # unfenced SSH/tar task running after claimant handoff.
+            raise LeaseLostError("protected-cloud staging requires pinned execution")
+        stage_thread_id = str(_thread_id or "")
+        _track_session_side_task(
+            asyncio.create_task(
+                _notify_cloud_stage(stage_thread_id),
+                name=f"cloud-stage-{stage_thread_id[:12]}",
+            )
+        )
 
 
 def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
@@ -10661,6 +10912,35 @@ async def _update_thread_status(
     pinned_agent_id: Optional[str] = None,
 ) -> bool:
     """Durably update status via REST, falling back when REST says ``False``."""
+    if _stateless_mode():
+        if (
+            pinned_agent_id is not None
+            or status not in {"active", "awaiting_user"}
+            or _session is None
+            or _session.postgres_conn is None
+            or _thread_id is None
+        ):
+            return False
+        lease_token = _current_stateless_lease_token()
+        if lease_token is None:
+            return False
+        try:
+            return await update_stateless_claim_status(
+                _session.postgres_conn,
+                thread_id=_thread_id,
+                lease_token=lease_token,
+                status=status,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Exact-lease stateless status update failed "
+                "(thread=%s status=%s token=%s): %s",
+                _thread_id,
+                status,
+                lease_token,
+                exc,
+            )
+            return False
     if _orchestrator_client and _thread_id:
         try:
             if pinned_agent_id is None:
@@ -10884,6 +11164,9 @@ async def _poll_workspace_ready(
                 "workspace_runtime_incarnation": ws.get(
                     "workspace_runtime_incarnation"
                 ),
+                # VM endpoints retain the historical AutoAddPolicy path; Slice
+                # 2 admits no stateless VM claimant with a pinned pod identity.
+                "workspace_ssh_host_key_fingerprint": None,
                 # Slice 1 has no trusted VM host-identity adapter.
                 "canvas_presentation_available": False,
                 "canvas_live_apps_available": False,
@@ -10950,11 +11233,21 @@ async def _poll_workspace_ready(
         status = ws.get("status", "none")
 
         if status == "ready" and ws.get("pod_ip"):
+            workspace_generation = ws.get("workspace_generation")
+            workspace_runtime_incarnation = ws.get("workspace_runtime_incarnation")
+            workspace_ssh_host_key_fingerprint = ws.get(
+                "workspace_ssh_host_key_fingerprint"
+            )
+            if not workspace_generation or not workspace_runtime_incarnation:
+                # Never let a detached fingerprint look like independently
+                # usable authority. Stateless setup consumes one triplet.
+                workspace_ssh_host_key_fingerprint = None
             return {
                 "backend": "sandbox",
-                "workspace_generation": ws.get("workspace_generation"),
-                "workspace_runtime_incarnation": ws.get(
-                    "workspace_runtime_incarnation"
+                "workspace_generation": workspace_generation,
+                "workspace_runtime_incarnation": workspace_runtime_incarnation,
+                "workspace_ssh_host_key_fingerprint": (
+                    workspace_ssh_host_key_fingerprint
                 ),
                 # This is an orchestrator-attested capability, not a property
                 # inferred from the backend label or endpoint reachability.
@@ -11181,12 +11474,18 @@ async def _handle_workspace_upgrade(
         shell_owner_token = _session.shell_owner_token
         workspace_generation = ws_config.get("workspace_generation")
         workspace_runtime_incarnation = ws_config.get("workspace_runtime_incarnation")
+        workspace_ssh_host_key_fingerprint = ws_config.get(
+            "workspace_ssh_host_key_fingerprint"
+        )
         if shell_owner_token is not None and (
-            not workspace_generation or not workspace_runtime_incarnation
+            not workspace_generation
+            or not workspace_runtime_incarnation
+            or not workspace_ssh_host_key_fingerprint
         ):
             raise WorkspaceUnavailableError(
                 "A stateless physical workspace upgrade requires an "
-                "orchestrator-attested backing and runtime incarnation"
+                "orchestrator-attested backing, runtime incarnation, and SSH "
+                "host identity"
             )
         new_backend = RemoteBackend(
             host=remote["host"],
@@ -11206,6 +11505,11 @@ async def _handle_workspace_upgrade(
             ),
             runtime_incarnation=(
                 workspace_runtime_incarnation if shell_owner_token is not None else None
+            ),
+            expected_host_key_fingerprint=(
+                workspace_ssh_host_key_fingerprint
+                if shell_owner_token is not None
+                else None
             ),
         )
         # Capability is attested by the orchestrator from a paired generation
@@ -11577,7 +11881,13 @@ def _is_low_signal_prompt(content: str) -> bool:
 
 
 async def _write_title_if_placeholder(
-    title: str, *, origin: str, allow_draft_overwrite: bool = False
+    title: str,
+    *,
+    origin: str,
+    allow_draft_overwrite: bool = False,
+    expected_session: Any | None = None,
+    expected_thread_id: str | None = None,
+    expected_generation: int | None = None,
 ) -> bool:
     """Write ``title`` while the thread is still untitled — or, when
     ``allow_draft_overwrite``, while it still shows the LLM-free draft — then
@@ -11588,9 +11898,18 @@ async def _write_title_if_placeholder(
     neither a placeholder nor the outstanding draft (i.e. a user rename) is left
     untouched. Returns True iff the title was written.
     """
-    if not title or not _session or not _session.postgres_conn or not _thread_id:
+    session = expected_session if expected_session is not None else _session
+    thread_id = expected_thread_id if expected_thread_id is not None else _thread_id
+    generation = (
+        expected_generation if expected_generation is not None else _session_generation
+    )
+    if not title or not session or not session.postgres_conn or not thread_id:
         return False
-    thread = await _session.postgres_conn.get_thread(_thread_id)
+    if not _session_identity_matches(session, str(thread_id), int(generation)):
+        return False
+    thread = await session.postgres_conn.get_thread(thread_id)
+    if not _session_identity_matches(session, str(thread_id), int(generation)):
+        return False
     current = thread.get("title", "") if thread else ""
     writable = _title_is_placeholder(current) or (
         allow_draft_overwrite
@@ -11599,14 +11918,18 @@ async def _write_title_if_placeholder(
     )
     if not writable:
         return False
-    async with _session.postgres_conn.acquire() as conn:
+    async with session.postgres_conn.acquire() as conn:
         await conn.execute(
             "UPDATE threads SET title = $2 WHERE id = $1",
-            _thread_id,
+            thread_id,
             title,
         )
+    if not _session_identity_matches(session, str(thread_id), int(generation)):
+        # The write was bound to the captured thread, so it cannot corrupt the
+        # successor; suppress only the process-global broadcast/marker update.
+        return False
     _broadcast("title.updated", {"title": title})
-    logger.info("%s-titled thread %s: %s", origin, _thread_id, title)
+    logger.info("%s-titled thread %s: %s", origin, thread_id, title)
     return True
 
 
@@ -11631,7 +11954,13 @@ def _draft_title_from_prompt(
     return draft or None
 
 
-async def _early_title_from_prompt(content: str) -> None:
+async def _early_title_from_prompt(
+    content: str,
+    *,
+    expected_session: Any | None = None,
+    expected_thread_id: str | None = None,
+    expected_generation: int | None = None,
+) -> None:
     """Fill the cockpit header the instant the user submits, with an LLM-free
     draft taken from the opening prompt — so it fills on submit instead of only
     after the (possibly long) first turn lands.
@@ -11643,16 +11972,33 @@ async def _early_title_from_prompt(content: str) -> None:
     """
     global _draft_title_value
     try:
-        if not _session or not _session.postgres_conn or not _thread_id:
+        session = expected_session if expected_session is not None else _session
+        thread_id = expected_thread_id if expected_thread_id is not None else _thread_id
+        generation = (
+            expected_generation
+            if expected_generation is not None
+            else _session_generation
+        )
+        if not session or not session.postgres_conn or not thread_id:
+            return
+        if not _session_identity_matches(session, str(thread_id), int(generation)):
             return
         if _is_low_signal_prompt(content):
             return
         # Cheap early-out on an already-titled thread (e.g. a resumed session).
-        thread = await _session.postgres_conn.get_thread(_thread_id)
+        thread = await session.postgres_conn.get_thread(thread_id)
+        if not _session_identity_matches(session, str(thread_id), int(generation)):
+            return
         if not _title_is_placeholder(thread.get("title", "") if thread else ""):
             return
         draft = _draft_title_from_prompt(content)
-        if draft and await _write_title_if_placeholder(draft, origin="Draft"):
+        if draft and await _write_title_if_placeholder(
+            draft,
+            origin="Draft",
+            expected_session=session,
+            expected_thread_id=str(thread_id),
+            expected_generation=int(generation),
+        ):
             _draft_title_value = draft
     except Exception as e:
         logger.warning(f"Early draft title failed (non-fatal): {e}")

@@ -35,6 +35,9 @@ class _FakeConn:
         self.calls.append(("execute", query, args))
         return "UPDATE 1"
 
+    async def executemany(self, query, args):
+        self.calls.append(("executemany", query, tuple(args)))
+
     async def fetch(self, query, *args):
         self.calls.append(("fetch", query, args))
         return []
@@ -49,6 +52,8 @@ class _FakeConn:
 
     async def fetchrow(self, query, *args):
         self.calls.append(("fetchrow", query, args))
+        if "INSERT INTO thread_messages" in query:
+            return {"id": args[0], "seq": 1}
         if "INSERT INTO thread_session_tasks" in query:
             return {
                 "task_number": 1,
@@ -134,6 +139,30 @@ def _upsert_anchor(db: PostgresDB, thread_id: str) -> Awaitable[object]:
     )
 
 
+def _save_message(db: PostgresDB, thread_id: str) -> Awaitable[object]:
+    return db.save_thread_message(
+        thread_id,
+        role="ai",
+        content="durable answer",
+        turn_number=3,
+        id="durable-message",
+    )
+
+
+def _save_messages(db: PostgresDB, thread_id: str) -> Awaitable[object]:
+    return db.save_thread_messages(
+        thread_id,
+        [
+            {
+                "id": "durable-message",
+                "role": "ai",
+                "content": "durable answer",
+                "turn_number": 3,
+            }
+        ],
+    )
+
+
 ALL_DURABLE_OPERATIONS: list[object] = [
     pytest.param(_record_turn, id="record-turn-commit"),
     pytest.param(_seed_baseline, id="seed-workspace-baseline"),
@@ -145,6 +174,8 @@ ALL_DURABLE_OPERATIONS: list[object] = [
     pytest.param(_claim_cursor, id="claim-memory-cursor"),
     pytest.param(_list_anchors, id="list-cloud-anchors"),
     pytest.param(_upsert_anchor, id="upsert-cloud-anchor"),
+    pytest.param(_save_message, id="save-message"),
+    pytest.param(_save_messages, id="save-messages"),
 ]
 
 
@@ -186,6 +217,8 @@ MUTATING_OPERATIONS: list[object] = [
     pytest.param(_complete_task, id="complete-task"),
     pytest.param(_claim_cursor, id="claim-memory-cursor"),
     pytest.param(_upsert_anchor, id="upsert-cloud-anchor"),
+    pytest.param(_save_message, id="save-message"),
+    pytest.param(_save_messages, id="save-messages"),
 ]
 
 
@@ -264,6 +297,50 @@ async def test_fk_insert_uses_threads_then_queue_then_write_lock_order(
     assert "FROM threads" in conn.calls[0][1]
     assert authority_lock in conn.calls[0][1]
     assert target_table in conn.calls[2][1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation,write_kind",
+    [
+        pytest.param(_save_message, "fetchrow", id="incremental"),
+        pytest.param(_save_messages, "executemany", id="reconcile-batch"),
+    ],
+)
+async def test_message_write_uses_threads_then_queue_then_mutations(
+    operation: Operation,
+    write_kind: str,
+):
+    conn = _FakeConn()
+    db = _db_with(conn)
+
+    async def fence(fenced_conn, received_lease):
+        assert fenced_conn is conn
+        assert received_lease == LEASE
+        conn.calls.append(("fence", "run_queue", (received_lease,)))
+
+    with (
+        patch(
+            "src.database.postgres_db._active_run_queue_lease",
+            return_value=LEASE,
+        ),
+        patch(
+            "src.database.postgres_db._require_run_queue_fence",
+            side_effect=fence,
+        ),
+    ):
+        await operation(db, THREAD_ID)
+
+    assert [kind for kind, _query, _args in conn.calls] == [
+        "fetchval",
+        "fence",
+        write_kind,
+        "execute",
+    ]
+    assert "FROM threads" in conn.calls[0][1]
+    assert "FOR KEY SHARE" in conn.calls[0][1]
+    assert "INSERT INTO thread_messages" in conn.calls[2][1]
+    assert "UPDATE threads" in conn.calls[3][1]
 
 
 @pytest.mark.asyncio

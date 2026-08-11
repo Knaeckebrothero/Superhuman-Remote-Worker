@@ -16,16 +16,115 @@ Selection logic:
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
 import os
+import shlex
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from services import resolve_ssh_key_path
 
 logger = logging.getLogger(__name__)
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _valid_ssh_sha256_fingerprint(value: object) -> bool:
+    encoded = value[len("SHA256:") :] if isinstance(value, str) else ""
+    return bool(
+        isinstance(value, str)
+        and value.startswith("SHA256:")
+        and len(encoded) == 43
+        and all(
+            char in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            for char in encoded
+        )
+    )
+
+
+async def _read_stream_tail(stream: Any, *, limit: int = 64 * 1024) -> bytes:
+    """Drain a subprocess pipe without unbounded buffering, retaining its tail."""
+
+    tail = bytearray()
+    while True:
+        chunk = await stream.read(16 * 1024)
+        if not chunk:
+            break
+        tail.extend(chunk)
+        if len(tail) > limit:
+            del tail[: len(tail) - limit]
+    return bytes(tail)
+
+
+async def _joined_blocking_call(func, /, *args, **kwargs):
+    """Run a blocking effect and never let cancellation orphan its thread.
+
+    ``asyncio.to_thread`` cannot stop the underlying call. If terminal
+    retirement releases its lifecycle lock while a cancelled S3 PUT is still
+    running, that stale writer can overwrite a successor snapshot. Shield the
+    worker, remember cancellation, and propagate it only after the effect has
+    reached a real terminal result.
+    """
+
+    task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        # Retrieve a blocking-call exception before honoring cancellation; the
+        # stale effect is terminal either way and can no longer race a retry.
+        with suppress(Exception):
+            task.result()
+        raise asyncio.CancelledError
+    return task.result()
+
+
+def _snapshot_tar_pipeline(include_dirs: list[str], *, strict_terminal: bool) -> str:
+    """Build the remote archive pipeline used by workspace snapshots.
+
+    Terminal stateless snapshots are the only copy of an emptyDir workspace.
+    They therefore retain Git object databases/repositories and run the whole
+    tar-to-zstd pipeline under ``pipefail`` so a truncated producer can never
+    be mistaken for a valid archive merely because zstd emitted some bytes.
+    """
+
+    exclude_patterns = [
+        "--exclude=/var/cache/*",
+        "--exclude=/tmp/*",
+        "--exclude=*.pyc",
+        "--exclude=__pycache__",
+        "--exclude=node_modules/.cache",
+        "--exclude=*/node_modules/*",
+    ]
+    if not strict_terminal:
+        exclude_patterns.extend(
+            [
+                "--exclude=.git/objects",
+                "--exclude=*/repos/*",
+            ]
+        )
+    pipeline = (
+        "tar --xattrs --xattrs-include='*' --acls -cf - "
+        f"{' '.join(exclude_patterns)} {' '.join(shlex.quote(path) for path in include_dirs)} "
+        "2>/dev/null | zstd -1 -T0"
+    )
+    return (
+        f"bash -o pipefail -c {shlex.quote(pipeline)}" if strict_terminal else pipeline
+    )
+
 
 try:
     import boto3
@@ -167,20 +266,20 @@ class SnapshotService:
 
         try:
             # Compute checksum
-            sha256 = await asyncio.to_thread(self._compute_sha256, tar_path)
+            sha256 = await _joined_blocking_call(self._compute_sha256, tar_path)
             manifest["checksum_sha256"] = sha256
 
             manifest_bytes = json.dumps(manifest, indent=2).encode()
 
             # Upload tarball + manifest to phase-specific prefix
             if phase_prefix:
-                await asyncio.to_thread(
+                await _joined_blocking_call(
                     self._s3.upload_file,
                     tar_path,
                     self._bucket,
                     f"{phase_prefix}/env.tar.zst",
                 )
-                await asyncio.to_thread(
+                await _joined_blocking_call(
                     self._s3.put_object,
                     Bucket=self._bucket,
                     Key=f"{phase_prefix}/manifest.json",
@@ -189,13 +288,13 @@ class SnapshotService:
                 )
 
             # Always update top-level (latest) snapshot
-            await asyncio.to_thread(
+            await _joined_blocking_call(
                 self._s3.upload_file,
                 tar_path,
                 self._bucket,
                 f"{prefix}/env.tar.zst",
             )
-            await asyncio.to_thread(
+            await _joined_blocking_call(
                 self._s3.put_object,
                 Bucket=self._bucket,
                 Key=f"{prefix}/manifest.json",
@@ -374,6 +473,8 @@ class SnapshotService:
         agent_config: str = "worker_base",
         entity_type: str = "jobs",
         work_marker: Optional[int] = None,
+        expected_host_key_fingerprint: Optional[str] = None,
+        strict_terminal: bool = False,
     ) -> bool:
         """Capture a VM environment snapshot via SSH tar and upload to S3.
 
@@ -393,6 +494,25 @@ class SnapshotService:
             True if capture + upload succeeded.
         """
         if not self._available:
+            return False
+
+        if strict_terminal and not _valid_ssh_sha256_fingerprint(
+            expected_host_key_fingerprint
+        ):
+            logger.error(
+                "Strict terminal snapshot refused without an exact SSH host key "
+                "fingerprint for %s %s",
+                entity_type.rstrip("s"),
+                job_id,
+            )
+            await self._set_snapshot_context(
+                job_id,
+                {
+                    "status": "capture_failed",
+                    "error": "strict snapshot host identity is unavailable",
+                },
+                entity_type=entity_type,
+            )
             return False
 
         from services.ssh_helpers import orchestrator_can_reach
@@ -427,6 +547,12 @@ class SnapshotService:
         )
 
         tar_path = None
+        known_hosts_path = None
+        process: asyncio.subprocess.Process | None = None
+        scan_process: asyncio.subprocess.Process | None = None
+        verify_process: asyncio.subprocess.Process | None = None
+        stderr_task: asyncio.Task[bytes] | None = None
+        verify_stderr_task: asyncio.Task[bytes] | None = None
         try:
             # Create temp file for the tarball
             with tempfile.NamedTemporaryFile(
@@ -439,28 +565,20 @@ class SnapshotService:
                 "/home/agent-host/",
                 "/usr/local/",
             ]
-            exclude_patterns = [
-                # System/build caches
-                "--exclude=/var/cache/*",
-                "--exclude=/tmp/*",
-                "--exclude=*.pyc",
-                "--exclude=__pycache__",
-                "--exclude=node_modules/.cache",
-                "--exclude=.git/objects",
-                # Workspace content re-cloned/regenerated on restore
-                "--exclude=*/repos/*",
-                "--exclude=*/node_modules/*",
-            ]
-
+            if strict_terminal and source_type == "pod":
+                # Workspace images provide /usr/local as immutable root-owned
+                # image content, and the stateless restore principal cannot
+                # overwrite it. The only mutable authority required for shell,
+                # files, tasks, Git/undo, and caches is agent-host's home.
+                include_dirs = ["/home/agent-host/"]
             # Build SSH tar command. --xattrs/--acls so fuse-overlayfs opaque-dir
             # xattrs + whiteouts survive capture/restore (protected cloud mode,
             # design §11.3). The capture roots already EXCLUDE the merged overlay
             # mount (it lives at /cloud/merged, outside /home/agent-host) and
             # INCLUDE the upperdir at /home/agent-host/.overlay/upper.
-            tar_cmd = (
-                f"tar --xattrs --xattrs-include='*' --acls -cf - "
-                f"{' '.join(exclude_patterns)} {' '.join(include_dirs)} 2>/dev/null"
-                " | zstd -1 -T0"
+            tar_cmd = _snapshot_tar_pipeline(
+                include_dirs,
+                strict_terminal=strict_terminal,
             )
             key_path = resolve_ssh_key_path()
             if not key_path:
@@ -469,13 +587,59 @@ class SnapshotService:
                     entity_type.rstrip("s"),
                     job_id,
                 )
-            ssh_cmd = [
-                "ssh",
-                *(["-i", key_path] if key_path else []),
+            host_key_options = [
                 "-o",
                 "StrictHostKeyChecking=no",
                 "-o",
                 "UserKnownHostsFile=/dev/null",
+            ]
+            if expected_host_key_fingerprint is not None:
+                scan_process = await asyncio.create_subprocess_exec(
+                    "ssh-keyscan",
+                    "-T",
+                    "10",
+                    "-p",
+                    str(ssh_port),
+                    ssh_host,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                scanned, _ = await asyncio.wait_for(
+                    scan_process.communicate(), timeout=15
+                )
+                matching_lines: list[bytes] = []
+                for line in scanned.splitlines():
+                    fields = line.split()
+                    if len(fields) < 3 or line.lstrip().startswith(b"#"):
+                        continue
+                    try:
+                        key_bytes = base64.b64decode(fields[2], validate=True)
+                    except (ValueError, TypeError):
+                        continue
+                    observed = "SHA256:" + base64.b64encode(
+                        hashlib.sha256(key_bytes).digest()
+                    ).decode("ascii").rstrip("=")
+                    if observed == expected_host_key_fingerprint:
+                        matching_lines.append(line)
+                if not matching_lines:
+                    raise RuntimeError(
+                        "workspace SSH host identity changed before snapshot"
+                    )
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", delete=False, prefix="snapshot_known_hosts_"
+                ) as known_hosts:
+                    known_hosts.write(b"\n".join(matching_lines) + b"\n")
+                    known_hosts_path = known_hosts.name
+                host_key_options = [
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                    "-o",
+                    f"UserKnownHostsFile={known_hosts_path}",
+                ]
+            ssh_cmd = [
+                "ssh",
+                *(["-i", key_path] if key_path else []),
+                *host_key_options,
                 "-o",
                 "ConnectTimeout=10",
                 "-p",
@@ -493,11 +657,33 @@ class SnapshotService:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            stderr_task = asyncio.create_task(_read_stream_tail(process.stderr))
+            strict_deadline: float | None = None
+            if strict_terminal:
+                try:
+                    capture_timeout_s = max(
+                        0.01,
+                        float(
+                            os.environ.get(
+                                "STATELESS_TERMINAL_SNAPSHOT_TIMEOUT_S", "300"
+                            )
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    capture_timeout_s = 300.0
+                strict_deadline = asyncio.get_running_loop().time() + capture_timeout_s
 
             total_bytes = 0
             with open(tar_path, "wb") as f:
                 while True:
-                    chunk = await process.stdout.read(1024 * 1024)  # 1 MB chunks
+                    read = process.stdout.read(1024 * 1024)  # 1 MB chunks
+                    if strict_deadline is None:
+                        chunk = await read
+                    else:
+                        remaining = strict_deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            raise asyncio.TimeoutError
+                        chunk = await asyncio.wait_for(read, timeout=remaining)
                     if not chunk:
                         break
                     total_bytes += len(chunk)
@@ -520,10 +706,17 @@ class SnapshotService:
                         return False
                     f.write(chunk)
 
-            await process.wait()
+            if strict_deadline is None:
+                await process.wait()
+            else:
+                remaining = strict_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await asyncio.wait_for(process.wait(), timeout=remaining)
+            stderr_tail = await stderr_task
 
-            if process.returncode != 0 and total_bytes == 0:
-                stderr = (await process.stderr.read()).decode(errors="replace")
+            if process.returncode != 0 and (strict_terminal or total_bytes == 0):
+                stderr = stderr_tail.decode(errors="replace")
                 logger.error(
                     "SSH tar failed for %s %s: %s",
                     entity_type.rstrip("s"),
@@ -539,9 +732,40 @@ class SnapshotService:
                     entity_type=entity_type,
                 )
                 return False
+            if strict_terminal:
+                if total_bytes == 0:
+                    raise RuntimeError("terminal snapshot archive is empty")
+                verify_process = await asyncio.create_subprocess_exec(
+                    "bash",
+                    "-o",
+                    "pipefail",
+                    "-c",
+                    f"zstd -t -- {shlex.quote(tar_path)} >/dev/null 2>&1 && "
+                    f"zstd -dc -- {shlex.quote(tar_path)} | tar -tf - >/dev/null",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                verify_stderr_task = asyncio.create_task(
+                    _read_stream_tail(verify_process.stderr)
+                )
+                await asyncio.wait_for(verify_process.wait(), timeout=120)
+                verify_stderr = await verify_stderr_task
+                if verify_process.returncode != 0:
+                    raise RuntimeError(
+                        "terminal snapshot archive validation failed: "
+                        + verify_stderr.decode(errors="replace")[:300]
+                    )
 
             # Collect package manifests via SSH
-            env_info = await self._collect_environment_info(ssh_host, ssh_port)
+            env_info = (
+                {}
+                if strict_terminal
+                else await self._collect_environment_info(
+                    ssh_host,
+                    ssh_port,
+                    known_hosts_path=known_hosts_path,
+                )
+            )
 
             # Build manifest
             manifest: dict[str, Any] = {
@@ -565,6 +789,11 @@ class SnapshotService:
 
             if phase_number is not None:
                 manifest["phase_number"] = phase_number
+            if strict_terminal:
+                manifest["strict_terminal"] = True
+                manifest["sha256_compressed"] = await asyncio.to_thread(
+                    _sha256_file, tar_path
+                )
 
             # Upload to S3
             uploaded = await self.upload_snapshot(
@@ -607,15 +836,44 @@ class SnapshotService:
             )
             return False
         finally:
+            if scan_process is not None and scan_process.returncode is None:
+                scan_process.kill()
+                with suppress(Exception):
+                    await scan_process.wait()
+            if process is not None and process.returncode is None:
+                process.kill()
+                with suppress(Exception):
+                    await process.wait()
+            if stderr_task is not None and not stderr_task.done():
+                stderr_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await stderr_task
+            if verify_process is not None and verify_process.returncode is None:
+                verify_process.kill()
+                with suppress(Exception):
+                    await verify_process.wait()
+            if verify_stderr_task is not None and not verify_stderr_task.done():
+                verify_stderr_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await verify_stderr_task
             # Clean up temp file
             if tar_path:
                 try:
                     os.unlink(tar_path)
                 except OSError:
                     pass
+            if known_hosts_path:
+                try:
+                    os.unlink(known_hosts_path)
+                except OSError:
+                    pass
 
     async def _collect_environment_info(
-        self, ssh_host: str, ssh_port: int
+        self,
+        ssh_host: str,
+        ssh_port: int,
+        *,
+        known_hosts_path: str | None = None,
     ) -> dict[str, Any]:
         """Collect package manifests from the VM via SSH.
 
@@ -631,15 +889,27 @@ class SnapshotService:
         }
 
         key_path = resolve_ssh_key_path()
+        host_key_options = (
+            [
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                f"UserKnownHostsFile={known_hosts_path}",
+            ]
+            if known_hosts_path
+            else [
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+            ]
+        )
         for key, cmd in commands.items():
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "ssh",
                     *(["-i", key_path] if key_path else []),
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "UserKnownHostsFile=/dev/null",
+                    *host_key_options,
                     "-o",
                     "ConnectTimeout=5",
                     "-p",
@@ -709,6 +979,7 @@ class SnapshotService:
         dest_path: str,
         phase_number: Optional[int] = None,
         entity_type: str = "jobs",
+        require_strict_terminal: bool = False,
     ) -> bool:
         """Download a snapshot tarball from S3.
 
@@ -736,6 +1007,48 @@ class SnapshotService:
                 key,
                 dest_path,
             )
+            manifest = await self.get_manifest(
+                job_id,
+                phase_number=phase_number,
+                entity_type=entity_type,
+            )
+            manifest_is_strict = bool(
+                isinstance(manifest, dict) and manifest.get("strict_terminal") is True
+            )
+            if require_strict_terminal and not manifest_is_strict:
+                logger.error(
+                    "Strict terminal snapshot manifest missing for %s %s",
+                    entity_type.rstrip("s"),
+                    job_id,
+                )
+                return False
+            expected_digest = (
+                manifest.get("sha256_compressed") if manifest_is_strict else None
+            )
+            if require_strict_terminal and (
+                not isinstance(expected_digest, str)
+                or len(expected_digest) != 64
+                or any(c not in "0123456789abcdef" for c in expected_digest)
+            ):
+                logger.error(
+                    "Strict terminal snapshot checksum is missing or malformed for %s %s",
+                    entity_type.rstrip("s"),
+                    job_id,
+                )
+                return False
+            if expected_digest is not None:
+                if (
+                    not isinstance(expected_digest, str)
+                    or len(expected_digest) != 64
+                    or await asyncio.to_thread(_sha256_file, dest_path)
+                    != expected_digest
+                ):
+                    logger.error(
+                        "Strict snapshot checksum mismatch for %s %s",
+                        entity_type.rstrip("s"),
+                        job_id,
+                    )
+                    return False
             return True
         except ClientError as e:
             logger.error("Failed to download snapshot for job %s: %s", job_id, e)
@@ -757,7 +1070,7 @@ class SnapshotService:
             paginator = self._s3.get_paginator("list_objects_v2")
             pages = paginator.paginate(Bucket=self._bucket, Prefix=prefix)
 
-            for page in await asyncio.to_thread(lambda: list(pages)):
+            for page in await _joined_blocking_call(lambda: list(pages)):
                 for obj in page.get("Contents", []):
                     if obj["Key"].endswith("manifest.json"):
                         try:
@@ -798,7 +1111,7 @@ class SnapshotService:
             pages = paginator.paginate(Bucket=self._bucket, Prefix=prefix)
 
             objects_to_delete = []
-            for page in await asyncio.to_thread(lambda: list(pages)):
+            for page in await _joined_blocking_call(lambda: list(pages)):
                 for obj in page.get("Contents", []):
                     objects_to_delete.append({"Key": obj["Key"]})
 
@@ -808,11 +1121,38 @@ class SnapshotService:
             # Delete in batches of 1000 (S3 limit)
             for i in range(0, len(objects_to_delete), 1000):
                 batch = objects_to_delete[i : i + 1000]
-                await asyncio.to_thread(
+                deleted = await _joined_blocking_call(
                     self._s3.delete_objects,
                     Bucket=self._bucket,
                     Delete={"Objects": batch},
                 )
+                if not isinstance(deleted, dict) or deleted.get("Errors"):
+                    logger.error(
+                        "Snapshot prefix delete reported per-object failures for %s %s",
+                        entity_type.rstrip("s"),
+                        job_id,
+                    )
+                    return False
+
+            # S3-compatible stores provide strongly consistent LIST after
+            # DELETE. Prove the terminal prefix is empty before allowing its
+            # ownership row/tombstone to disappear.
+            verify_pages = self._s3.get_paginator("list_objects_v2").paginate(
+                Bucket=self._bucket,
+                Prefix=prefix,
+            )
+            remaining = [
+                obj
+                for page in await _joined_blocking_call(lambda: list(verify_pages))
+                for obj in page.get("Contents", [])
+            ]
+            if remaining:
+                logger.error(
+                    "Snapshot prefix remained non-empty after delete for %s %s",
+                    entity_type.rstrip("s"),
+                    job_id,
+                )
+                return False
 
             # Clear snapshot context
             await self._set_snapshot_context(

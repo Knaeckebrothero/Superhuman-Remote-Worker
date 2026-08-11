@@ -25,6 +25,13 @@ from src.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
 
+# Must exceed the executor's 120s shutdown/abort budget plus local backend and
+# durable claimant-ACK drain. A shorter Kubernetes grace can SIGKILL the only
+# actor capable of proving SFTP quiescence and leave the loss ledger absorbing.
+STATELESS_CLAIMANT_EVICTION_GRACE_SECONDS = int(
+    os.environ.get("STATELESS_CLAIMANT_EVICTION_GRACE_SECONDS", "180")
+)
+
 
 def _env_flag(name: str, default: bool) -> bool:
     """Parse a boolean env var exactly the way ContainerProvisioner does.
@@ -441,7 +448,7 @@ class AgentProvisioner:
                 self._core_api.delete_namespaced_pod,
                 name=pod_name,
                 namespace=self._namespace,
-                grace_period_seconds=30,
+                grace_period_seconds=STATELESS_CLAIMANT_EVICTION_GRACE_SECONDS,
             )
             logger.info("Agent pod deleted: %s", pod_name)
             return True
@@ -450,6 +457,137 @@ class AgentProvisioner:
                 logger.debug("Agent pod already gone: %s", pod_name)
                 return True
             logger.error("Failed to delete agent pod %s: %s", pod_name, e)
+            return False
+
+    async def agent_pod_live(self, pod_name: str) -> Optional[bool]:
+        """Return exact pod liveness for terminal claimant reconciliation.
+
+        ``False`` is authoritative only for 404 or a terminal pod whose
+        containers are all terminated. API ambiguity returns ``None`` and
+        callers must remain fenced. Deletion grace and phase Unknown are not
+        quiescence proof: a claimant process may still be running.
+        A same-name Running/Pending pod stays live/ambiguous; its mere name is
+        never treated as proof that the old claimant process has disappeared.
+        """
+
+        if not self._k8s_available or not str(pod_name).strip():
+            return None
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=str(pod_name),
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return False
+            logger.debug("Agent pod liveness probe failed for %s: %s", pod_name, exc)
+            return None
+        if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None):
+            return None
+        phase = str(getattr(getattr(pod, "status", None), "phase", "") or "")
+        if phase in {"Running", "Pending"}:
+            return True
+        if phase in {"Failed", "Succeeded"}:
+            statuses = getattr(pod.status, "container_statuses", None) or []
+            if statuses and all(
+                getattr(getattr(status, "state", None), "terminated", None) is not None
+                for status in statuses
+            ):
+                return False
+        return None
+
+    async def agent_pod_authority(
+        self,
+        pod_name: str,
+        *,
+        expected_pod_uid: str,
+    ) -> str:
+        """Classify one immutable claimant Pod identity.
+
+        The name is only a lookup key.  ``exact_absent`` is returned solely
+        for an API 404 or a demonstrably terminal Pod with the expected UID;
+        a same-name replacement is a distinct result so callers never delete
+        or otherwise act on the successor object.  Deletion grace and phase
+        Unknown remain ambiguous because the old process may still run.
+        """
+
+        name = str(pod_name or "").strip()
+        expected_uid = str(expected_pod_uid or "").strip()
+        if not self._k8s_available or not name or not expected_uid:
+            return "unknown"
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return "exact_absent"
+            logger.debug("Agent pod authority probe failed for %s: %s", name, exc)
+            return "unknown"
+
+        actual_uid = str(getattr(getattr(pod, "metadata", None), "uid", "") or "")
+        if not actual_uid:
+            return "unknown"
+        if actual_uid != expected_uid:
+            return "replacement"
+        phase = str(getattr(getattr(pod, "status", None), "phase", "") or "")
+        statuses = getattr(pod.status, "container_statuses", None) or []
+        all_containers_terminated = bool(statuses) and all(
+            getattr(getattr(status, "state", None), "terminated", None) is not None
+            for status in statuses
+        )
+        # A graceful deletion may stamp deletionTimestamp before the final
+        # terminal phase update.  Exact UID plus every container's terminated
+        # state is the process-level proof we need; deletionTimestamp alone is
+        # deliberately not proof.
+        if all_containers_terminated:
+            return "exact_terminal"
+        if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None):
+            return "unknown"
+        if phase in {"Running", "Pending"}:
+            return "exact_live"
+        if phase in {"Failed", "Succeeded"}:
+            # A terminal phase with missing/partial container status is still
+            # ambiguous: the API object is authoritative only when every
+            # claimant container has an observed terminal state.
+            return "unknown"
+        return "unknown"
+
+    async def delete_agent_pod_exact(
+        self,
+        pod_name: str,
+        *,
+        expected_pod_uid: str,
+    ) -> bool:
+        """Request deletion of only the exact credential-bearing claimant."""
+
+        name = str(pod_name or "").strip()
+        expected_uid = str(expected_pod_uid or "").strip()
+        if not self._k8s_available or not name or not expected_uid:
+            return False
+        try:
+            await asyncio.to_thread(
+                self._core_api.delete_namespaced_pod,
+                name=name,
+                namespace=self._namespace,
+                grace_period_seconds=STATELESS_CLAIMANT_EVICTION_GRACE_SECONDS,
+                body={"preconditions": {"uid": expected_uid}},
+            )
+            logger.info(
+                "Exact claimant pod deletion requested: %s uid=%s", name, expected_uid
+            )
+            return True
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return True
+            # HTTP 409 means the precondition protected a same-name successor.
+            if getattr(exc, "status", None) == 409:
+                logger.info("Exact claimant pod already replaced: %s", name)
+                return True
+            logger.warning("Exact claimant pod delete failed for %s: %s", name, exc)
             return False
 
     async def _archive_pod_logs(self, pod_name: str) -> None:

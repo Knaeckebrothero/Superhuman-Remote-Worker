@@ -730,7 +730,11 @@ class TestSessionCreateBoundary:
 
         main, db, conn, _ = session_create_env
         workspace_create = AsyncMock(return_value=True)
+        schedule_workspace = MagicMock()
         monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", True)
+        monkeypatch.setattr(
+            main, "_schedule_stateless_workspace_ensure", schedule_workspace
+        )
         monkeypatch.setattr(
             main,
             "container_provisioner",
@@ -761,16 +765,58 @@ class TestSessionCreateBoundary:
 
         assert result == {"thread_id": SESSION_THREAD_ID, "status": "created"}
         assert db.create_thread.await_args.kwargs["execution_lane"] == "stateless"
-        assert _persisted_thread_override(conn)["officer"] == {
+        initial = db.create_thread.await_args.kwargs["initial_metadata"]
+        assert initial["config_override"]["officer"] == {
             "enabled": False,
             "conference": False,
         }
-        db.merge_thread_workspace_context.assert_awaited_once_with(
-            SESSION_THREAD_ID,
-            {"status": "pending", "provisioner": "k8s"},
-        )
-        workspace_create.assert_awaited_once()
+        creation = initial["workspace_container"]["_stateless_runtime_creation"]
+        assert creation["mode"] == "create"
+        assert creation["attempted"] is False
+        assert creation["replaces_uid"] is None
+        assert str(uuid.UUID(creation["generation"])) == creation["generation"]
+        assert initial["workspace_container"]["status"] == "pending"
+        assert initial["workspace_container"]["provisioner"] == "k8s"
+        conn.execute.assert_not_awaited()
+        db.merge_thread_workspace_context.assert_not_awaited()
+        schedule_workspace.assert_called_once_with(SESSION_THREAD_ID)
+        workspace_create.assert_not_awaited()
         pinned_provision.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stateless_sandbox_insert_failure_never_schedules_workspace(
+        self, session_create_env, monkeypatch
+    ):
+        from fastapi import HTTPException
+
+        main, db, _, _ = session_create_env
+        schedule_workspace = MagicMock()
+        db.create_thread.side_effect = RuntimeError("insert failed")
+        monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", True)
+        monkeypatch.setattr(
+            main, "_schedule_stateless_workspace_ensure", schedule_workspace
+        )
+        monkeypatch.setattr(
+            main,
+            "container_provisioner",
+            SimpleNamespace(
+                is_available=True,
+                in_cluster=True,
+                create_workspace=AsyncMock(return_value=True),
+            ),
+        )
+
+        with pytest.raises(HTTPException, match="insert failed") as exc:
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="stateless sandbox",
+                    config_override={"workspace": {"backend": "sandbox"}},
+                ),
+                MagicMock(),
+            )
+
+        assert exc.value.status_code == 500
+        schedule_workspace.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_disabled_pool_preserves_pinned_sandbox_agent_path(
