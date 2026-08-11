@@ -9904,7 +9904,7 @@ class PostgresDB:
                     ),
                     '{_stateless_claim_retirement,residents_retired_by}',
                     '"protocol"'::jsonb,
-                    false
+                    true
                 )
                 WHERE id = $1::uuid
                   AND execution_lane = 'stateless'
@@ -10003,7 +10003,7 @@ class PostgresDB:
                     ),
                     '{_stateless_claim_retirement,remote_retired_by}',
                     '"protocol"'::jsonb,
-                    false
+                    true
                 )
                 WHERE id = $1::uuid
                   AND execution_lane = 'stateless'
@@ -10150,7 +10150,7 @@ class PostgresDB:
                             ),
                             '{_stateless_claim_retirement,residents_retired_by}',
                             '"workspace_runtime_terminal"'::jsonb,
-                            false
+                            true
                         ),
                         '{_stateless_claim_retirement,remote_retired}',
                         'true'::jsonb,
@@ -10158,7 +10158,7 @@ class PostgresDB:
                     ),
                     '{_stateless_claim_retirement,remote_retired_by}',
                     '"workspace_runtime_terminal"'::jsonb,
-                    false
+                    true
                 )
                 WHERE id = $1::uuid
                   AND execution_lane = 'stateless'

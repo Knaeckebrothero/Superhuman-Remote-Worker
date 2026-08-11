@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -304,6 +306,119 @@ def test_refresh_vfs_issues_vfs_refresh_not_forget():
     assert "vfs/refresh" in s
     assert "recursive=true" in s
     assert "vfs/forget" not in s  # forget does NOT flush file content (design §11.2)
+
+
+_IDLE_CORE_STATS = {"bytes": 0, "errors": 0, "transfers": 0}
+_IDLE_VFS_STATS = {"diskCache": {"uploadsQueued": 0, "uploadsInProgress": 0}}
+
+
+def _terminal_drain_status_returncode(core, vfs) -> int:
+    core_json = core if isinstance(core, str) else json.dumps(core)
+    vfs_json = vfs if isinstance(vfs, str) else json.dumps(vfs)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            cloud_mount_module._TERMINAL_DRAIN_STATUS_PY,
+            core_json,
+            vfs_json,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode
+
+
+@pytest.mark.parametrize("transferring", [pytest.param(None, id="omitted"), []])
+def test_terminal_drain_accepts_rclone_idle_transfer_shapes(transferring):
+    core = dict(_IDLE_CORE_STATS)
+    if transferring is not None:
+        core["transferring"] = transferring
+
+    assert _terminal_drain_status_returncode(core, _IDLE_VFS_STATS) == 0
+
+
+@pytest.mark.parametrize(
+    "transferring",
+    [[{"name": "pending"}], None, {}, "idle", 0, False],
+)
+def test_terminal_drain_rejects_active_or_malformed_transfer_shapes(transferring):
+    core = {**_IDLE_CORE_STATS, "transferring": transferring}
+
+    assert _terminal_drain_status_returncode(core, _IDLE_VFS_STATS) == 1
+
+
+@pytest.mark.parametrize(
+    "core",
+    [
+        {},
+        {"error": "permission denied", "path": "core/stats", "status": 500},
+        [],
+        "{invalid-json",
+        {"bytes": 0, "errors": 0},
+        {"bytes": 0, "errors": 0, "transfers": False},
+        {"bytes": 0, "errors": "0", "transfers": 0},
+        {"bytes": 0.0, "errors": 0, "transfers": 0},
+        {"bytes": 0, "errors": -1, "transfers": 0},
+    ],
+)
+def test_terminal_drain_rejects_invalid_core_responses(core):
+    assert _terminal_drain_status_returncode(core, _IDLE_VFS_STATS) == 1
+
+
+@pytest.mark.parametrize("counter", ["uploadsQueued", "uploadsInProgress"])
+@pytest.mark.parametrize("value", [1, -1, "0", 0.0, 0.5, False, None, {}])
+def test_terminal_drain_rejects_non_idle_or_malformed_vfs_counters(counter, value):
+    disk_cache = dict(_IDLE_VFS_STATS["diskCache"])
+    disk_cache[counter] = value
+
+    assert (
+        _terminal_drain_status_returncode(_IDLE_CORE_STATS, {"diskCache": disk_cache})
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    "vfs",
+    [
+        {},
+        {"diskCache": None},
+        {"diskCache": []},
+        {"diskCache": {"uploadsQueued": 0}},
+        {"diskCache": {"uploadsInProgress": 0}},
+        [],
+        "{invalid-json",
+    ],
+)
+def test_terminal_drain_rejects_invalid_vfs_responses(vfs):
+    assert _terminal_drain_status_returncode(_IDLE_CORE_STATS, vfs) == 1
+
+
+def test_terminal_unmount_requires_successful_full_rc_probes_before_quit():
+    backend = FakeFencedRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+    state = manager._state_for_mount(_cloud_mount_cfg()["mounts"][0], 0)
+    script = manager._terminal_unmount_script(state, drain=True)
+
+    syntax = subprocess.run(
+        ["bash", "-n"], input=script, text=True, capture_output=True, check=False
+    )
+
+    assert syntax.returncode == 0, syntax.stderr
+    assert "core/stats 2>/dev/null || true" not in script
+    assert "vfs/stats 2>/dev/null || true" not in script
+    assert "short=true" not in script
+    assert "core/stats 2>/dev/null) &&" in script
+    assert "vfs/stats 2>/dev/null) &&" in script
+    drain_ack = script.index('[ "$_srw_drained" = yes ] || exit 89')
+    quit_call = script.index("core/quit")
+    assert drain_ack < quit_call
 
 
 # ------------------------------------------------------- Keycloak bearer auth

@@ -185,6 +185,24 @@ def stateless_retirement_authority(
     if marker["workspace_absence_proven"]:
         raise RuntimeError("terminal workspace absence proof is unsupported")
 
+    # Compatibility for acknowledgements written by the first S2 build: its
+    # nested jsonb_set used create_if_missing=false, so PostgreSQL could commit
+    # the exact ACK plus retired=true while silently omitting the new
+    # ``*_retired_by`` field.  Only infer an *absent* field from the ACK's
+    # explicit kind. An explicit null/malformed field remains fail-closed, and
+    # the normalized copy below still takes the full protocol drift checks.
+    for retired_key, retired_by_key, ack_key in (
+        ("residents_retired", "residents_retired_by", RESIDENT_RETIREMENT_ACK_KEY),
+        ("remote_retired", "remote_retired_by", SHELL_RETIREMENT_ACK_KEY),
+    ):
+        if marker[retired_key] and retired_by_key not in marker:
+            ack = root.get(ack_key)
+            if isinstance(ack, dict) and ack.get("kind") in {
+                "protocol",
+                "workspace_runtime_terminal",
+            }:
+                marker[retired_by_key] = ack["kind"]
+
     losses = unresolved_claim_losses(root)
     if marker["claimant_quiesced"] is not (not losses):
         raise RuntimeError(
