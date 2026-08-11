@@ -293,6 +293,7 @@ async def test_atomic_session_steal_parks_exact_uid_debt_after_settlement(monkey
     }
     assert "_stateless_active_claim" not in stored
     assert conn.fetchrow.await_args_list[-1].args[0] == mod._PARK_CLAIM_LOSS_HOLD_SQL
+    assert "run_after = NULL" not in mod._PARK_CLAIM_LOSS_HOLD_SQL
 
 
 @pytest.mark.asyncio
