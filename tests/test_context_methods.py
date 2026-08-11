@@ -8,6 +8,10 @@ trim_messages, and sanitize_message_history.
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from src.core.loader import (
+    CONTEXT_THRESHOLD_FRACTION,
+    MESSAGE_COUNT_MIN_FRACTION,
+)
 from src.core.context import (
     ContextManager,
     ContextConfig,
@@ -233,6 +237,57 @@ class TestTokenCounting:
             HumanMessage(content=f"Message {i} with some content to add tokens " * 10)
             for i in range(10)
         ]
+        assert mgr.should_summarize(messages) is True
+
+
+class TestMessageCountGateNeverBinds:
+    """Regression: a 400k-window session compacted at 162k (40% of window).
+
+    ``should_summarize`` ORs a token gate (``CONTEXT_THRESHOLD_FRACTION``,
+    0.80 of the window) with a message-count gate floored at
+    ``MESSAGE_COUNT_MIN_FRACTION``. While that floor was 0.40, every session
+    past ``message_count_threshold`` compacted at 40% of the window — half the
+    intended headroom, on a lossy summarize. The floor must never sit below the
+    token gate, so the message-count branch can never be the binding
+    constraint. See docs/done/ + session 1930dec9 (328 msgs, 162.0k/400.0k).
+    """
+
+    WINDOW = 400_000
+
+    def _mgr(self) -> ContextManager:
+        """A ContextManager wired the way the loader derives a 400k model."""
+        return ContextManager(
+            config=ContextConfig(
+                compaction_threshold_tokens=int(
+                    self.WINDOW * CONTEXT_THRESHOLD_FRACTION
+                ),
+                summarization_threshold_tokens=int(
+                    self.WINDOW * CONTEXT_THRESHOLD_FRACTION
+                ),
+                # config/session_base.yaml + config/worker_base.yaml
+                message_count_threshold=300,
+                message_count_min_tokens=int(self.WINDOW * MESSAGE_COUNT_MIN_FRACTION),
+                model_max_context_tokens=self.WINDOW,
+            )
+        )
+
+    def test_floor_is_not_below_the_token_gate(self):
+        """The derived floor must not undercut the token gate at any window."""
+        assert MESSAGE_COUNT_MIN_FRACTION >= CONTEXT_THRESHOLD_FRACTION
+
+    def test_long_session_below_token_gate_does_not_summarize(self):
+        """328 messages at 162k on a 400k model: 238k of window still free."""
+        mgr = self._mgr()
+        messages = [HumanMessage(content=f"turn {i}") for i in range(328)]
+        # The live trigger anchors on the provider's real input_tokens.
+        mgr.record_provider_usage(162_000)
+        assert mgr.should_summarize(messages) is False
+
+    def test_token_gate_still_fires_on_a_long_session(self):
+        """Neutering the message gate must not disarm the token gate."""
+        mgr = self._mgr()
+        messages = [HumanMessage(content=f"turn {i}") for i in range(328)]
+        mgr.record_provider_usage(int(self.WINDOW * CONTEXT_THRESHOLD_FRACTION) + 1)
         assert mgr.should_summarize(messages) is True
 
 

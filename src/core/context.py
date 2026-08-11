@@ -768,7 +768,10 @@ class ContextConfig:
     compaction_threshold_tokens: int = 80_000
     summarization_threshold_tokens: int = 100_000
     message_count_threshold: int = 200
-    message_count_min_tokens: int = 40_000
+    # Floored at the compaction threshold so the message-count branch of
+    # should_summarize() can never fire before the token gate. Mirrors
+    # loader.MESSAGE_COUNT_MIN_FRACTION (a base=100_000 instance).
+    message_count_min_tokens: int = 80_000
     keep_recent_tool_results: int = 15
     keep_recent_messages: int = 10
     max_tool_result_length: int = 5000
