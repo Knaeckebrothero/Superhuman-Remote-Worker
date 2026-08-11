@@ -52,7 +52,19 @@ VALID_IMAGE_QUALITY_TIERS = {"economy", "standard", "high"}
 # model's own window — src/core/summarizer.py,
 # docs/features/context_summarization_rework.md.
 CONTEXT_THRESHOLD_FRACTION = 0.80
-MESSAGE_COUNT_MIN_FRACTION = 0.40
+# Pinned EQUAL to the threshold fraction on purpose (was 0.40 until 2026-08-11).
+# It floors the alternate message-count summarization trigger
+# (ContextManager.should_summarize), which ORs "many messages" with "at least
+# this many tokens". At 0.40 that branch fired at 40% of the window, so any
+# session past `message_count_threshold` compacted on a lossy summary with 60%
+# of its window still free — a 400k model compacted at 162k. Pinning it to the
+# token gate makes the branch a strict subset of that gate, so it can never be
+# the binding constraint. The trigger it was written for (2026-01-16: hundreds
+# of TINY messages, when windows were 100k) is now covered by provider-anchored
+# token accounting. An operator can still opt back in by setting
+# `limits.message_count_min_tokens` explicitly in config — the derivation only
+# fills leaves the matrix owns.
+MESSAGE_COUNT_MIN_FRACTION = 0.80
 
 
 # =============================================================================
@@ -1634,7 +1646,7 @@ class LimitsConfig:
     # derivation; these only fire when a key is wholly absent (test/edge paths).
     context_threshold_tokens: int = 80000  # 100_000 * 0.80
     message_count_threshold: int = 200
-    message_count_min_tokens: int = 40000  # 100_000 * 0.40
+    message_count_min_tokens: int = 80000  # 100_000 * 0.80
     tool_retry_count: int = 3
     # Tier-1 in-process LLM-invoke retries before the worker freezes the job for
     # pause+backoff re-dispatch (llm_outage_pause_and_backoff_redispatch.md).
@@ -2508,7 +2520,7 @@ def load_agent_config(
     limits_config = LimitsConfig(
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
         message_count_threshold=limits_data.get("message_count_threshold", 200),
-        message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
+        message_count_min_tokens=limits_data.get("message_count_min_tokens", 80000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
         llm_inproc_retries=limits_data.get("llm_inproc_retries", 5),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
@@ -2770,7 +2782,7 @@ def load_agent_config_from_dict(
     limits_config = LimitsConfig(
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
         message_count_threshold=limits_data.get("message_count_threshold", 200),
-        message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
+        message_count_min_tokens=limits_data.get("message_count_min_tokens", 80000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
         llm_inproc_retries=limits_data.get("llm_inproc_retries", 5),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
