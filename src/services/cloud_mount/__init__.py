@@ -36,6 +36,18 @@ _RC_VFS = "__SRW_RCLONE_RC_VFS__"
 _RESIDENT_ADOPTED = "__SRW_RCLONE_RESIDENT_ADOPTED__"
 _RESIDENT_HEAL = "__SRW_RCLONE_RESIDENT_HEAL__"
 _RESIDENT_IDENTITY_VERSION = "1"
+_TERMINAL_DRAIN_STATUS_PY = (
+    "import json,sys; c=json.loads(sys.argv[1]); v=json.loads(sys.argv[2]); "
+    'd=v.get("diskCache") if isinstance(v,dict) else None; '
+    't=c.get("transferring") if isinstance(c,dict) else None; '
+    'core_ok=isinstance(c,dict) and "error" not in c and '
+    'all(type(c.get(k)) is int and c[k] >= 0 for k in ("bytes","errors","transfers")) '
+    'and ("transferring" not in c or (isinstance(t,list) and not t)); '
+    'vfs_ok=isinstance(d,dict) and type(d.get("uploadsQueued")) is int and '
+    'd["uploadsQueued"] == 0 and type(d.get("uploadsInProgress")) is int and '
+    'd["uploadsInProgress"] == 0; ok=core_ok and vfs_ok; '
+    "raise SystemExit(0 if ok else 1)"
+)
 
 _CACHE_FLAG_MAP = {
     "vfs_cache_mode": "--vfs-cache-mode",
@@ -1490,9 +1502,9 @@ if [ -e "/proc/$_srw_pid" ]; then
   if [ "$drain" = yes ]; then
     _srw_drained=
     for _srw_i in $(seq 1 60); do
-      _srw_core=$(timeout 5 rclone rc --rc-addr "$expected_rc" --rc-user {shlex.quote(state.rc_user)} --rc-pass "$_srw_pass" core/stats 2>/dev/null || true)
-      _srw_vfs=$(timeout 5 rclone rc --rc-addr "$expected_rc" --rc-user {shlex.quote(state.rc_user)} --rc-pass "$_srw_pass" vfs/stats 2>/dev/null || true)
-      if python3 -c 'import json,sys; c=json.loads(sys.argv[1]); v=json.loads(sys.argv[2]); d=v.get("diskCache"); ok=isinstance(c.get("transferring"),list) and not c["transferring"] and isinstance(d,dict) and int(d.get("uploadsQueued",-1)) == 0 and int(d.get("uploadsInProgress",-1)) == 0; raise SystemExit(0 if ok else 1)' "$_srw_core" "$_srw_vfs" 2>/dev/null; then
+      if _srw_core=$(timeout 5 rclone rc --rc-addr "$expected_rc" --rc-user {shlex.quote(state.rc_user)} --rc-pass "$_srw_pass" core/stats 2>/dev/null) &&
+         _srw_vfs=$(timeout 5 rclone rc --rc-addr "$expected_rc" --rc-user {shlex.quote(state.rc_user)} --rc-pass "$_srw_pass" vfs/stats 2>/dev/null) &&
+         python3 -c {shlex.quote(_TERMINAL_DRAIN_STATUS_PY)} "$_srw_core" "$_srw_vfs" 2>/dev/null; then
         _srw_drained=yes
         break
       fi

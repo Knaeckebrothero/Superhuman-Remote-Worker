@@ -2119,6 +2119,7 @@ __SRW_PROCESS_ZERO_PY__
         *,
         operation: str,
         allow_shell_retired: bool = False,
+        close_sftp: bool = False,
     ) -> str:
         """Run a generated tmux command and prove its remote exit status.
 
@@ -2133,6 +2134,20 @@ __SRW_PROCESS_ZERO_PY__
                 raise WorkspaceUnavailableError(
                     "Remote shell owner has been retired from this backend"
                 )
+            if close_sftp:
+                # The final stateless process-zero scan intentionally refuses
+                # unreadable same-UID processes. ``connect()`` opens an SFTP
+                # subsystem whose server is a sibling of the exec channel,
+                # not an ancestor the scan can exclude. Close this terminal
+                # backend's own writer channel before opening the proof exec;
+                # the still-active SSH transport is sufficient for that exec
+                # and `_ensure_connected()` will not recreate SFTP.
+                self._ensure_connected()
+                with self._sftp_lock:
+                    sftp = self._sftp
+                    self._sftp = None
+                    if sftp is not None:
+                        sftp.close()
             # tmux completion sentinels and the attested prompt live at the end
             # of capture-pane output. Keep a bounded tail so scrollback over the
             # generic 5 MiB SSH cap cannot make a finished command look busy.
@@ -4013,6 +4028,7 @@ __SRW_PROCESS_ZERO_PY__
                     self._tmux_lock_command(inner),
                     operation="retire stateless shell session",
                     allow_shell_retired=True,
+                    close_sftp=True,
                 )
                 self._tabs.clear()
                 self._shell_initialized = False

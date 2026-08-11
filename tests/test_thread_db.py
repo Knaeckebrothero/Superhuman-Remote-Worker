@@ -57,6 +57,82 @@ def _mock_conn():
     return conn
 
 
+class TestStatelessRetirementAcknowledgementSQL:
+    THREAD_ID = "aaaaaaaa-1111-4222-8333-444444444444"
+    GENERATION = "11111111-1111-4111-8111-111111111111"
+    RUNTIME = "22222222-2222-4222-8222-222222222222"
+    FINGERPRINT = "SHA256:" + ("A" * 43)
+
+    @staticmethod
+    def _normalized_fetchval_sql(conn) -> str:
+        return " ".join(conn.fetchval.await_args.args[0].split())
+
+    @pytest.mark.asyncio
+    async def test_resident_ack_creates_protocol_provenance_key(self):
+        conn = _mock_conn()
+        conn.fetchval = AsyncMock(return_value=UUID(self.THREAD_ID))
+        db = _make_db_with_conn(conn)
+
+        assert await db.acknowledge_stateless_thread_resident_retirement(
+            self.THREAD_ID,
+            terminal_token=8,
+            workspace_generation=self.GENERATION,
+            endpoint_generation=self.GENERATION,
+            runtime_incarnation=self.RUNTIME,
+            host_key_fingerprint=self.FINGERPRINT,
+            proof={"rclone_mounts": 1},
+        )
+
+        sql = self._normalized_fetchval_sql(conn)
+        assert (
+            "'{_stateless_claim_retirement,residents_retired_by}', "
+            "'\"protocol\"'::jsonb, true" in sql
+        )
+
+    @pytest.mark.asyncio
+    async def test_shell_ack_creates_protocol_provenance_key(self):
+        conn = _mock_conn()
+        conn.fetchval = AsyncMock(return_value=UUID(self.THREAD_ID))
+        db = _make_db_with_conn(conn)
+
+        assert await db.acknowledge_stateless_thread_shell_retirement(
+            self.THREAD_ID,
+            terminal_token=8,
+            workspace_generation=self.GENERATION,
+            endpoint_generation=self.GENERATION,
+            runtime_incarnation=self.RUNTIME,
+            host_key_fingerprint=self.FINGERPRINT,
+        )
+
+        sql = self._normalized_fetchval_sql(conn)
+        assert (
+            "'{_stateless_claim_retirement,remote_retired_by}', "
+            "'\"protocol\"'::jsonb, true" in sql
+        )
+
+    @pytest.mark.asyncio
+    async def test_exact_terminal_ack_creates_both_provenance_keys(self):
+        conn = _mock_conn()
+        conn.fetchval = AsyncMock(return_value=UUID(self.THREAD_ID))
+        db = _make_db_with_conn(conn)
+
+        assert await db.acknowledge_stateless_thread_shell_absent(
+            self.THREAD_ID,
+            terminal_token=8,
+            runtime_incarnation=self.RUNTIME,
+        )
+
+        sql = self._normalized_fetchval_sql(conn)
+        assert (
+            "'{_stateless_claim_retirement,residents_retired_by}', "
+            "'\"workspace_runtime_terminal\"'::jsonb, true" in sql
+        )
+        assert (
+            "'{_stateless_claim_retirement,remote_retired_by}', "
+            "'\"workspace_runtime_terminal\"'::jsonb, true" in sql
+        )
+
+
 # =============================================================================
 # 6.1: create_thread
 # =============================================================================
