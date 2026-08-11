@@ -435,7 +435,10 @@ from src.utils.ssh_key import (  # noqa: E402
 )
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
-from services.container_provisioner import container_provisioner  # noqa: E402
+from services.container_provisioner import (  # noqa: E402
+    WORKSPACE_RUNTIME_INCARNATION_KEY,
+    container_provisioner,
+)
 from services.workspace_lifecycle import (  # noqa: E402
     EnsureOutcome,
     WorkspaceOwner,
@@ -11222,6 +11225,7 @@ def _redact_nested_workspace_state(
             key in context
             for key in (
                 "_canvas_workspace_generation",
+                WORKSPACE_RUNTIME_INCARNATION_KEY,
                 "_docker_workspace_lease_id",
                 "_docker_workspace_trust_mode",
                 "_docker_workspace_attested",
@@ -11235,6 +11239,7 @@ def _redact_nested_workspace_state(
             changed = True
         context = dict(context)
         context.pop("_canvas_workspace_generation", None)
+        context.pop(WORKSPACE_RUNTIME_INCARNATION_KEY, None)
         context.pop("_docker_workspace_lease_id", None)
         context.pop("_docker_workspace_trust_mode", None)
         context.pop("_docker_workspace_attested", None)
@@ -26770,6 +26775,7 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
     binding = metadata.get("_workspace_binding") or {}
     workspace_backend = _thread_workspace_backend(thread)
     workspace_generation: str | None = None
+    workspace_runtime_incarnation: str | None = None
     if isinstance(binding, dict):
         try:
             candidate_generation = str(UUID(str(binding.get("generation"))))
@@ -26804,6 +26810,12 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
             # exact ready endpoint generation before cloud sync may call those
             # workspace bytes the source of an acknowledged generation.
             workspace_generation = candidate_generation
+            try:
+                workspace_runtime_incarnation = str(
+                    UUID(str(ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY)))
+                )
+            except (TypeError, ValueError):
+                workspace_runtime_incarnation = None
     if (
         thread.get("execution_lane") == "stateless"
         and workspace_backend == "virtual"
@@ -26949,6 +26961,10 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         # orchestrator-owned workspace incarnation and recheck it before each
         # external PUT.
         "workspace_generation": workspace_generation,
+        # Separate from the backing generation: a PVC-backed workspace keeps
+        # its generation across pod replacement, while this Kubernetes Pod UID
+        # changes and fences the prior runtime's shell ownership record.
+        "workspace_runtime_incarnation": workspace_runtime_incarnation,
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
         "pod_ip": ws.get("pod_ip") or ws.get("host"),
         "pod_name": ws.get("pod_name"),
