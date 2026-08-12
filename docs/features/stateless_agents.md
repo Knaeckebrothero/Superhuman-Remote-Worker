@@ -2,7 +2,7 @@
 
 **Status:** v3.4 — **WORKER DRIVER BUILT 2026-08-11.** The session spine, its performance work, the S1 session lane, the S2 handoff substrate, Gate 3 step 1 and the S3 worker driver are now on `feature/stateless-agents`. Nothing is pushed; `develop` is untouched. **Where things stand is §9.1 Implementation status**, written against the code rather than intent.
 
-In one paragraph: the shared queue/lease substrate is built, k3d-verified and genuinely kind-agnostic; **the session lane is functionally complete** — turns queue and run on any pod, survive a mid-generation kill, never double-answer, reconnect with no socket, and take durable control verbs, all without the cockpit ever learning a lane exists; **the worker driver is built behind an independent default-off gate** — exact Kubernetes workspaces can enqueue, rotate without calling the completion handler, resume on another pod with checkpoint/Todo/tmux state intact, and fence a stale completion report. VM jobs remain pinned. Gate 3 step 2 remains the separate completion-reliability program for both lanes; no command/effect schema or completion finalizer was added here. Turn latency went 99.6 s → 5.4 s cold / 3.0 s warm (§5.3.3, §5.3.4). Build history, measurements and failures: `docs/research/stateless_agents/implementation_log.md`; the completion-path evidence base is `docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
+In one paragraph: the shared queue/lease substrate is built, k3d-verified and genuinely kind-agnostic; **the session lane is functionally complete** — turns queue and run on any pod, survive a mid-generation kill, never double-answer, reconnect with no socket, and take durable control verbs, all without the cockpit ever learning a lane exists; **the worker driver is built behind an independent default-off gate** — exact Kubernetes workspaces can enqueue, rotate without calling the completion handler, resume on another pod with checkpoint/Todo/tmux state intact, and fence a stale completion report. VM jobs remain pinned. Gate 3 step 2 remains the separate completion-reliability program for both lanes; no command/effect schema or completion finalizer was added here — its design was adversarially reviewed and corrected on 2026-08-12 (§5.4.5), and `origin/develop` is merged into the branch with all four k3d smokes green, so it is **ready for a pull request onto develop**, arriving default-off (§9.1). Turn latency went 99.6 s → 5.4 s cold / 3.0 s warm (§5.3.3, §5.3.4). Build history, measurements and failures: `docs/research/stateless_agents/implementation_log.md`; the completion-path evidence base is `docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
 
 v1 2026-08-06 (initial proposal); v2 2026-08-07 after an 8-agent research fan-out; **v3 same night after a 6-lens adversarial panel** (10 critical + 28 major findings folded in). Raw research and critic reports: `docs/research/stateless_agents/`. Related implementation docs carrying pieces of this work: `no_workspace_agent_mode.md` §5.1 (op count is the cost — the virtual backend's scoped metadata index) and `cloud_collaboration_model.md` §4 (one `Depth: infinity` PROPFIND per turn boundary).
 **Origin:** user proposal — an LLM turn is conversation JSON in, bigger conversation JSON out; so agents can be a Deployment, not pinned pods.
@@ -241,9 +241,16 @@ v2 stood up `run_queue` next to the shipped jobs-row lease and never said which 
 
 #### 5.4.5 Completion is a command, not a call (Gate 3)
 
-**Status: design 2026-08-08; step 1 shipped 2026-08-10 (`2f5307f0`); scope
-corrected 2026-08-10 — no longer admission-blocking (see below).** Evidence base:
+**Status: design 2026-08-08; scope corrected 2026-08-10 — no longer
+admission-blocking (see below); step 1 shipped 2026-08-10 (`2f5307f0`);
+adversarially reviewed 2026-08-10/11 and folded in here 2026-08-12. Steps 2+
+are not built.** Evidence base:
 `docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
+Review of record: `docs/research/stateless_agents/gate3_adversarial_review.md`
+(four independent critics; every seeded candidate confirmed; 10 blockers). That
+file was authoritative over this section until this fold; **from 2026-08-12 this
+section is authoritative again**, and the review file is retained as the
+evidence and reasoning behind each change.
 
 ##### Scope correction (2026-08-10): rotation never goes through `/complete`
 
@@ -339,10 +346,26 @@ rejects A's last write and leaves everything before it applied.
 Several of these are reachable **today on the pinned lane**; per-turn claiming
 only raises their frequency. A crash between the status write and the archive
 leaks the pod, PVC and VM with nothing recording it, and the replay guard
-prevents recovery. A `completed` job can carry `completed_at IS NULL` forever.
-The duplicate-critic race can drop a blocking finding and approve work that
-should have been returned. Treat Gate 3 as repairing a fragile path, not as
-paying a stateless tax.
+prevents recovery. Treat Gate 3 as repairing a fragile path, not as paying a
+stateless tax.
+
+**Three of them are now fixed, ahead of the protocol** — which is the point of
+the rollout's step 1. `completed_at IS NULL` and S19's dispatcher-invisibility
+window closed together via the Class A merge, and the duplicate-critic race
+closed via the 0132 index (`2f5307f0`). The review then found a fourth and it
+is also fixed: the agent used to heartbeat `ready` **before** reporting
+completion, so `recover_orphaned_jobs` — which pauses any `processing` job whose
+agent says ready, with no `current_job_id` check and no grace — could pause the
+job mid-report. In the narrow variant the completion report is then discarded
+with a 400 (its rescue path is `failed`-only) and a finished job is re-run; in
+the wider variant the ready state spans the *entire* handler, so a sweep tick
+minutes in re-dispatches while the handler still runs and the status write later
+overwrites `paused`→`completed` on top of a second execution. That is a
+mechanical explanation for the "job ran twice" symptom class, and the fix was a
+two-line reordering (`ca25f98f`, 2026-08-11).
+
+What remains genuinely blocked on the protocol is the workspace leak (S36) and
+the crash-recovery story around it — the one-way-door problem itself.
 
 ##### The protocol
 
@@ -426,6 +449,40 @@ draft would have shipped:
 - **Run the same report twice concurrently** (not sequentially): one 202, one
   409, exactly one execution.
 
+Added after the adversarial review — each is a confirmed interleaving, with a
+one-evening reproduction recipe implicit in its wording:
+
+- **Park a command after the `reviewing` write for >30 min with the
+  verification sweeper live, then unpark.** Exactly one critic exists
+  afterwards and the target's status is coherent with whatever the human
+  decided.
+- **Park between the loop barrier claim and the advance for >10 min with the
+  loop sweeper live.** Exactly one stage-N+1 spawn.
+- **Complete a job with the teardown group blocked.** Exactly one snapshot
+  object; the reconciler either waited or resumed the same effect rows — never
+  raced them.
+- **Kill the agent between the 202 and the queue release.** The unit is not
+  requeued and no successor claims it.
+- **Cancel between accept and finalize.** The command supersedes; no Class C
+  effect runs.
+- **Report `job_complete`, then crash so the error handler reports under the
+  same token.** First-wins: the job stays completed.
+- **Resume a job whose terminal command is still finalizing.** Refused (409),
+  not claimed — and the workspace survives.
+- **Kill the orchestrator handler mid-terminal-completion on the stateless
+  lane.** Consume-or-benign-re-report; never park.
+
+**"A pinned job's completion is behaviorally identical to today's" is not
+testable as written**, because step 4 changes the observable order by design.
+Split it: *contract* (assert) — same terminal status for identical payload and
+DB state across the full stop matrix, same response shape to the agent, the
+same **set** of side effects order-free (assertable directly from the effects
+table), same guard responses, and p95 handler latency within a stated envelope.
+*Accepted and documented* — intermediate status timeline, `completed_at` skew
+bounded by delivery duration, the new command/effect rows, the new 4xx classes,
+and delivery-failure parking. Anything observable that is in neither list fails
+the gate; that closes the loophole "identical" leaves open.
+
 ##### Settled design (2026-08-09, revised same day against external review)
 
 The seven open questions are answered below, against the code as it stands after
@@ -453,6 +510,43 @@ corrected below rather than left for implementation to discover:
 The liveness predicate in (6) also survived review only in shape: as first
 written it reproduced Kubernetes' stuck-finalizer failure mode almost exactly.
 
+**Then the whole section was attacked by four independent adversarial critics
+(2026-08-10/11) and ten more blockers came out.** The protocol core — durable
+command row, accept fence, background finalizer, effects-as-rows — survived all
+four; nobody found a reason to change its direction. What did not survive was
+the *periphery*. The corrections are folded into the decisions below; the
+headline reframe is worth stating once, up front:
+
+**Decision (6) integrated with three sweeps. The orchestrator has eleven
+job-status-keyed autonomous actors, and they need four different treatments —
+not one predicate.** An exclusion view is the right tool for exactly one of the
+four classes:
+
+1. **Re-dispatch rescuers** — `recover_orphaned_jobs`,
+   `recover_expired_lease_jobs`, the stale-agent detector, plus the
+   llm_outage / infra_transient / vm_upgrade-expiry redispatch sweeps for
+   *pause* commands. The exclusion view + routing table works as designed.
+2. **Status-consuming effect synthesizers** — `unstick_reviewing_parents` and
+   its wallclock arm, the project-loop sweeper's heal, the lifecycle
+   workspace/VM reaper, the session-wake status arm. Exclusion alone is
+   insufficient **and wrong in one direction**: these need *bidirectional
+   deference*. The sweep stands down while the command's lease is live; but
+   once it has legitimately fired (expired or parked — it *is* the operator
+   fallback), the **finalizer's own effects must CAS on world state and mark
+   themselves `superseded` on miss**. The sweep checking the command row is
+   only half the contract.
+3. **The queue-side rescuer** — the run_queue reaper. Not fixable by any
+   jobs-side predicate; fixed at accept (B4 below).
+4. **Non-sweep concurrent verbs** — cancel, dispatcher preemption, drain,
+   human approve. Fixed by a status predicate on the finalizer's *own* Class A
+   write (B10 below). No view can provide this.
+
+**The CI invariant generalizes accordingly.** It was scoped to `processing`;
+every collision the review found occurs in `reviewing`, terminal, `paused` or
+`waiting`. Correct form: *every job with an unfinalized command row is owned by
+exactly one actor — a live agent lease, a live finalizer lease, or exactly one
+routed sweep — whatever its status.*
+
 **(1) The command row is its own table**, `job_completion_commands`, modelled on
 `thread_control_requests` (migration 0119) rather than on `run_queue`. Three
 reasons, in order of weight. `run_queue`'s module contract is explicitly "this
@@ -477,12 +571,15 @@ CREATE TABLE job_completion_commands (
     accepted_lease_token BIGINT,                 -- stateless fence   } exactly
     accepted_agent_id    UUID,                   -- pinned fence      } one
 
+    origin               TEXT NOT NULL DEFAULT 'agent',  -- agent | operator
+    requested_by         TEXT NOT NULL,      -- actor, 0119's house pattern
+
     state                TEXT NOT NULL DEFAULT 'pending',
     attempts             INT  NOT NULL DEFAULT 0,
     max_attempts         INT  NOT NULL DEFAULT 5,
     run_after            TIMESTAMPTZ NOT NULL DEFAULT now(),
     lease_expires_at     TIMESTAMPTZ,        -- renewable; the liveness signal
-    deadline_at          TIMESTAMPTZ NOT NULL,  -- absolute cap, NEVER extended
+    deadline_at          TIMESTAMPTZ NOT NULL,  -- absolute cap, see (3)
     finalizing_by        TEXT,               -- diagnostics only
     code_version         TEXT NOT NULL,      -- gates recovery across deploys
 
@@ -492,12 +589,50 @@ CREATE TABLE job_completion_commands (
 
     CONSTRAINT uq_job_completion_seq    UNIQUE (job_id, report_seq),
     CONSTRAINT uq_job_completion_client UNIQUE (job_id, client_report_id),
+
+    -- Scoped to agent-origin rows. approve_job and both Mode-A verdict paths
+    -- already run the same terminal effect set with NO agent identity and no
+    -- lease (4 call sites of apply_terminal_job_side_effects) — the original
+    -- unconditional XOR made those rows unrepresentable, which would have left
+    -- the approve-path crash windows orphanable while claiming to fix them.
     CONSTRAINT job_completion_fence_exactly_one CHECK (
-        (accepted_lease_token IS NOT NULL AND accepted_agent_id IS NULL)
-     OR (accepted_lease_token IS NULL AND accepted_agent_id IS NOT NULL)),
+        (origin = 'operator'
+         AND accepted_lease_token IS NULL AND accepted_agent_id IS NULL)
+     OR (origin <> 'operator'
+         AND ((accepted_lease_token IS NOT NULL AND accepted_agent_id IS NULL)
+           OR (accepted_lease_token IS NULL AND accepted_agent_id IS NOT NULL)))),
+
+    -- 0119's bidirectional style: half-written states are unrepresentable in
+    -- BOTH directions. The original constrained only 'done', which admitted a
+    -- pending row carrying an outcome and a parked row carrying finalized_at.
+    CONSTRAINT job_completion_state_value CHECK (state IN (
+        'pending', 'finalizing', 'done', 'parked', 'superseded',
+        'force_resolved')),
     CONSTRAINT job_completion_terminal_shape CHECK (
-        state <> 'done' OR (outcome IS NOT NULL AND finalized_at IS NOT NULL))
+        (state IN ('pending', 'finalizing')
+         AND outcome IS NULL AND finalized_at IS NULL AND error_code IS NULL)
+     OR (state = 'done'
+         AND outcome IS NOT NULL AND finalized_at IS NOT NULL
+         AND error_code IS NULL)
+     OR (state = 'force_resolved'
+         AND outcome IS NOT NULL AND finalized_at IS NOT NULL)
+     OR (state = 'superseded'
+         AND finalized_at IS NOT NULL AND outcome IS NOT NULL)
+     OR (state = 'parked'
+         AND error_code IS NOT NULL
+         AND outcome IS NULL AND finalized_at IS NULL))
 );
+
+-- The finalizer drain. run_queue's own idx_run_queue_claim precedent; churn is
+-- BOUNDED here (a row transits the predicate once, retries capped by
+-- max_attempts), unlike the mutable-jobs-status case rejected for the critic
+-- index. Without it the drain seq-scans an unboundedly growing table.
+CREATE INDEX idx_job_completion_drain
+    ON job_completion_commands (run_after)
+    WHERE state IN ('pending', 'finalizing');
+
+-- The sweeps' NOT EXISTS is already served by the (job_id, …) prefix of
+-- uq_job_completion_seq — deliberately no extra index for it.
 
 -- Progress marker: ONE ROW PER EFFECT, never a JSONB log on the command.
 -- POLYMORPHIC producer (run_queue's precedent) so the session lane shares this
@@ -507,13 +642,28 @@ CREATE TABLE job_completion_commands (
 -- cost is that retention is explicit rather than ON DELETE CASCADE.
 CREATE TABLE completion_effects (
     producer_kind TEXT NOT NULL,         -- 'job_completion' | 'session_turn'
-    producer_id   UUID NOT NULL,         -- command id, or the turn's unit id
+    -- job_completion: the command id. session_turn: a turn_execution_id minted
+    -- INSIDE the fenced transaction that makes the turn durable — NOT the
+    -- unit_id. A session unit's unit_id IS the thread_id (0115a: one durable
+    -- row per unit, reused for the thread's life), so keying on it collides
+    -- across every turn of a thread: with ON CONFLICT DO NOTHING every effect
+    -- after turn 1 is silently swallowed; with a plain INSERT it is a 23505 per
+    -- turn. Minting inside the fenced persist also makes stolen-attempt
+    -- disposition structural — a fenced-out attempt never commits its effect
+    -- rows, so they neither orphan nor double: they never exist.
+    producer_id   UUID NOT NULL,
+    scope_id      UUID,                  -- thread/job for joins; NOT the key
     effect_name   TEXT NOT NULL,         -- STABLE NAME, never an ordinal
     effect_group  TEXT NOT NULL,         -- independently retryable unit, see (4)
     state         TEXT NOT NULL DEFAULT 'pending',
     attempts      INT  NOT NULL DEFAULT 0,
+    max_attempts  INT  NOT NULL DEFAULT 5,   -- per-GROUP budget lives here…
+    run_after     TIMESTAMPTZ NOT NULL DEFAULT now(),  -- …and so does backoff
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),  -- age alarms + pruning
     intent_at     TIMESTAMPTZ,           -- written BEFORE the external call
-    complete_by   TIMESTAMPTZ,           -- strictly shorter than the owner's lease
+    -- Shorter than the CLAIM that owns this effect, not the producer's lease:
+    -- a session turn's queue lease is gone by the time the finalizer runs.
+    complete_by   TIMESTAMPTZ,
     completed_at  TIMESTAMPTZ,
     detail        JSONB NOT NULL DEFAULT '{}'::jsonb,  -- e.g. captured k8s UIDs
     error_code    TEXT,
@@ -521,8 +671,40 @@ CREATE TABLE completion_effects (
 );
 ```
 
-Command states are `pending | finalizing | done | parked | superseded`,
-app-validated (no CHECK), matching `run_queue`'s convention.
+**No partial index over `completion_effects.state`.** The command table can
+carry one (bounded churn); this table cannot. Session producers dominate it —
+roughly 3–4 effects per turn against workers' once-per-genuine-stop — so a
+`WHERE state='pending'` predicate would have ~10⁴–10⁵ entries per day
+transiting it and would make *every* state flip non-HOT, which is the table's
+dominant write. Keep effect rows close to single-transition (fold `intent_at`
+into the INSERT) and index only what the drain actually needs.
+
+**Retention is owned, not asserted.** The reaper prunes; effects delete before
+their command (the command id is the enumeration key); session effects are
+age-pruned from `created_at` on terminal state; a small orphan sweep catches
+effects whose producer vanished — necessary because `job_completion_commands`
+CASCADEs on job deletion (a live endpoint) while the effects table
+deliberately has no FK. All deletes are LIMIT-batched in short transactions:
+one large DELETE is exactly the long-lived transaction that holds back
+dead-tuple reclamation for this table and `run_queue` alike. Failures outlive
+successes (River's 7 days vs 24 hours is the precedent).
+
+**`detail` holds fixed-cardinality correctness capture only** — UIDs, SHAs,
+status codes, counts — with an app-side cap (~8 kB, truncate-and-count).
+Per-file inventories stay in their existing stashes (`context.loop_cloud_delivery`,
+the cloud-diff rows); S15's unbounded walk would otherwise reintroduce the
+TOAST problem this design just evicted from the command row.
+
+Command states are `pending | finalizing | done | parked | superseded |
+force_resolved` — **six, and CHECK-enforced**, not app-validated. The earlier
+"no CHECK, matching `run_queue`'s convention" borrowed the wrong precedent:
+0115a skipped the CHECK to avoid a NOT VALID/VALIDATE split on an existing hot
+table, whereas this table is new and empty. The review also found the state
+vocabulary internally inconsistent — `force_resolved` was assigned by the
+liveness section but missing from the list and from the sweep predicate, and
+nothing anywhere *set* `superseded`. It is set by **the finalizer, at winner
+selection**, and by the day-one safety-net sweep when it reconciles a stale
+command (see the rollback rules).
 
 **Why a table and not a JSONB column.** Postgres has no in-place partial update
 of a JSONB value: `jsonb_set` assigns a whole new value and MVCC writes a whole
@@ -559,16 +741,75 @@ definition. They separate cleanly:
   digest must cover the operation identity, not just the body, and the response
   carries an `Idempotent-Replayed` marker so a caller can distinguish "I just did
   this" from "this was already done".
-- **Fence** — `accepted_lease_token` XOR `accepted_agent_id`, the same
-  discriminated pair `thread_control_requests` uses, because the two lanes prove
-  ownership differently and neither should be forced into the other's shape.
-  Checked *at accept*, which is what makes it a real fence: the report is
-  admitted or rejected in one short transaction, not after 1046 lines.
+
+  **The id is minted randomly ONCE and persisted with its payload — never
+  re-derived.** "Derives from the stop" was a trap: the `job_complete` freeze
+  embeds `datetime.now()` and `head_commit`, so a crash-resume that re-derives
+  the payload produces a *different* digest, and a deterministic id would then
+  false-422 an honest retry — fail-closed on a legitimate completion. Mint the
+  UUID once, persist id **and the exact payload** together in the
+  freeze/checkpoint, and resend that payload verbatim; any re-derivation is a
+  new stop with a new id. The digest is computed **server-side** over canonical
+  JSON excluding transport/fence fields (an agent-computed digest false-422s
+  across serializer versions).
+
+  **The full retry matrix**, because three states were unspecified:
+  `pending`/`finalizing` ⇒ 409; `done` ⇒ stored outcome + `Idempotent-Replayed`;
+  **`parked` ⇒ 202 still-pending WITHOUT a retry promise** (409's documented
+  contract is "retry, it will succeed", which is false for a command parked
+  awaiting an operator for days); **`superseded` ⇒ terminal, naming the winning
+  `report_seq`** (it has no outcome of its own to return);
+  **`force_resolved` ⇒ terminal, reporting which effects were abandoned**.
+- **Fence** — `accepted_lease_token` XOR `accepted_agent_id` for agent-origin
+  rows, the same discriminated pair `thread_control_requests` uses, because the
+  two lanes prove ownership differently and neither should be forced into the
+  other's shape. Checked *at accept*, which is what makes it a real fence: the
+  report is admitted or rejected in one short transaction, not after 1046 lines.
+
+  **The pinned arm needed a credential that did not exist.** `JobCompleteRequest`
+  carries no agent identity and the endpoint's auth is a fleet-shared
+  `X-Internal-Key` — it proves "an agent", never "this agent" — so
+  `accepted_agent_id` could only be copied from `jobs.assigned_agent_id`, which
+  a sweep clears asynchronously. That made the pinned fence either vacuous or
+  fail-closed on a live race. Three changes: `JobCompleteRequest` gains an
+  optional `agent_id` (pydantic v2 ignores unknown fields, so agent-first is
+  skew-safe) compared at accept; **the accept INSERT becomes the FIRST database
+  write of `/complete`, before any guard**, so a routed sweep sees the command
+  and stands off — making the race structurally impossible rather than merely
+  narrow; and the underlying ordering bug was fixed at the source
+  (`ca25f98f`, 2026-08-11) — the agent now reports completion *before*
+  heartbeating ready. 0119's equivalent works only because the owner registers
+  its own UUID in advance and clears it itself; the jobs analogue is cleared by
+  a sweep, which is why it could not be copied.
 - **Order** — `report_seq`, allocated by incrementing `jobs.completion_seq_hwm`
   under the jobs-row lock, never from an IDENTITY. This is the control inbox's
   rule and it exists for a reason: an IDENTITY value can be allocated by a later
-  transaction that commits first, so it does not order commits. Authority when
-  two reports race is the highest `report_seq` whose fence still validates.
+  transaction that commits first, so it does not order commits.
+
+  **Authority is finalization ORDER, not "highest seq wins".** The original
+  rule manufactured a regression: a driver reports `job_complete` (seq N), then
+  crashes during teardown, and the outer error handler reports the failure
+  (seq N+1) under the *same still-valid token* — highest-wins crowns the error
+  report and marks completed work `failed`, where today's status guard gives
+  first-wins. Correct rule: **commands finalize in `report_seq` order, each
+  applying against the state its predecessors produced.** The existing
+  already-successful backstop in `determine_job_status` ("ignoring a coincident
+  error on an already-successful job") then absorbs the trailing error as a
+  no-op, preserving today's semantics for free. `report_seq` keeps its real
+  jobs — ordering sequential pinned reports (where the fence value repeats
+  across a pause→re-dispatch-to-the-same-agent lifecycle and cannot order
+  them), commit-ordered audit, and deterministic tie-break.
+
+  **Lock order is binding and inverts the 0119 precedent.** Any transaction
+  locking both a `run_queue` row and its `jobs` row takes the **run_queue row
+  first**. The claim's shape forces it — its CTE discovers `unit_id` from the
+  queue scan, so jobs-first is impossible there — while a faithful copy of
+  0119's parent-first ordering would make accept take jobs-then-queue and
+  deadlock against every concurrent claim (40P01, ~1 s victim, landing on
+  `/complete`, which does not retry). So accept validates the fence
+  (`FOR SHARE` on run_queue) *before* taking the jobs row for the hwm bump.
+  "Extend the proven pattern" explicitly does **not** apply to lock order —
+  0119 is safe parent-first only because `claim_unit` never locks `threads`.
 
 `(job_id, lease_token)` alone is insufficient, which the original question
 suspected but did not pin down: pinned jobs have no run_queue lease at all, so
@@ -832,6 +1073,18 @@ retires when pinned adopts the command path.
 fence at accept protects accept; it does not stop a resurrected attempt-N
 finalizer from clobbering attempt N+1's outcome minutes later. The final write is
 `UPDATE jobs SET status = $new WHERE id = $job AND current_term = $term_held`.
+
+**And it must CAS on the expected entry status too.** The term guard defends
+against a resurrected finalizer; it does nothing against a *legitimate*
+concurrent writer, and background finalization widens that window from
+milliseconds to seconds-or-more. Concretely: the report is accepted (202), the
+user cancels or the dispatcher preempts, and the finalizer then commits
+`completed` over it and runs merge/spawn effects for a job the user cancelled —
+the inventory's destructive-interleaving #4 surviving the redesign verbatim. So
+the write carries `AND status = ANY($expected_entry_statuses)`, and a miss
+routes the command to `superseded`/`parked` rather than overwriting. Condition
+4's lease-renewal cancel discovery covers only *mid-run* cancels; this closes
+the post-report window.
 Checking lease expiry just before writing is explicitly *not* a substitute — a
 process can be paused at exactly the wrong instant between the check and the
 write.
@@ -852,10 +1105,19 @@ rescue path on the very thing that may be broken: a wedged finalizer leaves the
 job stuck *and* invisible to the safety net that would have rescued it. That is
 structurally identical to `JobTrackingWithFinalizers`, which cost Kubernetes four
 years of bugs including pods stuck 91 days with no controller left to clear them.
-Two corrections make it safe:
+Five corrections make it safe — the first two below, then the claim barrier, the
+accept-side queue terminalization, and the bidirectional deference the effect
+synthesizers need:
 
-**Key on a live lease, not on presence.** The predicate is
-`AND NOT EXISTS (… state IN ('pending','finalizing') AND lease_expires_at > now())`.
+**Key on a live lease, not on presence — and cover `parked`.** The predicate is
+`AND NOT EXISTS (… state IN ('pending','finalizing','parked') AND (lease_expires_at > now() OR state = 'parked'))`.
+The first draft named only `pending|finalizing`, which left a hole the review
+caught: a command can park **before** the status write (a delivery group
+exhausting its attempts is this design's own dialect), leaving the job
+`processing` with its agent gone and the exclusion FALSE — so the rescuer
+pauses and re-dispatches a job whose half-applied command an operator is
+holding. Parked rows are excluded from re-dispatch and routed to **alert-only**;
+they already *are* the operator worklist.
 This is the whole fix in one clause — it converts "stuck forever" into "bounded
 delay, then the safety net fires". It is Airflow's
 `or_(Job.state != RUNNING, Job.latest_heartbeat < limit)` in our schema. Lease
@@ -887,6 +1149,34 @@ bug twice: the sweep re-fires every interval because nothing records that a reap
 is already in flight, and in one case walked a task to `FAILED` with its retries
 never consumed.
 
+**A pending terminal command must block a new claim of the same unit.** Nothing
+in the first draft said so, and the review confirmed the consequence by tracing
+code: terminal report accepted (202) → finalizer backlogged (its normal state)
+→ the user resumes the `failed` job (`resume_job` explicitly allows `failed`;
+`queue_job_for_resume` is `WHERE id = $1` with **no status predicate**) → a new
+pod claims and runs on the same PVC → the finalizer then drains the *old*
+command's Class C and **destroys the workspace under the running successor**,
+with the "final" snapshot capturing half-mutated round-two state. The UID
+precondition does not help — same object, legitimately captured UID. Three
+layers, cheapest first: the lane-aware resume verb refuses with 409
+("completion finalizing") while the newest command is live-or-within-deadline,
+and on an expired lease kicks the resume-the-finalizer arm before proceeding;
+the claim predicate excludes units whose job carries such a command (the
+liveness answer transfers verbatim — live lease OR within `deadline_at`, so
+"blocked forever" degrades to bounded wait); and S36 re-checks in its own
+transaction that no higher `report_seq` exists before deleting — the authority
+rule applied at the effect site, where it currently is not.
+
+**Accept must terminal-ize the run_queue unit in the same transaction.** The
+queue reaper is the one rescuer no jobs-side predicate can reach. Without this:
+the agent reports terminal (202), dies before `complete_unit`, its lease
+expires, the reaper requeues, and a successor **re-runs the final batch** —
+paid tokens and external side effects — inside a workspace the finalizer may
+already be archiving, then files a second report under a valid fence. So a
+terminal-report accept runs `complete_unit` (or a terminal park) under the
+report's own token, in the accept transaction; a fence failure rejects the
+report.
+
 **Ship the redundant safety net on day one.** A second, dumber sweep that finds
 command rows whose job is already terminal, or that never advanced past their
 first effect, and reconciles them. Kubernetes added exactly this in v1.29 —
@@ -901,9 +1191,49 @@ terminal status**, marks the command `force_resolved`, and records which effects
 were skipped — state recorded, tail explicitly abandoned. Log it as an incident,
 not a routine operation.
 
-**One invariant, testable in CI:** for every job in `processing`, either a live
-agent lease exists, or a live finalizer lease exists, or exactly one sweep
-matches it. A job matched by nothing is the stuck namespace, rebuilt.
+**The effect synthesizers need deference in both directions** (class 2 of the
+four). Three concrete collisions the review confirmed against code, each fixed
+the same way — the sweep stands down while the command's lease is live, and
+the finalizer's *own* effect CASes on world state and marks itself
+`superseded` on a miss:
+
+- **`unstick_reviewing_parents` vs the critic spawn.** Class B writes
+  `reviewing`; the finalizer parks before Class C spawns the critic; at 30
+  minutes the watchdog fires — legitimately, its predicate is vacuously
+  satisfied with zero critic children — hands the target to a human, who
+  decides. The resumed finalizer then spawns a critic anyway (the spawn path
+  has **no parent-status predicate**), whose verdict is applied by writers that
+  also have none: a `returned` verdict re-queues a human-approved, merged,
+  torn-down job; an `approved` verdict overrides a human rejection. **The 0132
+  index does not help** — this interleaving contains exactly one INSERT; the
+  index closes only the crash-after-INSERT-before-marker case.
+- **The project-loop heal vs the loop advance.** The heal's guard is
+  emptiness + a 600 s age gate, and that gate's own code comment records the
+  live incident it was built for (duplicate iter-14 critics). A finalizer that
+  parks between the barrier claim and the advance makes that window routine,
+  so the heal re-arms a barrier the finalizer already claimed and both spawn
+  stage N+1. **Simplest fix, and preferred: move the barrier claim out of
+  Class B into the same Class C transaction as the spawn** — nothing in the
+  triage rationale requires the claim to precede the status write, since loop
+  jobs resolve `completed` regardless.
+- **The lifecycle reconciler vs Class C teardown.** It runs under a *different*
+  leadership domain than the finalizer, so both run concurrently by
+  construction; terminal statuses are reapable with no grace and `reviewing` is
+  idle-reapable behind only a live-child guard — which is false in exactly the
+  Class B→Class C window. Result: double snapshot-then-delete to the same key,
+  or a parent pod reaped under a not-yet-spawned critic. It cannot simply be
+  excluded — it is decision (8)'s leak backstop — so it is **routed**: skip
+  while the lease is live; on expiry, *resume the same UID-keyed teardown
+  effect rows* rather than run a parallel implementation. Note the VM path
+  already passes `preconditions: {uid}`; pods and PVCs are the gap, and one
+  shared implementation in `container_provisioner` serves both actors.
+
+**One invariant, testable in CI:** every job carrying an unfinalized command
+row is owned by exactly one actor — a live agent lease, a live finalizer lease,
+or exactly one routed sweep — **whatever its status**. (Scoping this to
+`processing`, as the first draft did, misses every collision above: they occur
+in `reviewing`, terminal, `paused` and `waiting`.) A job matched by nothing is
+the stuck namespace, rebuilt.
 
 **(7) Rollout — one triage, then six steps, each independently revertible.**
 
@@ -970,8 +1300,8 @@ window that (6)'s liveness machinery has to defend shrinks with it.
    critic index with its dedupe pre-flight as a separate earlier migration.
 2. **0140+** — the command and effect tables, `jobs.completion_seq_hwm`, the
    leader lease row, and the sweep predicate view. Dead schema; zero behaviour
-   change. The worker driver needed no schema and left its allocated 0133–0139
-   range unused.
+   change. The worker driver needed no schema; S2's close-out later took 0133
+   from that range, leaving 0134–0139 free.
 3. Accept writes the command for **both** lanes; the finalizer runs **inline**
    for both. Behaviour is identical to today, but every report is now durably
    recorded. This is the step that carries real risk — soak it behind a flag.
@@ -980,6 +1310,36 @@ window that (6)'s liveness machinery has to defend shrinks with it.
    with (6)'s sweep predicates. Pinned gains crash recovery here.
 5. Background finalizer enabled for stateless units only.
 6. Stateless worker admission opens.
+
+**Revert rules, per step — "independently revertible" was asserted, not
+demonstrated.** Step 1's image rollback cannot remove the 0132 index, and
+pre-step-1 code has no `23505` handler, so the closed race re-manifests as an
+unhandled 500 mid-`/complete` — fail-loud and acceptable, but name it. Steps
+2/3 rolled back with rows already written: old code ignores the tables and
+replays via the status guard, but commands stranded `pending` across the
+rollback get found later by step 4's sweep, for jobs old code long since
+re-completed — so the safety net's "reconcile" **must mean mark-superseded,
+never execute**; executing a stale S36 months late is the workspace-kill above
+through the back door. Step 4 inherits §5.4.1's discipline explicitly: **drain,
+or flag off the reordering, before any orchestrator rollback during the soak**
+— otherwise old sweeps, which know nothing of the routing table, see
+"processing + agent gone" and re-dispatch mid-finalization. Step 5's max-age
+alarm must live in the **sweep/monitoring path, not the finalizer loop**, or
+disabling the finalizer disables the alarm that would report it. Step 6
+re-closed means **admission-off ≠ executor-off**: stop enqueueing, keep the
+claim loop until in-flight units drain terminal — a lane flip cannot rescue
+them, because rotation never stashes `freeze_data` and pinned agents cannot
+read the fenced PG checkpoint, so re-dispatch would silently restart from
+phase 0. Add a stateless queued-age alarm too: scaling the worker Deployment
+to zero leaves queued units with no claimant and no reaper coverage.
+
+**One live-fuse constraint on step 3.** `report_completion` uses a 60 s client
+timeout and starlette cancels the handler on client disconnect, so today's
+completion pipeline already carries an undocumented upper bound whose failure
+mode is duplicate execution. Step 3 must therefore split accept from finalize
+so a cancellation can only land *between* them, and must ship the
+finalizer-resume drain **with** step 3 rather than at steps 4/5 — otherwise
+cancellation mints pending commands that nothing drains.
 
 The agent-side `client_report_id` must be **optional** with a server-side
 fallback (synthesize from `(job_id, report_seq)`), so an orchestrator that
@@ -1031,9 +1391,12 @@ Sequencing: this lands **after** step 1 below, so the three items S2 has blocked
 behind it (exact `llm_requests` archival, turn-end memory capture, post-callback
 Git turn→SHA ordering) wait on the substrate rather than on all of Gate 3.
 
-**Migration numbering:** S1 used 0115–0121; S2 used **0122–0129** (all
-consumed); Gate 3 step 1 used **0130–0132**; the **worker driver owns
-0133–0139**; **Gate 3 steps 2+ keep 0140–0149**. The wider ranges are deliberate
+**Migration numbering:** S1 used 0115–0121 (with `0115a_run_queue.sql` renamed
+during the 2026-08-12 develop merge — develop had independently taken 0115;
+the rename is byte-identical so recorded checksums stay valid); S2 used
+**0122–0129** plus **0133** at close-out; Gate 3 step 1 used **0130–0132**;
+**0134–0139 remain free**; **Gate 3 steps 2+ keep 0140–0149**. The wider ranges
+are deliberate
 — S2 was allocated eight numbers, used all eight, and stopped partly because it
 had none left, which was an allocation error rather than a design constraint.
 Range allocation itself remains necessary: the earlier dev-cluster wedge came
@@ -1197,17 +1560,46 @@ The migration's steady state is **dual control planes** for the whole soak — a
 - **S4 — optional, bill-driven**: in-process multiplexing; compile-once; workspace pause tier (§10.7); JetStream hatch.
 - **Rollback**: per-class flag at every stage; pinned plane intact until lane retirement decisions (§10.9).
 
-### 9.1 Implementation status (2026-08-11)
+### 9.1 Implementation status (2026-08-12)
 
-Written against the code on the consolidated `feature/stateless-agents`, not against
-intent. The short version: **the shared substrate is genuinely kind-agnostic;
-the session lane now accepts exact virtual/none and Kubernetes sandbox
-workspaces; and the default-off worker driver is built end to end on the current
-shared local pool.** S2 sandbox admission passed its fail-closed lifecycle and
-two-pod acceptance gates on 2026-08-11. Worker rotation still obeys the
-2026-08-10 §5.4.5 scope correction: it releases only through `run_queue` and
-never calls `/complete`. The production two-Deployment/KEDA shape, Job Bench
-rollout gate and Gate 3's separate multi-effect completion program remain open.
+Written against the code on `feature/stateless-agents`, not against intent. The
+short version: **the shared substrate is genuinely kind-agnostic; the session
+lane now accepts exact virtual/none and Kubernetes sandbox workspaces; and the
+default-off worker driver is built end to end on the current shared local
+pool.** S2 sandbox admission passed its fail-closed lifecycle and two-pod
+acceptance gates on 2026-08-11. Worker rotation still obeys the 2026-08-10
+§5.4.5 scope correction: it releases only through `run_queue` and never calls
+`/complete`. The production two-Deployment/KEDA shape, Job Bench rollout gate
+and Gate 3's separate multi-effect completion program remain open.
+
+**Integration status (2026-08-12).** `origin/develop` is merged into the branch
+(`8a730c63`); drift is zero and `origin/develop` is an ancestor of HEAD. The
+migration collision that merge created is resolved by renaming ours to
+`0115a_run_queue.sql` — byte-identical, so recorded checksums stay valid —
+leaving develop's `0115_datasource_tombstones.sql` untouched; verify that
+ordering with the runner's own `sorted()`, never with `sort(1)`, which reports
+the opposite under locale collation. All four k3d smokes pass on the merged
+tree: pinned job to `completed` with a non-null `completed_at` and zero
+residue; a stateless session surviving a forced cross-pod handoff with file,
+tmux environment and cwd intact; the worker driver rotating with
+`complete_calls=0` and then making exactly **one** terminal `/complete`; and
+suspension/resume restoring an exact file across a changed workspace Pod UID.
+The post-merge pytest baseline is **17 known failures** (11 pre-existing
+environment/py3.14 plus 6 VM-chart contract tests that reproduce on a clean
+`origin/develop`), against ~17,060 passing. **The branch is ready for a pull
+request onto develop**, where it arrives mostly dormant: stateless session
+admission and worker admission are both default-off in the chart, and every
+thread and job defaults to `pinned`. What actually goes live on dev is the
+pinned-lane fix set — the Class A atomic status write, the ready-before-report
+ordering fix, the critic dedupe index, the durable control/interrupt inboxes,
+DB-backed session tasks and the workspace path-bypass fixes.
+
+**Gate 3 documentation status.** §5.4.5 was adversarially reviewed on
+2026-08-10/11 (four critics, ten blockers) and the findings were folded back
+into it on 2026-08-12. That section is authoritative again;
+`docs/research/stateless_agents/gate3_adversarial_review.md` is retained as the
+evidence behind each change. **Its DDL is now the corrected one** — the
+pre-fold version must not be built from.
 
 #### Is it shared between sessions and workers? The substrate and local pool are; the production split is not built.
 
