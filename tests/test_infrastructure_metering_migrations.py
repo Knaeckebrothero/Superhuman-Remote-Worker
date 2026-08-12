@@ -130,8 +130,73 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
     ROOT
     / "orchestrator/database/migrations/app/0114_compute_interval_epoch_shape_repair.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = (
+# Bump this whenever a new app migration lands — the assertion below is the
+# tripwire that says "a migration was added; check the snapshot was regenerated
+# and nothing was renumbered". Head as of the merged stateless work: the S3
+# worker-lane partition (0118), session control inbox (0119-0121), and the
+# stateless cloud-generation fence/content baseline (0122-0124), and durable
+# owner-gated client presence (0125), and lane-independent Canvas editor
+# awareness (0126), the exact-lease interrupt inbox (0127-0129), and the
+# verification-critic dedupe/concurrent unique-index rollout (0130-0132), and
+# the S2 durable persistent-session residue tables (0133).
+APP_DATASOURCE_TOMBSTONES_MIGRATION = (
     ROOT / "orchestrator/database/migrations/app/0115_datasource_tombstones.sql"
+)
+APP_JOBS_EXECUTION_LANE_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
+)
+APP_THREAD_CONTROL_INBOX_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0119_thread_control_inbox.sql"
+)
+APP_THREAD_CONTROL_RECEIPT_INDEX = (
+    ROOT
+    / "orchestrator/database/migrations/app/0120_thread_control_receipt_idx.notx.sql"
+)
+APP_THREAD_CONTROL_VALIDATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0121_thread_control_validate_constraints.sql"
+)
+APP_THREAD_CLOUD_SYNC_GENERATIONS = (
+    ROOT / "orchestrator/database/migrations/app/0122_thread_cloud_sync_generations.sql"
+)
+APP_THREAD_CLOUD_SYNC_BASELINES = (
+    ROOT / "orchestrator/database/migrations/app/0123_thread_cloud_sync_baselines.sql"
+)
+APP_CLOUD_SYNC_MARKER_COMMENT = (
+    ROOT / "orchestrator/database/migrations/app/0124_cloud_sync_marker_comment.sql"
+)
+APP_THREAD_CLIENT_PRESENCE = (
+    ROOT / "orchestrator/database/migrations/app/0125_thread_client_presence.sql"
+)
+APP_CANVAS_EDITOR_AWARENESS = (
+    ROOT / "orchestrator/database/migrations/app/0126_canvas_editor_awareness.sql"
+)
+APP_THREAD_INTERRUPT_INBOX = (
+    ROOT / "orchestrator/database/migrations/app/0127_thread_interrupt_inbox.sql"
+)
+APP_THREAD_INTERRUPT_RECEIPT_INDEX = (
+    ROOT
+    / "orchestrator/database/migrations/app/0128_thread_interrupt_receipt_idx.notx.sql"
+)
+APP_THREAD_INTERRUPT_VALIDATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0129_thread_interrupt_validate_constraints.sql"
+)
+APP_JOBS_VERIFICATION_DEDUPE = (
+    ROOT / "orchestrator/database/migrations/app/0130_jobs_verification_dedupe.sql"
+)
+APP_JOBS_VERIFICATION_DROP_INDEX = (
+    ROOT
+    / "orchestrator/database/migrations/app/0131_drop_jobs_verification_uniq.notx.sql"
+)
+APP_JOBS_VERIFICATION_INDEX = (
+    ROOT / "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql"
+)
+APP_THREAD_SESSION_DURABLE_STATE = (
+    ROOT / "orchestrator/database/migrations/app/0133_thread_session_durable_state.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = (
+    ROOT / "orchestrator/database/migrations/app/0133_thread_session_durable_state.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
@@ -684,7 +749,113 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
         "schema_current"
         not in APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.read_text()
     )
+    assert "schema_current" not in APP_DATASOURCE_TOMBSTONES_MIGRATION.read_text()
+    assert "schema_current" not in APP_THREAD_SESSION_DURABLE_STATE.read_text()
     assert "audit_schema_current" not in AUDIT_EXPANSION.read_text()
+
+
+def test_control_inbox_migration_preserves_and_constrains_narration_receipts() -> None:
+    sql = _compact(APP_THREAD_CONTROL_INBOX_MIGRATION.read_text())
+    index_sql = _compact(APP_THREAD_CONTROL_RECEIPT_INDEX.read_text())
+    validation_sql = _compact(APP_THREAD_CONTROL_VALIDATION.read_text())
+
+    assert "ADD COLUMN narration_mode TEXT" in sql
+    assert "ADD COLUMN control_admission_agent_id UUID" in sql
+    assert "control_admission_open" not in sql
+    assert "narration_mode TEXT NOT NULL" not in sql
+    assert "narration_mode TEXT NOT NULL DEFAULT 'auto'" not in sql
+    assert (
+        "metadata #>> '{config_override,interactive,narration_mode}'" in validation_sql
+    )
+    assert "IN ('silent', 'verbose', 'auto')" in validation_sql
+    assert "CONSTRAINT valid_narration_mode" in sql
+    assert "CHECK (narration_mode IN ('silent', 'verbose', 'auto')) NOT VALID" in sql
+    assert "CONSTRAINT uq_thread_control_identity UNIQUE (id, thread_id)" in sql
+    assert "FOREIGN KEY (control_request_id, thread_id)" in sql
+    assert "REFERENCES thread_control_requests(id, thread_id) NOT VALID" in sql
+    assert "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS" in index_sql
+    assert "idx_thread_events_control_request" in index_sql
+    assert "VALIDATE CONSTRAINT valid_narration_mode" in validation_sql
+    assert (
+        "VALIDATE CONSTRAINT thread_events_control_request_thread_fkey"
+        in validation_sql
+    )
+
+
+def test_stateless_cloud_sync_migrations_keep_resource_and_baseline_fences() -> None:
+    generations = _compact(APP_THREAD_CLOUD_SYNC_GENERATIONS.read_text())
+    baselines = _compact(APP_THREAD_CLOUD_SYNC_BASELINES.read_text())
+    marker_comment = _compact(APP_CLOUD_SYNC_MARKER_COMMENT.read_text())
+
+    assert "PRIMARY KEY (thread_id, mount_id)" in generations
+    assert "acknowledged_generation <= required_generation" in generations
+    assert "WHERE acknowledged_generation < required_generation" in generations
+    assert "workspace_generation TEXT NOT NULL" in generations
+    assert "sync_scope_sha256 CHAR(64) NOT NULL" in generations
+    assert "baseline_manifest JSONB NOT NULL DEFAULT '{}'::jsonb" in baselines
+    assert "octet_length(baseline_manifest::text) <= 4194304" in baselines
+    assert "baseline_sha256 CHAR(64) NOT NULL" in baselines
+    assert "thread_cloud_sync_baseline_digest_shape" in baselines
+    assert "The resource commit" in marker_comment
+    assert "marker binds this digest" in marker_comment
+    assert "Resource marker v2" not in marker_comment
+
+
+def test_thread_client_presence_is_ttl_only_and_not_an_authority() -> None:
+    presence = _compact(APP_THREAD_CLIENT_PRESENCE.read_text())
+
+    assert "thread_id UUID PRIMARY KEY" in presence
+    assert "REFERENCES threads(id) ON DELETE CASCADE" in presence
+    assert "CHECK (expires_at > refreshed_at)" in presence
+    assert "idx_thread_client_presence_expires_at" in presence
+    assert "disconnect never deletes it" in presence
+    assert "never authorization, queue ownership" in presence
+    assert "fencing token" in presence
+
+
+def test_canvas_editor_awareness_is_monotonic_ttl_courtesy_state() -> None:
+    awareness = _compact(APP_CANVAS_EDITOR_AWARENESS.read_text())
+
+    assert "PRIMARY KEY (thread_id, canvas_id, editing_session_id)" in awareness
+    assert "REFERENCES canvases (thread_id, canvas_id) ON DELETE CASCADE" in awareness
+    assert "UNIQUE (sender_id)" in awareness
+    assert "CHECK (canvas_id = 'main')" in awareness
+    assert "CHECK (client_seq > 0)" in awareness
+    assert "state IN ('editing', 'idle')" in awareness
+    assert "state = 'idle' AND expires_at = refreshed_at" in awareness
+    assert "idx_canvas_editor_awareness_expires_at" in awareness
+    assert "UX state only, never authorization or execution lease" in awareness
+
+
+def test_interrupt_inbox_is_exact_lease_turn_and_durably_receipted() -> None:
+    inbox = _compact(APP_THREAD_INTERRUPT_INBOX.read_text())
+    index_sql = _compact(APP_THREAD_INTERRUPT_RECEIPT_INDEX.read_text())
+    validation_sql = _compact(APP_THREAD_INTERRUPT_VALIDATION.read_text())
+
+    assert "ADD COLUMN interrupt_admission_lease_token BIGINT" in inbox
+    assert "ADD COLUMN interrupt_admission_turn_id INTEGER" in inbox
+    assert "CONSTRAINT run_queue_interrupt_admission_shape" in inbox
+    assert "interrupt_admission_lease_token = lease_token" in inbox
+    assert "unit_kind = 'session_turn'" in inbox
+    assert "state = 'leased'" in inbox
+    assert "CREATE TABLE thread_interrupt_requests" in inbox
+    assert "UNIQUE (thread_id, client_request_id)" in inbox
+    assert "UNIQUE (id, thread_id)" in inbox
+    assert "UNIQUE (thread_id, accepted_lease_token, target_turn_id)" not in inbox
+    assert "accepted_lease_token BIGINT NOT NULL" in inbox
+    assert "target_turn_id INTEGER NOT NULL" in inbox
+    assert "outcome IN ('applied', 'rejected')" in inbox
+    assert "applied_mode IN ('hard', 'graceful')" in inbox
+    assert "applied_lease_token = accepted_lease_token" in inbox
+    assert "FOREIGN KEY (interrupt_request_id, thread_id)" in inbox
+    assert "REFERENCES thread_interrupt_requests(id, thread_id) NOT VALID" in inbox
+    assert "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS" in index_sql
+    assert "idx_thread_events_interrupt_request" in index_sql
+    assert "VALIDATE CONSTRAINT run_queue_interrupt_admission_shape" in validation_sql
+    assert (
+        "VALIDATE CONSTRAINT thread_events_interrupt_request_thread_fkey"
+        in validation_sql
+    )
 
 
 def test_compute_foundation_is_immutable_and_lock_fix_is_superseding() -> None:

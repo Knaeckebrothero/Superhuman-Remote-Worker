@@ -168,6 +168,14 @@ Cockpit flow:
 
 Both endpoints reuse the same `{ws_url, token, expires_at}` shape so the cockpit code path is unified.
 
+> **Stateless-lane override (2026-08-08):** this section remains the pinned-lane
+> contract. `GET /connection` now also returns `execution_lane` and
+> `control_socket`. A detached queue-served thread reports
+> `execution_lane="stateless"`, `control_socket="none"`, and explicit null
+> socket fields. That means “turn admission is ready,” not “REST controls
+> exist”; Cockpit consumption and durable stateless controls remain unbuilt.
+> See [stateless_agents.md](stateless_agents.md#91-implementation-status-2026-08-08).
+
 ### Orchestrator: `orchestrator/services/session_router.py` (new module)
 
 Single responsibility: keep a K8s Ingress resource in sync with the agent-binding state.

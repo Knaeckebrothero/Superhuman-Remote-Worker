@@ -262,6 +262,11 @@ class TestSweeperPerThreadTTL:
         fake_db = MagicMock()
         fake_db.acquire = lambda: _Acquire()
         monkeypatch.setattr(orch_main, "postgres_db", fake_db)
+        monkeypatch.setattr(
+            orch_main,
+            "promote_expired_stateless_pauses",
+            AsyncMock(return_value=[]),
+        )
 
         suspension = MagicMock()
         suspension.is_enabled = True

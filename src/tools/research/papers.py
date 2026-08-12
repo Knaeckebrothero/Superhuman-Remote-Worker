@@ -67,29 +67,6 @@ def _detect_identifier_type(identifier: str) -> str:
     return "doi"  # Default assumption
 
 
-def _is_remote_workspace(context: ToolContext) -> bool:
-    """Check if the workspace lives on a remote host."""
-    if not context.has_workspace():
-        return False
-    return context.workspace_manager.backend.host is not None
-
-
-def _get_local_documents_dir(context: ToolContext) -> Path:
-    """Get a local directory for downloads.
-
-    For local workspaces, returns the workspace documents/ dir directly.
-    For remote workspaces, returns a local temp dir (caller must transfer
-    files to the workspace via the backend).
-    """
-    if not context.has_workspace():
-        return Path("./downloads")
-    if _is_remote_workspace(context):
-        # Remote workspace — download locally first, transfer after
-        d = Path(tempfile.mkdtemp(prefix="paper_dl_"))
-        return d
-    return context.workspace_manager.get_path("documents")
-
-
 def _transfer_to_workspace(
     context: ToolContext, local_path: Path, dest_rel: str
 ) -> str:
@@ -159,18 +136,24 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
         if identifier_type == "auto":
             identifier_type = _detect_identifier_type(identifier)
 
-        remote = _is_remote_workspace(context)
-        dest_dir = _get_local_documents_dir(context)
+        if not context.has_workspace():
+            return "Could not download paper: no workspace is available."
 
         # Track whether we found a paywalled paper (for messaging)
         paywalled_title = None
 
-        try:
+        # A virtual workspace has ``host is None`` but its paths are object
+        # keys, not agent-local files. Every tier therefore downloads to a
+        # bounded local staging directory and writes the result via the
+        # backend.
+        with tempfile.TemporaryDirectory(prefix="paper_dl_") as temp_dir:
+            dest_dir = Path(temp_dir)
+
             # Try arXiv first (for arXiv IDs, or DOIs that might be arXiv)
             if identifier_type == "arxiv" or "arxiv" in identifier.lower():
                 result = await _try_arxiv_download(identifier, dest_dir)
                 if result.success:
-                    ws_path = _maybe_transfer(context, remote, result.path)
+                    ws_path = _store_download_in_workspace(context, result.path)
                     await _register_downloaded_paper(context, result, ws_path)
                     return (
                         f"Downloaded: {result.paper.title}\n"
@@ -186,7 +169,7 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
                         doi.group(), dest_dir, proxy=proxy
                     )
                     if result.success:
-                        ws_path = _maybe_transfer(context, remote, result.path)
+                        ws_path = _store_download_in_workspace(context, result.path)
                         await _register_downloaded_paper(context, result, ws_path)
                         return (
                             f"Downloaded: {result.paper.title}\n"
@@ -199,13 +182,6 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
                         paywalled_title = result.paper.title
                     elif result.error:
                         logger.debug(f"Unpaywall download failed: {result.error}")
-
-        finally:
-            # Clean up temp dir if we created one for remote downloads
-            if remote and dest_dir.exists():
-                import shutil
-
-                shutil.rmtree(dest_dir, ignore_errors=True)
 
         # All methods failed
         if paywalled_title:
@@ -467,17 +443,12 @@ async def _get_arxiv_info(identifier: str) -> str:
     return "\n".join(lines)
 
 
-def _maybe_transfer(
-    context: ToolContext, remote: bool, local_path: Optional[Path]
+def _store_download_in_workspace(
+    context: ToolContext, local_path: Optional[Path]
 ) -> str:
-    """If remote, transfer a locally downloaded file to the workspace.
-
-    Returns a display path (workspace-relative for remote, absolute for local).
-    """
+    """Write one operation-scoped download through the workspace backend."""
     if local_path is None:
         return ""
-    if not remote:
-        return str(local_path)
     dest_rel = f"documents/{local_path.name}"
     _transfer_to_workspace(context, local_path, dest_rel)
     return dest_rel

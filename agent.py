@@ -20,6 +20,10 @@ Examples:
     # Persistent-only server with a specific thread
     python agent.py --mode persistent --port 8002 --thread-id <uuid>
 
+    # Stateless turn executor: claims session_turn units from the shared
+    # run_queue instead of registering/heartbeating (stateless_agents.md M3).
+    python agent.py --mode stateless --config session_base --port 8001
+
     # Loop mode: after a job/session completes, return to IDLE instead of
     # exiting. Needed for Docker Compose / bare-metal dev where the process
     # is not respawned automatically.
@@ -95,9 +99,14 @@ def parse_args():
     # Agent mode
     parser.add_argument(
         "--mode",
-        choices=["worker", "persistent", "dual"],
+        choices=["worker", "persistent", "dual", "stateless"],
         default="dual",
-        help="Agent mode: 'dual' (accepts jobs or sessions, default), 'worker' (jobs only), or 'persistent' (sessions only)",
+        help=(
+            "Agent mode: 'dual' (accepts jobs or sessions, default), 'worker' "
+            "(jobs only), 'persistent' (sessions only), or 'stateless' "
+            "(claims session turns from the run_queue — no registration, no "
+            "heartbeat; stateless_agents.md M3)"
+        ),
     )
     parser.add_argument(
         "--loop",
@@ -148,6 +157,36 @@ def run_persistent_server(
     from src.api.persistent_app import create_persistent_app
 
     app = create_persistent_app(config_path, thread_id)
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        # Defer to our root JSON handler so uvicorn's own access/error logs are
+        # JSON too, not plain text (see docs/features/centralized_logging.md).
+        log_config=None,
+    )
+
+
+def run_stateless_server(config_path: str, host: str, port: int):
+    """Run the stateless turn executor (stateless_agents.md M3).
+
+    Boots the persistent app internals with STATELESS_EXECUTOR=1: no
+    orchestrator registration, no heartbeat loop, no boot-WS/status
+    watchdogs. Work arrives exclusively via run_queue claims (the executor
+    background task started by the lifespan); direct WS/input endpoints
+    answer 409. /health and /ready stay live for k8s probes.
+    """
+    logger = logging.getLogger(__name__)
+
+    logger.info(f"Starting Stateless Turn Executor on {host}:{port}")
+    logger.info(f"Config: {config_path}")
+
+    os.environ["STATELESS_EXECUTOR"] = "1"
+
+    from src.api.persistent_app import create_persistent_app
+
+    app = create_persistent_app(config_path, None)
     uvicorn.run(
         app,
         host=host,
@@ -219,6 +258,10 @@ def main():
 
     if args.mode == "worker":
         run_server(config_path, args.host, args.port)
+        return
+
+    if args.mode == "stateless":
+        run_stateless_server(config_path, args.host, args.port)
         return
 
     # Dual mode (default) — accepts both jobs and sessions

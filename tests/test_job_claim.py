@@ -37,6 +37,7 @@ async def db(pg_dsn):
             CREATE TABLE IF NOT EXISTS jobs (
                 id uuid PRIMARY KEY,
                 status text NOT NULL,
+                execution_lane text NOT NULL DEFAULT 'pinned',
                 assigned_agent_id uuid,
                 lease_expires_at timestamptz,
                 -- claim_job_for_agent() clears the previous run's failure
@@ -79,4 +80,15 @@ async def test_claim_rejects_non_dispatchable_status(db):
     # 'processing'/terminal jobs are not claimable even if assigned_agent_id is NULL.
     async with db.acquire() as conn:
         await conn.execute("UPDATE jobs SET status='completed', assigned_agent_id=NULL")
+    assert await db.claim_job_for_agent(JOB, AGENT_1) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["stateless", "future-lane"])
+async def test_claim_rejects_non_pinned_execution_lane(db, lane):
+    """Gate 1: legacy claim is a pinned-lane allowlist, not a denylist."""
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET execution_lane=$2 WHERE id = $1", UUID(JOB), lane
+        )
     assert await db.claim_job_for_agent(JOB, AGENT_1) is False

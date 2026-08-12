@@ -7,7 +7,7 @@ such as workspace managers, database connections, and configuration.
 import asyncio
 import hashlib
 import logging
-import os
+import posixpath
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
     Callable,
     Deque,
     Dict,
@@ -232,6 +233,18 @@ class ToolContext:
     # drift fingerprint (etag, file_sha256) + best-effort live pointer
     # (backend, path, webdav_url) captured when a cloud file is read, so
     # cite_* can persist it onto the source's metadata.cloud block.
+    _cloud_anchor_write_locks: Dict[str, asyncio.Lock] = field(
+        default_factory=dict
+    )  # Per-canonical-path serialization for the workspace write + durable
+    # anchor update. Without this, concurrent downloads to the same target can
+    # leave bytes from one source paired with the other source's provenance.
+    cloud_anchor_persist_callback: Optional[
+        Callable[[str, Dict[str, Any]], Awaitable[None]]
+    ] = (
+        None  # Persistent sessions bind this to a per-thread Postgres upsert.
+        # Pinned workers and focused tests may leave it unset and retain the
+        # historical claim-local anchor cache.
+    )
     _inaccessible_sources: Dict[str, str] = field(
         default_factory=dict
     )  # url -> error message
@@ -306,12 +319,10 @@ class ToolContext:
     _delivered_reply_keys: Set[str] = field(
         default_factory=set
     )  # Content keys of queued replies already appended to the conversation.
-    # The delivery ack is fire-and-forget, so the heartbeat inbox keeps
-    # returning the same entries for up to one interval afterwards; without
-    # this, every todo completed in that window would append the same reply
-    # again. Deliberately process-local: a successor pod has no record of the
-    # delivery, so it redelivers — which is the correct at-least-once
-    # behaviour when the ack may never have landed.
+    # Pinned workers use this process-locally while their ack is in flight.
+    # Stateless workers hydrate it from checkpointed delivered_reply_keys.
+    _stateless_worker: bool = False
+    _worker_lease_token: Optional[int] = None
     _snapshot_callback: Optional[Any] = (
         None  # Callable[[str], None] — pre-write file snapshot for undo
     )
@@ -563,34 +574,74 @@ class ToolContext:
 
         return self.citation_engine
 
-    @staticmethod
-    def _normalize_anchor_key(local_path: str) -> str:
-        """Normalize a local path to the absolute form ``add_doc_source`` uses."""
+    def _normalize_anchor_key(self, path: str) -> str:
+        """Normalize a local or workspace-relative citation path."""
+        if self.workspace_manager is not None:
+            return self.workspace_manager.workspace_relative_path(path)
         try:
-            return str(Path(local_path).resolve())
+            candidate = Path(path)
+            if candidate.is_absolute():
+                return str(candidate.resolve())
+            # Workspace paths are POSIX-like on every backend, including flat
+            # object-store keys. Do not anchor them to this pod's cwd.
+            return posixpath.normpath(path)
         except (OSError, ValueError, RuntimeError):
-            return str(local_path)
+            return str(path)
 
-    def record_cloud_anchor(self, local_path: str, anchor: Dict[str, Any]) -> None:
+    def record_cloud_anchor(self, file_path: str, anchor: Dict[str, Any]) -> None:
         """Stash a cloud snapshot-anchor for a downloaded file (Phase 3, D7).
 
         Called by cloud read tools (e.g. ``webdav_read``) once a file lands in
         the workspace, so a later ``cite_*`` on that path can persist the anchor
-        onto the source's ``metadata.cloud`` block. Keyed by the resolved
-        absolute path (matching how the engine resolves sources).
+        onto the source's ``metadata.cloud`` block. The key may be a real local
+        path or a workspace-relative backend path; producers and consumers use
+        the same normalized identity.
         """
-        if not local_path or not anchor:
+        if not file_path or not anchor:
             return
-        self._cloud_anchors[self._normalize_anchor_key(local_path)] = anchor
+        self._cloud_anchors[self._normalize_anchor_key(file_path)] = anchor
 
-    def get_cloud_anchor(self, local_path: str) -> Optional[Dict[str, Any]]:
-        """Return the stashed cloud snapshot-anchor for a local path, if any."""
-        if not local_path:
+    def get_cloud_anchor(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Return the stashed cloud anchor for a local or workspace path."""
+        if not file_path:
             return None
-        return self._cloud_anchors.get(self._normalize_anchor_key(local_path))
+        return self._cloud_anchors.get(self._normalize_anchor_key(file_path))
+
+    def cloud_anchor_write_lock(self, file_path: str) -> asyncio.Lock:
+        """Return the claim-local lock for one canonical workspace path.
+
+        Datasource tools hold this across both the backend write and
+        ``persist_cloud_anchor``. ``ToolContext`` is event-loop-local, so lock
+        creation cannot interleave before the dictionary entry is published.
+        """
+
+        workspace_path = self._normalize_anchor_key(file_path)
+        lock = self._cloud_anchor_write_locks.get(workspace_path)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._cloud_anchor_write_locks[workspace_path] = lock
+        return lock
+
+    async def persist_cloud_anchor(
+        self,
+        file_path: str,
+        anchor: Dict[str, Any],
+    ) -> None:
+        """Record an anchor locally and await its optional durable sink.
+
+        The callback seam lets persistent sessions bind a thread-scoped
+        Postgres upsert without coupling datasource tools to the database.
+        Callback errors propagate: a configured durable lane must not report a
+        successful cloud read while silently dropping its provenance anchor.
+        """
+        workspace_path = self._normalize_anchor_key(file_path)
+        self.record_cloud_anchor(workspace_path, anchor)
+        callback = self.cloud_anchor_persist_callback
+        if callback is not None:
+            await callback(workspace_path, anchor)
 
     async def snapshot_cloud_source_bytes(
-        self, local_path: str, anchor: Dict[str, Any]
+        self, file_path: str, anchor: Dict[str, Any]
     ) -> Optional[str]:
         """Persist a cited cloud file's original bytes to the snapshot store (D7).
 
@@ -601,25 +652,41 @@ class ToolContext:
         a re-cite of the same file doesn't re-upload, and so the source is
         registered with the key already present (Phase 3b).
 
-        Best-effort: returns the key, or ``None`` when there's no orchestrator
-        client, the file can't be read, or the upload fails — the extracted-text
-        copy remains the citation's verification anchor either way.
+        ``file_path`` may be a local path or a workspace-relative backend path.
+        The latter is materialized with ``WorkspaceManager.local_copy`` before
+        byte access. Best-effort: returns the key, or ``None`` when there's no
+        orchestrator client, the file can't be read, or the upload fails — the
+        extracted-text copy remains the citation's verification anchor either
+        way.
         """
         if anchor.get("snapshot_blob_key"):
             return anchor["snapshot_blob_key"]
         client = self.orchestrator_client
         if client is None:
             return None
+
+        def _read_bytes() -> bytes:
+            if self.workspace_manager is not None:
+                # Workspace identity is authoritative whenever a workspace is
+                # bound.  A same-named file in the agent CWD/image must never
+                # substitute for remote/virtual workspace bytes.
+                workspace_path = self.workspace_manager.workspace_relative_path(
+                    file_path
+                )
+                with self.workspace_manager.local_copy(workspace_path) as local_path:
+                    return local_path.read_bytes()
+            return Path(file_path).read_bytes()
+
         try:
-            data = await asyncio.to_thread(Path(local_path).read_bytes)
-        except OSError as e:
-            logger.debug("Cloud snapshot read failed for %s: %s", local_path, e)
+            data = await asyncio.to_thread(_read_bytes)
+        except Exception as e:
+            logger.debug("Cloud snapshot read failed for %s: %s", file_path, e)
             return None
         content_type = anchor.get("content_type") or "application/octet-stream"
         try:
             key = await client.save_citation_snapshot(data, content_type=content_type)
         except Exception as e:  # never let a snapshot upload break citation creation
-            logger.debug("Cloud snapshot upload failed for %s: %s", local_path, e)
+            logger.debug("Cloud snapshot upload failed for %s: %s", file_path, e)
             return None
         if key:
             anchor["snapshot_blob_key"] = key
@@ -652,36 +719,32 @@ class ToolContext:
         Raises:
             FileNotFoundError: If document doesn't exist
         """
-        if file_path in self._source_registry:
-            return self._source_registry[file_path]
+        source_key = self._normalize_anchor_key(file_path)
+        if source_key in self._source_registry:
+            return self._source_registry[source_key]
 
         if cloud_metadata is None:
-            cloud_metadata = self.get_cloud_anchor(file_path)
+            cloud_metadata = self.get_cloud_anchor(source_key)
 
         metadata = {"cloud": cloud_metadata} if cloud_metadata else None
 
         engine = self.get_citation_engine()
-        # The engine does local filesystem I/O (os.path.exists / fitz.open / open).
-        # On a remote workspace backend the file lives on the workspace pod, not on
-        # this agent host, so materialize a local copy first — mirroring the read
-        # tools (workspace.local_copy in files.py / filesystem.py). A path that is
-        # already present locally (e.g. the agent-side auto-register glob) is passed
-        # through unchanged.
-        if self.workspace_manager is not None and not os.path.exists(file_path):
-            # local_copy resolves relative to the workspace root; the backend
-            # rejects absolute/leading-slash paths, so normalize first.
-            rel = file_path.lstrip("/")
-            with self.workspace_manager.local_copy(rel) as local_path:
+        # The engine performs local filesystem I/O, while this value identifies
+        # a workspace object.  Always materialize through the workspace backend:
+        # host ``os.path.exists`` is not a locality signal and a CWD/image decoy
+        # with the same relative name must not replace remote/virtual bytes.
+        if self.workspace_manager is not None:
+            with self.workspace_manager.local_copy(source_key) as local_path:
                 source = await engine.add_doc_source(
                     str(local_path),
-                    name=name or os.path.basename(file_path),
+                    name=name or posixpath.basename(source_key),
                     metadata=metadata,
                 )
         else:
             source = await engine.add_doc_source(
                 file_path, name=name, metadata=metadata
             )
-        self._source_registry[file_path] = source.id
+        self._source_registry[source_key] = source.id
         return source.id
 
     async def get_or_register_web_source(
@@ -935,16 +998,23 @@ class ToolContext:
             content: Complete text content observed by the reader, when available
         """
         normalized = path.lstrip("/").strip()
+        content_version = None
+        if content is not None:
+            raw = content.encode("utf-8") if isinstance(content, str) else content
+            content_version = "sha256:" + hashlib.sha256(raw).hexdigest()
         # Instruction files are pinned: unrelated reads must not make a
         # job-scoped gate look unread merely because the 10-entry FIFO cycled.
         # Phase/freshness-scoped gates use the independent stamp below.
         if self._is_instruction_path(normalized):
             self._pinned_reads.add(normalized)
-            self._instruction_read_stamps[normalized] = {
+            stamp: Dict[str, Any] = {
                 "phase": self._current_phase,
                 "phase_number": self._current_phase_number,
                 "turn_count": self._current_turn_count,
             }
+            if content_version is not None:
+                stamp["content_version"] = content_version
+            self._instruction_read_stamps[normalized] = stamp
         evicted = None
         # Remove if already present (we'll re-add at the end)
         if normalized in self._recent_reads:
@@ -966,10 +1036,7 @@ class ToolContext:
             # other callers that do not have authoritative full text.
             self._recent_read_versions.pop(normalized, None)
         else:
-            raw = content.encode("utf-8") if isinstance(content, str) else content
-            self._recent_read_versions[normalized] = (
-                "sha256:" + hashlib.sha256(raw).hexdigest()
-            )
+            self._recent_read_versions[normalized] = content_version
 
     def _is_instruction_path(self, normalized: str) -> bool:
         """Whether a normalized path is a configured instruction file."""
@@ -1032,6 +1099,105 @@ class ToolContext:
         self._recent_read_versions.pop(normalized, None)
         self._instruction_read_stamps.pop(normalized, None)
         return present
+
+    def export_instruction_read_receipts(self) -> Dict[str, Dict[str, Any]]:
+        """Return safe instruction-read receipts for a worker checkpoint.
+
+        Only configured instruction paths are exported. Ordinary recent-file
+        reads and their write-authorizing versions remain claim-local: carrying
+        those across a handoff could authorize a stale edit. The optional
+        content version here is used solely to reject a receipt when the
+        instruction changed between images/claims.
+        """
+
+        receipts: Dict[str, Dict[str, Any]] = {}
+        for path, stamp in self._instruction_read_stamps.items():
+            if path not in self._pinned_reads or not self._is_instruction_path(path):
+                continue
+            receipt: Dict[str, Any] = {
+                "phase": stamp.get("phase"),
+                "phase_number": stamp.get("phase_number"),
+                "turn_count": int(stamp.get("turn_count") or 0),
+            }
+            content_version = stamp.get("content_version")
+            if content_version:
+                receipt["content_version"] = content_version
+            receipts[path] = receipt
+        return receipts
+
+    def restore_instruction_read_receipts(self, value: Any) -> int:
+        """Hydrate checkpointed instruction receipts into this claim.
+
+        Invalid paths/shapes and receipts for changed instruction content are
+        ignored fail-closed. This restores only enforcement visibility and its
+        phase/turn stamp; it never restores ``_recent_reads`` or
+        ``_recent_read_versions``, so read-before-write authorization cannot
+        cross a worker lease.
+        """
+
+        if not isinstance(value, dict):
+            return 0
+
+        configured_paths = {
+            (getattr(entry, "path", "") or "").lstrip("/").strip()
+            for entry in self._instruction_files
+        }
+        configured_paths.discard("")
+        for path in configured_paths:
+            if path in self._recent_reads:
+                self._recent_reads.remove(path)
+            self._pinned_reads.discard(path)
+            self._recent_read_versions.pop(path, None)
+            self._instruction_read_stamps.pop(path, None)
+
+        restored = 0
+        for raw_path, raw_receipt in value.items():
+            path = str(raw_path or "").lstrip("/").strip()
+            if path not in configured_paths or not isinstance(raw_receipt, dict):
+                continue
+            phase = raw_receipt.get("phase")
+            phase_number = raw_receipt.get("phase_number")
+            turn_count = raw_receipt.get("turn_count")
+            if phase is not None and not isinstance(phase, str):
+                continue
+            if phase_number is not None and (
+                isinstance(phase_number, bool) or not isinstance(phase_number, int)
+            ):
+                continue
+            if (
+                isinstance(turn_count, bool)
+                or not isinstance(turn_count, int)
+                or turn_count < 0
+            ):
+                continue
+
+            content_version = raw_receipt.get("content_version")
+            if content_version is not None:
+                if not (
+                    isinstance(content_version, str)
+                    and content_version.startswith("sha256:")
+                ):
+                    continue
+                try:
+                    content = self.workspace_manager.read_file(path)
+                except Exception:
+                    continue
+                raw = content.encode("utf-8") if isinstance(content, str) else content
+                current_version = "sha256:" + hashlib.sha256(raw).hexdigest()
+                if current_version != content_version:
+                    continue
+
+            self._pinned_reads.add(path)
+            stamp: Dict[str, Any] = {
+                "phase": phase,
+                "phase_number": phase_number,
+                "turn_count": turn_count,
+            }
+            if content_version is not None:
+                stamp["content_version"] = content_version
+            self._instruction_read_stamps[path] = stamp
+            restored += 1
+        return restored
 
     def get_read_tracking_limit(self) -> int:
         """Get the tracking window size from config or default.
@@ -1202,10 +1368,13 @@ class ToolContext:
     async def browser_exec(self, action: str, **args: Any) -> Dict[str, Any]:
         """Run one browser action on the workspace via the browser-exec helper.
 
-        Drives Chromium on the workspace over SSH (``exec_command``) rather
-        than speaking CDP across the pod boundary. The workspace daemon holds
-        the persistent session so element refs survive between calls. Returns
-        the parsed JSON result, or an ``{"error": ...}`` dict on any failure.
+        Drives Chromium on the workspace over SSH rather than speaking CDP
+        across the pod boundary. The workspace daemon holds the persistent
+        session so element refs survive between calls. Stateless workspaces
+        route the command through the same exact-claim resource fence as other
+        workspace-resident daemons; the base implementation preserves the
+        historical unfenced behavior for pinned/custom backends. Returns the
+        parsed JSON result, or an ``{"error": ...}`` dict on any failure.
 
         See docs/features/browser_workspace_executor.md.
         """
@@ -1225,8 +1394,21 @@ class ToolContext:
         payload = _json.dumps(args)
         cmd = f"browser-exec {shlex.quote(action)} --json {shlex.quote(payload)}"
         try:
-            # exec_command is blocking SSH; keep the event loop responsive.
-            out = await asyncio.to_thread(backend.exec_command, cmd, 200)
+            # Workspace command execution is blocking; keep the event loop
+            # responsive.  Every production WorkspaceBackend exposes the
+            # claim-resource seam.  The callable fallback retains support for
+            # older/custom duck-typed backends without silently bypassing the
+            # stateless RemoteBackend fence.
+            claim_exec = getattr(backend, "exec_claim_resource", None)
+            if callable(claim_exec):
+                out = await asyncio.to_thread(
+                    claim_exec,
+                    cmd,
+                    200,
+                    operation=f"browser-exec {action}",
+                )
+            else:
+                out = await asyncio.to_thread(backend.exec_command, cmd, 200)
         except Exception as e:
             return {"error": f"browser-exec call failed: {e}"}
 
@@ -1239,12 +1421,26 @@ class ToolContext:
         except Exception:
             return {"error": f"browser-exec returned non-JSON: {out[:500]}"}
 
-    async def close_browser(self) -> None:
-        """Shut down the workspace browser-exec daemon. Called on job/session end."""
+    async def close_browser(self, *, strict: bool = False) -> None:
+        """Shut down the workspace browser-exec daemon.
+
+        Normal tool cleanup retains the historical best-effort behavior.
+        Terminal stateless retirement passes ``strict=True`` and requires the
+        workspace client to attest that its daemon and exact-profile Chromium
+        processes are absent before snapshot/release may continue.
+        """
         if not self.has_workspace():
             return
         try:
-            await self.browser_exec("shutdown")
+            result = await self.browser_exec("shutdown")
+            if strict and (
+                not isinstance(result, dict)
+                or result.get("ok") is not True
+                or result.get("shutdown_complete") is not True
+            ):
+                raise RuntimeError("browser-exec shutdown was not acknowledged")
         except Exception as e:
+            if strict:
+                raise
             logger.debug(f"browser-exec shutdown failed: {e}")
         logger.info("Browser cleaned up")

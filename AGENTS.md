@@ -72,6 +72,7 @@ npm run build
 Python verification:
 
 ```bash
+./scripts/pytest-fast.sh
 pytest tests/ -x -q --tb=short
 pytest tests/test_<area>.py -x -q --tb=short
 ruff check src/ orchestrator/ tests/
@@ -157,6 +158,8 @@ k3d cluster stop srw
 - `.github/workflows/main.yml` is the full blocking pipeline for `main`.
 - `.github/workflows/develop.yml` is change-based and auto-formats Python on
   pushes to `develop`; still run local checks before pushing.
+- Python test jobs use `scripts/pytest-fast.sh` with bounded, file-level xdist
+  scheduling. Keep local and CI invocation aligned; do not switch CI to `-n auto`.
 - CI uses Python 3.12, Node 22, npm for Cockpit, and Ruff 0.14.10.
 - The Playwright version is pinned in `.playwright-version` and must match the
   `playwright==...` pin in `requirements.txt`.

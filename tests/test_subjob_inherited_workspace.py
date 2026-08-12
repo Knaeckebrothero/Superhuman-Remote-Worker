@@ -166,6 +166,21 @@ class TestSelfProvisionedDiscrimination:
 
 class TestContainerInheritance:
     @pytest.mark.asyncio
+    async def test_flag_only_child_overlays_parent_ready_container(self, patch_get_job):
+        get_parent = patch_get_job(
+            {"status": "waiting", "context": {"workspace_container": READY_CONTAINER}}
+        )
+        job = _subjob(_inherited())
+
+        assert await main._resolve_subjob_inherited_workspace(job) == (
+            "proceed",
+            None,
+        )
+
+        get_parent.assert_awaited_once_with("parent-uuid")
+        assert job["context"]["workspace_container"] == READY_CONTAINER
+
+    @pytest.mark.asyncio
     async def test_stale_snapshot_overlays_parent_ready_container(self, patch_get_job):
         patch_get_job(
             {"status": "waiting", "context": {"workspace_container": READY_CONTAINER}}
@@ -396,6 +411,35 @@ class TestFailSubjobUnblocksParent:
         assert ("critic-uuid", "failed", "workspace gone") in patch_db["status"]
         # No unblock: parent was never transitioned to created.
         assert not any(s == "created" for _, s, _ in patch_db["status"])
+
+    @pytest.mark.asyncio
+    async def test_stale_stateless_failure_does_not_unblock_parent(self, monkeypatch):
+        job = _subjob({"scholar_target": "parent-uuid"})
+        job.update(
+            {
+                "id": "scholar-uuid",
+                "status": "created",
+                "execution_lane": "stateless",
+                "creation_order": None,
+            }
+        )
+        update = AsyncMock(return_value=False)
+        scholar = AsyncMock()
+        delegation = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "update_job_status", update)
+        monkeypatch.setattr(main, "_handle_scholar_completion", scholar)
+        monkeypatch.setattr(main, "_handle_delegation_child_completion", delegation)
+
+        await main._fail_subjob_and_unblock_parent(job, "cannot inherit")
+
+        update.assert_awaited_once_with(
+            "scholar-uuid",
+            status="failed",
+            error_message="cannot inherit",
+            expected_status="created",
+        )
+        scholar.assert_not_awaited()
+        delegation.assert_not_awaited()
 
 
 class TestScholarMaterializationFailure:

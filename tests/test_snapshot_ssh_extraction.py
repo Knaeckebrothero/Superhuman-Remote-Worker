@@ -21,6 +21,9 @@ archive is masked whenever ``tar`` still exits 0 — plain ``set -o pipefail``
 handling, including the benign full-extract tar rc==2 case.
 """
 
+import asyncio
+import base64
+import hashlib
 import os
 import shutil
 import subprocess
@@ -44,17 +47,22 @@ from orchestrator.services.ssh_helpers import (  # noqa: E402
     EXTRACT_HOME_REMOTE_CMD,
     EXTRACT_REMOTE_CMD,
     SSHPrivateKeyError,
+    _read_stream_tail,
     build_agent_ssh_cmd,
     stream_extract_snapshot,
     wait_for_agent_ssh,
     workspace_private_key_fingerprint,
 )
 
+VALID_TEST_FINGERPRINT = "SHA256:" + ("A" * 43)
+
 
 def _fake_proc(returncode=0, stderr=b""):
     proc = MagicMock()
     proc.returncode = returncode
     proc.communicate = AsyncMock(return_value=(b"", stderr))
+    proc.wait = AsyncMock(return_value=returncode)
+    proc.stderr.read = AsyncMock(side_effect=[stderr, b""])
     return proc
 
 
@@ -218,6 +226,227 @@ class TestStreamExtractSnapshot:
         assert rc == 1
         assert stderr == b"tar: short read"
 
+    @pytest.mark.asyncio
+    async def test_strict_extract_pins_scanned_key_and_uses_pipefail(self, tar_file):
+        key_blob = b"provisioner-attested-ed25519-host-key"
+        encoded = base64.b64encode(key_blob).decode("ascii")
+        fingerprint = "SHA256:" + base64.b64encode(
+            hashlib.sha256(key_blob).digest()
+        ).decode("ascii").rstrip("=")
+        scan = _fake_proc()
+        scan.communicate.return_value = (
+            f"[10.0.0.9]:30022 ssh-ed25519 {encoded}\n".encode(),
+            b"",
+        )
+        extract = _fake_proc()
+
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=[scan, extract]),
+        ) as mock_exec:
+            rc, stderr = await stream_extract_snapshot(
+                "10.0.0.9",
+                30022,
+                tar_file,
+                key_path="/tmp/k",
+                expected_host_key_fingerprint=fingerprint,
+                require_pipefail=True,
+            )
+
+        assert (rc, stderr) == (0, b"")
+        scan_argv = mock_exec.await_args_list[0].args
+        assert scan_argv[:2] == ("ssh-keyscan", "-T")
+        assert "30022" in scan_argv
+        extract_argv = mock_exec.await_args_list[1].args
+        assert (
+            mock_exec.await_args_list[1].kwargs["stdout"] == asyncio.subprocess.DEVNULL
+        )
+        assert "StrictHostKeyChecking=yes" in extract_argv
+        known_hosts = next(
+            value for value in extract_argv if value.startswith("UserKnownHostsFile=")
+        )
+        assert known_hosts != "UserKnownHostsFile=/dev/null"
+        assert extract_argv[-1].startswith(
+            "flock -w 300 /tmp/.srw-terminal-snapshot-restore.lock "
+        )
+        assert "bash -o pipefail -c " in extract_argv[-1]
+        assert "zstd -d | tar" in extract_argv[-1]
+
+    @pytest.mark.asyncio
+    async def test_strict_extract_cancellation_kills_and_reaps_ssh_child(
+        self, tar_file
+    ):
+        wait_calls = 0
+
+        async def _cancel_then_reap():
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                raise asyncio.CancelledError
+            return 0
+
+        extract = _fake_proc()
+        extract.returncode = None
+        extract.wait = AsyncMock(side_effect=_cancel_then_reap)
+        extract.kill = MagicMock()
+
+        with (
+            patch(
+                "orchestrator.services.ssh_helpers._scan_pinned_host_key",
+                new=AsyncMock(return_value=("host ssh-ed25519 key", b"")),
+            ),
+            patch(
+                "asyncio.create_subprocess_exec", new=AsyncMock(return_value=extract)
+            ),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await stream_extract_snapshot(
+                    "10.0.0.9",
+                    30022,
+                    tar_file,
+                    key_path="/tmp/k",
+                    expected_host_key_fingerprint=VALID_TEST_FINGERPRINT,
+                    require_pipefail=True,
+                )
+
+        extract.kill.assert_called_once_with()
+        assert extract.wait.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_strict_extract_timeout_kills_and_reaps_ssh_child(
+        self, tar_file, monkeypatch
+    ):
+        wait_calls = 0
+
+        async def _blocked_communicate():
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                await asyncio.sleep(3600)
+            return 0
+
+        extract = _fake_proc()
+        extract.returncode = None
+        extract.wait = AsyncMock(side_effect=_blocked_communicate)
+        extract.kill = MagicMock()
+        monkeypatch.setenv("STATELESS_SNAPSHOT_RESTORE_TIMEOUT_S", "0.01")
+
+        with (
+            patch(
+                "orchestrator.services.ssh_helpers._scan_pinned_host_key",
+                new=AsyncMock(return_value=("host ssh-ed25519 key", b"")),
+            ),
+            patch(
+                "asyncio.create_subprocess_exec", new=AsyncMock(return_value=extract)
+            ),
+        ):
+            rc, stderr = await stream_extract_snapshot(
+                "10.0.0.9",
+                30022,
+                tar_file,
+                key_path="/tmp/k",
+                expected_host_key_fingerprint=VALID_TEST_FINGERPRINT,
+                require_pipefail=True,
+            )
+
+        assert rc == 124
+        assert b"timed out" in stderr
+        extract.kill.assert_called_once_with()
+        assert extract.wait.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_strict_extract_rejects_host_key_mismatch_before_bytes(
+        self, tar_file
+    ):
+        encoded = base64.b64encode(b"different-host-key").decode("ascii")
+        scan = _fake_proc()
+        scan.communicate.return_value = (
+            f"[10.0.0.9]:30022 ssh-ed25519 {encoded}\n".encode(),
+            b"",
+        )
+
+        with patch(
+            "asyncio.create_subprocess_exec", new=AsyncMock(return_value=scan)
+        ) as mock_exec:
+            rc, stderr = await stream_extract_snapshot(
+                "10.0.0.9",
+                30022,
+                tar_file,
+                key_path="/tmp/k",
+                expected_host_key_fingerprint=VALID_TEST_FINGERPRINT,
+                require_pipefail=True,
+            )
+
+        assert rc == 255
+        assert b"did not match" in stderr
+        assert mock_exec.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cancelled_host_key_scan_kills_and_reaps_child(self, tar_file):
+        scan = _fake_proc()
+        scan.returncode = None
+        scan.communicate = AsyncMock(side_effect=asyncio.CancelledError)
+        scan.kill = MagicMock()
+        scan.wait = AsyncMock(return_value=0)
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=scan)):
+            with pytest.raises(asyncio.CancelledError):
+                await stream_extract_snapshot(
+                    "10.0.0.9",
+                    30022,
+                    tar_file,
+                    key_path="/tmp/k",
+                    expected_host_key_fingerprint=VALID_TEST_FINGERPRINT,
+                    require_pipefail=True,
+                )
+
+        scan.kill.assert_called_once_with()
+        scan.wait.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "fingerprint",
+        [
+            None,
+            "",
+            "SHA256:",
+            "md5:abc",
+            "SHA256:bad value",
+            "SHA256:" + ("A" * 42),
+            "SHA256:" + ("A" * 42) + "=",
+            "SHA256:" + ("A" * 42) + "_",
+        ],
+    )
+    async def test_strict_extract_refuses_missing_or_malformed_pin_before_ssh(
+        self, tar_file, fingerprint
+    ):
+        create = AsyncMock(side_effect=AssertionError("strict pin precedes SSH"))
+        with patch("asyncio.create_subprocess_exec", new=create):
+            rc, stderr = await stream_extract_snapshot(
+                "10.0.0.9",
+                30022,
+                tar_file,
+                key_path="/tmp/k",
+                expected_host_key_fingerprint=fingerprint,
+                require_pipefail=True,
+            )
+
+        assert rc == 255
+        assert b"pinned SSH host key" in stderr
+        create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_subprocess_stderr_tail_is_bounded(self):
+        stream = MagicMock()
+        stream.read = AsyncMock(
+            side_effect=[b"a" * 40000, b"b" * 40000, b"c" * 40000, b""]
+        )
+
+        tail = await _read_stream_tail(stream, limit=65536)
+
+        assert len(tail) == 65536
+        assert tail == (b"b" * 25536) + (b"c" * 40000)
+
 
 class TestExtractRemoteCmdPipefail:
     """Extract-side ``set -o pipefail`` guard (§C1c).
@@ -319,7 +548,7 @@ def _fake_capture_proc(returncode=0, chunks=(b"tarball-bytes",), stderr=b""):
     proc.stdout = MagicMock()
     proc.stdout.read = AsyncMock(side_effect=[*chunks, b""])
     proc.stderr = MagicMock()
-    proc.stderr.read = AsyncMock(return_value=stderr)
+    proc.stderr.read = AsyncMock(side_effect=[stderr, b""])
     proc.wait = AsyncMock(return_value=None)
     return proc
 

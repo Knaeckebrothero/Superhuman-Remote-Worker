@@ -1074,6 +1074,49 @@ $$;
 
 
 --
+-- Name: notify_thread_control_request(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.notify_thread_control_request() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM pg_notify(
+        'thread_control_requests',
+        json_build_object(
+            'id', NEW.id,
+            'thread_id', NEW.thread_id,
+            'request_seq', NEW.request_seq
+        )::text
+    );
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: notify_thread_interrupt_request(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.notify_thread_interrupt_request() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM pg_notify(
+        'thread_interrupt_requests',
+        json_build_object(
+            'id', NEW.id,
+            'thread_id', NEW.thread_id,
+            'lease_token', NEW.accepted_lease_token,
+            'turn_id', NEW.target_turn_id
+        )::text
+    );
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: notify_thread_permission_update(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -4358,6 +4401,61 @@ CREATE TABLE public.bench_runs (
 
 
 --
+-- Name: canvas_editor_awareness; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.canvas_editor_awareness (
+    thread_id uuid NOT NULL,
+    canvas_id character varying(64) DEFAULT 'main'::character varying NOT NULL,
+    editing_session_id character varying(128) NOT NULL,
+    sender_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    state character varying(16) NOT NULL,
+    client_seq bigint NOT NULL,
+    path text NOT NULL,
+    presentation_revision bigint NOT NULL,
+    source_version character varying(71) NOT NULL,
+    refreshed_at timestamp with time zone NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT ck_canvas_editor_awareness_client_seq CHECK ((client_seq > 0)),
+    CONSTRAINT ck_canvas_editor_awareness_expiry CHECK (((((state)::text = 'editing'::text) AND (expires_at > refreshed_at)) OR (((state)::text = 'idle'::text) AND (expires_at = refreshed_at)))),
+    CONSTRAINT ck_canvas_editor_awareness_main CHECK (((canvas_id)::text = 'main'::text)),
+    CONSTRAINT ck_canvas_editor_awareness_path CHECK (((char_length(path) >= 1) AND (char_length(path) <= 4096))),
+    CONSTRAINT ck_canvas_editor_awareness_revision CHECK ((presentation_revision > 0)),
+    CONSTRAINT ck_canvas_editor_awareness_session_id CHECK (((editing_session_id)::text ~ '^[A-Za-z0-9_-]{8,128}$'::text)),
+    CONSTRAINT ck_canvas_editor_awareness_source_version CHECK (((source_version)::text ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT ck_canvas_editor_awareness_state CHECK (((state)::text = ANY ((ARRAY['editing'::character varying, 'idle'::character varying])::text[])))
+);
+
+
+--
+-- Name: TABLE canvas_editor_awareness; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.canvas_editor_awareness IS 'Owner-authenticated Canvas editor courtesy leases. Per-editor rows keep tabs independent; idle tombstones and client_seq reject reordered stale renewals. This is UX state only, never authorization or execution lease.';
+
+
+--
+-- Name: COLUMN canvas_editor_awareness.sender_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvas_editor_awareness.sender_id IS 'Server-minted stable public fan-out identity for this editor row.';
+
+
+--
+-- Name: COLUMN canvas_editor_awareness.client_seq; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvas_editor_awareness.client_seq IS 'Client-monotonic sequence. Lower values never mutate the row; equal values are idempotent only when the complete state and Canvas identity match.';
+
+
+--
+-- Name: COLUMN canvas_editor_awareness.expires_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvas_editor_awareness.expires_at IS 'Database-clock editing deadline. Idle tombstones set expires_at equal to refreshed_at and remain briefly so delayed lower-sequence renewals lose.';
+
+
+--
 -- Name: canvas_origin_sessions; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5342,6 +5440,7 @@ CREATE TABLE public.jobs (
     wake_attempts integer DEFAULT 0 NOT NULL,
     wake_notified_status text,
     failed_at timestamp with time zone,
+    execution_lane text DEFAULT 'pinned'::text NOT NULL,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
     CONSTRAINT jobs_wake_state_known CHECK ((wake_state = ANY (ARRAY['none'::text, 'pending'::text, 'sending'::text, 'sent'::text, 'dead'::text]))),
@@ -5410,6 +5509,13 @@ COMMENT ON COLUMN public.jobs.wake_notified_status IS 'Terminal status last deli
 --
 
 COMMENT ON COLUMN public.jobs.failed_at IS 'When the job entered ''failed'', set by update_job_status on the transition. Use this, NEVER updated_at, to date a failure: the update_jobs_updated_at trigger fires on FK cascades from gc_offline_agents, which rewrites updated_at to exactly 24h after the assigned agent''s last heartbeat. NULL on rows that failed before migration 0072 — the time is genuinely unknown, not zero. Design: docs/superpowers/specs/2026-07-28-transient-infra-failure-handling-design.md.';
+
+
+--
+-- Name: COLUMN jobs.execution_lane; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.jobs.execution_lane IS 'Which execution plane owns this job: ''pinned'' (registered-agent dispatch and jobs-row lease recovery, the default) or ''stateless'' (worker_batch run_queue claim and reaper). App-validated by design; exactly one plane may dispatch or recover a job. See docs/features/stateless_agents.md §5.4.4.';
 
 
 --
@@ -6372,6 +6478,176 @@ COMMENT ON TABLE public.rollup_state IS 'Rollup watermarks — one row per named
 
 
 --
+-- Name: run_queue; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.run_queue (
+    unit_id uuid NOT NULL,
+    unit_kind text NOT NULL,
+    dedup_key text,
+    state text DEFAULT 'queued'::text NOT NULL,
+    priority integer DEFAULT 0 NOT NULL,
+    fair_key text,
+    run_after timestamp with time zone DEFAULT now() NOT NULL,
+    attempts_since_completion integer DEFAULT 0 NOT NULL,
+    max_attempts integer DEFAULT 5 NOT NULL,
+    lease_token bigint DEFAULT 0 NOT NULL,
+    leased_by text,
+    leased_until timestamp with time zone,
+    input_seq bigint,
+    consumed_seq bigint,
+    queued_at timestamp with time zone DEFAULT now() NOT NULL,
+    enqueue_ord bigint NOT NULL,
+    last_leased_by text,
+    control_input_seq bigint DEFAULT 0 NOT NULL,
+    control_consumed_seq bigint DEFAULT 0 NOT NULL,
+    interrupt_admission_lease_token bigint,
+    interrupt_admission_turn_id integer,
+    CONSTRAINT run_queue_interrupt_admission_shape CHECK ((((interrupt_admission_lease_token IS NULL) AND (interrupt_admission_turn_id IS NULL)) OR ((interrupt_admission_lease_token IS NOT NULL) AND (interrupt_admission_turn_id IS NOT NULL) AND (unit_kind = 'session_turn'::text) AND (state = 'leased'::text) AND (interrupt_admission_lease_token = lease_token) AND (interrupt_admission_lease_token > 0) AND (interrupt_admission_turn_id > 0))))
+);
+
+
+--
+-- Name: TABLE run_queue; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.run_queue IS 'Work queue + recorded lease for stateless execution (docs/features/stateless_agents.md §5.1/§5.2). One DURABLE row per unit (thread, job, or bg task): rows are never deleted while the unit lives, so lease_token stays monotonic — delete-and-reinsert would reset it and break fencing. State machine: queued -> leased -> {done | queued | parked}; states are app-validated by design (no CHECK), values: queued, leased, done, parked. All writes go through src/shared/run_queue/.';
+
+
+--
+-- Name: COLUMN run_queue.unit_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.unit_id IS 'Polymorphic unit id: thread_id (session_turn), job_id (worker_batch), or a fresh task id (bg_task). Deliberately NO foreign key — the queue outlives and predates its referents across kinds.';
+
+
+--
+-- Name: COLUMN run_queue.unit_kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.unit_kind IS 'session_turn | worker_batch | bg_task (app-validated). Claims filter on kind so bg work never starves interactive claims.';
+
+
+--
+-- Name: COLUMN run_queue.dedup_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.dedup_key IS 'Collapse key for collapsible bg work (e.g. cloud_push:<thread>). Dedup is QUEUED-ONLY (partial unique index below): one pending and one running instance may coexist; a signal arriving mid-run must produce a new pending row, never be swallowed (§5.1).';
+
+
+--
+-- Name: COLUMN run_queue.fair_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.fair_key IS 'Per-user fairness dimension for session_turn claims (user id). The column ships with S1; the per-key round-robin CTE follows (§5.3.7).';
+
+
+--
+-- Name: COLUMN run_queue.run_after; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.run_after IS 'Not claimable before this instant: scheduling + retry backoff. Reset by completion; pushed out by error release and reaper steals.';
+
+
+--
+-- Name: COLUMN run_queue.attempts_since_completion; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.attempts_since_completion IS 'Claims since the last successful completion (incremented at claim, not at release). Reset to 0 only by complete_unit and unpark_unit. The reaper parks the unit when it reaches max_attempts.';
+
+
+--
+-- Name: COLUMN run_queue.lease_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.lease_token IS 'Kleppmann fencing token: MONOTONIC per unit, bumped on EVERY claim and EVERY reaper steal, NEVER reset by enqueue/complete/release. Every persist transaction fences on it (fence_lease, FOR SHARE); a zombie writer holding a stale token is rejected at persist time.';
+
+
+--
+-- Name: COLUMN run_queue.leased_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.leased_by IS 'Pod name. Diagnostics only — never correctness; ownership is proven by lease_token alone.';
+
+
+--
+-- Name: COLUMN run_queue.input_seq; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.input_seq IS 'Newest thread_messages.seq enqueued for this unit (input watermark). Input arriving during a leased turn bumps ONLY this column — flipping a leased row''s state would break the lease.';
+
+
+--
+-- Name: COLUMN run_queue.consumed_seq; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.consumed_seq IS 'Newest seq a COMPLETED turn has answered (consumed watermark). Completion re-queues when input_seq is ahead; every claim compares the two watermarks BEFORE invoking the LLM (skip-if-answered) so a steal landing between final persist and completion cannot double-answer.';
+
+
+--
+-- Name: COLUMN run_queue.queued_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.queued_at IS 'Fairness position: reset on completion, voluntary release and steal, so claim order (priority DESC, queued_at) round-robins within a priority class instead of letting the oldest unit win every cycle.';
+
+
+--
+-- Name: COLUMN run_queue.enqueue_ord; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.enqueue_ord IS 'Insertion-order tiebreak: final ORDER BY key of the claim so equal-timestamp claims are deterministic FIFO. Never reused, never meaningful beyond ordering.';
+
+
+--
+-- Name: COLUMN run_queue.last_leased_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.last_leased_by IS 'Pod that most recently claimed this unit (set by the claim, never cleared on completion — that is the point). Feeds the affinity grace in the general claim: for affinity_grace_seconds after a unit is queued, only this pod (or any pod, once the grace lapses) may claim it, so the holder of the warm in-process session wins its own re-claims instead of racing cold pods. Soft optimization ONLY — correctness never depends on it, and the grace is bounded so a dead holder delays a unit by at most that window. Cleared by the reaper on a steal.';
+
+
+--
+-- Name: COLUMN run_queue.control_input_seq; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.control_input_seq IS 'Newest control request_seq admitted for this stateless unit. Admission advances it without disturbing a live lease; completion requeues while it is ahead of control_consumed_seq.';
+
+
+--
+-- Name: COLUMN run_queue.control_consumed_seq; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.control_consumed_seq IS 'Newest contiguous control request_seq whose owner-written journal result is durable and whose request row has been terminalized under the current lease fence.';
+
+
+--
+-- Name: COLUMN run_queue.interrupt_admission_lease_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.interrupt_admission_lease_token IS 'NULL closes stateless interrupt admission. While open, this is the exact current session_turn lease token and never transfers to a successor. Admission and closure serialize on the run_queue row.';
+
+
+--
+-- Name: COLUMN run_queue.interrupt_admission_turn_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.interrupt_admission_turn_id IS 'Concrete active turn accepted by the exact interrupt lease window. NULL means closed. This is deliberately not a queue watermark: an interrupt for one turn must never wake or cancel a later turn.';
+
+
+--
+-- Name: run_queue_enqueue_ord_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.run_queue ALTER COLUMN enqueue_ord ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.run_queue_enqueue_ord_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: schema_migrations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -6927,6 +7203,191 @@ CREATE TABLE public.system_settings (
 
 
 --
+-- Name: thread_client_presence; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_client_presence (
+    thread_id uuid NOT NULL,
+    refreshed_at timestamp with time zone NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT thread_client_presence_expiry_order CHECK ((expires_at > refreshed_at))
+);
+
+
+--
+-- Name: TABLE thread_client_presence; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_client_presence IS 'Owner-gated SSE attestation that at least one browser is attached to a stateless session. One TTL row per thread deliberately collapses tabs: reload and reconnect renew the same row, and disconnect never deletes it. This is cooperative UX state only, never authorization, queue ownership, a fencing token, or a worker/finalizer liveness signal.';
+
+
+--
+-- Name: COLUMN thread_client_presence.refreshed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_client_presence.refreshed_at IS 'Database-clock time of the latest successful SSE establishment or renewal.';
+
+
+--
+-- Name: COLUMN thread_client_presence.expires_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_client_presence.expires_at IS 'Database-clock presence deadline. Absence means no row or expires_at at or before clock_timestamp(); rows are retained and overwritten so cardinality remains bounded by threads.';
+
+
+--
+-- Name: thread_cloud_citation_anchors; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_cloud_citation_anchors (
+    thread_id uuid NOT NULL,
+    workspace_path text NOT NULL,
+    anchor jsonb NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT thread_cloud_anchor_object CHECK ((jsonb_typeof(anchor) = 'object'::text)),
+    CONSTRAINT thread_cloud_anchor_path_nonempty CHECK ((btrim(workspace_path) <> ''::text))
+);
+
+
+--
+-- Name: TABLE thread_cloud_citation_anchors; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_cloud_citation_anchors IS 'Latest cloud provenance/version anchor per logical workspace path. A WebDAV read commits this metadata before returning; later claimants hydrate it before citation registration.';
+
+
+--
+-- Name: thread_cloud_sync_generations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_cloud_sync_generations (
+    thread_id uuid NOT NULL,
+    mount_id text NOT NULL,
+    required_generation bigint DEFAULT 0 NOT NULL,
+    acknowledged_generation bigint DEFAULT 0 NOT NULL,
+    required_lease_token bigint DEFAULT 0 NOT NULL,
+    workspace_generation text NOT NULL,
+    sync_scope_sha256 character(64) NOT NULL,
+    required_at timestamp with time zone DEFAULT now() NOT NULL,
+    acknowledged_at timestamp with time zone,
+    baseline_manifest jsonb DEFAULT '{}'::jsonb NOT NULL,
+    baseline_sha256 character(64) DEFAULT '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a'::bpchar NOT NULL,
+    CONSTRAINT thread_cloud_sync_baseline_digest_shape CHECK ((baseline_sha256 ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT thread_cloud_sync_baseline_manifest_shape CHECK (((jsonb_typeof(baseline_manifest) = 'object'::text) AND (octet_length((baseline_manifest)::text) <= 4194304))),
+    CONSTRAINT thread_cloud_sync_generation_shape CHECK (((required_generation >= 0) AND (acknowledged_generation >= 0) AND (acknowledged_generation <= required_generation) AND (required_lease_token >= 0) AND ((required_generation = 0) OR (required_lease_token > 0)))),
+    CONSTRAINT thread_cloud_sync_mount_id_nonempty CHECK ((mount_id <> ''::text)),
+    CONSTRAINT thread_cloud_sync_scope_digest_shape CHECK ((sync_scope_sha256 ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT thread_cloud_sync_workspace_generation_nonempty CHECK ((workspace_generation <> ''::text))
+);
+
+
+--
+-- Name: TABLE thread_cloud_sync_generations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_cloud_sync_generations IS 'Queue-fenced required generation per thread cloud mount. Before a stateless owner starts push(N), it increments required_generation in the same statement that proves its live run_queue lease. The remote cloud marker is the resource-side commit acknowledgement; the DB acknowledgement is an observable mirror, not a substitute for reading that marker on the next claim.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.mount_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.mount_id IS 'Stable logical cloud destination key derived from non-secret source/path identity; never the replace-on-edit thread_mounts row UUID. Legacy session folders use the reserved value legacy-session.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.required_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.required_generation IS 'Highest push generation a successor must observe committed on the cloud resource before it may pull. Monotonic for the lifetime of the thread.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.acknowledged_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.acknowledged_generation IS 'Highest resource marker verified or written by a live lease owner. This may lag after marker-write/DB-ack crash; successors reconcile it from the resource. It never authorizes pull by itself.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.required_lease_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.required_lease_token IS 'run_queue lease token that reserved required_generation. Diagnostic and recovery evidence; current ownership is always re-proved against run_queue rather than inferred from this value.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.workspace_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.workspace_generation IS 'Authoritative orchestrator workspace-binding generation whose durable workspace bytes are being pushed. A pending row may not be recovered against a different runtime incarnation.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.sync_scope_sha256; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.sync_scope_sha256 IS 'SHA-256 over the non-secret cloud destination descriptor (thread, mount identity/path/backend/WebDAV URL) plus workspace generation. It binds the counter to one exact source/destination pair without persisting credentials.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.baseline_manifest; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.baseline_manifest IS 'Queue-fenced turn-start baseline keyed by mount-relative path. Each entry contains the SHA-256 of durable workspace bytes and the WebDAV ETag observed after pull. A successor compares against this baseline and replays only locally changed/new/deleted paths; it never force-PUTs untouched files over concurrent cloud edits.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.baseline_sha256; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.baseline_sha256 IS 'SHA-256 of the canonical compact JSON baseline. The resource commit marker binds this digest so marker-write/DB-ack recovery can acknowledge without replaying the already committed delta.';
+
+
+--
+-- Name: thread_control_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_control_requests (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    thread_id uuid NOT NULL,
+    request_seq bigint NOT NULL,
+    client_request_id uuid NOT NULL,
+    verb text NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    requested_by text NOT NULL,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    accepted_agent_id uuid,
+    outcome text,
+    result jsonb,
+    applied_at timestamp with time zone,
+    applied_lease_token bigint,
+    applied_agent_id uuid,
+    journal_epoch integer,
+    journal_seq bigint,
+    acknowledged_at timestamp with time zone,
+    error_code text,
+    CONSTRAINT thread_control_outcome_value CHECK (((outcome IS NULL) OR (outcome = ANY (ARRAY['applied'::text, 'rejected'::text])))),
+    CONSTRAINT thread_control_payload_object CHECK ((jsonb_typeof(payload) = 'object'::text)),
+    CONSTRAINT thread_control_terminal_shape CHECK ((((outcome IS NULL) AND (result IS NULL) AND (applied_at IS NULL) AND (applied_lease_token IS NULL) AND (applied_agent_id IS NULL) AND (journal_epoch IS NULL) AND (journal_seq IS NULL) AND (acknowledged_at IS NULL) AND (error_code IS NULL)) OR ((outcome IS NOT NULL) AND (result IS NOT NULL) AND (applied_at IS NOT NULL) AND (((applied_lease_token IS NOT NULL) AND (applied_agent_id IS NULL)) OR ((applied_lease_token IS NULL) AND (applied_agent_id IS NOT NULL))) AND (journal_epoch IS NOT NULL) AND (journal_seq IS NOT NULL) AND (acknowledged_at IS NOT NULL))))
+);
+
+
+--
+-- Name: TABLE thread_control_requests; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_control_requests IS 'Durable session control inbox shared by pinned and stateless lanes. The orchestrator admits an owner-authorized request; only the exact serving owner applies it and writes its journal result. outcome remains NULL until the result event is durably committed and terminalization proves the current lease token or exact pinned agent binding.';
+
+
+--
+-- Name: COLUMN thread_control_requests.accepted_agent_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_control_requests.accepted_agent_id IS 'Exact pinned journal-writer credential. Captured under the admission row lock and transferable only to a reciprocal successor before any receipt; NULL for stateless requests. Hostname, IP and pod name are not ownership credentials.';
+
+
+--
 -- Name: thread_events; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -6937,7 +7398,9 @@ CREATE TABLE public.thread_events (
     seq bigint NOT NULL,
     kind text NOT NULL,
     payload jsonb NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    control_request_id uuid,
+    interrupt_request_id uuid
 );
 
 
@@ -6970,6 +7433,20 @@ COMMENT ON COLUMN public.thread_events.kind IS 'Frame method: token, thinking, t
 
 
 --
+-- Name: COLUMN thread_events.control_request_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_events.control_request_id IS 'Durable receipt link for an owner-written control result frame. A pending request with this event already committed is validated and finalized without emitting a duplicate frame; the current owner then converges its in-memory scalar from the validated result.';
+
+
+--
+-- Name: COLUMN thread_events.interrupt_request_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_events.interrupt_request_id IS 'Durable result link for one exact-lease interrupt request. A committed receipt lets the same owner recover finalization without emitting a duplicate journal frame; it never transfers application authority to a successor lease.';
+
+
+--
 -- Name: thread_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
@@ -6981,6 +7458,74 @@ ALTER TABLE public.thread_events ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDE
     NO MAXVALUE
     CACHE 1
 );
+
+
+--
+-- Name: thread_interrupt_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_interrupt_requests (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    thread_id uuid NOT NULL,
+    client_request_id uuid NOT NULL,
+    target_turn_id integer NOT NULL,
+    accepted_lease_token bigint NOT NULL,
+    accepted_leased_by text NOT NULL,
+    requested_by text NOT NULL,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    outcome text,
+    result jsonb,
+    applied_mode text,
+    applied_at timestamp with time zone,
+    applied_lease_token bigint,
+    journal_epoch integer,
+    journal_seq bigint,
+    acknowledged_at timestamp with time zone,
+    error_code text,
+    CONSTRAINT thread_interrupt_exact_lease_receipt CHECK (((applied_lease_token IS NULL) OR (applied_lease_token = accepted_lease_token))),
+    CONSTRAINT thread_interrupt_lease_token_positive CHECK ((accepted_lease_token > 0)),
+    CONSTRAINT thread_interrupt_leased_by_nonempty CHECK ((btrim(accepted_leased_by) <> ''::text)),
+    CONSTRAINT thread_interrupt_mode_value CHECK (((applied_mode IS NULL) OR (applied_mode = ANY (ARRAY['hard'::text, 'graceful'::text])))),
+    CONSTRAINT thread_interrupt_outcome_value CHECK (((outcome IS NULL) OR (outcome = ANY (ARRAY['applied'::text, 'rejected'::text])))),
+    CONSTRAINT thread_interrupt_result_object CHECK (((result IS NULL) OR (jsonb_typeof(result) = 'object'::text))),
+    CONSTRAINT thread_interrupt_target_turn_positive CHECK ((target_turn_id > 0)),
+    CONSTRAINT thread_interrupt_terminal_shape CHECK ((((outcome IS NULL) AND (result IS NULL) AND (applied_mode IS NULL) AND (applied_at IS NULL) AND (applied_lease_token IS NULL) AND (journal_epoch IS NULL) AND (journal_seq IS NULL) AND (acknowledged_at IS NULL) AND (error_code IS NULL)) OR ((outcome = 'applied'::text) AND (result IS NOT NULL) AND (applied_mode IS NOT NULL) AND (applied_at IS NOT NULL) AND (applied_lease_token = accepted_lease_token) AND (journal_epoch IS NOT NULL) AND (journal_seq IS NOT NULL) AND (acknowledged_at IS NOT NULL) AND (error_code IS NULL)) OR ((outcome = 'rejected'::text) AND (result IS NOT NULL) AND (applied_mode IS NULL) AND (applied_at IS NOT NULL) AND (applied_lease_token = accepted_lease_token) AND (journal_epoch IS NOT NULL) AND (journal_seq IS NOT NULL) AND (acknowledged_at IS NOT NULL) AND (error_code IS NOT NULL) AND (btrim(error_code) <> ''::text))))
+);
+
+
+--
+-- Name: TABLE thread_interrupt_requests; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_interrupt_requests IS 'Durable stateless interrupt inbox. Each request is admitted only for the exact run_queue lease and concrete active turn captured on the row. The lease owner applies the idempotent signal and writes the journal result with its in-process sequence allocator; a successor never applies it. outcome remains NULL until that receipt is durable and owner-fenced.';
+
+
+--
+-- Name: COLUMN thread_interrupt_requests.client_request_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_interrupt_requests.client_request_id IS 'Browser-generated idempotency and acknowledgement correlation key. It is unique per thread; concurrent tabs keep distinct rows and receipts.';
+
+
+--
+-- Name: COLUMN thread_interrupt_requests.accepted_lease_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_interrupt_requests.accepted_lease_token IS 'Immutable exact stateless owner credential captured while the matching run_queue admission window is locked. No later lease may adopt it.';
+
+
+--
+-- Name: COLUMN thread_interrupt_requests.accepted_leased_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_interrupt_requests.accepted_leased_by IS 'Pod identity captured for diagnostics only. Correctness is fenced by accepted_lease_token; hostname or pod name is never an owner credential.';
+
+
+--
+-- Name: COLUMN thread_interrupt_requests.applied_lease_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_interrupt_requests.applied_lease_token IS 'Lease that wrote the durable result frame. The table constraint requires it to equal accepted_lease_token for every terminal result.';
 
 
 --
@@ -7244,6 +7789,54 @@ COMMENT ON TABLE public.thread_rewinds IS 'One row per session rewind: the audit
 
 
 --
+-- Name: thread_session_runtime_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_session_runtime_state (
+    thread_id uuid NOT NULL,
+    memory_extraction_turn integer DEFAULT 0 NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT thread_session_memory_cursor_nonnegative CHECK ((memory_extraction_turn >= 0))
+);
+
+
+--
+-- Name: TABLE thread_session_runtime_state; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_session_runtime_state IS 'Small durable cursors for persistent-session work that is otherwise process-local. memory_extraction_turn prevents a successor claim from repeating interval extraction already claimed by its predecessor.';
+
+
+--
+-- Name: thread_session_tasks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_session_tasks (
+    thread_id uuid NOT NULL,
+    task_number integer NOT NULL,
+    description text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    priority text DEFAULT 'medium'::text NOT NULL,
+    notes text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT thread_session_tasks_completion_shape CHECK ((((status = 'completed'::text) AND (completed_at IS NOT NULL)) OR ((status <> 'completed'::text) AND (completed_at IS NULL)))),
+    CONSTRAINT thread_session_tasks_description_nonempty CHECK ((btrim(description) <> ''::text)),
+    CONSTRAINT thread_session_tasks_number_positive CHECK ((task_number > 0)),
+    CONSTRAINT thread_session_tasks_priority_value CHECK ((priority = ANY (ARRAY['high'::text, 'medium'::text, 'low'::text]))),
+    CONSTRAINT thread_session_tasks_status_value CHECK ((status = ANY (ARRAY['pending'::text, 'in_progress'::text, 'completed'::text])))
+);
+
+
+--
+-- Name: TABLE thread_session_tasks; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_session_tasks IS 'Authoritative persistent-session checklist keyed by thread. The runtime hydrates it on every attach; task_number is rendered as task_<N> and is allocated while the parent thread row is locked.';
+
+
+--
 -- Name: thread_turn_commits; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -7289,6 +7882,12 @@ CREATE TABLE public.threads (
     events_epoch integer DEFAULT 0 NOT NULL,
     awaiting_user_since timestamp with time zone,
     extend_count integer DEFAULT 0 NOT NULL,
+    execution_lane text DEFAULT 'pinned'::text NOT NULL,
+    events_seq_hwm bigint DEFAULT 0 NOT NULL,
+    control_seq_hwm bigint DEFAULT 0 NOT NULL,
+    control_admission_agent_id uuid,
+    narration_mode text,
+    CONSTRAINT valid_narration_mode CHECK ((narration_mode = ANY (ARRAY['silent'::text, 'verbose'::text, 'auto'::text]))),
     CONSTRAINT valid_permission_mode CHECK (((permission_mode)::text = ANY ((ARRAY['supervised'::character varying, 'auto_accept'::character varying, 'autonomous'::character varying])::text[]))),
     CONSTRAINT valid_thread_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'active'::character varying, 'idle'::character varying, 'awaiting_user'::character varying, 'suspended'::character varying, 'ended'::character varying])::text[])))
 );
@@ -7298,7 +7897,7 @@ CREATE TABLE public.threads (
 -- Name: COLUMN threads.events_epoch; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.threads.events_epoch IS 'Current event-log runtime generation. The agent allocates a new epoch on every DB-backed runtime attach; older client cursors trigger authoritative re-sync.';
+COMMENT ON COLUMN public.threads.events_epoch IS 'Current event-log writer generation (client-visible). Bumped only deliberately: rewind, a reaper/steal takeover, or an attach that finds the previous session life terminal (terminal thread status, a terminal lifecycle frame in the epoch, or the epoch wholly beyond retention). Clean reattaches REUSE the epoch so cached client cursors stay valid; an older-epoch cursor triggers authoritative re-sync (gone_beyond_horizon). See docs/features/stateless_agents.md §5.3.2.';
 
 
 --
@@ -7313,6 +7912,41 @@ COMMENT ON COLUMN public.threads.awaiting_user_since IS 'Set by the agent when i
 --
 
 COMMENT ON COLUMN public.threads.extend_count IS 'Number of magic-link extend-window clicks since this awaiting_user session began. Capped at 4 (= 4h ceiling at default 60min/extend).';
+
+
+--
+-- Name: COLUMN threads.execution_lane; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.execution_lane IS 'Which execution plane serves this thread: ''pinned'' (registered-agent pod, the default) or ''stateless'' (run_queue claim by any pod). App-validated by design — no CHECK. See docs/features/stateless_agents.md §5.4.4.';
+
+
+--
+-- Name: COLUMN threads.events_seq_hwm; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.events_seq_hwm IS 'Highest seq ever allocated in the CURRENT events_epoch. Survives retention pruning of the thread_events rows themselves; reset to 0 atomically on every epoch bump. Maintained by the agent journal writer''s fenced flush (GREATEST over the batch in the same statement) and pre-incremented by the system-frame allocator (src/shared/event_journal). Attach seeds its in-process counter from GREATEST(events_seq_hwm, MAX(seq) of the epoch). See docs/features/stateless_agents.md §5.3.2.';
+
+
+--
+-- Name: COLUMN threads.control_seq_hwm; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.control_seq_hwm IS 'Highest commit-ordered thread_control_requests.request_seq allocated for this thread. Admission increments it while holding the threads row lock; never allocate request order from an IDENTITY/sequence.';
+
+
+--
+-- Name: COLUMN threads.control_admission_agent_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.control_admission_agent_id IS 'Exact pinned-owner capability and teardown fence. NULL is closed. An inbox-capable reciprocal owner writes its own agent UUID after attach and clears it before its final drain. A stale credential never transfers to a different owner generation.';
+
+
+--
+-- Name: COLUMN threads.narration_mode; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.narration_mode IS 'Durable interactive narration mode (silent | verbose | auto). NULL means the thread still inherits its resolved config; creation and the serving control owner materialize an explicit value.';
 
 
 --
@@ -8198,6 +8832,14 @@ ALTER TABLE ONLY public.notification_queue
 
 
 --
+-- Name: canvas_editor_awareness pk_canvas_editor_awareness; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_editor_awareness
+    ADD CONSTRAINT pk_canvas_editor_awareness PRIMARY KEY (thread_id, canvas_id, editing_session_id);
+
+
+--
 -- Name: canvas_snapshots pk_canvas_snapshots; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8574,6 +9216,14 @@ ALTER TABLE ONLY public.rollup_state
 
 
 --
+-- Name: run_queue run_queue_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.run_queue
+    ADD CONSTRAINT run_queue_pkey PRIMARY KEY (unit_id);
+
+
+--
 -- Name: schema_migrations schema_migrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8830,11 +9480,51 @@ ALTER TABLE ONLY public.system_settings
 
 
 --
+-- Name: thread_client_presence thread_client_presence_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_client_presence
+    ADD CONSTRAINT thread_client_presence_pkey PRIMARY KEY (thread_id);
+
+
+--
+-- Name: thread_cloud_citation_anchors thread_cloud_citation_anchors_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_cloud_citation_anchors
+    ADD CONSTRAINT thread_cloud_citation_anchors_pkey PRIMARY KEY (thread_id, workspace_path);
+
+
+--
+-- Name: thread_cloud_sync_generations thread_cloud_sync_generations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_cloud_sync_generations
+    ADD CONSTRAINT thread_cloud_sync_generations_pkey PRIMARY KEY (thread_id, mount_id);
+
+
+--
+-- Name: thread_control_requests thread_control_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_control_requests
+    ADD CONSTRAINT thread_control_requests_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: thread_events thread_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.thread_events
     ADD CONSTRAINT thread_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: thread_interrupt_requests thread_interrupt_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_interrupt_requests
+    ADD CONSTRAINT thread_interrupt_requests_pkey PRIMARY KEY (id);
 
 
 --
@@ -8878,6 +9568,22 @@ ALTER TABLE ONLY public.thread_rewinds
 
 
 --
+-- Name: thread_session_runtime_state thread_session_runtime_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_session_runtime_state
+    ADD CONSTRAINT thread_session_runtime_state_pkey PRIMARY KEY (thread_id);
+
+
+--
+-- Name: thread_session_tasks thread_session_tasks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_session_tasks
+    ADD CONSTRAINT thread_session_tasks_pkey PRIMARY KEY (thread_id, task_number);
+
+
+--
 -- Name: thread_turn_commits thread_turn_commits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8902,6 +9608,14 @@ ALTER TABLE ONLY public.canvas_view_bootstraps
 
 
 --
+-- Name: canvas_editor_awareness uq_canvas_editor_awareness_sender; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_editor_awareness
+    ADD CONSTRAINT uq_canvas_editor_awareness_sender UNIQUE (sender_id);
+
+
+--
 -- Name: canvases uq_canvases_thread_canvas; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8923,6 +9637,46 @@ ALTER TABLE ONLY public.experts
 
 ALTER TABLE ONLY public.models
     ADD CONSTRAINT uq_model_provider_v2 UNIQUE (provider_kind, provider_ref, model_id);
+
+
+--
+-- Name: thread_control_requests uq_thread_control_client_request; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_control_requests
+    ADD CONSTRAINT uq_thread_control_client_request UNIQUE (thread_id, client_request_id);
+
+
+--
+-- Name: thread_control_requests uq_thread_control_identity; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_control_requests
+    ADD CONSTRAINT uq_thread_control_identity UNIQUE (id, thread_id);
+
+
+--
+-- Name: thread_control_requests uq_thread_control_request_seq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_control_requests
+    ADD CONSTRAINT uq_thread_control_request_seq UNIQUE (thread_id, request_seq);
+
+
+--
+-- Name: thread_interrupt_requests uq_thread_interrupt_client_request; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_interrupt_requests
+    ADD CONSTRAINT uq_thread_interrupt_client_request UNIQUE (thread_id, client_request_id);
+
+
+--
+-- Name: thread_interrupt_requests uq_thread_interrupt_identity; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_interrupt_requests
+    ADD CONSTRAINT uq_thread_interrupt_identity UNIQUE (id, thread_id);
 
 
 --
@@ -9233,6 +9987,13 @@ CREATE INDEX idx_automations_owner ON public.automations USING btree (owner_id);
 --
 
 CREATE INDEX idx_automations_project ON public.automations USING btree (project_id) WHERE (project_id IS NOT NULL);
+
+
+--
+-- Name: idx_canvas_editor_awareness_expires_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_canvas_editor_awareness_expires_at ON public.canvas_editor_awareness USING btree (expires_at);
 
 
 --
@@ -9663,6 +10424,34 @@ CREATE INDEX idx_projects_status ON public.projects USING btree (status);
 
 
 --
+-- Name: idx_run_queue_affinity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_run_queue_affinity ON public.run_queue USING btree (last_leased_by, queued_at) WHERE (state = 'queued'::text);
+
+
+--
+-- Name: idx_run_queue_claim; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_run_queue_claim ON public.run_queue USING btree (unit_kind, priority DESC, queued_at, enqueue_ord) WHERE (state = 'queued'::text);
+
+
+--
+-- Name: idx_run_queue_dedup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_run_queue_dedup ON public.run_queue USING btree (unit_kind, dedup_key) WHERE ((dedup_key IS NOT NULL) AND (state = 'queued'::text));
+
+
+--
+-- Name: idx_run_queue_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_run_queue_expiry ON public.run_queue USING btree (leased_until) WHERE (state = 'leased'::text);
+
+
+--
 -- Name: idx_security_events_created_at; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -9761,6 +10550,41 @@ CREATE INDEX idx_sudo_rules_active ON public.sudo_auto_rules USING btree (priori
 
 
 --
+-- Name: idx_thread_client_presence_expires_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_thread_client_presence_expires_at ON public.thread_client_presence USING btree (expires_at);
+
+
+--
+-- Name: idx_thread_cloud_sync_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_thread_cloud_sync_pending ON public.thread_cloud_sync_generations USING btree (thread_id, required_generation) WHERE (acknowledged_generation < required_generation);
+
+
+--
+-- Name: idx_thread_control_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_thread_control_pending ON public.thread_control_requests USING btree (thread_id, request_seq) WHERE (outcome IS NULL);
+
+
+--
+-- Name: idx_thread_events_control_request; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_thread_events_control_request ON public.thread_events USING btree (control_request_id) WHERE (control_request_id IS NOT NULL);
+
+
+--
+-- Name: idx_thread_events_interrupt_request; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_thread_events_interrupt_request ON public.thread_events USING btree (interrupt_request_id) WHERE (interrupt_request_id IS NOT NULL);
+
+
+--
 -- Name: idx_thread_events_thread_created; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -9772,6 +10596,13 @@ CREATE INDEX idx_thread_events_thread_created ON public.thread_events USING btre
 --
 
 CREATE UNIQUE INDEX idx_thread_events_thread_epoch_seq ON public.thread_events USING btree (thread_id, epoch, seq);
+
+
+--
+-- Name: idx_thread_interrupt_pending_exact; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_thread_interrupt_pending_exact ON public.thread_interrupt_requests USING btree (thread_id, accepted_lease_token, target_turn_id, requested_at, id) WHERE (outcome IS NULL);
 
 
 --
@@ -9919,6 +10750,13 @@ CREATE INDEX infrastructure_storage_resource_mappings_resource_idx ON public.inf
 --
 
 CREATE INDEX jobs_lease_expiry_idx ON public.jobs USING btree (lease_expires_at) WHERE ((status)::text = 'processing'::text);
+
+
+--
+-- Name: jobs_verification_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX jobs_verification_uniq ON public.jobs USING btree (parent_job_id, ((context ->> 'verification_round'::text))) WHERE (((context ->> 'verification_target'::text) IS NOT NULL) AND jsonb_exists(context, 'verification_round'::text));
 
 
 --
@@ -10923,6 +11761,20 @@ CREATE TRIGGER storage_volume_incarnations_lifecycle_guard BEFORE DELETE OR UPDA
 
 
 --
+-- Name: thread_control_requests thread_control_request_notify_trigger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_control_request_notify_trigger AFTER INSERT ON public.thread_control_requests FOR EACH ROW EXECUTE FUNCTION public.notify_thread_control_request();
+
+
+--
+-- Name: thread_interrupt_requests thread_interrupt_request_notify_trigger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_interrupt_request_notify_trigger AFTER INSERT ON public.thread_interrupt_requests FOR EACH ROW EXECUTE FUNCTION public.notify_thread_interrupt_request();
+
+
+--
 -- Name: thread_permission_requests thread_permission_notify_trigger; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -11429,6 +12281,14 @@ ALTER TABLE ONLY public.external_contacts
 
 ALTER TABLE ONLY public.external_contacts
     ADD CONSTRAINT external_contacts_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: canvas_editor_awareness fk_canvas_editor_awareness_canvas; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_editor_awareness
+    ADD CONSTRAINT fk_canvas_editor_awareness_canvas FOREIGN KEY (thread_id, canvas_id) REFERENCES public.canvases(thread_id, canvas_id) ON DELETE CASCADE;
 
 
 --
@@ -12080,11 +12940,67 @@ ALTER TABLE ONLY public.sudo_approval_requests
 
 
 --
+-- Name: thread_client_presence thread_client_presence_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_client_presence
+    ADD CONSTRAINT thread_client_presence_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_cloud_citation_anchors thread_cloud_citation_anchors_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_cloud_citation_anchors
+    ADD CONSTRAINT thread_cloud_citation_anchors_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_cloud_sync_generations thread_cloud_sync_generations_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_cloud_sync_generations
+    ADD CONSTRAINT thread_cloud_sync_generations_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_control_requests thread_control_requests_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_control_requests
+    ADD CONSTRAINT thread_control_requests_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_events thread_events_control_request_thread_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_events
+    ADD CONSTRAINT thread_events_control_request_thread_fkey FOREIGN KEY (control_request_id, thread_id) REFERENCES public.thread_control_requests(id, thread_id);
+
+
+--
+-- Name: thread_events thread_events_interrupt_request_thread_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_events
+    ADD CONSTRAINT thread_events_interrupt_request_thread_fkey FOREIGN KEY (interrupt_request_id, thread_id) REFERENCES public.thread_interrupt_requests(id, thread_id);
+
+
+--
 -- Name: thread_events thread_events_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.thread_events
     ADD CONSTRAINT thread_events_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_interrupt_requests thread_interrupt_requests_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_interrupt_requests
+    ADD CONSTRAINT thread_interrupt_requests_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
 
 
 --
@@ -12125,6 +13041,22 @@ ALTER TABLE ONLY public.thread_notifications
 
 ALTER TABLE ONLY public.thread_permission_requests
     ADD CONSTRAINT thread_permission_requests_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_session_runtime_state thread_session_runtime_state_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_session_runtime_state
+    ADD CONSTRAINT thread_session_runtime_state_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_session_tasks thread_session_tasks_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_session_tasks
+    ADD CONSTRAINT thread_session_tasks_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
 
 
 --

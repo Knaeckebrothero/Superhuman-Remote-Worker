@@ -340,7 +340,8 @@ async def mark_orphaned_threads_ended(db):
             UPDATE threads
             SET status        = 'ended',
                 ended_at      = CURRENT_TIMESTAMP,
-                last_activity = CURRENT_TIMESTAMP
+                last_activity = CURRENT_TIMESTAMP,
+                control_admission_agent_id = NULL
             WHERE status IN ('created', 'active')
               AND agent_id IS NOT NULL
               AND agent_id IN (SELECT id
@@ -399,6 +400,7 @@ class TestMarkOrphanedThreadsEnded:
         assert "'active'" in sql
         assert "'ended'" in sql
         assert "ended_at" in sql
+        assert "control_admission_agent_id = NULL" in sql
         # Fresh threads (agent_id IS NULL) are intentionally skipped — they
         # cover legitimate transient states the dispatcher / WS proxy own.
         assert "agent_id IS NOT NULL" in sql
@@ -422,7 +424,8 @@ async def mark_orphaned_threads_suspended(db):
             UPDATE threads
             SET status        = 'suspended',
                 agent_id      = NULL,
-                last_activity = CURRENT_TIMESTAMP
+                last_activity = CURRENT_TIMESTAMP,
+                control_admission_agent_id = NULL
             WHERE status IN ('awaiting_user', 'suspended')
               AND agent_id IS NOT NULL
               AND agent_id IN (SELECT id
@@ -479,6 +482,7 @@ class TestMarkOrphanedThreadsSuspended:
         assert "'awaiting_user'" in sql
         assert "'suspended'" in sql
         assert "= NULL" in sql
+        assert "control_admission_agent_id = NULL" in sql
         assert "agent_id IS NOT NULL" in sql
         assert "'offline'" in sql
         assert "RETURNING id" in sql

@@ -29,6 +29,18 @@ image:
   workspace:
     pullPolicy: IfNotPresent
 
+# Stateless worker jobs remain default-off in the production chart. Tilt is
+# the explicit local acceptance environment for the S3 worker driver, with a
+# shorter batch floor so an A -> B rotation is observable in one test run.
+agent:
+  stateless:
+    # The worker gate is invalid without the shared stateless executor pool.
+    # Keep both explicit so this overlay renders safely without a private file.
+    enabled: true
+    worker:
+      enabled: true
+      batchMinWallSeconds: 60
+
 # Pre-warm DaemonSet pulls with `Always` and would crash on Tilt-built tags.
 # Side-effect: agent/workspace pods pull on first session/job spawn rather
 # than at cluster boot. ~10–30 s slower first-session experience; acceptable.

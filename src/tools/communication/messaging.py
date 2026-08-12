@@ -222,6 +222,11 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
                         "mode": mode,
                         "thread_id": thread_id,
                         "project_id": getattr(context, "project_id", None),
+                        "lease_token": (
+                            context._worker_lease_token
+                            if context._stateless_worker
+                            else None
+                        ),
                     },
                 )
 

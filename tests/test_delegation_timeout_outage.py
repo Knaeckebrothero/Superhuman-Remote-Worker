@@ -62,6 +62,9 @@ def _parent_row(*, started_ago_s, timeout=7200):
         },
         "config_override": {},
         "context": {},
+        "execution_lane": "pinned",
+        "priority": 5,
+        "user_id": None,
     }
 
 
@@ -200,3 +203,89 @@ async def test_under_timeout_never_touches_children(wired, monkeypatch):
     assert await main._check_delegation_timeouts() == 0
     main.postgres_db.get_delegation_children.assert_not_awaited()
     cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stateless_timeout_reenqueues_without_dispatcher(wired, monkeypatch):
+    parent = _parent_row(started_ago_s=3 * 3600)
+    parent.update(
+        {
+            "execution_lane": "stateless",
+            "priority": 8,
+            "user_id": "44444444-4444-4444-4444-444444444444",
+        }
+    )
+    cancel, claim = wired(parent, [_child("processing")])
+    queue = AsyncMock(return_value=True)
+    monkeypatch.setattr(main.postgres_db, "queue_stateless_job_for_resume", queue)
+
+    assert await main._check_delegation_timeouts() == 1
+
+    cancel.assert_awaited_once_with("c1")
+    claim.assert_not_awaited()
+    queued = queue.await_args
+    assert queued.args[0] == "par-1"
+    assert queued.args[1]["delegation_timed_out"] is True
+    assert queued.kwargs == {
+        "priority": 8,
+        "fair_key": "44444444-4444-4444-4444-444444444444",
+        "expected_status": "waiting",
+    }
+    main._trigger_dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stateless_timeout_finalizes_even_an_already_closed_queue(
+    wired, monkeypatch
+):
+    """Queue closure is not checkpoint/workspace cleanup completion.
+
+    A queued child is closed synchronously by cancellation, but the durable
+    cleanup marker still requires the shared finalizer before its parent can
+    resume against the same workspace.
+    """
+    child = _child("processing")
+    child["execution_lane"] = "stateless"
+    _cancel, claim = wired(_parent_row(started_ago_s=3 * 3600), [child])
+    cancel_stateless = AsyncMock(return_value=(True, True))
+    settle = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main.postgres_db,
+        "cancel_stateless_job",
+        cancel_stateless,
+    )
+    monkeypatch.setattr(main, "_wait_for_stateless_cancel_settle", settle)
+
+    assert await main._check_delegation_timeouts() == 1
+
+    cancel_stateless.assert_awaited_once_with("c1")
+    settle.assert_awaited_once_with("c1")
+    claim.assert_awaited_once_with("par-1")
+
+
+@pytest.mark.asyncio
+async def test_stateless_timeout_retry_settles_already_cancelled_child(
+    wired, monkeypatch
+):
+    child = _child("cancelled")
+    child.update(
+        {
+            "execution_lane": "stateless",
+            "context": {"_stateless_cancel_cleanup_pending": True},
+        }
+    )
+    _cancel, claim = wired(_parent_row(started_ago_s=3 * 3600), [child])
+    cancel_stateless = AsyncMock()
+    settle = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main.postgres_db,
+        "cancel_stateless_job",
+        cancel_stateless,
+    )
+    monkeypatch.setattr(main, "_wait_for_stateless_cancel_settle", settle)
+
+    assert await main._check_delegation_timeouts() == 1
+
+    cancel_stateless.assert_not_awaited()
+    settle.assert_awaited_once_with("c1")
+    claim.assert_awaited_once_with("par-1")

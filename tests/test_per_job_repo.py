@@ -304,6 +304,104 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_branch.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_stateless_delete_fences_and_prunes_before_resource_cleanup(self):
+        job = {
+            "id": "12345678-1111-2222-3333-444444444444",
+            "execution_lane": "stateless",
+            "repo_name": None,
+            "branch_name": None,
+            "parent_job_id": None,
+            "project_id": None,
+        }
+
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            patch(f"{MODULE}.gitea_client") as mock_gitea,
+            patch(f"{MODULE}.snapshot_service") as mock_snapshots,
+            patch(f"{MODULE}._archive_and_cleanup_workspace") as cleanup_workspace,
+            _bypass_job_access_gate(job),
+        ):
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.prepare_stateless_job_for_delete = AsyncMock(return_value=True)
+
+            async def cleanup_after_fence(_job_id):
+                mock_db.prepare_stateless_job_for_delete.assert_awaited_once_with(
+                    str(job["id"])
+                )
+
+            cleanup_workspace.side_effect = cleanup_after_fence
+
+            async def delete_after_fence(_job_id, *, prepared_stateless=False):
+                mock_db.prepare_stateless_job_for_delete.assert_awaited_once()
+                assert prepared_stateless is True
+                return True
+
+            mock_db.delete_job = AsyncMock(side_effect=delete_after_fence)
+            mock_gitea.is_initialized = False
+            mock_snapshots.is_available = False
+
+            result = await orch_main.delete_job(_stub_request(), str(job["id"]))
+
+        assert result == {"status": "deleted"}
+        cleanup_workspace.assert_awaited_once_with(str(job["id"]))
+        mock_db.delete_job.assert_awaited_once_with(
+            str(job["id"]), prepared_stateless=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_stateless_delete_prepare_failure_keeps_resources_intact(self):
+        job = {
+            "id": "12345678-1111-2222-3333-444444444444",
+            "execution_lane": "stateless",
+            "parent_job_id": None,
+            "project_id": None,
+        }
+
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            patch(f"{MODULE}._archive_and_cleanup_workspace") as cleanup_workspace,
+            _bypass_job_access_gate(job),
+        ):
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.prepare_stateless_job_for_delete = AsyncMock(return_value=False)
+            mock_db.delete_job = AsyncMock()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await orch_main.delete_job(_stub_request(), str(job["id"]))
+
+        assert exc_info.value.status_code == 409
+        cleanup_workspace.assert_not_awaited()
+        mock_db.delete_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stateless_delete_strict_prune_error_keeps_resources_intact(self):
+        job = {
+            "id": "12345678-1111-2222-3333-444444444444",
+            "execution_lane": "stateless",
+            "parent_job_id": None,
+            "project_id": None,
+        }
+
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            patch(f"{MODULE}._archive_and_cleanup_workspace") as cleanup_workspace,
+            _bypass_job_access_gate(job),
+        ):
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.prepare_stateless_job_for_delete = AsyncMock(
+                side_effect=RuntimeError("strict prune failed")
+            )
+            mock_db.delete_job = AsyncMock()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await orch_main.delete_job(_stub_request(), str(job["id"]))
+
+        assert exc_info.value.status_code == 500
+        assert "strict prune failed" in str(exc_info.value.detail)
+        cleanup_workspace.assert_not_awaited()
+        mock_db.delete_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_job_not_found_raises_404(self):
         # The gate (`require_job_access`) is what raises 404 for missing
         # jobs now — let the real helper run with a patched db that returns None.
@@ -363,8 +461,13 @@ class TestSubjobMergeEndpoint:
 
     @pytest.mark.asyncio
     async def test_returns_skipped_when_no_branch(self):
-        """Subjob without branch config returns skipped."""
-        job = {"parent_job_id": "parent-id", "branch_name": None, "repo_name": None}
+        """Stateless subjob merge is unchanged by the /complete lease fence."""
+        job = {
+            "parent_job_id": "parent-id",
+            "branch_name": None,
+            "repo_name": None,
+            "execution_lane": "stateless",
+        }
 
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
@@ -870,4 +973,36 @@ class TestDelegationUnblockDispatcherContract:
             db.claim_delegation_resume = AsyncMock(return_value=False)
             with patch(f"{MODULE}._trigger_dispatch") as trig:
                 await orch_main._handle_delegation_child_completion(job, [])
+        trig.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stateless_parent_reenqueues_without_dispatcher(self):
+        job, parent, children = self._fixtures()
+        parent.update(
+            {
+                "execution_lane": "stateless",
+                "priority": 9,
+                "user_id": "33333333-3333-3333-3333-333333333333",
+            }
+        )
+        with patch(f"{MODULE}.postgres_db") as db:
+            db.all_delegation_children_terminal = AsyncMock(return_value=True)
+            db.get_job = AsyncMock(return_value=parent)
+            db.get_delegation_children = AsyncMock(return_value=children)
+            db.queue_stateless_job_for_resume = AsyncMock(return_value=True)
+            db.merge_job_context = AsyncMock()
+            db.claim_delegation_resume = AsyncMock()
+            with patch(f"{MODULE}._trigger_dispatch") as trig:
+                await orch_main._handle_delegation_child_completion(job, [])
+
+        queued = db.queue_stateless_job_for_resume.await_args
+        assert queued.args[0] == "par-1"
+        assert queued.args[1]["delegation_results"][0]["job_id"] == "child-1"
+        assert queued.kwargs == {
+            "priority": 9,
+            "fair_key": "33333333-3333-3333-3333-333333333333",
+            "expected_status": "waiting",
+        }
+        db.merge_job_context.assert_not_awaited()
+        db.claim_delegation_resume.assert_not_awaited()
         trig.assert_not_called()

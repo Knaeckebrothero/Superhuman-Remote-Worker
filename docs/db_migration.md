@@ -415,9 +415,18 @@ await conn.execute("SELECT pg_advisory_xact_lock($1)", LOCK_ID)
 
 `pg_advisory_xact_lock` releases automatically when the transaction ends. Single-replica today; the lock is cheap insurance against a future scale-up. golang-migrate uses the same primitive; Flyway's `PostgreSQLAdvisoryLockTemplate` uses the same family.
 
+The `.notx.sql` pass uses a separate **session advisory lock** and holds it from
+the physical operation through the migration-ledger write. It acquires that
+lock with short `pg_try_advisory_lock` calls, not a blocking
+`pg_advisory_lock`: a blocked advisory-lock statement owns a virtual
+transaction ID, and `CREATE INDEX CONCURRENTLY` can wait for that transaction
+while the second runner waits for the index builder, forming a deadlock. The
+try-lock statements finish between attempts, allowing the concurrent build to
+advance.
+
 ### The runner
 
-`orchestrator/database/migrate.py`, ~280 lines. Invoked from the orchestrator's FastAPI `lifespan` via `await postgres_db.apply_migrations()` (a thin method wrapper on `PostgresDB` that calls into the free function `run_migrations(pool, migrations_dir)`).
+`orchestrator/database/migrate.py`. Invoked from the orchestrator's FastAPI `lifespan` via `await postgres_db.apply_migrations()` (a thin method wrapper on `PostgresDB` that calls into the free function `run_migrations(pool, migrations_dir)`).
 
 ```python
 import asyncpg, hashlib, logging, time
@@ -529,6 +538,7 @@ What it handles:
 | Concern | Mechanism |
 |---------|-----------|
 | Two replicas migrating at once | `pg_advisory_xact_lock` on a shared int64 ID |
+| Two replicas running `.notx.sql` | Separate session try-lock held through operation, verification, and ledger write |
 | Modified-after-applied migration | SHA-256 checksum compared on every run, hard fail |
 | Deleted applied migration on disk | Stray-file detection, hard fail |
 | Mid-migration failure | Outer txn rolls back; failure row written on a fresh connection; subsequent runs refuse via dirty-row check |
@@ -542,7 +552,6 @@ What it deliberately skips:
 - **Module namespacing** (per-library `module_name` columns, à la pgdbm). Single project, single tenant.
 - **Audit log table** (e.g. Migretti's `_migrations_log` for every action). The main table records who/when/how-long; that's sufficient.
 - **Out-of-order tolerance.** Strict-sequential simplifies the mental model.
-- **Non-transactional support in v1.** Add it the first time we actually need `CREATE INDEX CONCURRENTLY` (see below).
 
 ### Migration file template
 
@@ -628,11 +637,23 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_priority_status
     WHERE status IN ('created', 'paused');
 
 -- If a previous run failed mid-build, the index may exist as INVALID.
--- The runner's pre-flight (when added) drops invalid indexes by name
--- before retry — until then, check `pg_indexes` and drop manually.
+-- Recovery is automatic only when this exact migration has an explicitly
+-- reviewed recipe in migration_recovery.py; otherwise repair it manually.
 ```
 
 When a single logical change needs both transactional DDL and a `CREATE INDEX CONCURRENTLY` — **split into two files**. Don't try to embed `COMMIT;` mid-file; that's how invalid indexes get left behind.
+
+Automatic recovery is deliberately opt-in rather than inferred from SQL. A
+registered concurrent-index recipe names an already-applied replay-safe data
+repair, an already-applied cleanup migration, and the expected catalog shape.
+On a normal attempt or retry the runner inspects `pg_index` explicitly. It
+accepts a valid-but-unledgered index only when it is unique, valid, ready, live,
+and matches the reviewed table, access method, keys, and predicate. Otherwise
+it executes the exact cleanup bytes, replays the repair, executes the immutable
+`CREATE INDEX CONCURRENTLY` bytes, verifies the same invariants, and only then
+marks the ledger row successful. A registered dirty row is retried on normal
+startup; every unregistered dirty migration still fails closed for operator
+review.
 
 ### Migration-file anti-patterns
 
@@ -728,9 +749,14 @@ Test on a clone of test/prod (`pg_dump | pg_restore` to a scratch DB; run migrat
 **A migration fails at runtime.**
 1. Orchestrator pod CrashLoops. Logs show the migration filename and the error.
 2. The dirty row is in `schema_migrations` with `success=false` and the error text.
-3. Fix root cause: usually edit the migration file. If the migration is partially applied (non-transactional), undo what got done by hand or write a follow-up migration.
-4. `DELETE FROM schema_migrations WHERE filename = '0042_*.sql' AND success = FALSE;` to clear the dirty flag.
-5. Redeploy.
+3. If the filename has an explicit recovery recipe in `migration_recovery.py`,
+   restart normally. The runner retries it under the session lock and refuses
+   to mark success until its catalog invariant passes.
+4. Otherwise fix the root cause. If the migration is partially applied
+   (non-transactional), undo what got done by hand or write a follow-up
+   migration.
+5. `DELETE FROM schema_migrations WHERE filename = '0042_*.sql' AND success = FALSE;` to clear an unregistered dirty flag after the repair.
+6. Redeploy.
 
 **A migration's checksum drifted.**
 Runner refuses to start with `checksum changed: 0042_*.sql`. Means someone edited a migration that was already applied somewhere. Either revert the edit, or write a new migration that supersedes the change (and accept that local dev DBs may need manual reconciliation).
@@ -739,8 +765,6 @@ Runner refuses to start with `checksum changed: 0042_*.sql`. Means someone edite
 
 - **Squawk config** lands alongside step 1 with the rule list above. Iterate on noise.
 - **Atlas drift detection** is deferred until the nightly `pg_dump` diff becomes routine.
-- **Concurrent migrations on a multi-replica orchestrator** are out of scope today; the advisory lock is in place for when we scale.
-- **Non-transactional support in the runner** is deferred until the first migration that genuinely needs `CREATE INDEX CONCURRENTLY`.
 - **pgTAP integration** is deferred to "first migration that needs structural assertions"; not blocking cutover.
 
 ## Deployment Checklist for Breaking Changes

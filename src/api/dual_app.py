@@ -1472,14 +1472,14 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         return await pa.handle_api_input(request)
 
     @app.post("/api/interrupt", tags=["Session"])
-    async def api_interrupt():
+    async def api_interrupt(request: Request):
         if _pod_state != PodState.SESSION:
             return JSONResponse(
                 {"error": "Pod is not in session mode"}, status_code=404
             )
         import src.api.persistent_app as pa
 
-        return await pa.handle_api_interrupt()
+        return await pa.handle_api_interrupt(request)
 
     @app.post("/api/approve", tags=["Session"])
     async def api_approve(request: Request):

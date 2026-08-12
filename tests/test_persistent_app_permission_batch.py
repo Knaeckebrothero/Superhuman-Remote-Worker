@@ -14,6 +14,20 @@ import src.api.persistent_app as pa
 from src.persistent_graph import PermissionOutcome
 
 
+PINNED_AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+
+@pytest.fixture(autouse=True)
+def _exact_pinned_permission_owner(monkeypatch):
+    """Permission sweeps in this unit module run as one exact pinned owner."""
+
+    monkeypatch.setattr(
+        pa,
+        "_permission_retirement_authority",
+        lambda: ("pinned", PINNED_AGENT_ID),
+    )
+
+
 def _mock_session(permission_mode: str = "supervised"):
     session = MagicMock()
     session.permission_mode = permission_mode
@@ -892,6 +906,79 @@ class TestSweepWithoutADbKeepsTheLedger:
         assert set(ledger) == {"tc_0"}
 
 
+class TestSweepHoldsExactRuntimeAuthority:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("authority", "required_fragments"),
+        [
+            (
+                ("stateless", 41),
+                ("run_queue AS queue", "queue.lease_token", "FOR SHARE OF queue"),
+            ),
+            (
+                ("pinned", PINNED_AGENT_ID),
+                (
+                    "threads AS thread",
+                    "agents AS agent",
+                    "FOR NO KEY UPDATE OF thread",
+                    "FOR SHARE OF agent",
+                ),
+            ),
+        ],
+    )
+    async def test_irreversible_update_and_owner_fence_are_one_statement(
+        self, authority, required_fragments
+    ):
+        ledger = {"tc_0": ("rid-tc_0", "web_search", "tid")}
+        session, conn = _conn_with(None)
+        conn.fetchval = AsyncMock(return_value=None)
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", ledger),
+            patch.object(pa, "_gates_in_flight", set()),
+            patch.object(pa, "_active_permission_request_id", None),
+            patch.object(
+                pa, "_permission_retirement_authority", return_value=authority
+            ),
+            patch.object(pa, "_broadcast", MagicMock()) as broadcast,
+        ):
+            await pa._retire_announced_permission_rows("authority test")
+
+        sql, request_id, thread_id, credential = conn.fetchval.await_args.args
+        assert "UPDATE thread_permission_requests AS request" in sql
+        assert all(fragment in sql for fragment in required_fragments)
+        assert (request_id, thread_id, credential) == (
+            "rid-tc_0",
+            "tid",
+            authority[1],
+        )
+        # A moved owner returns no row. The stale process drops only its local
+        # bookkeeping and never fabricates a resolved event.
+        assert ledger == {}
+        broadcast.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_exact_owner_leaves_pending_row_for_successor(self):
+        ledger = {"tc_0": ("rid-tc_0", "web_search", "tid")}
+        session, conn = _conn_with(None)
+        conn.fetchval = AsyncMock()
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", ledger),
+            patch.object(pa, "_gates_in_flight", set()),
+            patch.object(pa, "_active_permission_request_id", None),
+            patch.object(pa, "_permission_retirement_authority", return_value=None),
+        ):
+            await pa._retire_announced_permission_rows("owner already moved")
+
+        conn.fetchval.assert_not_awaited()
+        assert set(ledger) == {"tc_0"}
+
+
 # =============================================================================
 # Defect C — the ledger must never outlive, or reach across, a session
 #
@@ -906,17 +993,19 @@ class TestSweepWithoutADbKeepsTheLedger:
 # =============================================================================
 
 
-async def _terminate(reason: str = "rest_detach"):
+async def _terminate(reason: str = "rest_detach", **kwargs):
     """Drive the real terminate path with everything unrelated stubbed."""
     with (
         patch.object(pa, "_update_thread_status", AsyncMock()),
         patch.object(pa, "_stop_watchdogs", MagicMock()),
+        patch.object(pa, "_stop_thread_control_watcher", AsyncMock()),
+        patch.object(pa, "_stop_thread_interrupt_watcher", AsyncMock()),
         patch.object(pa, "_clear_all_canvas_awareness", MagicMock()),
         patch.object(pa, "_loop_task", None),
         patch.object(pa, "_event_writer", None),
         patch.object(pa, "_max_sessions_per_process", 0),
     ):
-        await pa._terminate_session_inner(reason)
+        await pa._terminate_session_inner(reason, **kwargs)
 
 
 class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
@@ -940,11 +1029,18 @@ class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
             await pa._loop_announce_permission_batch(FOUR_CALLS)
             assert set(ledger) == {"tc_0", "tc_1", "tc_2", "tc_3"}
 
-            await _terminate()
+            with (
+                patch.object(pa, "_control_owner_agent_id", PINNED_AGENT_ID),
+                patch.object(
+                    pa, "_close_pinned_control_inbox", AsyncMock(return_value=True)
+                ) as close_inbox,
+            ):
+                await _terminate()
 
             assert ledger == {}, "the next session inherits this thread's rows"
             assert pa._gates_in_flight == set()
             assert pa._active_permission_request_id is None
+            close_inbox.assert_awaited_once_with(agent_id=PINNED_AGENT_ID)
 
         assert set(store.status.values()) == {"expired"}, (
             "rows left pending on an ended thread re-render as phantom cards"
@@ -994,6 +1090,76 @@ class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
         assert leaked == [], (
             f"the new thread's clients were told about {leaked} — tool calls "
             "from a thread they never saw"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stateless_teardown_without_live_lease_only_clears_local_state(self):
+        store = _FakeRowStore()
+        store.status["rid-tc_0"] = "pending"
+        session = _session_with_store(store)
+        session.cleanup = AsyncMock()
+        session.workspace_manager = None
+        ledger = {"tc_0": ("rid-tc_0", "web_search", "tid")}
+        gates = {"tc_0"}
+        close_inbox = AsyncMock()
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", ledger),
+            patch.object(pa, "_gates_in_flight", gates),
+            patch.object(pa, "_active_permission_request_id", "rid-tc_0"),
+            patch.object(pa, "_stateless_mode", return_value=True),
+            patch.object(pa, "_permission_retirement_authority", return_value=None),
+            patch.object(pa, "_close_pinned_control_inbox", close_inbox),
+        ):
+            await _terminate(mark_thread=False)
+
+        assert store.status["rid-tc_0"] == "pending"
+        assert ledger == {}
+        assert gates == set()
+        close_inbox.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pinned_rebind_after_admission_close_cannot_expire_successor_row(
+        self,
+    ):
+        store = _FakeRowStore()
+        store.status["rid-tc_0"] = "pending"
+        session = _session_with_store(store)
+        session.cleanup = AsyncMock()
+        session.workspace_manager = None
+        ledger = {"tc_0": ("rid-tc_0", "web_search", "tid")}
+        broadcast = MagicMock()
+
+        # Admission closure succeeded in its earlier transaction, but the
+        # binding moves before the retirement statement. PostgreSQL then
+        # returns no updated row from the exact owner-fenced CTE.
+        store.fetchval = AsyncMock(return_value=None)
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", ledger),
+            patch.object(pa, "_gates_in_flight", set()),
+            patch.object(pa, "_active_permission_request_id", None),
+            patch.object(pa, "_control_owner_agent_id", PINNED_AGENT_ID),
+            patch.object(
+                pa, "_close_pinned_control_inbox", AsyncMock(return_value=True)
+            ),
+            patch.object(
+                pa,
+                "_permission_retirement_authority",
+                return_value=("pinned", PINNED_AGENT_ID),
+            ),
+            patch.object(pa, "_broadcast", broadcast),
+        ):
+            await _terminate(mark_thread=False)
+
+        assert store.status["rid-tc_0"] == "pending"
+        assert ledger == {}
+        assert not any(
+            call.args and call.args[0] == "permission.resolved"
+            for call in broadcast.call_args_list
         )
 
 

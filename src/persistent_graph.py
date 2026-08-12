@@ -548,6 +548,14 @@ class PersistentLoopCallbacks:
     # Optional: None ⇒ persist only at turn-complete (back-compat).
     persist_message: Optional[Callable[[Any], Awaitable[None]]] = None
 
+    # Full turn-unwind acknowledgement.  Unlike ``on_turn_complete`` (which
+    # persists the transcript before the workspace commit is mapped), this
+    # fires only after turn-owned memory work and Git commit/push/mapping have
+    # settled.  Stateless executors must wait for this edge before detaching a
+    # reusable session; otherwise cancelling the loop can strand an unmapped
+    # commit and make cross-pod workspace undo unavailable.
+    on_turn_settled: Optional[Callable[[int], Awaitable[None]]] = None
+
     # Audit one main-LLM call (messages, response, metrics) to the
     # llm_requests trail. Sync callback — the transport schedules its own
     # background write (session_silent_failure_audit.md #14).
@@ -779,6 +787,9 @@ async def run_persistent_loop(
     get_current_system_prompt: Optional[Callable[[], str]] = None,
     memory_extraction_prompt: str = "",
     memory_service: Optional[Any] = None,
+    claim_memory_extraction_interval: Optional[
+        Callable[[int, int], Awaitable[bool]]
+    ] = None,
 ) -> None:
     """Run the persistent interactive agent loop.
 
@@ -813,6 +824,9 @@ async def run_persistent_loop(
             bound (memory.manager.enabled), the in-loop extraction and the
             per-turn retrieval/injection route through it instead of the
             direct-store paths (memory overhaul Phase 1 cutover).
+        claim_memory_extraction_interval: Durable migration-0133 cursor claim
+            for the legacy writer path. ``None`` preserves the local cursor for
+            tests/installs without Postgres.
     """
     # Build tool lookup map
     tool_map: Dict[str, Any] = {tool.name: tool for tool in tools}
@@ -961,41 +975,51 @@ async def run_persistent_loop(
             # (session_silent_failure_audit.md #2).
             await callbacks.on_error(_user_facing_turn_error(e), turn_id=turn_id)
 
-        # Memory extraction every N turns (fire-and-forget).
+        # Memory extraction every N turns.  It is part of this claim's durable
+        # footprint: snapshot the mutable history and await the writer before
+        # publishing the full turn-settled edge.  A detached task can inherit a
+        # mutable LeaseHandle, run after it is repointed to another thread, and
+        # either mutate the wrong cursor or vanish after advancing it.
+        extraction_messages = list(messages)
         # Manager path (memory overhaul Phase 1): one turn_end capture —
         # the persistent_interval_extractor writer reproduces the elapsed
         # gate, the fixed window, and the extraction call below.
         if memory_service is not None:
             from .services.memory import CaptureEvent
 
-            asyncio.create_task(
-                memory_service.capture(
-                    CaptureEvent(
-                        kind="turn_end",
-                        messages=messages,
-                        turn_count=turn_count,
-                    )
+            await memory_service.capture(
+                CaptureEvent(
+                    kind="turn_end",
+                    messages=extraction_messages,
+                    turn_count=turn_count,
                 )
             )
-        elif (
-            recall_store
-            and auxiliary_llm
-            and extraction_interval > 0
-            and (turn_count - _last_extraction_turn) >= extraction_interval
-        ):
-            _last_extraction_turn = turn_count
+        elif recall_store and auxiliary_llm and extraction_interval > 0:
+            if claim_memory_extraction_interval is not None:
+                extraction_due = await claim_memory_extraction_interval(
+                    turn_count,
+                    extraction_interval,
+                )
+            else:
+                extraction_due = (
+                    turn_count - _last_extraction_turn
+                ) >= extraction_interval
+            if extraction_due:
+                _last_extraction_turn = turn_count
+        else:
+            extraction_due = False
+
+        if memory_service is None and extraction_due:
             try:
                 from .services.auxiliary import extract_and_store_memories
 
-                asyncio.create_task(
-                    extract_and_store_memories(
-                        auxiliary_llm=auxiliary_llm,
-                        recall_store=recall_store,
-                        messages=messages,
-                        memory_extraction_prompt=memory_extraction_prompt,
-                        source_turn_start=turn_count - extraction_interval,
-                        source_turn_end=turn_count,
-                    )
+                await extract_and_store_memories(
+                    auxiliary_llm=auxiliary_llm,
+                    recall_store=recall_store,
+                    messages=extraction_messages,
+                    memory_extraction_prompt=memory_extraction_prompt,
+                    source_turn_start=turn_count - extraction_interval,
+                    source_turn_end=turn_count,
                 )
                 logger.debug(f"Memory extraction triggered at turn {turn_count}")
             except Exception as e:
@@ -1004,56 +1028,68 @@ async def run_persistent_loop(
         turn_metrics = result.metrics if result else None
         await callbacks.on_turn_complete(turn_id, turn_metrics)
 
-        # Auto-commit workspace changes after tool-executing turns, then push
-        # so the remote — which the version-history UI reads — stays current.
-        # The push runs on EVERY turn (no turn-count throttle) and regardless
-        # of whether this turn used tools, so commits can't be stranded locally
-        # when a session ends on a no-tool turn. has_unpushed_commits() is a
-        # local-ref check, so turns with nothing to push skip the network.
-        # Commit/push failures are surfaced (warning) rather than swallowed:
-        # unpushed commits live only on the workspace pod until a push succeeds.
-        if tool_context:
-            ws_mgr = getattr(tool_context, "workspace_manager", None)
-            git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
-            if git_mgr and git_mgr.is_active:
-                if tool_calls_this_turn > 0:
+        try:
+            # Auto-commit workspace changes after the transcript reconcile, then
+            # push before publishing the durable turn mapping.  The executor's
+            # full-turn acknowledgement is below this block, so it cannot cancel
+            # the loop between commit and mapping during a pod handoff.
+            if tool_context:
+                ws_mgr = getattr(tool_context, "workspace_manager", None)
+                git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
+                if git_mgr and git_mgr.is_active:
+                    map_head = False
+                    if tool_calls_this_turn > 0:
+                        try:
+                            if git_mgr.has_uncommitted_changes():
+                                if not git_mgr.commit(
+                                    f"Auto-commit after turn {turn_id}"
+                                ):
+                                    logger.warning(
+                                        f"Turn {turn_id}: workspace auto-commit failed"
+                                    )
+                                else:
+                                    map_head = True
+                        except Exception:
+                            logger.warning(
+                                f"Turn {turn_id}: workspace auto-commit raised",
+                                exc_info=True,
+                            )
                     try:
-                        if git_mgr.has_uncommitted_changes():
-                            if not git_mgr.commit(f"Auto-commit after turn {turn_id}"):
+                        unpushed = git_mgr.has_unpushed_commits()
+                        if unpushed:
+                            if git_mgr.push():
+                                # Also heals a mapping missed when an earlier
+                                # turn's push failed and this no-tool turn flushes
+                                # the same HEAD successfully.
+                                map_head = True
+                            else:
                                 logger.warning(
-                                    f"Turn {turn_id}: workspace auto-commit failed"
+                                    f"Turn {turn_id}: workspace git push failed — "
+                                    "unpushed commits remain only on the workspace "
+                                    "pod and will not appear in the version history "
+                                    "until a later push succeeds"
                                 )
-                            elif callbacks.on_workspace_commit:
-                                sha = git_mgr.get_current_commit()
-                                if sha:
-                                    try:
-                                        await callbacks.on_workspace_commit(sha)
-                                    except Exception:
-                                        logger.warning(
-                                            f"Turn {turn_id}: turn-commit mapping "
-                                            "failed (rewind code-restore loses this "
-                                            "granularity point)",
-                                            exc_info=True,
-                                        )
+                                map_head = False
+                        if map_head and callbacks.on_workspace_commit:
+                            sha = git_mgr.get_current_commit()
+                            if sha:
+                                try:
+                                    await callbacks.on_workspace_commit(sha)
+                                except Exception:
+                                    logger.warning(
+                                        f"Turn {turn_id}: turn-commit mapping "
+                                        "failed (workspace undo/rewind loses this "
+                                        "granularity point)",
+                                        exc_info=True,
+                                    )
                     except Exception:
                         logger.warning(
-                            f"Turn {turn_id}: workspace auto-commit raised",
+                            f"Turn {turn_id}: workspace git push raised",
                             exc_info=True,
                         )
-                try:
-                    if git_mgr.has_unpushed_commits():
-                        if not git_mgr.push():
-                            logger.warning(
-                                f"Turn {turn_id}: workspace git push failed — "
-                                "unpushed commits remain only on the workspace "
-                                "pod and will not appear in the version history "
-                                "until a later push succeeds"
-                            )
-                except Exception:
-                    logger.warning(
-                        f"Turn {turn_id}: workspace git push raised",
-                        exc_info=True,
-                    )
+        finally:
+            if callbacks.on_turn_settled is not None:
+                await callbacks.on_turn_settled(turn_id)
 
         logger.info(
             f"Turn {turn_id} complete: {tool_calls_this_turn} tool calls, "
@@ -1539,26 +1575,34 @@ async def _execute_turn(
                 git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
                 if git_mgr and git_mgr.is_active:
                     try:
+                        checkpoint_sha = None
                         if git_mgr.has_uncommitted_changes():
-                            if (
-                                git_mgr.commit(
-                                    f"Auto-compaction checkpoint ({pre_compact_len} → {len(messages)} msgs)"
+                            committed = git_mgr.commit(
+                                "Auto-compaction checkpoint "
+                                f"({pre_compact_len} → {len(messages)} msgs)"
+                            )
+                            if committed:
+                                checkpoint_sha = git_mgr.get_current_commit()
+                        # Never publish a ledger SHA that a successor cannot
+                        # fetch.  A failed push leaves the mapping absent; the
+                        # next successful turn push/reconcile heals current HEAD.
+                        pushed = git_mgr.push()
+                        if pushed and checkpoint_sha and callbacks.on_workspace_commit:
+                            try:
+                                await callbacks.on_workspace_commit(checkpoint_sha)
+                            except Exception:
+                                logger.warning(
+                                    "Auto-compaction checkpoint: turn-commit "
+                                    "mapping failed (workspace undo/rewind loses "
+                                    "this granularity point)",
+                                    exc_info=True,
                                 )
-                                and callbacks.on_workspace_commit
-                            ):
-                                sha = git_mgr.get_current_commit()
-                                if sha:
-                                    try:
-                                        await callbacks.on_workspace_commit(sha)
-                                    except Exception:
-                                        logger.warning(
-                                            "Auto-compaction checkpoint: "
-                                            "turn-commit mapping failed (rewind "
-                                            "code-restore loses this granularity "
-                                            "point)",
-                                            exc_info=True,
-                                        )
-                        git_mgr.push()
+                        elif checkpoint_sha and not pushed:
+                            logger.warning(
+                                "Auto-compaction checkpoint push failed; "
+                                "withholding turn-commit mapping until the "
+                                "durable remote contains the commit"
+                            )
                     except Exception as e:
                         logger.debug(
                             f"Git push on auto-compaction failed (non-fatal): {e}"

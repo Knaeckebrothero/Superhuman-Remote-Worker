@@ -30,7 +30,9 @@ def _install_fake_main(monkeypatch, **overrides) -> types.ModuleType:
 
     # Defaults — individual tests override via `overrides`.
     fake_db = MagicMock()
-    fake_db.get_thread = AsyncMock(return_value={"id": "t1", "agent_id": None})
+    fake_db.get_thread = AsyncMock(
+        return_value={"id": "t1", "execution_lane": "pinned", "agent_id": None}
+    )
     fake_db.resolve_datasources_for_thread = AsyncMock(return_value=[])
     fake_db.get_agent = AsyncMock(
         return_value={"id": "a1", "pod_ip": "10.0.0.5", "pod_port": 8001}
@@ -113,6 +115,93 @@ def _install_fake_lifecycle_module(monkeypatch, emit_calls: list[dict]):
 
 
 @pytest.mark.asyncio
+async def test_create_path_refetch_treats_stateless_as_ready_without_lifecycle_error(
+    monkeypatch,
+):
+    """A legitimate lane change neither provisions nor emits a false failure."""
+    fake_main = _install_fake_main(monkeypatch)
+    fake_main.postgres_db.get_thread = AsyncMock(
+        return_value={
+            "id": "t1",
+            "execution_lane": "stateless",
+            "agent_id": None,
+        }
+    )
+    fake_main._find_idle_persistent_agent = AsyncMock()
+    fake_main._send_session_attach = AsyncMock()
+    emit_calls: list[dict] = []
+    _install_fake_lifecycle_module(monkeypatch, emit_calls)
+
+    from services.provision_or_assign import provision_or_assign
+
+    await provision_or_assign("u1", "t1", "session_base", {}, [], None)
+
+    assert emit_calls == []
+    fake_main._session_grant_violations.assert_not_awaited()
+    fake_main._session_endpoint_violations.assert_not_awaited()
+    fake_main._find_idle_persistent_agent.assert_not_awaited()
+    fake_main._send_session_attach.assert_not_awaited()
+    fake_main.agent_provisioner.provision_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "thread_row",
+    [None, {"id": "t1", "execution_lane": "future-lane", "agent_id": None}],
+)
+async def test_create_path_refetch_fails_closed_for_missing_or_unknown_lane(
+    monkeypatch, thread_row
+):
+    fake_main = _install_fake_main(monkeypatch)
+    fake_main.postgres_db.get_thread = AsyncMock(return_value=thread_row)
+    fake_main._find_idle_persistent_agent = AsyncMock()
+    fake_main._send_session_attach = AsyncMock()
+    emit_calls: list[dict] = []
+    _install_fake_lifecycle_module(monkeypatch, emit_calls)
+
+    from services.provision_or_assign import provision_or_assign
+
+    await provision_or_assign("u1", "t1", "session_base", {}, [], None)
+
+    assert [call["state"] for call in emit_calls] == ["failed"]
+    assert "pinned provisioning" in emit_calls[0]["reason"]
+    fake_main._session_grant_violations.assert_not_awaited()
+    fake_main._session_endpoint_violations.assert_not_awaited()
+    fake_main._find_idle_persistent_agent.assert_not_awaited()
+    fake_main._send_session_attach.assert_not_awaited()
+    fake_main.agent_provisioner.provision_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_pool_reservation_refetches_lane_before_pod_fallback(monkeypatch):
+    idle_agent = {
+        "id": "a1",
+        "hostname": "srw-agent-pool-1",
+        "pod_ip": "10.0.0.5",
+        "pod_port": 8001,
+    }
+    fake_main = _install_fake_main(monkeypatch)
+    fake_main.postgres_db.get_thread = AsyncMock(
+        side_effect=[
+            {"id": "t1", "execution_lane": "pinned", "agent_id": None},
+            {"id": "t1", "execution_lane": "stateless", "agent_id": None},
+        ]
+    )
+    fake_main._find_idle_persistent_agent = AsyncMock(return_value=idle_agent)
+    fake_main._send_session_attach = AsyncMock(return_value=False)
+    emit_calls: list[dict] = []
+    _install_fake_lifecycle_module(monkeypatch, emit_calls)
+
+    from services.provision_or_assign import provision_or_assign
+
+    await provision_or_assign("u1", "t1", "session_base", {}, [], None)
+
+    assert [call["state"] for call in emit_calls] == ["provisioning"]
+    fake_main._send_session_attach.assert_awaited_once()
+    fake_main.agent_provisioner.provision_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_idle_pool_attach_emits_provisioning_booting_ready(monkeypatch):
     """Warm pool fast-path: agent attaches instantly, /ready flips fast."""
     idle_agent = {
@@ -128,7 +217,7 @@ async def test_idle_pool_attach_emits_provisioning_booting_ready(monkeypatch):
     fake_main = _install_fake_main(monkeypatch, _find_idle_persistent_agent=_find_idle)
     # First get_thread inside the lock — no prior binding.
     fake_main.postgres_db.get_thread = AsyncMock(
-        return_value={"id": "t1", "agent_id": None}
+        return_value={"id": "t1", "execution_lane": "pinned", "agent_id": None}
     )
 
     emit_calls: list[dict] = []
@@ -160,8 +249,8 @@ async def test_fresh_pod_path_emits_full_sequence(monkeypatch):
     # get_thread sees the binding.
     fake_main.postgres_db.get_thread = AsyncMock(
         side_effect=[
-            {"id": "t1", "agent_id": None},
-            {"id": "t1", "agent_id": "a-new"},
+            {"id": "t1", "execution_lane": "pinned", "agent_id": None},
+            {"id": "t1", "execution_lane": "pinned", "agent_id": "a-new"},
         ]
     )
     fake_main.postgres_db.get_agent = AsyncMock(
@@ -198,8 +287,17 @@ async def test_fresh_pod_path_waits_when_agent_pod_marker_in_flight(monkeypatch)
     }
     fake_main.postgres_db.get_thread = AsyncMock(
         side_effect=[
-            {"id": "t1", "agent_id": None, "metadata": {"agent_pod": marker}},
-            {"id": "t1", "agent_id": "a-existing"},
+            {
+                "id": "t1",
+                "execution_lane": "pinned",
+                "agent_id": None,
+                "metadata": {"agent_pod": marker},
+            },
+            {
+                "id": "t1",
+                "execution_lane": "pinned",
+                "agent_id": "a-existing",
+            },
         ]
     )
     fake_main.postgres_db.get_agent = AsyncMock(
@@ -265,7 +363,12 @@ async def test_grant_denied_fails_fast_without_pool_or_pod(monkeypatch):
     """
     fake_main = _install_fake_main(monkeypatch)
     fake_main.postgres_db.get_thread = AsyncMock(
-        return_value={"id": "t1", "agent_id": None, "user_id": "u1"}
+        return_value={
+            "id": "t1",
+            "execution_lane": "pinned",
+            "agent_id": None,
+            "user_id": "u1",
+        }
     )
     fake_main._session_grant_violations = AsyncMock(
         return_value=["permission_mode: 'autonomous' exceeds the ceiling"]
@@ -307,7 +410,12 @@ async def test_endpoint_denied_fails_fast_without_pool_or_pod(monkeypatch):
     """
     fake_main = _install_fake_main(monkeypatch)
     fake_main.postgres_db.get_thread = AsyncMock(
-        return_value={"id": "t1", "agent_id": None, "user_id": "u1"}
+        return_value={
+            "id": "t1",
+            "execution_lane": "pinned",
+            "agent_id": None,
+            "user_id": "u1",
+        }
     )
     fake_main._session_endpoint_violations = AsyncMock(
         return_value=[
@@ -346,7 +454,12 @@ async def test_grant_ok_but_endpoint_check_runs(monkeypatch):
     """The endpoint pre-flight runs even when grants pass (it's a second gate)."""
     fake_main = _install_fake_main(monkeypatch)
     fake_main.postgres_db.get_thread = AsyncMock(
-        return_value={"id": "t1", "agent_id": None, "user_id": "u1"}
+        return_value={
+            "id": "t1",
+            "execution_lane": "pinned",
+            "agent_id": None,
+            "user_id": "u1",
+        }
     )
     fake_main._find_idle_persistent_agent = AsyncMock(return_value=None)
 
@@ -370,7 +483,11 @@ async def test_already_bound_exits_without_emitting_booting_or_ready(monkeypatch
     fake_main = _install_fake_main(monkeypatch)
     # Already bound — duplicate-provision guard fires.
     fake_main.postgres_db.get_thread = AsyncMock(
-        return_value={"id": "t1", "agent_id": "previously-bound"}
+        return_value={
+            "id": "t1",
+            "execution_lane": "pinned",
+            "agent_id": "previously-bound",
+        }
     )
 
     emit_calls: list[dict] = []
