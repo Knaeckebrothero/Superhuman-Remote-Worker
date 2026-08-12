@@ -3789,3 +3789,62 @@ same exact 11-failure set with **17,088 passed and 163 skipped** (the +22 are
 the new real-Postgres cases). M2 (durable accept and agent retry identity), M3
 (inline finalizer/resume drain), M4 (flag/parity/k3d kill proof) and optional
 M5 remain.
+
+## M2 shipped
+
+- Added the default-off durable accept wrapper around `/complete`. With
+  `COMPLETION_COMMANDS_ENABLED=false`, the wrapper authenticates and calls the
+  legacy body directly; focused tests prove it does not import or call the new
+  command service and returns the exact legacy object.
+- Added optional `agent_id` and `client_report_id` transport fields. Pinned
+  reports are fenced against the exact assigned agent; stateless reports are
+  fenced against the exact live worker lease. The canonical server-side digest
+  covers the job identity and operation body while excluding all three
+  transport/fence fields.
+- Admission locks `run_queue` before `jobs`, allocates `report_seq` from the
+  locked jobs-row HWM, inserts the immutable command as its first database
+  write, advances the HWM, and terminalizes a stateless `worker_batch` under
+  the accepted token in the same transaction. Exact retries authenticate
+  against the immutable accepted fence, not current mutable assignment/queue
+  state. The full pending/finalizing, done, parked, superseded,
+  force-resolved, and divergent-payload response matrix is covered.
+- Added the agent retry envelope: a random UUID and exact four-field completion
+  payload are persisted in the graph checkpoint immediately before END,
+  reused byte-for-byte by HTTP retries and successor END reports, and cleared
+  on genuine resume. `report_completion` accepts both 200 and 202, including a
+  bodyless 202. Pinned callers now send their registered agent identity, and
+  `dual_app` reports before its idle heartbeat, matching the already-correct
+  ordinary app ordering.
+- B4 queue terminalization means a 20-second heartbeat or the driver's
+  post-report renewal can observe `run_queue.state='done'` while finalization
+  is still running. The worker driver now recognizes only an exact
+  `(job_id, accepted_lease_token)` command joined to that done queue row as a
+  benign accepted handoff; it stops heartbeating and skips the old second
+  `complete_unit` instead of declaring a stolen lease. This lookup is itself
+  behind the same default-off flag, so the closed-gate worker path never reads
+  a command relation.
+
+One intentional deviation from the literal §5.4.5 lock wording: accept takes
+the queue row `FOR UPDATE`, not `FOR SHARE`. B4, folded later in the same
+authority section, requires accept to update that row. Two concurrent reporters
+holding `FOR SHARE` and then upgrading can deadlock; taking the required write
+lock at the start preserves the binding queue-before-jobs order and removes the
+upgrade. A second small rolling-compatibility detail is explicit: the stored
+payload is the verbatim four-field operation payload received by the accept
+service, not its transport envelope; the route removes fences before calling
+the service, exactly matching the digest and checkpoint contract.
+
+Verification at the M2 boundary: **46 new focused tests** (19 command-unit, 7
+real-Postgres accept/race/rollback, 8 endpoint-wrapper, 7 newly added
+client/envelope cases, 2 B4 driver cases, and 3 ordering/state cases) and the affected completion/agent matrix
+passes **300/300**. The real-Postgres cases prove concurrent same-key first
+wins/one 409, exact pinned and stateless fences, zero mutation on a stale token,
+transaction-wide rollback on injected queue-close failure, HWM/fallback ID
+semantics, and same-transaction queue closure. M3 (effect journal, command and
+leader leases, inline/resume drain), M4 operational parity/kill proof, and M5
+remain.
+
+The post-M2 repository-wide non-fail-fast suite produced the exact baseline
+failure set again: **17,134 passed, 163 skipped, 11 failed**. This is +46 from
+the post-M1 count and contains no new failure. Repository-wide Ruff check and
+format check (1,109 files) and the whitespace gate also pass.

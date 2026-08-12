@@ -649,7 +649,11 @@ async def _process_orchestrator_job(
         _current_job_id = None
         if _orchestrator_client:
             try:
-                await _orchestrator_client.report_completion(job_id, result)
+                await _orchestrator_client.report_completion(
+                    job_id,
+                    result,
+                    agent_id=_orchestrator_client.agent_id,
+                )
             except Exception as e:
                 logger.error(f"Failed to report completion for job {job_id}: {e}")
 
@@ -669,7 +673,11 @@ async def _process_orchestrator_job(
         error_result = completion_error_payload(e)
         if _orchestrator_client:
             try:
-                await _orchestrator_client.report_completion(job_id, error_result)
+                await _orchestrator_client.report_completion(
+                    job_id,
+                    error_result,
+                    agent_id=_orchestrator_client.agent_id,
+                )
             except Exception:
                 logger.error(f"Failed to report error for job {job_id}")
     finally:
@@ -1202,7 +1210,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 if _orchestrator_client:
                     try:
                         await _orchestrator_client.report_completion(
-                            request.job_id, result
+                            request.job_id,
+                            result,
+                            agent_id=_orchestrator_client.agent_id,
                         )
                     except Exception as e:
                         logger.error(
@@ -1225,7 +1235,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 if _orchestrator_client:
                     try:
                         await _orchestrator_client.report_completion(
-                            request.job_id, error_result
+                            request.job_id,
+                            error_result,
+                            agent_id=_orchestrator_client.agent_id,
                         )
                     except Exception:
                         logger.error(

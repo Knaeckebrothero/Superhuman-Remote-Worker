@@ -63,6 +63,11 @@ class TestCreateInitialState:
         state = create_initial_state(job_id="j1", workspace_path="/ws")
         assert state["consecutive_llm_errors"] == 0
 
+    def test_completion_report_envelope_starts_empty(self):
+        state = create_initial_state(job_id="j1", workspace_path="/ws")
+        assert state["client_report_id"] is None
+        assert state["completion_report_payload"] is None
+
     def test_workspace_memory_empty(self):
         state = create_initial_state(job_id="j1", workspace_path="/ws")
         assert state["workspace_memory"] == ""

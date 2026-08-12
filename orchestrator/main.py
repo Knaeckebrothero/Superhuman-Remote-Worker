@@ -1475,6 +1475,12 @@ STATELESS_WORKER_ENABLED = os.environ.get(
     "STATELESS_WORKER_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
 
+# Gate-3 completion commands ship dark.  Helm wires this value explicitly in
+# M4; local/tests may opt in before then without changing the legacy path.
+COMPLETION_COMMANDS_ENABLED = os.environ.get(
+    "COMPLETION_COMMANDS_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+
 # Dispatcher lock prevents concurrent dispatch (double-assignment)
 _dispatch_lock = asyncio.Lock()
 
@@ -9118,6 +9124,20 @@ class JobCompleteRequest(BaseModel):
         ge=1,
         description=(
             "Current worker_batch fencing token. Required only for stateless jobs."
+        ),
+    )
+    agent_id: UUID | None = Field(
+        None,
+        description=(
+            "Registered agent UUID. Required only for pinned jobs when the "
+            "durable completion-command gate is enabled."
+        ),
+    )
+    client_report_id: UUID | None = Field(
+        None,
+        description=(
+            "Per-stop UUID idempotency key. Optional during rolling upgrades; "
+            "new agents persist and resend it with the exact completion body."
         ),
     )
 
@@ -18877,6 +18897,110 @@ async def complete_job(
     request: Request,
     job_id: str,
     body: JobCompleteRequest,
+) -> Any:
+    """Authenticate, optionally admit a durable command, then run legacy effects.
+
+    With the default-off gate closed this calls the pre-Gate-3 implementation
+    directly and never reads or writes any completion-command relation.
+    """
+    await require_internal(request)
+    if not COMPLETION_COMMANDS_ENABLED:
+        return await _complete_job_legacy(request, job_id, body, _authorized=True)
+
+    from services.job_completion_commands import (
+        CompletionCommandNotFound,
+        CompletionFenceRejected,
+        CompletionInProgress,
+        CompletionPayloadMismatch,
+        accept_completion_command,
+        complete_completion_command,
+    )
+
+    payload = body.model_dump(
+        mode="json",
+        exclude={"lease_token", "agent_id", "client_report_id"},
+    )
+    try:
+        accepted = await accept_completion_command(
+            postgres_db,
+            job_id=job_id,
+            payload=payload,
+            lease_token=body.lease_token,
+            agent_id=str(body.agent_id) if body.agent_id is not None else None,
+            client_report_id=(
+                str(body.client_report_id)
+                if body.client_report_id is not None
+                else None
+            ),
+            requested_by=(
+                f"agent:{body.agent_id}"
+                if body.agent_id is not None
+                else f"worker-lease:{body.lease_token}"
+            ),
+        )
+    except CompletionCommandNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CompletionPayloadMismatch as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except CompletionInProgress as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+            headers={"Retry-After": "1"},
+        ) from exc
+    except CompletionFenceRejected as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if accepted.disposition == "replay_done":
+        return JSONResponse(
+            content=accepted.outcome or {},
+            headers={"Idempotent-Replayed": "true"},
+        )
+    if accepted.disposition == "replay_parked":
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "still_pending",
+                "job_id": accepted.job_id,
+                "command_id": accepted.command_id,
+                "command_state": accepted.state,
+            },
+            headers={"Idempotent-Replayed": "true"},
+        )
+    if accepted.disposition == "replay_superseded":
+        outcome = dict(accepted.outcome or {})
+        outcome.setdefault("status", "superseded")
+        outcome.setdefault("job_id", accepted.job_id)
+        outcome.setdefault("winning_report_seq", accepted.winning_report_seq)
+        return JSONResponse(
+            content=outcome,
+            headers={"Idempotent-Replayed": "true"},
+        )
+    if accepted.disposition == "replay_force_resolved":
+        outcome = dict(accepted.outcome or {})
+        outcome.setdefault("status", "force_resolved")
+        outcome.setdefault("job_id", accepted.job_id)
+        outcome.setdefault("abandoned_effects", list(accepted.abandoned_effects))
+        return JSONResponse(
+            content=outcome,
+            headers={"Idempotent-Replayed": "true"},
+        )
+
+    result = await _complete_job_legacy(request, job_id, body, _authorized=True)
+    if not await complete_completion_command(postgres_db, accepted.command_id, result):
+        raise HTTPException(
+            status_code=500,
+            detail="Completion effects ran but command outcome was not recorded",
+        )
+    return result
+
+
+async def _complete_job_legacy(
+    request: Request,
+    job_id: str,
+    body: JobCompleteRequest,
+    *,
+    _authorized: bool = False,
 ) -> dict[str, Any]:
     """Handle job completion reported by the agent. **Internal** (P4b) —
     requires ``X-Internal-Key``. Ingress strips this path.
@@ -18888,7 +19012,8 @@ async def complete_job(
     This replaces the agent-side ``_update_job_status_from_result``,
     ``_handle_critic_verdict``, and ``_maybe_trigger_verification`` functions.
     """
-    await require_internal(request)
+    if not _authorized:
+        await require_internal(request)
     from services.completion import (
         determine_job_status,
         handle_pod_workspace_recovery,
@@ -18985,7 +19110,9 @@ async def complete_job(
                 "actions": [f"exact-token terminal retry; job already {job['status']}"],
             }
 
-        result = body.model_dump(exclude={"lease_token"})
+        result = body.model_dump(
+            exclude={"lease_token", "agent_id", "client_report_id"},
+        )
         actions: list[str] = []
 
         if job["status"] not in (

@@ -127,6 +127,27 @@ SELECT EXISTS (
 )
 """
 
+_ACCEPTED_WORKER_COMPLETION_SQL = """
+SELECT job.status::text AS job_status,
+       queue.state AS queue_state,
+       command.state AS command_state,
+       command.id AS command_id
+FROM run_queue AS queue
+JOIN jobs AS job ON job.id = queue.unit_id
+JOIN LATERAL (
+    SELECT id, state
+    FROM job_completion_commands
+    WHERE job_id = queue.unit_id
+      AND accepted_lease_token = $2::bigint
+    ORDER BY report_seq DESC
+    LIMIT 1
+) AS command ON TRUE
+WHERE queue.unit_id = $1::uuid
+  AND queue.unit_kind = 'worker_batch'
+  AND queue.state = 'done'
+  AND queue.lease_token = $2::bigint
+"""
+
 _LOCK_WORKER_ROTATION_SQL = """
 SELECT input_seq
 FROM run_queue
@@ -234,6 +255,16 @@ class WorkerRenewal:
         """Whether an out-of-band control status requires this claim to stop."""
 
         return self.job_status in _PREEMPTED_JOB_STATUSES
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerCompletionAcceptance:
+    """A queue lease closed by durable completion-command admission (B4)."""
+
+    job_status: str
+    queue_state: str
+    command_state: str
+    command_id: UUID
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,6 +603,37 @@ async def renew_worker_batch(
     )
 
 
+async def get_worker_completion_acceptance(
+    conn: Any,
+    *,
+    unit_id: UUID | str,
+    lease_token: int,
+) -> WorkerCompletionAcceptance | None:
+    """Recognize B4 queue closure without misclassifying it as a stolen lease.
+
+    The completion-command accept transaction closes ``run_queue`` before the
+    legacy/finalizer tail runs.  A concurrent executor heartbeat consequently
+    receives no renewal even though it remains the accepted reporter.  This
+    exact token-to-command join distinguishes that benign terminal handoff from
+    a real reaper steal; callers must never treat a merely ``done`` queue row as
+    proof on its own.
+    """
+
+    row = await conn.fetchrow(
+        _ACCEPTED_WORKER_COMPLETION_SQL,
+        _uuid(unit_id),
+        int(lease_token),
+    )
+    if row is None:
+        return None
+    return WorkerCompletionAcceptance(
+        job_status=str(row["job_status"]),
+        queue_state=str(row["queue_state"]),
+        command_state=str(row["command_state"]),
+        command_id=_uuid(row["command_id"]),
+    )
+
+
 async def complete_worker_batch(
     conn: Any,
     *,
@@ -704,12 +766,14 @@ async def rotate_worker_batch(
 
 __all__ = [
     "WorkerClaim",
+    "WorkerCompletionAcceptance",
     "WorkerRenewal",
     "WorkerRotation",
     "cancel_queued_worker_batch",
     "claim_worker_batch",
     "complete_worker_batch",
     "enqueue_worker_batch",
+    "get_worker_completion_acceptance",
     "renew_worker_batch",
     "release_worker_batch",
     "rotate_worker_batch",

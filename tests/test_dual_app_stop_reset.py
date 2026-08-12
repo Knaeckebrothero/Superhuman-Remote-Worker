@@ -132,6 +132,59 @@ class TestProcessJobCooperativeStop:
         client.report_completion.assert_not_awaited()
 
 
+class TestProcessJobCompletionOrdering:
+    @pytest.mark.asyncio
+    async def test_reports_with_pinned_fence_before_ready_heartbeat(
+        self, tmp_path, monkeypatch
+    ):
+        from src.api import dual_app
+
+        client = _reset_module(dual_app, pod_state=dual_app.PodState.WORKING)
+        dual_app._current_job_id = "job-complete"
+        monkeypatch.setenv("AGENT_LOOP", "1")
+
+        events: list[str] = []
+
+        async def _report(*_args, **_kwargs):
+            events.append("report")
+            return True
+
+        async def _heartbeat(*_args, **_kwargs):
+            events.append("heartbeat")
+            return {}
+
+        client.report_completion = AsyncMock(side_effect=_report)
+        client.heartbeat = AsyncMock(side_effect=_heartbeat)
+
+        final = {
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": None,
+            "freeze_data": None,
+        }
+
+        async def _stream():
+            yield final
+
+        agent = MagicMock()
+        agent.process_job = AsyncMock(return_value=_stream())
+        dual_app._agent = agent
+
+        from src.core import workspace as ws_mod
+
+        monkeypatch.setattr(ws_mod, "get_logs_path", lambda: tmp_path)
+
+        await dual_app._process_orchestrator_job("job-complete", "desc")
+
+        assert events[0] == "report"
+        client.report_completion.assert_awaited_once_with(
+            "job-complete",
+            final,
+            agent_id="agent-1",
+        )
+        assert client.heartbeat.await_count >= 1
+
+
 class TestCancelHardKillResets:
     """Site C — the cancel handler's 120s hard-kill timeout branch."""
 

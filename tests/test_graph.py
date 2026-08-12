@@ -12,6 +12,7 @@ import sys
 import yaml
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock, patch
+from uuid import UUID
 
 # Add project root src to path for imports
 project_root = Path(__file__).parent.parent
@@ -38,6 +39,7 @@ from src.graph import (  # noqa: E402
     create_handle_transition_node,
     create_audited_tool_node,
     build_phase_alternation_graph,
+    checkpoint_completion_report,
     get_managers_from_workspace,
     worker_batch_boundary_updates,
 )
@@ -474,6 +476,116 @@ class TestWorkerBatchBudget:
         assert result["error"] is None
 
 
+class TestCheckpointCompletionReport:
+    def test_mints_one_id_with_an_exact_deep_copied_payload(self):
+        state = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {"type": "llm_error", "detail": {"attempt": 2}},
+            "freeze_data": {
+                "freeze_type": "blocking_message",
+                "summary": "wait for a reply",
+            },
+        }
+
+        updates = checkpoint_completion_report(state)
+
+        UUID(updates["client_report_id"])
+        assert set(updates["completion_report_payload"]) == {
+            "should_stop",
+            "goal_achieved",
+            "error",
+            "freeze_data",
+        }
+        assert updates["completion_report_payload"] == state
+
+        state["error"]["detail"]["attempt"] = 3
+        state["freeze_data"]["summary"] = "changed after END"
+        assert updates["completion_report_payload"]["error"]["detail"]["attempt"] == 2
+        assert (
+            updates["completion_report_payload"]["freeze_data"]["summary"]
+            == "wait for a reply"
+        )
+
+    def test_retry_keeps_existing_identity_and_payload_verbatim(self):
+        report_id = "11111111-1111-4111-8111-111111111111"
+        payload = {
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": None,
+            "freeze_data": {"freeze_type": "job_complete", "stamp": "first"},
+        }
+        state = {
+            "client_report_id": report_id,
+            "completion_report_payload": payload,
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {"message": "later state must not replace the stop"},
+            "freeze_data": None,
+        }
+
+        assert checkpoint_completion_report(state) == {}
+        assert state["client_report_id"] == report_id
+        assert state["completion_report_payload"] is payload
+
+    def test_batch_boundary_does_not_mint_and_clears_stale_envelope(self):
+        result = checkpoint_completion_report(
+            {
+                "client_report_id": "11111111-1111-4111-8111-111111111111",
+                "completion_report_payload": {
+                    "should_stop": True,
+                    "goal_achieved": True,
+                    "error": None,
+                    "freeze_data": None,
+                },
+                "should_stop": True,
+                "freeze_data": {"freeze_type": "batch_boundary"},
+            }
+        )
+
+        assert result == {
+            "client_report_id": None,
+            "completion_report_payload": None,
+        }
+
+    def test_graph_checkpoints_report_before_end(self):
+        source = inspect.getsource(build_phase_alternation_graph)
+        assert '"end": "checkpoint_completion_report"' in source
+        assert 'workflow.add_edge("checkpoint_completion_report", END)' in source
+
+    @pytest.mark.asyncio
+    async def test_report_envelope_is_in_the_terminal_checkpoint(self):
+        from langgraph.checkpoint.memory import InMemorySaver
+        from langgraph.graph import END, StateGraph
+
+        from src.core.state import UniversalAgentState
+
+        workflow = StateGraph(UniversalAgentState)
+        workflow.add_node("checkpoint_completion_report", checkpoint_completion_report)
+        workflow.set_entry_point("checkpoint_completion_report")
+        workflow.add_edge("checkpoint_completion_report", END)
+        graph = workflow.compile(checkpointer=InMemorySaver())
+        config = {"configurable": {"thread_id": "completion-envelope-test"}}
+
+        result = await graph.ainvoke(
+            {
+                "should_stop": True,
+                "goal_achieved": True,
+                "error": None,
+                "freeze_data": {"freeze_type": "job_complete"},
+            },
+            config=config,
+        )
+        terminal = await graph.aget_state(config)
+
+        assert terminal.next == ()
+        assert terminal.values["client_report_id"] == result["client_report_id"]
+        assert (
+            terminal.values["completion_report_payload"]
+            == result["completion_report_payload"]
+        )
+
+
 class TestRestoreTodoStateNode:
     """Tests for restore_todo_state node."""
 
@@ -505,12 +617,24 @@ class TestRestoreTodoStateNode:
             ],
             "staged_todos": [],
             "todo_next_id": 3,
+            "client_report_id": "11111111-1111-4111-8111-111111111111",
+            "completion_report_payload": {
+                "should_stop": True,
+                "goal_achieved": False,
+                "error": None,
+                "freeze_data": {"freeze_type": "blocking_message"},
+            },
         }
 
         result = node(state)
 
         # Node always clears stop flags on resume
-        assert result == {"should_stop": False, "goal_achieved": False}
+        assert result == {
+            "should_stop": False,
+            "goal_achieved": False,
+            "client_report_id": None,
+            "completion_report_payload": None,
+        }
 
         # But TodoManager should be restored
         todos = managers["todo"].list_all()

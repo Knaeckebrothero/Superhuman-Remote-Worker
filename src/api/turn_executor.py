@@ -92,6 +92,7 @@ from ..shared.worker_queue import (
     WorkerRenewal,
     claim_worker_batch,
     complete_worker_batch,
+    get_worker_completion_acceptance,
     renew_worker_batch,
     release_worker_batch,
     rotate_worker_batch,
@@ -328,6 +329,7 @@ class StatelessTurnExecutor:
         abort_grace_seconds: float = TURN_ABORT_GRACE_SECONDS,
         warm_session_idle_ttl_seconds: float = WARM_SESSION_IDLE_TTL_SECONDS,
         worker_enabled: Optional[bool] = None,
+        completion_commands_enabled: Optional[bool] = None,
     ) -> None:
         self._pod_name = (
             pod_name or os.getenv("POD_NAME") or socket.gethostname() or "agent"
@@ -345,6 +347,11 @@ class StatelessTurnExecutor:
             _enabled_env("STATELESS_WORKER_ENABLED", False)
             if worker_enabled is None
             else bool(worker_enabled)
+        )
+        self._completion_commands_enabled = (
+            _enabled_env("COMPLETION_COMMANDS_ENABLED", False)
+            if completion_commands_enabled is None
+            else bool(completion_commands_enabled)
         )
         self._worker_preempted = asyncio.Event()
         self._worker_preempt_status: Optional[str] = None
@@ -971,6 +978,7 @@ class StatelessTurnExecutor:
             # queue error-release. Never cancel an in-flight report: Starlette
             # cancellation can strand the existing multi-write handler.
             failed_report_status: str | None = None
+            accepted_completion = None
             if not self._lease.lost.is_set():
                 renewal = await renew_worker_batch(
                     self._db,
@@ -978,10 +986,25 @@ class StatelessTurnExecutor:
                     lease_token=token,
                 )
                 if renewal is None:
-                    self._lease.mark_lost()
+                    accepted_completion = await self._accepted_worker_completion(claim)
+                    if accepted_completion is None:
+                        self._lease.mark_lost()
+                    else:
+                        failed_report_status = accepted_completion.job_status
                 else:
                     failed_report_status = renewal.job_status
                     self._observe_worker_renewal(job_id, renewal)
+            if accepted_completion is not None:
+                await self._cleanup_worker_runtime(preserve_shell=True)
+                logger.info(
+                    "worker completion already accepted: unit=%s token=%d "
+                    "command=%s state=%s after ambiguous HTTP result",
+                    job_id,
+                    token,
+                    accepted_completion.command_id,
+                    accepted_completion.command_state,
+                )
+                return
             if self._lease.lost.is_set():
                 await self._cleanup_worker_runtime(preserve_shell=True)
                 return
@@ -1008,6 +1031,7 @@ class StatelessTurnExecutor:
         # before queue closure. Report-authored paused/failed states use the
         # same safe terminal closure; their cleanup disposition is status-based.
         post_report_status: str | None = None
+        accepted_completion = None
         if not self._lease.lost.is_set():
             renewal = await renew_worker_batch(
                 self._db,
@@ -1015,7 +1039,11 @@ class StatelessTurnExecutor:
                 lease_token=token,
             )
             if renewal is None:
-                self._lease.mark_lost()
+                accepted_completion = await self._accepted_worker_completion(claim)
+                if accepted_completion is None:
+                    self._lease.mark_lost()
+                else:
+                    post_report_status = accepted_completion.job_status
             else:
                 post_report_status = renewal.job_status
                 self._observe_worker_renewal(job_id, renewal)
@@ -1037,6 +1065,18 @@ class StatelessTurnExecutor:
         await self._cleanup_worker_runtime(
             preserve_shell=post_report_status in _WORKER_PRESERVE_SHELL_STATUSES
         )
+        if accepted_completion is not None:
+            logger.info(
+                "worker_batch terminal accepted: unit=%s token=%d "
+                "queue_state=%s command=%s command_state=%s "
+                "complete_calls=0 http_complete_calls=1",
+                job_id,
+                token,
+                accepted_completion.queue_state,
+                accepted_completion.command_id,
+                accepted_completion.command_state,
+            )
+            return
         state = await complete_worker_batch(
             self._db,
             unit_id=unit.unit_id,
@@ -1230,6 +1270,17 @@ class StatelessTurnExecutor:
                 )
                 continue
             if renewal is None:
+                accepted_completion = await self._accepted_worker_completion(claim)
+                if accepted_completion is not None:
+                    logger.info(
+                        "worker completion accepted during heartbeat: unit=%s "
+                        "token=%d command=%s state=%s",
+                        job_id,
+                        token,
+                        accepted_completion.command_id,
+                        accepted_completion.command_state,
+                    )
+                    return
                 self._lease.mark_lost()
                 logger.warning(
                     "lease lost: worker unit=%s token=%d (renewal rejected)",
@@ -1238,6 +1289,26 @@ class StatelessTurnExecutor:
                 )
                 return
             self._observe_worker_renewal(job_id, renewal)
+
+    async def _accepted_worker_completion(self, claim: WorkerClaim) -> Any | None:
+        """Return an exact B4 accept only while the shared rollout gate is on."""
+
+        if not self._completion_commands_enabled:
+            return None
+        try:
+            return await get_worker_completion_acceptance(
+                self._db,
+                unit_id=claim.unit_id,
+                lease_token=claim.lease_token,
+            )
+        except Exception as exc:
+            logger.warning(
+                "worker completion-acceptance lookup failed for unit %s "
+                "(treating renewal rejection as lease loss): %s",
+                claim.unit_id,
+                exc,
+            )
+            return None
 
     def _observe_worker_renewal(self, job_id: str, renewal: WorkerRenewal) -> None:
         self._seed_worker_inboxes(
