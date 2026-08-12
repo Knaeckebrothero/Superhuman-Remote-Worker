@@ -304,22 +304,20 @@ def test_no_chart_renders_an_empty_authorized_keys(chart: Chart) -> None:
 
 
 def test_vault_key_branch_emits_no_unsubstituted_placeholder() -> None:
-    """The Vault/ESO key branch must not emit a placeholder nobody substitutes.
+    """The Vault/ESO key branch must close its runtime SSH-key placeholder.
 
     ``helm-vm-cluster`` has two SSH-key branches. The inline ``ssh.publicKey``
     branch templates the real key at render time. The ``ssh.publicKeyVaultPath``
-    branch instead emits a literal ``${SSH_AUTHORIZED_KEY}`` for the controller
-    to fill from the synced Secret at provision time — but the controller has no
-    such substitution, so that literal reaches the guest as authorized_keys.
-
-    Only the inline branch is exercised elsewhere in this file, which is exactly
-    why this defect survived: the broken branch is the one CI never renders.
+    branch emits ``${SSH_AUTHORIZED_KEY}`` for the controller to fill from the
+    synced Secret at provision time. Render that valid ESO-backed scenario and
+    keep its placeholder covered by the controller's replacement contract.
     """
     chart = CHARTS[1]
     rendered = render_chart(
         chart,
         "ssh.publicKey=",
         "ssh.publicKeyVaultPath=secret/data/srw/vm-ssh",
+        "externalSecrets.enabled=true",
     )
     unsubstituted = (
         placeholders(yaml.safe_dump(vm_template(rendered))) - controller_replacements()
