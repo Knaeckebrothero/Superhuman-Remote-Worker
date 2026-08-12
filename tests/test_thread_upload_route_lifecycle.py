@@ -216,16 +216,27 @@ async def test_stateless_delete_holds_lifecycle_lock_through_exact_delete():
 
 
 @pytest.mark.asyncio
-async def test_retirement_marker_refuses_stateless_delete_before_transport():
+@pytest.mark.parametrize(
+    "marker_key",
+    [
+        "_stateless_workspace_retirement_pending",
+        "_stateless_claim_retirement",
+        "_stateless_claim_loss_hold",
+        "_stateless_claim_losses",
+    ],
+)
+@pytest.mark.parametrize("value", [None, False, 0, "", [], {}])
+async def test_present_falsey_stop_marker_refuses_delete_before_transport(
+    marker_key, value
+):
     from orchestrator import main
     from services import thread_uploads
 
     order: list[str] = []
     initial = _thread()
-    ended = deepcopy(initial)
-    ended["status"] = "ended"
-    ended["metadata"]["_stateless_workspace_retirement_pending"] = True
-    db = _DB(ended, order)
+    blocked = deepcopy(initial)
+    blocked["metadata"][marker_key] = value
+    db = _DB(blocked, order)
 
     with (
         patch.object(
@@ -389,3 +400,92 @@ async def test_cancelled_virtual_upload_keeps_lifecycle_lock_until_writer_finish
 
     assert order.index("write-finished") < order.index("upload-unlock")
     assert order.index("upload-unlock") < order.index("end-delete")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_virtual_delete_keeps_lifecycle_lock_until_worker_finishes():
+    from orchestrator import main
+    from services import thread_uploads
+
+    order: list[str] = []
+    entered = threading.Event()
+    release = threading.Event()
+    lock = asyncio.Lock()
+    thread = {
+        "id": THREAD_ID,
+        "user_id": "user-a",
+        "execution_lane": "stateless",
+        "status": "active",
+        "metadata": {
+            "config_override": {"workspace": {"backend": "virtual"}},
+            "_workspace_binding": {
+                "generation": GENERATION,
+                "kind": "virtual",
+                "backing_id": f"rclone:threads/{THREAD_ID}",
+                "ssh_host_key_fingerprint": None,
+            },
+        },
+    }
+
+    class _LockDB:
+        get_thread = AsyncMock(return_value=thread)
+
+        @asynccontextmanager
+        async def stateless_session_workspace_ensure_lock(self, *_args, **_kwargs):
+            async with lock:
+                order.append("delete-lock")
+                try:
+                    yield True
+                finally:
+                    order.append("delete-unlock")
+
+    def _blocked_delete(_target, _relpath):
+        entered.set()
+        assert release.wait(timeout=5)
+        order.append("delete-finished")
+        return True
+
+    destination = thread_uploads._VirtualTarget(
+        spec={"type": "s3", "root": "bucket", "config": {}},
+        prefix=f"threads/{THREAD_ID}/",
+    )
+    db = _LockDB()
+    with (
+        patch.object(
+            main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"sub": "user-a"}, thread)),
+        ),
+        patch.object(main, "postgres_db", db),
+        patch.object(
+            thread_uploads,
+            "resolve_thread_upload_destination",
+            return_value=destination,
+        ),
+        patch.object(thread_uploads, "_virtual_delete_file", _blocked_delete),
+    ):
+        deleting = asyncio.create_task(
+            main.delete_thread_upload(THREAD_ID, "notes.txt", SimpleNamespace())
+        )
+        deadline = asyncio.get_running_loop().time() + 2
+        while not entered.is_set():
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+
+        deleting.cancel()
+
+        async def _resume_owner():
+            async with db.stateless_session_workspace_ensure_lock(THREAD_ID):
+                order.append("resume")
+
+        resuming = asyncio.create_task(_resume_owner())
+        await asyncio.sleep(0.02)
+        assert not deleting.done()
+        assert not resuming.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await deleting
+        await resuming
+
+    assert order.index("delete-finished") < order.index("delete-unlock")
+    assert order.index("delete-unlock") < order.index("resume")

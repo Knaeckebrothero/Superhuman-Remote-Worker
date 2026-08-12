@@ -87,10 +87,13 @@ async def _joined_blocking_call(func, /, *args, **kwargs):
             await asyncio.shield(task)
         except asyncio.CancelledError:
             cancelled = True
+        except Exception:
+            if not cancelled:
+                raise
     if cancelled:
         # Retrieve a blocking-call exception before honoring cancellation; the
         # stale effect is terminal either way and can no longer race a retry.
-        with suppress(Exception):
+        with suppress(BaseException):
             task.result()
         raise asyncio.CancelledError
     return task.result()

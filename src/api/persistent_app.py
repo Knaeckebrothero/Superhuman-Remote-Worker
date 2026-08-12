@@ -3066,15 +3066,13 @@ async def _terminate_session_inner(
 
     # Retire this thread's announced permission rows, then drop the ledger.
     # The turn-end sweep in _loop_on_turn_complete is the usual owner, but the
-    # cancel above skips it. Admission is already fenced here, so a current
-    # pinned owner can clean up before any later lifecycle CAS/quiesce failure.
+    # cancel above skips it. The helper holds the exact queue lease or pinned
+    # reciprocal binding through each irreversible UPDATE, so a binding move
+    # after admission closure cannot let this stale runtime touch successor
+    # rows.
     _gates_in_flight.clear()
     _active_permission_request_id = None
-    # Stateless permission rows are not lease-qualified, so a stale owner may
-    # never sweep thread-wide state that can already belong to its successor.
-    # The same applies to a pinned runtime whose reciprocal binding moved.
-    if not _stateless_mode() and (pinned_control_owner is None or admission_closed):
-        await _retire_announced_permission_rows(f"session terminated ({reason})")
+    await _retire_announced_permission_rows(f"session terminated ({reason})")
     _announced_permission_rows.clear()
 
     if mark_thread:
@@ -7652,6 +7650,69 @@ _active_permission_request_id: Optional[str] = None
 _gates_in_flight: Set[str] = set()
 
 
+def _permission_retirement_authority() -> Optional[Tuple[str, int | str]]:
+    """Capture the exact credential allowed to retire permission rows."""
+
+    if _stateless_mode():
+        lease_token = _current_stateless_lease_token()
+        return ("stateless", lease_token) if lease_token is not None else None
+    agent_id = _control_owner_agent_id or _registered_pinned_agent_id()
+    return ("pinned", agent_id) if agent_id is not None else None
+
+
+_RETIRE_STATELESS_PERMISSION_SQL = """
+    WITH owner AS MATERIALIZED (
+        SELECT queue.unit_id
+        FROM run_queue AS queue
+        WHERE queue.unit_id = $2::uuid
+          AND queue.unit_kind = 'session_turn'
+          AND queue.state = 'leased'
+          AND queue.lease_token = $3::bigint
+        FOR SHARE OF queue
+    ), expired AS (
+        UPDATE thread_permission_requests AS request
+        SET status = 'expired', decided_at = clock_timestamp(),
+            decided_by = 'system'
+        WHERE request.id = $1::uuid
+          AND request.thread_id = $2::uuid
+          AND request.status = 'pending'
+          AND EXISTS (SELECT 1 FROM owner)
+        RETURNING request.id
+    )
+    SELECT id FROM expired
+"""
+
+
+_RETIRE_PINNED_PERMISSION_SQL = """
+    WITH thread_owner AS MATERIALIZED (
+        SELECT thread.id
+        FROM threads AS thread
+        WHERE thread.id = $2::uuid
+          AND thread.execution_lane = 'pinned'
+          AND thread.agent_id = $3::uuid
+        FOR NO KEY UPDATE OF thread
+    ), agent_owner AS MATERIALIZED (
+        SELECT agent.id
+        FROM agents AS agent
+        WHERE agent.id = $3::uuid
+          AND agent.thread_id = $2::uuid
+          AND EXISTS (SELECT 1 FROM thread_owner)
+        FOR SHARE OF agent
+    ), expired AS (
+        UPDATE thread_permission_requests AS request
+        SET status = 'expired', decided_at = clock_timestamp(),
+            decided_by = 'system'
+        WHERE request.id = $1::uuid
+          AND request.thread_id = $2::uuid
+          AND request.status = 'pending'
+          AND EXISTS (SELECT 1 FROM thread_owner)
+          AND EXISTS (SELECT 1 FROM agent_owner)
+        RETURNING request.id
+    )
+    SELECT id FROM expired
+"""
+
+
 async def _retire_announced_permission_rows(
     reason: str, mode: Optional[str] = None
 ) -> None:
@@ -7680,8 +7741,11 @@ async def _retire_announced_permission_rows(
     only ever expire rows announced by the session it is running in.
 
     CAS (``WHERE id = $1 AND status = 'pending'``) so a genuine decision that
-    landed a microsecond earlier still wins; only rows this sweep really
-    expired are broadcast, so an attached client drops exactly those cards.
+    landed a microsecond earlier still wins. The same statement holds either
+    the exact stateless run-queue lease or the reciprocal pinned binding while
+    updating; a stale runtime therefore cannot expire a successor's gate.
+    Only rows this sweep really expired are broadcast, so an attached client
+    drops exactly those cards.
     """
     if not _announced_permission_rows:
         return
@@ -7692,6 +7756,13 @@ async def _retire_announced_permission_rows(
     # on every reattach with no way left to resolve them.
     if _session is None or _session.postgres_conn is None:
         return
+    authority = _permission_retirement_authority()
+    if authority is None or _thread_id is None:
+        logger.info(
+            "Skipped permission-row retirement without exact owner (%s)", reason
+        )
+        return
+    authority_kind, authority_credential = authority
     # Take ownership up front so a second sweep can't double-work the same
     # rows; anything we fail to reach goes back on the ledger below. No await
     # between this and the pop, so ownership is atomic.
@@ -7713,12 +7784,12 @@ async def _retire_announced_permission_rows(
         async with _session.postgres_conn.acquire() as conn:
             for tool_call_id, (request_id, _tool, _tid) in list(doomed.items()):
                 row_id = await conn.fetchval(
-                    "UPDATE thread_permission_requests "
-                    "SET status = 'expired', decided_at = now(), "
-                    "    decided_by = 'system' "
-                    "WHERE id = $1 AND status = 'pending' "
-                    "RETURNING id",
+                    _RETIRE_STATELESS_PERMISSION_SQL
+                    if authority_kind == "stateless"
+                    else _RETIRE_PINNED_PERMISSION_SQL,
                     request_id,
+                    _thread_id,
+                    authority_credential,
                 )
                 doomed.pop(tool_call_id, None)
                 if row_id is not None:
