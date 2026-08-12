@@ -4767,6 +4767,58 @@ COMMENT ON COLUMN public.cloud_ro_mounts.staged_summary IS 'manifest counts + co
 
 
 --
+-- Name: completion_effects; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.completion_effects (
+    producer_kind text NOT NULL,
+    producer_id uuid NOT NULL,
+    scope_id uuid,
+    effect_name text NOT NULL,
+    effect_group text NOT NULL,
+    state text DEFAULT 'pending'::text NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    max_attempts integer DEFAULT 5 NOT NULL,
+    run_after timestamp with time zone DEFAULT now() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    intent_at timestamp with time zone,
+    complete_by timestamp with time zone,
+    completed_at timestamp with time zone,
+    detail jsonb DEFAULT '{}'::jsonb NOT NULL,
+    error_code text
+);
+
+
+--
+-- Name: TABLE completion_effects; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.completion_effects IS 'One stable-name progress row per completion effect. Polymorphic by producer_kind and deliberately has no foreign key or state-driven partial index; retention is explicit and shared with session producers.';
+
+
+--
+-- Name: completion_finalizer_leases; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.completion_finalizer_leases (
+    lease_name text NOT NULL,
+    leader_id text NOT NULL,
+    elected_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT completion_finalizer_leader_id_nonempty CHECK ((btrim(leader_id) <> ''::text)),
+    CONSTRAINT completion_finalizer_lease_expiry_order CHECK ((expires_at > elected_at)),
+    CONSTRAINT completion_finalizer_lease_name_nonempty CHECK ((btrim(lease_name) <> ''::text))
+);
+
+
+--
+-- Name: TABLE completion_finalizer_leases; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.completion_finalizer_leases IS 'Observable expiring leader leases for completion finalizer drains. Election inserts a named row, renewal fences on leader_id plus elected_at, and failover reaps only an expired row.';
+
+
+--
 -- Name: compute_metering_activation; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5375,6 +5427,63 @@ COMMENT ON COLUMN public.job_change_records.job_id IS 'Execution job identifier 
 
 
 --
+-- Name: job_completion_commands; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.job_completion_commands (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    job_id uuid NOT NULL,
+    report_seq bigint NOT NULL,
+    client_report_id uuid NOT NULL,
+    payload jsonb NOT NULL,
+    payload_digest text NOT NULL,
+    reported_at timestamp with time zone DEFAULT now() NOT NULL,
+    accepted_lease_token bigint,
+    accepted_agent_id uuid,
+    origin text DEFAULT 'agent'::text NOT NULL,
+    requested_by text NOT NULL,
+    state text DEFAULT 'pending'::text NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    max_attempts integer DEFAULT 5 NOT NULL,
+    run_after timestamp with time zone DEFAULT now() NOT NULL,
+    lease_expires_at timestamp with time zone,
+    deadline_at timestamp with time zone NOT NULL,
+    finalizing_by text,
+    code_version text NOT NULL,
+    outcome jsonb,
+    finalized_at timestamp with time zone,
+    error_code text,
+    CONSTRAINT job_completion_fence_exactly_one CHECK ((((origin = 'operator'::text) AND (accepted_lease_token IS NULL) AND (accepted_agent_id IS NULL)) OR ((origin <> 'operator'::text) AND (((accepted_lease_token IS NOT NULL) AND (accepted_agent_id IS NULL)) OR ((accepted_lease_token IS NULL) AND (accepted_agent_id IS NOT NULL)))))),
+    CONSTRAINT job_completion_state_value CHECK ((state = ANY (ARRAY['pending'::text, 'finalizing'::text, 'done'::text, 'parked'::text, 'superseded'::text, 'force_resolved'::text]))),
+    CONSTRAINT job_completion_terminal_shape CHECK ((((state = ANY (ARRAY['pending'::text, 'finalizing'::text])) AND (outcome IS NULL) AND (finalized_at IS NULL) AND (error_code IS NULL)) OR ((state = 'done'::text) AND (outcome IS NOT NULL) AND (finalized_at IS NOT NULL) AND (error_code IS NULL)) OR ((state = 'force_resolved'::text) AND (outcome IS NOT NULL) AND (finalized_at IS NOT NULL)) OR ((state = 'superseded'::text) AND (finalized_at IS NOT NULL) AND (outcome IS NOT NULL)) OR ((state = 'parked'::text) AND (error_code IS NOT NULL) AND (outcome IS NULL) AND (finalized_at IS NULL))))
+);
+
+
+--
+-- Name: TABLE job_completion_commands; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.job_completion_commands IS 'Durable, commit-ordered completion reports for both pinned and stateless job lanes. Agent-origin reports are fenced by exactly one lane-specific credential; operator-origin terminal paths carry neither.';
+
+
+--
+-- Name: job_completion_sweep_exclusions; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.job_completion_sweep_exclusions AS
+ SELECT DISTINCT command.job_id
+   FROM public.job_completion_commands command
+  WHERE ((command.state = ANY (ARRAY['pending'::text, 'finalizing'::text, 'parked'::text])) AND ((command.lease_expires_at > now()) OR (command.state = 'parked'::text)));
+
+
+--
+-- Name: VIEW job_completion_sweep_exclusions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON VIEW public.job_completion_sweep_exclusions IS 'Single source of truth for jobs-side sweep exclusion: live finalizer leases and parked operator work only. Expired commands must route to the finalizer resume path rather than disappear from all rescuers.';
+
+
+--
 -- Name: job_datasources; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5441,6 +5550,7 @@ CREATE TABLE public.jobs (
     wake_notified_status text,
     failed_at timestamp with time zone,
     execution_lane text DEFAULT 'pinned'::text NOT NULL,
+    completion_seq_hwm bigint DEFAULT 0 NOT NULL,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
     CONSTRAINT jobs_wake_state_known CHECK ((wake_state = ANY (ARRAY['none'::text, 'pending'::text, 'sending'::text, 'sent'::text, 'dead'::text]))),
@@ -5516,6 +5626,13 @@ COMMENT ON COLUMN public.jobs.failed_at IS 'When the job entered ''failed'', set
 --
 
 COMMENT ON COLUMN public.jobs.execution_lane IS 'Which execution plane owns this job: ''pinned'' (registered-agent dispatch and jobs-row lease recovery, the default) or ''stateless'' (worker_batch run_queue claim and reaper). App-validated by design; exactly one plane may dispatch or recover a job. See docs/features/stateless_agents.md §5.4.4.';
+
+
+--
+-- Name: COLUMN jobs.completion_seq_hwm; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.jobs.completion_seq_hwm IS 'Highest commit-ordered job_completion_commands.report_seq allocated for this job. Admission increments it while holding the jobs row lock; never allocate completion order from an IDENTITY/sequence.';
 
 
 --
@@ -8504,6 +8621,22 @@ ALTER TABLE ONLY public.cloud_ro_mounts
 
 
 --
+-- Name: completion_effects completion_effects_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.completion_effects
+    ADD CONSTRAINT completion_effects_pkey PRIMARY KEY (producer_kind, producer_id, effect_name);
+
+
+--
+-- Name: completion_finalizer_leases completion_finalizer_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.completion_finalizer_leases
+    ADD CONSTRAINT completion_finalizer_leases_pkey PRIMARY KEY (lease_name);
+
+
+--
 -- Name: compute_metering_epoch_authorities compute_epoch_authorities_epoch_uq; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8717,6 +8850,14 @@ ALTER TABLE ONLY public.infrastructure_storage_resource_mappings
 
 ALTER TABLE ONLY public.job_change_records
     ADD CONSTRAINT job_change_records_pkey PRIMARY KEY (job_id);
+
+
+--
+-- Name: job_completion_commands job_completion_commands_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_completion_commands
+    ADD CONSTRAINT job_completion_commands_pkey PRIMARY KEY (id);
 
 
 --
@@ -9632,6 +9773,22 @@ ALTER TABLE ONLY public.experts
 
 
 --
+-- Name: job_completion_commands uq_job_completion_client; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_completion_commands
+    ADD CONSTRAINT uq_job_completion_client UNIQUE (job_id, client_report_id);
+
+
+--
+-- Name: job_completion_commands uq_job_completion_seq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_completion_commands
+    ADD CONSTRAINT uq_job_completion_seq UNIQUE (job_id, report_seq);
+
+
+--
 -- Name: models uq_model_provider_v2; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -10169,6 +10326,13 @@ CREATE INDEX idx_job_change_records_loop_iteration ON public.job_change_records 
 --
 
 CREATE INDEX idx_job_change_records_project_created ON public.job_change_records USING btree (project_id, created_at DESC);
+
+
+--
+-- Name: idx_job_completion_drain; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_job_completion_drain ON public.job_completion_commands USING btree (run_after) WHERE (state = ANY (ARRAY['pending'::text, 'finalizing'::text]));
 
 
 --
@@ -12321,6 +12485,14 @@ ALTER TABLE ONLY public.job_change_records
 
 ALTER TABLE ONLY public.job_change_records
     ADD CONSTRAINT job_change_records_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE SET NULL;
+
+
+--
+-- Name: job_completion_commands job_completion_commands_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_completion_commands
+    ADD CONSTRAINT job_completion_commands_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
 
 
 --
