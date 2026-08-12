@@ -3530,3 +3530,195 @@ absence as quiescence. Final independent inventory found zero residue for all
 five UUIDs in every checked DB relation, Kubernetes resource class,
 object-store prefix, repository and cloud path. The unrelated 2026-08-07
 baseline fixture `9a756800-…` was explicitly excluded and remained unchanged.
+
+# Session 13 — origin/develop integration and final worker authority (2026-08-12)
+
+Branch: `feature/stateless-agents`; not pushed. Local `develop` remained at
+`30e154bc`; `origin/develop` was merged, not rebased. Merge `8a730c63` has
+parents `fb1bfe87` and `c730409a` and contains all 113 develop commits which
+had landed since the feature branch point. Two build-machine OOM interruptions
+did not change the resolution: the first left resolved files unstaged, so the
+written tree was audited and staged explicitly; the second resumed from the
+committed final worker repair. Tilt was down for the merge and every edit, and
+was started only for the live proof.
+
+## Migration collision and ledger
+
+Develop's `0115_datasource_tombstones.sql` remains byte-identical to its parent
+(SHA-256 `75760ae595ac33394b4328e2c899ef84b5cd3c20489f055cef2caf996053fcf3`).
+The feature migration was renamed to `0115a_run_queue.sql` with a 100% Git
+rename and zero content edits; it and the old feature-parent blob both hash to
+`e83475b3b4e77fb200bc26030f805f2ae2ff3bf0f0f72122b1db6a15ec936a93`.
+Its stale filename header, and stale dependency comments in already-applied
+0116–0132 files, were deliberately preserved to keep their checksums exact.
+
+Production discovery reports **134 files / 134 unique prefixes** in the exact
+order `0114_compute_interval_epoch_shape_repair.sql` →
+`0115_datasource_tombstones.sql` → `0115a_run_queue.sql` →
+`0116_events_seq_hwm.sql`; 0116–0133 remain byte-identical to the feature
+parent. The feature parent already contained
+`0133_thread_session_durable_state.sql`, so the merged metering tripwire keeps
+the actual lexicographic head at **0133** while adding develop's tombstone
+entry. The integration brief's literal 0132 sentence was stale relative to
+its own source branch; reverting the test to 0132 would discard S2 and fail the
+real head assertion.
+
+With Tilt and the orchestrator down, a temporary PostgreSQL-only pod mounted
+the retained app PVC and ran the one prescribed statement. `psql` returned
+exactly **`UPDATE 1`**; the old ledger filename then counted zero, the new name
+counted one, and its stored checksum still matched the byte-identical file.
+The helper pod was deleted before Tilt started. The first merged orchestrator
+startup logged exactly:
+
+```text
+applying 1 transactional migration(s) in app
+→ 0115_datasource_tombstones.sql
+✓ 0115_datasource_tombstones.sql (37 ms)
+```
+
+No duplicate-prefix, applied-but-missing, or checksum-changed error appeared.
+The live ledger contains successful `0115a_run_queue.sql` and
+`0115_datasource_tombstones.sql` rows with the two checksums above.
+
+## Semantic conflict union
+
+- `orchestrator/main.py` and `orchestrator/database/postgres.py` retain the feature lane
+  partition, token-aware verbs, Class A writes and exact lifecycle gates while
+  incorporating develop's datasource tombstones and owner-scoped config-drift
+  resume flow. `register_agent` was not resolved by selecting either side; its
+  existing behavior remains. The merge held 89 `execution_lane` occurrences
+  in Postgres and 130 in main before the worker-attestation follow-up.
+- `persistent_session.py`, `persistent_app.py` and `persistent_graph.py` keep
+  S2 setup/teardown, shell-owner propagation, awaited settlement and transcript
+  ordering together with develop's configured-but-unbound warning and durable
+  pending/expired permission outcomes. Follow-up `f91a7f36` made permission-row
+  retirement atomic with the exact stateless lease or reciprocal pinned
+  binding, preventing an old claimant from expiring a successor's gate.
+- `workspace_suspension.py`, `snapshot_service.py` and `ssh_helpers.py` formed
+  a semantic overlap but not a design conflict. Develop's reclaim-on-idle,
+  scoped-HOME restore, stage/verify/history/canonical promotion and honest
+  pipeline status coexist with S2's strict runtime UID/host-key authority,
+  joined cancellation-safe blocking effects, capture validation and
+  shell-ownership arguments. The HOME command keeps both Bash `pipefail` and
+  xattr/ACL flags. Generic suspension and lifecycle reapers continue to refuse
+  stateless rows by design; stateless handoff remains the queue/UID retirement
+  protocol, while snapshot suspension remains the legacy pinned path.
+- Helm is a field-wise union of the stateless lane and develop's ESO,
+  infrastructure-metering and reclaim-on-idle settings. Both stateless defaults
+  remain false in `helm/values.yaml`; only the Tilt overlay enables them. The
+  strict-msgpack environment and checkpoint dependency pins remain intact.
+- Cockpit keeps same-thread replay/composer continuity, develop's expired
+  permission outcome and attachment-send stages, both i18n sets and the
+  stateless stale-interrupt/upload protections. The endpoint inventory and
+  backlog are mechanical unions. The entire
+  `docs/features/stateless_agents.md`, not only §5.4.5, is byte-identical to
+  the feature parent (SHA-256
+  `8fcf7b4ab5458022b4aa7875dd9a563d7f6bf5a944f7ddcab5953cd76d57eb9d`).
+
+The merged upload DELETE route initially exposed a non-textual authority gap:
+develop's generic Paramiko delete could race a stateless workspace handoff.
+`9f484a03` and `f91a7f36` added the lifecycle lock and fresh-row/stop-marker
+checks, exact Pod UID plus pinned-host-key AsyncSSH deletion, joined virtual
+effects, and correct AsyncSSH-v4 type/no-such-path handling. Pinned behavior is
+unchanged.
+
+## Live-discovered worker authority repair
+
+The first merged worker claim revealed that S3 workers still supplied the old
+token/generation-only shell protocol, while S2 correctly requires process-tagged
+workspace incarnation authority and returned exit 81. Provisional commit
+`15588fdb` relaxed that requirement; review found it unsafe and immediate
+revert `ab2d7a0f` restored the mandatory fence before another trusted proof.
+
+Final repair `58784cd3` instead makes every worker claim attest its actual
+workspace owner twice around slow bundle construction, then recheck the exact
+lease. The in-memory bundle carries the freshly attested endpoint, PVC/Pod
+backing UID, current Pod UID and SSH host-key fingerprint. Root workers use
+`v1:job:<job-id>:<pod-uid>` workspace process authority. An inherited child
+attests the parent workspace while retaining its own job/tmux identity, and
+terminal cleanup targets only that child's exact shell-generation tag rather
+than killing parent or sibling residents. Protocol-v1/v2 active and retired
+markers still fail with exit 81 without mutation. Terminal cleanup remains
+best effort under the existing one-phase worker completion contract: after an
+accepted terminal response there is no durable cleanup-only claim state, so
+pretending a raised cleanup error were retryable would wedge the row rather
+than add authority. Two independent frozen-diff reviews found no P0/P1 blocker;
+the focused repair matrices passed **586** and **166** tests.
+
+## Verification
+
+The final Python tree at `58784cd3` completed in **835.45 s** with **17,060
+passed, 163 skipped, 17 failed and 57 warnings**. All 17 failures are reproduced
+environment baselines: one unavailable local PostgreSQL connection, seven
+MCP/Python-3.14 transport and wiring cases, six VM-chart contract cases
+reproduced on a clean `origin/develop` worktree, and three optional
+arXiv/provider cases. The earlier merged-tree run had the same 17 failures and
+**17,026 passed**; the increase is the final authority coverage.
+
+Repository-wide Ruff check passed and format check covered **1,104 files**.
+Both Helm value-set lints, Squawk, fresh app-schema replay from zero and a
+second snapshot replay passed. Cockpit passed **127/127 files and 2,082/2,082
+tests**, its production build, and the **2,508-key** i18n parity check. Git
+whitespace checks passed. The final worker repair changed only Python and
+Python tests, so the Helm/schema/Cockpit gates were not rerun after that commit;
+the full Python and Ruff gates were.
+
+## k3d proof
+
+All trusted runs first proved the final source markers inside every executor
+pod and the orchestrator; both stateless executors and the orchestrator had
+zero restarts.
+
+1. Pinned README smoke: session `98af3d16-…` remained pinned and produced an
+   AI response after creating the exact workspace file. Pinned job
+   `4d002a4a-…` reached `pending_review`, approval reached `completed` with a
+   non-null `completed_at`, and public deletion left job, queue and workspace
+   resources at zero.
+2. Stateless sandbox session `776e585d-…` was force-handed from one executor
+   pod to a different pod. Its file, tmux environment and cwd survived exactly;
+   the queue ended `done` with `input_seq=consumed_seq=2783`. Public permanent
+   deletion converged to zero thread, queue and workspace resources.
+3. Suspension/resume reused the pinned session because generic suspension must
+   refuse stateless rows. A strict **99,083,944-byte** snapshot preserved the
+   proof file; resume changed workspace Pod UID from `7d1722…` to `44ceb…`,
+   changed the bound agent, restored `active|ready`, and the next AI turn read
+   the exact bytes. Cleanup converged.
+4. Natural stateless worker fixture `04c9ee52-…` held token 1 through the final
+   pending todo and a 560-second command. At 12:44:31Z it emitted exactly one:
+
+   ```text
+   worker_batch rotate: unit=04c9ee52-4b47-4b3b-8b4a-d4fb3455017a token=***REDACTED*** queue_verb=complete_and_requeue queue_state=queued input_seq=None next_input_seq=1 complete_calls=0 http_complete_calls=0
+   ```
+
+   Token 2 restored the result, completed the todo and naturally reported the
+   dependent phase boundary at 12:44:50Z. Exactly one terminal completion POST
+   returned 200; the stable terminal line recorded
+   `queue_state=done complete_calls=1 http_complete_calls=1`, and the database
+   read `pending_review|done|token 2|input 1|consumed 1`. Approval correctly
+   resumed this phase-boundary freeze rather than treating it as a final-job
+   freeze; the disposable continuation was cancelled through the public API,
+   then public DELETE returned 200. Job, queue, all three checkpoint tables,
+   Pod, Service, PVC and ConfigMap inventoried zero.
+
+After the proof, Tilt was stopped and the Helm release removed again.
+
+## Remaining operator debt
+
+Disposable pre-fix thread `e4bb35f8-…` remains ended with queue token 4 done,
+input/consumed 2762/2754, one token-2 claimant-loss record with
+`quiesced:false`, a permanent-retirement record with
+`claimant_quiesced:false`, and its exact live workspace. Its old claimant Pod
+was force-deleted before it could acknowledge quiescence; the reaper correctly
+refuses to turn API/CRI absence into process-zero proof, so repeated public
+DELETE returns 503. No claimant acknowledgement or metadata was fabricated.
+Removing this disposable fixture requires the documented exceptional operator
+procedure under the exact lifecycle lock with two unchanged-state assertions
+and complete DB/Kubernetes/object/repository inventory; no checked-in helper
+currently provides it. This is cleanup debt, not a weakened runtime fence.
+
+Final branch proof before handoff is
+`git rev-list --count HEAD..origin/develop` = **0**. The only intentionally
+unverified operational item
+is that guarded cleanup of `e4bb35f8-…`; the production two-Deployment/KEDA
+split, Job Bench and Gate 3 finalizer remain the previously documented future
+scope rather than integration regressions.
