@@ -23,6 +23,7 @@ See docs/features/workspace_durability_tiering.md §C2/§C3.
 """
 
 import hashlib
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -741,6 +742,115 @@ class TestUploadSnapshotPromote:
             for call in fake_svc._set_snapshot_context.call_args_list
         ]
         assert statuses == ["available"]
+
+
+class TestTerminalSnapshotGeneration:
+    GENERATION = "12345678-1234-4678-9abc-123456789abc"
+    RUNTIME = "87654321-4321-4678-9abc-abcdefabcdef"
+    FINGERPRINT = "SHA256:" + ("A" * 43)
+
+    @staticmethod
+    def _manifest(payload: bytes) -> dict:
+        digest = hashlib.sha256(payload).hexdigest()
+        return {
+            "version": 1,
+            "job_id": "job-1",
+            "source_type": "pod",
+            "created_at": "2026-08-13T01:02:03+00:00",
+            "strict_terminal": True,
+            "terminal_generation": TestTerminalSnapshotGeneration.GENERATION,
+            "runtime_incarnation": TestTerminalSnapshotGeneration.RUNTIME,
+            "ssh_host_key_fingerprint": TestTerminalSnapshotGeneration.FINGERPRINT,
+            "size_compressed_bytes": len(payload),
+            "sha256_compressed": digest,
+            "checksum_sha256": digest,
+        }
+
+    @pytest.mark.asyncio
+    async def test_command_key_replay_keeps_one_history_generation(
+        self, fake_svc, fake_s3, tmp_path
+    ):
+        prefix = "jobs/job-1"
+        payload = b"quiescent-terminal-archive"
+        tar_path = _write_tar(tmp_path, "terminal.tar.zst", payload)
+
+        for _ in range(2):
+            assert await fake_svc.upload_snapshot(
+                "job-1",
+                tar_path,
+                self._manifest(payload),
+                terminal_generation=self.GENERATION,
+            )
+
+        assert _history_generations(fake_s3, prefix) == {
+            f"completion-{self.GENERATION}"
+        }
+
+    @pytest.mark.asyncio
+    async def test_complete_generation_repairs_canonical_before_success(
+        self, fake_svc, fake_s3
+    ):
+        prefix = "jobs/job-1"
+        history = f"{prefix}/history/completion-{self.GENERATION}"
+        payload = b"strict-terminal"
+        manifest = self._manifest(payload)
+        fake_s3.store[f"{history}/env.tar.zst"] = payload
+        fake_s3.store[f"{history}/manifest.json"] = json.dumps(manifest).encode()
+        fake_s3.store[f"{prefix}/env.tar.zst"] = b"stale"
+        fake_s3.store[f"{prefix}/manifest.json"] = b'{"stale":true}'
+        fake_svc._streaming_sha256_from_s3 = MagicMock(
+            return_value=hashlib.sha256(payload).hexdigest()
+        )
+
+        ok, state = await fake_svc.reconcile_terminal_snapshot_generation(
+            "job-1",
+            terminal_generation=self.GENERATION,
+            expected_runtime_incarnation=self.RUNTIME,
+            expected_host_key_fingerprint=self.FINGERPRINT,
+        )
+
+        assert (ok, state) == (True, "complete")
+        assert fake_s3.store[f"{prefix}/env.tar.zst"] == payload
+        assert json.loads(fake_s3.store[f"{prefix}/manifest.json"]) == manifest
+
+    @pytest.mark.asyncio
+    async def test_one_object_generation_is_partial_and_never_promoted(
+        self, fake_svc, fake_s3
+    ):
+        prefix = "jobs/job-1"
+        history = f"{prefix}/history/completion-{self.GENERATION}"
+        fake_s3.store[f"{history}/env.tar.zst"] = b"orphaned-but-atomic"
+
+        ok, state = await fake_svc.reconcile_terminal_snapshot_generation(
+            "job-1",
+            terminal_generation=self.GENERATION,
+            expected_runtime_incarnation=self.RUNTIME,
+            expected_host_key_fingerprint=self.FINGERPRINT,
+        )
+
+        assert (ok, state) == (False, "partial")
+        assert f"{prefix}/env.tar.zst" not in fake_s3.store
+
+    @pytest.mark.asyncio
+    async def test_probe_permission_error_is_not_misclassified_as_missing(
+        self, fake_svc, fake_s3
+    ):
+        fake_s3.head_object = MagicMock(
+            side_effect=ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "denied"}},
+                "HeadObject",
+            )
+        )
+
+        ok, state = await fake_svc.reconcile_terminal_snapshot_generation(
+            "job-1",
+            terminal_generation=self.GENERATION,
+            expected_runtime_incarnation=self.RUNTIME,
+            expected_host_key_fingerprint=self.FINGERPRINT,
+        )
+
+        assert ok is False
+        assert state.startswith("probe error:")
 
 
 class TestUploadSnapshotHistoryPruning:

@@ -104,6 +104,7 @@ def _make_deps(*, pod_alive: bool, pause_ok: bool = True):
     db = AsyncMock()
     db.pause_job_shed_freeze.return_value = pause_ok
     delete_workspace = AsyncMock()
+    delete_workspace.return_value = True
     trigger_dispatch = MagicMock()
 
     async def probe(_host, _port, timeout=3.0):
@@ -118,6 +119,7 @@ def _job(attempts: int = 0) -> dict:
         "port": 30022,
         "status": "ready",
         "pod_ip": "10.42.0.1",
+        "_runtime_incarnation": "55555555-5555-4555-8555-555555555555",
     }
     if attempts:
         ctx["recovery_attempts"] = attempts
@@ -176,6 +178,153 @@ class TestHandlePodWorkspaceRecovery:
         assert merged["pod_ip"] is None
         assert merged["recovery_attempts"] == 1
         assert result["new_status"] == "paused"
+
+    @pytest.mark.asyncio
+    async def test_legacy_recovery_response_shape_stays_exact(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
+        job = _job()
+
+        result = await handle_pod_workspace_recovery(
+            job,
+            job["id"],
+            _ERROR,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+        )
+
+        assert result == {
+            "status": "handled",
+            "job_id": job["id"],
+            "new_status": "paused",
+            "actions": [
+                "workspace recovery: dead pod deleted (PVC kept), "
+                "re-dispatch for reattach (attempt 1/3)"
+            ],
+        }
+
+    @pytest.mark.asyncio
+    async def test_durable_dead_pod_delete_failure_remains_retryable(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
+        delete_workspace.side_effect = RuntimeError("kubernetes unavailable")
+        job = _job()
+
+        with pytest.raises(RuntimeError, match="kubernetes unavailable"):
+            await handle_pod_workspace_recovery(
+                job,
+                job["id"],
+                _ERROR,
+                db=db,
+                delete_workspace=delete_workspace,
+                trigger_dispatch=trigger_dispatch,
+                probe=probe,
+                completion_command_id="44444444-4444-4444-8444-444444444444",
+                completion_finalizing_by="owner-a",
+            )
+
+        db.pause_job_shed_freeze.assert_not_awaited()
+        trigger_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_durable_false_delete_result_remains_retryable(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
+        delete_workspace.return_value = False
+        job = _job()
+
+        with pytest.raises(RuntimeError, match="delete did not complete"):
+            await handle_pod_workspace_recovery(
+                job,
+                job["id"],
+                _ERROR,
+                db=db,
+                delete_workspace=delete_workspace,
+                trigger_dispatch=trigger_dispatch,
+                probe=probe,
+                completion_command_id="44444444-4444-4444-8444-444444444444",
+                completion_finalizing_by="owner-a",
+            )
+
+        db.pause_job_shed_freeze.assert_not_awaited()
+        trigger_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_durable_delete_refuses_missing_pod_uid(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
+        job = _job()
+        del job["context"]["workspace_container"]["_runtime_incarnation"]
+
+        with pytest.raises(RuntimeError, match="missing the captured Pod UID"):
+            await handle_pod_workspace_recovery(
+                job,
+                job["id"],
+                _ERROR,
+                db=db,
+                delete_workspace=delete_workspace,
+                trigger_dispatch=trigger_dispatch,
+                probe=probe,
+                completion_command_id="44444444-4444-4444-8444-444444444444",
+                completion_finalizing_by="owner-a",
+            )
+
+        delete_workspace.assert_not_awaited()
+        db.pause_job_shed_freeze.assert_not_awaited()
+        trigger_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_legacy_dead_pod_delete_failure_remains_best_effort(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
+        delete_workspace.side_effect = RuntimeError("kubernetes unavailable")
+        job = _job()
+
+        result = await handle_pod_workspace_recovery(
+            job,
+            job["id"],
+            _ERROR,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+        )
+
+        assert result["new_status"] == "paused"
+        assert "paused" not in result
+        db.pause_job_shed_freeze.assert_awaited_once_with(job["id"])
+        trigger_dispatch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_durable_reconciled_cleanup_failure_remains_retryable(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
+        delete_workspace.side_effect = RuntimeError("kubernetes unavailable")
+        command_id = "44444444-4444-4444-8444-444444444444"
+        job = _job(attempts=4)
+        job["context"]["workspace_container"].update(
+            {
+                "recovery_completion_command_id": command_id,
+                "recovery_completion_outcome": {
+                    "status": "handled",
+                    "job_id": job["id"],
+                    "new_status": "failed",
+                    "actions": ["failed loud"],
+                },
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="kubernetes unavailable"):
+            await handle_pod_workspace_recovery(
+                job,
+                job["id"],
+                _ERROR,
+                db=db,
+                delete_workspace=delete_workspace,
+                trigger_dispatch=trigger_dispatch,
+                probe=probe,
+                completion_command_id=command_id,
+                completion_finalizing_by="owner-b",
+            )
+
+        db.merge_workspace_container_context.assert_not_awaited()
+        db.pause_job_shed_freeze.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_counter_increments_even_when_pod_alive(self):
@@ -263,6 +412,73 @@ class TestHandlePodWorkspaceRecovery:
         db.pause_job_shed_freeze.assert_awaited_once_with(job["id"])
         db.pause_job.assert_not_awaited()
         assert result["new_status"] == "paused"
+        trigger_dispatch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_durable_recovery_keys_counter_and_disposition_to_command(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
+        command_id = "44444444-4444-4444-8444-444444444444"
+        result = await handle_pod_workspace_recovery(
+            _job(),
+            _job()["id"],
+            _ERROR,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+            completion_command_id=command_id,
+            completion_finalizing_by="owner-a",
+        )
+
+        counter_call = db.merge_workspace_container_context.await_args
+        assert counter_call.kwargs == {
+            "completion_command_id": command_id,
+            "completion_finalizing_by": "owner-a",
+        }
+        assert counter_call.args[1]["recovery_attempt_command_id"] == command_id
+        pause_call = db.pause_job_shed_freeze.await_args
+        assert pause_call.kwargs["completion_command_id"] == command_id
+        assert pause_call.kwargs["completion_finalizing_by"] == "owner-a"
+        marker = pause_call.kwargs["workspace_context_updates"]
+        assert marker["recovery_completion_command_id"] == command_id
+        assert marker["recovery_completion_outcome"] == result
+
+    @pytest.mark.asyncio
+    async def test_durable_recovery_reconciles_atomic_disposition_without_reprobe(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
+        command_id = "44444444-4444-4444-8444-444444444444"
+        outcome = {
+            "status": "handled",
+            "job_id": _job()["id"],
+            "new_status": "paused",
+            "paused": True,
+            "actions": ["workspace recovery: reconciled"],
+        }
+        job = _job(attempts=2)
+        job["context"]["workspace_container"].update(
+            {
+                "recovery_completion_command_id": command_id,
+                "recovery_completion_outcome": outcome,
+            }
+        )
+
+        assert (
+            await handle_pod_workspace_recovery(
+                job,
+                job["id"],
+                _ERROR,
+                db=db,
+                delete_workspace=delete_workspace,
+                trigger_dispatch=trigger_dispatch,
+                probe=probe,
+                completion_command_id=command_id,
+                completion_finalizing_by="owner-b",
+            )
+            == outcome
+        )
+        db.merge_workspace_container_context.assert_not_awaited()
+        db.pause_job_shed_freeze.assert_not_awaited()
+        delete_workspace.assert_not_awaited()
         trigger_dispatch.assert_called_once()
 
 

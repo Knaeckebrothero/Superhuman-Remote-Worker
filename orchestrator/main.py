@@ -454,6 +454,7 @@ from services.container_provisioner import (  # noqa: E402
     WORKSPACE_RUNTIME_INCARNATION_KEY,
     WorkspaceRuntimeAttestation,
     WorkspaceRuntimeAuthorityError,
+    WorkspaceTeardownIdentity,
     container_provisioner,
 )
 from services.workspace_lifecycle import (  # noqa: E402
@@ -1322,7 +1323,11 @@ async def _next_output_ordinal(repo_name: str, base_branch: str) -> str:
     return f"{nxt:03d}"
 
 
-async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
+async def _graft_subjob_output(
+    job_id: str,
+    *,
+    completion_command_id: str | None = None,
+) -> dict[str, Any] | None:
     """Graft a completed subjob's ``output/`` onto its parent's branch.
 
     Copies the subjob branch's ``output/`` subtree to
@@ -1355,8 +1360,9 @@ async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
         await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
         return {"status": "skipped", "reason": "critic-not-merged"}
 
-    # Idempotency: never graft twice — a second run would copy the output under
-    # a fresh ordinal and duplicate it. If a graft path is already recorded, skip.
+    # Legacy idempotency: never graft twice when the marker made it back to the
+    # database. Gate-3 also probes the command-keyed commit trailer below,
+    # closing the commit-before-marker window this check cannot see.
     if isinstance(ctx, dict) and ctx.get("graft_output_path"):
         return {
             "status": "skipped",
@@ -1372,7 +1378,41 @@ async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
     parent = await postgres_db.get_job(str(job["parent_job_id"]))
     base_branch = (parent.get("branch_name") if parent else None) or "main"
 
-    tree = await gitea_client.list_tree(repo_name, ref=subjob_branch) or []
+    if completion_command_id is not None:
+        from services.completion_effect_reconciliation import probe_graft_commit
+
+        prior_commit = await probe_graft_commit(
+            gitea_client,
+            repo_name=repo_name,
+            branch=base_branch,
+            command_id=completion_command_id,
+        )
+        if prior_commit is not None:
+            # The external commit is authoritative evidence. Reconcile both DB
+            # markers before declaring the effect complete; either write may
+            # itself have been the crash boundary on the previous attempt.
+            merge_status_recorded = await postgres_db.update_job_merge_status(
+                job_id, merge_status="grafted"
+            )
+            path_recorded = await postgres_db.merge_job_context(
+                job_id, {"graft_output_path": prior_commit.output_path}
+            )
+            if not merge_status_recorded or not path_recorded:
+                raise RuntimeError(
+                    "could not reconcile the command-keyed graft database markers"
+                )
+            return {
+                "status": "grafted",
+                "reason": "reconciled-command-trailer",
+                "base_branch": base_branch,
+                "output_path": prior_commit.output_path,
+                "commit_sha": prior_commit.commit_sha,
+            }
+
+    tree_result = await gitea_client.list_tree(repo_name, ref=subjob_branch)
+    if tree_result is None and completion_command_id is not None:
+        raise RuntimeError("could not read the subjob tree for durable graft")
+    tree = tree_result or []
     output_blobs = [
         e["path"]
         for e in tree
@@ -1390,6 +1430,8 @@ async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
         data = await gitea_client.get_file_bytes(repo_name, path, ref=subjob_branch)
         if data is None:
             logger.warning(f"Graft {job_id}: failed to read {path}; aborting graft")
+            if completion_command_id is not None:
+                raise RuntimeError(f"could not read {path} for durable graft")
             await postgres_db.update_job_merge_status(
                 job_id, merge_status="graft-failed"
             )
@@ -1402,15 +1444,38 @@ async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
             }
         )
 
+    commit_message = f"Graft {dest} from subjob {short_id}"
+    if completion_command_id is not None:
+        from services.completion_effect_reconciliation import graft_commit_message
+
+        commit_message = graft_commit_message(
+            output_path=dest,
+            subjob_short_id=short_id,
+            command_id=completion_command_id,
+        )
     ok = await gitea_client.change_files(
-        repo_name, base_branch, files, message=f"Graft {dest} from subjob {short_id}"
+        repo_name, base_branch, files, message=commit_message
     )
     if not ok:
+        if completion_command_id is not None:
+            # False is deliberately ambiguous: Gitea collapses a transport
+            # timeout after commit and a definite non-2xx into this result.
+            # Leave the effect pending; its next attempt probes the exact
+            # command trailer before deciding whether to repeat the write.
+            raise RuntimeError("durable graft write outcome is ambiguous")
         await postgres_db.update_job_merge_status(job_id, merge_status="graft-failed")
         return {"status": "error", "reason": "write-failed"}
 
-    await postgres_db.update_job_merge_status(job_id, merge_status="grafted")
-    await postgres_db.merge_job_context(job_id, {"graft_output_path": dest})
+    merge_status_recorded = await postgres_db.update_job_merge_status(
+        job_id, merge_status="grafted"
+    )
+    path_recorded = await postgres_db.merge_job_context(
+        job_id, {"graft_output_path": dest}
+    )
+    if completion_command_id is not None and (
+        not merge_status_recorded or not path_recorded
+    ):
+        raise RuntimeError("could not persist the command-keyed graft database markers")
 
     logger.info(
         f"Grafted subjob {short_id}/{config_name} output ({len(files)} files) "
@@ -1425,13 +1490,21 @@ async def _graft_subjob_output(job_id: str) -> dict[str, Any] | None:
     }
 
 
-async def _maybe_graft_completed_subjob(job: dict[str, Any]) -> dict[str, Any] | None:
+async def _maybe_graft_completed_subjob(
+    job: dict[str, Any],
+    *,
+    completion_command_id: str | None = None,
+) -> dict[str, Any] | None:
     """Graft any completed subjob's output onto its parent. Applies uniformly
     to scholar, delegation children, and any other subjob; critic is skipped
     inside _graft_subjob_output. Root jobs (no parent) are ignored."""
     if not job.get("parent_job_id"):
         return None
-    return await _graft_subjob_output(str(job["id"]))
+    if completion_command_id is None:
+        return await _graft_subjob_output(str(job["id"]))
+    return await _graft_subjob_output(
+        str(job["id"]), completion_command_id=completion_command_id
+    )
 
 
 def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -9734,7 +9807,7 @@ class CustomJSONResponse(JSONResponse):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global _shutdown_event
+    global _completion_finalizer_instance, _shutdown_event
 
     # Hard-fail if the legacy LLM_BASE_URL env var is set. The env-var-driven
     # routing for self-hosted "Local" group models was removed in chunk 6 of
@@ -10842,6 +10915,15 @@ async def lifespan(app: FastAPI):
     run_queue_reaper_task = asyncio.create_task(
         run_queue_reaper_loop(postgres_db, _shutdown_event)
     )
+    # Gate-3 completion drain uses its own observable River-style lease row;
+    # it must never be wrapped in the orchestrator advisory-leader helper.
+    # Keep even the module import dark while the default-off gate is closed.
+    completion_finalizer_task = None
+    if COMPLETION_COMMANDS_ENABLED:
+        completion_finalizer_task = asyncio.create_task(
+            _get_completion_finalizer().run_drain(_shutdown_event),
+            name="completion-finalizer-drain",
+        )
     security_events_prune_task = asyncio.create_task(
         security_events_prune_sweeper(_shutdown_event)
     )
@@ -11095,6 +11177,8 @@ async def lifespan(app: FastAPI):
     await sudo_sweeper_task
     await thread_events_prune_task
     await run_queue_reaper_task
+    if completion_finalizer_task is not None:
+        await completion_finalizer_task
     await security_events_prune_task
     await checkpoint_retention_task
     await headless_notify_task
@@ -11158,6 +11242,7 @@ async def lifespan(app: FastAPI):
     if audit_db is not None:
         await audit_db.disconnect()
     await postgres_db.disconnect()
+    _completion_finalizer_instance = None
 
 
 app = FastAPI(
@@ -15582,19 +15667,20 @@ async def _upgrade_job_to_vm_internal(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-async def _capture_workspace_snapshot_for_freeze(job: dict, job_id: str) -> None:
+async def _capture_workspace_snapshot_for_freeze(job: dict, job_id: str) -> bool:
     """Force a durable capture when a job parks on a vm_upgrade approval.
 
     The pause that follows is a human-wait (24 h approval TTL) while the
     workspace may be legitimately reclaimed after the warm grace — the S3
     archive (plus the cross-pod checkpointer) is what makes that reclaim
-    non-destructive. Runs as a background task: a tar + upload can take tens
-    of seconds and must not block the agent's /complete POST. Unreachable
-    targets (tailnet VMs) skip visibly inside the snapshot service; the
-    reconciler's snapshot-before-reap remains the backstop.
+    non-destructive. The legacy caller runs this as a background task; the
+    durable completion runner awaits and journals the result so a process death
+    cannot lose the Class-D attempt. Unreachable targets (tailnet VMs) skip
+    visibly inside the snapshot service; the reconciler's snapshot-before-reap
+    remains the backstop.
     """
     if not getattr(snapshot_service, "is_available", False):
-        return
+        return False
     container_ctx = _get_container_context(job)
     vm_ctx = _get_vm_context(job)
     container_host = container_ctx.get("host") or container_ctx.get("pod_ip")
@@ -15605,7 +15691,7 @@ async def _capture_workspace_snapshot_for_freeze(job: dict, job_id: str) -> None
         ssh_port, source = int(vm_ctx.get("ssh_port") or 22), "vm"
     else:
         logger.info(f"Freeze capture skipped for {job_id}: no live workspace endpoint")
-        return
+        return True
     try:
         ok = await snapshot_service.capture_vm_snapshot(
             job_id=job_id,
@@ -15618,8 +15704,10 @@ async def _capture_workspace_snapshot_for_freeze(job: dict, job_id: str) -> None
             f"Freeze capture for {job_id} ({source} {ssh_host}:{ssh_port}): "
             f"{'ok' if ok else 'failed/skipped'}"
         )
+        return bool(ok)
     except Exception:
         logger.exception(f"Freeze capture failed for {job_id}")
+        return False
 
 
 async def _resume_job_without_vm_internal(
@@ -15750,7 +15838,8 @@ async def _internal_resume_job(
     reason: str | None = None,
     *,
     expected_status: str | None = None,
-) -> None:
+    additional_context: Mapping[str, Any] | None = None,
+) -> bool:
     """Queue a job for resume via the auto-dispatcher.
 
     THE escalation verb — this is a destructive resume: the worker
@@ -15772,13 +15861,16 @@ async def _internal_resume_job(
     paused-but-invisible forever.
     See docs/issues/blocking_message_reply_keeps_freeze_data.md.
     """
-    updates: dict[str, Any] = {"queued_feedback": feedback}
+    updates: dict[str, Any] = {
+        **dict(additional_context or {}),
+        "queued_feedback": feedback,
+    }
     if reason:
         updates["queued_feedback_reason"] = reason
     job = await postgres_db.get_job(job_id)
     if not job:
         logger.warning(f"_internal_resume_job: job {job_id} not found")
-        return
+        return False
     observed_status = str(job.get("status") or "")
     if expected_status is not None and observed_status != expected_status:
         logger.warning(
@@ -15787,14 +15879,14 @@ async def _internal_resume_job(
             job_id,
             observed_status,
         )
-        return
+        return False
     if observed_status in ("completed", "failed", "cancelled"):
         logger.warning(
             "_internal_resume_job: refusing to resurrect terminal job %s (%s)",
             job_id,
             observed_status,
         )
-        return
+        return False
 
     if job.get("execution_lane") == "stateless":
         queued = await postgres_db.queue_stateless_job_for_resume(
@@ -15826,7 +15918,7 @@ async def _internal_resume_job(
         )
     if not queued:
         logger.warning("_internal_resume_job: queue CAS lost for job %s", job_id)
-        return
+        return False
 
     logger.info(
         "Queued job %s for %s resume with feedback",
@@ -15834,6 +15926,7 @@ async def _internal_resume_job(
         job.get("execution_lane", "pinned"),
     )
     _trigger_dispatch()
+    return True
 
 
 async def _set_target_to_autonomy_status(target_job_id: str) -> str:
@@ -17072,10 +17165,94 @@ def _critic_config_override(parent_llm: dict[str, Any] | None) -> dict[str, Any]
     return override
 
 
+async def _setup_verification_critic_workspace(
+    target_job: dict[str, Any],
+    critic_job: dict[str, Any],
+    critic_config: str,
+    *,
+    durable_reconcile: bool = False,
+) -> None:
+    """Finish the critic's idempotent Gitea/DB workspace handoff.
+
+    ``create_job`` is the critic identity linearization point.  The durable
+    completion path may replay here after that INSERT but before the branch or
+    job-row handoff finished, so this helper is shared by both a fresh spawn
+    and exact-round reconciliation.  Legacy callers retain the historical
+    best-effort behavior; durable callers surface failures for effect retry.
+    """
+    if not gitea_client.is_initialized:
+        return
+
+    critic_job_id = str(critic_job["id"])
+    short_id = critic_job_id[:8]
+    effective_config = str(critic_job.get("config_name") or critic_config)
+    parent_repo_name = target_job.get("repo_name")
+    if not parent_repo_name:
+        parent_repo_name = f"job-{str(target_job['id'])[:8]}"
+
+    from_branch = target_job.get("branch_name") or "main"
+    branch_name = f"subjob/{short_id}/{effective_config}"
+    try:
+        branch_ok = await gitea_client.create_branch(
+            parent_repo_name, branch_name, from_branch=from_branch
+        )
+        if not branch_ok:
+            message = (
+                f"Failed to create branch '{branch_name}' from '{from_branch}' "
+                f"in '{parent_repo_name}' for critic {critic_job_id}"
+            )
+            logger.error(message)
+            if durable_reconcile:
+                raise RuntimeError(message)
+
+        parent_context = target_job.get("context") or {}
+        if isinstance(parent_context, str):
+            try:
+                parent_context = json.loads(parent_context)
+            except (json.JSONDecodeError, ValueError):
+                parent_context = {}
+        git_remote_url = parent_context.get("git_remote_url", "")
+
+        context_updated = await postgres_db.merge_job_context(
+            critic_job_id, {"git_remote_url": git_remote_url}
+        )
+        if durable_reconcile and not context_updated:
+            raise RuntimeError(
+                f"Critic {critic_job_id} disappeared during context handoff"
+            )
+
+        worktree_path = None
+        if parent_context.get("vm") or parent_context.get("workspace_container"):
+            worktree_path = (
+                f"/home/agent-host/workspace/worktrees/{short_id}-{effective_config}"
+            )
+
+        async with postgres_db.acquire() as conn:
+            update_result = await conn.execute(
+                "UPDATE jobs SET branch_name = $1, repo_name = $2, worktree_path = $3 WHERE id = $4::uuid",
+                branch_name,
+                parent_repo_name,
+                worktree_path,
+                critic_job_id,
+            )
+        if durable_reconcile and update_result != "UPDATE 1":
+            raise RuntimeError(
+                f"Critic {critic_job_id} disappeared during branch handoff"
+            )
+    except Exception as exc:
+        logger.warning(
+            f"Failed to create Gitea branch for critic {critic_job_id}: {exc}"
+        )
+        if durable_reconcile:
+            raise
+
+
 async def _trigger_verification_on_complete(
     job: dict[str, Any],
     result: dict[str, Any],
     actions: list[str],
+    *,
+    reconcile_existing_critic: bool = False,
 ) -> None:
     """Spawn a fresh critic, or escalate to a human, after a main job completes.
 
@@ -17164,6 +17341,31 @@ async def _trigger_verification_on_complete(
         await _escalate_target(job_id, job, reason)
         actions.append(f"target {job_id} escalated: {reason}")
         return
+
+    # Durable replay resolves the INSERT's immutable identity before applying
+    # the broader "any live critic" guard.  This also reconciles a critic that
+    # moved terminal between the crash and replay; the 0132 target/round index,
+    # not its mutable status, owns identity.
+    if reconcile_existing_critic:
+        existing_critic = await postgres_db.get_verification_critic_for_round(
+            job_id, len(rounds)
+        )
+        if existing_critic is not None:
+            await _setup_verification_critic_workspace(
+                job,
+                existing_critic,
+                verification_config.get("critic_config", "critic"),
+                durable_reconcile=True,
+            )
+            critic_job_id = str(existing_critic["id"])
+            _trigger_dispatch()
+            actions.append(f"critic job {critic_job_id} reconciled")
+            logger.info(
+                "Verification job %s reconciled for job %s",
+                critic_job_id,
+                job_id,
+            )
+            return
 
     # A critic for this target is already in flight. `complete_job` accepts
     # entry statuses processing/reviewing/pending_review/completed, so a
@@ -17314,6 +17516,7 @@ async def _trigger_verification_on_complete(
         creation_path="critic_lifecycle",
     )
 
+    critic_was_reconciled = False
     try:
         critic_job = await postgres_db.create_job(
             description=verification_description,
@@ -17345,10 +17548,20 @@ async def _trigger_verification_on_complete(
             job_id,
             len(rounds),
         )
-        actions.append(
-            f"critic round {len(rounds)} already exists for {job_id} — spawn skipped"
+        if not reconcile_existing_critic:
+            actions.append(
+                f"critic round {len(rounds)} already exists for {job_id} — spawn skipped"
+            )
+            return
+        critic_job = await postgres_db.get_verification_critic_for_round(
+            job_id, len(rounds)
         )
-        return
+        if critic_job is None:
+            raise RuntimeError(
+                f"Verification critic index winner for {job_id} round "
+                f"{len(rounds)} could not be resolved"
+            ) from exc
+        critic_was_reconciled = True
     except DatasourcePolicyConflictError:
         reason = (
             "Verification could not start because the target's connector "
@@ -17359,61 +17572,20 @@ async def _trigger_verification_on_complete(
         return
 
     critic_job_id = str(critic_job["id"])
-    short_id = critic_job_id[:8]
-
-    # Set up Gitea branch for the subjob (same logic as create_job endpoint)
-    if gitea_client.is_initialized:
-        parent_repo_name = job.get("repo_name")
-        if not parent_repo_name:
-            parent_repo_name = f"job-{str(job['id'])[:8]}"
-
-        from_branch = job.get("branch_name") or "main"
-        branch_name = f"subjob/{short_id}/{critic_config}"
-        try:
-            branch_ok = await gitea_client.create_branch(
-                parent_repo_name, branch_name, from_branch=from_branch
-            )
-            if not branch_ok:
-                logger.error(
-                    f"Failed to create branch '{branch_name}' from '{from_branch}' "
-                    f"in '{parent_repo_name}' for critic {critic_job_id}"
-                )
-            # Propagate git remote URL and update branch/repo on the critic job
-            parent_context = job.get("context") or {}
-            if isinstance(parent_context, str):
-                try:
-                    parent_context = json.loads(parent_context)
-                except (json.JSONDecodeError, ValueError):
-                    parent_context = {}
-            git_remote_url = parent_context.get("git_remote_url", "")
-
-            await postgres_db.merge_job_context(
-                critic_job_id, {"git_remote_url": git_remote_url}
-            )
-
-            # Set worktree_path if subjob inherits a workspace backend
-            worktree_path = None
-            if parent_ctx.get("vm") or parent_ctx.get("workspace_container"):
-                worktree_path = (
-                    f"/home/agent-host/workspace/worktrees/{short_id}-{critic_config}"
-                )
-
-            async with postgres_db.acquire() as conn:
-                await conn.execute(
-                    "UPDATE jobs SET branch_name = $1, repo_name = $2, worktree_path = $3 WHERE id = $4::uuid",
-                    branch_name,
-                    parent_repo_name,
-                    worktree_path,
-                    critic_job_id,
-                )
-        except Exception as e:
-            logger.warning(
-                f"Failed to create Gitea branch for critic {critic_job_id}: {e}"
-            )
+    await _setup_verification_critic_workspace(
+        job,
+        critic_job,
+        critic_config,
+        durable_reconcile=reconcile_existing_critic,
+    )
 
     _trigger_dispatch()
-    actions.append(f"critic job {critic_job_id} created")
-    logger.info(f"Verification job {critic_job_id} created for job {job_id}")
+    if critic_was_reconciled:
+        actions.append(f"critic job {critic_job_id} reconciled")
+        logger.info(f"Verification job {critic_job_id} reconciled for job {job_id}")
+    else:
+        actions.append(f"critic job {critic_job_id} created")
+        logger.info(f"Verification job {critic_job_id} created for job {job_id}")
 
 
 def _loop_deadline_passed(run_until: Any) -> bool:
@@ -18694,6 +18866,8 @@ async def _resume_project_loop(loop_id: str) -> dict[str, Any] | None:
 async def _trigger_curation_final_pass(
     target_job_id: str,
     target_job: dict[str, Any] | None = None,
+    *,
+    completion_command_id: str | None = None,
 ) -> None:
     """Resume the waiting curator with a final-pass signal.
 
@@ -18737,10 +18911,28 @@ async def _trigger_curation_final_pass(
         return
 
     curator_id = str(row["id"])
+    if completion_command_id is not None:
+        curator = await postgres_db.get_job(curator_id)
+        curator_context = (curator or {}).get("context") or {}
+        if isinstance(curator_context, str):
+            try:
+                curator_context = json.loads(curator_context)
+            except (TypeError, ValueError):
+                curator_context = {}
+        if (
+            isinstance(curator_context, Mapping)
+            and curator_context.get("curation_final_pass_completion_command_id")
+            == completion_command_id
+        ):
+            # The exact command already committed its status/context handoff.
+            # Re-kick the idempotent dispatcher after a marker-window crash;
+            # never mint a new stateless resume generation for the same S31.
+            _trigger_dispatch()
+            return
     logger.info(
         f"Triggering curation final pass via curator {curator_id} for {target_job_id}"
     )
-    await _internal_resume_job(
+    queued = await _internal_resume_job(
         curator_id,
         feedback=(
             "FINAL CURATION PASS. The target job has been approved by the critic. "
@@ -18749,7 +18941,14 @@ async def _trigger_curation_final_pass(
             "`state` note summarizing what changed. Check for open questions. "
             "Link all notes. Then call job_complete."
         ),
+        additional_context=(
+            {"curation_final_pass_completion_command_id": completion_command_id}
+            if completion_command_id is not None
+            else None
+        ),
     )
+    if completion_command_id is not None and not queued:
+        raise RuntimeError("curation final-pass handoff lost its queue CAS")
 
 
 class LoopPlanRequest(BaseModel):
@@ -18913,7 +19112,6 @@ async def complete_job(
         CompletionInProgress,
         CompletionPayloadMismatch,
         accept_completion_command,
-        complete_completion_command,
     )
 
     payload = body.model_dump(
@@ -18952,6 +19150,7 @@ async def complete_job(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     if accepted.disposition == "replay_done":
+        _raise_durable_completion_http_outcome(accepted.outcome or {})
         return JSONResponse(
             content=accepted.outcome or {},
             headers={"Idempotent-Replayed": "true"},
@@ -18986,13 +19185,207 @@ async def complete_job(
             headers={"Idempotent-Replayed": "true"},
         )
 
-    result = await _complete_job_legacy(request, job_id, body, _authorized=True)
-    if not await complete_completion_command(postgres_db, accepted.command_id, result):
+    finalizer = _get_completion_finalizer()
+    inline_error: HTTPException | None = None
+
+    async def _inline_workflow(effect_runner: Any) -> dict[str, Any]:
+        nonlocal inline_error
+        try:
+            return await _complete_job_legacy(
+                request,
+                job_id,
+                body,
+                _authorized=True,
+                _effect_runner=effect_runner,
+            )
+        except HTTPException as exc:
+            # Deterministic 4xx guards are part of the command's exact outcome;
+            # transient/server failures retain the command for the drain.
+            if exc.status_code >= 500:
+                inline_error = exc
+                raise
+            return _durable_completion_http_outcome(exc)
+
+    finalized = await finalizer.finalize_command(
+        accepted.command_id,
+        callback=_inline_workflow,
+        inline=True,
+    )
+    if finalized.disposition in {"done", "terminal"} and finalized.outcome:
+        _raise_durable_completion_http_outcome(finalized.outcome)
+        return finalized.outcome
+    if inline_error is not None:
+        raise inline_error
+    if finalized.state == "missing":
         raise HTTPException(
-            status_code=500,
-            detail="Completion effects ran but command outcome was not recorded",
+            status_code=404, detail="Accepted completion command no longer exists"
         )
-    return result
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "accepted_pending",
+            "job_id": accepted.job_id,
+            "command_id": accepted.command_id,
+            "command_state": finalized.state,
+        },
+    )
+
+
+_DURABLE_COMPLETION_HTTP_ERROR = "_completion_http_error"
+_completion_finalizer_instance: Any | None = None
+
+
+def _durable_completion_http_outcome(exc: HTTPException) -> dict[str, Any]:
+    """Encode a deterministic HTTP guard as an exact replayable outcome."""
+
+    return {
+        _DURABLE_COMPLETION_HTTP_ERROR: {
+            "status_code": int(exc.status_code),
+            "detail": exc.detail,
+            "headers": dict(exc.headers or {}),
+        }
+    }
+
+
+def _raise_durable_completion_http_outcome(outcome: Mapping[str, Any]) -> None:
+    envelope = outcome.get(_DURABLE_COMPLETION_HTTP_ERROR)
+    if not isinstance(envelope, Mapping):
+        return
+    raise HTTPException(
+        status_code=int(envelope.get("status_code", 500)),
+        detail=envelope.get("detail"),
+        headers=dict(envelope.get("headers") or {}) or None,
+    )
+
+
+async def _run_persisted_completion_workflow(effect_runner: Any) -> dict[str, Any]:
+    """Rebuild the authenticated request body for a background resume."""
+
+    command = effect_runner.command
+    payload = dict(command.get("payload") or {})
+    payload.update(
+        {
+            "lease_token": command.get("accepted_lease_token"),
+            "agent_id": command.get("accepted_agent_id"),
+            "client_report_id": command.get("client_report_id"),
+        }
+    )
+    body = JobCompleteRequest(**payload)
+    try:
+        return await _complete_job_legacy(
+            None,
+            str(command["job_id"]),
+            body,
+            _authorized=True,
+            _effect_runner=effect_runner,
+        )
+    except HTTPException as exc:
+        if exc.status_code >= 500:
+            raise
+        return _durable_completion_http_outcome(exc)
+
+
+def _get_completion_finalizer() -> Any:
+    """Lazily import/build the finalizer only when the default-off gate opens."""
+
+    global _completion_finalizer_instance
+    if _completion_finalizer_instance is None:
+        from services.completion_finalizer import CompletionFinalizer
+
+        _completion_finalizer_instance = CompletionFinalizer(
+            postgres_db,
+            workflow=_run_persisted_completion_workflow,
+        )
+    return _completion_finalizer_instance
+
+
+_LEGACY_COMPLETION_EFFECT_PLAN: tuple[tuple[str, str], ...] = (
+    ("late_callback_guard", "entry"),  # S1
+    ("clear_stale_failure", "entry"),  # S2
+    ("persist_reported_freeze", "entry"),  # S3
+    ("drop_queued_replies", "entry"),  # S4
+    ("infra_transient_give_up", "recovery"),  # S5
+    ("infra_transient_pause", "recovery"),  # S6
+    ("pod_workspace_recovery", "recovery"),  # S7
+    ("vm_workspace_recovery", "recovery"),  # S8
+    ("reset_recovery_strikes", "recovery"),  # S9
+    ("memory_kb_retry_pause", "recovery"),  # S11
+    ("llm_outage_retry_pause", "recovery"),  # S12
+    ("llm_give_up_operator_alert", "llm_give_up_alert"),  # S13
+    ("deliverable_contract_gate", "delivery_gate"),  # S14
+    ("loop_project_cloud_delivery", "delivery"),  # S15
+    ("mode_a_diff_capture", "delivery"),  # S16
+    ("main_status_write", "job_disposition"),  # S17
+    ("clear_assigned_agent_on_pause", "job_disposition"),  # S18
+    ("stash_and_clear_freeze", "job_disposition"),  # S19
+    ("drain_stall_counter_alert", "drain_stall_alert"),  # S20
+    ("drain_stall_operator_alert", "drain_stall_notification"),  # S20 notification
+    ("completed_at", "job_disposition"),  # S21
+    ("sudo_approval_request", "sudo_request"),  # S22
+    ("auto_deny_resume", "auto_deny_resume"),  # S23
+    ("freeze_workspace_snapshot", "workspace_snapshot"),  # S24
+    ("freeze_notification", "freeze_notification"),  # S25
+    ("subjob_output_graft", "subjob_graft"),  # S26
+    ("critic_verdict", "critic_verdict"),  # S27
+    ("scholar_parent_unblock", "scholar_unblock"),  # S28
+    ("delegation_parent_unblock", "delegation_unblock"),  # S29
+    ("verification_critic_spawn", "verification"),  # S30
+    ("curation_final_pass", "curation"),  # S31
+    ("project_loop_advance", "project_loop"),  # S32
+    ("terminal_merge_change_record", "terminal_delivery"),  # S33
+    ("session_wake_enqueue", "session_wake_enqueue"),  # S34
+    ("dispatch_trigger", "dispatch"),  # S35
+    ("workspace_archive_teardown", "workspace_teardown"),  # S36
+    ("session_wake_drain_kick", "session_wake_kick"),  # S37
+)
+_LEGACY_COMPLETION_EFFECT_INDEX = frozenset(_LEGACY_COMPLETION_EFFECT_PLAN)
+if len(_LEGACY_COMPLETION_EFFECT_INDEX) != len(_LEGACY_COMPLETION_EFFECT_PLAN):
+    raise RuntimeError("completion effect stable names must be unique")
+
+
+async def _run_completion_effect(
+    effect_runner: Any | None,
+    name: str,
+    group: str,
+    callback: Callable[[], Coroutine[Any, Any, Any]],
+    *,
+    retry_on_error: bool = False,
+    error_output: Callable[[BaseException], Any] | None = None,
+    retry_if: Callable[[Any], bool] | None = None,
+    depends_on_groups: tuple[str, ...] = (),
+    transactional: bool = False,
+    effect_timeout_seconds: float | None = None,
+    command_lease_seconds: float | None = None,
+) -> Any:
+    """Run one legacy completion effect through the optional durable journal.
+
+    The ``None`` arm is intentionally just the historical callback invocation:
+    the default-off route neither imports the finalizer nor touches its tables.
+    A durable runner returns the callback's recorded result when the stable
+    effect name is already complete, which lets a restarted command reconstruct
+    branch decisions and response actions without repeating the side effect.
+    """
+
+    if effect_runner is None:
+        return await callback()
+    if (name, group) not in _LEGACY_COMPLETION_EFFECT_INDEX:
+        raise RuntimeError(f"unregistered completion effect {group}/{name}")
+    run_effect = (
+        getattr(effect_runner, "run_transactional", effect_runner.run)
+        if transactional
+        else effect_runner.run
+    )
+    return await run_effect(
+        name=name,
+        group=group,
+        callback=callback,
+        retry_on_error=retry_on_error,
+        error_output=error_output,
+        retry_if=retry_if,
+        depends_on_groups=depends_on_groups,
+        effect_timeout_seconds=effect_timeout_seconds,
+        command_lease_seconds=command_lease_seconds,
+    )
 
 
 async def _complete_job_legacy(
@@ -19001,6 +19394,7 @@ async def _complete_job_legacy(
     body: JobCompleteRequest,
     *,
     _authorized: bool = False,
+    _effect_runner: Any | None = None,
 ) -> dict[str, Any]:
     """Handle job completion reported by the agent. **Internal** (P4b) —
     requires ``X-Internal-Key``. Ingress strips this path.
@@ -19030,12 +19424,40 @@ async def _complete_job_legacy(
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
         completion_entry_status = str(job.get("status") or "")
         stateless_completion = job.get("execution_lane", "pinned") == "stateless"
+        completion_result = body.model_dump(
+            exclude={"lease_token", "agent_id", "client_report_id"},
+        )
+
+        # A retry must not re-run a pure disposition decision against context
+        # already advanced by this command (memory/LLM/infra counters are the
+        # sharp case at their retry ceilings).  Resolve the parent snapshot and
+        # initial status while S1 still sees the accepted command's entry row;
+        # the journal stores only fixed-cardinality decision inputs/outputs.
+        entry_parent_status: str | None = None
+        if _effect_runner is not None and job.get("parent_job_id"):
+            entry_parent = await postgres_db.get_job(str(job["parent_job_id"]))
+            entry_parent_status = (
+                str(entry_parent.get("status")) if entry_parent else None
+            )
+
+        entry_context = job.get("context") or {}
+        if isinstance(entry_context, str):
+            try:
+                entry_context = json.loads(entry_context)
+            except (json.JSONDecodeError, TypeError):
+                entry_context = {}
+        if not isinstance(entry_context, Mapping):
+            entry_context = {}
+        entry_llm_outage = entry_context.get("llm_outage")
+        entry_llm_outage = (
+            entry_llm_outage if isinstance(entry_llm_outage, Mapping) else {}
+        )
 
         # Thin S3 entry fence. Rotation never reaches this route; a genuine
         # terminal stateless report must prove the exact live worker lease.
         # Keep the check before the terminal-status early return and every
         # mutation/side effect. Pinned callers remain tokenless.
-        if stateless_completion:
+        if stateless_completion and _effect_runner is None:
             from src.shared.worker_queue import worker_lease_is_current
 
             lease_current = False
@@ -19057,6 +19479,183 @@ async def _complete_job_legacy(
                     detail="Completion report does not hold the current worker lease",
                 )
 
+        async def _evaluate_late_callback_guard() -> dict[str, Any]:
+            if _effect_runner is None:
+                # Keep the dark path byte-for-byte equivalent to the legacy S1
+                # status guard. Durable-only replay inputs deliberately avoid
+                # parsing historical context/config values here: old rows may
+                # contain shapes that no legacy completion branch ever read.
+                return {
+                    "entry_status": completion_entry_status,
+                    "matched": completion_entry_status
+                    in ("completed", "reviewing", "pending_review"),
+                }
+            entry_resolution = None
+            entry_resolution, _entry_error = determine_job_status(
+                job,
+                completion_result,
+                parent_status=entry_parent_status,
+            )
+            return {
+                "entry_status": completion_entry_status,
+                "entry_assigned_agent_id": (
+                    str(job["assigned_agent_id"])
+                    if job.get("assigned_agent_id") is not None
+                    else None
+                ),
+                "entry_updated_at": (
+                    job["updated_at"].isoformat()
+                    if isinstance(job.get("updated_at"), datetime)
+                    else job.get("updated_at")
+                ),
+                "matched": completion_entry_status
+                in ("completed", "reviewing", "pending_review"),
+                "entry_needs_vm": _job_needs_vm(job),
+                "entry_parent_status": entry_parent_status,
+                "entry_resolution": entry_resolution,
+                "entry_infra_transient_attempts": int(
+                    (entry_context.get("infra_transient") or {}).get("attempts") or 0
+                )
+                if isinstance(entry_context.get("infra_transient"), Mapping)
+                else 0,
+                "entry_memory_retry_count": int(
+                    entry_context.get("memory_retry_count") or 0
+                ),
+                "entry_llm_outage": {
+                    "attempt": int(entry_llm_outage.get("attempt") or 0),
+                    "first_failed_at": entry_llm_outage.get("first_failed_at"),
+                    "last_failed_at": entry_llm_outage.get("last_failed_at"),
+                    "next_retry_at": entry_llm_outage.get("next_retry_at"),
+                    "fingerprint": (
+                        str(entry_llm_outage["fingerprint"])[:512]
+                        if entry_llm_outage.get("fingerprint") is not None
+                        else None
+                    ),
+                    "repeat_key": (
+                        str(entry_llm_outage["repeat_key"])[:512]
+                        if entry_llm_outage.get("repeat_key") is not None
+                        else None
+                    ),
+                    "repeats": int(entry_llm_outage.get("repeats") or 0),
+                    "shape_nudge_attempted": bool(
+                        entry_llm_outage.get("shape_nudge_attempted")
+                    ),
+                },
+            }
+
+        late_guard = await _run_completion_effect(
+            _effect_runner,
+            "late_callback_guard",
+            "entry",
+            _evaluate_late_callback_guard,
+        )
+        # On finalizer resume the jobs row may already carry S17's disposition.
+        # The journaled entry status reconstructs the original branch decision,
+        # so S1 cannot turn a resumable command into a false late callback.
+        completion_entry_status = str(late_guard["entry_status"])
+        if _effect_runner is not None:
+            entry_updated_at = late_guard.get("entry_updated_at")
+            if isinstance(entry_updated_at, str):
+                try:
+                    entry_updated_at = datetime.fromisoformat(entry_updated_at)
+                except ValueError:
+                    entry_updated_at = None
+            job["updated_at"] = entry_updated_at
+        completion_current_status = str(job.get("status") or "")
+        if completion_current_status != completion_entry_status:
+            # A durable callback is allowed to observe a jobs-row disposition
+            # written by this *same* command only when the corresponding effect
+            # marker committed with it.  Matching status alone is not proof: a
+            # concurrent cancel/pause or human writer can legitimately reach
+            # the same value.  Postgres-only disposition effects use
+            # run_transactional(), so their domain write and marker are one
+            # commit; external recovery/gate effects may resume only after
+            # their completed output names the exact status they produced.
+            owned_disposition = False
+            if _effect_runner is not None:
+                disposition_effects = (
+                    "infra_transient_give_up",
+                    "infra_transient_pause",
+                    "pod_workspace_recovery",
+                    "vm_workspace_recovery",
+                    "memory_kb_retry_pause",
+                    "llm_outage_retry_pause",
+                    "deliverable_contract_gate",
+                    "main_status_write",
+                )
+                for effect_name in disposition_effects:
+                    if not await _effect_runner.has_completed(effect_name):
+                        continue
+                    effect_output = await _effect_runner.completed_detail(effect_name)
+                    if not isinstance(effect_output, Mapping):
+                        continue
+                    effect_status = effect_output.get("new_status")
+                    if effect_name in {
+                        "memory_kb_retry_pause",
+                        "llm_outage_retry_pause",
+                    }:
+                        effect_status = (
+                            "paused" if effect_output.get("paused") else None
+                        )
+                    elif effect_name == "deliverable_contract_gate":
+                        effect_status = (
+                            "paused" if effect_output.get("bounced") else effect_status
+                        )
+                    if effect_status == completion_current_status:
+                        owned_disposition = True
+                        break
+                if not owned_disposition and await _effect_runner.has_started(
+                    "pod_workspace_recovery"
+                ):
+                    recovery_context = _get_container_context(job)
+                    recovery_outcome = recovery_context.get(
+                        "recovery_completion_outcome"
+                    )
+                    if (
+                        recovery_context.get("recovery_completion_command_id")
+                        == _effect_runner.command_id
+                        and isinstance(recovery_outcome, Mapping)
+                        and recovery_outcome.get("new_status")
+                        == completion_current_status
+                    ):
+                        # S7 contains external probe/delete work, so it cannot
+                        # run inside the jobs/effect transaction.  Its final
+                        # processing disposition instead carries this exact
+                        # command key in the same jobs-row UPDATE; that domain
+                        # marker is the reconcile proof after a marker crash.
+                        owned_disposition = True
+            if not owned_disposition:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Completion finalization lost an out-of-band job control race"
+                    ),
+                )
+            # Keep the database snapshot intact and use a logical copy for the
+            # pre-S17 decision path. Completed callbacks replay stored results;
+            # the exact command-owned marker above is the only authority for
+            # bypassing S1 after a prior disposition commit.
+            job = {
+                **job,
+                "status": completion_entry_status,
+                "assigned_agent_id": late_guard.get("entry_assigned_agent_id"),
+            }
+            # Class A may already have atomically stashed and cleared an
+            # auto-redispatch freeze.  Rehydrate it from the durable context so
+            # the resumed S20/S22-S25 tail observes the same payload without
+            # putting an unbounded freeze blob in completion_effects.detail.
+            if not job.get("freeze_data"):
+                replay_context = job.get("context") or {}
+                if isinstance(replay_context, str):
+                    try:
+                        replay_context = json.loads(replay_context)
+                    except (json.JSONDecodeError, TypeError):
+                        replay_context = {}
+                if isinstance(replay_context, Mapping) and isinstance(
+                    replay_context.get("last_freeze_data"), Mapping
+                ):
+                    job["freeze_data"] = dict(replay_context["last_freeze_data"])
+
         # Post-execution handoff states are monotonic.  The agent that reported
         # one may still be unwinding while this handler archives its workspace
         # or starts verification; that process can race us with a trailing
@@ -19070,7 +19669,7 @@ async def _complete_job_legacy(
         # Reproduced on k3d: a loop diff reached Nextcloud and wrote its change
         # record, then the old agent's llm_unavailable callback arrived 15s
         # later and changed ``completed`` -> ``paused``.
-        if job["status"] in ("completed", "reviewing", "pending_review"):
+        if late_guard["matched"]:
             logger.info(
                 "Job %s: ignoring late completion callback while status is %s",
                 job_id,
@@ -19110,9 +19709,7 @@ async def _complete_job_legacy(
                 "actions": [f"exact-token terminal retry; job already {job['status']}"],
             }
 
-        result = body.model_dump(
-            exclude={"lease_token", "agent_id", "client_report_id"},
-        )
+        result = completion_result
         actions: list[str] = []
 
         if job["status"] not in (
@@ -19135,7 +19732,24 @@ async def _complete_job_legacy(
                     job_id,
                     job.get("error_message"),
                 )
-                await postgres_db.clear_job_failure(job_id)
+
+                async def _clear_stale_failure() -> bool:
+                    kwargs: dict[str, Any] = {}
+                    if _effect_runner is not None:
+                        kwargs = {
+                            "expected_updated_at": job.get("updated_at"),
+                            "completion_command_id": _effect_runner.command_id,
+                            "completion_finalizing_by": _effect_runner.owner,
+                        }
+                    return bool(await postgres_db.clear_job_failure(job_id, **kwargs))
+
+                await _run_completion_effect(
+                    _effect_runner,
+                    "clear_stale_failure",
+                    "entry",
+                    _clear_stale_failure,
+                    transactional=True,
+                )
                 job["error_message"] = None
                 job["error_details"] = None
                 actions.append("late completion freeze re-resolved a terminal job")
@@ -19175,15 +19789,30 @@ async def _complete_job_legacy(
         if result.get("freeze_data"):
             if should_persist_completion_freeze(result):
                 job["freeze_data"] = result["freeze_data"]
-                try:
-                    async with postgres_db.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid",
-                            json.dumps(result["freeze_data"]),
-                            job_id,
+
+                async def _persist_reported_freeze() -> dict[str, Any]:
+                    try:
+                        async with postgres_db.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE jobs SET freeze_data = $1::jsonb "
+                                "WHERE id = $2::uuid",
+                                json.dumps(result["freeze_data"]),
+                                job_id,
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            f"Failed to write freeze_data for {job_id}: {exc}"
                         )
-                except Exception as e:
-                    logger.warning(f"Failed to write freeze_data for {job_id}: {e}")
+                        return {"persisted": False, "error": str(exc)}
+                    return {"persisted": True}
+
+                await _run_completion_effect(
+                    _effect_runner,
+                    "persist_reported_freeze",
+                    "entry",
+                    _persist_reported_freeze,
+                    transactional=True,
+                )
             else:
                 logger.info(
                     "Job %s: skipping freeze_data persist on "
@@ -19194,15 +19823,29 @@ async def _complete_job_legacy(
         # Clear any remaining queued_replies from job context on completion.
         # The agent may have consumed them during phase transitions.
         if result.get("should_stop") and not stateless_completion:
-            try:
-                async with postgres_db.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE jobs SET context = context - 'queued_replies' "
-                        "WHERE id = $1::uuid AND context ? 'queued_replies'",
-                        job_id,
+
+            async def _drop_queued_replies() -> dict[str, Any]:
+                try:
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE jobs SET context = context - 'queued_replies' "
+                            "WHERE id = $1::uuid AND context ? 'queued_replies'",
+                            job_id,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to clear queued_replies for {job_id}: {exc}"
                     )
-            except Exception as e:
-                logger.warning(f"Failed to clear queued_replies for {job_id}: {e}")
+                    return {"cleared": False, "error": str(exc)}
+                return {"cleared": True}
+
+            await _run_completion_effect(
+                _effect_runner,
+                "drop_queued_replies",
+                "entry",
+                _drop_queued_replies,
+                transactional=True,
+            )
 
         # 0. Workspace-unavailable recovery: the agent's remote workspace went
         #    unreachable mid-run. Recover by BACKEND TYPE — a pod-backed job must
@@ -19227,6 +19870,11 @@ async def _complete_job_legacy(
             )
 
             _prev = _get_infra_transient_context(job)
+            if "entry_infra_transient_attempts" in late_guard:
+                _prev = {
+                    **_prev,
+                    "attempts": int(late_guard["entry_infra_transient_attempts"]),
+                }
             _attempt = int(_prev.get("attempts") or 0) + 1
             _msg = str(error.get("message") or "transient infrastructure failure")
 
@@ -19238,26 +19886,51 @@ async def _complete_job_legacy(
                     f"{INFRA_TRANSIENT_MAX_ATTEMPTS} retries: {_msg}"
                 )
                 logger.error("Job %s: %s", job_id, _detail)
-                await postgres_db.update_job_status(
-                    job_id,
-                    status="failed",
-                    error_message=_detail,
-                    error_details={
-                        "type": "infra_transient",
-                        "message": _msg,
-                        "recoverable": False,
-                        "attempts": _attempt - 1,
-                    },
+
+                async def _give_up_infra_transient() -> dict[str, Any]:
+                    update_kwargs: dict[str, Any] = {}
+                    if _effect_runner is not None:
+                        update_kwargs = {
+                            "expected_status": completion_entry_status,
+                            "completion_command_id": _effect_runner.command_id,
+                            "completion_finalizing_by": _effect_runner.owner,
+                        }
+                    disposition_updated = await postgres_db.update_job_status(
+                        job_id,
+                        status="failed",
+                        error_message=_detail,
+                        error_details={
+                            "type": "infra_transient",
+                            "message": _msg,
+                            "recoverable": False,
+                            "attempts": _attempt - 1,
+                        },
+                        **update_kwargs,
+                    )
+                    if _effect_runner is not None and not disposition_updated:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Completion report lost an out-of-band job control race"
+                            ),
+                        )
+                    return {
+                        "status": "handled",
+                        "job_id": job_id,
+                        "new_status": "failed",
+                        "actions": [
+                            f"infra_transient: give-up after "
+                            f"{INFRA_TRANSIENT_MAX_ATTEMPTS} attempts"
+                        ],
+                    }
+
+                return await _run_completion_effect(
+                    _effect_runner,
+                    "infra_transient_give_up",
+                    "recovery",
+                    _give_up_infra_transient,
+                    transactional=True,
                 )
-                return {
-                    "status": "handled",
-                    "job_id": job_id,
-                    "new_status": "failed",
-                    "actions": [
-                        f"infra_transient: give-up after "
-                        f"{INFRA_TRANSIENT_MAX_ATTEMPTS} attempts"
-                    ],
-                }
 
             _delay = infra_transient_backoff_seconds(_attempt)
             _next = datetime.now(timezone.utc) + timedelta(seconds=_delay)
@@ -19267,62 +19940,83 @@ async def _complete_job_legacy(
                 "attempts": _attempt,
                 "last_error": _msg[:500],
             }
-            try:
-                # Durable attempt counter first — it must survive the sweeper
-                # clearing freeze_data, or the ceiling is unreachable.
-                await postgres_db.merge_job_context(
-                    job_id,
-                    {
-                        "infra_transient": {
-                            "attempts": _attempt,
-                            "last_error": _msg[:500],
-                            "next_retry_at": _next.isoformat(),
-                        }
-                    },
-                )
-                async with postgres_db.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid",
-                        json.dumps(_freeze),
+
+            async def _pause_infra_transient() -> dict[str, Any] | None:
+                try:
+                    # Durable attempt counter first — it must survive the sweeper
+                    # clearing freeze_data, or the ceiling is unreachable.
+                    await postgres_db.merge_job_context(
                         job_id,
+                        {
+                            "infra_transient": {
+                                "attempts": _attempt,
+                                "last_error": _msg[:500],
+                                "next_retry_at": _next.isoformat(),
+                            }
+                        },
                     )
-            except Exception as e:
-                # Without the freeze the sweeper cannot find the job again, so
-                # do NOT pause into an unreachable state — fall through and let
-                # the normal path resolve it.
-                logger.error(
-                    "Job %s: failed to write infra_transient freeze (%s) — "
-                    "not pausing, falling through to normal resolution",
-                    job_id,
-                    e,
-                )
-            else:
-                if await postgres_db.pause_job(job_id):
-                    logger.warning(
-                        "Job %s: paused for transient infrastructure failure "
-                        "(attempt %d/%d, retry in %.0fs, workspace KEPT): %s",
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE jobs SET freeze_data = $1::jsonb "
+                            "WHERE id = $2::uuid",
+                            json.dumps(_freeze),
+                            job_id,
+                        )
+                except Exception as exc:
+                    # Without the freeze the sweeper cannot find the job again,
+                    # so preserve the legacy fall-through disposition.
+                    logger.error(
+                        "Job %s: failed to write infra_transient freeze (%s) — "
+                        "not pausing, falling through to normal resolution",
                         job_id,
-                        _attempt,
-                        INFRA_TRANSIENT_MAX_ATTEMPTS,
-                        _delay,
-                        _msg[:200],
+                        exc,
                     )
-                    return {
-                        "status": "handled",
-                        "job_id": job_id,
-                        "new_status": "paused",
-                        "actions": [
-                            f"infra_transient: paused for retry "
-                            f"(attempt {_attempt}/{INFRA_TRANSIENT_MAX_ATTEMPTS}, "
-                            f"next retry in {_delay:.0f}s, workspace kept)"
-                        ],
-                    }
+                    return None
+                if not await postgres_db.pause_job(job_id):
+                    if _effect_runner is not None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Completion report lost an out-of-band job control race"
+                            ),
+                        )
+                    return None
+                logger.warning(
+                    "Job %s: paused for transient infrastructure failure "
+                    "(attempt %d/%d, retry in %.0fs, workspace KEPT): %s",
+                    job_id,
+                    _attempt,
+                    INFRA_TRANSIENT_MAX_ATTEMPTS,
+                    _delay,
+                    _msg[:200],
+                )
+                return {
+                    "status": "handled",
+                    "job_id": job_id,
+                    "new_status": "paused",
+                    "actions": [
+                        f"infra_transient: paused for retry "
+                        f"(attempt {_attempt}/{INFRA_TRANSIENT_MAX_ATTEMPTS}, "
+                        f"next retry in {_delay:.0f}s, workspace kept)"
+                    ],
+                }
+
+            infra_pause_outcome = await _run_completion_effect(
+                _effect_runner,
+                "infra_transient_pause",
+                "recovery",
+                _pause_infra_transient,
+                transactional=True,
+            )
+            if infra_pause_outcome is not None:
+                return infra_pause_outcome
 
         if isinstance(error, dict) and error.get("type") == "workspace_unavailable":
             # Decide on the ORIGINAL job (before any stamp): a pod/sandbox job has
             # no vm.requested, so _job_needs_vm is False and it recovers via PVC
             # reattach; only a true VM job takes the legacy VM path below.
-            if not _job_needs_vm(job):
+            entry_needs_vm = bool(late_guard.get("entry_needs_vm", _job_needs_vm(job)))
+            if not entry_needs_vm:
                 # --- G1: pod (sandbox/PVC) recovery -------------------------------
                 # Extracted to services.completion for testability. Probes the
                 # workspace sshd before any delete (a live pod is kept warm),
@@ -19330,22 +20024,76 @@ async def _complete_job_legacy(
                 # fail-loud so it cannot leak.
                 # See docs/features/workspace_pvc_branch_a_implementation.md (G1)
                 # and docs/issues/maxsessions_parallel_tools_false_workspace_death.md.
-                async def _delete_pod(jid: str) -> None:
-                    await container_provisioner.delete_workspace(
-                        WorkspaceOwner.job(jid)
+                async def _delete_pod(jid: str) -> bool:
+                    delete_kwargs: dict[str, Any] = {}
+                    owner = WorkspaceOwner.job(jid)
+                    if _effect_runner is not None:
+                        runtime_incarnation = _get_container_context(job).get(
+                            "_runtime_incarnation"
+                        )
+                        if runtime_incarnation:
+                            authority = (
+                                await container_provisioner.workspace_pod_authority(
+                                    owner,
+                                    expected_runtime_incarnation=str(
+                                        runtime_incarnation
+                                    ),
+                                )
+                            )
+                            if authority in {"exact_absent", "replacement"}:
+                                # The captured runtime is already gone. A
+                                # same-name replacement is not this command's
+                                # delete target and must survive.
+                                return True
+                            if authority not in {"exact_live", "exact_terminal"}:
+                                return False
+                            delete_kwargs = {
+                                "expected_runtime_incarnation": str(
+                                    runtime_incarnation
+                                ),
+                                "wait_for_exact_absence": True,
+                            }
+                    return await container_provisioner.delete_workspace(
+                        owner, **delete_kwargs
                     )
 
-                return await handle_pod_workspace_recovery(
-                    job,
-                    job_id,
-                    error,
-                    db=postgres_db,
-                    delete_workspace=_delete_pod,
-                    trigger_dispatch=_trigger_dispatch,
+                async def _recover_pod_workspace() -> dict[str, Any]:
+                    return await handle_pod_workspace_recovery(
+                        job,
+                        job_id,
+                        error,
+                        db=postgres_db,
+                        delete_workspace=_delete_pod,
+                        trigger_dispatch=_trigger_dispatch,
+                        completion_command_id=(
+                            _effect_runner.command_id
+                            if _effect_runner is not None
+                            else None
+                        ),
+                        completion_finalizing_by=(
+                            _effect_runner.owner if _effect_runner is not None else None
+                        ),
+                    )
+
+                pod_recovery = await _run_completion_effect(
+                    _effect_runner,
+                    "pod_workspace_recovery",
+                    "recovery",
+                    _recover_pod_workspace,
                 )
+                if _effect_runner is not None and not pod_recovery.get("paused", True):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Completion report lost an out-of-band job control race"
+                        ),
+                    )
+                return pod_recovery
 
             # --- VM recovery (legacy path, unchanged) -------------------------
-            # Guard: skip if recovery is already in progress (prevents double-dispatch loop)
+            # VM finalization is explicitly outside this Gate-3 milestone. Keep
+            # the historical duplicate guard and best-effort sequence intact;
+            # unlike Kubernetes recovery, this branch is not journaled tonight.
             vm_ctx = _get_vm_context(job)
             if vm_ctx and vm_ctx.get("recovering"):
                 logger.info(
@@ -19358,71 +20106,108 @@ async def _complete_job_legacy(
                     "actions": ["vm recovery: duplicate skipped"],
                 }
 
-            logger.warning(
-                f"Job {job_id}: workspace unavailable — attempting VM recovery"
-            )
-            # Set recovering flag *before* issuing delete to prevent re-entry.
-            # Replace context.vm wholesale (recovery intentionally resets the vm
-            # object) via a top-level merge that preserves other context keys.
-            await postgres_db.merge_job_context(
-                job_id,
-                {
-                    "vm": {
-                        "requested": True,
-                        "recovering": True,
-                        "previous_error": "workspace_unavailable",
-                        # Survives this wholesale reset on purpose: the disk
-                        # outlives the VM and the kept-disk GC sweep looks for
-                        # exactly this key.
-                        "rootdisk": "kept",
-                    }
-                },
-            )
+            async def _recover_vm_workspace() -> dict[str, Any]:
+                logger.warning(
+                    f"Job {job_id}: workspace unavailable — attempting VM recovery"
+                )
+                # Set recovering flag *before* issuing delete to prevent re-entry.
+                # Replace context.vm wholesale (recovery intentionally resets the
+                # vm object) via a top-level merge that preserves other keys.
+                await postgres_db.merge_job_context(
+                    job_id,
+                    {
+                        "vm": {
+                            "requested": True,
+                            "recovering": True,
+                            "previous_error": "workspace_unavailable",
+                            "rootdisk": "kept",
+                        }
+                    },
+                )
 
-            # Delete the old (crashed) VM, but keep its rootdisk — the whole
-            # point of the recovery is that the re-dispatched VM reattaches the
-            # same disk and finds its files, instead of booting a pristine
-            # golden clone with a checkpoint that believes it is mid-phase-N.
-            # docs/features/vm_persistent_rootdisk.md D2.
-            if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
-                await vm_provisioner.delete_vm(job_id, purge_disk=False)
-            # Put job back in queue as paused (dispatchable, clears assigned_agent_id)
-            await postgres_db.pause_job(job_id)
-            _trigger_dispatch()
-            return {
-                "status": "handled",
-                "job_id": job_id,
-                "new_status": "paused",
-                "actions": [
-                    "vm recovery: old VM deleted, new VM will be provisioned, job re-queued"
-                ],
-            }
+                # Delete the old VM but retain the persistent root disk.
+                if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
+                    await vm_provisioner.delete_vm(job_id, purge_disk=False)
+                await postgres_db.pause_job(job_id)
+                _trigger_dispatch()
+                return {
+                    "status": "handled",
+                    "job_id": job_id,
+                    "new_status": "paused",
+                    "actions": [
+                        "vm recovery: old VM deleted, new VM will be provisioned, "
+                        "job re-queued"
+                    ],
+                }
+
+            return await _recover_vm_workspace()
 
         # Any other handled completion proves the workspace connection works —
         # clear a lingering recovery strike so an old blip cannot make a later,
         # unrelated one exhaust the cap early.
         # docs/issues/maxsessions_parallel_tools_false_workspace_death.md (D).
         if should_reset_recovery_counter(_get_container_context(job), error):
-            try:
-                await postgres_db.merge_workspace_container_context(
-                    job_id, {"recovery_attempts": 0, "previous_error": None}
-                )
-            except Exception:
-                logger.warning(
-                    f"Failed to reset workspace recovery counter for {job_id}"
-                )
+
+            async def _reset_recovery_strikes() -> dict[str, Any]:
+                try:
+                    await postgres_db.merge_workspace_container_context(
+                        job_id, {"recovery_attempts": 0, "previous_error": None}
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to reset workspace recovery counter for {job_id}"
+                    )
+                    return {"reset": False, "error": str(exc)}
+                return {"reset": True}
+
+            await _run_completion_effect(
+                _effect_runner,
+                "reset_recovery_strikes",
+                "recovery",
+                _reset_recovery_strikes,
+                transactional=True,
+            )
 
         # 1. Determine and set the new job status. For a subjob, pass the parent's
         # current status so a drain-frozen subjob resolves terminally instead of
         # pausing into a cascade-guard wedge under a permanently-failed parent.
         # docs/done/coincident_infra_error_overrides_reported_job_outcome.md
-        _parent_status = None
-        if job.get("parent_job_id"):
+        _parent_status = late_guard.get("entry_parent_status")
+        if _effect_runner is None and job.get("parent_job_id"):
             _parent = await postgres_db.get_job(str(job["parent_job_id"]))
             _parent_status = _parent.get("status") if _parent else None
+        decision_job = job
+        if _effect_runner is not None:
+            decision_context = job.get("context") or {}
+            if isinstance(decision_context, str):
+                try:
+                    decision_context = json.loads(decision_context)
+                except (json.JSONDecodeError, TypeError):
+                    decision_context = {}
+            decision_context = (
+                dict(decision_context) if isinstance(decision_context, Mapping) else {}
+            )
+            if "entry_memory_retry_count" in late_guard:
+                decision_context["memory_retry_count"] = int(
+                    late_guard["entry_memory_retry_count"]
+                )
+            if "entry_llm_outage" in late_guard:
+                decision_context["llm_outage"] = dict(
+                    late_guard.get("entry_llm_outage") or {}
+                )
+            decision_job = {**job, "context": decision_context}
         new_status, error_message = determine_job_status(
-            job, result, parent_status=_parent_status
+            decision_job, result, parent_status=_parent_status
         )
+        if _effect_runner is not None and "entry_resolution" in late_guard:
+            entry_resolution = late_guard.get("entry_resolution")
+            if entry_resolution != new_status:
+                # The only expected divergence is a counter/time decision that
+                # this same command advanced before its marker was replayed.
+                # Preserve S1's accepted-entry result, including a None result.
+                new_status = entry_resolution
+                if new_status != "failed":
+                    error_message = None
 
         # 1·mem. Memory/KB-unavailable bounded retry. determine_job_status has
         # already enforced the cap (paused under MEMORY_RETRY_CAP, failed at it).
@@ -19443,12 +20228,48 @@ async def _complete_job_legacy(
                 "memory_unavailable",
                 "kb_unavailable",
             ):
-                # Atomic increment (race-proof) — a duplicate re-dispatch of the
-                # same paused job must not let two handlers both read the old
-                # value and stall the counter, which would defeat the cap.
-                _mn = await postgres_db.increment_job_memory_retry(job_id)
-                if await postgres_db.pause_job(job_id):
-                    _trigger_dispatch()
+
+                async def _pause_for_memory_retry() -> dict[str, Any]:
+                    # Atomic increment (race-proof) — a duplicate re-dispatch of
+                    # the same paused job must not stall the counter.
+                    retry_count = await postgres_db.increment_job_memory_retry(job_id)
+                    paused = bool(await postgres_db.pause_job(job_id))
+                    if _effect_runner is not None and not paused:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Completion report lost an out-of-band job control race"
+                            ),
+                        )
+                    if paused and _effect_runner is None:
+                        _trigger_dispatch()
+                    return {"paused": paused, "retry_count": retry_count}
+
+                memory_retry = await _run_completion_effect(
+                    _effect_runner,
+                    "memory_kb_retry_pause",
+                    "recovery",
+                    _pause_for_memory_retry,
+                    transactional=True,
+                )
+                if memory_retry["paused"]:
+                    # The durable callback's DB writes and effect marker are
+                    # committed before this task is scheduled.  A child task
+                    # must not inherit/use the transaction-scoped connection.
+                    if _effect_runner is not None:
+                        _trigger_dispatch()
+                    if completion_current_status not in (
+                        completion_entry_status,
+                        "paused",
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Completion finalization lost an out-of-band job "
+                                "control race"
+                            ),
+                        )
+                    _mn = int(memory_retry["retry_count"])
                     actions.append(
                         f"memory_unavailable: re-queued for retry "
                         f"(memory_retry_count -> {_mn})"
@@ -19484,70 +20305,102 @@ async def _complete_job_legacy(
                     llm_outage_repeat_key,
                 )
 
-                _now = datetime.now(timezone.utc)
-                _adv = await postgres_db.increment_job_llm_outage_attempt(
-                    job_id,
-                    now=_now,
-                    reset_window_seconds=LLM_OUTAGE_RESET_WINDOW_SECONDS,
-                    fingerprint=llm_outage_fingerprint(_lfd),
-                    repeat_key=llm_outage_repeat_key(_lfd),
-                    # TEMPORARY QUICKFIX — docs/done/codex_stream_disconnect_shape_nudge.md
-                    nudge_at_repeats=(
-                        LLM_OUTAGE_REPEAT_CEILING if LLM_OUTAGE_SHAPE_NUDGE else None
-                    ),
-                )
-                _attempt = _adv["attempt"]
-                _ra = _lfd.get("retry_after_seconds")
-                try:
-                    _ra = float(_ra) if _ra is not None else None
-                except (ValueError, TypeError):
-                    _ra = None
-                _delay = llm_outage_backoff_seconds(_attempt, retry_after_seconds=_ra)
-                _next = _now + timedelta(seconds=_delay)
-                # Persist next_retry_at + attempt INTO freeze_data so the sweeper's
-                # due-query + CAS can find and gate on it (overwrites the agent's
-                # freeze_data written earlier in this handler). ALSO stamp
-                # next_retry_at into context.llm_outage so the auto-reset anchors
-                # on the end of this scheduled wait rather than the last failure —
-                # without it a long cooldown pause spuriously resets the ceiling
-                # (docs/features/llm_cooldown_pause_and_resume.md §Design decision).
-                # Follow-up (not folded into the increment) because next_retry_at
-                # depends on the post-increment attempt; a crash between the two
-                # leaves next_retry_at absent → the anchor degrades to today's
-                # last_failed_at behavior, which is safe.
-                _out_fd = dict(_lfd)
-                _out_fd["next_retry_at"] = _next.isoformat()
-                _out_fd["attempt"] = _attempt
-                try:
-                    async with postgres_db.acquire() as conn:
-                        await conn.execute(
-                            """
-                            UPDATE jobs
-                               SET freeze_data = $1::jsonb,
-                                   context = jsonb_set(
-                                       COALESCE(context, '{}'::jsonb),
-                                       '{llm_outage,next_retry_at}',
-                                       to_jsonb($3::text),
-                                       true
-                                   )
-                             WHERE id = $2::uuid
-                            """,
-                            json.dumps(_out_fd),
-                            job_id,
-                            _next.isoformat(),
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to write llm_outage next_retry_at for {job_id}: {e}"
+                async def _pause_for_llm_outage() -> dict[str, Any]:
+                    now = datetime.now(timezone.utc)
+                    advanced = await postgres_db.increment_job_llm_outage_attempt(
+                        job_id,
+                        now=now,
+                        reset_window_seconds=LLM_OUTAGE_RESET_WINDOW_SECONDS,
+                        fingerprint=llm_outage_fingerprint(_lfd),
+                        repeat_key=llm_outage_repeat_key(_lfd),
+                        nudge_at_repeats=(
+                            LLM_OUTAGE_REPEAT_CEILING
+                            if LLM_OUTAGE_SHAPE_NUDGE
+                            else None
+                        ),
                     )
-                if await postgres_db.pause_job(job_id):
+                    attempt = int(advanced["attempt"])
+                    retry_after = _lfd.get("retry_after_seconds")
+                    try:
+                        retry_after = (
+                            float(retry_after) if retry_after is not None else None
+                        )
+                    except (ValueError, TypeError):
+                        retry_after = None
+                    delay = llm_outage_backoff_seconds(
+                        attempt, retry_after_seconds=retry_after
+                    )
+                    next_retry = now + timedelta(seconds=delay)
+                    out_freeze = dict(_lfd)
+                    out_freeze["next_retry_at"] = next_retry.isoformat()
+                    out_freeze["attempt"] = attempt
+                    try:
+                        async with postgres_db.acquire() as conn:
+                            await conn.execute(
+                                """
+                                UPDATE jobs
+                                   SET freeze_data = $1::jsonb,
+                                       context = jsonb_set(
+                                           COALESCE(context, '{}'::jsonb),
+                                           '{llm_outage,next_retry_at}',
+                                           to_jsonb($3::text),
+                                           true
+                                       )
+                                 WHERE id = $2::uuid
+                                """,
+                                json.dumps(out_freeze),
+                                job_id,
+                                next_retry.isoformat(),
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to write llm_outage next_retry_at for %s: %s",
+                            job_id,
+                            exc,
+                        )
+                    paused = bool(await postgres_db.pause_job(job_id))
+                    if _effect_runner is not None and not paused:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Completion report lost an out-of-band job control race"
+                            ),
+                        )
+                    return {
+                        "paused": paused,
+                        "attempt": attempt,
+                        "delay": delay,
+                        "next_retry_at": next_retry.isoformat(),
+                    }
+
+                llm_retry = await _run_completion_effect(
+                    _effect_runner,
+                    "llm_outage_retry_pause",
+                    "recovery",
+                    _pause_for_llm_outage,
+                    transactional=True,
+                )
+                if llm_retry["paused"]:
+                    if completion_current_status not in (
+                        completion_entry_status,
+                        "paused",
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Completion finalization lost an out-of-band job "
+                                "control race"
+                            ),
+                        )
+                    _attempt = int(llm_retry["attempt"])
+                    _delay = float(llm_retry["delay"])
                     actions.append(
                         f"llm_unavailable: paused for backoff re-dispatch "
                         f"(attempt {_attempt}, next retry in {_delay:.0f}s)"
                     )
                     logger.warning(
                         f"Job {job_id} paused for LLM outage — attempt {_attempt}, "
-                        f"next_retry_at={_next.isoformat()} "
+                        f"next_retry_at={llm_retry['next_retry_at']} "
                         f"(classification={_lfd.get('classification')}, "
                         f"model={_lfd.get('model')})"
                     )
@@ -19559,13 +20412,30 @@ async def _complete_job_legacy(
                     f"Job {job_id} FAILED after LLM-outage give-up ceiling: "
                     f"{error_message}"
                 )
-                try:
-                    await _notify_operator_freeze(job, job_id, "llm_unavailable", _lfd)
+
+                async def _alert_llm_give_up() -> dict[str, Any]:
+                    try:
+                        await _notify_operator_freeze(
+                            job, job_id, "llm_unavailable", _lfd
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to send llm_unavailable give-up alert for %s: %s",
+                            job_id,
+                            exc,
+                        )
+                        return {"sent": False, "error": str(exc)}
+                    return {"sent": True}
+
+                llm_alert = await _run_completion_effect(
+                    _effect_runner,
+                    "llm_give_up_operator_alert",
+                    "llm_give_up_alert",
+                    _alert_llm_give_up,
+                    retry_if=lambda output: not bool(output.get("sent")),
+                )
+                if llm_alert["sent"]:
                     actions.append("operator alerted (llm_unavailable give-up)")
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to send llm_unavailable give-up alert for {job_id}: {e}"
-                    )
 
         # 1·gate. Deliverable-contract gate (P1-C): a completion that CLAIMS
         # done-ness must have every context.required_deliverables artifact
@@ -19588,19 +20458,37 @@ async def _complete_job_legacy(
                 feedback,
                 reason,
                 expected_status=(
-                    completion_entry_status if stateless_completion else None
+                    completion_entry_status
+                    if stateless_completion or _effect_runner is not None
+                    else None
                 ),
             )
 
-        new_status, _gate_actions, _gate_bounced = await apply_deliverable_gate(
-            job,
-            result,
-            new_status,
-            db=postgres_db,
-            gitea=gitea_client,
-            queue_resume=_queue_deliverable_gate_resume,
-            vector_db=vector_db,
+        async def _apply_completion_deliverable_gate() -> dict[str, Any]:
+            status, gate_actions, bounced = await apply_deliverable_gate(
+                job,
+                result,
+                new_status,
+                db=postgres_db,
+                gitea=gitea_client,
+                queue_resume=_queue_deliverable_gate_resume,
+                vector_db=vector_db,
+            )
+            return {
+                "new_status": status,
+                "actions": list(gate_actions),
+                "bounced": bool(bounced),
+            }
+
+        gate_result = await _run_completion_effect(
+            _effect_runner,
+            "deliverable_contract_gate",
+            "delivery_gate",
+            _apply_completion_deliverable_gate,
         )
+        new_status = gate_result["new_status"]
+        _gate_actions = list(gate_result["actions"])
+        _gate_bounced = bool(gate_result["bounced"])
         actions.extend(_gate_actions)
         if _gate_bounced:
             # Refused seal: the job is already parked paused with
@@ -19625,108 +20513,160 @@ async def _complete_job_legacy(
 
         _completion_loop_id = job_loop_id(job)
         if _completion_loop_id and new_status == "completed":
-            try:
-                from services.job_cloud_baseline import deliver_loop_diff_to_cloud
 
-                _delivery_project = (
-                    await postgres_db.get_project(str(job["project_id"]))
-                    if job.get("project_id")
-                    else None
-                )
-                if not _delivery_project:
-                    _loop_delivery = {
-                        "delivery_status": "cloud-unavailable",
-                        "needs_review": True,
-                        "delivery_sha": None,
-                        "notes": ["project row is unavailable"],
-                    }
-                else:
-                    _loop_delivery = await deliver_loop_diff_to_cloud(
-                        job=job,
-                        project=_delivery_project,
-                        postgres_db=postgres_db,
-                        gitea_client=gitea_client,
-                        main_cloud_router=main_cloud_router,
-                    )
-                _delivery_status = str(_loop_delivery["delivery_status"])
-                job["merge_status"] = _delivery_status
-                await postgres_db.update_job_merge_status(
-                    job_id, merge_status=_delivery_status
-                )
-
-                _job_ctx = job.get("context") or {}
-                if isinstance(_job_ctx, str):
-                    try:
-                        _job_ctx = json.loads(_job_ctx)
-                    except (json.JSONDecodeError, TypeError):
-                        _job_ctx = {}
-                if not isinstance(_job_ctx, dict):
-                    _job_ctx = {}
-                _job_ctx["loop_cloud_delivery"] = _loop_delivery
-                job["context"] = _job_ctx
-                await postgres_db.merge_job_context(
-                    job_id, {"loop_cloud_delivery": _loop_delivery}
-                )
-
-                if _loop_delivery.get("needs_review"):
-                    new_status = "pending_review"
-                    actions.append(
-                        f"loop cloud delivery {_delivery_status} -> pending_review"
-                    )
-                else:
-                    actions.append(f"loop cloud delivery -> {_delivery_status}")
-            except Exception as e:
-                # Fail closed for loops. Advancing here would strand the only
-                # durable copy of this turn's project-file contribution.
-                logger.exception(
-                    "Loop cloud delivery failed for job %s; parking for review",
-                    job_id,
-                )
-                new_status = "pending_review"
-                job["merge_status"] = "cloud-unavailable"
+            async def _deliver_loop_project_cloud() -> dict[str, Any]:
                 try:
+                    from services.job_cloud_baseline import deliver_loop_diff_to_cloud
+
+                    delivery_project = (
+                        await postgres_db.get_project(str(job["project_id"]))
+                        if job.get("project_id")
+                        else None
+                    )
+                    if not delivery_project:
+                        loop_delivery = {
+                            "delivery_status": "cloud-unavailable",
+                            "needs_review": True,
+                            "delivery_sha": None,
+                            "notes": ["project row is unavailable"],
+                        }
+                    else:
+                        loop_delivery = await deliver_loop_diff_to_cloud(
+                            job=job,
+                            project=delivery_project,
+                            postgres_db=postgres_db,
+                            gitea_client=gitea_client,
+                            main_cloud_router=main_cloud_router,
+                            completion_command_id=getattr(
+                                _effect_runner, "command_id", None
+                            ),
+                        )
+                    delivery_status = str(loop_delivery["delivery_status"])
                     await postgres_db.update_job_merge_status(
-                        job_id, merge_status="cloud-unavailable"
+                        job_id, merge_status=delivery_status
                     )
                     await postgres_db.merge_job_context(
-                        job_id,
-                        {
-                            "loop_cloud_delivery": {
-                                "delivery_status": "cloud-unavailable",
-                                "needs_review": True,
-                                "notes": [str(e)],
-                            }
-                        },
+                        job_id, {"loop_cloud_delivery": loop_delivery}
                     )
-                except Exception:
-                    logger.warning(
-                        "Failed to persist loop cloud delivery failure for %s",
-                        job_id,
-                        exc_info=True,
+                    status = (
+                        "pending_review"
+                        if loop_delivery.get("needs_review")
+                        else "completed"
                     )
-                actions.append("loop cloud delivery failed -> pending_review")
+                    action = (
+                        f"loop cloud delivery {delivery_status} -> pending_review"
+                        if status == "pending_review"
+                        else f"loop cloud delivery -> {delivery_status}"
+                    )
+                    result = {
+                        "new_status": status,
+                        "delivery_status": delivery_status,
+                        "action": action,
+                    }
+                    if _effect_runner is None:
+                        result["legacy_loop_delivery"] = loop_delivery
+                    return result
+                except Exception as exc:
+                    # Fail closed for loops. Advancing here would strand the only
+                    # durable copy of this turn's project-file contribution.
+                    logger.exception(
+                        "Loop cloud delivery failed for job %s; parking for review",
+                        job_id,
+                    )
+                    try:
+                        await postgres_db.update_job_merge_status(
+                            job_id, merge_status="cloud-unavailable"
+                        )
+                        await postgres_db.merge_job_context(
+                            job_id,
+                            {
+                                "loop_cloud_delivery": {
+                                    "delivery_status": "cloud-unavailable",
+                                    "needs_review": True,
+                                    "notes": [str(exc)],
+                                }
+                            },
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist loop cloud delivery failure for %s",
+                            job_id,
+                            exc_info=True,
+                        )
+                    return {
+                        "new_status": "pending_review",
+                        "delivery_status": "cloud-unavailable",
+                        "action": "loop cloud delivery failed -> pending_review",
+                    }
+
+            loop_delivery_result = await _run_completion_effect(
+                _effect_runner,
+                "loop_project_cloud_delivery",
+                "delivery",
+                _deliver_loop_project_cloud,
+            )
+            new_status = str(loop_delivery_result["new_status"])
+            job["merge_status"] = loop_delivery_result["delivery_status"]
+            # S15's potentially unbounded per-file inventory already lives in
+            # context.loop_cloud_delivery. Never copy it into the 8 KiB effect
+            # detail row. Durable replay reloads the domain record; the dark
+            # path preserves the historical in-memory merge and extra-read
+            # count exactly.
+            if _effect_runner is not None:
+                refreshed_loop_job = await postgres_db.get_job(job_id)
+                if refreshed_loop_job is not None:
+                    job["context"] = refreshed_loop_job.get("context") or job.get(
+                        "context"
+                    )
+            else:
+                legacy_loop_delivery = loop_delivery_result.get("legacy_loop_delivery")
+                if legacy_loop_delivery is not None:
+                    loop_context = job.get("context") or {}
+                    if isinstance(loop_context, str):
+                        try:
+                            loop_context = json.loads(loop_context)
+                        except (json.JSONDecodeError, TypeError):
+                            loop_context = {}
+                    if not isinstance(loop_context, dict):
+                        loop_context = {}
+                    loop_context["loop_cloud_delivery"] = legacy_loop_delivery
+                    job["context"] = loop_context
+            actions.append(str(loop_delivery_result["action"]))
         elif (
             job.get("cloud_diff_baseline_commit")
             and new_status in ("completed", "pending_review")
             and gitea_client.is_initialized
             and not _completion_loop_id
         ):
-            try:
-                from services.job_cloud_baseline import capture_diff_for_mode_a_job
 
-                captured = await capture_diff_for_mode_a_job(
-                    job=job,
-                    postgres_db=postgres_db,
-                    gitea_client=gitea_client,
-                )
-                if captured and new_status == "completed":
-                    new_status = "pending_review"
-                    actions.append("mode A diff captured -> pending_review")
-            except Exception as e:
-                logger.warning(
-                    f"Mode A: diff capture failed for job {job_id} ({e}); "
-                    "proceeding with original status"
-                )
+            async def _capture_mode_a_diff() -> dict[str, Any]:
+                try:
+                    from services.job_cloud_baseline import capture_diff_for_mode_a_job
+
+                    captured = await capture_diff_for_mode_a_job(
+                        job=job,
+                        postgres_db=postgres_db,
+                        gitea_client=gitea_client,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Mode A: diff capture failed for job %s (%s); "
+                        "proceeding with original status",
+                        job_id,
+                        exc,
+                    )
+                    return {"captured": False, "error": str(exc)}
+                return {"captured": bool(captured)}
+
+            mode_a_capture = await _run_completion_effect(
+                _effect_runner,
+                "mode_a_diff_capture",
+                "delivery",
+                _capture_mode_a_diff,
+            )
+            if mode_a_capture["captured"] and new_status == "completed":
+                new_status = "pending_review"
+                actions.append("mode A diff captured -> pending_review")
 
         if new_status:
             kwargs: dict[str, Any] = {"status": new_status}
@@ -19770,24 +20710,60 @@ async def _complete_job_legacy(
                         kwargs["stash_and_clear_freeze"] = True
                         kwargs["freeze_data"] = fd_row
 
-            if stateless_completion:
+            if stateless_completion or _effect_runner is not None:
                 kwargs["expected_status"] = completion_entry_status
-            disposition_updated = await postgres_db.update_job_status(job_id, **kwargs)
-            if stateless_completion and not disposition_updated:
-                current = await postgres_db.get_job(job_id)
-                current_status = str((current or {}).get("status") or "unknown")
-                logger.warning(
-                    "Stateless completion disposition lost control race "
-                    "job=%s lease_token=%s entry_status=%s current_status=%s",
-                    job_id,
-                    body.lease_token,
-                    completion_entry_status,
-                    current_status,
+            if _effect_runner is not None:
+                kwargs["completion_command_id"] = _effect_runner.command_id
+                kwargs["completion_finalizing_by"] = _effect_runner.owner
+
+            async def _write_main_status() -> dict[str, Any]:
+                disposition_updated = await postgres_db.update_job_status(
+                    job_id, **kwargs
                 )
-                raise HTTPException(
-                    status_code=409,
-                    detail="Completion report lost an out-of-band job control race",
-                )
+                if (
+                    stateless_completion or _effect_runner is not None
+                ) and not disposition_updated:
+                    current = await postgres_db.get_job(job_id)
+                    current_status = str((current or {}).get("status") or "unknown")
+                    logger.warning(
+                        "Durable completion disposition lost control race "
+                        "job=%s lease_token=%s entry_status=%s current_status=%s",
+                        job_id,
+                        body.lease_token,
+                        completion_entry_status,
+                        current_status,
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Completion report lost an out-of-band job control race",
+                    )
+                return {
+                    "new_status": new_status,
+                    "had_assigned_agent": had_assigned_agent,
+                    "stash_and_clear_freeze": stash_and_clear_freeze,
+                }
+
+            status_effect = await _run_completion_effect(
+                _effect_runner,
+                "main_status_write",
+                "job_disposition",
+                _write_main_status,
+                transactional=True,
+            )
+            new_status = status_effect["new_status"]
+            had_assigned_agent = bool(status_effect["had_assigned_agent"])
+            stash_and_clear_freeze = bool(status_effect["stash_and_clear_freeze"])
+            # The freeze payload can contain an unbounded command/result blob.
+            # It belongs on jobs.freeze_data/context.last_freeze_data, never in
+            # completion_effects.detail. Rehydrate it from that domain record
+            # after replaying S17's fixed-cardinality decision summary.
+            replay_fd = job.get("freeze_data")
+            if isinstance(replay_fd, str):
+                try:
+                    replay_fd = json.loads(replay_fd)
+                except (json.JSONDecodeError, TypeError):
+                    replay_fd = None
+            fd_row = dict(replay_fd) if isinstance(replay_fd, Mapping) else None
             actions.append(f"status -> {new_status}")
             logger.info(f"Job {job_id} status set to '{new_status}'")
 
@@ -19802,6 +20778,19 @@ async def _complete_job_legacy(
                 if had_assigned_agent:
                     actions.append("cleared agent on paused job (re-dispatchable)")
 
+            async def _record_assigned_agent_clear() -> dict[str, Any]:
+                return {
+                    "applied_in_main_status_write": new_status == "paused",
+                    "had_assigned_agent": had_assigned_agent,
+                }
+
+            await _run_completion_effect(
+                _effect_runner,
+                "clear_assigned_agent_on_pause",
+                "job_disposition",
+                _record_assigned_agent_clear,
+            )
+
             # Auto-redispatch pauses must ALSO shed the row-level freeze blob:
             # get_dispatchable_jobs requires ``freeze_data IS NULL`` (partial
             # index, 0046), so a kept freeze makes the paused job invisible to
@@ -19813,50 +20802,109 @@ async def _complete_job_legacy(
                 job["freeze_data"] = None
                 actions.append("freeze stashed to context (auto-redispatch)")
 
+                async def _record_freeze_stash() -> dict[str, Any]:
+                    return {"applied_in_main_status_write": True}
+
+                await _run_completion_effect(
+                    _effect_runner,
+                    "stash_and_clear_freeze",
+                    "job_disposition",
+                    _record_freeze_stash,
+                )
+
                 # Progress-aware drain backstop (defense-in-depth for the
                 # version_upgrade drain livelock,
                 # docs/issues/version_upgrade_drain_livelock.md). Detects a
                 # re-dispatch loop that is NOT advancing (freeze phase_number
                 # stuck) and alerts, rather than letting it churn invisibly.
                 # Pure decision in services.completion; I/O stays here.
-                try:
-                    from services.completion import auto_continue_drain_update
+                async def _update_drain_stall_counter() -> dict[str, Any]:
+                    try:
+                        from services.completion import auto_continue_drain_update
 
-                    ctx = job.get("context") or {}
-                    if isinstance(ctx, str):
-                        ctx = json.loads(ctx)
-                    cap = int(os.environ.get("AUTO_CONTINUE_DRAIN_ALERT_CAP", "10"))
-                    drains, last_phase, should_alert = auto_continue_drain_update(
-                        ctx or {}, fd_row, cap=cap
-                    )
-                    await postgres_db.merge_job_context(
-                        job_id,
-                        {
-                            "auto_continue_drains": drains,
-                            "auto_continue_last_phase": last_phase,
-                        },
-                    )
-                    if should_alert:
-                        logger.error(
-                            f"Job {job_id}: {drains} consecutive "
-                            f"{fd_row.get('freeze_type')} re-dispatches with NO "
-                            f"phase progress (stuck at phase {last_phase}) — the "
-                            f"agent-side resume-clear may be failing; alerting "
-                            f"operator."
+                        ctx = job.get("context") or {}
+                        if isinstance(ctx, str):
+                            ctx = json.loads(ctx)
+                        cap = int(os.environ.get("AUTO_CONTINUE_DRAIN_ALERT_CAP", "10"))
+                        drains, last_phase, should_alert = auto_continue_drain_update(
+                            ctx or {}, fd_row, cap=cap
                         )
+                        merged = await postgres_db.merge_job_context(
+                            job_id,
+                            {
+                                "auto_continue_drains": drains,
+                                "auto_continue_last_phase": last_phase,
+                            },
+                        )
+                        if _effect_runner is not None and not merged:
+                            raise RuntimeError(
+                                "drain-stall counter update did not commit"
+                            )
+                        return {
+                            "drains": drains,
+                            "last_phase": last_phase,
+                            "alerted": should_alert,
+                        }
+                    except Exception as exc:
+                        if _effect_runner is not None:
+                            raise
+                        logger.warning(
+                            "Failed to update auto-continue drain counter for %s: %s",
+                            job_id,
+                            exc,
+                        )
+                        return {"error": str(exc)}
+
+                drain_stall = await _run_completion_effect(
+                    _effect_runner,
+                    "drain_stall_counter_alert",
+                    "drain_stall_alert",
+                    _update_drain_stall_counter,
+                    transactional=True,
+                )
+                if drain_stall.get("alerted"):
+                    logger.error(
+                        f"Job {job_id}: {drain_stall['drains']} consecutive "
+                        f"{fd_row.get('freeze_type')} re-dispatches with NO "
+                        f"phase progress (stuck at {drain_stall['last_phase']}) — "
+                        f"the agent-side resume-clear may be failing; alerting "
+                        f"operator."
+                    )
+
+                    async def _send_drain_stall_alert() -> dict[str, Any]:
                         try:
                             await _notify_operator_freeze(
-                                job, job_id, fd_row.get("freeze_type"), fd_row
+                                job,
+                                job_id,
+                                fd_row.get("freeze_type"),
+                                fd_row,
                             )
-                        except Exception as _ne:
+                        except Exception as exc:
                             logger.warning(
-                                f"Failed to alert on drain-stall for {job_id}: {_ne}"
+                                "Failed to alert on drain-stall for %s: %s",
+                                job_id,
+                                exc,
                             )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to update auto-continue drain counter for "
-                        f"{job_id}: {e}"
+                            return {"sent": False, "error": str(exc)}
+                        return {"sent": True}
+
+                    await _run_completion_effect(
+                        _effect_runner,
+                        "drain_stall_operator_alert",
+                        "drain_stall_notification",
+                        _send_drain_stall_alert,
+                        retry_if=lambda output: bool(output.get("error")),
                     )
+
+            async def _record_completed_at() -> dict[str, Any]:
+                return {"applied_in_main_status_write": new_status == "completed"}
+
+            await _run_completion_effect(
+                _effect_runner,
+                "completed_at",
+                "job_disposition",
+                _record_completed_at,
+            )
 
             # Update job dict with new status for downstream checks
             job["status"] = new_status
@@ -19902,45 +20950,79 @@ async def _complete_job_legacy(
                             "raising the approval request normally"
                         )
 
-                    try:
-                        sudo_request_id = await sudo_gate.insert_vm_upgrade_request(
-                            job_id=job_id,
-                            command=fd.get("command", "unknown"),
-                            reason=fd.get("reason", ""),
-                            config_name=job.get("config_name", ""),
-                            status="auto_denied" if denial_detail else "pending",
-                            decision_reason=denial_detail or "",
-                        )
-                        if sudo_request_id:
-                            actions.append(
-                                f"sudo request created ({sudo_request_id[:8]})"
-                                + (" [auto-denied]" if denial_detail else "")
+                    async def _create_sudo_approval_request() -> dict[str, Any]:
+                        try:
+                            request_id = await sudo_gate.insert_vm_upgrade_request(
+                                job_id=job_id,
+                                command=fd.get("command", "unknown"),
+                                reason=fd.get("reason", ""),
+                                config_name=job.get("config_name", ""),
+                                status="auto_denied" if denial_detail else "pending",
+                                decision_reason=denial_detail or "",
                             )
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to create sudo request for {job_id}: {e}"
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to create sudo request for %s: %s",
+                                job_id,
+                                exc,
+                            )
+                            return {
+                                "request_id": None,
+                                "denial_detail": denial_detail,
+                                "error": str(exc),
+                            }
+                        return {
+                            "request_id": request_id,
+                            "denial_detail": denial_detail,
+                        }
+
+                    sudo_effect = await _run_completion_effect(
+                        _effect_runner,
+                        "sudo_approval_request",
+                        "sudo_request",
+                        _create_sudo_approval_request,
+                        retry_if=lambda output: bool(output.get("error")),
+                    )
+                    sudo_request_id = sudo_effect["request_id"]
+                    denial_detail = sudo_effect["denial_detail"]
+                    if sudo_request_id:
+                        actions.append(
+                            f"sudo request created ({sudo_request_id[:8]})"
+                            + (" [auto-denied]" if denial_detail else "")
                         )
 
                     if denial_detail:
-                        try:
-                            await _resume_job_without_vm_internal(
-                                job_id,
-                                decided_by="system",
-                                reason=denial_detail,
-                                denied=True,
-                            )
-                            auto_denied = True
+
+                        async def _auto_deny_vm_upgrade() -> dict[str, Any]:
+                            try:
+                                await _resume_job_without_vm_internal(
+                                    job_id,
+                                    decided_by="system",
+                                    reason=denial_detail,
+                                    denied=True,
+                                )
+                            except Exception as exc:
+                                # Preserve the legacy fallback to manual review.
+                                logger.exception(
+                                    "Auto-deny resume failed for %s; leaving the "
+                                    "job paused for a manual decision",
+                                    job_id,
+                                )
+                                return {"auto_denied": False, "error": str(exc)}
+                            return {"auto_denied": True}
+
+                        auto_deny_effect = await _run_completion_effect(
+                            _effect_runner,
+                            "auto_deny_resume",
+                            "auto_deny_resume",
+                            _auto_deny_vm_upgrade,
+                            retry_if=lambda output: bool(output.get("error")),
+                        )
+                        auto_denied = bool(auto_deny_effect["auto_denied"])
+                        if auto_denied:
                             actions.append(
                                 "vm upgrade auto-denied — job continues on its "
                                 "original tier"
-                            )
-                        except Exception:
-                            # Fall back to the normal operator flow: the job
-                            # stays paused with freeze_data and the (auto-denied)
-                            # request can be re-driven via the deny endpoint.
-                            logger.exception(
-                                f"Auto-deny resume failed for {job_id}; leaving "
-                                "the job paused for a manual decision"
                             )
 
                 if not auto_denied:
@@ -19948,64 +21030,195 @@ async def _complete_job_legacy(
                         # Durable capture while the workspace is certainly
                         # alive — the job now parks on a 24h human decision and
                         # the workspace only stays warm for the reap grace.
-                        asyncio.create_task(
-                            _capture_workspace_snapshot_for_freeze(job, job_id),
-                            name=f"freeze-capture-{job_id[:8]}",
+                        async def _schedule_freeze_snapshot() -> dict[str, Any]:
+                            if _effect_runner is None:
+                                # Historical latency contract while the durable
+                                # path is dark: schedule and return immediately.
+                                asyncio.create_task(
+                                    _capture_workspace_snapshot_for_freeze(job, job_id),
+                                    name=f"freeze-capture-{job_id[:8]}",
+                                )
+                            else:
+                                # A durable effect cannot mark "scheduled" as
+                                # done: an orchestrator crash would lose the
+                                # detached task permanently. Class D may lag,
+                                # but it remains at-least-once, so the flagged
+                                # finalizer awaits the capture attempt before
+                                # committing its marker.
+                                captured = await _capture_workspace_snapshot_for_freeze(
+                                    job, job_id
+                                )
+                                return {"scheduled": True, "captured": captured}
+                            return {"scheduled": True}
+
+                        await _run_completion_effect(
+                            _effect_runner,
+                            "freeze_workspace_snapshot",
+                            "workspace_snapshot",
+                            _schedule_freeze_snapshot,
+                            retry_if=lambda output: output.get("captured") is False,
                         )
-                    try:
-                        await _notify_operator_freeze(
-                            job,
-                            job_id,
-                            ft,
-                            fd,
-                            sudo_request_id=sudo_request_id,
-                        )
+
+                    async def _send_freeze_notification() -> dict[str, Any]:
+                        try:
+                            await _notify_operator_freeze(
+                                job,
+                                job_id,
+                                ft,
+                                fd,
+                                sudo_request_id=sudo_request_id,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to send freeze notification for %s: %s",
+                                job_id,
+                                exc,
+                            )
+                            return {"sent": False, "error": str(exc)}
+                        return {"sent": True}
+
+                    freeze_notification = await _run_completion_effect(
+                        _effect_runner,
+                        "freeze_notification",
+                        "freeze_notification",
+                        _send_freeze_notification,
+                        retry_if=lambda output: bool(output.get("error")),
+                    )
+                    if freeze_notification["sent"]:
                         actions.append(f"notification sent ({ft})")
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to send freeze notification for {job_id}: {e}"
-                        )
 
         # 2. Subjob output graft (uniform for all subjob types; critic skipped inside)
         if job.get("parent_job_id"):
-            graft_result = await _maybe_graft_completed_subjob(job)
+
+            async def _graft_subjob_output() -> dict[str, Any]:
+                graft = await _maybe_graft_completed_subjob(
+                    job,
+                    completion_command_id=getattr(_effect_runner, "command_id", None),
+                )
+                return {"graft_result": graft}
+
+            graft_effect = await _run_completion_effect(
+                _effect_runner,
+                "subjob_output_graft",
+                "subjob_graft",
+                _graft_subjob_output,
+                retry_on_error=True,
+                error_output=lambda exc: {
+                    "graft_result": {
+                        "status": "error",
+                        "reason": str(exc),
+                    }
+                },
+            )
+            graft_result = graft_effect["graft_result"]
             if graft_result and graft_result.get("status") == "grafted":
                 actions.append(
                     f"subjob output grafted to {graft_result['output_path']}"
                 )
 
         # 3. Handle critic verdict (if this is a critic job)
-        try:
-            await _handle_critic_verdict_on_complete(job, actions)
-        except Exception as e:
-            logger.error(
-                f"Error handling critic verdict for {job_id}: {e}", exc_info=True
-            )
+        async def _apply_critic_verdict() -> dict[str, Any]:
+            effect_actions: list[str] = []
+            try:
+                await _handle_critic_verdict_on_complete(job, effect_actions)
+            except Exception as exc:
+                logger.error(
+                    f"Error handling critic verdict for {job_id}: {exc}",
+                    exc_info=True,
+                )
+                return {"actions": effect_actions, "error": str(exc)}
+            return {"actions": effect_actions}
+
+        critic_verdict = await _run_completion_effect(
+            _effect_runner,
+            "critic_verdict",
+            "critic_verdict",
+            _apply_critic_verdict,
+            retry_if=lambda output: bool(output.get("error")),
+        )
+        actions.extend(critic_verdict["actions"])
 
         # 3b. Handle scholar completion (unblock parent job)
-        try:
-            await _handle_scholar_completion(job, actions)
-        except Exception as e:
-            logger.error(
-                f"Error handling scholar completion for {job_id}: {e}", exc_info=True
-            )
+        async def _unblock_scholar_parent() -> dict[str, Any]:
+            effect_actions: list[str] = []
+            try:
+                await _handle_scholar_completion(job, effect_actions)
+            except Exception as exc:
+                logger.error(
+                    f"Error handling scholar completion for {job_id}: {exc}",
+                    exc_info=True,
+                )
+                return {"actions": effect_actions, "error": str(exc)}
+            return {"actions": effect_actions}
+
+        scholar_unblock = await _run_completion_effect(
+            _effect_runner,
+            "scholar_parent_unblock",
+            "scholar_unblock",
+            _unblock_scholar_parent,
+            retry_if=lambda output: bool(output.get("error")),
+            retry_on_error=True,
+            error_output=lambda exc: {"actions": [], "error": str(exc)},
+            depends_on_groups=("subjob_graft",),
+        )
+        actions.extend(scholar_unblock["actions"])
 
         # 3c. Handle delegation child completion (resume parent when all siblings done)
-        try:
-            await _handle_delegation_child_completion(job, actions)
-        except Exception as e:
-            logger.error(
-                f"Error handling delegation child completion for {job_id}: {e}",
-                exc_info=True,
-            )
+        async def _unblock_delegation_parent() -> dict[str, Any]:
+            effect_actions: list[str] = []
+            try:
+                await _handle_delegation_child_completion(job, effect_actions)
+            except Exception as exc:
+                logger.error(
+                    f"Error handling delegation child completion for {job_id}: {exc}",
+                    exc_info=True,
+                )
+                return {"actions": effect_actions, "error": str(exc)}
+            return {"actions": effect_actions}
+
+        delegation_unblock = await _run_completion_effect(
+            _effect_runner,
+            "delegation_parent_unblock",
+            "delegation_unblock",
+            _unblock_delegation_parent,
+            retry_if=lambda output: bool(output.get("error")),
+            retry_on_error=True,
+            error_output=lambda exc: {"actions": [], "error": str(exc)},
+            depends_on_groups=("subjob_graft",),
+        )
+        actions.extend(delegation_unblock["actions"])
 
         # 4. Trigger verification (if this is a main job that completed)
-        try:
-            await _trigger_verification_on_complete(job, result, actions)
-        except Exception as e:
-            logger.error(
-                f"Error triggering verification for {job_id}: {e}", exc_info=True
-            )
+        async def _spawn_verification_critic() -> dict[str, Any]:
+            effect_actions: list[str] = []
+            try:
+                durable_verification_kwargs = (
+                    {"reconcile_existing_critic": True}
+                    if _effect_runner is not None
+                    else {}
+                )
+                await _trigger_verification_on_complete(
+                    job,
+                    result,
+                    effect_actions,
+                    **durable_verification_kwargs,
+                )
+            except Exception as exc:
+                logger.error(
+                    f"Error triggering verification for {job_id}: {exc}",
+                    exc_info=True,
+                )
+                return {"actions": effect_actions, "error": str(exc)}
+            return {"actions": effect_actions}
+
+        verification_spawn = await _run_completion_effect(
+            _effect_runner,
+            "verification_critic_spawn",
+            "verification",
+            _spawn_verification_critic,
+            retry_if=lambda output: bool(output.get("error")),
+        )
+        actions.extend(verification_spawn["actions"])
 
         # 5. Curation final pass (if no verification but curation enabled, and goal achieved)
         if (
@@ -20014,13 +21227,36 @@ async def _complete_job_legacy(
             and result.get("should_stop")
             and result.get("goal_achieved")
         ):
-            try:
-                await _trigger_curation_final_pass(job_id, job)
+
+            async def _start_curation_final_pass() -> dict[str, Any]:
+                try:
+                    curation_kwargs = (
+                        {"completion_command_id": _effect_runner.command_id}
+                        if _effect_runner is not None
+                        else {}
+                    )
+                    await _trigger_curation_final_pass(
+                        job_id,
+                        job,
+                        **curation_kwargs,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"Error triggering curation for {job_id}: {exc}",
+                        exc_info=True,
+                    )
+                    return {"triggered": False, "error": str(exc)}
+                return {"triggered": True}
+
+            curation_pass = await _run_completion_effect(
+                _effect_runner,
+                "curation_final_pass",
+                "curation",
+                _start_curation_final_pass,
+                retry_if=lambda output: bool(output.get("error")),
+            )
+            if curation_pass["triggered"]:
                 actions.append("curation final pass triggered (no verification)")
-            except Exception as e:
-                logger.error(
-                    f"Error triggering curation for {job_id}: {e}", exc_info=True
-                )
 
         # 5d. Advance project self-improvement loop (if this job belongs to one).
         # Loop jobs run bare, so this is the only completion hook that fires for
@@ -20029,13 +21265,27 @@ async def _complete_job_legacy(
         # memory_unavailable bounded-retry) is re-dispatched as the SAME job, so
         # the loop must keep waiting on it rather than rotate to the next role.
         # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
-        try:
-            if job.get("status") in ("completed", "failed", "cancelled"):
-                await _advance_project_loop(job, result, actions)
-        except Exception as e:
-            logger.error(
-                f"Error advancing project loop for {job_id}: {e}", exc_info=True
-            )
+        async def _advance_completion_project_loop() -> dict[str, Any]:
+            effect_actions: list[str] = []
+            try:
+                if job.get("status") in ("completed", "failed", "cancelled"):
+                    await _advance_project_loop(job, result, effect_actions)
+            except Exception as exc:
+                logger.error(
+                    f"Error advancing project loop for {job_id}: {exc}",
+                    exc_info=True,
+                )
+                return {"actions": effect_actions, "error": str(exc)}
+            return {"actions": effect_actions}
+
+        loop_advance = await _run_completion_effect(
+            _effect_runner,
+            "project_loop_advance",
+            "project_loop",
+            _advance_completion_project_loop,
+            retry_if=lambda output: bool(output.get("error")),
+        )
+        actions.extend(loop_advance["actions"])
 
         # 5d2. Structured terminal history (project_jobs_repo_retirement.md).
         # New jobs write one database record; no history file is committed into
@@ -20046,23 +21296,49 @@ async def _complete_job_legacy(
         # already attached to a shared project repo before this migration.
         # Best-effort: a failure here never blocks completion handling.
         if new_status in ("completed", "failed"):
-            try:
-                from services.completion import apply_terminal_job_side_effects
 
-                side_effects = await apply_terminal_job_side_effects(
-                    job,
-                    new_status,
-                    gitea=gitea_client,
-                    db=postgres_db,
-                    vector_db=vector_db,
-                    error=error_message,
-                )
-                actions.extend(side_effects["actions"])
-            except Exception:
-                logger.warning(
-                    f"Job {job_id}: terminal side effects failed (non-fatal)",
-                    exc_info=True,
-                )
+            async def _apply_terminal_merge_and_record() -> dict[str, Any]:
+                try:
+                    from services.completion import apply_terminal_job_side_effects
+
+                    durable_merge_kwargs: dict[str, Any] = {}
+                    if _effect_runner is not None:
+                        durable_merge_kwargs = {
+                            "completion_command_id": _effect_runner.command_id,
+                            "load_merge_intent": lambda: _effect_runner.capture_intent(
+                                "terminal_merge_change_record"
+                            ),
+                            "store_merge_intent": lambda detail: (
+                                _effect_runner.capture_intent(
+                                    "terminal_merge_change_record", detail
+                                )
+                            ),
+                        }
+                    side_effects = await apply_terminal_job_side_effects(
+                        job,
+                        new_status,
+                        gitea=gitea_client,
+                        db=postgres_db,
+                        vector_db=vector_db,
+                        error=error_message,
+                        **durable_merge_kwargs,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"Job {job_id}: terminal side effects failed (non-fatal)",
+                        exc_info=True,
+                    )
+                    return {"actions": [], "error": str(exc)}
+                return {"actions": list(side_effects["actions"])}
+
+            terminal_effects = await _run_completion_effect(
+                _effect_runner,
+                "terminal_merge_change_record",
+                "terminal_delivery",
+                _apply_terminal_merge_and_record,
+                retry_if=lambda output: bool(output.get("error")),
+            )
+            actions.extend(terminal_effects["actions"])
 
         # 5e. Wake the session that created this job, if any. Must sit BEFORE
         # the workspace archive below: that call tears the workspace down, and
@@ -20078,29 +21354,224 @@ async def _complete_job_legacy(
         # by the sweeper, which reads the row's real status.
         # docs/features/session_wake_on_job_completion.md
         if new_status:
-            await maybe_wake_session(postgres_db, job_id, new_status)
+
+            async def _enqueue_session_wake() -> dict[str, Any]:
+                await maybe_wake_session(postgres_db, job_id, new_status)
+                return {"enqueued": True}
+
+            await _run_completion_effect(
+                _effect_runner,
+                "session_wake_enqueue",
+                "session_wake_enqueue",
+                _enqueue_session_wake,
+                retry_on_error=True,
+                error_output=lambda exc: {
+                    "enqueued": False,
+                    "error": str(exc),
+                },
+            )
 
         # 6. Trigger dispatch (freed agent can pick up queued work)
-        _trigger_dispatch()
+        async def _kick_dispatch() -> dict[str, Any]:
+            _trigger_dispatch()
+            return {"triggered": True}
+
+        await _run_completion_effect(
+            _effect_runner,
+            "dispatch_trigger",
+            "dispatch",
+            _kick_dispatch,
+        )
 
         # 7. Archive workspace (snapshot to S3) and clean up VM/container
         if job.get("status") in ("completed", "failed"):
-            try:
-                cleanup_actions = await _archive_and_cleanup_workspace(job_id)
-                actions.extend(cleanup_actions)
-            except Exception as e:
-                logger.warning(
-                    "Workspace cleanup failed for job %s (non-blocking): %s",
-                    job_id,
-                    e,
+            initial_workspace_context = _get_container_context(job)
+            initial_vm_context = _get_vm_context(job)
+            durable_kubernetes_teardown = bool(
+                _effect_runner is not None
+                and (
+                    await _effect_runner.has_started("workspace_archive_teardown")
+                    or (
+                        initial_workspace_context.get("provisioner") != "docker"
+                        and not initial_vm_context
+                    )
                 )
-                actions.append(f"workspace cleanup failed: {e}")
+            )
+            teardown_runner = _effect_runner if durable_kubernetes_teardown else None
+
+            async def _archive_and_teardown_workspace() -> dict[str, Any]:
+                try:
+                    use_uid_fenced_kubernetes_teardown = False
+                    teardown_intent: dict[str, Any] | None = None
+                    if teardown_runner is not None:
+                        teardown_intent = await teardown_runner.capture_intent(
+                            "workspace_archive_teardown"
+                        )
+                        use_uid_fenced_kubernetes_teardown = bool(
+                            teardown_intent is not None
+                            and teardown_intent.get("kind") == "kubernetes"
+                        )
+                        teardown_job = await postgres_db.get_job(job_id)
+                        if (
+                            not use_uid_fenced_kubernetes_teardown
+                            and teardown_job is not None
+                        ):
+                            workspace_context = _get_container_context(teardown_job)
+                            vm_context = _get_vm_context(teardown_job)
+                            workspace_is_active = bool(workspace_context) and (
+                                workspace_context.get("status")
+                                not in ("deleted", "deleting", "released", None)
+                            )
+                            vm_is_active = bool(vm_context) and (
+                                vm_context.get("status") not in ("deleted", "deleting")
+                            )
+                            use_uid_fenced_kubernetes_teardown = (
+                                workspace_is_active
+                                and workspace_context.get("provisioner") != "docker"
+                                and not vm_is_active
+                            )
+
+                    if use_uid_fenced_kubernetes_teardown:
+                        owner = WorkspaceOwner.job(job_id)
+                        intent = teardown_intent
+                        if intent is None:
+                            captured = await container_provisioner.capture_terminal_workspace_identity(
+                                owner
+                            )
+                            intent = await teardown_runner.capture_intent(
+                                "workspace_archive_teardown",
+                                {
+                                    "kind": "kubernetes",
+                                    "pod_uid": captured.pod_uid,
+                                    "pvc_uid": captured.pvc_uid,
+                                    "service_uid": captured.service_uid,
+                                    "pod_ip": captured.pod_ip,
+                                    "ssh_host_key_fingerprint": (
+                                        captured.ssh_host_key_fingerprint
+                                    ),
+                                    "ssh_port": captured.ssh_port,
+                                    "snapshot_generation": (teardown_runner.command_id),
+                                    "snapshot_created_at": (
+                                        datetime.now(timezone.utc).isoformat()
+                                    ),
+                                },
+                            )
+
+                        if intent is None or intent.get("kind") != "kubernetes":
+                            raise RuntimeError(
+                                "workspace teardown intent is missing Kubernetes identity"
+                            )
+                        pod_uid = intent.get("pod_uid")
+                        pvc_uid = intent.get("pvc_uid")
+                        service_uid = intent.get("service_uid")
+                        pod_ip = intent.get("pod_ip")
+                        host_key = intent.get("ssh_host_key_fingerprint")
+                        ssh_port = intent.get("ssh_port")
+                        snapshot_generation = intent.get("snapshot_generation")
+                        snapshot_created_at = intent.get("snapshot_created_at")
+                        if not isinstance(pod_uid, str) or not pod_uid:
+                            raise RuntimeError(
+                                "workspace teardown intent has invalid Pod UID"
+                            )
+                        if pvc_uid is not None and (
+                            not isinstance(pvc_uid, str) or not pvc_uid
+                        ):
+                            raise RuntimeError(
+                                "workspace teardown intent has invalid PVC UID"
+                            )
+                        if service_uid is not None and (
+                            not isinstance(service_uid, str) or not service_uid
+                        ):
+                            raise RuntimeError(
+                                "workspace teardown intent has invalid Service UID"
+                            )
+                        if not isinstance(pod_ip, str) or not pod_ip:
+                            raise RuntimeError(
+                                "workspace teardown intent has invalid Pod IP"
+                            )
+                        if not isinstance(host_key, str) or not host_key:
+                            raise RuntimeError(
+                                "workspace teardown intent has invalid SSH host key"
+                            )
+                        if isinstance(ssh_port, bool) or not isinstance(ssh_port, int):
+                            raise RuntimeError(
+                                "workspace teardown intent has invalid SSH port"
+                            )
+                        if (
+                            snapshot_generation != teardown_runner.command_id
+                            or not isinstance(snapshot_created_at, str)
+                            or not snapshot_created_at
+                        ):
+                            raise RuntimeError(
+                                "workspace teardown intent has invalid snapshot identity"
+                            )
+                        teardown_identity = WorkspaceTeardownIdentity(
+                            pod_uid=pod_uid,
+                            pvc_uid=pvc_uid,
+                            service_uid=service_uid,
+                            pod_ip=pod_ip,
+                            ssh_host_key_fingerprint=host_key,
+                            ssh_port=ssh_port,
+                        )
+
+                        released = await container_provisioner.release_workspace(
+                            owner,
+                            teardown_identity=teardown_identity,
+                            require_snapshot=True,
+                            expected_runtime_incarnation=pod_uid,
+                            expected_host_key_fingerprint=host_key,
+                            strict_terminal_snapshot=True,
+                            terminal_snapshot_generation=snapshot_generation,
+                            terminal_snapshot_created_at=snapshot_created_at,
+                            strict=True,
+                        )
+                        if not released:
+                            raise RuntimeError(
+                                "UID-fenced Kubernetes workspace release was not confirmed"
+                            )
+                        cleanup_actions = ["k8s workspace released"]
+                    else:
+                        # Includes every default-off call plus the VM and Docker
+                        # lanes, whose established cleanup semantics are not in
+                        # Gate 3's Kubernetes-only S36 scope.
+                        cleanup_actions = await _archive_and_cleanup_workspace(job_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Workspace cleanup failed for job %s (non-blocking): %s",
+                        job_id,
+                        exc,
+                    )
+                    return {
+                        "actions": [f"workspace cleanup failed: {exc}"],
+                        "error": str(exc),
+                    }
+                return {"actions": list(cleanup_actions)}
+
+            workspace_cleanup = await _run_completion_effect(
+                teardown_runner,
+                "workspace_archive_teardown",
+                "workspace_teardown",
+                _archive_and_teardown_workspace,
+                retry_if=lambda output: bool(output.get("error")),
+                effect_timeout_seconds=890.0,
+                command_lease_seconds=900.0,
+            )
+            actions.extend(workspace_cleanup["actions"])
 
         # Fast path for the wake enqueued above. Every statement here
         # autocommits, so the terminal status is already durable; this only
         # skips the sweeper's tick. Fire-and-forget by design — losing it is
         # harmless because the claim, not this call, is the mechanism.
-        _kick_session_wake_drain(postgres_db)
+        async def _kick_wake_drain() -> dict[str, Any]:
+            _kick_session_wake_drain(postgres_db)
+            return {"triggered": True}
+
+        await _run_completion_effect(
+            _effect_runner,
+            "session_wake_drain_kick",
+            "session_wake_kick",
+            _kick_wake_drain,
+        )
 
         return {
             "status": "handled",

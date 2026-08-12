@@ -484,7 +484,13 @@ class TestVerificationTriggerGuards:
         from orchestrator import main
 
         create_job_mock = AsyncMock(return_value={"id": "critic-999"})
+        round_lookup_mock = AsyncMock()
         monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_verification_critic_for_round",
+            round_lookup_mock,
+        )
         monkeypatch.setattr(
             main.postgres_db,
             "has_live_verification_critic",
@@ -498,6 +504,83 @@ class TestVerificationTriggerGuards:
         await main._trigger_verification_on_complete(job, result, actions)
 
         create_job_mock.assert_not_awaited()
+        round_lookup_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_durable_replay_finishes_existing_critic_handoff(self, monkeypatch):
+        """A post-INSERT replay reuses the indexed critic and finishes S30."""
+        from orchestrator import main
+
+        critic_id = "11111111-2222-3333-4444-555555555555"
+        create_job_mock = AsyncMock()
+        round_lookup_mock = AsyncMock(
+            return_value={"id": critic_id, "config_name": "critic"}
+        )
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_verification_critic_for_round",
+            round_lookup_mock,
+        )
+        merge_context = AsyncMock(return_value=True)
+        monkeypatch.setattr(main.postgres_db, "merge_job_context", merge_context)
+
+        conn = AsyncMock()
+        conn.execute.return_value = "UPDATE 1"
+        acquired = MagicMock()
+        acquired.__aenter__ = AsyncMock(return_value=conn)
+        acquired.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            main.postgres_db, "acquire", MagicMock(return_value=acquired)
+        )
+
+        gitea = MagicMock()
+        gitea.is_initialized = True
+        gitea.create_branch = AsyncMock(return_value=True)
+        monkeypatch.setattr(main, "gitea_client", gitea)
+        trigger_dispatch = MagicMock()
+        monkeypatch.setattr(main, "_trigger_dispatch", trigger_dispatch)
+
+        job = self._passing_job(
+            context={
+                "git_remote_url": "http://gitea/job-aaaaaaaa.git",
+                "workspace_container": {"status": "ready"},
+            }
+        )
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(
+            job,
+            self._passing_result(),
+            actions,
+            reconcile_existing_critic=True,
+        )
+
+        create_job_mock.assert_not_awaited()
+        round_lookup_mock.assert_awaited_once_with(job["id"], 0)
+        gitea.create_branch.assert_awaited_once_with(
+            "job-aaaaaaaa",
+            "subjob/11111111/critic",
+            from_branch="main",
+        )
+        merge_context.assert_awaited_once_with(
+            critic_id,
+            {"git_remote_url": "http://gitea/job-aaaaaaaa.git"},
+        )
+        update_args = conn.execute.await_args.args
+        assert update_args[1:] == (
+            "subjob/11111111/critic",
+            "job-aaaaaaaa",
+            "/home/agent-host/workspace/worktrees/11111111-critic",
+            critic_id,
+        )
+        trigger_dispatch.assert_called_once_with()
+        assert actions == [f"critic job {critic_id} reconciled"]
 
     @pytest.mark.asyncio
     async def test_index_loser_skips_critic_side_effects(self, monkeypatch):

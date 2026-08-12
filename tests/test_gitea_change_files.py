@@ -16,6 +16,74 @@ from services import gitea as gitea_mod  # noqa: E402
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "misleading_body", "expected"),
+    [
+        (204, '{"message":"pull request has not been merged","status":404}', True),
+        (404, '{"merged":true,"message":"already merged"}', False),
+        (405, '{"merged":true}', None),
+    ],
+)
+async def test_probe_pr_merged_uses_status_code_never_body(
+    status_code, misleading_body, expected
+):
+    gc = gitea_mod.GiteaClient.__new__(gitea_mod.GiteaClient)
+    gc._initialized = True
+    gc._url = "http://gitea"
+    gc._user = "srw"
+
+    resp = MagicMock(status_code=status_code, text=misleading_body)
+    client = MagicMock()
+    client.get = AsyncMock(return_value=resp)
+    gc._get_client = MagicMock(return_value=client)
+
+    assert await gc.probe_pr_merged("project-jobs", 41) is expected
+    client.get.assert_awaited_once_with(
+        "http://gitea/api/v1/repos/srw/project-jobs/pulls/41/merge"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_pull_requests_requests_all_states_and_normalizes_refs():
+    gc = gitea_mod.GiteaClient.__new__(gitea_mod.GiteaClient)
+    gc._initialized = True
+    gc._url = "http://gitea"
+    gc._user = "srw"
+
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = [
+        {
+            "number": 12,
+            "title": "terminal marker",
+            "body": "trailers",
+            "state": "closed",
+            "head": {"ref": "job/abcdef12", "sha": "a" * 40},
+            "base": {"ref": "main", "sha": "b" * 40},
+        }
+    ]
+    client = MagicMock()
+    client.get = AsyncMock(return_value=resp)
+    gc._get_client = MagicMock(return_value=client)
+
+    pulls = await gc.list_pull_requests("project-jobs", state="all", page=3, limit=50)
+
+    client.get.assert_awaited_once_with(
+        "http://gitea/api/v1/repos/srw/project-jobs/pulls",
+        params={"state": "all", "page": 3, "limit": 50},
+    )
+    assert pulls == [
+        {
+            "number": 12,
+            "title": "terminal marker",
+            "body": "trailers",
+            "state": "closed",
+            "head": "job/abcdef12",
+            "base": "main",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_change_files_posts_batch_create_payload():
     gc = gitea_mod.GiteaClient.__new__(gitea_mod.GiteaClient)  # bypass __init__
     gc._initialized = True

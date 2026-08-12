@@ -26,13 +26,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from services.completion_effect_reconciliation import (
+    completion_pr_body,
+    completion_pr_title,
+)
 from services.project_loops import (
+    TerminalMergeReconciliationError,
     merge_loop_job_branch,
     merge_loop_job_contribution,
     write_loop_retro,
 )
 
 JOB_ID = uuid.UUID("abcdef12-3456-7890-abcd-ef1234567890")
+COMMAND_ID = "11111111-2222-4333-8444-555555555555"
 
 
 def _tree(paths) -> list[dict]:
@@ -67,6 +73,9 @@ def _make_gitea(
     )
     g.create_pr = AsyncMock(return_value=pr)
     g.merge_pr = AsyncMock(return_value=merge_ok)
+    g.probe_pr_merged = AsyncMock(return_value=None)
+    g.list_pull_requests = AsyncMock(side_effect=lambda *args, **kw: [])
+    g.get_commits = AsyncMock(side_effect=lambda *args, **kw: [])
     g.get_branch_head_sha = AsyncMock(return_value="c0ffee00" * 5)
     g.change_files = AsyncMock(return_value=change_ok)
     g.close_pr = AsyncMock(return_value=close_ok)
@@ -182,6 +191,254 @@ class TestMergeLoopJobBranch:
         status, _ = await merge_loop_job_branch(g, _job())
 
         assert status == "merge-failed"
+
+    @pytest.mark.asyncio
+    async def test_durable_merge_persists_pr_index_before_merge(self) -> None:
+        g = _make_gitea()
+        intent = None
+        events: list[str] = []
+
+        async def load():
+            return intent
+
+        async def store(detail):
+            nonlocal intent
+            events.append("intent")
+            intent = detail
+            return detail
+
+        async def merge(*args, **kwargs):
+            events.append("merge")
+            return True
+
+        g.merge_pr.side_effect = merge
+
+        result = await merge_loop_job_branch(
+            g,
+            _job(),
+            load_merge_intent=load,
+            store_merge_intent=store,
+            completion_command_id=COMMAND_ID,
+        )
+
+        assert result == ("merged", "c0ffee00" * 5)
+        assert events == ["intent", "merge"]
+        assert intent == {
+            "kind": "gitea_pr_merge",
+            "repo_name": "project-1a387b4d-jobs",
+            "head": "job/abcdef12",
+            "base": "main",
+            "pr_index": 7,
+        }
+
+    @pytest.mark.asyncio
+    async def test_crash_after_merge_replays_probe_without_second_merge(self) -> None:
+        g = _make_gitea()
+        intent = None
+
+        async def load():
+            return intent
+
+        async def store(detail):
+            nonlocal intent
+            intent = detail
+            return detail
+
+        g.merge_pr.side_effect = RuntimeError("process died after Gitea merged")
+        with pytest.raises(RuntimeError, match="process died"):
+            await merge_loop_job_branch(
+                g,
+                _job(),
+                load_merge_intent=load,
+                store_merge_intent=store,
+                completion_command_id=COMMAND_ID,
+            )
+
+        g.probe_pr_merged.return_value = True
+        result = await merge_loop_job_branch(
+            g,
+            _job(),
+            load_merge_intent=load,
+            store_merge_intent=store,
+            completion_command_id=COMMAND_ID,
+        )
+
+        assert result == ("merged", "c0ffee00" * 5)
+        g.probe_pr_merged.assert_awaited_once_with("project-1a387b4d-jobs", 7)
+        assert g.merge_pr.await_count == 1
+        assert g.create_pr.await_count == 1
+        # Reconciliation runs before the now-misleading branch comparison.
+        assert g.get_compare.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_crash_after_pr_create_before_intent_recovers_marker(self) -> None:
+        """A lost create response/store must adopt the exact PR, not create #2."""
+        g = _make_gitea()
+        pull_history: list[dict] = []
+        intent = None
+        crash_store = True
+
+        async def list_pulls(_repo, *, state, page, limit):
+            assert state == "all"
+            assert limit == 50
+            return list(pull_history) if page == 1 else []
+
+        async def create_pr(_repo, *, title, head, base, body):
+            pull_history.append(
+                {
+                    "number": 31,
+                    "title": title,
+                    "body": body,
+                    "state": "open",
+                    "head": head,
+                    "base": base,
+                }
+            )
+            return {"number": 31, "url": "http://g/pr/31", "state": "open"}
+
+        async def load():
+            return intent
+
+        async def store(detail):
+            nonlocal crash_store, intent
+            if crash_store:
+                crash_store = False
+                raise RuntimeError("killed after create before intent")
+            intent = detail
+            return detail
+
+        g.list_pull_requests.side_effect = list_pulls
+        g.create_pr.side_effect = create_pr
+        g.probe_pr_merged.return_value = False
+
+        with pytest.raises(RuntimeError, match="killed after create"):
+            await merge_loop_job_branch(
+                g,
+                _job(),
+                load_merge_intent=load,
+                store_merge_intent=store,
+                completion_command_id=COMMAND_ID,
+            )
+
+        result = await merge_loop_job_branch(
+            g,
+            _job(),
+            load_merge_intent=load,
+            store_merge_intent=store,
+            completion_command_id=COMMAND_ID,
+        )
+
+        assert result == ("merged", "c0ffee00" * 5)
+        assert g.create_pr.await_count == 1
+        assert g.get_compare.await_count == 1
+        g.merge_pr.assert_awaited_once_with(
+            "project-1a387b4d-jobs",
+            31,
+            merge_strategy="squash",
+            delete_branch_after_merge=False,
+        )
+        assert intent["pr_index"] == 31
+        assert f"SRW-Completion-Command: {COMMAND_ID}" in pull_history[0]["title"]
+        assert f"SRW-Completion-Command: {COMMAND_ID}" in pull_history[0]["body"]
+
+    @pytest.mark.asyncio
+    async def test_marker_on_wrong_head_is_ambiguous_not_adopted(self) -> None:
+        g = _make_gitea()
+        title = completion_pr_title(
+            "terminal",
+            command_id=COMMAND_ID,
+            effect_kind="s33-terminal-merge",
+        )
+        body = completion_pr_body(
+            "job: another",
+            command_id=COMMAND_ID,
+            effect_kind="s33-terminal-merge",
+        )
+
+        async def list_pulls(_repo, *, state, page, limit):
+            if page > 1:
+                return []
+            return [
+                {
+                    "number": 32,
+                    "title": title,
+                    "body": body,
+                    "state": "open",
+                    "head": "job/not-this-job",
+                    "base": "main",
+                }
+            ]
+
+        g.list_pull_requests.side_effect = list_pulls
+
+        with pytest.raises(
+            TerminalMergeReconciliationError, match="mismatched marker, head, base"
+        ):
+            await merge_loop_job_branch(
+                g,
+                _job(),
+                load_merge_intent=AsyncMock(return_value=None),
+                store_merge_intent=AsyncMock(),
+                completion_command_id=COMMAND_ID,
+            )
+
+        g.create_pr.assert_not_called()
+        g.get_compare.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_404_probe_retries_the_exact_persisted_pr(self) -> None:
+        g = _make_gitea()
+        g.probe_pr_merged.return_value = False
+        intent = {
+            "kind": "gitea_pr_merge",
+            "repo_name": "project-1a387b4d-jobs",
+            "head": "job/abcdef12",
+            "base": "main",
+            "pr_index": 19,
+        }
+
+        result = await merge_loop_job_branch(
+            g,
+            _job(),
+            load_merge_intent=AsyncMock(return_value=intent),
+            store_merge_intent=AsyncMock(),
+            completion_command_id=COMMAND_ID,
+        )
+
+        assert result == ("merged", "c0ffee00" * 5)
+        g.merge_pr.assert_awaited_once_with(
+            "project-1a387b4d-jobs",
+            19,
+            merge_strategy="squash",
+            delete_branch_after_merge=False,
+        )
+        g.create_pr.assert_not_called()
+        g.get_compare.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_probe_never_guesses_or_merges(self) -> None:
+        g = _make_gitea()
+        g.probe_pr_merged.return_value = None
+        intent = {
+            "kind": "gitea_pr_merge",
+            "repo_name": "project-1a387b4d-jobs",
+            "head": "job/abcdef12",
+            "base": "main",
+            "pr_index": 23,
+        }
+
+        with pytest.raises(TerminalMergeReconciliationError, match="ambiguous"):
+            await merge_loop_job_branch(
+                g,
+                _job(),
+                load_merge_intent=AsyncMock(return_value=intent),
+                store_merge_intent=AsyncMock(),
+                completion_command_id=COMMAND_ID,
+            )
+
+        g.merge_pr.assert_not_called()
+        g.create_pr.assert_not_called()
+        g.get_compare.assert_not_called()
 
 
 class TestWriteLoopRetro:
@@ -429,6 +686,133 @@ class TestMergeLoopJobContribution:
         assert sha == "c0ffee00" * 5
         g.merge_pr.assert_not_called()
         assert any("audit PR could not be created" in n for n in notes)
+
+    @pytest.mark.asyncio
+    async def test_durable_curated_commit_response_loss_probes_before_repeating(
+        self,
+    ) -> None:
+        """Crash after ChangeFiles lands: replay adopts its command trailer."""
+        g = _make_gitea(branch_files={"output/report.md": b"r"})
+        commit_history: list[dict] = []
+
+        async def list_commits(_repo, *, sha, page, limit):
+            assert sha == "main"
+            assert limit == 50
+            return list(commit_history) if page == 1 else []
+
+        async def commit_then_lose_response(_repo, branch, files, *, message):
+            assert branch == "main"
+            commit_history.append(
+                {"sha": "a" * 40, "message": message, "author": "srw"}
+            )
+            raise RuntimeError("connection lost after commit")
+
+        async def load():
+            return None
+
+        async def store(detail):
+            return detail
+
+        g.get_commits.side_effect = list_commits
+        g.change_files.side_effect = commit_then_lose_response
+
+        with pytest.raises(
+            TerminalMergeReconciliationError, match="response was ambiguous"
+        ):
+            await merge_loop_job_contribution(
+                g,
+                _contract_job("output/report.md"),
+                ctx=CTX,
+                load_merge_intent=load,
+                store_merge_intent=store,
+                completion_command_id=COMMAND_ID,
+            )
+
+        status, sha, _notes = await merge_loop_job_contribution(
+            g,
+            _contract_job("output/report.md"),
+            ctx=CTX,
+            load_merge_intent=load,
+            store_merge_intent=store,
+            completion_command_id=COMMAND_ID,
+        )
+
+        assert (status, sha) == ("curated", "a" * 40)
+        assert g.change_files.await_count == 1
+        assert g.merge_pr.await_count == 0
+        assert f"SRW-Completion-Command: {COMMAND_ID}" in commit_history[0]["message"]
+        assert (
+            "SRW-Completion-Effect: s33-curated-commit" in commit_history[0]["message"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_durable_audit_pr_create_crash_adopts_marker(self) -> None:
+        """The curated audit PR is singular across create-before-close replay."""
+        g = _make_gitea(branch_files={"output/report.md": b"r"})
+        commit_history: list[dict] = []
+        pull_history: list[dict] = []
+
+        async def list_commits(_repo, *, sha, page, limit):
+            return list(commit_history) if page == 1 else []
+
+        async def change_files(_repo, branch, files, *, message):
+            commit_history.append({"sha": "b" * 40, "message": message})
+            return True
+
+        async def list_pulls(_repo, *, state, page, limit):
+            return list(pull_history) if page == 1 else []
+
+        async def create_then_die(_repo, *, title, head, base, body):
+            pull_history.append(
+                {
+                    "number": 44,
+                    "title": title,
+                    "body": body,
+                    "state": "open",
+                    "head": head,
+                    "base": base,
+                }
+            )
+            raise RuntimeError("killed after audit PR create")
+
+        async def load():
+            return None
+
+        async def store(detail):
+            return detail
+
+        g.get_commits.side_effect = list_commits
+        g.change_files.side_effect = change_files
+        g.list_pull_requests.side_effect = list_pulls
+        g.create_pr.side_effect = create_then_die
+
+        with pytest.raises(
+            TerminalMergeReconciliationError, match="audit PR ceremony was interrupted"
+        ):
+            await merge_loop_job_contribution(
+                g,
+                _contract_job("output/report.md"),
+                ctx=CTX,
+                load_merge_intent=load,
+                store_merge_intent=store,
+                completion_command_id=COMMAND_ID,
+            )
+
+        result = await merge_loop_job_contribution(
+            g,
+            _contract_job("output/report.md"),
+            ctx=CTX,
+            load_merge_intent=load,
+            store_merge_intent=store,
+            completion_command_id=COMMAND_ID,
+        )
+
+        assert result[0:2] == ("curated", "b" * 40)
+        assert g.change_files.await_count == 1
+        assert g.create_pr.await_count == 1
+        g.close_pr.assert_awaited_once_with("project-1a387b4d-jobs", 44)
+        assert f"SRW-Completion-Command: {COMMAND_ID}" in pull_history[0]["title"]
+        assert "SRW-Completion-Effect: s33-curated-audit-pr" in pull_history[0]["body"]
 
     # -- structural guards keep the full-merge vocabulary -----------------
 

@@ -82,6 +82,24 @@ class WorkspaceRuntimeAttestation:
     port: int = 30022
 
 
+@dataclass(frozen=True)
+class WorkspaceTeardownIdentity:
+    """Immutable Kubernetes identities captured before terminal teardown.
+
+    A deterministic resource name is not authority: Kubernetes may recreate a
+    Pod, PVC, or Service with the same name after a finalizer crash.  S36 keeps
+    this fixed-cardinality record in the completion effect intent and every
+    destructive call later carries the corresponding UID precondition.
+    """
+
+    pod_uid: str | None
+    pvc_uid: str | None
+    service_uid: str | None
+    pod_ip: str | None = None
+    ssh_host_key_fingerprint: str | None = None
+    ssh_port: int = 30022
+
+
 def _canonical_runtime_uuid(value: Any, *, label: str) -> str:
     if isinstance(value, bool) or not isinstance(value, str):
         raise ValueError(f"{label} is invalid")
@@ -2102,6 +2120,7 @@ class ContainerProvisioner:
         *,
         expected_runtime_incarnation: str | None = None,
         wait_for_exact_absence: bool = False,
+        captured_teardown_uid: str | None = None,
     ) -> bool:
         """Delete the workspace container for a job or persistent thread.
 
@@ -2111,6 +2130,10 @@ class ContainerProvisioner:
         if not self._k8s_available:
             return False
         if wait_for_exact_absence and expected_runtime_incarnation is None:
+            return False
+        if captured_teardown_uid is not None and (
+            expected_runtime_incarnation != captured_teardown_uid
+        ):
             return False
 
         pod_name = owner.pod_name
@@ -2169,6 +2192,27 @@ class ContainerProvisioner:
                     owner.kind,
                     owner.id,
                 )
+            elif (
+                hasattr(e, "status")
+                and e.status == 409
+                and captured_teardown_uid is not None
+            ):
+                # The apiserver applied the UID precondition atomically. A
+                # conflict means the captured Pod is gone and a same-name
+                # replacement now owns the name; never mutate that replacement
+                # or its durable endpoint context.
+                logger.debug(
+                    "Captured workspace Pod already gone; preserving replacement: "
+                    "%s (%s %s)",
+                    pod_name,
+                    owner.kind,
+                    owner.id,
+                )
+                # The captured Pod is gone, but this grouped teardown must not
+                # interpret that as authority over the captured PVC/Service:
+                # the replacement may already be using those same objects.
+                # Returning False makes S36 preserve the entire resource set.
+                return False
             else:
                 logger.error(
                     "Failed to delete workspace container for %s %s: %s",
@@ -2220,6 +2264,7 @@ class ContainerProvisioner:
         owner: WorkspaceOwner,
         *,
         require_exact_owner: bool = False,
+        expected_uid: str | None = None,
     ) -> bool:
         """Reclaim the PVC backing a job or session workspace, if one exists.
 
@@ -2233,9 +2278,163 @@ class ContainerProvisioner:
         genuinely finished. An emptyDir workspace has no PVC, and a PVC already
         gone is a 404 — both are idempotent successes.
         """
-        return await self._delete_pvc(
-            _pvc_name_for(owner),
-            expected_owner=owner if require_exact_owner else None,
+        delete_kwargs: dict[str, Any] = {
+            "expected_owner": owner if require_exact_owner else None,
+        }
+        if expected_uid is not None:
+            delete_kwargs["expected_uid"] = expected_uid
+        return await self._delete_pvc(_pvc_name_for(owner), **delete_kwargs)
+
+    async def capture_workspace_teardown_identity(
+        self,
+        owner: WorkspaceOwner,
+    ) -> WorkspaceTeardownIdentity:
+        """Capture S36's exact Pod/PVC/Service identities without SSH.
+
+        A Pod 404 does not imply that its PVC and Service are gone. In that
+        case ``pod_uid`` is ``None`` and the residual deterministic resources
+        are captured independently under their full owner/spec authority. The
+        Pod name is re-read after those captures so a concurrent replacement
+        cannot donate its PVC or Service identity to this teardown intent.
+        Every ambiguous API failure raises rather than granting cleanup.
+        """
+
+        if not self._k8s_available:
+            raise WorkspaceRuntimeAuthorityError(
+                "Kubernetes workspace identity capture is unavailable"
+            )
+        pod_absent = False
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                pod_absent = True
+                pod_uid = None
+                pvc_name = _pvc_name_for(owner)
+            else:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod identity capture failed"
+                ) from exc
+        else:
+            pod_uid = self._require_workspace_pod_owner(
+                pod,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                allow_terminating=True,
+            )
+            pvc_name = self._workspace_pvc_name_from_pod(pod, owner=owner)
+
+        pvc_uid: str | None = None
+        if pvc_name is not None:
+            try:
+                claim = await asyncio.to_thread(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                )
+            except Exception as exc:
+                if not (pod_absent and getattr(exc, "status", None) == 404):
+                    raise WorkspaceRuntimeAuthorityError(
+                        "workspace PVC identity capture failed"
+                    ) from exc
+            else:
+                pvc_uid = self._require_stateless_pvc_identity(
+                    claim,
+                    owner=owner,
+                    pvc_name=pvc_name,
+                    allow_any_storage_class=True,
+                )
+
+        service_uid: str | None
+        try:
+            service = await asyncio.to_thread(
+                self._core_api.read_namespaced_service,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                service_uid = None
+            else:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Service identity capture failed"
+                ) from exc
+        else:
+            service_uid = self._require_stateless_service_identity(service, owner=owner)
+
+        if pod_absent:
+            # The first 404 and this final 404 bracket the residual captures.
+            # Any same-name Pod observed here may already consume those
+            # resources, so its appearance makes the whole capture ambiguous.
+            try:
+                await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+            except Exception as exc:
+                if getattr(exc, "status", None) != 404:
+                    raise WorkspaceRuntimeAuthorityError(
+                        "workspace Pod absence recheck failed"
+                    ) from exc
+            else:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod appeared during teardown identity capture"
+                )
+        else:
+            # Bracket the PVC/Service reads with the exact Pod UID. Without
+            # this second read, a same-name replacement could donate its
+            # freshly-created named resources to the old teardown intent.
+            try:
+                confirmed_pod = await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+                confirmed_uid = self._require_workspace_pod_owner(
+                    confirmed_pod,
+                    owner=owner,
+                    allow_owner_unlabeled=False,
+                    allow_terminating=True,
+                )
+            except Exception as exc:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod identity recheck failed"
+                ) from exc
+            if confirmed_uid != pod_uid:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod changed during teardown identity capture"
+                )
+
+        return WorkspaceTeardownIdentity(
+            pod_uid=pod_uid,
+            pvc_uid=pvc_uid,
+            service_uid=service_uid,
+        )
+
+    async def capture_terminal_workspace_identity(
+        self,
+        owner: WorkspaceOwner,
+    ) -> WorkspaceTeardownIdentity:
+        """Capture S36's UID tuple plus the exact SSH snapshot authority."""
+
+        attestation = await self.attest_workspace_runtime(owner)
+        identity = await self.capture_workspace_teardown_identity(owner)
+        if identity.pod_uid != attestation.runtime_incarnation:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod changed between SSH and teardown attestation"
+            )
+        return WorkspaceTeardownIdentity(
+            pod_uid=identity.pod_uid,
+            pvc_uid=identity.pvc_uid,
+            service_uid=identity.service_uid,
+            pod_ip=attestation.pod_ip,
+            ssh_host_key_fingerprint=attestation.ssh_host_key_fingerprint,
+            ssh_port=attestation.port,
         )
 
     async def release_workspace(
@@ -2249,7 +2448,10 @@ class ContainerProvisioner:
         on_snapshot_captured: Callable[[], Awaitable[bool]] | None = None,
         capture_snapshot: bool = True,
         strict_terminal_snapshot: bool = False,
+        terminal_snapshot_generation: str | None = None,
+        terminal_snapshot_created_at: str | None = None,
         strict: bool = False,
+        teardown_identity: WorkspaceTeardownIdentity | None = None,
     ) -> bool:
         """Snapshot a workspace to S3, then delete the pod (and, by default, its PVC).
 
@@ -2275,6 +2477,22 @@ class ContainerProvisioner:
         """
         if not self._k8s_available:
             return False
+
+        if teardown_identity is not None:
+            return await self._release_captured_workspace(
+                owner,
+                teardown_identity,
+                reclaim_volume=reclaim_volume,
+                require_snapshot=require_snapshot,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+                expected_host_key_fingerprint=expected_host_key_fingerprint,
+                on_snapshot_captured=on_snapshot_captured,
+                capture_snapshot=capture_snapshot,
+                strict_terminal_snapshot=strict_terminal_snapshot,
+                terminal_snapshot_generation=terminal_snapshot_generation,
+                terminal_snapshot_created_at=terminal_snapshot_created_at,
+                strict=strict,
+            )
 
         if expected_runtime_incarnation is not None:
             # Shell retirement and archive are two separate network effects.
@@ -2412,6 +2630,212 @@ class ContainerProvisioner:
         if strict:
             return bool(volume_deleted and service_deleted)
         return True
+
+    async def _release_captured_workspace(
+        self,
+        owner: WorkspaceOwner,
+        identity: WorkspaceTeardownIdentity,
+        *,
+        reclaim_volume: bool,
+        require_snapshot: bool,
+        expected_runtime_incarnation: str | None,
+        expected_host_key_fingerprint: str | None,
+        on_snapshot_captured: Callable[[], Awaitable[bool]] | None,
+        capture_snapshot: bool,
+        strict_terminal_snapshot: bool,
+        terminal_snapshot_generation: str | None,
+        terminal_snapshot_created_at: str | None,
+        strict: bool,
+    ) -> bool:
+        """Release only the Kubernetes objects captured in an S36 intent."""
+
+        if (
+            expected_runtime_incarnation is not None
+            and expected_runtime_incarnation != identity.pod_uid
+        ):
+            return False
+        if expected_host_key_fingerprint is not None and (
+            expected_host_key_fingerprint != identity.ssh_host_key_fingerprint
+        ):
+            return False
+
+        snapshot_captured = False
+        if require_snapshot:
+            if (
+                not strict_terminal_snapshot
+                or identity.pod_uid is None
+                or not identity.pod_ip
+                or not identity.ssh_host_key_fingerprint
+                or terminal_snapshot_generation is None
+                or terminal_snapshot_created_at is None
+                or not self._snapshot_service
+                or not self._snapshot_service.is_available
+            ):
+                return False
+            (
+                snapshot_captured,
+                _,
+            ) = await self._snapshot_service.reconcile_terminal_snapshot_generation(
+                owner.id,
+                terminal_generation=terminal_snapshot_generation,
+                entity_type=("threads" if owner.kind == "session" else "jobs"),
+                expected_runtime_incarnation=identity.pod_uid,
+                expected_host_key_fingerprint=(identity.ssh_host_key_fingerprint),
+            )
+        if identity.pod_uid is None:
+            if (
+                require_snapshot and not snapshot_captured
+            ) or not await self._captured_teardown_pod_is_absent(owner):
+                return False
+            authority = "exact_absent"
+        else:
+            authority = await self.workspace_pod_authority(
+                owner,
+                expected_runtime_incarnation=identity.pod_uid,
+            )
+            if authority == "unknown":
+                return False
+            if authority == "replacement":
+                # A same-name successor may legitimately reuse the captured
+                # PVC and Service.  Preserve the entire resource set; proving
+                # only that the old Pod UID is gone is not teardown authority
+                # over resources attached to its replacement.
+                return False
+
+            if authority == "exact_live":
+                status = await self.get_workspace_status(owner)
+                if (
+                    status is None
+                    or str(status.get("runtime_incarnation") or "") != identity.pod_uid
+                ):
+                    return False
+                pod_ip = status.get("pod_ip")
+                ready = status.get("ready")
+                if identity.pod_ip is not None and pod_ip != identity.pod_ip:
+                    return False
+                if (
+                    not snapshot_captured
+                    and capture_snapshot
+                    and self._snapshot_service
+                    and self._snapshot_service.is_available
+                    and pod_ip
+                    and ready
+                ):
+                    capture_kwargs: dict[str, Any] = {
+                        "job_id": owner.id,
+                        "ssh_host": identity.pod_ip or pod_ip,
+                        "ssh_port": identity.ssh_port,
+                        "source_type": "pod",
+                        "entity_type": (
+                            "threads" if owner.kind == "session" else "jobs"
+                        ),
+                        "expected_host_key_fingerprint": (
+                            identity.ssh_host_key_fingerprint
+                        ),
+                    }
+                    if strict_terminal_snapshot:
+                        capture_kwargs["strict_terminal"] = True
+                    if terminal_snapshot_generation is not None:
+                        capture_kwargs.update(
+                            {
+                                "terminal_generation": terminal_snapshot_generation,
+                                "terminal_created_at": terminal_snapshot_created_at,
+                                "expected_runtime_incarnation": identity.pod_uid,
+                            }
+                        )
+                    try:
+                        captured = bool(
+                            await self._snapshot_service.capture_vm_snapshot(
+                                **capture_kwargs
+                            )
+                        )
+                    except Exception:
+                        if require_snapshot:
+                            logger.exception(
+                                "Required captured workspace snapshot failed for %s %s",
+                                owner.kind,
+                                owner.id,
+                            )
+                            return False
+                        logger.exception(
+                            "Captured workspace snapshot failed for %s %s",
+                            owner.kind,
+                            owner.id,
+                        )
+                        captured = False
+                    if captured and on_snapshot_captured is not None:
+                        if not await on_snapshot_captured():
+                            return False
+                    if not captured and require_snapshot:
+                        return False
+                    snapshot_captured = snapshot_captured or captured
+                elif require_snapshot and not snapshot_captured:
+                    return False
+            elif require_snapshot and not snapshot_captured:
+                # A terminal/absent/replacement Pod can no longer produce the
+                # required final snapshot. Never call SSH through the stable name.
+                return False
+
+        if require_snapshot and not snapshot_captured:
+            return False
+
+        # Re-probe at the snapshot/delete handoff. Replacement and 404 prove
+        # the captured Pod is gone; neither permits deleting the current name.
+        if identity.pod_uid is None:
+            if not await self._captured_teardown_pod_is_absent(owner):
+                return False
+            authority = "exact_absent"
+        else:
+            authority = await self.workspace_pod_authority(
+                owner,
+                expected_runtime_incarnation=identity.pod_uid,
+            )
+            if authority in {"unknown", "replacement"}:
+                return False
+        pod_deleted = True
+        if authority in {"exact_live", "exact_terminal"}:
+            pod_deleted = await self.delete_workspace(
+                owner,
+                expected_runtime_incarnation=identity.pod_uid,
+                captured_teardown_uid=identity.pod_uid,
+                **({"wait_for_exact_absence": True} if strict else {}),
+            )
+        if not pod_deleted:
+            return False
+
+        volume_deleted = True
+        if reclaim_volume and identity.pvc_uid is not None:
+            volume_deleted = await self.delete_workspace_pvc(
+                owner,
+                require_exact_owner=True,
+                expected_uid=identity.pvc_uid,
+            )
+        service_deleted = True
+        if identity.service_uid is not None:
+            service_deleted = await self._delete_service(
+                owner,
+                require_exact_owner=True,
+                expected_uid=identity.service_uid,
+            )
+        if strict:
+            return bool(volume_deleted and service_deleted)
+        return True
+
+    async def _captured_teardown_pod_is_absent(
+        self,
+        owner: WorkspaceOwner,
+    ) -> bool:
+        """Re-prove a Pod-less S36 intent without adopting a same-name Pod."""
+
+        try:
+            await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            return getattr(exc, "status", None) == 404
+        return False
 
     async def release_absent_workspace(
         self,
@@ -3144,6 +3568,7 @@ class ContainerProvisioner:
         pvc_name: str,
         *,
         expected_owner: WorkspaceOwner | None = None,
+        expected_uid: str | None = None,
     ) -> bool:
         """Delete a PVC. Idempotent — 404 treated as success."""
         if not self._k8s_available:
@@ -3162,6 +3587,14 @@ class ContainerProvisioner:
                     owner=expected_owner,
                     pvc_name=pvc_name,
                 )
+                if expected_uid is not None and claim_uid != expected_uid:
+                    logger.info(
+                        "Captured workspace PVC %s is already gone; refusing "
+                        "same-name replacement UID %s",
+                        expected_uid,
+                        claim_uid,
+                    )
+                    return True
             except Exception as error:
                 if getattr(error, "status", None) == 404:
                     return True
@@ -3186,7 +3619,7 @@ class ContainerProvisioner:
             )
             if expected_owner is not None:
                 try:
-                    await asyncio.to_thread(
+                    current_claim = await asyncio.to_thread(
                         self._core_api.read_namespaced_persistent_volume_claim,
                         name=pvc_name,
                         namespace=self._namespace,
@@ -3195,11 +3628,24 @@ class ContainerProvisioner:
                     if getattr(error, "status", None) == 404:
                         logger.info("PVC deleted: %s", pvc_name)
                         return True
+                else:
+                    try:
+                        current_uid = self._require_stateless_pvc_identity(
+                            current_claim,
+                            owner=expected_owner,
+                            pvc_name=pvc_name,
+                        )
+                    except Exception:
+                        current_uid = None
+                    if expected_uid is not None and current_uid != expected_uid:
+                        return True
                 return False
             logger.info("PVC deleted: %s", pvc_name)
             return True
         except Exception as e:
-            if hasattr(e, "status") and e.status == 404:
+            if hasattr(e, "status") and e.status in (
+                {404, 409} if expected_uid is not None else {404}
+            ):
                 logger.debug("PVC already deleted: %s", pvc_name)
                 return True
             logger.error("Failed to delete PVC %s: %s", pvc_name, e)
@@ -3387,6 +3833,7 @@ class ContainerProvisioner:
         owner: WorkspaceOwner,
         *,
         require_exact_owner: bool = False,
+        expected_uid: str | None = None,
     ) -> bool:
         """Delete the workspace's headless Service. Idempotent — 404 = success."""
         if not self._k8s_available:
@@ -3403,6 +3850,14 @@ class ContainerProvisioner:
                 service_uid = self._require_stateless_service_identity(
                     service, owner=owner
                 )
+                if expected_uid is not None and service_uid != expected_uid:
+                    logger.info(
+                        "Captured workspace Service %s is already gone; refusing "
+                        "same-name replacement UID %s",
+                        expected_uid,
+                        service_uid,
+                    )
+                    return True
             except Exception as e:
                 if getattr(e, "status", None) == 404:
                     return True
@@ -3423,7 +3878,7 @@ class ContainerProvisioner:
             )
             if require_exact_owner:
                 try:
-                    await asyncio.to_thread(
+                    current_service = await asyncio.to_thread(
                         self._core_api.read_namespaced_service,
                         name=svc_name,
                         namespace=self._namespace,
@@ -3432,11 +3887,22 @@ class ContainerProvisioner:
                     if getattr(e, "status", None) == 404:
                         logger.info("Workspace Service deleted: %s", svc_name)
                         return True
+                else:
+                    try:
+                        current_uid = self._require_stateless_service_identity(
+                            current_service, owner=owner
+                        )
+                    except Exception:
+                        current_uid = None
+                    if expected_uid is not None and current_uid != expected_uid:
+                        return True
                 return False
             logger.info("Workspace Service deleted: %s", svc_name)
             return True
         except Exception as e:
-            if hasattr(e, "status") and e.status == 404:
+            if hasattr(e, "status") and e.status in (
+                {404, 409} if expected_uid is not None else {404}
+            ):
                 logger.debug("Workspace Service already deleted: %s", svc_name)
                 return True
             logger.error("Failed to delete workspace Service %s: %s", svc_name, e)

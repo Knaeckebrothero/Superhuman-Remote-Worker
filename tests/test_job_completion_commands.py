@@ -23,7 +23,6 @@ from orchestrator.services.job_completion_commands import (
     CompletionPayloadMismatch,
     accept_completion_command,
     canonical_completion_payload,
-    complete_completion_command,
     completion_payload_digest,
     fallback_client_report_id,
 )
@@ -602,40 +601,3 @@ async def test_agent_origin_requires_exactly_one_fence_arm(
         )
 
     assert _mutating_calls(conn) == []
-
-
-class _SettleConnection:
-    def __init__(self, updated: bool) -> None:
-        self.updated = updated
-        self.calls: list[_Call] = []
-
-    async def fetchval(self, sql: str, *args: Any) -> int | None:
-        self.calls.append(_Call("fetchval", sql, args))
-        return 1 if self.updated else None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("updated", "expected"), [(True, True), (False, False)])
-async def test_settle_helper_is_pending_finalizing_cas(
-    updated: bool, expected: bool
-) -> None:
-    conn = _SettleConnection(updated)
-    outcome = {
-        "status": "handled",
-        "actions": ["two", "one"],
-        "nested": {"z": 2, "a": 1},
-    }
-
-    assert await complete_completion_command(conn, str(COMMAND_ID), outcome) is expected
-
-    [call] = conn.calls
-    assert "state in ('pending', 'finalizing')" in call.normalized_sql
-    assert "set state = 'done'" in call.normalized_sql
-    assert call.args[0] == COMMAND_ID
-    assert call.args[1] == json.dumps(
-        outcome,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )

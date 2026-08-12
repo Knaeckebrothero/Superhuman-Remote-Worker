@@ -4471,6 +4471,528 @@ class TestWorkspaceNamedResourceAuthority:
             ),
         )
 
+    @pytest.mark.asyncio
+    async def test_s36_capture_records_exact_pod_pvc_and_service_uids(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
+
+        p = self._provisioner()
+        pvc_name = f"pvc-ws-thread-{self.OWNER.id[:12]}"
+        p._core_api.read_namespaced_pod.return_value = (
+            TestStrictStatelessWorkspaceCreation._pod(pvc_name=pvc_name)
+        )
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = (
+            TestStrictStatelessWorkspaceCreation._claim(p)
+        )
+        p._core_api.read_namespaced_service.return_value = self._service(p)
+
+        captured = await p.capture_workspace_teardown_identity(self.OWNER)
+
+        assert captured == WorkspaceTeardownIdentity(
+            pod_uid=self.POD_UID,
+            pvc_uid=self.RESOURCE_UID,
+            service_uid=self.RESOURCE_UID,
+        )
+        assert p._core_api.read_namespaced_pod.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_s36_terminal_capture_combines_uid_and_ssh_attestations(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAttestation,
+            WorkspaceTeardownIdentity,
+        )
+
+        p = self._provisioner()
+        fingerprint = "SHA256:" + ("A" * 43)
+        p.attest_workspace_runtime = AsyncMock(
+            return_value=WorkspaceRuntimeAttestation(
+                backing_id=f"k8s-pod:test:{self.POD_UID}",
+                workspace_generation=self.POD_UID,
+                runtime_incarnation=self.POD_UID,
+                ssh_host_key_fingerprint=fingerprint,
+                host="10.0.0.8",
+                pod_ip="10.0.0.8",
+            )
+        )
+        p.capture_workspace_teardown_identity = AsyncMock(
+            return_value=WorkspaceTeardownIdentity(
+                pod_uid=self.POD_UID,
+                pvc_uid=self.RESOURCE_UID,
+                service_uid=self.RESOURCE_UID,
+            )
+        )
+
+        captured = await p.capture_terminal_workspace_identity(self.OWNER)
+
+        assert captured == WorkspaceTeardownIdentity(
+            pod_uid=self.POD_UID,
+            pvc_uid=self.RESOURCE_UID,
+            service_uid=self.RESOURCE_UID,
+            pod_ip="10.0.0.8",
+            ssh_host_key_fingerprint=fingerprint,
+            ssh_port=30022,
+        )
+
+    @pytest.mark.asyncio
+    async def test_s36_capture_after_pod_404_records_residual_resource_uids(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
+
+        class _NotFound(Exception):
+            status = 404
+
+        p = self._provisioner()
+        p._core_api.read_namespaced_pod.side_effect = _NotFound()
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = (
+            TestStrictStatelessWorkspaceCreation._claim(p)
+        )
+        p._core_api.read_namespaced_service.return_value = self._service(p)
+
+        captured = await p.capture_workspace_teardown_identity(self.OWNER)
+
+        assert captured == WorkspaceTeardownIdentity(
+            pod_uid=None,
+            pvc_uid=self.RESOURCE_UID,
+            service_uid=self.RESOURCE_UID,
+        )
+        assert p._core_api.read_namespaced_pod.call_count == 2
+        assert (
+            p._core_api.read_namespaced_persistent_volume_claim.call_args.kwargs["name"]
+            == f"pvc-ws-thread-{self.OWNER.id[:12]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_s36_pod_404_capture_rejects_pod_appearing_during_residual_reads(
+        self,
+    ):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        class _NotFound(Exception):
+            status = 404
+
+        p = self._provisioner()
+        p._core_api.read_namespaced_pod.side_effect = [
+            _NotFound(),
+            TestStrictStatelessWorkspaceCreation._pod(),
+        ]
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = (
+            TestStrictStatelessWorkspaceCreation._claim(p)
+        )
+        p._core_api.read_namespaced_service.return_value = self._service(p)
+
+        with pytest.raises(WorkspaceRuntimeAuthorityError, match="appeared"):
+            await p.capture_workspace_teardown_identity(self.OWNER)
+
+    @pytest.mark.asyncio
+    async def test_s36_release_without_pod_uid_cleans_only_captured_residuals(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
+
+        p = self._provisioner()
+        p._captured_teardown_pod_is_absent = AsyncMock(return_value=True)
+        p.workspace_pod_authority = AsyncMock()
+        p.delete_workspace = AsyncMock()
+        p.delete_workspace_pvc = AsyncMock(return_value=True)
+        p._delete_service = AsyncMock(return_value=True)
+        identity = WorkspaceTeardownIdentity(
+            pod_uid=None,
+            pvc_uid=self.RESOURCE_UID,
+            service_uid=self.RESOURCE_UID,
+        )
+
+        assert await p.release_workspace(
+            self.OWNER,
+            teardown_identity=identity,
+            capture_snapshot=False,
+            strict=True,
+        )
+
+        assert p._captured_teardown_pod_is_absent.await_count == 2
+        p.workspace_pod_authority.assert_not_awaited()
+        p.delete_workspace.assert_not_awaited()
+        p.delete_workspace_pvc.assert_awaited_once_with(
+            self.OWNER,
+            require_exact_owner=True,
+            expected_uid=self.RESOURCE_UID,
+        )
+        p._delete_service.assert_awaited_once_with(
+            self.OWNER,
+            require_exact_owner=True,
+            expected_uid=self.RESOURCE_UID,
+        )
+
+    @pytest.mark.asyncio
+    async def test_s36_release_without_pod_uid_refuses_when_pod_name_reappears(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
+
+        p = self._provisioner()
+        p._captured_teardown_pod_is_absent = AsyncMock(return_value=False)
+        p.delete_workspace_pvc = AsyncMock()
+        p._delete_service = AsyncMock()
+
+        assert not await p.release_workspace(
+            self.OWNER,
+            teardown_identity=WorkspaceTeardownIdentity(
+                pod_uid=None,
+                pvc_uid=self.RESOURCE_UID,
+                service_uid=self.RESOURCE_UID,
+            ),
+            capture_snapshot=False,
+            strict=True,
+        )
+        p.delete_workspace_pvc.assert_not_awaited()
+        p._delete_service.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_s36_release_preserves_same_name_replacement_and_all_attached_resources(
+        self,
+    ):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
+
+        p = self._provisioner()
+        p._snapshot_service = MagicMock(is_available=True)
+        p._snapshot_service.capture_vm_snapshot = AsyncMock()
+        p.workspace_pod_authority = AsyncMock(
+            side_effect=["replacement", "replacement"]
+        )
+        p.delete_workspace = AsyncMock(return_value=True)
+        p.delete_workspace_pvc = AsyncMock(return_value=True)
+        p._delete_service = AsyncMock(return_value=True)
+        captured = WorkspaceTeardownIdentity(
+            pod_uid=self.POD_UID,
+            pvc_uid=self.RESOURCE_UID,
+            service_uid=self.RESOURCE_UID,
+        )
+
+        assert not await p.release_workspace(
+            self.OWNER,
+            teardown_identity=captured,
+            capture_snapshot=False,
+            strict=True,
+        )
+
+        p.delete_workspace.assert_not_awaited()
+        p._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        p.delete_workspace_pvc.assert_not_awaited()
+        p._delete_service.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_s36_release_aborts_all_deletes_when_replacement_appears_at_handoff(
+        self,
+    ):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
+
+        p = self._provisioner()
+        p._snapshot_service = MagicMock(is_available=False)
+        p.workspace_pod_authority = AsyncMock(side_effect=["exact_live", "replacement"])
+        p.get_workspace_status = AsyncMock(
+            return_value={
+                "runtime_incarnation": self.POD_UID,
+                "pod_ip": "10.0.0.2",
+                "ready": True,
+            }
+        )
+        p.delete_workspace = AsyncMock()
+        p.delete_workspace_pvc = AsyncMock()
+        p._delete_service = AsyncMock()
+
+        assert not await p.release_workspace(
+            self.OWNER,
+            teardown_identity=WorkspaceTeardownIdentity(
+                pod_uid=self.POD_UID,
+                pvc_uid=self.RESOURCE_UID,
+                service_uid=self.RESOURCE_UID,
+            ),
+            capture_snapshot=False,
+            strict=True,
+        )
+
+        p.delete_workspace.assert_not_awaited()
+        p.delete_workspace_pvc.assert_not_awaited()
+        p._delete_service.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_s36_release_preserves_residuals_when_pod_delete_finds_replacement(
+        self,
+    ):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
+
+        p = self._provisioner()
+        p._snapshot_service = MagicMock(is_available=False)
+        p.workspace_pod_authority = AsyncMock(
+            side_effect=["exact_live", "exact_terminal"]
+        )
+        p.get_workspace_status = AsyncMock(
+            return_value={
+                "runtime_incarnation": self.POD_UID,
+                "pod_ip": "10.0.0.2",
+                "ready": True,
+            }
+        )
+        p.delete_workspace = AsyncMock(return_value=False)
+        p.delete_workspace_pvc = AsyncMock()
+        p._delete_service = AsyncMock()
+
+        assert not await p.release_workspace(
+            self.OWNER,
+            teardown_identity=WorkspaceTeardownIdentity(
+                pod_uid=self.POD_UID,
+                pvc_uid=self.RESOURCE_UID,
+                service_uid=self.RESOURCE_UID,
+            ),
+            capture_snapshot=False,
+            strict=True,
+        )
+
+        p.delete_workspace.assert_awaited_once()
+        p.delete_workspace_pvc.assert_not_awaited()
+        p._delete_service.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_s36_strict_release_captures_command_keyed_terminal_snapshot(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
+
+        generation = "12345678-1234-4678-9abc-123456789abc"
+        created_at = "2026-08-13T01:02:03+00:00"
+        fingerprint = "SHA256:" + ("A" * 43)
+        p = self._provisioner()
+        p._snapshot_service = MagicMock(is_available=True)
+        p._snapshot_service.reconcile_terminal_snapshot_generation = AsyncMock(
+            return_value=(False, "missing")
+        )
+        p._snapshot_service.capture_vm_snapshot = AsyncMock(return_value=True)
+        p.workspace_pod_authority = AsyncMock(
+            side_effect=["exact_live", "exact_terminal"]
+        )
+        p.get_workspace_status = AsyncMock(
+            return_value={
+                "runtime_incarnation": self.POD_UID,
+                "pod_ip": "10.0.0.8",
+                "ready": True,
+            }
+        )
+        p.delete_workspace = AsyncMock(return_value=True)
+        p.delete_workspace_pvc = AsyncMock(return_value=True)
+        p._delete_service = AsyncMock(return_value=True)
+        identity = WorkspaceTeardownIdentity(
+            pod_uid=self.POD_UID,
+            pvc_uid=self.RESOURCE_UID,
+            service_uid=self.RESOURCE_UID,
+            pod_ip="10.0.0.8",
+            ssh_host_key_fingerprint=fingerprint,
+        )
+
+        assert await p.release_workspace(
+            self.OWNER,
+            teardown_identity=identity,
+            require_snapshot=True,
+            expected_runtime_incarnation=self.POD_UID,
+            expected_host_key_fingerprint=fingerprint,
+            strict_terminal_snapshot=True,
+            terminal_snapshot_generation=generation,
+            terminal_snapshot_created_at=created_at,
+            strict=True,
+        )
+
+        p._snapshot_service.capture_vm_snapshot.assert_awaited_once_with(
+            job_id=self.OWNER.id,
+            ssh_host="10.0.0.8",
+            ssh_port=30022,
+            source_type="pod",
+            entity_type="threads",
+            expected_host_key_fingerprint=fingerprint,
+            strict_terminal=True,
+            terminal_generation=generation,
+            terminal_created_at=created_at,
+            expected_runtime_incarnation=self.POD_UID,
+        )
+
+    @pytest.mark.asyncio
+    async def test_s36_replay_uses_proven_snapshot_after_pod_disappears(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
+
+        generation = "12345678-1234-4678-9abc-123456789abc"
+        fingerprint = "SHA256:" + ("A" * 43)
+        p = self._provisioner()
+        p._snapshot_service = MagicMock(is_available=True)
+        p._snapshot_service.reconcile_terminal_snapshot_generation = AsyncMock(
+            return_value=(True, "complete")
+        )
+        p._snapshot_service.capture_vm_snapshot = AsyncMock()
+        p.workspace_pod_authority = AsyncMock(
+            side_effect=["exact_absent", "exact_absent"]
+        )
+        p.delete_workspace = AsyncMock()
+        p.delete_workspace_pvc = AsyncMock(return_value=True)
+        p._delete_service = AsyncMock(return_value=True)
+        identity = WorkspaceTeardownIdentity(
+            pod_uid=self.POD_UID,
+            pvc_uid=self.RESOURCE_UID,
+            service_uid=self.RESOURCE_UID,
+            pod_ip="10.0.0.8",
+            ssh_host_key_fingerprint=fingerprint,
+        )
+
+        assert await p.release_workspace(
+            self.OWNER,
+            teardown_identity=identity,
+            require_snapshot=True,
+            expected_runtime_incarnation=self.POD_UID,
+            expected_host_key_fingerprint=fingerprint,
+            strict_terminal_snapshot=True,
+            terminal_snapshot_generation=generation,
+            terminal_snapshot_created_at="2026-08-13T01:02:03+00:00",
+            strict=True,
+        )
+
+        p._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        p.delete_workspace.assert_not_awaited()
+        p.delete_workspace_pvc.assert_awaited_once()
+        p._delete_service.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_s36_pvc_uid_mismatch_proves_old_object_gone_without_delete(self):
+        p = self._provisioner()
+        replacement_uid = "88888888-9999-4aaa-8bbb-cccccccccccc"
+        replacement = TestStrictStatelessWorkspaceCreation._claim(
+            p, uid=replacement_uid
+        )
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = replacement
+
+        assert await p.delete_workspace_pvc(
+            self.OWNER,
+            require_exact_owner=True,
+            expected_uid=self.RESOURCE_UID,
+        )
+        p._core_api.delete_namespaced_persistent_volume_claim.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_s36_pvc_uid_precondition_conflict_preserves_replacement(self):
+        class _Conflict(Exception):
+            status = 409
+
+        p = self._provisioner()
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = (
+            TestStrictStatelessWorkspaceCreation._claim(p)
+        )
+        p._core_api.delete_namespaced_persistent_volume_claim.side_effect = _Conflict()
+
+        assert await p.delete_workspace_pvc(
+            self.OWNER,
+            require_exact_owner=True,
+            expected_uid=self.RESOURCE_UID,
+        )
+        assert p._core_api.delete_namespaced_persistent_volume_claim.call_args.kwargs[
+            "body"
+        ] == {"preconditions": {"uid": self.RESOURCE_UID}}
+
+    @pytest.mark.asyncio
+    async def test_s36_service_uid_precondition_conflict_preserves_replacement(self):
+        class _Conflict(Exception):
+            status = 409
+
+        p = self._provisioner()
+        p._core_api.read_namespaced_service.return_value = self._service(p)
+        p._core_api.delete_namespaced_service.side_effect = _Conflict()
+
+        assert await p._delete_service(
+            self.OWNER,
+            require_exact_owner=True,
+            expected_uid=self.RESOURCE_UID,
+        )
+        assert p._core_api.delete_namespaced_service.call_args.kwargs["body"] == {
+            "preconditions": {"uid": self.RESOURCE_UID}
+        }
+
+    @pytest.mark.asyncio
+    async def test_s36_pod_uid_precondition_conflict_preserves_replacement(self):
+        class _Conflict(Exception):
+            status = 409
+
+        p = self._provisioner()
+        p._core_api.read_namespaced_pod.return_value = (
+            TestStrictStatelessWorkspaceCreation._pod()
+        )
+        p._core_api.delete_namespaced_pod.side_effect = _Conflict()
+        p._set_context = AsyncMock()
+
+        assert not await p.delete_workspace(
+            self.OWNER,
+            expected_runtime_incarnation=self.POD_UID,
+            wait_for_exact_absence=True,
+            captured_teardown_uid=self.POD_UID,
+        )
+        assert p._core_api.delete_namespaced_pod.call_args.kwargs["body"] == {
+            "preconditions": {"uid": self.POD_UID}
+        }
+        p._set_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_legacy_pod_delete_conflict_remains_a_failure(self):
+        class _Conflict(Exception):
+            status = 409
+
+        p = self._provisioner()
+        p._core_api.read_namespaced_pod.return_value = (
+            TestStrictStatelessWorkspaceCreation._pod()
+        )
+        p._core_api.delete_namespaced_pod.side_effect = _Conflict()
+        p._set_context = AsyncMock()
+
+        assert not await p.delete_workspace(
+            self.OWNER,
+            expected_runtime_incarnation=self.POD_UID,
+            wait_for_exact_absence=True,
+        )
+        p._set_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_legacy_pvc_delete_conflict_remains_a_failure(self):
+        class _Conflict(Exception):
+            status = 409
+
+        p = self._provisioner()
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = (
+            TestStrictStatelessWorkspaceCreation._claim(p)
+        )
+        p._core_api.delete_namespaced_persistent_volume_claim.side_effect = _Conflict()
+
+        assert not await p.delete_workspace_pvc(
+            self.OWNER,
+            require_exact_owner=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_service_delete_conflict_remains_a_failure(self):
+        class _Conflict(Exception):
+            status = 409
+
+        p = self._provisioner()
+        p._core_api.read_namespaced_service.return_value = self._service(p)
+        p._core_api.delete_namespaced_service.side_effect = _Conflict()
+
+        assert not await p._delete_service(
+            self.OWNER,
+            require_exact_owner=True,
+        )
+
     @pytest.mark.parametrize(
         "drift",
         [

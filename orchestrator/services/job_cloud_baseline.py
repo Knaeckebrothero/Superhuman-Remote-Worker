@@ -631,6 +631,7 @@ async def deliver_loop_diff_to_cloud(
     postgres_db: Any,
     gitea_client: Any,
     main_cloud_router: MainCloudRouter,
+    completion_command_id: str | None = None,
 ) -> dict[str, Any]:
     """Apply a loop job's isolated project-file diff to its cloud folder.
 
@@ -643,7 +644,9 @@ async def deliver_loop_diff_to_cloud(
     Returns ``{delivery_status, needs_review, delivery_sha, notes, ...}``.
     Stable delivery statuses are ``no-changes`` and ``cloud-applied``;
     review statuses name the reason (``cloud-conflict``, ``cloud-partial``,
-    ``cloud-unavailable``).
+    ``cloud-unavailable``). When ``completion_command_id`` is present, a
+    bounded command-owned apply intent closes the apply-before-final-stamp
+    crash window; omitting it preserves the legacy path exactly.
     """
     job_id = str(job.get("id"))
     existing_delivery = _job_context(job).get("loop_cloud_delivery") or {}
@@ -723,31 +726,62 @@ async def deliver_loop_diff_to_cloud(
     job["diff_status"] = "pending"
 
     scope_paths = {rel for _entry, rel in project_files}
-    try:
-        diverged = await detect_external_mods(
-            job=job,
-            project=project,
-            main_cloud_router=main_cloud_router,
-            scope_paths=scope_paths,
-            strict=True,
-        )
-    except Exception as e:
-        return {
-            "delivery_status": "cloud-unavailable",
-            "needs_review": True,
-            "delivery_sha": head,
-            "notes": [f"could not verify the live cloud baseline: {e}"],
-        }
-    if diverged:
-        return {
-            "delivery_status": "cloud-conflict",
-            "needs_review": True,
-            "delivery_sha": head,
-            "notes": [
-                f"cloud changed since baseline: {item['path']}" for item in diverged
-            ],
-            "diverged": diverged,
-        }
+    resume_own_apply = bool(
+        completion_command_id
+        and existing_delivery.get("delivery_status") == "cloud-applying"
+        and str(existing_delivery.get("completion_command_id") or "")
+        == completion_command_id
+        and str(existing_delivery.get("baseline_commit") or "") == str(baseline)
+        and str(existing_delivery.get("delivery_sha") or "") == head
+    )
+    if not resume_own_apply:
+        try:
+            diverged = await detect_external_mods(
+                job=job,
+                project=project,
+                main_cloud_router=main_cloud_router,
+                scope_paths=scope_paths,
+                strict=True,
+            )
+        except Exception as e:
+            return {
+                "delivery_status": "cloud-unavailable",
+                "needs_review": True,
+                "delivery_sha": head,
+                "notes": [f"could not verify the live cloud baseline: {e}"],
+            }
+        if diverged:
+            return {
+                "delivery_status": "cloud-conflict",
+                "needs_review": True,
+                "delivery_sha": head,
+                "notes": [
+                    f"cloud changed since baseline: {item['path']}" for item in diverged
+                ],
+                "diverged": diverged,
+            }
+
+        if completion_command_id:
+            # Register a bounded, command-owned intent only after the live
+            # divergence check is clean and before the first WebDAV mutation.
+            # A crash after any PUT/DELETE can then replay the same idempotent
+            # diff without mistaking those writes for somebody else's edit.
+            # Per-path inventory remains in the established cloud baseline and
+            # final loop_cloud_delivery context; never copy it into this stamp.
+            delivery_intent = {
+                "delivery_status": "cloud-applying",
+                "completion_command_id": completion_command_id,
+                "baseline_commit": str(baseline),
+                "delivery_sha": head,
+            }
+            intent_persisted = await postgres_db.merge_job_context(
+                job_id, {"loop_cloud_delivery": delivery_intent}
+            )
+            if not intent_persisted:
+                raise RuntimeError("could not persist loop cloud delivery intent")
+            context = dict(_job_context(job))
+            context["loop_cloud_delivery"] = delivery_intent
+            job["context"] = context
 
     applied = await apply_diff_to_cloud(
         job=job,

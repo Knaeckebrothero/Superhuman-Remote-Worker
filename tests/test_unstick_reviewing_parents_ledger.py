@@ -536,6 +536,40 @@ async def test_invalid_uuid_is_reported_live(db):
 
 
 @pytest.mark.asyncio
+async def test_critic_round_lookup_returns_only_the_exact_round(db):
+    target = uuid4()
+    round_zero_critic = uuid4()
+    round_one_critic = uuid4()
+    await _insert_job(db, job_id=target, status="reviewing")
+    await _insert_job(
+        db,
+        job_id=round_zero_critic,
+        status="processing",
+        parent_job_id=target,
+        context={
+            "verification_target": str(target),
+            "verification_round": 0,
+        },
+    )
+    await _insert_job(
+        db,
+        job_id=round_one_critic,
+        status="created",
+        parent_job_id=target,
+        context={
+            "verification_target": str(target),
+            "verification_round": 1,
+        },
+    )
+
+    found = await db.get_verification_critic_for_round(str(target), 1)
+
+    assert found is not None
+    assert str(found["id"]) == str(round_one_critic)
+    assert await db.get_verification_critic_for_round(str(target), 2) is None
+
+
+@pytest.mark.asyncio
 async def test_cas_does_not_touch_non_reviewing_targets(db):
     """The CAS (`WHERE p.status = 'reviewing'`) — a target already moved on
     (e.g. the verdict handler won the race and flipped it to something else)

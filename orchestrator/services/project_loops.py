@@ -21,6 +21,7 @@ import base64
 import json
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,9 +30,29 @@ from typing import Any
 # write a retro file into an agent-visible repository.
 from services.job_records import write_loop_retro as write_loop_retro
 
+from .completion_effect_reconciliation import (
+    CompletionEffectProbeError,
+    completion_commit_message,
+    completion_pr_body,
+    completion_pr_title,
+    probe_completion_commit,
+    probe_completion_pull_request,
+)
 from .datasource_policy import default_datasource_selection
 
 logger = logging.getLogger(__name__)
+
+
+TerminalMergeIntentReader = Callable[[], Awaitable[dict[str, Any] | None]]
+TerminalMergeIntentWriter = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+
+_S33_TERMINAL_PR_EFFECT = "s33-terminal-merge"
+_S33_CURATED_COMMIT_EFFECT = "s33-curated-commit"
+_S33_CURATED_AUDIT_PR_EFFECT = "s33-curated-audit-pr"
+
+
+class TerminalMergeReconciliationError(RuntimeError):
+    """A durable PR merge could not be reconciled without guessing."""
 
 
 # Every loop role gets an isolated job repository seeded from the project cloud
@@ -1099,7 +1120,12 @@ async def create_loop_job(
 
 
 async def merge_loop_job_branch(
-    gitea_client: Any, job: dict[str, Any]
+    gitea_client: Any,
+    job: dict[str, Any],
+    *,
+    load_merge_intent: TerminalMergeIntentReader | None = None,
+    store_merge_intent: TerminalMergeIntentWriter | None = None,
+    completion_command_id: str | None = None,
 ) -> tuple[str, str | None]:
     """Squash-merge a completed loop job's branch into ``main``.
 
@@ -1126,8 +1152,106 @@ async def merge_loop_job_branch(
     if not repo_name or not branch or branch == "main":
         return "skipped", None
 
+    durable = (
+        load_merge_intent is not None
+        or store_merge_intent is not None
+        or completion_command_id is not None
+    )
+    if (load_merge_intent is None) != (store_merge_intent is None):
+        raise ValueError(
+            "durable terminal merge requires both intent reader and writer"
+        )
+    if durable and (
+        load_merge_intent is None
+        or store_merge_intent is None
+        or completion_command_id is None
+    ):
+        raise ValueError(
+            "durable terminal merge requires intent callbacks and command id"
+        )
+
+    async def _finish_intent(intent: dict[str, Any]) -> tuple[str, str | None]:
+        pr_index = intent.get("pr_index")
+        valid = (
+            intent.get("kind") == "gitea_pr_merge"
+            and intent.get("repo_name") == repo_name
+            and intent.get("head") == branch
+            and intent.get("base") == "main"
+            and isinstance(pr_index, int)
+            and not isinstance(pr_index, bool)
+            and pr_index > 0
+        )
+        if not valid:
+            raise TerminalMergeReconciliationError(
+                "persisted terminal-merge intent does not match this job"
+            )
+
+        merged = await gitea_client.probe_pr_merged(repo_name, pr_index)
+        if merged is None:
+            raise TerminalMergeReconciliationError(
+                f"merge state for PR #{pr_index} is ambiguous"
+            )
+        if not merged:
+            merged = await gitea_client.merge_pr(
+                repo_name,
+                pr_index,
+                merge_strategy="squash",
+                delete_branch_after_merge=False,
+            )
+            if not merged:
+                raise TerminalMergeReconciliationError(
+                    f"merge of persisted PR #{pr_index} was refused"
+                )
+        sha = await gitea_client.get_branch_head_sha(repo_name, "main")
+        return "merged", sha
+
+    # Reconciliation MUST precede the compare.  After a successful squash or
+    # rebase merge the branch comparison can look empty or otherwise cannot
+    # identify the original commit.  The persisted PR number is the exact key.
+    if durable:
+        assert load_merge_intent is not None
+        prior_intent = await load_merge_intent()
+        if prior_intent is not None:
+            return await _finish_intent(prior_intent)
+
+        # ``create_pr`` is external and the response can be lost.  Search all
+        # PR states for the exact command marker before the compare or another
+        # create.  This is legal only in the durable finalizer arm, whose
+        # complete_by/lease discipline proves the predecessor is gone.
+        assert completion_command_id is not None
+        try:
+            prior_pr = await probe_completion_pull_request(
+                gitea_client,
+                repo_name=repo_name,
+                head=branch,
+                base="main",
+                command_id=completion_command_id,
+                effect_kind=_S33_TERMINAL_PR_EFFECT,
+            )
+        except CompletionEffectProbeError as exc:
+            raise TerminalMergeReconciliationError(str(exc)) from exc
+        if prior_pr is not None:
+            recovered_intent = {
+                "kind": "gitea_pr_merge",
+                "repo_name": repo_name,
+                "head": branch,
+                "base": "main",
+                "pr_index": prior_pr.pr_index,
+            }
+            assert store_merge_intent is not None
+            persisted = await store_merge_intent(recovered_intent)
+            if persisted != recovered_intent:
+                raise TerminalMergeReconciliationError(
+                    "persisted terminal-merge intent changed identity"
+                )
+            return await _finish_intent(recovered_intent)
+
     compare = await gitea_client.get_compare(repo_name, "main", branch)
     if compare is None:
+        if durable:
+            raise TerminalMergeReconciliationError(
+                "branch comparison failed before terminal PR creation"
+            )
         return "merge-failed", None
     if not compare.get("total_commits"):
         return "empty", None
@@ -1136,15 +1260,52 @@ async def merge_loop_job_branch(
     title = (job.get("description") or "").splitlines()[0].strip()[:200] or (
         f"Loop job {job_id[:8]}"
     )
+    body = f"job: {job_id}\nbranch: {branch}"
+    if durable:
+        assert completion_command_id is not None
+        title = completion_pr_title(
+            title,
+            command_id=completion_command_id,
+            effect_kind=_S33_TERMINAL_PR_EFFECT,
+        )
+        body = completion_pr_body(
+            body,
+            command_id=completion_command_id,
+            effect_kind=_S33_TERMINAL_PR_EFFECT,
+        )
     pr = await gitea_client.create_pr(
         repo_name,
         title=title,
         head=branch,
         base="main",
-        body=f"job: {job_id}\nbranch: {branch}",
+        body=body,
     )
     if not pr:
+        if durable:
+            raise TerminalMergeReconciliationError(
+                "terminal pull request could not be created"
+            )
         return "merge-failed", None
+
+    if durable:
+        pr_index = pr.get("number")
+        if not isinstance(pr_index, int) or isinstance(pr_index, bool) or pr_index <= 0:
+            raise TerminalMergeReconciliationError(
+                "terminal pull request has no usable numeric index"
+            )
+        intent = {
+            "kind": "gitea_pr_merge",
+            "repo_name": repo_name,
+            "head": branch,
+            "base": "main",
+            "pr_index": pr_index,
+        }
+        assert store_merge_intent is not None
+        persisted = await store_merge_intent(intent)
+        if persisted != intent:
+            raise TerminalMergeReconciliationError(
+                "persisted terminal-merge intent changed identity"
+            )
     merged = await gitea_client.merge_pr(
         repo_name,
         pr["number"],
@@ -1153,6 +1314,10 @@ async def merge_loop_job_branch(
         delete_branch_after_merge=False,
     )
     if not merged:
+        if durable:
+            raise TerminalMergeReconciliationError(
+                f"merge of persisted PR #{pr['number']} was refused"
+            )
         return "merge-failed", None
     sha = await gitea_client.get_branch_head_sha(repo_name, "main")
     return "merged", sha
@@ -1185,6 +1350,9 @@ async def merge_loop_job_contribution(
     job: dict[str, Any],
     *,
     ctx: dict[str, Any] | None = None,
+    load_merge_intent: TerminalMergeIntentReader | None = None,
+    store_merge_intent: TerminalMergeIntentWriter | None = None,
+    completion_command_id: str | None = None,
 ) -> tuple[str, str | None, list[str]]:
     """Land a completed loop job's contribution on ``main`` — curated when
     the job carries a file-deliverable contract, full squash-merge otherwise.
@@ -1219,9 +1387,50 @@ async def merge_loop_job_contribution(
     * Some missing → curate what exists, list the missing paths.
     """
     files_contract = contracted_file_deliverables(job)
+    durable = (
+        load_merge_intent is not None
+        or store_merge_intent is not None
+        or completion_command_id is not None
+    )
+    if (load_merge_intent is None) != (store_merge_intent is None):
+        raise ValueError(
+            "durable terminal merge requires both intent reader and writer"
+        )
+    if durable and (
+        load_merge_intent is None
+        or store_merge_intent is None
+        or completion_command_id is None
+    ):
+        raise ValueError(
+            "durable terminal merge requires intent callbacks and command id"
+        )
     if not files_contract:
-        status, sha = await merge_loop_job_branch(gitea_client, job)
+        status, sha = await merge_loop_job_branch(
+            gitea_client,
+            job,
+            load_merge_intent=load_merge_intent,
+            store_merge_intent=store_merge_intent,
+            completion_command_id=completion_command_id,
+        )
         return status, sha, []
+
+    # A prior curation attempt may already have entered its full-merge
+    # fallback and captured a PR.  That exact PR now owns the effect: resume
+    # it before reconsidering curation, otherwise a repaired read could land a
+    # curated commit while the already-created PR remains unresolved.
+    if load_merge_intent is not None and await load_merge_intent() is not None:
+        status, sha = await merge_loop_job_branch(
+            gitea_client,
+            job,
+            load_merge_intent=load_merge_intent,
+            store_merge_intent=store_merge_intent,
+            completion_command_id=completion_command_id,
+        )
+        return (
+            status,
+            sha,
+            ["resumed persisted full-merge fallback pull request"],
+        )
 
     # Structural guards — same vocabulary and same order as the full merge.
     repo_name = job.get("repo_name")
@@ -1230,6 +1439,10 @@ async def merge_loop_job_contribution(
         return "skipped", None, []
     compare = await gitea_client.get_compare(repo_name, "main", branch)
     if compare is None:
+        if load_merge_intent is not None:
+            raise TerminalMergeReconciliationError(
+                "branch comparison failed before terminal curation"
+            )
         return "merge-failed", None, []
     if not compare.get("total_commits"):
         return "empty", None, []
@@ -1245,7 +1458,20 @@ async def merge_loop_job_contribution(
             job_id[:8],
             reason,
         )
-        status, sha = await merge_loop_job_branch(gitea_client, job)
+        try:
+            status, sha = await merge_loop_job_branch(
+                gitea_client,
+                job,
+                load_merge_intent=load_merge_intent,
+                store_merge_intent=store_merge_intent,
+                completion_command_id=completion_command_id,
+            )
+        except Exception as exc:
+            if load_merge_intent is not None:
+                raise TerminalMergeReconciliationError(
+                    f"durable full-merge fallback did not complete: {exc}"
+                ) from exc
+            raise
         return (
             status,
             sha,
@@ -1309,18 +1535,50 @@ async def merge_loop_job_contribution(
                     "operation": "update" if path in main_paths else "create",
                 }
             )
+    except TerminalMergeReconciliationError:
+        raise
     except Exception as e:  # noqa: BLE001 — a curation bug must not lose work
         return await _fallback(f"unexpected curation error: {e!r}")
 
     message = f"curated merge: {role} ({job_id[:8]}) — {len(files)} deliverable(s)"
-    try:
-        committed = await gitea_client.change_files(
-            repo_name, "main", files, message=message
+    reconciled_sha: str | None = None
+    if durable:
+        assert completion_command_id is not None
+        message = completion_commit_message(
+            message,
+            command_id=completion_command_id,
+            effect_kind=_S33_CURATED_COMMIT_EFFECT,
         )
-    except Exception as e:  # noqa: BLE001
-        return await _fallback(f"curated commit raised: {e!r}")
-    if not committed:
-        return await _fallback("curated commit refused by change_files")
+        try:
+            prior_commit = await probe_completion_commit(
+                gitea_client,
+                repo_name=repo_name,
+                branch="main",
+                command_id=completion_command_id,
+                effect_kind=_S33_CURATED_COMMIT_EFFECT,
+            )
+        except CompletionEffectProbeError as exc:
+            raise TerminalMergeReconciliationError(str(exc)) from exc
+        if prior_commit is not None:
+            reconciled_sha = prior_commit.commit_sha
+
+    if reconciled_sha is None:
+        try:
+            committed = await gitea_client.change_files(
+                repo_name, "main", files, message=message
+            )
+        except Exception as e:  # noqa: BLE001
+            if durable:
+                raise TerminalMergeReconciliationError(
+                    f"curated commit response was ambiguous: {e!r}"
+                ) from e
+            return await _fallback(f"curated commit raised: {e!r}")
+        if not committed:
+            if durable:
+                raise TerminalMergeReconciliationError(
+                    "curated commit response was ambiguous or refused"
+                )
+            return await _fallback("curated commit refused by change_files")
 
     # ------------------------------------------------------------------
     # The curated commit is on ``main`` — the point of no return. From here
@@ -1328,10 +1586,13 @@ async def merge_loop_job_contribution(
     # re-land the whole branch on top of the curated files).
     # ------------------------------------------------------------------
     notes: list[str] = []
-    try:
-        curated_sha = await gitea_client.get_branch_head_sha(repo_name, "main")
-    except Exception:  # noqa: BLE001 — sha is provenance, not load-bearing
-        curated_sha = None
+    if reconciled_sha is not None:
+        curated_sha = reconciled_sha
+    else:
+        try:
+            curated_sha = await gitea_client.get_branch_head_sha(repo_name, "main")
+        except Exception:  # noqa: BLE001 — sha is provenance, not load-bearing
+            curated_sha = None
     sha8 = (curated_sha or "")[:8] or "?"
     notes.append(
         f"curated merge: {len(resolved)}/{len(files_contract)} contracted "
@@ -1349,41 +1610,88 @@ async def merge_loop_job_contribution(
 
     # Audit-PR ceremony: the numbered PR documents the branch's full diff,
     # then closes unmerged — the branch stays behind as the scratchpad's
-    # audit log. Strictly best-effort.
+    # audit log. Legacy calls retain the best-effort behavior. Durable calls
+    # first reconcile the exact marker so a create-response loss cannot leave
+    # duplicate audit PRs.
     try:
         record_path = loop_retro_path(job, ctx or {})
         title = (job.get("description") or "").splitlines()[0].strip()[:200] or (
             f"Loop job {job_id[:8]}"
         )
-        pr = await gitea_client.create_pr(
-            repo_name,
-            title=title,
-            head=branch,
-            base="main",
-            body=f"job: {job_id}\nbranch: {branch}",
-        )
-        if pr:
-            await gitea_client.comment_on_pr(
-                repo_name,
-                pr["number"],
-                (
-                    f"Curated merge (§6.4): {len(resolved)} contracted "
-                    f"deliverable(s) landed on `main` as `{curated_sha or '?'}`.\n"
-                    f"Record: `{record_path}`\n\n"
-                    f"This PR is the branch's audit trail and is closed "
-                    f"WITHOUT merging — the branch is a scratchpad; only "
-                    f"contracted deliverables merge."
-                ),
+        body = f"job: {job_id}\nbranch: {branch}"
+        pr = None
+        if durable:
+            assert completion_command_id is not None
+            title = completion_pr_title(
+                title,
+                command_id=completion_command_id,
+                effect_kind=_S33_CURATED_AUDIT_PR_EFFECT,
             )
-            closed = await gitea_client.close_pr(repo_name, pr["number"])
-            if not closed:
-                notes.append(
-                    f"audit PR #{pr['number']} could not be closed "
-                    f"(left open, unmerged)"
+            body = completion_pr_body(
+                body,
+                command_id=completion_command_id,
+                effect_kind=_S33_CURATED_AUDIT_PR_EFFECT,
+            )
+            prior_audit_pr = await probe_completion_pull_request(
+                gitea_client,
+                repo_name=repo_name,
+                head=branch,
+                base="main",
+                command_id=completion_command_id,
+                effect_kind=_S33_CURATED_AUDIT_PR_EFFECT,
+            )
+            if prior_audit_pr is not None:
+                pr = {
+                    "number": prior_audit_pr.pr_index,
+                    "state": prior_audit_pr.state,
+                }
+        if pr is None:
+            pr = await gitea_client.create_pr(
+                repo_name,
+                title=title,
+                head=branch,
+                base="main",
+                body=body,
+            )
+            if durable and not pr:
+                raise TerminalMergeReconciliationError(
+                    "command-keyed curated audit pull request could not be created"
                 )
+        if pr:
+            if pr.get("state") != "closed":
+                await gitea_client.comment_on_pr(
+                    repo_name,
+                    pr["number"],
+                    (
+                        f"Curated merge (§6.4): {len(resolved)} contracted "
+                        f"deliverable(s) landed on `main` as `{curated_sha or '?'}`.\n"
+                        f"Record: `{record_path}`\n\n"
+                        f"This PR is the branch's audit trail and is closed "
+                        f"WITHOUT merging — the branch is a scratchpad; only "
+                        f"contracted deliverables merge."
+                    ),
+                )
+                closed = await gitea_client.close_pr(repo_name, pr["number"])
+                if not closed:
+                    if durable:
+                        raise TerminalMergeReconciliationError(
+                            f"command-keyed audit PR #{pr['number']} could not be closed"
+                        )
+                    notes.append(
+                        f"audit PR #{pr['number']} could not be closed "
+                        f"(left open, unmerged)"
+                    )
         else:
             notes.append("audit PR could not be created (curated commit landed)")
+    except (CompletionEffectProbeError, TerminalMergeReconciliationError) as e:
+        if durable:
+            raise TerminalMergeReconciliationError(str(e)) from e
+        notes.append(f"audit PR ceremony failed: {e!r}")
     except Exception as e:  # noqa: BLE001 — ceremony must not flip the outcome
+        if durable:
+            raise TerminalMergeReconciliationError(
+                f"durable audit PR ceremony was interrupted: {e!r}"
+            ) from e
         notes.append(f"audit PR ceremony failed: {e!r}")
 
     logger.info(

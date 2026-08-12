@@ -19,6 +19,8 @@ import math
 import os
 import re
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Any, List, Dict, Tuple
@@ -72,6 +74,26 @@ _STATELESS_RUNTIME_CREATION_FIELDS = frozenset(
 _DOCKER_INVENTORY_COLUMNS = (
     "host, port, status, lease_id, owner_kind, owner_id, trust_mode, "
     "host_key_fingerprint, quarantine_reason"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _TaskTransactionScope:
+    """One connection reusable only by the task that opened its transaction.
+
+    ``ContextVar`` values are copied into child tasks.  Keeping the owning task
+    alongside the connection is therefore essential: a fire-and-forget task
+    created inside a transaction must acquire its own connection instead of
+    inheriting one that may commit or return to the pool before the child runs.
+    """
+
+    database: "PostgresDB"
+    connection: Any
+    owner_task: asyncio.Task[Any]
+
+
+_TASK_TRANSACTION_SCOPE: ContextVar[_TaskTransactionScope | None] = ContextVar(
+    "postgres_task_transaction_scope", default=None
 )
 
 
@@ -1003,6 +1025,12 @@ class PostgresDB:
     async def acquire(self):
         """Acquire a connection from the pool.
 
+        Inside :meth:`transaction_scope`, calls made by the owning asyncio task
+        reuse that transaction's connection.  Child tasks deliberately do not:
+        task contexts inherit ``ContextVar`` values, but sharing one asyncpg
+        connection across tasks would race the transaction owner and could use
+        the connection after it has returned to the pool.
+
         Context manager for getting a connection from the pool.
         Connection is automatically returned when context exits.
 
@@ -1012,10 +1040,63 @@ class PostgresDB:
         Raises:
             RuntimeError: If not connected to database
         """
+        scope = _TASK_TRANSACTION_SCOPE.get()
+        current_task = asyncio.current_task()
+        if (
+            scope is not None
+            and scope.database is self
+            and current_task is scope.owner_task
+        ):
+            yield scope.connection
+            return
         if self._pool is None:
             raise RuntimeError("Not connected to database. Call connect() first.")
         async with self._pool.acquire() as conn:
             yield conn
+
+    @asynccontextmanager
+    async def transaction_scope(self):
+        """Run database-helper calls in one task-bound transaction.
+
+        Existing helpers continue to use :meth:`acquire`; while this scope is
+        active, their acquisitions resolve to the same connection and therefore
+        the same transaction.  A nested scope in the owning task uses
+        asyncpg's nested-transaction savepoint semantics.  Exception and task
+        cancellation both leave through the transaction context manager, so the
+        transaction rolls back before the connection is returned to the pool.
+
+        This is intentionally opt-in: callers outside the scope retain the
+        historical one-pool-acquisition-per-helper behavior.
+        """
+        current_task = asyncio.current_task()
+        if current_task is None:  # pragma: no cover - async context always has one
+            raise RuntimeError("transaction_scope requires an asyncio task")
+
+        scope = _TASK_TRANSACTION_SCOPE.get()
+        if (
+            scope is not None
+            and scope.database is self
+            and scope.owner_task is current_task
+        ):
+            async with scope.connection.transaction():
+                yield scope.connection
+            return
+
+        if self._pool is None:
+            raise RuntimeError("Not connected to database. Call connect() first.")
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                token = _TASK_TRANSACTION_SCOPE.set(
+                    _TaskTransactionScope(
+                        database=self,
+                        connection=conn,
+                        owner_task=current_task,
+                    )
+                )
+                try:
+                    yield conn
+                finally:
+                    _TASK_TRANSACTION_SCOPE.reset(token)
 
     async def execute(self, query: str, *args) -> str:
         """Execute a query without returning results.
@@ -2279,7 +2360,14 @@ class PostgresDB:
                 )
         return row is not None
 
-    async def pause_job_shed_freeze(self, job_id: str) -> bool:
+    async def pause_job_shed_freeze(
+        self,
+        job_id: str,
+        *,
+        completion_command_id: str | None = None,
+        completion_finalizing_by: str | None = None,
+        workspace_context_updates: Dict[str, Any] | None = None,
+    ) -> bool:
         """``pause_job`` that also sheds a row-level freeze (stash-and-clear).
 
         For pause transitions that must leave the job DISPATCHABLE — the
@@ -2305,24 +2393,54 @@ class PostgresDB:
         except ValueError:
             return False
 
+        if (completion_command_id is None) != (completion_finalizing_by is None):
+            raise ValueError(
+                "completion_command_id and completion_finalizing_by must be paired"
+            )
+        command_guard = ""
+        values: list[Any] = [uuid_val]
+        context_expression = (
+            "COALESCE(context, '{}'::jsonb) "
+            "|| CASE WHEN freeze_data IS NULL THEN '{}'::jsonb "
+            "ELSE jsonb_build_object('last_freeze_data', freeze_data) END"
+        )
+        if workspace_context_updates is not None:
+            values.append(json.dumps(workspace_context_updates))
+            workspace_param = len(values)
+            context_expression = (
+                "jsonb_set("
+                f"{context_expression}, "
+                "'{workspace_container}', "
+                f"COALESCE(context->'workspace_container', '{{}}'::jsonb) "
+                f"|| ${workspace_param}::jsonb, true)"
+            )
+        if completion_command_id is not None:
+            values.extend([UUID(completion_command_id), str(completion_finalizing_by)])
+            command_param = len(values) - 1
+            owner_param = len(values)
+            command_guard = (
+                " AND EXISTS ("
+                "SELECT 1 FROM job_completion_commands AS command "
+                f"WHERE command.id = ${command_param}::uuid "
+                "AND command.job_id = jobs.id "
+                "AND command.state = 'finalizing' "
+                f"AND command.finalizing_by = ${owner_param}::text "
+                "AND command.lease_expires_at > now() "
+                "AND command.deadline_at > now())"
+            )
+
         async with self.acquire() as conn:
             result = await conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET status = 'paused',
                     assigned_agent_id = NULL,
-                    context = COALESCE(context, '{}'::jsonb)
-                              || CASE
-                                     WHEN freeze_data IS NULL THEN '{}'::jsonb
-                                     ELSE jsonb_build_object(
-                                         'last_freeze_data', freeze_data
-                                     )
-                                 END,
+                    context = {context_expression},
                     freeze_data = NULL,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE id = $1 AND status = 'processing'
+                WHERE id = $1 AND status = 'processing'{command_guard}
                 """,
-                uuid_val,
+                *values,
             )
 
         return result == "UPDATE 1"
@@ -2337,7 +2455,10 @@ class PostgresDB:
         error_details: Dict[str, Any] | None = None,
         *,
         stash_and_clear_freeze: bool = False,
+        workspace_context_updates: Dict[str, Any] | None = None,
         expected_status: str | None = None,
+        completion_command_id: str | None = None,
+        completion_finalizing_by: str | None = None,
     ) -> bool:
         """Update job status fields.
 
@@ -2358,6 +2479,11 @@ class PostgresDB:
                 after the thin lease check cannot be overwritten later in the
                 long-running completion handler. Omitted callers retain the
                 historical unconditional-by-id behavior.
+            completion_command_id: Optional durable completion command whose
+                exact live finalizer term must still be held by
+                ``completion_finalizing_by`` in the same UPDATE statement.
+            completion_finalizing_by: Unique command-attempt owner. Must be
+                supplied together with ``completion_command_id``.
 
         Returns:
             True if updated, False if not found
@@ -2372,6 +2498,7 @@ class PostgresDB:
         values = []
         param_count = 0
         stash_freeze_param: int | None = None
+        workspace_context_param: int | None = None
 
         if status is not None:
             param_count += 1
@@ -2405,6 +2532,11 @@ class PostgresDB:
             updates.append(f"error_details = ${param_count}::jsonb")
             values.append(json.dumps(error_details))
 
+        if workspace_context_updates is not None:
+            param_count += 1
+            workspace_context_param = param_count
+            values.append(json.dumps(workspace_context_updates))
+
         # Stamp the failure time on the transition INTO 'failed'. updated_at
         # cannot serve this: the update_jobs_updated_at trigger also fires on
         # gc_offline_agents' FK cascade, which rewrites it to exactly 24h after
@@ -2422,19 +2554,31 @@ class PostgresDB:
         if status == "completed":
             updates.append("completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)")
 
+        context_expression: str | None = None
         if stash_and_clear_freeze:
             if stash_freeze_param is None:
                 raise ValueError(
                     "stash_and_clear_freeze requires the exact freeze_data payload"
                 )
-            updates.extend(
-                [
-                    "context = COALESCE(context, '{}'::jsonb) || "
-                    f"jsonb_build_object('last_freeze_data', "
-                    f"${stash_freeze_param}::jsonb)",
-                    "freeze_data = NULL",
-                ]
+            context_expression = (
+                "COALESCE(context, '{}'::jsonb) || "
+                f"jsonb_build_object('last_freeze_data', "
+                f"${stash_freeze_param}::jsonb)"
             )
+            updates.append("freeze_data = NULL")
+
+        if workspace_context_param is not None:
+            context_base = context_expression or "COALESCE(context, '{}'::jsonb)"
+            context_expression = (
+                "jsonb_set("
+                f"{context_base}, "
+                "'{workspace_container}', "
+                f"COALESCE(({context_base})->'workspace_container', '{{}}'::jsonb) "
+                f"|| ${workspace_context_param}::jsonb, true)"
+            )
+
+        if context_expression is not None:
+            updates.append(f"context = {context_expression}")
 
         if not updates:
             return False
@@ -2448,6 +2592,27 @@ class PostgresDB:
             param_count += 1
             values.append(expected_status)
             query += f" AND status::text = ${param_count}::text"
+        if (completion_command_id is None) != (completion_finalizing_by is None):
+            raise ValueError(
+                "completion_command_id and completion_finalizing_by must be paired"
+            )
+        if completion_command_id is not None:
+            param_count += 1
+            values.append(UUID(completion_command_id))
+            command_param = param_count
+            param_count += 1
+            values.append(completion_finalizing_by)
+            owner_param = param_count
+            query += (
+                " AND EXISTS ("
+                "SELECT 1 FROM job_completion_commands AS command "
+                f"WHERE command.id = ${command_param}::uuid "
+                "AND command.job_id = jobs.id "
+                "AND command.state = 'finalizing' "
+                f"AND command.finalizing_by = ${owner_param}::text "
+                "AND command.lease_expires_at > now() "
+                "AND command.deadline_at > now())"
+            )
 
         terminal_lane: str | None = None
         async with self.acquire() as conn:
@@ -2472,7 +2637,14 @@ class PostgresDB:
                 logger.debug("checkpoint prune skipped for %s: %s", job_id, e)
         return updated
 
-    async def clear_job_failure(self, job_id: str) -> bool:
+    async def clear_job_failure(
+        self,
+        job_id: str,
+        *,
+        expected_updated_at: datetime | None = None,
+        completion_command_id: str | None = None,
+        completion_finalizing_by: str | None = None,
+    ) -> bool:
         """Clear a stale failure record when a late report re-resolves a job.
 
         ``update_job_status`` cannot do this — it only writes fields that are
@@ -2488,17 +2660,41 @@ class PostgresDB:
             uuid_val = UUID(job_id)
         except ValueError:
             return False
+        if (completion_command_id is None) != (completion_finalizing_by is None):
+            raise ValueError(
+                "completion_command_id and completion_finalizing_by must be paired"
+            )
+        predicates = ["id = $1"]
+        values: list[Any] = [uuid_val]
+        if expected_updated_at is not None:
+            values.append(expected_updated_at)
+            predicates.append(f"updated_at = ${len(values)}::timestamptz")
+        if completion_command_id is not None:
+            values.append(UUID(completion_command_id))
+            command_param = len(values)
+            values.append(completion_finalizing_by)
+            owner_param = len(values)
+            predicates.append(
+                "EXISTS ("
+                "SELECT 1 FROM job_completion_commands AS command "
+                f"WHERE command.id = ${command_param}::uuid "
+                "AND command.job_id = jobs.id "
+                "AND command.state = 'finalizing' "
+                f"AND command.finalizing_by = ${owner_param}::text "
+                "AND command.lease_expires_at > now() "
+                "AND command.deadline_at > now())"
+            )
         async with self.acquire() as conn:
             result = await conn.execute(
-                """
+                f"""
                 UPDATE jobs
                    SET error_message = NULL,
                        error_details = NULL,
                        failed_at = NULL,
                        updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $1
+                 WHERE {" AND ".join(predicates)}
                 """,
-                uuid_val,
+                *values,
             )
         return result == "UPDATE 1"
 
@@ -4196,7 +4392,12 @@ class PostgresDB:
         return result == "UPDATE 1"
 
     async def merge_workspace_container_context(
-        self, job_id: str, container_updates: Dict[str, Any]
+        self,
+        job_id: str,
+        container_updates: Dict[str, Any],
+        *,
+        completion_command_id: str | None = None,
+        completion_finalizing_by: str | None = None,
     ) -> bool:
         """Atomically merge updates into context.workspace_container.
 
@@ -4217,6 +4418,25 @@ class PostgresDB:
         except ValueError:
             return False
 
+        if (completion_command_id is None) != (completion_finalizing_by is None):
+            raise ValueError(
+                "completion_command_id and completion_finalizing_by must be paired"
+            )
+        values: list[Any] = [json_module.dumps(container_updates), uuid_val]
+        command_guard = ""
+        if completion_command_id is not None:
+            values.extend([UUID(completion_command_id), completion_finalizing_by])
+            command_guard = (
+                " AND EXISTS ("
+                "SELECT 1 FROM job_completion_commands AS command "
+                "WHERE command.id = $3::uuid "
+                "AND command.job_id = jobs.id "
+                "AND command.state = 'finalizing' "
+                "AND command.finalizing_by = $4::text "
+                "AND command.lease_expires_at > now() "
+                "AND command.deadline_at > now())"
+            )
+
         query = (
             "UPDATE jobs "
             "SET context = jsonb_set("
@@ -4225,12 +4445,10 @@ class PostgresDB:
             "    COALESCE(context->'workspace_container', '{}'::jsonb) || $1::jsonb"
             "), "
             "    updated_at = CURRENT_TIMESTAMP "
-            "WHERE id = $2"
+            f"WHERE id = $2{command_guard}"
         )
         async with self.acquire() as conn:
-            result = await conn.execute(
-                query, json_module.dumps(container_updates), uuid_val
-            )
+            result = await conn.execute(query, *values)
 
         return result == "UPDATE 1"
 
@@ -7409,6 +7627,39 @@ class PostgresDB:
                 target_job_id,
             )
             return True
+
+    async def get_verification_critic_for_round(
+        self, target_job_id: str, verification_round: int
+    ) -> Optional[Dict[str, Any]]:
+        """Return the critic fixed by the immutable target/round identity.
+
+        This is deliberately separate from ``has_live_verification_critic``:
+        the latter remains the fail-closed duplicate-spawn guard, while this
+        lookup is used only by the durable completion path to finish the
+        branch/context handoff after a crash that followed the critic INSERT.
+        Migration 0132's partial unique index guarantees at most one row.
+        """
+        try:
+            target_uuid = UUID(target_job_id)
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, status, config_name, context, branch_name, repo_name,
+                       worktree_path
+                  FROM jobs
+                 WHERE parent_job_id = $1
+                   AND context->>'verification_target' = $2
+                   AND context->>'verification_round' = $3
+                 LIMIT 1
+                """,
+                target_uuid,
+                target_job_id,
+                str(verification_round),
+            )
+        return dict(row) if row else None
 
     async def unstick_reviewing_parents(
         self, grace_minutes: int = 30

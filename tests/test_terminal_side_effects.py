@@ -36,6 +36,7 @@ from services.completion import (
 )
 
 JOB_ID = uuid.UUID("abcdef12-3456-7890-abcd-ef1234567890")
+COMMAND_ID = "11111111-2222-4333-8444-555555555555"
 PROJECT_ID = uuid.UUID("68137e29-1111-2222-3333-444444444444")
 REPO = "project-68137e29-jobs"
 BRANCH = "job/abcdef12"
@@ -71,6 +72,9 @@ def _make_gitea(
     g.get_compare = AsyncMock(return_value={"total_commits": total_commits})
     g.create_pr = AsyncMock(return_value={"number": 7, "url": "http://g/pr/7"})
     g.merge_pr = AsyncMock(return_value=True)
+    g.probe_pr_merged = AsyncMock(return_value=None)
+    g.list_pull_requests = AsyncMock(side_effect=lambda *args, **kw: [])
+    g.get_commits = AsyncMock(side_effect=lambda *args, **kw: [])
     g.close_pr = AsyncMock(return_value=True)
     g.comment_on_pr = AsyncMock(return_value=True)
     g.get_branch_head_sha = AsyncMock(return_value="c0ffee00" * 5)
@@ -483,6 +487,54 @@ class TestNoDoubleMerge:
 
 
 class TestBestEffort:
+    @pytest.mark.asyncio
+    async def test_durable_callbacks_reconcile_full_merge_fallback(self) -> None:
+        job = _job()
+        # No contracted file exists, so curation deliberately falls back to
+        # the full PR merge -- the S33 path whose exact PR must survive a kill.
+        g = _make_gitea(branch_files={})
+        db = _FakeDB(job)
+        intent = None
+
+        async def load():
+            return intent
+
+        async def store(detail):
+            nonlocal intent
+            intent = detail
+            return detail
+
+        g.merge_pr.side_effect = RuntimeError("killed after merge response")
+        with pytest.raises(RuntimeError, match="killed after merge"):
+            await apply_terminal_job_side_effects(
+                job,
+                "completed",
+                gitea=g,
+                db=db,
+                load_merge_intent=load,
+                store_merge_intent=store,
+                completion_command_id=COMMAND_ID,
+            )
+
+        g.probe_pr_merged.return_value = True
+        g.merge_pr.side_effect = None
+        out = await apply_terminal_job_side_effects(
+            job,
+            "completed",
+            gitea=g,
+            db=db,
+            load_merge_intent=load,
+            store_merge_intent=store,
+            completion_command_id=COMMAND_ID,
+        )
+
+        assert out["merge_status"] == "merged"
+        assert out["record_written"] is True
+        g.probe_pr_merged.assert_awaited_once_with(REPO, 7)
+        # Exactly the first, possibly-successful POST; replay only probes.
+        assert g.merge_pr.await_count == 1
+        assert g.create_pr.await_count == 1
+
     @pytest.mark.asyncio
     async def test_merge_failure_does_not_block_the_record(self) -> None:
         job = _job()
