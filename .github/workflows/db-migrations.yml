@@ -165,10 +165,20 @@ jobs:
       # contents of orchestrator/ into /app/, so the package treats orchestrator/
       # as the top of sys.path (e.g. `from security.crypto import ...`,
       # `from utils.db_url import ...`). Run the migration runner the same way.
+      #
+      # That same /app also holds the repository-root `src/` tree (the
+      # Dockerfile copies it to /app/src/), so in production ONE sys.path entry
+      # resolves both roots. Here they are two directories, and
+      # database/__init__.py -> postgres.py imports `src.shared.*` at module
+      # scope, so orchestrator/ alone raises ModuleNotFoundError: No module
+      # named 'src'. Carrying the workspace in PYTHONPATH reunites the two
+      # halves of production's single root — the same reason
+      # scripts/schema-snapshot.sh passes REPO_ROOT to its own invocation.
       - name: Dry-run app migrations
         working-directory: orchestrator
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m database.migrate \
             --dir database/migrations/app \
@@ -177,6 +187,7 @@ jobs:
         working-directory: orchestrator
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_vector
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m database.migrate \
             --dir database/migrations/vector \
@@ -185,6 +196,7 @@ jobs:
         working-directory: orchestrator
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
+          PYTHONPATH: ${{ github.workspace }}
         run: python -m database.migrate --dir database/migrations/app
       - name: Exercise Canvas viewer lifecycle against PostgreSQL
         env:
