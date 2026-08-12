@@ -31,6 +31,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from langchain_core.messages import AIMessage, HumanMessage
 
 project_root = Path(__file__).parent.parent
@@ -225,6 +226,60 @@ class TestUrgentReplyRoutesToGuidance:
         resume.assert_not_awaited()
         db.append_pending_guidance.assert_not_awaited()
         db.append_queued_reply.assert_awaited_once()
+        queued = db.append_queued_reply.await_args.args[1]
+        assert queued["id"]
+        assert queued["thread_id"] == "officer"
+
+
+class TestCheckpointCoupledAckEndpoint:
+    @pytest.mark.asyncio
+    async def test_forwards_exact_checkpoint_delivery_sets(self):
+        import orchestrator.main as om
+
+        db = AsyncMock()
+        db.consume_job_guidance.return_value = 4
+        body = om.GuidanceAckRequest(
+            guidance_ids=["g1"],
+            reply_keys=["id:r1"],
+            feedback_keys=["feedback:id:f1"],
+            delegation_keys=["delegation:id:d1"],
+            checkpoint_id="cp-9",
+        )
+        with (
+            patch.object(om, "postgres_db", db),
+            patch.object(om, "require_internal", AsyncMock()),
+        ):
+            result = await om.ack_job_guidance(MagicMock(), JOB_ID, body)
+
+        assert result == {"status": "ok", "consumed": 4}
+        db.consume_job_guidance.assert_awaited_once_with(
+            JOB_ID,
+            guidance_ids=["g1"],
+            reply_threads=[],
+            reply_keys=["id:r1"],
+            feedback_keys=["feedback:id:f1"],
+            delegation_keys=["delegation:id:d1"],
+            checkpoint_id="cp-9",
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_checkpoint_proof_is_conflict(self):
+        import orchestrator.main as om
+
+        db = AsyncMock()
+        db.consume_job_guidance.side_effect = ValueError("checkpoint missing")
+        with (
+            patch.object(om, "postgres_db", db),
+            patch.object(om, "require_internal", AsyncMock()),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await om.ack_job_guidance(
+                MagicMock(),
+                JOB_ID,
+                om.GuidanceAckRequest(guidance_ids=["g1"]),
+            )
+
+        assert exc.value.status_code == 409
 
 
 # =============================================================================
@@ -441,7 +496,14 @@ class TestGuidanceRendering:
 
 
 class TestExecuteRendersGuidance:
-    def _make_execute(self, workspace_manager, todo_manager, captured_requests):
+    def _make_execute(
+        self,
+        workspace_manager,
+        todo_manager,
+        captured_requests,
+        *,
+        tool_context=None,
+    ):
         from src.graph import create_execute_node
 
         async def fake_ainvoke(prepared, **kwargs):
@@ -461,6 +523,7 @@ class TestExecuteRendersGuidance:
         phase_cfg.model_max_context_tokens = 100000
         config.llm.get_phase_config.return_value = phase_cfg
         config.limits.model_max_context_tokens = 100000
+        config.limits.response_validation.enabled = False
         config.context_management.max_summary_length = 500
 
         context_mgr = MagicMock()
@@ -484,7 +547,7 @@ class TestExecuteRendersGuidance:
             retry_manager=MagicMock(),
             auxiliary_llm=None,
             summarization_prompt="",
-            tool_context=None,
+            tool_context=tool_context,
             tool_names=["read_file"],
         )
 
@@ -567,6 +630,70 @@ class TestExecuteRendersGuidance:
             if isinstance(getattr(m, "content", ""), str)
         )
         ack.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stateless_guidance_is_checkpointed_before_ack(
+        self, workspace_manager, todo_manager
+    ):
+        from src.tools.context import ToolContext
+
+        dual_app._guidance_inbox["job-under-test"] = [
+            {"id": "g1", "text": "read file Z", "source": "officer"}
+        ]
+        context = ToolContext(workspace_manager=workspace_manager)
+        context._stateless_worker = True
+        captured = []
+        execute = self._make_execute(
+            workspace_manager,
+            todo_manager,
+            captured,
+            tool_context=context,
+        )
+        ack = MagicMock()
+
+        with (
+            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("src.graph.get_archiver", return_value=None),
+            patch.object(dual_app, "ack_guidance", ack),
+        ):
+            result = await execute(self._state())
+
+        assert captured
+        assert result["delivered_guidance_ids"] == ["g1"]
+        ack.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stateless_reclaim_suppresses_checkpointed_guidance(
+        self, workspace_manager, todo_manager
+    ):
+        from src.tools.context import ToolContext
+
+        dual_app._guidance_inbox["job-under-test"] = [
+            {"id": "g1", "text": "already absorbed", "source": "officer"}
+        ]
+        context = ToolContext(workspace_manager=workspace_manager)
+        context._stateless_worker = True
+        captured = []
+        execute = self._make_execute(
+            workspace_manager,
+            todo_manager,
+            captured,
+            tool_context=context,
+        )
+        state = self._state()
+        state["delivered_guidance_ids"] = ["g1"]
+
+        with (
+            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("src.graph.get_archiver", return_value=None),
+        ):
+            await execute(state)
+
+        assert captured
+        assert not any(
+            "[SUPERVISOR GUIDANCE]" in getattr(message, "content", "")
+            for message in captured[0]
+        )
 
 
 # =============================================================================

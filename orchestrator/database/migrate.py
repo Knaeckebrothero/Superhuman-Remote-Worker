@@ -16,9 +16,17 @@ from pathlib import Path
 
 import asyncpg
 
+from .migration_recovery import NOTX_RECOVERIES, ConcurrentIndexRecovery
 from utils.db_url import build_postgres_url
 
 LOCK_ID = 0x5352575F4D4947  # "SRW_MIG" packed into int64.
+# A distinct lock is load-bearing for CREATE INDEX CONCURRENTLY. If a second
+# runner opens the transactional pass and then waits on the same session lock,
+# PostgreSQL's concurrent build can wait for that transaction's old snapshot
+# while the transaction waits for the build: a real advisory/virtual-xid
+# deadlock. The normal migration lock still serializes transactional passes;
+# this one serializes each non-transactional operation through its ledger write.
+NOTX_LOCK_ID = 0x5352575F4E5458  # "SRW_NOTX" packed into int64.
 NOTX_SUFFIX = ".notx.sql"
 
 log = logging.getLogger(__name__)
@@ -69,6 +77,18 @@ def _is_notx(path: Path) -> bool:
     return path.name.endswith(NOTX_SUFFIX)
 
 
+async def _acquire_notx_lock(conn: asyncpg.Connection) -> None:
+    """Acquire the session lock without blocking a concurrent-index build.
+
+    A blocking ``pg_advisory_lock`` call itself holds a virtual transaction ID.
+    ``CREATE INDEX CONCURRENTLY`` may wait for that transaction while it waits
+    for the advisory lock, producing a deadlock. Short try-lock statements end
+    before the build needs to advance to its next phase.
+    """
+    while not await conn.fetchval("SELECT pg_try_advisory_lock($1)", NOTX_LOCK_ID):
+        await asyncio.sleep(0.05)
+
+
 def discover(migrations_dir: Path) -> list[Path]:
     """List migrations in apply order. Reject duplicate versions early.
 
@@ -115,6 +135,182 @@ async def _record_failure(
             checksum,
             ms,
             error[:8000],
+        )
+
+
+async def _record_failure_on_connection(
+    conn: asyncpg.Connection,
+    filename: str,
+    checksum: str,
+    ms: int,
+    error: str,
+) -> None:
+    """Record a non-transactional failure while its session lock is held."""
+    await conn.execute(
+        "INSERT INTO schema_migrations(filename, checksum, "
+        "execution_ms, success, error) VALUES($1,$2,$3,FALSE,$4) "
+        "ON CONFLICT (filename) DO UPDATE SET "
+        "checksum = EXCLUDED.checksum, "
+        "applied_at = now(), "
+        "applied_by = current_user, "
+        "execution_ms = EXCLUDED.execution_ms, "
+        "success = FALSE, "
+        "error = EXCLUDED.error",
+        filename,
+        checksum,
+        ms,
+        error[:8000],
+    )
+
+
+async def _record_success_on_connection(
+    conn: asyncpg.Connection,
+    filename: str,
+    checksum: str,
+    ms: int,
+) -> None:
+    """Record a non-transactional success, replacing its dirty row if any."""
+    await conn.execute(
+        "INSERT INTO schema_migrations"
+        "(filename, checksum, execution_ms) VALUES($1,$2,$3) "
+        "ON CONFLICT (filename) DO UPDATE SET "
+        "checksum = EXCLUDED.checksum, "
+        "applied_at = now(), "
+        "applied_by = current_user, "
+        "execution_ms = EXCLUDED.execution_ms, "
+        "success = TRUE, "
+        "error = NULL",
+        filename,
+        checksum,
+        ms,
+    )
+
+
+async def _concurrent_index_state(
+    conn: asyncpg.Connection,
+    recovery: ConcurrentIndexRecovery,
+) -> asyncpg.Record | None:
+    """Return the visible same-name index state and its canonical shape."""
+    return await conn.fetchrow(
+        """
+        SELECT
+            i.indisunique,
+            i.indisvalid,
+            i.indisready,
+            i.indislive,
+            i.indnkeyatts,
+            i.indnatts,
+            am.amname AS access_method,
+            i.indrelid = to_regclass($2) AS expected_table,
+            ARRAY(
+                SELECT pg_get_indexdef(i.indexrelid, position, TRUE)
+                FROM generate_series(1, i.indnkeyatts) AS position
+                ORDER BY position
+            ) AS key_definitions,
+            pg_get_expr(i.indpred, i.indrelid) AS predicate
+        FROM pg_index AS i
+        JOIN pg_class AS index_class ON index_class.oid = i.indexrelid
+        JOIN pg_am AS am ON am.oid = index_class.relam
+        WHERE i.indexrelid = to_regclass($1)
+        """,
+        recovery.index_name,
+        recovery.table_name,
+    )
+
+
+def _is_expected_concurrent_index(
+    state: asyncpg.Record | None,
+    recovery: ConcurrentIndexRecovery,
+) -> bool:
+    """Require both usable catalog flags and the reviewed exact index shape."""
+    if state is None:
+        return False
+    return (
+        state["indisunique"]
+        and state["indisvalid"]
+        and state["indisready"]
+        and state["indislive"]
+        and state["indnkeyatts"] == len(recovery.key_definitions)
+        and state["indnatts"] == len(recovery.key_definitions)
+        and state["access_method"] == recovery.access_method
+        and state["expected_table"]
+        and tuple(state["key_definitions"]) == recovery.key_definitions
+        and state["predicate"] == recovery.predicate
+    )
+
+
+async def _require_applied_recovery_dependency(
+    conn: asyncpg.Connection,
+    migrations_dir: Path,
+    filename: str,
+) -> Path:
+    """Resolve one reviewed replay file and prove its ledger checksum."""
+    path = migrations_dir / filename
+    if not path.is_file():
+        raise RuntimeError(
+            f"recovery dependency {filename!r} is missing for {migrations_dir}"
+        )
+    row = await conn.fetchrow(
+        "SELECT checksum, success FROM schema_migrations WHERE filename = $1",
+        filename,
+    )
+    checksum = _checksum(path.read_text())
+    if row is None or not row["success"]:
+        raise RuntimeError(
+            f"recovery dependency {filename!r} is not successfully applied"
+        )
+    if row["checksum"] != checksum:
+        raise RuntimeError(
+            f"checksum changed: {filename} (recovery dependencies are immutable)"
+        )
+    return path
+
+
+async def _run_concurrent_index_recovery(
+    conn: asyncpg.Connection,
+    path: Path,
+    recovery: ConcurrentIndexRecovery,
+) -> None:
+    """Converge one explicitly reviewed concurrent-index migration."""
+    cleanup_path = await _require_applied_recovery_dependency(
+        conn,
+        path.parent,
+        recovery.cleanup_filename,
+    )
+    replay_path = await _require_applied_recovery_dependency(
+        conn,
+        path.parent,
+        recovery.replay_filename,
+    )
+
+    state = await _concurrent_index_state(conn, recovery)
+    if state is not None and not _is_expected_concurrent_index(state, recovery):
+        log.warning(
+            "recovering unusable or unexpected %s before %s",
+            recovery.index_name,
+            path.name,
+        )
+        await conn.execute(cleanup_path.read_text())
+        if await _concurrent_index_state(conn, recovery) is not None:
+            raise RuntimeError(
+                f"{cleanup_path.name} did not remove {recovery.index_name}"
+            )
+
+    # Re-run the reviewed, replay-safe dedupe immediately before the build.
+    # This closes the ordinary retry gap where new duplicates appeared after
+    # 0130 was ledgered but before a prior concurrent build completed.
+    await conn.execute(replay_path.read_text())
+
+    state = await _concurrent_index_state(conn, recovery)
+    if state is None:
+        # Execute the immutable migration bytes, not reconstructed DDL.
+        await conn.execute(path.read_text())
+        state = await _concurrent_index_state(conn, recovery)
+
+    if not _is_expected_concurrent_index(state, recovery):
+        raise RuntimeError(
+            f"{path.name} did not produce a unique, valid, ready, live "
+            f"{recovery.index_name} with the reviewed shape"
         )
 
 
@@ -167,15 +363,39 @@ async def run_migrations(
             async with conn.transaction():
                 await conn.execute("SELECT pg_advisory_xact_lock($1)", LOCK_ID)
 
-                dirty = await conn.fetchrow(
-                    "SELECT filename, error FROM schema_migrations "
-                    "WHERE success = FALSE LIMIT 1"
+                dirty_rows = await conn.fetch(
+                    "SELECT filename, checksum, error FROM schema_migrations "
+                    "WHERE success = FALSE ORDER BY filename"
                 )
-                if dirty:
+                unrecoverable_dirty = [
+                    row for row in dirty_rows if row["filename"] not in NOTX_RECOVERIES
+                ]
+                if unrecoverable_dirty:
+                    dirty = unrecoverable_dirty[0]
                     raise RuntimeError(
                         f"dirty migration {dirty['filename']!r}: "
                         f"{dirty['error']!s}; manual repair required "
                         f"(see docs/db_migration.md §Operational runbook)"
+                    )
+                for dirty in dirty_rows:
+                    path = next(
+                        (item for item in files if item.name == dirty["filename"]),
+                        None,
+                    )
+                    if path is None:
+                        raise RuntimeError(
+                            f"dirty recoverable migration {dirty['filename']!r} "
+                            "is missing on disk"
+                        )
+                    if dirty["checksum"] != _checksum(path.read_text()):
+                        raise RuntimeError(
+                            f"checksum changed: {path.name} "
+                            "(dirty recoverable migrations are immutable)"
+                        )
+                    log.warning(
+                        "dirty migration %s has an explicit automatic "
+                        "recovery contract; retrying",
+                        dirty["filename"],
                     )
 
                 applied = {
@@ -248,7 +468,9 @@ async def run_migrations(
 
     # Non-transactional pass — run outside any txn, one connection per migration
     # so the runner survives the kinds of operations that demand it (CREATE
-    # INDEX CONCURRENTLY, ALTER SYSTEM, etc.). Skipped on dry-run.
+    # INDEX CONCURRENTLY, ALTER SYSTEM, etc.). A session advisory lock spans
+    # the physical operation, catalog verification (when registered), and its
+    # ledger write. Skipped on dry-run.
     if dry_run:
         if non_transactional:
             log.info(
@@ -260,32 +482,54 @@ async def run_migrations(
 
     for path in non_transactional:
         async with pool.acquire() as conn:
-            applied_row = await conn.fetchrow(
-                "SELECT 1 FROM schema_migrations "
-                "WHERE filename = $1 AND success = TRUE",
-                path.name,
-            )
-            if applied_row:
-                continue
-
-            sql = path.read_text()
-            log.info("→ %s (non-transactional)", path.name)
-            t0 = time.monotonic()
+            await _acquire_notx_lock(conn)
             try:
-                await conn.execute(sql)
-            except Exception as exc:
+                # A second runner may have completed this migration while this
+                # connection waited for the session lock, so re-read the row.
+                applied_row = await conn.fetchrow(
+                    "SELECT checksum FROM schema_migrations "
+                    "WHERE filename = $1 AND success = TRUE",
+                    path.name,
+                )
+                sql = path.read_text()
+                checksum = _checksum(sql)
+                if applied_row:
+                    if applied_row["checksum"] != checksum:
+                        raise RuntimeError(
+                            f"checksum changed: {path.name} "
+                            "(applied migrations are immutable; write a "
+                            "superseding migration instead)"
+                        )
+                    continue
+
+                recovery = NOTX_RECOVERIES.get(path.name)
+                log.info("→ %s (non-transactional)", path.name)
+                t0 = time.monotonic()
+                try:
+                    if recovery is None:
+                        await conn.execute(sql)
+                    else:
+                        await _run_concurrent_index_recovery(conn, path, recovery)
+                except Exception as exc:
+                    ms = int((time.monotonic() - t0) * 1000)
+                    await _record_failure_on_connection(
+                        conn,
+                        path.name,
+                        checksum,
+                        ms,
+                        str(exc),
+                    )
+                    raise
                 ms = int((time.monotonic() - t0) * 1000)
-                await _record_failure(pool, path.name, _checksum(sql), ms, str(exc))
-                raise
-            ms = int((time.monotonic() - t0) * 1000)
-            await conn.execute(
-                "INSERT INTO schema_migrations"
-                "(filename, checksum, execution_ms) VALUES($1,$2,$3)",
-                path.name,
-                _checksum(sql),
-                ms,
-            )
-            log.info("✓ %s (%d ms)", path.name, ms)
+                await _record_success_on_connection(
+                    conn,
+                    path.name,
+                    checksum,
+                    ms,
+                )
+                log.info("✓ %s (%d ms)", path.name, ms)
+            finally:
+                await conn.execute("SELECT pg_advisory_unlock($1)", NOTX_LOCK_ID)
 
 
 async def _main() -> int:

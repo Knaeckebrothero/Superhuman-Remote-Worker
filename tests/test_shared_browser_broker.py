@@ -20,6 +20,8 @@ from services.canvas_ssh import CanvasSSHError, PinnedSSHCommandResult
 
 
 _WORKSPACE_GENERATION = UUID("11111111-aaaa-4aaa-8aaa-111111111111")
+_RUNTIME_INCARNATION = UUID("22222222-bbbb-4bbb-8bbb-222222222222")
+_THREAD_ID = UUID("33333333-cccc-4ccc-8ccc-333333333333")
 _VALID_ORIGIN = "http://localhost:4200"
 
 
@@ -49,6 +51,35 @@ def _bound_thread(*, generation: UUID = _WORKSPACE_GENERATION) -> dict:
             },
         },
     }
+
+
+def _stateless_thread(*, status: str = "active") -> dict:
+    thread = _bound_thread()
+    thread["id"] = str(_THREAD_ID)
+    thread["execution_lane"] = "stateless"
+    thread["status"] = status
+    thread["metadata"].update(
+        {
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "_workspace_binding": {
+                "generation": str(_WORKSPACE_GENERATION),
+                "kind": "remote",
+                "backing_id": "k8s-pvc:srw:test",
+                "ssh_host_key_fingerprint": "SHA256:test",
+            },
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "workspace.test",
+                "pod_port": 30022,
+                "pod_name": "workspace-test",
+                "namespace": "srw",
+                "_canvas_workspace_generation": str(_WORKSPACE_GENERATION),
+                "_runtime_incarnation": str(_RUNTIME_INCARNATION),
+            },
+        }
+    )
+    return thread
 
 
 class TestCodecMirror:
@@ -135,6 +166,63 @@ class TestExecStreamInfo:
         assert captured["generation_resolver"] is current
         assert captured["max_output_bytes"] == 64 * 1024
 
+    def test_stateless_cold_start_injects_exact_workspace_runtime_tag(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        async def run_command(**kwargs):
+            captured.update(kwargs)
+            return PinnedSSHCommandResult(
+                exit_status=0,
+                stdout=(
+                    b'{"generation":"g1","token":"t","port":38801,"baton":"agent"}\n'
+                ),
+                stderr=b"",
+            )
+
+        monkeypatch.setattr(
+            broker.PINNED_SSH_TRANSPORT_POOL, "run_command", run_command
+        )
+        monkeypatch.setattr(broker, "resolve_ssh_key_path", lambda: "/tmp/key")
+        monkeypatch.setattr(broker, "orchestrator_can_reach", lambda host: True)
+        thread = _stateless_thread()
+
+        info = asyncio.run(
+            broker.exec_stream_info(
+                thread,
+                generation_resolver=lambda: asyncio.sleep(0, result=thread),
+            )
+        )
+
+        assert info["generation"] == "g1"
+        assert captured["command"] == (
+            "env SRW_WORKSPACE_PROCESS_TAG="
+            f"v1:session:{_THREAD_ID}:{_RUNTIME_INCARNATION} "
+            "browser-exec stream_info --json '{}'"
+        )
+
+    def test_stateless_cold_start_refuses_missing_runtime_tag_authority(
+        self, monkeypatch
+    ):
+        async def forbidden(**kwargs):
+            raise AssertionError(kwargs)
+
+        monkeypatch.setattr(broker.PINNED_SSH_TRANSPORT_POOL, "run_command", forbidden)
+        thread = _stateless_thread()
+        thread["metadata"]["workspace_container"].pop("_runtime_incarnation")
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            asyncio.run(
+                broker.exec_stream_info(
+                    thread,
+                    generation_resolver=lambda: asyncio.sleep(0, result=thread),
+                )
+            )
+
+        assert error.value.status == 503
+        assert "runtime authority" in error.value.detail
+
     def test_generation_change_maps_to_typed_unavailable(self, monkeypatch):
         async def run_command(**kwargs):
             await kwargs["generation_resolver"]()
@@ -192,6 +280,292 @@ class TestExecStreamInfo:
         captured = error.value.detail + caplog.text
         assert "stdout-secret-sentinel" not in captured
         assert "stderr-secret-sentinel" not in captured
+
+
+class TestStatelessColdStartLifecycle:
+    def test_cold_start_is_serialized_and_rechecked(self, monkeypatch):
+        thread = _stateless_thread()
+        events = []
+
+        class DB:
+            locked = False
+
+            @asynccontextmanager
+            async def stateless_session_workspace_ensure_lock(self, thread_id, *, wait):
+                assert (thread_id, wait) == ("t1", True)
+                self.locked = True
+                events.append("lock-enter")
+                try:
+                    yield True
+                finally:
+                    events.append("lock-exit")
+                    self.locked = False
+
+            async def get_thread(self, thread_id):
+                assert thread_id == "t1"
+                assert self.locked is True
+                events.append("read")
+                return dict(thread)
+
+        db = DB()
+
+        async def fake_exec(current, **kwargs):
+            assert current == thread
+            assert db.locked is True
+            assert callable(kwargs["generation_resolver"])
+            events.append("spawn")
+            return {"generation": "g1"}
+
+        monkeypatch.setattr(broker, "exec_stream_info", fake_exec)
+
+        result = asyncio.run(
+            broker._exec_stream_info_with_lifecycle(
+                thread,
+                thread_id="t1",
+                db=db,
+                generation_resolver=lambda: asyncio.sleep(0, result=thread),
+            )
+        )
+
+        assert result == {"generation": "g1"}
+        assert events == ["lock-enter", "read", "spawn", "read", "lock-exit"]
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            lambda thread: {**thread, "status": "ended"},
+            lambda thread: {**thread, "status": "suspended"},
+            lambda thread: {
+                **thread,
+                "metadata": {
+                    **thread["metadata"],
+                    "_stateless_workspace_retirement_pending": True,
+                },
+            },
+            lambda thread: {
+                **thread,
+                "metadata": {
+                    **thread["metadata"],
+                    "_stateless_claim_losses": {
+                        "7": {"pod": "agent-a", "quiesced": False}
+                    },
+                },
+            },
+        ],
+        ids=["ended", "suspended", "retirement-pending", "claim-loss"],
+    )
+    def test_fresh_terminal_or_loss_state_blocks_spawn(self, monkeypatch, mutation):
+        thread = _stateless_thread()
+
+        class DB:
+            @asynccontextmanager
+            async def stateless_session_workspace_ensure_lock(self, *_args, **_kwargs):
+                yield True
+
+            async def get_thread(self, _thread_id):
+                return mutation(thread)
+
+        async def forbidden(*_args, **_kwargs):
+            raise AssertionError("terminal stateless thread spawned browser-exec")
+
+        monkeypatch.setattr(broker, "exec_stream_info", forbidden)
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            asyncio.run(
+                broker._exec_stream_info_with_lifecycle(
+                    thread,
+                    thread_id="t1",
+                    db=DB(),
+                    generation_resolver=lambda: asyncio.sleep(0, result=thread),
+                )
+            )
+
+        assert error.value.status == 409
+
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            "_stateless_workspace_retirement_pending",
+            "_stateless_claim_retirement",
+            "_stateless_claim_loss_hold",
+            "_stateless_claim_losses",
+        ],
+        ids=["workspace-retirement", "claim-retirement", "loss-hold", "losses"],
+    )
+    @pytest.mark.parametrize(
+        "marker_value",
+        [None, False, 0, "", [], {}],
+        ids=["null", "false", "zero", "empty-string", "empty-list", "empty-map"],
+    )
+    def test_present_falsey_lifecycle_marker_blocks_spawn(
+        self, monkeypatch, marker, marker_value
+    ):
+        thread = _stateless_thread()
+        thread["metadata"] = {
+            **thread["metadata"],
+            marker: marker_value,
+        }
+
+        class DB:
+            @asynccontextmanager
+            async def stateless_session_workspace_ensure_lock(self, *_args, **_kwargs):
+                yield True
+
+            async def get_thread(self, _thread_id):
+                return thread
+
+        async def forbidden(*_args, **_kwargs):
+            raise AssertionError("malformed lifecycle marker spawned browser-exec")
+
+        monkeypatch.setattr(broker, "exec_stream_info", forbidden)
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            asyncio.run(
+                broker._exec_stream_info_with_lifecycle(
+                    thread,
+                    thread_id="t1",
+                    db=DB(),
+                    generation_resolver=lambda: asyncio.sleep(0, result=thread),
+                )
+            )
+
+        assert error.value.status == 409
+
+    @pytest.mark.parametrize(
+        "protected_cloud",
+        [None, True, 0, "", [], {}],
+        ids=["null", "true", "zero", "empty-string", "empty-list", "empty-map"],
+    )
+    def test_present_nonfalse_protected_cloud_blocks_spawn(
+        self, monkeypatch, protected_cloud
+    ):
+        thread = _stateless_thread()
+        thread["metadata"] = {
+            **thread["metadata"],
+            "protected_cloud": protected_cloud,
+        }
+
+        class DB:
+            @asynccontextmanager
+            async def stateless_session_workspace_ensure_lock(self, *_args, **_kwargs):
+                yield True
+
+            async def get_thread(self, _thread_id):
+                return thread
+
+        async def forbidden(*_args, **_kwargs):
+            raise AssertionError("protected stateless thread spawned browser-exec")
+
+        monkeypatch.setattr(broker, "exec_stream_info", forbidden)
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            asyncio.run(
+                broker._exec_stream_info_with_lifecycle(
+                    thread,
+                    thread_id="t1",
+                    db=DB(),
+                    generation_resolver=lambda: asyncio.sleep(0, result=thread),
+                )
+            )
+
+        assert error.value.status == 409
+
+    @pytest.mark.parametrize("tier", ["vm", "unknown"], ids=["vm", "unknown"])
+    def test_non_sandbox_physical_or_unknown_tier_blocks_spawn(self, monkeypatch, tier):
+        thread = _stateless_thread()
+        if tier == "vm":
+            thread["metadata"]["vm"] = {
+                "status": "ready",
+                "host": "vm.test",
+            }
+        else:
+            thread["metadata"]["config_override"]["workspace"]["backend"] = (
+                "future-tier"
+            )
+
+        class DB:
+            @asynccontextmanager
+            async def stateless_session_workspace_ensure_lock(self, *_args, **_kwargs):
+                yield True
+
+            async def get_thread(self, _thread_id):
+                return thread
+
+        async def forbidden(*_args, **_kwargs):
+            raise AssertionError("non-sandbox stateless tier spawned browser-exec")
+
+        monkeypatch.setattr(broker, "exec_stream_info", forbidden)
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            asyncio.run(
+                broker._exec_stream_info_with_lifecycle(
+                    thread,
+                    thread_id=str(_THREAD_ID),
+                    db=DB(),
+                    generation_resolver=lambda: asyncio.sleep(0, result=thread),
+                )
+            )
+
+        assert error.value.status == 409
+
+    def test_lifecycle_change_during_startup_is_rejected_under_lock(self, monkeypatch):
+        thread = _stateless_thread()
+        reads = 0
+
+        class DB:
+            @asynccontextmanager
+            async def stateless_session_workspace_ensure_lock(self, *_args, **_kwargs):
+                yield True
+
+            async def get_thread(self, _thread_id):
+                nonlocal reads
+                reads += 1
+                if reads == 1:
+                    return dict(thread)
+                changed = dict(thread)
+                changed["metadata"] = {
+                    **thread["metadata"],
+                    "_stateless_workspace_retirement_pending": True,
+                }
+                return changed
+
+        async def fake_exec(*_args, **_kwargs):
+            return {"generation": "g1"}
+
+        monkeypatch.setattr(broker, "exec_stream_info", fake_exec)
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            asyncio.run(
+                broker._exec_stream_info_with_lifecycle(
+                    thread,
+                    thread_id="t1",
+                    db=DB(),
+                    generation_resolver=lambda: asyncio.sleep(0, result=thread),
+                )
+            )
+
+        assert error.value.status == 409
+        assert reads == 2
+
+    def test_pinned_start_does_not_require_lifecycle_lock(self, monkeypatch):
+        thread = _bound_thread()
+
+        async def fake_exec(current, **_kwargs):
+            assert current is thread
+            return {"generation": "g1"}
+
+        monkeypatch.setattr(broker, "exec_stream_info", fake_exec)
+
+        result = asyncio.run(
+            broker._exec_stream_info_with_lifecycle(
+                thread,
+                thread_id="t1",
+                db=object(),
+                generation_resolver=lambda: asyncio.sleep(0, result=thread),
+            )
+        )
+
+        assert result == {"generation": "g1"}
 
 
 def _ws_app():
@@ -480,6 +854,40 @@ class TestRelayReadmission:
         monkeypatch.setattr(broker, "exec_stream_info", revoke_binding_during_start)
 
         assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4503
+        assert broker._ACTIVE_VIEWERS == {}
+
+    @pytest.mark.parametrize("transition", ["stop", "class", "tier"])
+    def test_stateless_lifecycle_is_rechecked_after_startup(
+        self, monkeypatch, transition
+    ):
+        db = _RelayDB(_stateless_thread())
+        app, _, writer = _install_hanging_relay(monkeypatch, db=db)
+
+        async def transition_after_startup(thread, **kwargs):
+            del thread, kwargs
+            changed = _stateless_thread()
+            metadata = dict(changed["metadata"])
+            if transition == "stop":
+                metadata["_stateless_workspace_retirement_pending"] = True
+            elif transition == "class":
+                metadata["config_override"] = {
+                    "workspace": {"backend": "sandbox"},
+                    "officer": {"enabled": "yes"},
+                }
+            else:
+                metadata["config_override"] = {"workspace": {"backend": "virtual"}}
+            changed["metadata"] = metadata
+            db.thread = changed
+            return {"generation": "g1", "token": "tok", "port": 38801}
+
+        monkeypatch.setattr(
+            broker,
+            "_exec_stream_info_with_lifecycle",
+            transition_after_startup,
+        )
+
+        assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4409
+        assert writer.frames == []
         assert broker._ACTIVE_VIEWERS == {}
 
 

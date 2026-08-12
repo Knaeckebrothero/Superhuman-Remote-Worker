@@ -47,6 +47,8 @@ POST   /api/admin/providers/models                                              
 DELETE /api/admin/providers/models/{catalog_id}                                         admin:_require_admin
 PATCH  /api/admin/providers/models/{catalog_id}                                         admin:_require_admin
 POST   /api/admin/providers/models/{catalog_id}/test                                    admin:_require_admin
+GET    /api/admin/run-queue                                                             admin:_require_admin
+POST   /api/admin/run-queue/{unit_id}/unpark                                            admin:_require_admin
 GET    /api/admin/security-events                                                       admin:_require_admin
 DELETE /api/admin/system-settings/main_cloud                                            admin:_require_admin
 GET    /api/admin/system-settings/main_cloud                                            admin:_require_admin
@@ -268,6 +270,8 @@ GET    /api/persistent/threads/{thread_id}/browser/capability                   
 POST   /api/persistent/threads/{thread_id}/browser/open                                 gated:require_thread_owner
 DELETE /api/persistent/threads/{thread_id}/canvases/main                                gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/canvases/main                                gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/canvases/main/awareness/stream               gated:require_thread_owner
+PUT    /api/persistent/threads/{thread_id}/canvases/main/awareness/{editing_session_id} gated:require_thread_owner
 PUT    /api/persistent/threads/{thread_id}/canvases/main/content                        gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/canvases/main/office-session                 gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/canvases/main/refresh                        gated:require_thread_owner
@@ -278,12 +282,14 @@ POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attac
 POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attachment_id}/renew gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/citations                                    gated:require_thread_owner
 PATCH  /api/persistent/threads/{thread_id}/config                                       gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/controls                                     gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/ide                                          gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/input                                        gated:require_approved_user
-POST   /api/persistent/threads/{thread_id}/interrupt                                    gated:require_approved_user
+POST   /api/persistent/threads/{thread_id}/interrupt                                    gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/logs                                         gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/messages                                     gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/resume                                       gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/state                                        gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/stream                                       gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/tool-groups                                  gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/transcribe                                   gated:require_thread_owner

@@ -8,11 +8,14 @@ Connect with: websocat ws://localhost:8001/ws/chat
 """
 
 import asyncio
+import hashlib
+import inspect
 import json
 import logging
 import os
 import re
-from contextlib import asynccontextmanager
+import time
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from typing import (
@@ -57,6 +60,18 @@ from ..core.tool_policy import (
     validate_tool_override_fragment,
 )
 from ..core.workspace_backend import WorkspaceUnavailableError
+from ..services.workspace_undo import (
+    WorkspaceUndoRetryable,
+    WorkspaceUndoUnavailable,
+)
+from .lease_context import LeaseLostError
+from .lease_context import current_lease as _current_lease_var
+from ..shared import event_journal as _event_journal
+from ..shared.thread_presence import (
+    expire_permission_if_untethered,
+    mark_stateless_natural_pause,
+)
+from ..shared.session_retirement import update_stateless_claim_status
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
@@ -110,7 +125,7 @@ _awaiting_input: bool = False
 _ws_connected_event: Optional[asyncio.Event] = None
 _watchdog_tasks: list[asyncio.Task] = []
 
-# Re-entrancy guard for _terminate_session. Out-of-band teardown (drain,
+# Awaitable single-flight for _terminate_session. Out-of-band teardown (drain,
 # watchdog, REST detach) cancels the loop task and awaits it — but
 # run_persistent_loop swallows CancelledError during the input wait and
 # returns CLEANLY, so the loop's completion-handler wrapper observes a
@@ -118,8 +133,11 @@ _watchdog_tasks: list[asyncio.Task] = []
 # outer teardown is still in progress. Historically that just duplicated
 # work (double sync/cleanup, duplicate 'ended' writes); under drain-suspend
 # the inner call's 'ended' write would defeat the orchestrator's
-# 'suspended' transition, so the second caller now returns immediately.
+# 'suspended' transition. The loop task itself remains a non-awaiting
+# re-entrant caller (otherwise outer teardown and cancelled loop deadlock),
+# while every independent caller awaits the same authoritative cleanup result.
 _terminating: bool = False
+_termination_task: Optional[asyncio.Task[None]] = None
 
 # Reference to the currently running persistent-loop task. Set by ws_chat when
 # it spawns the loop, cleared when _terminate_session runs. _terminate_session()
@@ -225,6 +243,55 @@ _rewind_lock: asyncio.Lock = asyncio.Lock()
 # if the pod restarts between the two passes the draft simply sticks, which is a
 # fine title — not worth a DB column.
 _draft_title_value: Optional[str] = None
+# Session-local fire-and-forget work must not survive pool reuse.  Every task
+# captures an immutable attach generation and is terminally joined during
+# teardown before the event writer or claimant lease is released.
+_session_generation: int = 0
+_session_side_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _track_session_side_task(task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+    _session_side_tasks.add(task)
+    task.add_done_callback(_session_side_tasks.discard)
+    return task
+
+
+def _session_identity_matches(
+    session: Any,
+    thread_id: str,
+    generation: int,
+) -> bool:
+    return bool(
+        _session is session
+        and _thread_id == thread_id
+        and _session_generation == generation
+    )
+
+
+async def _quiesce_session_side_tasks() -> None:
+    """Cancel and join title/stage tasks before process-global identity reuse."""
+
+    pending = {
+        task
+        for task in _session_side_tasks
+        if task is not asyncio.current_task() and not task.done()
+    }
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    done, pending = await asyncio.wait(
+        pending,
+        timeout=float(os.environ.get("SESSION_SIDE_TASK_CLOSE_TIMEOUT_S", "5")),
+    )
+    for task in done:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            pass
+    if pending:
+        raise RuntimeError(f"{len(pending)} session side task(s) ignored cancellation")
+
 
 # True while a tool call is mid-`ainvoke`. Read by POST /api/interrupt to
 # pick hard vs graceful mode. Set in _loop_on_tool_start, cleared in
@@ -258,13 +325,59 @@ _cloud_sync_retry_pending: bool = False
 # docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
 _pending_cloud_push_task: Optional[asyncio.Task] = None
 
+# M3 full-turn-settlement seam for the stateless executor (turn_executor.py): a
+# synchronous callable invoked by ``_loop_on_turn_settled`` only after the
+# transcript reconcile, turn-owned memory work, and Git commit/push/ledger
+# mapping. The executor installs a closure that sets an asyncio.Event per claim;
+# the pinned lane leaves this None. Publishing this at transcript completion is
+# too early: the executor can detach/cancel the loop and strand an unmapped Git
+# commit, breaking cross-pod undo.
+_turn_complete_external_hook: Optional[Callable[[int], None]] = None
+
+# S2 turn-start seam for the stateless executor. Unlike the completion seam,
+# this hook is awaited: the exact lease/turn interrupt admission must be open
+# and its consumer armed before ``turn.started`` makes the turn interruptible
+# to clients. Pinned sessions leave it unset.
+_turn_start_external_hook: Optional[Callable[[int], Awaitable[None]]] = None
+
 # Phase 2 event-log cursor. Allocated synchronously by _broadcast, then queued
 # through one ordered writer so a later sequence can never become visible in
 # Postgres before an earlier queued sequence. Each DB-backed runtime attach
-# atomically allocates a fresh epoch; teardown clears the process-local cursor.
+# resolves (epoch, seq seed) via _resolve_event_journal_epoch — REUSING the
+# thread's current epoch on clean reattaches and bumping only when the prior
+# session life is terminal (doc §5.3.2); teardown clears the process-local
+# cursor.
 _events_epoch: int = 0
 _next_seq: int = 0
 _event_writer: Optional["_OrderedPersistentEventWriter"] = None
+
+# Durable control-inbox consumer. Pinned agents own this for their whole
+# attach; stateless agents own it only while turn_executor holds a live lease.
+# The task is deliberately separate from the persistent loop so a control can
+# change the next permission gate while an LLM turn is already running.
+_control_watcher_task: Optional[asyncio.Task] = None
+_control_watcher_stop: Optional[asyncio.Event] = None
+_control_owner_lease_token: Optional[int] = None
+_control_owner_agent_id: Optional[str] = None
+_control_drain_lock: asyncio.Lock = asyncio.Lock()
+
+_CONTROL_NOTIFY_CHANNEL = "thread_control_requests"
+_CONTROL_POLL_SECONDS = 5.0
+_CONTROL_STOP_GRACE_SECONDS = 1.0
+
+# A stateless interrupt belongs to one exact (lease token, turn id) pair. Its
+# consumer is deliberately independent of the scalar-control watcher: an
+# interrupt has a synchronous RAM side effect and its admission window closes
+# before queue completion, not at attach/detach.
+_interrupt_watcher_task: Optional[asyncio.Task] = None
+_interrupt_watcher_stop: Optional[asyncio.Event] = None
+_interrupt_owner_lease_token: Optional[int] = None
+_interrupt_owner_turn_id: Optional[int] = None
+_interrupt_drain_lock: asyncio.Lock = asyncio.Lock()
+_interrupt_watcher_lifecycle_lock: asyncio.Lock = asyncio.Lock()
+
+_INTERRUPT_NOTIFY_CHANNEL = "thread_interrupt_requests"
+_INTERRUPT_POLL_SECONDS = 1.0
 
 _EVENT_WRITER_QUEUE_MAXSIZE: int = int(
     os.environ.get("THREAD_EVENT_WRITER_QUEUE_MAXSIZE", "10000")
@@ -320,6 +433,81 @@ _NOTIFICATION_METHODS = frozenset(
 _ACCEPTED_INPUT_ROLES = frozenset({"human", "event"})
 
 
+def _stateless_mode() -> bool:
+    """True when this process runs as the M3 stateless turn executor.
+
+    Set via ``STATELESS_EXECUTOR=1`` (agent.py ``--mode stateless`` exports
+    it). In this mode the pod claims ``session_turn`` units from the shared
+    ``run_queue`` (``src/api/turn_executor.py``) instead of being registered,
+    heartbeated, watched and driven over WS/REST: registration, the
+    orchestrator heartbeat loop, the boot-WS/status watchdogs, and the
+    direct input/attach surface are all disabled. Read per call (not cached
+    at import) so tests can flip it with monkeypatch.setenv.
+    """
+    return os.environ.get("STATELESS_EXECUTOR", "").strip() == "1"
+
+
+def _current_stateless_lease_token() -> Optional[int]:
+    """Return the exact live claim token for this attached stateless thread."""
+
+    if not _stateless_mode() or _thread_id is None:
+        return None
+    handle = _current_lease_var.get()
+    if (
+        handle is None
+        or not handle.active
+        or handle.lost.is_set()
+        or str(handle.unit_id) != str(_thread_id)
+    ):
+        return None
+    return int(handle.lease_token)
+
+
+async def _safe_mark_stateless_natural_pause(*, require_untethered: bool) -> bool:
+    """Best-effort durable presence oracle for stateless natural pauses."""
+
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return False
+    lease_token = _current_stateless_lease_token()
+    if lease_token is None:
+        logger.warning(
+            "Skipped stateless natural pause without exact lease (thread=%s)",
+            _thread_id,
+        )
+        return False
+    try:
+        return await mark_stateless_natural_pause(
+            _session.postgres_conn,
+            thread_id=_thread_id,
+            lease_token=lease_token,
+            require_untethered=require_untethered,
+        )
+    except Exception as exc:
+        # Lifecycle state is converged by the orchestrator's expired-presence
+        # sweep after run_queue reaches done; never fail a completed turn for
+        # this advisory status write.
+        logger.warning(
+            "Failed stateless natural-pause presence check (thread=%s): %s",
+            _thread_id,
+            exc,
+        )
+        return False
+
+
+def _stateless_reject() -> JSONResponse:
+    """409 for direct-session verbs on a stateless executor pod."""
+    return JSONResponse(
+        {
+            "error": (
+                "stateless executor: this pod serves queued turns from the "
+                "run_queue (threads.execution_lane='stateless'); direct "
+                "session attach/input is not accepted here"
+            )
+        },
+        status_code=409,
+    )
+
+
 class WorkspaceNotReady(RuntimeError):
     """The session's workspace container never became ready in time.
 
@@ -331,6 +519,14 @@ class WorkspaceNotReady(RuntimeError):
 
 class EventJournalUnavailable(RuntimeError):
     """The persistent event generation could not be resolved authoritatively."""
+
+
+class ControlInboxBlocked(EventJournalUnavailable):
+    """The oldest control cannot be safely consumed by this runtime owner."""
+
+
+class InterruptInboxBlocked(EventJournalUnavailable):
+    """An exact-turn interrupt cannot be safely consumed by this owner."""
 
 
 async def _ensure_nats_client():
@@ -533,6 +729,7 @@ def _ensure_persistent_loop_started(
             on_workspace_commit=_loop_on_workspace_commit,
             on_context_compacted=_loop_on_context_compacted,
             persist_message=_loop_persist_message,
+            on_turn_settled=_loop_on_turn_settled,
             archive_llm_call=_loop_archive_llm_call,
             on_usage=_loop_on_usage,
             hard_interrupt_event=_hard_interrupt_event,
@@ -571,6 +768,18 @@ def _ensure_persistent_loop_started(
                 get_current_system_prompt=lambda: _session.system_prompt,
                 memory_extraction_prompt=_session.memory_extraction_prompt,
                 memory_service=_session.memory_service,
+                claim_memory_extraction_interval=(
+                    (
+                        lambda turn_count,
+                        interval: _session.postgres_conn.claim_memory_extraction_interval(
+                            _session.thread_id,
+                            turn_count=turn_count,
+                            interval=interval,
+                        )
+                    )
+                    if _session.postgres_conn is not None
+                    else None
+                ),
             ),
             name="persistent-loop",
         )
@@ -696,7 +905,11 @@ async def _drain_suspend_session() -> None:
     # makes the SIGTERM shutdown handler a no-op when the orchestrator
     # deletes this pod as part of the suspend.
     try:
-        await _terminate_session("drain", mark_thread=False)
+        await _terminate_session(
+            "drain",
+            mark_thread=False,
+            preserve_shell=False,
+        )
     except Exception as e:
         logger.warning(f"Session teardown during drain-suspend failed: {e}")
 
@@ -835,6 +1048,14 @@ def _start_watchdogs() -> None:
     """Start watchdog tasks for the active session. Safe to call repeatedly."""
     global _ws_connected_event, _watchdog_tasks
 
+    # Stateless executor (M3): no boot-WS ever arrives (input rides the run
+    # queue) and thread status is orchestrator-owned — both watchdogs would
+    # tear down healthy cached sessions. The run_queue lease/reaper plays
+    # their abandoned-pod role in this mode.
+    if _stateless_mode():
+        logger.debug("Stateless executor mode: session watchdogs disabled")
+        return
+
     # Stop any prior watchdogs (defensive — should already be cleared).
     for task in _watchdog_tasks:
         if not task.done():
@@ -879,7 +1100,7 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
         if tool_context is not None:
             graph_progress = tool_context.get_graph_progress()
             metrics["graph_progress"] = graph_progress
-    except Exception:
+    except BaseException:
         pass
 
     try:
@@ -1074,11 +1295,19 @@ async def lifespan(app: FastAPI):
         _thread_id
 
     _started_at = datetime.now()
+    stateless = _stateless_mode()
     pool_mode = _thread_id is None
-    logger.info(
-        f"Starting persistent agent: config={_config_path}, "
-        f"thread={_thread_id or '(pool mode — waiting for assignment)'}"
-    )
+    if stateless:
+        logger.info(
+            f"Starting stateless turn executor agent: config={_config_path} "
+            "(no registration, no heartbeat, no watchdogs — work arrives via "
+            "run_queue claims)"
+        )
+    else:
+        logger.info(
+            f"Starting persistent agent: config={_config_path}, "
+            f"thread={_thread_id or '(pool mode — waiting for assignment)'}"
+        )
 
     # 1. Create and initialize UniversalAgent (singleton layer)
     _agent = UniversalAgent.from_config(_config_path)
@@ -1087,7 +1316,27 @@ async def lifespan(app: FastAPI):
     # 2. Connect to orchestrator
     orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085")
     dedicated_register_ok = True
-    if orchestrator_url:
+    if stateless:
+        # M3 stateless executor: the orchestrator client exists ONLY for the
+        # claim-bundle fetch and the attach-path reads (get_thread_workspace,
+        # status writes). No registration, no heartbeat loop — liveness is the
+        # run_queue lease, and the reaper replaces the watchdog/sweep roles.
+        if orchestrator_url:
+            try:
+                _orchestrator_client = create_orchestrator_client_from_env(
+                    _agent.config.agent_id
+                )
+                await _orchestrator_client.connect()
+            except Exception as e:
+                logger.warning(
+                    f"Orchestrator client init failed (stateless mode, "
+                    f"non-fatal — claims will release until it recovers): {e}"
+                )
+                _orchestrator_client = None
+        from .turn_executor import start_stateless_executor
+
+        await start_stateless_executor()
+    elif orchestrator_url:
         try:
             _orchestrator_client = create_orchestrator_client_from_env(
                 _agent.config.agent_id
@@ -1209,6 +1458,11 @@ async def lifespan(app: FastAPI):
             "registration.",
             _thread_id,
         )
+    elif stateless:
+        logger.info(
+            "Stateless executor: claim loop running — sessions attach only "
+            "under run_queue leases"
+        )
     else:
         logger.info(
             "Pool mode: waiting for session assignment via POST /session/attach"
@@ -1219,20 +1473,31 @@ async def lifespan(app: FastAPI):
     # --- Shutdown ---
     logger.info("Shutting down persistent agent")
 
-    # Detach any active session
+    if stateless:
+        # SIGTERM/preStop contract (M3): stop claiming; a mid-flight turn
+        # finishes under its lease (bounded) and completes/releases before
+        # the session teardown below. Exit stays 0.
+        from .turn_executor import stop_stateless_executor
+
+        await stop_stateless_executor()
+
+    # Detach any active session. Stateless lane: never mark the thread ended —
+    # thread lifecycle belongs to the orchestrator, and the next claim (on any
+    # pod) picks the thread back up from thread_messages.
     if _session:
-        await _terminate_session("shutdown")
+        await _terminate_session("shutdown", mark_thread=not stateless)
 
     if _orchestrator_client:
         try:
-            _orchestrator_client.stop_heartbeat()
-            if _heartbeat_task:
-                _heartbeat_task.cancel()
-                try:
-                    await _heartbeat_task
-                except asyncio.CancelledError:
-                    pass
-            await _orchestrator_client.deregister()
+            if not stateless:
+                _orchestrator_client.stop_heartbeat()
+                if _heartbeat_task:
+                    _heartbeat_task.cancel()
+                    try:
+                        await _heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                await _orchestrator_client.deregister()
             await _orchestrator_client.close()
         except Exception as e:
             logger.warning(f"Orchestrator cleanup error: {e}")
@@ -1264,6 +1529,8 @@ def _build_sync_coordinator(
     workspace_path,
     workspace_backend,
     cloud_cfg: Optional[Dict[str, Any]],
+    thread_id: str = "",
+    workspace_generation: str = "",
 ):
     """Construct a ``WorkspaceSyncCoordinator`` from the orchestrator's payload.
 
@@ -1287,7 +1554,49 @@ def _build_sync_coordinator(
         build_workspace_sync,
     )
 
-    coordinator = WorkspaceSyncCoordinator()
+    coordinator = WorkspaceSyncCoordinator(
+        thread_id=thread_id,
+        workspace_generation=workspace_generation,
+    )
+
+    def _identity(
+        cfg: Dict[str, Any], *, logical_key: str, target_path: str
+    ) -> tuple[str, str]:
+        """Stable row key + exact non-secret source/destination digest.
+
+        ``thread_mounts.id`` is replace-on-edit and therefore cannot name a
+        durable generation. The logical key excludes workspace incarnation;
+        the scope digest includes it so a clean row can be rebound while a
+        pending row for an old incarnation fails closed.
+        """
+
+        destination = {
+            "backend": str(cfg.get("backend") or ""),
+            "mount_kind": str(cfg.get("mount_kind") or ""),
+            "target_path": str(target_path or "").strip("/"),
+            "webdav_url": str(cfg.get("webdav_url") or "").rstrip("/"),
+        }
+        encoded_destination = json.dumps(
+            destination, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        destination_sha = hashlib.sha256(encoded_destination).hexdigest()
+        mount_key = (
+            "legacy-session"
+            if logical_key == "legacy-session"
+            else f"mount:{destination_sha}"
+        )
+        if not thread_id or not workspace_generation:
+            return mount_key, ""
+        scope = {
+            "thread_id": str(thread_id),
+            "workspace_generation": str(workspace_generation),
+            "mount_key": mount_key,
+            "destination_sha256": destination_sha,
+        }
+        scope_sha = hashlib.sha256(
+            json.dumps(scope, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return mount_key, scope_sha
 
     def _attach(cfg: Dict[str, Any], *, mount_id: str, target_path: str) -> None:
         sync = build_workspace_sync(
@@ -1297,8 +1606,17 @@ def _build_sync_coordinator(
             mount_subdir=target_path,
         )
         if sync is not None:
+            mount_key, scope_sha = _identity(
+                cfg, logical_key=mount_id, target_path=target_path
+            )
             coordinator.add(
-                MountSync(mount_id=mount_id, target_path=target_path, sync=sync)
+                MountSync(
+                    mount_id=mount_id,
+                    target_path=target_path,
+                    sync=sync,
+                    sync_scope_sha256=scope_sha,
+                    generation_key=mount_key,
+                )
             )
 
     if cloud_cfg.get("version") == 2:
@@ -1474,6 +1792,14 @@ def _sanitize_live_session_config_override(
     if not isinstance(config_override, dict):
         raise ValueError("Session config override must be an object")
     sanitized = dict(config_override)
+    interactive = sanitized.get("interactive")
+    if isinstance(interactive, dict) and {
+        "permission_mode",
+        "narration_mode",
+    }.intersection(interactive):
+        raise ValueError(
+            "permission_mode and narration_mode use the session control endpoint"
+        )
     if "tools" in sanitized:
         accepted_tools = validate_tool_override_fragment(sanitized)
         if accepted_tools:
@@ -1483,41 +1809,198 @@ def _sanitize_live_session_config_override(
     return sanitized
 
 
-async def _resolve_event_journal_epoch(postgres_conn: Any, thread_id: str) -> int:
-    """Atomically allocate a new event generation for this runtime attach.
+# Thread statuses that mark the previous session life as over. Only 'ended'
+# is terminal in the vocabulary enforced by valid_thread_status (created /
+# active / idle / awaiting_user / suspended / ended): 'suspended' threads are
+# live-resumable (drain-suspend, attention-sleep) and their reattach is
+# exactly the clean-handoff case that must REUSE the epoch.
+_TERMINAL_THREAD_STATUSES: frozenset = frozenset({"ended"})
 
-    Allocation is unconditional: an empty current epoch may be genuinely new,
-    fully pruned, or left by a failed runtime. Reusing it can strand a cached
-    SSE cursor ahead of every newly allocated sequence. The existing SSE
-    mid-stream epoch-change path safely re-anchors provisioning clients that
-    opened against the pre-attach generation.
+# Journal kinds that render a session life terminal client-side. Keep in
+# lockstep with the cockpit's terminal-lifecycle handlers and its
+# _isSupersededLifecycleFrame guard (persistent-chat.service.ts), which
+# swallows exactly these kinds at epoch <= resumedFromEpoch: a resume that
+# REUSED the epoch would have its genuine future terminal frames swallowed
+# forever, so an epoch that already carries one of these must bump on the
+# next attach. 'session.suspended' is deliberately absent — the cockpit
+# treats it as live-resumable, not terminal.
+_TERMINAL_LIFECYCLE_EVENT_KINDS: tuple = ("session.ended", "session.idle_timeout")
+
+
+async def _resolve_event_journal_epoch(
+    postgres_conn: Any, thread_id: str
+) -> Tuple[int, int]:
+    """Resolve ``(events_epoch, seq_seed)`` for this runtime attach.
+
+    REUSE by default, bump only when the previous session life is provably
+    over (doc §5.3.2). The old contract here allocated a new epoch on every
+    attach; that made every reattach fire the client cascade — ~2s of
+    dead-epoch polling, then ``gone_beyond_horizon`` → IndexedDB thread-cache
+    wipe → full transcript refetch → SSE reopen — and is the #1 blocker for
+    per-turn (stateless) attaches, where it would fire every turn. With seq
+    seeded monotonic (below), a clean reattach on the same epoch is invisible
+    to clients: their cached cursors stay valid and replay continues.
+
+    BUMP iff any of:
+      - thread status is terminal (``_TERMINAL_THREAD_STATUSES``);
+      - the current epoch already carries a terminal lifecycle frame
+        (``_TERMINAL_LIFECYCLE_EVENT_KINDS``): the cockpit's
+        ``resumedFromEpoch`` guard swallows terminal frames at
+        ``epoch <= resumedFromEpoch``, so a resumed life must move to a
+        higher epoch for its own eventual terminal frames to render;
+      - the epoch is non-virgin yet has no surviving rows (retention pruned
+        it, or the 0116 backfill found it already pruned): every cursor a
+        client could hold predates retention, so a bump costs nothing, while
+        reuse could seed below a cached cursor (dead poll) and re-trips the
+        resume-guard hazard above;
+      - the seed probe itself fails (safety fallback: never reuse an epoch
+        we could not read).
+
+    On REUSE the seed is ``GREATEST(events_seq_hwm, MAX(seq))``:
+    ``events_seq_hwm`` (0116) survives retention pruning of the rows
+    themselves, so the seed stays above every seq ever served even when
+    ``MAX(seq)`` shrank; MAX is belt-and-braces for rows written before the
+    hwm existed (the UNIQUE (thread_id, epoch, seq) index backs it). The
+    caller sets ``_next_seq = seq_seed`` — ``_broadcast`` pre-increments, so
+    the first frame lands at seed + 1.
     """
 
-    sql = """
-        UPDATE threads
-        SET events_epoch = events_epoch + 1
-        WHERE id = $1
-        RETURNING events_epoch
-    """
     try:
         async with postgres_conn.acquire() as conn:
-            row = await conn.fetchrow(sql, thread_id)
+            row = await conn.fetchrow(
+                "SELECT events_epoch, events_seq_hwm, status "
+                "FROM threads WHERE id = $1",
+                thread_id,
+            )
+            if row is None:
+                raise EventJournalUnavailable(
+                    "Persistent event journal thread does not exist"
+                )
+            try:
+                epoch = int(row["events_epoch"])
+                hwm = int(row["events_seq_hwm"] or 0)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise EventJournalUnavailable(
+                    "Persistent event journal returned an invalid generation"
+                ) from exc
+            status = row["status"]
+
+            bump_reason: Optional[str] = None
+            max_seq = 0
+            if status in _TERMINAL_THREAD_STATUSES:
+                bump_reason = f"terminal_status:{status}"
+            else:
+                try:
+                    has_terminal_frame = await conn.fetchval(
+                        "SELECT EXISTS ("
+                        "  SELECT 1 FROM thread_events "
+                        "  WHERE thread_id = $1 AND epoch = $2 "
+                        "    AND kind = ANY($3::text[])"
+                        ")",
+                        thread_id,
+                        epoch,
+                        list(_TERMINAL_LIFECYCLE_EVENT_KINDS),
+                    )
+                    if has_terminal_frame:
+                        bump_reason = "terminal_lifecycle_frame"
+                    else:
+                        max_seq_raw = await conn.fetchval(
+                            "SELECT MAX(seq) FROM thread_events "
+                            "WHERE thread_id = $1 AND epoch = $2",
+                            thread_id,
+                            epoch,
+                        )
+                        if max_seq_raw is None and (hwm > 0 or epoch > 0):
+                            # Non-virgin epoch with zero surviving rows: its
+                            # entire history is beyond retention (hwm > 0), or
+                            # it predates 0116 and was backfilled to 0 after
+                            # the prune already ran (epoch > 0). Either way no
+                            # client cursor for it can still be served.
+                            bump_reason = "epoch_beyond_retention"
+                        else:
+                            max_seq = int(max_seq_raw or 0)
+                except Exception as probe_exc:
+                    bump_reason = f"seed_probe_failed:{type(probe_exc).__name__}"
+                    logger.warning(
+                        "Event journal seed probe failed for thread %s — "
+                        "falling back to an epoch bump: %s",
+                        thread_id,
+                        probe_exc,
+                    )
+
+            if bump_reason is None:
+                seq_seed = max(hwm, max_seq)
+                if seq_seed > hwm:
+                    # Persist the correction so the mark is authoritative for
+                    # the fenced flush and any system-frame allocation.
+                    await conn.execute(
+                        "UPDATE threads SET events_seq_hwm = $2 "
+                        "WHERE id = $1 AND events_seq_hwm < $2",
+                        thread_id,
+                        seq_seed,
+                    )
+                logger.info(
+                    "Reusing events_epoch %d for thread %s "
+                    "(seq_seed=%d hwm=%d max_seq=%d status=%s)",
+                    epoch,
+                    thread_id,
+                    seq_seed,
+                    hwm,
+                    max_seq,
+                    status,
+                )
+                return epoch, seq_seed
+
+            new_epoch = await _event_journal.bump_epoch(conn, thread_id=thread_id)
+            logger.info(
+                "Bumped events_epoch %d -> %d for thread %s (reason=%s)",
+                epoch,
+                new_epoch,
+                thread_id,
+                bump_reason,
+            )
+            return new_epoch, 0
+    except EventJournalUnavailable:
+        raise
+    except LookupError as exc:
+        # bump_epoch: the thread row vanished between statements.
+        raise EventJournalUnavailable(
+            "Persistent event journal thread does not exist"
+        ) from exc
     except Exception as exc:
         raise EventJournalUnavailable(
             "Persistent event journal initialization failed"
         ) from exc
 
-    if row is None:
-        raise EventJournalUnavailable("Persistent event journal thread does not exist")
-    try:
-        epoch = int(row["events_epoch"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise EventJournalUnavailable(
-            "Persistent event journal returned an invalid generation"
-        ) from exc
 
-    logger.info("Allocated events_epoch %d for thread %s", epoch, thread_id)
-    return epoch
+async def _bump_event_journal_epoch(postgres_conn: Any, thread_id: str) -> int:
+    """Force a new event generation: epoch + 1, seq high-water mark to 0.
+
+    The deliberate-bump half of the epoch contract — rewind (its caller here)
+    and the reaper's steal (M4, importing ``src.shared.event_journal``
+    directly) are the only legitimate bumpers; attach resolution reuses live
+    epochs (``_resolve_event_journal_epoch``). Wraps the shared
+    single-statement implementation with this app's pool acquire and failure
+    taxonomy.
+    """
+
+    try:
+        async with postgres_conn.acquire() as conn:
+            new_epoch = await _event_journal.bump_epoch(conn, thread_id=thread_id)
+    except LookupError as exc:
+        raise EventJournalUnavailable(
+            "Persistent event journal thread does not exist"
+        ) from exc
+    except Exception as exc:
+        raise EventJournalUnavailable(
+            "Persistent event journal epoch bump failed"
+        ) from exc
+    logger.info(
+        "Bumped events_epoch to %d for thread %s (deliberate bump)",
+        new_epoch,
+        thread_id,
+    )
+    return new_epoch
 
 
 async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
@@ -1527,6 +2010,9 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
     global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
     global _loop_user_queue, _loop_interrupt_flag, _hard_interrupt_event
     global _loop_last_user_content
+
+    await _stop_thread_interrupt_watcher()
+    await _stop_thread_control_watcher()
 
     writer = _event_writer
     if writer is not None:
@@ -1548,7 +2034,21 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
             tool_context.citation_verdict_callback = None
             tool_context.canvas_event_callback = None
         try:
-            await failed_session.cleanup()
+            # Attach failure never owns thread lifecycle. In particular, a
+            # successor claimant may need the deterministic remote tmux left by
+            # the previous owner, so partial-attach cleanup is transport-only.
+            await failed_session.cleanup(
+                preserve_shell=True,
+                preserve_workspace_daemons=(
+                    getattr(failed_session, "shell_owner_token", None) is not None
+                    and getattr(
+                        failed_session,
+                        "stateless_warm_reuse_safe",
+                        True,
+                    )
+                    is False
+                ),
+            )
         except Exception as exc:
             logger.warning(
                 "Failed to clean partial session after event-journal error "
@@ -1571,6 +2071,56 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
     _subscribers.clear()
 
 
+# Memory-path embedding routing keys. EmbeddingService is a process-wide
+# singleton built from these EMBEDDING_* env vars at first call.
+MEMORY_EMBEDDING_ENV_KEYS = (
+    "EMBEDDING_PROVIDER",
+    "EMBEDDING_MODEL",
+    "EMBEDDING_BASE_URL",
+    "EMBEDDING_API_KEY",
+)
+
+
+def _apply_session_embedding_env(env_keys: Optional[Dict[str, Any]]) -> None:
+    """Replace the process embedding profile with this attach's snapshot.
+
+    Scrub-on-claim (stateless_agents.md §5.6 — M3 deliverable D, and a live
+    pinned-lane pod-reuse leak): the KB path (``apply_kb_embedding_env``) was
+    deliberately hardened pop-first for pod reuse; the memory path was not —
+    it pushed ``EMBEDDING_API_KEY`` into process-global ``os.environ`` and
+    never popped it, so a following tenant whose config omitted ``env_keys``
+    skipped the block and inherited the prior tenant's key + un-reset
+    singleton. Symmetric now: at EVERY attach, unconditionally pop all
+    memory-embedding keys and null the memory-embedding singleton BEFORE
+    applying the new ``env_keys`` (which then re-set them only if provided).
+
+    Acceptance (tests/test_turn_executor.py scrub matrix): after an attach
+    with tenant-A env_keys followed by an attach with tenant-B env_keys
+    absent, ``os.environ`` carries no A values and the singleton is None.
+    """
+    for k in MEMORY_EMBEDDING_ENV_KEYS:
+        os.environ.pop(k, None)
+    from ..services import embedding_service as _embedding_module
+
+    _embedding_module._embedding_service = None
+    # KB path: already a complete pop-first attach-time snapshot.
+    _embedding_module.apply_kb_embedding_env(env_keys)
+    if env_keys:
+        for k in MEMORY_EMBEDDING_ENV_KEYS:
+            value = env_keys.get(k)
+            if value is not None:
+                os.environ[k] = str(value)
+        if any(
+            k in env_keys
+            for k in MEMORY_EMBEDDING_ENV_KEYS + _embedding_module.KB_EMBEDDING_ENV_KEYS
+        ):
+            logger.info(
+                "Embedding overrides applied: memory_model=%s, kb_model=%s",
+                os.environ.get("EMBEDDING_MODEL"),
+                os.environ.get("KB_EMBEDDING_MODEL"),
+            )
+
+
 async def _attach_session(
     thread_id: str,
     config_override: Optional[Dict[str, Any]] = None,
@@ -1589,7 +2139,7 @@ async def _attach_session(
     base instead of the pod's boot config when provided.
     """
     global _session, _thread_id, _events_epoch, _next_seq, _tool_inflight
-    global _turn_event_open
+    global _turn_event_open, _session_generation, _draft_title_value
     global _event_writer, _cloud_sync_retry_pending
 
     _cloud_sync_retry_pending = False
@@ -1599,6 +2149,14 @@ async def _attach_session(
         raise RuntimeError(
             f"Cannot attach thread {thread_id}: already attached to {_thread_id}"
         )
+
+    stale_side_tasks = {task for task in _session_side_tasks if not task.done()}
+    if stale_side_tasks:
+        raise RuntimeError(
+            "Cannot attach a new thread while prior session tasks remain active"
+        )
+    _session_generation += 1
+    _draft_title_value = None
 
     # A normal detach always closes and clears the prior writer. Recover from a
     # stale writer defensively before a pool-mode reattach so no event can land
@@ -1619,10 +2177,12 @@ async def _attach_session(
     # The orchestrator attaches the lite object-store mounts to this response
     # for lite threads, so the session can build its backend without a pod.
     _rc, _co = resolved_config, config_override
+    workspace_generation = ""
     if _rc is None and _co is None and _orchestrator_client and _thread_id:
         try:
             _peek = await _orchestrator_client.get_thread_workspace(_thread_id)
-            if _peek:
+            if isinstance(_peek, dict):
+                workspace_generation = str(_peek.get("workspace_generation") or "")
                 _rc = _peek.get("resolved_config")
                 _co = _peek.get("config_override")
         except Exception:
@@ -1671,6 +2231,12 @@ async def _attach_session(
             _thread_id,
         )
 
+    workspace_generation = str(
+        (workspace_override or {}).get("workspace_generation")
+        or workspace_generation
+        or ""
+    )
+
     # Apply config overrides, project_ids, and datasources from thread metadata
     if not config_override:
         config_override = (workspace_override or {}).get("config_override")
@@ -1700,6 +2266,9 @@ async def _attach_session(
         try:
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if ws_info:
+                workspace_generation = workspace_generation or str(
+                    ws_info.get("workspace_generation") or ""
+                )
                 if not config_override:
                     config_override = ws_info.get("config_override")
                 if resolved_config is None:
@@ -1743,6 +2312,7 @@ async def _attach_session(
         )
         mcp_manager = datasources_dict.get("mcp")
         if mcp_manager is not None:
+            _t_step = time.perf_counter()
             try:
                 await mcp_manager.connect_all()
             except Exception as e:
@@ -1751,6 +2321,9 @@ async def _attach_session(
                     type(e).__name__,
                 )
             mcp_manager.annotate_configs()
+            logger.info(
+                "attach step: mcp connect_all %.2fs", time.perf_counter() - _t_step
+            )
 
         # Inject datasource tool categories so the correct tools are loaded
         # when config is resolved below. Shared map with the orchestrator's
@@ -1958,49 +2531,16 @@ async def _attach_session(
             aux_cfg.base_url or "default",
         )
 
-    # Embedding override. EmbeddingService is a process-wide singleton built
-    # from EMBEDDING_* env vars at first call. When the orchestrator supplies
-    # env_keys carrying embedding routing, push them onto os.environ and
-    # clear the singleton so the next get_embedding_service() rebuilds with
-    # the right base_url + api_key. Without this the singleton stays bound
-    # to whatever was set at boot.
+    # Embedding override + scrub-on-claim (§5.6): replace the process-wide
+    # embedding profile (memory + KB) with this attach's snapshot — pop-first
+    # on BOTH paths, singleton nulled unconditionally. Extracted to a helper
+    # so the tenant-A→tenant-B residue acceptance is unit-testable.
     _env_keys_src = (
         (effective_config.extra or {}).get("env_keys")
         if _hydrated
         else (config_override.get("env_keys") if config_override else None)
     )
-    from ..services.embedding_service import (
-        KB_EMBEDDING_ENV_KEYS,
-        apply_kb_embedding_env,
-    )
-
-    # Pool agents are reused across threads. Treat the dedicated KB profile as
-    # a complete attach-time snapshot: clear the previous thread's transport
-    # even when this attach has no knowledge scope or the new provider omits a
-    # base URL/key that the previous endpoint needed.
-    apply_kb_embedding_env(_env_keys_src)
-    if _env_keys_src:
-        env_keys = _env_keys_src
-        memory_embedding_keys = (
-            "EMBEDDING_PROVIDER",
-            "EMBEDDING_MODEL",
-            "EMBEDDING_BASE_URL",
-            "EMBEDDING_API_KEY",
-        )
-        embedding_keys = memory_embedding_keys + KB_EMBEDDING_ENV_KEYS
-        if any(k in env_keys for k in embedding_keys):
-            for k in memory_embedding_keys:
-                if k in env_keys and env_keys[k] is not None:
-                    os.environ[k] = str(env_keys[k])
-            from ..services import embedding_service as _embedding_module
-
-            if any(k in env_keys for k in memory_embedding_keys):
-                _embedding_module._embedding_service = None
-            logger.info(
-                "Embedding overrides applied: memory_model=%s, kb_model=%s",
-                os.environ.get("EMBEDDING_MODEL"),
-                os.environ.get("KB_EMBEDDING_MODEL"),
-            )
+    _apply_session_embedding_env(_env_keys_src)
 
     from ..services.knowledge.bindings import build_knowledge_bindings
 
@@ -2010,9 +2550,19 @@ async def _attach_session(
     )
 
     # Create PersistentSession
+    live_lease = _current_lease_var.get()
+    shell_owner_token = None
+    if live_lease is not None and live_lease.active:
+        if str(live_lease.unit_id) != str(_thread_id):
+            raise RuntimeError(
+                "Stateless lease identity does not match the session being attached"
+            )
+        shell_owner_token = live_lease.lease_token
+
     _session = PersistentSession(
         thread_id=_thread_id,
         config=effective_config,
+        shell_owner_token=shell_owner_token,
         project_ids=project_ids or [],
         datasources=datasources_dict,
         knowledge_bindings=knowledge_bindings,
@@ -2025,6 +2575,7 @@ async def _attach_session(
     git_remote_url = (
         workspace_override.get("git_remote_url") if workspace_override else None
     )
+    _t_step = time.perf_counter()
     await _session.setup(
         llm=llm,
         auxiliary_llm=auxiliary_llm,
@@ -2034,6 +2585,7 @@ async def _attach_session(
         git_remote_url=git_remote_url,
         cloud_mount_cfg=cloud_mount_cfg,
     )
+    logger.info("attach step: session.setup %.2fs", time.perf_counter() - _t_step)
 
     # Live citation-verdict push: let the engine's background verifier broadcast
     # pending→verified/failed so the cockpit citations panel updates in place
@@ -2043,27 +2595,42 @@ async def _attach_session(
         _session.tool_context.citation_verdict_callback = _emit_citation_verdict
         _session.tool_context.canvas_event_callback = _emit_canvas_event
 
-    # Allocate one authoritative generation per runtime attach before the first
-    # broadcast. This is unconditional even when the previous generation has no
-    # rows: retention may have pruned it while clients still cache a high
-    # cursor. A provisioning SSE opened against the pre-attach generation uses
-    # the existing mid-stream epoch-change reconciliation path.
+    # Resolve the authoritative (generation, seq seed) before the first
+    # broadcast. Clean reattaches REUSE the thread's current epoch with the
+    # seq counter seeded above every previously served frame, so cached client
+    # cursors stay valid and no cache-wipe cascade fires; the epoch bumps only
+    # when the previous session life is terminal (see
+    # _resolve_event_journal_epoch). A provisioning SSE opened against a
+    # pre-bump generation uses the existing mid-stream epoch-change
+    # reconciliation path.
     _tool_inflight = False
     _turn_event_open = False
     _events_epoch = 0
     _next_seq = 0
     if _session is not None and _session.postgres_conn is not None:
         try:
-            _events_epoch = await _resolve_event_journal_epoch(
+            _events_epoch, _next_seq = await _resolve_event_journal_epoch(
                 _session.postgres_conn, _thread_id
+            )
+            live_lease = _current_lease_var.get()
+            pinned_agent_id = (
+                _registered_pinned_agent_id() if live_lease is None else None
             )
             writer = _OrderedPersistentEventWriter(
                 postgres_conn=_session.postgres_conn,
                 thread_id=_thread_id,
+                epoch=_events_epoch,
                 on_terminal_failure=_event_persistence_failed,
+                # Stateless executor attach: fence every flush on the live
+                # claim (the executor set the LeaseHandle before attaching).
+                # Pinned lane: ContextVar default None → today's statement.
+                lease=live_lease,
+                pinned_agent_id=pinned_agent_id,
             )
             writer.start()
             _event_writer = writer
+            if live_lease is None and pinned_agent_id is not None:
+                await _start_thread_control_watcher(agent_id=pinned_agent_id)
         except Exception as exc:
             logger.error(
                 "Event journal initialization failed; aborting session attach "
@@ -2128,22 +2695,27 @@ async def _attach_session(
     # cloud_mount_active above); letting either field through here would
     # rebuild a live agent-service WebDAV sync in every degraded-protected
     # scenario (refused engage, flag off, VM tier, overlay-failure teardown).
+    suppress_disposable_cloud = bool(
+        _stateless_mode()
+        and getattr(getattr(effective_config, "workspace", None), "backend", None)
+        == "none"
+    )
     cloud_cfg = (
         None
-        if cloud_mount_active or protected_cloud
+        if cloud_mount_active or protected_cloud or suppress_disposable_cloud
         else workspace_override.get("cloud_sync")
         if workspace_override
         else None
     )
     nc_folder = (
         None
-        if protected_cloud
+        if protected_cloud or suppress_disposable_cloud
         else workspace_override.get("nc_session_folder")
         if workspace_override
         else None
     )
     cloud_degraded_hint = False
-    if (
+    if not suppress_disposable_cloud and (
         not cloud_mount_active
         and (not cloud_cfg or not nc_folder)
         and _orchestrator_client
@@ -2152,6 +2724,9 @@ async def _attach_session(
         try:
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if ws_info:
+                workspace_generation = workspace_generation or str(
+                    ws_info.get("workspace_generation") or ""
+                )
                 protected_cloud = protected_cloud or bool(
                     ws_info.get("protected_cloud")
                 )
@@ -2160,7 +2735,27 @@ async def _attach_session(
                     nc_folder = nc_folder or ws_info.get("nc_session_folder")
                 cloud_degraded_hint = bool(ws_info.get("cloud_sync_degraded"))
         except Exception:
-            pass
+            # A stateless turn cannot distinguish "no cloud configured" from
+            # "the credential/config boundary was unreachable" and must not
+            # execute unsynced on that ambiguity. Pinned keeps the historical
+            # degraded behavior and retries on its next boundary.
+            if _stateless_mode():
+                _cloud_sync_retry_pending = True
+    if suppress_disposable_cloud:
+        # backend=none is an intentionally disposable ScratchBackend with no
+        # user file tools. The orchestrator may still provision a generic
+        # session cloud folder; mirroring internal scratch scaffolding into it
+        # would both violate the stateless tier contract and lack a durable
+        # workspace generation. Suppress both structured and legacy sync paths
+        # only for stateless claims; pinned keeps its historical behavior.
+        cloud_cfg = None
+        nc_folder = None
+        _cloud_sync_retry_pending = False
+    # The late credential/config fetch above is often the first place a lite
+    # attach receives its binding generation. Retain the final value even when
+    # no coordinator is built, so an omitted/degraded payload cannot hide a
+    # pending generation row from the turn-start fail-closed check.
+    _session.cloud_sync_workspace_generation = workspace_generation
     # Back-compat: translate a bare nc_session_folder into the new schema.
     # F-C1: gated on `not protected_cloud` too (defense-in-depth — nc_folder
     # is already forced None above for a protected thread, but this keeps
@@ -2173,7 +2768,11 @@ async def _attach_session(
                 workspace_path=_session.workspace_manager.path,
                 workspace_backend=_session.workspace_manager.backend,
                 cloud_cfg=cloud_cfg,
+                thread_id=str(_thread_id or ""),
+                workspace_generation=workspace_generation,
             )
+            if _session.workspace_sync is None:
+                raise RuntimeError("cloud sync payload resolved no usable mounts")
             if _session.workspace_sync:
                 # Phase 1 of cloud_collaboration_model.md: turn-boundary sync,
                 # not background polling. Do one blocking initial pull to
@@ -2181,7 +2780,28 @@ async def _attach_session(
                 # the agent starts its first turn — and raise immediately if
                 # any mount is broken, so the operator sees it before any
                 # actual work is committed.
-                await _session.workspace_sync.pull_all()
+                #
+                # Stateless executor: SKIP this pull. Every claimed turn runs
+                # the same full pull at turn start (_run_persistent_turn's
+                # turn-boundary sync) seconds after this attach, so the
+                # attach-time pull is a duplicate full-mount walk on the
+                # claim's critical path (measured 41s of the 49s attach,
+                # 2026-08-08 baseline). Broken-mount surfacing moves to the
+                # turn's _resilient_cloud_sync path, which broadcasts
+                # workspace_sync.error and flags degradation — same operator
+                # visibility, one walk instead of two.
+                if _stateless_mode():
+                    logger.info(
+                        "attach step: initial cloud pull_all skipped "
+                        "(stateless — turn-start pull covers seeding)"
+                    )
+                else:
+                    _t_step = time.perf_counter()
+                    await _session.workspace_sync.pull_all()
+                    logger.info(
+                        "attach step: initial cloud pull_all %.2fs",
+                        time.perf_counter() - _t_step,
+                    )
                 logger.info(
                     "Cloud workspace sync coordinator started (%d mount(s))",
                     len(_session.workspace_sync),
@@ -2231,10 +2851,15 @@ async def _attach_session(
         _cloud_sync_retry_pending = True
 
     # Restore message history from DB (for session resume)
+    _t_step = time.perf_counter()
     await _restore_session_messages()
+    logger.info("attach step: message restore %.2fs", time.perf_counter() - _t_step)
 
-    # Mark thread as active
-    await _update_thread_status("active")
+    # Mark thread as active. Stateless attach is an authorization boundary:
+    # End may have fenced the queue after claim-bundle returned, so a failed
+    # exact-lease CAS must abort before loop/tool admission.
+    if not await _update_thread_status("active"):
+        raise LeaseLostError("stateless attach lost lifecycle authority")
 
     # Initialize headless loop primitives. These survive WS reconnect so that
     # the loop can keep reading input / responding to interrupts across
@@ -2257,7 +2882,13 @@ async def _attach_session(
     # readable in the very first turn. Gated on the loop not already running:
     # a re-attach (e.g. a retried /session/attach POST) must not inject a
     # second boot wake — the k3d smoke produced exactly that duplicate.
-    if _officer_cfg() is not None and (_loop_task is None or _loop_task.done()):
+    # Stateless executor pods never self-wake: turns run only under a
+    # run_queue lease (officer threads stay on the pinned lane in S1).
+    if (
+        _officer_cfg() is not None
+        and not _stateless_mode()
+        and (_loop_task is None or _loop_task.done())
+    ):
         _ensure_persistent_loop_started("officer_boot")
         await _accept_user_input(
             "[wake: session started/restarted] You are the project officer "
@@ -2271,7 +2902,13 @@ async def _attach_session(
     logger.info(f"Session attached: thread={_thread_id} events_epoch={_events_epoch}")
 
 
-async def _terminate_session(reason: str, *, mark_thread: bool = True) -> None:
+async def _terminate_session(
+    reason: str,
+    *,
+    mark_thread: bool = True,
+    preserve_shell: Optional[bool] = None,
+    preserve_workspace_daemons: bool = False,
+) -> None:
     """Tear down the current session and return to idle.
 
     Called by:
@@ -2298,7 +2935,13 @@ async def _terminate_session(reason: str, *, mark_thread: bool = True) -> None:
          uses that to keep status authority with the orchestrator, which
          flips the thread to 'suspended' instead.
       3. Git commit + push.
-      4. Clean up session resources.
+      4. Clean up session resources. ``preserve_shell`` is an independent
+         ownership disposition: true for a claim/pod handoff, false for a
+         genuine thread end. When omitted it follows ``not mark_thread`` for
+         back-compat, but losing an exact pinned binding always forces preserve.
+         ``preserve_workspace_daemons`` is narrower still: only the stateless
+         physical-claim handoff leaves workspace-side rclone/overlay processes
+         resident while retiring their agent-local controllers.
       5. Clear session globals AND headless input primitives + subscribers.
       6. Increment session counter, exit if max reached.
 
@@ -2306,34 +2949,70 @@ async def _terminate_session(reason: str, *, mark_thread: bool = True) -> None:
     "idle_timeout", "loop_crash", "loop_complete", "shutdown", "rest_detach",
     "thread_ended_oob", "boot_ws_timeout", "legacy".
     """
-    global _terminating
+    global _terminating, _termination_task
+    active = _termination_task
+    if active is not None and not active.done():
+        if asyncio.current_task() is _loop_task:
+            # The active owner cancels and awaits this loop task. Awaiting the
+            # owner here would form a cycle; this is the one safe no-op
+            # re-entry. Every independent release/complete caller waits below.
+            logger.debug("Terminate(%s) re-entered from the loop being joined", reason)
+            return
+        await asyncio.shield(active)
+        return
     if not _session:
         return
-    if _terminating:
-        logger.debug(
-            "Terminate(%s) skipped — session teardown already in progress", reason
-        )
-        return
-    _terminating = True
+
+    async def _run() -> None:
+        global _terminating, _termination_task
+        _terminating = True
+        try:
+            await _terminate_session_inner(
+                reason,
+                mark_thread=mark_thread,
+                preserve_shell=preserve_shell,
+                preserve_workspace_daemons=preserve_workspace_daemons,
+            )
+        finally:
+            _terminating = False
+            if _termination_task is asyncio.current_task():
+                _termination_task = None
+
+    task = asyncio.create_task(
+        _run(),
+        name=f"session-terminate-{str(_thread_id or 'detached')[:12]}",
+    )
+    _termination_task = task
     try:
-        await _terminate_session_inner(reason, mark_thread=mark_thread)
-    finally:
-        _terminating = False
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Teardown continues as the single owner. Propagate caller
+        # cancellation without publishing a false completion signal.
+        raise
 
 
-async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> None:
+async def _terminate_session_inner(
+    reason: str,
+    *,
+    mark_thread: bool = True,
+    preserve_shell: Optional[bool] = None,
+    preserve_workspace_daemons: bool = False,
+) -> None:
     """Body of _terminate_session — only reached holding the _terminating guard."""
     global _session, _thread_id, _sessions_served, _loop_task
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
     global _hard_interrupt_event
     global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
-    global _event_writer, _cloud_sync_retry_pending
+    global _event_writer, _cloud_sync_retry_pending, _draft_title_value
     global _active_permission_request_id
 
     if not _session:
         return
 
     thread_id = _thread_id
+    preserve_remote_shell = (
+        not mark_thread if preserve_shell is None else preserve_shell
+    )
     logger.info(f"Terminating session: thread={thread_id} reason={reason}")
 
     # Cancel in-flight loop_task FIRST. Out-of-band callers (heartbeat-intent
@@ -2356,23 +3035,88 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     # they would have triggered, no point letting them race the detach.
     _stop_watchdogs()
 
+    # Close public admission before stopping a pinned owner. The dedicated
+    # gate is needed for drain-suspend: the general agent status route forbids
+    # writing ``suspended``, and marking ``ended`` would prevent the snapshot
+    # transition that follows teardown. The thread-row update serializes with
+    # admission; one last exact-owner drain then consumes every request that
+    # committed before closure. A lost binding means a successor owns that
+    # work, so this runtime must not adopt it.
+    pinned_control_owner = (
+        None
+        if _stateless_mode()
+        else (_control_owner_agent_id or _registered_pinned_agent_id())
+    )
+    admission_closed = True
+    if pinned_control_owner is not None:
+        admission_closed = await _close_pinned_control_inbox(
+            agent_id=pinned_control_owner
+        )
+        if not admission_closed:
+            # The reciprocal binding is the pinned owner's resource fence. A
+            # stale pod that lost it may close only its own transports; the
+            # successor can already be using the deterministic remote tmux.
+            preserve_remote_shell = True
+            logger.info(
+                "Pinned control admission close skipped: exact binding moved "
+                "(thread=%s agent=%s)",
+                thread_id,
+                pinned_control_owner,
+            )
+
     # Retire this thread's announced permission rows, then drop the ledger.
     # The turn-end sweep in _loop_on_turn_complete is the usual owner, but the
-    # cancel above skips it: the graph's `except CancelledError: return` never
-    # reaches on_turn_complete, so a session terminated mid-batch (every
-    # ✕-detach, drain, watchdog, shutdown) leaves its rows 'pending' with
-    # nothing left to reap them. They then re-render as live approval cards
-    # that execute nothing — and, before the ledger was thread-scoped, the
-    # NEXT session's first announce swept them and broadcast
-    # permission.resolved for a thread its clients had never seen.
-    #
-    # The reservations are dropped first, deliberately: the loop task is dead,
-    # so nothing is legitimately holding a gate, and a stale reservation would
-    # make the sweep skip a row we are about to forget about.
+    # cancel above skips it. The helper holds the exact queue lease or pinned
+    # reciprocal binding through each irreversible UPDATE, so a binding move
+    # after admission closure cannot let this stale runtime touch successor
+    # rows.
     _gates_in_flight.clear()
     _active_permission_request_id = None
     await _retire_announced_permission_rows(f"session terminated ({reason})")
     _announced_permission_rows.clear()
+
+    if mark_thread:
+        if pinned_control_owner is not None and not admission_closed:
+            logger.info(
+                "Pinned lifecycle close skipped after ownership moved "
+                "(thread=%s agent=%s)",
+                thread_id,
+                pinned_control_owner,
+            )
+        elif not await _update_thread_status(
+            "ended",
+            pinned_agent_id=pinned_control_owner,
+        ):
+            if (
+                pinned_control_owner is not None
+                and not await _set_pinned_control_admission(
+                    agent_id=pinned_control_owner,
+                    open_for_admission=False,
+                )
+            ):
+                preserve_remote_shell = True
+                logger.info(
+                    "Pinned lifecycle close lost ownership before status CAS "
+                    "(thread=%s agent=%s)",
+                    thread_id,
+                    pinned_control_owner,
+                )
+            else:
+                raise EventJournalUnavailable(
+                    "cannot durably close thread lifecycle during teardown: "
+                    f"{thread_id}"
+                )
+
+    # A pinned consumer owns the attach lifetime; a stateless consumer owns
+    # the active lease. In both cases it must be fully stopped before the
+    # journal writer drains or ownership is released.
+    await _stop_thread_interrupt_watcher()
+    await _stop_thread_control_watcher()
+
+    # Join process-global side tasks while the captured session/thread identity
+    # and event writer are still authoritative.  A delayed title or protected
+    # cloud ping must never observe the next pool attachment.
+    await _quiesce_session_side_tasks()
 
     # B11: final memory capture for ALL terminate reasons — the ✕-button
     # detach (and drain, watchdog, shutdown, …) historically skipped
@@ -2385,6 +3129,7 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
         _session.memory_service is not None
         and not _session.final_memory_extracted
         and _session.messages
+        and not (_session.shell_owner_token is not None and not mark_thread)
     ):
         try:
             from ..services.memory import CaptureEvent
@@ -2397,11 +3142,22 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
         except Exception as e:
             logger.warning(f"Terminate memory capture failed (non-fatal): {e}")
 
-    # Mark thread as ended (still resumable — `ended` is the only inactive
-    # state). The drain-suspend path passes mark_thread=False: the
-    # orchestrator flips the thread to 'suspended' right after this teardown.
-    if mark_thread:
-        await _update_thread_status("ended")
+    # capture_nowait(pre_compaction) and asynchronous citation verification
+    # both carry session-scoped write/callback authority. Disarm and join them
+    # before the journal closes and before a queue claimant can be released.
+    try:
+        quiesce_result = _session.quiesce_background_tasks()
+        if inspect.isawaitable(quiesce_result):
+            await quiesce_result
+        elif isinstance(_session, PersistentSession):
+            raise RuntimeError("PersistentSession RAM quiescence is not awaitable")
+    except Exception:
+        if _session.shell_owner_token is not None:
+            raise
+        logger.warning(
+            "Pinned session background-task quiescence failed (contained)",
+            exc_info=True,
+        )
 
     # Final cloud sync + drop secrets. No more background polling to stop:
     # Phase 1 moved sync to turn boundaries via the coordinator. The last
@@ -2410,8 +3166,14 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     if _session.workspace_sync:
         try:
             await _await_pending_cloud_push()
-            await _session.workspace_sync.push_all()
-            await _session.workspace_sync.pull_all()
+            # Stateless bytes are committed only by the armed generation task
+            # above. A second raw push here would have no durable requirement
+            # or acknowledgement and, on lease-loss teardown, could overlap a
+            # successor's pull. Pinned teardown keeps its existing final
+            # push+pull byte-for-byte.
+            if not _stateless_mode():
+                await _session.workspace_sync.push_all()
+                await _session.workspace_sync.pull_all()
         except Exception as e:
             logger.warning(f"Final cloud sync failed (non-fatal): {e}")
         try:
@@ -2447,8 +3209,17 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
         finally:
             _event_writer = None
 
-    # Clean up session resources
-    await _session.cleanup()
+    # Shell ownership is deliberately separate from thread-status authority.
+    # Claim switches preserve by explicit/default disposition; a stale pinned
+    # owner that lost its reciprocal binding is forced to preserve above.
+    # This is deliberately after final Git: GitManager itself delegates through
+    # the remote shell. From here onward cleanup may mutate mount transports but
+    # no new tool/shell command is admitted.
+    _session.retire_shell_owner()
+    await _session.cleanup(
+        preserve_shell=preserve_remote_shell,
+        preserve_workspace_daemons=preserve_workspace_daemons,
+    )
 
     # Clear session state
     _session = None
@@ -2462,6 +3233,7 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     _loop_interrupt_flag = None
     _hard_interrupt_event = None
     _loop_last_user_content = [""]
+    _draft_title_value = None
     _clear_all_canvas_awareness()
     _subscribers.clear()
 
@@ -2535,7 +3307,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 "status": (
                     "healthy" if app_guide.get("state") == "ready" else "degraded"
                 ),
-                "mode": "persistent",
+                "mode": "stateless" if _stateless_mode() else "persistent",
                 "thread_id": _thread_id,
                 "uptime_seconds": (datetime.now() - _started_at).total_seconds()
                 if _started_at
@@ -2546,6 +3318,16 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.get("/ready")
     async def ready():
+        if _stateless_mode():
+            # A stateless executor is "ready" when its claim loop is alive —
+            # there is no session/WS surface to gate on (k8s probes, M5).
+            from .turn_executor import executor_running
+
+            is_ready = executor_running()
+            return JSONResponse(
+                {"ready": is_ready, "mode": "stateless", "thread_id": _thread_id},
+                status_code=200 if is_ready else 503,
+            )
         is_ready = _session_ready()
         return JSONResponse(
             {"ready": is_ready, "mode": "persistent", "thread_id": _thread_id},
@@ -2606,6 +3388,11 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 base instead of this pod's boot config (pool pods boot as
                 workers; see docs/issues/session_config_name_plumbing.md)
         """
+        if _stateless_mode():
+            # The executor owns attach/detach on this pod — an out-of-band
+            # attach would corrupt its session cache and run outside a lease.
+            return _stateless_reject()
+
         thread_id = request.get("thread_id")
         if not thread_id:
             return JSONResponse({"error": "thread_id is required"}, status_code=400)
@@ -2660,6 +3447,10 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         Called by the orchestrator when a thread ends, or by the agent
         itself on idle timeout.  Tears down the PersistentSession.
         """
+        if _stateless_mode():
+            # A detach mid-lease would kill a claimed turn out-of-band; the
+            # executor detaches its own cached session between claims.
+            return _stateless_reject()
         if _session is None:
             return JSONResponse({"status": "already_idle", "thread_id": None})
 
@@ -2715,8 +3506,8 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         return await handle_api_input(request)
 
     @app.post("/api/interrupt")
-    async def api_interrupt():
-        return await handle_api_interrupt()
+    async def api_interrupt(request: Request):
+        return await handle_api_interrupt(request)
 
     @app.post("/api/approve")
     async def api_approve(request: Request):
@@ -2837,7 +3628,20 @@ async def _accept_user_input(content: str, *, role: str = "human") -> str:
     # Injected input is excluded: a wake landing in a young session would
     # retitle the whole thread after the job-completion text.
     if not injected and _session is not None and _session.turn_count <= 2:
-        asyncio.create_task(_early_title_from_prompt(content))
+        title_session = _session
+        title_thread_id = str(_thread_id or "")
+        title_generation = _session_generation
+        _track_session_side_task(
+            asyncio.create_task(
+                _early_title_from_prompt(
+                    content,
+                    expected_session=title_session,
+                    expected_thread_id=title_thread_id,
+                    expected_generation=title_generation,
+                ),
+                name=f"early-title-{title_thread_id[:12]}",
+            )
+        )
     return msg.id
 
 
@@ -2852,6 +3656,8 @@ async def handle_api_input(request: Request) -> JSONResponse:
     running, and the orchestrator falls back to writing the notice durably for
     the next resume.
     """
+    if _stateless_mode():
+        return _stateless_reject()
     if _session is None or _loop_user_queue is None:
         return JSONResponse({"error": "Session not active"}, status_code=503)
     try:
@@ -2883,12 +3689,22 @@ async def handle_api_input(request: Request) -> JSONResponse:
     )
 
 
-async def handle_api_interrupt() -> JSONResponse:
-    """Signal the loop to stop. Mode is hard vs graceful based on
-    whether a tool call is currently in flight."""
+def _signal_interrupt_for_turn(target_turn_id: int) -> Optional[str]:
+    """Synchronously signal RAM iff ``target_turn_id`` is still active.
+
+    The check and mutation have no await between them. That is the local half
+    of the exact-target fence: the database protects the lease generation,
+    while this function prevents a late request for turn N from interrupting
+    turn N+1 after an in-process transition.
+    """
+
     global _loop_interrupt_flag
-    if _session is None:
-        return JSONResponse({"error": "Session not active"}, status_code=503)
+    if (
+        _session is None
+        or not _turn_event_open
+        or int(_session.turn_count) != int(target_turn_id)
+    ):
+        return None
     mode = "graceful" if _tool_inflight else "hard"
     _loop_interrupt_flag = mode
     # Hard interrupt with no tool in flight ⇒ the loop is parked in an LLM /
@@ -2896,12 +3712,119 @@ async def handle_api_interrupt() -> JSONResponse:
     # waiting for the next cooperative check_interrupt poll.
     if mode == "hard" and _hard_interrupt_event is not None:
         _hard_interrupt_event.set()
+    return mode
+
+
+async def handle_api_interrupt(request: Optional[Request] = None) -> JSONResponse:
+    """Signal the pinned loop, optionally fenced to a correlated turn.
+
+    A body-less call retains the legacy in-cluster contract. New orchestrator
+    forwarding supplies ``client_request_id`` and ``target_turn_id``; those
+    calls are rejected before any RAM mutation unless the exact transcript
+    turn is active. Stateless pods consume the durable inbox instead of this
+    direct route.
+    """
+
+    if _stateless_mode():
+        return _stateless_reject()
+    if _session is None:
+        return JSONResponse({"error": "Session not active"}, status_code=503)
+
+    body: Optional[Dict[str, Any]] = None
+    if request is not None:
+        raw = await request.body()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "invalid JSON", "error_code": "invalid_request"},
+                    status_code=400,
+                )
+            if not isinstance(parsed, dict):
+                return JSONResponse(
+                    {
+                        "error": "body must be a JSON object",
+                        "error_code": "invalid_request",
+                    },
+                    status_code=400,
+                )
+            if parsed:
+                body = parsed
+
+    if body is None:
+        # Legacy callers did not carry a turn identity. Preserve their exact
+        # historical behavior while all new public traffic uses correlation.
+        mode = "graceful" if _tool_inflight else "hard"
+        global _loop_interrupt_flag
+        _loop_interrupt_flag = mode
+        if mode == "hard" and _hard_interrupt_event is not None:
+            _hard_interrupt_event.set()
+        logger.info(
+            "Interrupt received via legacy REST (mode=%s, tool_inflight=%s)",
+            mode,
+            _tool_inflight,
+        )
+        return JSONResponse({"ack": True, "mode": mode})
+
+    client_request_id = body.get("client_request_id")
+    target_turn_id = body.get("target_turn_id")
+    if not isinstance(client_request_id, str) or not client_request_id:
+        return JSONResponse(
+            {
+                "error": "client_request_id must be a non-empty string",
+                "error_code": "invalid_request",
+            },
+            status_code=400,
+        )
+    if (
+        isinstance(target_turn_id, bool)
+        or not isinstance(target_turn_id, int)
+        or target_turn_id < 1
+    ):
+        return JSONResponse(
+            {
+                "error": "target_turn_id must be a positive integer",
+                "error_code": "invalid_request",
+            },
+            status_code=400,
+        )
+
+    response: Dict[str, Any] = {
+        "client_request_id": client_request_id,
+        "target_turn_id": target_turn_id,
+    }
+    request_id = body.get("request_id")
+    if request_id is not None:
+        if not isinstance(request_id, str) or not request_id:
+            return JSONResponse(
+                {
+                    "error": "request_id must be a non-empty string",
+                    "error_code": "invalid_request",
+                },
+                status_code=400,
+            )
+        response["request_id"] = request_id
+
+    mode = _signal_interrupt_for_turn(target_turn_id)
+    if mode is None:
+        return JSONResponse(
+            {
+                **response,
+                "applied": False,
+                "error": "target turn is no longer active",
+                "error_code": "target_turn_not_active",
+            },
+            status_code=409,
+        )
     logger.info(
-        "Interrupt received via REST (mode=%s, tool_inflight=%s)",
+        "Correlated interrupt received via REST "
+        "(target_turn=%d mode=%s tool_inflight=%s)",
+        target_turn_id,
         mode,
         _tool_inflight,
     )
-    return JSONResponse({"ack": True, "mode": mode})
+    return JSONResponse({**response, "ack": True, "applied": True, "mode": mode})
 
 
 async def handle_api_approve(request: Request) -> JSONResponse:
@@ -2911,6 +3834,8 @@ async def handle_api_approve(request: Request) -> JSONResponse:
     row for this thread is resolved (legacy single-pending-at-a-time
     contract). The DB trigger emits NOTIFY → agent's permission_check
     wakes up."""
+    if _stateless_mode():
+        return _stateless_reject()
     if _session is None:
         return JSONResponse({"error": "Session not active"}, status_code=503)
     try:
@@ -2981,6 +3906,26 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
 
     await ws.accept()
 
+    # Stateless executor (M3): sessions on this pod are driven exclusively by
+    # run_queue claims — there is no live WS surface. Mirror the REST 409.
+    if _stateless_mode():
+        try:
+            await ws.send_json(
+                {
+                    "method": "error",
+                    "params": {
+                        "message": (
+                            "stateless executor: this pod serves queued turns; "
+                            "no direct session WebSocket is available"
+                        )
+                    },
+                }
+            )
+        except Exception:
+            pass
+        await ws.close(code=4409, reason="stateless executor")
+        return
+
     # Signal the boot-WS watchdog that a connection arrived. Done before
     # the readiness check so even a failed-to-be-ready connection counts:
     # the user clearly came back, and a different error path applies.
@@ -3025,13 +3970,19 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             "tool": running_tool["tool"],
             "args": _safe_serialize(running_tool["args"]),
         }
+    (
+        durable_permission_mode,
+        durable_narration_mode,
+    ) = await _durable_session_control_modes()
+    task_manager = _session.session_task_manager
+    session_tasks = task_manager.to_dict_list() if task_manager is not None else []
     await _ws_send(
         ws,
         "session.state",
         {
             "thread_id": _thread_id,
-            "permission_mode": _session.permission_mode,
-            "narration_mode": _session.narration_mode,
+            "permission_mode": durable_permission_mode,
+            "narration_mode": durable_narration_mode,
             "turn_count": _session.turn_count,
             # Authoritative join signal for a cold Cockpit reattach. REST can
             # already contain an incrementally persisted prefix of this turn;
@@ -3043,6 +3994,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             "temperature": _session.config.llm.temperature,
             "running_tool": running_tool,
             "pending_permissions": await _pending_permission_requests(),
+            "tasks": session_tasks,
         },
     )
 
@@ -3054,6 +4006,12 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
     # --- WebSocket receive loop ---
     global _loop_interrupt_flag
     try:
+        # The exact current queue lock is also the admission serialization
+        # point. Any old-token admission that started before this claim must
+        # commit before this snapshot; one that starts after it observes the
+        # new token and cannot create old-generation work. Fetch the complete
+        # (unbounded) generation once so one steal produces at most one epoch
+        # rotation and one terminal boundary per abandoned target.
         while True:
             raw = await ws.receive_text()
             try:
@@ -3115,57 +4073,19 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                 await _ws_send(ws, "interrupt.ack", {"mode": mode})
                 logger.info("Interrupt acknowledged (mode=%s)", mode)
 
-            elif method == "mode.set":
-                new_mode = data.get("mode", "supervised")
-                if new_mode in ("supervised", "auto_accept", "autonomous"):
-                    if _session is None:
-                        await _ws_send(
-                            ws,
-                            "error",
-                            {"message": "Session no longer active"},
-                        )
-                        continue
-                    _session.permission_mode = new_mode
-                    if new_mode in ("auto_accept", "autonomous"):
-                        # Rows announced under the stricter mode that the new
-                        # one auto-approves will never reach a gate — retire
-                        # them now so the card shrinks instead of stranding
-                        # entries nobody waits on. The row an active waiter
-                        # holds is deliberately left alone.
-                        asyncio.create_task(
-                            _retire_announced_permission_rows(
-                                f"mode.set {new_mode}", new_mode
-                            ),
-                            name="retire-announced-on-mode-downgrade",
-                        )
-                    await _ws_send(ws, "mode.changed", {"mode": new_mode})
-                    logger.info(f"Permission mode changed to: {new_mode}")
-                else:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {"message": f"Invalid mode: {new_mode}"},
-                    )
-
-            elif method == "narration.set":
-                new_mode = data.get("mode", "auto")
-                if new_mode in ("silent", "verbose", "auto"):
-                    if _session is None:
-                        await _ws_send(
-                            ws,
-                            "error",
-                            {"message": "Session no longer active"},
-                        )
-                        continue
-                    _session.narration_mode = new_mode
-                    await _ws_send(ws, "narration.changed", {"mode": new_mode})
-                    logger.info(f"Narration mode changed to: {new_mode}")
-                else:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {"message": f"Invalid narration mode: {new_mode}"},
-                    )
+            elif method in {"mode.set", "narration.set"}:
+                # These verbs are lane-agnostic orchestrator REST controls.
+                # Keeping a second live-only mutation path here would let an
+                # old client change RAM without the desired scalar, inbox
+                # order, durable result receipt, or owner fence.
+                await _ws_send(
+                    ws,
+                    "error",
+                    {
+                        "code": "control_transport_retired",
+                        "message": "Use the session control REST endpoint",
+                    },
+                )
 
             elif method == "config.update":
                 config_override = data.get("config", {})
@@ -3213,22 +4133,42 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                         {"message": "Session no longer active"},
                     )
                     continue
-                turn_id = data.get("turn_id")
-                restored = _session.undo_turn(turn_id)
-                if restored:
+                if _session.shell_owner_token is not None:
                     await _ws_send(
                         ws,
-                        "files.restored",
+                        "error",
                         {
-                            "paths": restored,
-                            "turn_id": turn_id,
+                            "code": "control_transport_required",
+                            "message": "Use the session control REST endpoint",
+                        },
+                    )
+                    continue
+                turn_id = data.get("turn_id")
+                try:
+                    restored = await _session.undo_turn(turn_id)
+                except WorkspaceUndoUnavailable as exc:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {
+                            "code": exc.code,
+                            "message": str(exc),
+                        },
+                    )
+                except WorkspaceUndoRetryable as exc:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {
+                            "code": "workspace_undo_retryable",
+                            "message": str(exc),
                         },
                     )
                 else:
                     await _ws_send(
                         ws,
-                        "error",
-                        {"message": "No checkpoints available to undo"},
+                        "files.restored",
+                        {**restored, "turn_id": turn_id},
                     )
 
             elif method == "rewind":
@@ -3363,6 +4303,14 @@ class _QueuedPersistentEvent:
     seq: int
     kind: str
     payload: Any
+    control_request_id: Optional[str] = None
+    control_lease_token: Optional[int] = None
+    control_agent_id: Optional[str] = None
+    interrupt_request_id: Optional[str] = None
+    interrupt_lease_token: Optional[int] = None
+    interrupt_accepted_lease_token: Optional[int] = None
+    interrupt_stale_recovery: bool = False
+    receipt: Optional[asyncio.Future] = None
 
 
 def _requires_bounded_event_retry(kind: str) -> bool:
@@ -3384,35 +4332,177 @@ class _OrderedPersistentEventWriter:
     writer for the attached runtime. A single INSERT persists each batch in
     queue order, eliminating the old one-task-per-frame visibility race.
 
+    The writer OWNS the epoch it attached under (constructor argument, not
+    inferred from events) and every flush is fenced on it: rows land only
+    while ``threads.events_epoch`` still equals that epoch. A fenced-out
+    flush (another runtime, a rewind, or the reaper moved the generation) is
+    terminal — the writer stops rather than keep inserting into a dead epoch
+    forever, which is exactly what the unfenced INSERT used to do.
+
     Ordinary streaming frames get one best-effort write. State invalidations
     receive bounded retries. Queue overflow and terminal write failure are
     reported through ``on_terminal_failure`` so callers can force an
     authoritative-state reconciliation without recursively journaling it.
     """
 
-    _INSERT_BATCH_SQL = """
-        INSERT INTO thread_events (thread_id, epoch, seq, kind, payload)
-        SELECT
-            $1,
-            (queued.value->>'epoch')::integer,
-            (queued.value->>'seq')::bigint,
-            queued.value->>'kind',
-            queued.value->'payload'
-        FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY
-            AS queued(value, ordinal)
-        ORDER BY queued.ordinal
+    # One guarded round-trip (autocommit-safe): the INSERT is gated on the
+    # threads row still being on this writer's epoch ($3), each unnested row
+    # is belt-checked against the same epoch, and the thread's seq high-water
+    # mark advances to the batch tail in the same statement (guarded on rows
+    # actually inserted). The final SELECT returns the inserted count — 0 on
+    # a non-empty batch means the epoch (or, stateless lane, the run_queue
+    # lease) moved underneath us.
+    #
+    # M3 (stateless lane): when the writer is constructed with a lease, the
+    # {lease_fence} slot carries a second EXISTS against run_queue —
+    # token-equality only, deliberately WITHOUT ``state='leased'``: trailing
+    # flushes between complete_unit (which does not bump the token) and the
+    # next claim must still land, while any later claim/steal bumps the token
+    # and fences stragglers out (§5.2 — "stragglers are invalidated by the
+    # NEXT claim"). FOR SHARE holds the queue row against a concurrent
+    # claim/steal for the duration of this single statement, so a flush can
+    # never interleave with the token bump that should have fenced it.
+    _INSERT_BATCH_SQL_TEMPLATE = """
+        WITH queued_rows AS (
+            SELECT
+                (queued.value->>'epoch')::integer AS epoch,
+                (queued.value->>'seq')::bigint    AS seq,
+                queued.value->>'kind'             AS kind,
+                queued.value->'payload'           AS payload,
+                NULLIF(queued.value->>'control_request_id', '')::uuid
+                                                    AS control_request_id,
+                NULLIF(queued.value->>'interrupt_request_id', '')::uuid
+                                                    AS interrupt_request_id,
+                queued.ordinal                    AS ordinal
+            FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY
+                AS queued(value, ordinal)
+        ),
+        inserted AS (
+            INSERT INTO thread_events (
+                thread_id, epoch, seq, kind, payload, control_request_id,
+                interrupt_request_id
+            )
+            SELECT $1, queued_rows.epoch, queued_rows.seq,
+                   queued_rows.kind, queued_rows.payload,
+                   queued_rows.control_request_id,
+                   queued_rows.interrupt_request_id
+            FROM queued_rows
+            WHERE EXISTS (
+                    SELECT 1 FROM threads
+                    WHERE threads.id = $1
+                      AND threads.events_epoch = $3
+                  )
+              AND queued_rows.epoch = $3{lease_fence}
+            ORDER BY queued_rows.ordinal
+            RETURNING seq
+        ),
+        hwm_update AS (
+            UPDATE threads
+            SET events_seq_hwm = GREATEST(
+                    events_seq_hwm,
+                    (SELECT MAX(seq) FROM inserted)
+                )
+            WHERE id = $1
+              AND EXISTS (SELECT 1 FROM inserted)
+            RETURNING 1
+        )
+        SELECT COUNT(*)::bigint FROM inserted
     """
+    _LEASE_FENCE_SQL = """
+              AND EXISTS (
+                    SELECT 1 FROM run_queue
+                    WHERE run_queue.unit_id = $4::uuid
+                      AND run_queue.lease_token = $5::bigint
+                    FOR SHARE
+                  )"""
+    # Ordinary stateless frames retain the relaxed trailing-flush token rule,
+    # but must establish the same threads -> run_queue lock order as public
+    # End before their INSERT takes an implicit thread FK lock and updates the
+    # event HWM.  Acquire that mutation's FOR NO KEY UPDATE strength up front:
+    # it conflicts with public End's FOR UPDATE and serializes concurrent HWM
+    # writers.  A weaker prelock lets two writers both reach the guarded HWM
+    # UPDATE and deadlock while converting their parent-row locks.
+    _LOCK_STATELESS_EVENT_THREAD_SQL = """
+        SELECT 1 FROM threads
+        WHERE id = $1::uuid AND events_epoch = $2::integer
+        FOR NO KEY UPDATE
+    """
+    _LOCK_STATELESS_EVENT_QUEUE_SQL = """
+        SELECT 1 FROM run_queue
+        WHERE unit_id = $1::uuid AND lease_token = $2::bigint
+        FOR SHARE
+    """
+    # Durable control batches use an explicit transaction and acquire these
+    # locks in the same threads -> queue/agent -> request order as admission.
+    # The ordinary stateless writer intentionally keeps its relaxed trailing
+    # flush fence; only control results require a live leased state.
+    _LOCK_STATELESS_CONTROL_THREAD_SQL = """
+        SELECT 1 FROM threads
+        WHERE id = $1::uuid
+          AND execution_lane = 'stateless'
+          AND agent_id IS NULL
+        FOR NO KEY UPDATE
+    """
+    _LOCK_PINNED_CONTROL_THREAD_SQL = """
+        SELECT 1 FROM threads
+        WHERE id = $1::uuid
+          AND execution_lane = 'pinned'
+          AND agent_id = $2::uuid
+        FOR NO KEY UPDATE
+    """
+    _LOCK_STATELESS_CONTROL_QUEUE_SQL = """
+        SELECT 1 FROM run_queue
+        WHERE unit_id = $1::uuid
+          AND unit_kind = 'session_turn'
+          AND state = 'leased'
+          AND lease_token = $2::bigint
+        FOR SHARE
+    """
+    _LOCK_PINNED_CONTROL_AGENT_SQL = """
+        SELECT 1 FROM agents
+        WHERE id = $1::uuid AND thread_id = $2::uuid
+        FOR SHARE
+    """
+    _LOCK_CONTROL_REQUESTS_SQL = """
+        SELECT COUNT(*)::bigint
+        FROM (
+            SELECT request.id
+            FROM thread_control_requests request
+            WHERE request.id = ANY($1::uuid[])
+              AND request.thread_id = $2::uuid
+              AND request.accepted_agent_id IS NOT DISTINCT FROM $3::uuid
+              AND request.outcome IS NULL
+            FOR SHARE
+        ) locked_requests
+    """
+    _LOCK_INTERRUPT_REQUESTS_SQL = """
+        SELECT COUNT(*)::bigint
+        FROM (
+            SELECT request.id
+            FROM thread_interrupt_requests request
+            WHERE request.id = ANY($1::uuid[])
+              AND request.thread_id = $2::uuid
+              AND request.accepted_lease_token = $3::bigint
+              AND request.outcome IS NULL
+            FOR SHARE
+        ) locked_requests
+    """
+    # Pinned lane keeps the exact pre-M3 statement (and its 4-arg call shape).
+    _INSERT_BATCH_SQL = _INSERT_BATCH_SQL_TEMPLATE.format(lease_fence="")
 
     def __init__(
         self,
         *,
         postgres_conn: Any,
         thread_id: str,
+        epoch: int,
         on_terminal_failure: Callable[[list[_QueuedPersistentEvent], str], None],
         queue_maxsize: int = _EVENT_WRITER_QUEUE_MAXSIZE,
         batch_size: int = _EVENT_WRITER_BATCH_SIZE,
         state_max_attempts: int = _EVENT_WRITER_STATE_MAX_ATTEMPTS,
         retry_base_s: float = _EVENT_WRITER_RETRY_BASE_S,
+        lease: Any = None,
+        pinned_agent_id: Optional[str] = None,
     ) -> None:
         if queue_maxsize < 1:
             raise ValueError("event writer queue_maxsize must be positive")
@@ -3420,9 +4510,26 @@ class _OrderedPersistentEventWriter:
             raise ValueError("event writer batch_size must be positive")
         if state_max_attempts < 1:
             raise ValueError("event writer state_max_attempts must be positive")
+        if int(epoch) < 0:
+            raise ValueError("event writer epoch must be non-negative")
 
         self.postgres_conn = postgres_conn
         self.thread_id = thread_id
+        self.epoch = int(epoch)
+        # Stateless lane: a live LeaseHandle (src/api/lease_context.py). The
+        # flush reads unit_id/lease_token AT FLUSH TIME, so an affinity
+        # re-claim of the same thread (new token, same writer) keeps flushing
+        # under the current claim without a writer swap. None = pinned lane =
+        # the exact pre-M3 statement and call shape.
+        self._lease = lease
+        self._pinned_agent_id = pinned_agent_id
+        self._insert_sql = (
+            self._INSERT_BATCH_SQL
+            if lease is None
+            else self._INSERT_BATCH_SQL_TEMPLATE.format(
+                lease_fence=self._LEASE_FENCE_SQL
+            )
+        )
         self._on_terminal_failure = on_terminal_failure
         self._queue: asyncio.Queue[_QueuedPersistentEvent] = asyncio.Queue(
             maxsize=queue_maxsize
@@ -3434,6 +4541,7 @@ class _OrderedPersistentEventWriter:
         self._closing = False
         self._last_enqueued_cursor: Optional[tuple[int, int]] = None
         self._active_batch: tuple[_QueuedPersistentEvent, ...] = ()
+        self._deferred_event: Optional[_QueuedPersistentEvent] = None
 
     def start(self) -> None:
         if self._task is not None:
@@ -3448,6 +4556,7 @@ class _OrderedPersistentEventWriter:
 
         if self._task is None or self._closing or self._task.done():
             self._notify_terminal_failure([event], "writer_unavailable")
+            self._fail_receipt(event, "writer_unavailable")
             return False
 
         cursor = (event.epoch, event.seq)
@@ -3464,6 +4573,7 @@ class _OrderedPersistentEventWriter:
                 event.kind,
             )
             self._notify_terminal_failure([event], "non_monotonic_cursor")
+            self._fail_receipt(event, "non_monotonic_cursor")
             return False
         self._last_enqueued_cursor = cursor
 
@@ -3484,6 +4594,7 @@ class _OrderedPersistentEventWriter:
                 event.kind,
             )
             self._notify_terminal_failure([event], "queue_overflow")
+            self._fail_receipt(event, "queue_overflow")
             return False
 
     async def close(self, timeout_s: float = _EVENT_WRITER_CLOSE_TIMEOUT_S) -> None:
@@ -3512,6 +4623,10 @@ class _OrderedPersistentEventWriter:
                 await task
             except asyncio.CancelledError:
                 pass
+            if self._deferred_event is not None:
+                failed_on_shutdown.append(self._deferred_event)
+                self._deferred_event = None
+                self._queue.task_done()
             while True:
                 try:
                     failed_on_shutdown.append(self._queue.get_nowait())
@@ -3528,6 +4643,8 @@ class _OrderedPersistentEventWriter:
                 self._notify_terminal_failure(
                     failed_on_shutdown, "writer_shutdown_timeout"
                 )
+                for event in failed_on_shutdown:
+                    self._fail_receipt(event, "writer_shutdown_timeout")
         else:
             task.cancel()
             try:
@@ -3539,23 +4656,65 @@ class _OrderedPersistentEventWriter:
 
     async def _run(self) -> None:
         while True:
-            first = await self._queue.get()
+            if self._deferred_event is not None:
+                first = self._deferred_event
+                self._deferred_event = None
+            else:
+                first = await self._queue.get()
             batch = [first]
-            while len(batch) < self._batch_size:
-                try:
-                    batch.append(self._queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
+            # A strict owner-fenced control result must never share a database
+            # batch with ordinary trailing journal frames. If its live lease
+            # fence fails, only that acknowledgement may fail; ordinary frames
+            # retain the established epoch/token trailing-flush contract.
+            if first.control_request_id is None and first.interrupt_request_id is None:
+                while len(batch) < self._batch_size:
+                    try:
+                        candidate = self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if (
+                        candidate.control_request_id is not None
+                        or candidate.interrupt_request_id is not None
+                    ):
+                        self._deferred_event = candidate
+                        break
+                    batch.append(candidate)
 
             self._active_batch = tuple(batch)
             try:
-                await self._write_with_retry(batch)
+                failure = await self._write_with_retry(batch)
+                for event in batch:
+                    if failure is None:
+                        self._resolve_receipt(event)
+                    else:
+                        self._fail_receipt(event, failure)
             finally:
                 self._active_batch = ()
                 for _event in batch:
                     self._queue.task_done()
 
-    async def _write_with_retry(self, batch: list[_QueuedPersistentEvent]) -> None:
+    async def _write_with_retry(
+        self, batch: list[_QueuedPersistentEvent]
+    ) -> Optional[str]:
+        # The writer owns one epoch; a frame stamped with any other epoch in
+        # its stream is a sequencing bug (the rewind path swaps writers around
+        # its bump precisely so this cannot happen legitimately). Fail loudly
+        # and stop — a writer that cannot trust its stream must not keep
+        # writing.
+        if any(event.epoch != self.epoch for event in batch):
+            self._closing = True
+            logger.error(
+                "thread_events batch spans epochs — writer owns %d, saw %s; "
+                "stopping writer (thread=%s first_seq=%d last_seq=%d)",
+                self.epoch,
+                sorted({event.epoch for event in batch}),
+                self.thread_id,
+                batch[0].seq,
+                batch[-1].seq,
+            )
+            self._notify_terminal_failure(batch, "epoch_mismatch")
+            return "epoch_mismatch"
+
         attempts = (
             self._state_max_attempts
             if any(_requires_bounded_event_retry(event.kind) for event in batch)
@@ -3563,8 +4722,7 @@ class _OrderedPersistentEventWriter:
         )
         for attempt in range(1, attempts + 1):
             try:
-                await self._write_batch(batch)
-                return
+                inserted = await self._write_batch(batch)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -3593,22 +4751,283 @@ class _OrderedPersistentEventWriter:
                     exc,
                 )
                 self._notify_terminal_failure(batch, "write_failed")
+                return "write_failed"
 
-    async def _write_batch(self, batch: list[_QueuedPersistentEvent]) -> None:
+            if inserted < len(batch):
+                # The fence rejected the batch: threads.events_epoch moved
+                # past this writer (rewind, reaper steal, or a competing
+                # runtime) — or, stateless lane, the run_queue lease token
+                # moved (a successor claimed the unit). Deterministic, not
+                # retryable — stop the writer so a superseded runtime can
+                # never keep appending into a dead (or worse, the
+                # successor's) generation.
+                self._closing = True
+                logger.error(
+                    "thread_events writer fenced out — fence rejected the "
+                    "flush (events_epoch or run_queue lease moved past this "
+                    "writer); stopping "
+                    "(thread=%s writer_epoch=%d inserted=%d batch=%d "
+                    "first_seq=%d last_seq=%d lease=%s)",
+                    self.thread_id,
+                    self.epoch,
+                    inserted,
+                    len(batch),
+                    batch[0].seq,
+                    batch[-1].seq,
+                    (
+                        f"{self._lease.unit_id}:{self._lease.lease_token}"
+                        if self._lease is not None
+                        else "none"
+                    ),
+                )
+                self._notify_terminal_failure(batch, "epoch_fenced")
+                return "epoch_fenced"
+            return None
+
+    async def _write_batch(self, batch: list[_QueuedPersistentEvent]) -> int:
+        """Flush one batch through the fenced statement; return inserted count."""
+
         rows = [
             {
                 "epoch": event.epoch,
                 "seq": event.seq,
                 "kind": event.kind,
                 "payload": event.payload,
+                "control_request_id": event.control_request_id,
+                "interrupt_request_id": event.interrupt_request_id,
             }
             for event in batch
         ]
+        args: list[Any] = [self.thread_id, json.dumps(rows), self.epoch]
+        control_events = [
+            event for event in batch if event.control_request_id is not None
+        ]
+        interrupt_events = [
+            event for event in batch if event.interrupt_request_id is not None
+        ]
+        if control_events and interrupt_events:
+            return 0
+        if any(
+            event.control_request_id is not None
+            and event.interrupt_request_id is not None
+            for event in batch
+        ):
+            return 0
+        control_agent_id: Optional[str] = None
+        control_lease_token: Optional[int] = None
+        if control_events and self._lease is not None:
+            control_tokens = {event.control_lease_token for event in control_events}
+            if (
+                None in control_tokens
+                or len(control_tokens) != 1
+                or any(event.control_agent_id is not None for event in control_events)
+            ):
+                return 0
+            # A control acknowledgement is fenced on the immutable token held
+            # when the owner consumed the request, never the mutable warm
+            # LeaseHandle a successor may already have refreshed by flush time.
+            control_lease_token = control_tokens.pop()
+        elif control_events:
+            control_agents = {event.control_agent_id for event in control_events}
+            if (
+                None in control_agents
+                or len(control_agents) != 1
+                or self._pinned_agent_id not in control_agents
+                or any(
+                    event.control_lease_token is not None for event in control_events
+                )
+            ):
+                return 0
+            control_agent_id = control_agents.pop()
+
+        interrupt_lease_token: Optional[int] = None
+        interrupt_accepted_lease_token: Optional[int] = None
+        if interrupt_events:
+            # The inbox is stateless-only. ``interrupt_lease_token`` is the
+            # CURRENT writer authority. Usually it is also the immutable
+            # admission token. Explicit stale recovery instead locks an older
+            # accepted request while still fencing the INSERT on the current
+            # live queue token; a warm LeaseHandle is never authority here.
+            if self._lease is None:
+                return 0
+            interrupt_tokens = {
+                event.interrupt_lease_token for event in interrupt_events
+            }
+            if None in interrupt_tokens or len(interrupt_tokens) != 1:
+                return 0
+            interrupt_lease_token = interrupt_tokens.pop()
+            accepted_tokens = {
+                (
+                    event.interrupt_accepted_lease_token
+                    if event.interrupt_accepted_lease_token is not None
+                    else event.interrupt_lease_token
+                )
+                for event in interrupt_events
+            }
+            stale_modes = {
+                bool(event.interrupt_stale_recovery) for event in interrupt_events
+            }
+            if None in accepted_tokens or len(accepted_tokens) != 1:
+                return 0
+            if len(stale_modes) != 1:
+                return 0
+            interrupt_accepted_lease_token = accepted_tokens.pop()
+            stale_recovery = stale_modes.pop()
+            if stale_recovery:
+                if interrupt_accepted_lease_token >= interrupt_lease_token:
+                    return 0
+            elif interrupt_accepted_lease_token != interrupt_lease_token:
+                return 0
+
+        ordinary_lease_unit_id: Optional[str] = None
+        ordinary_lease_token: Optional[int] = None
+        if not control_events and not interrupt_events and self._lease is not None:
+            # Snapshot the warm handle before the first await.  A later claim
+            # may repoint the shared handle, but one flush must authorize one
+            # coherent (unit_id, token) pair, and a handle for another thread
+            # is never authority to write this writer's journal.
+            ordinary_lease_unit_id = self._lease.unit_id
+            ordinary_lease_token = int(self._lease.lease_token)
+            if ordinary_lease_unit_id is None or str(ordinary_lease_unit_id) != str(
+                self.thread_id
+            ):
+                return 0
+
         async with self.postgres_conn.acquire() as conn:
-            await conn.execute(
-                self._INSERT_BATCH_SQL,
-                self.thread_id,
-                json.dumps(rows),
+            if control_events:
+                request_ids = [
+                    str(event.control_request_id) for event in control_events
+                ]
+                if len(set(request_ids)) != len(request_ids):
+                    return 0
+                async with conn.transaction():
+                    if control_lease_token is not None:
+                        thread_fenced = await conn.fetchval(
+                            self._LOCK_STATELESS_CONTROL_THREAD_SQL,
+                            self.thread_id,
+                        )
+                        if thread_fenced is None:
+                            return 0
+                        queue_fenced = await conn.fetchval(
+                            self._LOCK_STATELESS_CONTROL_QUEUE_SQL,
+                            self.thread_id,
+                            control_lease_token,
+                        )
+                        if queue_fenced is None:
+                            return 0
+                        accepted_agent_id = None
+                    else:
+                        if control_agent_id is None:
+                            return 0
+                        thread_fenced = await conn.fetchval(
+                            self._LOCK_PINNED_CONTROL_THREAD_SQL,
+                            self.thread_id,
+                            control_agent_id,
+                        )
+                        if thread_fenced is None:
+                            return 0
+                        agent_fenced = await conn.fetchval(
+                            self._LOCK_PINNED_CONTROL_AGENT_SQL,
+                            control_agent_id,
+                            self.thread_id,
+                        )
+                        if agent_fenced is None:
+                            return 0
+                        accepted_agent_id = control_agent_id
+                    locked_requests = int(
+                        await conn.fetchval(
+                            self._LOCK_CONTROL_REQUESTS_SQL,
+                            request_ids,
+                            self.thread_id,
+                            accepted_agent_id,
+                        )
+                        or 0
+                    )
+                    if locked_requests != len(request_ids):
+                        return 0
+                    inserted = await conn.fetchval(self._INSERT_BATCH_SQL, *args)
+            elif interrupt_events:
+                request_ids = [
+                    str(event.interrupt_request_id) for event in interrupt_events
+                ]
+                if len(set(request_ids)) != len(request_ids):
+                    return 0
+                if interrupt_lease_token is None:
+                    return 0
+                async with conn.transaction():
+                    thread_fenced = await conn.fetchval(
+                        self._LOCK_STATELESS_CONTROL_THREAD_SQL,
+                        self.thread_id,
+                    )
+                    if thread_fenced is None:
+                        return 0
+                    queue_fenced = await conn.fetchval(
+                        self._LOCK_STATELESS_CONTROL_QUEUE_SQL,
+                        self.thread_id,
+                        interrupt_lease_token,
+                    )
+                    if queue_fenced is None:
+                        return 0
+                    locked_requests = int(
+                        await conn.fetchval(
+                            self._LOCK_INTERRUPT_REQUESTS_SQL,
+                            request_ids,
+                            self.thread_id,
+                            interrupt_accepted_lease_token,
+                        )
+                        or 0
+                    )
+                    if locked_requests != len(request_ids):
+                        return 0
+                    inserted = await conn.fetchval(self._INSERT_BATCH_SQL, *args)
+            else:
+                insert_sql = self._insert_sql
+                ordinary_args = list(args)
+                if self._lease is None:
+                    # Pinned lane keeps the exact pre-stateless autocommit
+                    # statement and three-argument call shape.
+                    inserted = await conn.fetchval(insert_sql, *ordinary_args)
+                else:
+                    # Ordinary trailing journal frames retain the M3 rule:
+                    # token equality is sufficient after completion, but the
+                    # exact unit remains bound to this writer.  Lock/validate
+                    # thread epoch first, then queue identity, then perform the
+                    # existing guarded INSERT/HWM update in one transaction.
+                    if ordinary_lease_unit_id is None or ordinary_lease_token is None:
+                        return 0
+                    ordinary_args.extend([ordinary_lease_unit_id, ordinary_lease_token])
+                    async with conn.transaction():
+                        thread_fenced = await conn.fetchval(
+                            self._LOCK_STATELESS_EVENT_THREAD_SQL,
+                            self.thread_id,
+                            self.epoch,
+                        )
+                        if thread_fenced is None:
+                            return 0
+                        queue_fenced = await conn.fetchval(
+                            self._LOCK_STATELESS_EVENT_QUEUE_SQL,
+                            ordinary_lease_unit_id,
+                            ordinary_lease_token,
+                        )
+                        if queue_fenced is None:
+                            return 0
+                        inserted = await conn.fetchval(insert_sql, *ordinary_args)
+        return int(inserted or 0)
+
+    @staticmethod
+    def _resolve_receipt(event: _QueuedPersistentEvent) -> None:
+        receipt = event.receipt
+        if receipt is not None and not receipt.done():
+            receipt.set_result((event.epoch, event.seq))
+
+    @staticmethod
+    def _fail_receipt(event: _QueuedPersistentEvent, reason: str) -> None:
+        receipt = event.receipt
+        if receipt is not None and not receipt.done():
+            receipt.set_exception(
+                EventJournalUnavailable(
+                    f"durable owner result journal persistence failed: {reason}"
+                )
             )
 
     def _notify_terminal_failure(
@@ -3679,12 +5098,26 @@ def _event_persistence_failed(
     )
 
 
-def _broadcast(method: str, params: Dict[str, Any]) -> None:
-    """Enqueue a frame onto every subscriber queue, persist to event log.
+def _broadcast_frame(
+    method: str,
+    params: Dict[str, Any],
+    *,
+    control_request_id: Optional[str] = None,
+    control_lease_token: Optional[int] = None,
+    control_agent_id: Optional[str] = None,
+    interrupt_request_id: Optional[str] = None,
+    interrupt_lease_token: Optional[int] = None,
+    interrupt_accepted_lease_token: Optional[int] = None,
+    interrupt_stale_recovery: bool = False,
+    durable_receipt: bool = False,
+) -> Optional[asyncio.Future]:
+    """Fan out one frame and enqueue its ordered journal write.
 
-    Non-blocking. On a full subscriber queue, drops the oldest frame to make
-    room for the new one — token-stream pacing semantics. We'd rather lose an
-    old chunk than block the loop on a stuck consumer.
+    The ordinary broadcast path stays non-blocking and best-effort. A control
+    result asks for a receipt future and is not acknowledged in its inbox
+    until the ordered writer resolves that future after the INSERT commits.
+    Both paths allocate through this one function, so an inbox result can
+    never race a second sequence allocator.
 
     Phase 2 (event log): allocates the next seq synchronously and stamps
     `(_events_epoch, seq)` into the frame's params under `_seq`. One
@@ -3692,6 +5125,9 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
     past an earlier event whose independent write is still in flight.
     """
     global _next_seq
+    receipt: Optional[asyncio.Future] = None
+    if durable_receipt:
+        receipt = asyncio.get_running_loop().create_future()
     _next_seq += 1
     seq = _next_seq
     epoch = _events_epoch
@@ -3700,13 +5136,31 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
     # consistent under reconnect.
     params_with_cursor = {**params, "_seq": [epoch, seq]}
     frame = {"method": method, "params": params_with_cursor}
-    _fan_out_live_frame(frame)
 
-    # Mirror notification-worthy events to NATS so the orchestrator's
-    # bridge can fan them out to the SSE notification feed. Non-blocking,
-    # non-fatal on failure.
-    if method in _NOTIFICATION_METHODS:
-        asyncio.create_task(emit_session_event(method, params))
+    def _publish_live() -> None:
+        _fan_out_live_frame(frame)
+        # Mirror notification-worthy events to NATS so the orchestrator's
+        # bridge can fan them out to the SSE notification feed. Non-blocking,
+        # non-fatal on failure.
+        if method in _NOTIFICATION_METHODS:
+            asyncio.create_task(emit_session_event(method, params))
+
+    if receipt is None:
+        _publish_live()
+    else:
+        # A durable control acknowledgement is authoritative only after its
+        # journal INSERT commits. Do not let a live subscriber observe a frame
+        # that a failed writer would be unable to replay after reload.
+        def _publish_committed(done: asyncio.Future) -> None:
+            if done.cancelled():
+                return
+            try:
+                done.result()
+            except Exception:
+                return
+            _publish_live()
+
+        receipt.add_done_callback(_publish_committed)
 
     # Queue one immutable journal snapshot. The loop stays non-blocking, while
     # the sole writer serializes database visibility for every sequence.
@@ -3716,6 +5170,14 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
             seq=seq,
             kind=method,
             payload=json.loads(json.dumps(_safe_serialize(params))),
+            control_request_id=control_request_id,
+            control_lease_token=control_lease_token,
+            control_agent_id=control_agent_id,
+            interrupt_request_id=interrupt_request_id,
+            interrupt_lease_token=interrupt_lease_token,
+            interrupt_accepted_lease_token=interrupt_accepted_lease_token,
+            interrupt_stale_recovery=interrupt_stale_recovery,
+            receipt=receipt,
         )
         writer = _event_writer
         if writer is None or writer.thread_id != _thread_id:
@@ -3727,8 +5189,1565 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
                 method,
             )
             _event_persistence_failed([event], "writer_unavailable")
+            _OrderedPersistentEventWriter._fail_receipt(event, "writer_unavailable")
         else:
             writer.enqueue(event)
+    elif receipt is not None:
+        receipt.set_exception(
+            EventJournalUnavailable(
+                "durable owner result journal persistence failed: session_unavailable"
+            )
+        )
+    return receipt
+
+
+def _broadcast(method: str, params: Dict[str, Any]) -> None:
+    """Non-blocking live fanout plus best-effort ordered journal persistence."""
+
+    _broadcast_frame(method, params)
+
+
+async def _broadcast_durable(
+    method: str,
+    params: Dict[str, Any],
+    *,
+    control_request_id: str,
+    lease_token: Optional[int],
+    agent_id: Optional[str],
+) -> tuple[int, int]:
+    """Broadcast and wait until the owner-fenced journal INSERT commits."""
+
+    if (lease_token is None) == (agent_id is None):
+        raise ValueError("exactly one durable control owner is required")
+
+    receipt = _broadcast_frame(
+        method,
+        params,
+        control_request_id=control_request_id,
+        control_lease_token=lease_token,
+        control_agent_id=agent_id,
+        durable_receipt=True,
+    )
+    if receipt is None:  # pragma: no cover - defensive; durable always creates one
+        raise EventJournalUnavailable("control result receipt was not created")
+    return await receipt
+
+
+async def _broadcast_interrupt_durable(
+    method: str,
+    params: Dict[str, Any],
+    *,
+    interrupt_request_id: str,
+    lease_token: int,
+    accepted_lease_token: Optional[int] = None,
+    stale_recovery: bool = False,
+) -> tuple[int, int]:
+    """Wait for one immutable-lease interrupt receipt to commit.
+
+    ``_broadcast_frame`` allocates and enqueues synchronously before this
+    coroutine reaches its first suspension. The RAM interrupt signal can
+    therefore be followed immediately by this call without allowing the graph
+    to consume the flag and finish ahead of receipt allocation.
+    """
+
+    receipt = _broadcast_frame(
+        method,
+        params,
+        interrupt_request_id=interrupt_request_id,
+        interrupt_lease_token=int(lease_token),
+        interrupt_accepted_lease_token=(
+            int(accepted_lease_token) if accepted_lease_token is not None else None
+        ),
+        interrupt_stale_recovery=bool(stale_recovery),
+        durable_receipt=True,
+    )
+    if receipt is None:  # pragma: no cover - defensive; durable always creates one
+        raise EventJournalUnavailable("interrupt result receipt was not created")
+    return await receipt
+
+
+async def _broadcast_event_durable(
+    method: str,
+    params: Dict[str, Any],
+) -> tuple[int, int]:
+    """Wait for an ordinary current-owner journal frame to commit."""
+
+    receipt = _broadcast_frame(method, params, durable_receipt=True)
+    if receipt is None:  # pragma: no cover - defensive; durable always creates one
+        raise EventJournalUnavailable("durable event receipt was not created")
+    return await receipt
+
+
+async def _durable_session_control_modes() -> tuple[str, str]:
+    """Read journal-authoritative welcome scalars for a pinned WS client.
+
+    A second tab can connect while a control result is between journal commit
+    and request finalization. Start with the first-class columns and overlay
+    only fully matching pending receipts, exactly like the orchestrator REST
+    snapshot. Falling back to RAM is safe because RAM changes only after
+    durable finalization.
+    """
+
+    if _session is None:
+        return "supervised", "auto"
+    fallback = (_session.permission_mode, _session.narration_mode)
+    if _session.postgres_conn is None or _thread_id is None:
+        return fallback
+
+    from ..shared.thread_controls import applied_control_scalar
+
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                row = await conn.fetchrow(
+                    "SELECT permission_mode, narration_mode FROM threads "
+                    "WHERE id = $1::uuid",
+                    _thread_id,
+                )
+                if row is None:
+                    return fallback
+                permission_mode = str(row["permission_mode"] or "supervised")
+                narration_mode = (
+                    str(row["narration_mode"])
+                    if row["narration_mode"] is not None
+                    else fallback[1]
+                )
+                receipts = await conn.fetch(
+                    "SELECT request.id AS request_id, request.client_request_id, "
+                    "request.request_seq, "
+                    "request.verb, request.payload AS request_payload, "
+                    "event.kind AS event_kind, event.payload AS event_payload "
+                    "FROM thread_control_requests request "
+                    "JOIN thread_events event "
+                    "ON event.thread_id = request.thread_id "
+                    "AND event.control_request_id = request.id "
+                    "WHERE request.thread_id = $1::uuid "
+                    "AND request.outcome IS NULL "
+                    "ORDER BY request.request_seq",
+                    _thread_id,
+                )
+        for receipt in receipts:
+            scalar = applied_control_scalar(
+                request_id=receipt["request_id"],
+                client_request_id=receipt["client_request_id"],
+                request_seq=int(receipt["request_seq"]),
+                verb=str(receipt["verb"]),
+                request_payload=receipt["request_payload"],
+                event_kind=str(receipt["event_kind"]),
+                event_payload=receipt["event_payload"],
+            )
+            if scalar is None:
+                continue
+            column, value = scalar
+            if column == "permission_mode":
+                permission_mode = value
+            elif column == "narration_mode":
+                narration_mode = value
+        return permission_mode, narration_mode
+    except Exception:
+        logger.warning(
+            "durable control scalar read failed for WS welcome; using "
+            "post-finalization RAM",
+            exc_info=True,
+        )
+        return fallback
+
+
+def _registered_pinned_agent_id() -> Optional[str]:
+    """Return the orchestrator-issued DB identity, never a hostname/config id."""
+
+    if _orchestrator_client is None or _orchestrator_client.agent_id is None:
+        return None
+    try:
+        from uuid import UUID
+
+        return str(UUID(str(_orchestrator_client.agent_id)))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _control_receipt_matches(request: Any, receipt: Any) -> bool:
+    """Reject a malformed/cross-linked receipt instead of phantom-applying it."""
+
+    from ..shared.thread_controls import control_receipt_result
+
+    return (
+        control_receipt_result(
+            request_id=request.id,
+            client_request_id=request.client_request_id,
+            request_seq=request.request_seq,
+            verb=request.verb,
+            request_payload=request.payload,
+            event_kind=receipt.kind,
+            event_payload=receipt.payload,
+        )
+        is not None
+    )
+
+
+def _describe_control_request(request: Any) -> tuple[str, str, Optional[str]]:
+    """Validate one request without mutating RAM or any durable state."""
+
+    mode = str(request.payload.get("mode") or "")
+    if request.verb == "mode.set" and mode in {
+        "supervised",
+        "auto_accept",
+        "autonomous",
+    }:
+        return "mode.changed", "applied", None
+    if request.verb == "narration.set" and mode in {"silent", "verbose", "auto"}:
+        return "narration.changed", "applied", None
+    if request.verb == "workspace.undo" and request.payload == {}:
+        return "files.restored", "applied", None
+    return "control.rejected", "rejected", "unsupported_control"
+
+
+async def _finalize_durable_control(
+    request: Any,
+    *,
+    lease_token: Optional[int],
+    agent_id: Optional[str],
+    outcome: str,
+    error_code: Optional[str] = None,
+) -> str:
+    """Atomically terminalize a receipt and its stateless consumed watermark."""
+
+    from ..shared.thread_controls import finalize_control_request
+
+    if _session is None or _session.postgres_conn is None:
+        raise EventJournalUnavailable("control finalization lost its session")
+    async with _session.postgres_conn.acquire() as conn:
+        async with conn.transaction():
+            return await finalize_control_request(
+                conn,
+                request_id=request.id,
+                lease_token=lease_token,
+                agent_id=agent_id,
+                outcome=outcome,
+                error_code=error_code,
+            )
+
+
+async def _reconcile_durable_control_scalars(
+    *,
+    lease_token: Optional[int],
+    agent_id: Optional[str],
+) -> None:
+    """Converge RAM from first-class scalars under the current owner fence.
+
+    This closes the ambiguous-finalizer window: PostgreSQL may commit the
+    scalar/request/watermark transaction just as the awaiting task is
+    cancelled. A warm affinity reuse must not keep the old in-process mode
+    merely because the now-terminal request no longer appears in the inbox.
+    """
+
+    from ..shared.thread_controls import owner_fence_current
+
+    if (lease_token is None) == (agent_id is None):
+        raise ValueError("exactly one control owner credential is required")
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        raise EventJournalUnavailable("control scalar reconciliation lost session")
+
+    async with _session.postgres_conn.acquire() as conn:
+        async with conn.transaction():
+            fenced = await owner_fence_current(
+                conn,
+                thread_id=_thread_id,
+                lease_token=lease_token,
+                agent_id=agent_id,
+            )
+            if not fenced:
+                raise ControlInboxBlocked(
+                    "control scalar reconciliation lost current owner"
+                )
+            row = await conn.fetchrow(
+                "SELECT permission_mode, narration_mode FROM threads "
+                "WHERE id = $1::uuid",
+                _thread_id,
+            )
+    if row is None or _session is None:
+        raise ControlInboxBlocked("control scalar reconciliation lost thread")
+    _session.permission_mode = str(row["permission_mode"] or "supervised")
+    # NULL is the migration sentinel for a legacy inherited narration value;
+    # retain the mode already loaded from resolved config until a control (or
+    # creation-time materialization) writes a first-class value.
+    if row["narration_mode"] is not None:
+        _session.narration_mode = str(row["narration_mode"])
+
+
+async def _set_pinned_control_admission(
+    *, agent_id: str, open_for_admission: bool
+) -> bool:
+    """Set the durable admission credential under the reciprocal binding.
+
+    Teardown closes this before its last drain, serializing with orchestrator
+    admission on the threads row. A new pinned owner reopens it only after its
+    writer/session are attached. ``False`` means this runtime no longer owns
+    the binding; database failures raise and must not be treated as closure.
+    """
+
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        raise EventJournalUnavailable("control admission gate lost session")
+    async with _session.postgres_conn.acquire() as conn:
+        async with conn.transaction():
+            thread = await conn.fetchrow(
+                "SELECT agent_id, execution_lane, status FROM threads "
+                "WHERE id = $1::uuid FOR UPDATE",
+                _thread_id,
+            )
+            if (
+                thread is None
+                or str(thread["execution_lane"] or "") != "pinned"
+                or str(thread["agent_id"] or "") != str(agent_id)
+                or (
+                    open_for_admission
+                    and str(thread["status"] or "") in {"ended", "suspended"}
+                )
+            ):
+                return False
+            reciprocal = await conn.fetchval(
+                "SELECT 1 FROM agents WHERE id = $1::uuid "
+                "AND thread_id = $2::uuid FOR SHARE",
+                agent_id,
+                _thread_id,
+            )
+            if reciprocal is None:
+                return False
+            updated = await conn.fetchval(
+                "UPDATE threads SET control_admission_agent_id = "
+                "CASE WHEN $3::boolean THEN $2::uuid ELSE NULL END "
+                "WHERE id = $1::uuid AND agent_id = $2::uuid RETURNING id",
+                _thread_id,
+                agent_id,
+                bool(open_for_admission),
+            )
+            return updated is not None
+
+
+async def _close_pinned_control_inbox(*, agent_id: str) -> bool:
+    """Close admission and drain controls without trapping a stale owner.
+
+    The binding can move after the first close transaction commits but before
+    the final drain locks its first request.  In that case the successor owns
+    the request and this process must continue local cleanup without attempting
+    the lifecycle CAS.  A drain failure while the binding is still ours stays
+    fatal: otherwise a real journal/finalization failure could strand work.
+    """
+
+    if not await _set_pinned_control_admission(
+        agent_id=agent_id,
+        open_for_admission=False,
+    ):
+        return False
+    try:
+        await _drain_thread_controls(agent_id=agent_id)
+    except ControlInboxBlocked:
+        if await _set_pinned_control_admission(
+            agent_id=agent_id,
+            open_for_admission=False,
+        ):
+            raise
+        logger.info(
+            "Pinned control owner moved during final drain (thread=%s agent=%s)",
+            _thread_id,
+            agent_id,
+        )
+        return False
+    return True
+
+
+def _apply_control_request(request: Any) -> tuple[str, str, Optional[str]]:
+    """Converge RAM after durable owner-fenced terminalization.
+
+    Validation is intentionally side-effect free and happens before the
+    journal write. This function is called only after finalization proves the
+    immutable journal owner and publishes the first-class DB scalar.
+    """
+
+    if _session is None:
+        raise EventJournalUnavailable("control apply lost its session")
+
+    event_kind, outcome, error_code = _describe_control_request(request)
+    if outcome != "applied":
+        return event_kind, outcome, error_code
+
+    mode = str(request.payload.get("mode") or "")
+    if request.verb == "mode.set":
+        _session.permission_mode = mode
+        # Permission-card retirement stays owned by the existing gate/turn
+        # cleanup path. It is not part of this control acknowledgement:
+        # rows have no lease identity yet, so sweeping them here cannot be
+        # made crash-recoverable without risking a successor's active gate.
+    elif request.verb == "narration.set":
+        _session.narration_mode = mode
+    return event_kind, outcome, error_code
+
+
+async def _drain_thread_controls(
+    *,
+    lease_token: Optional[int] = None,
+    agent_id: Optional[str] = None,
+) -> int:
+    """Drain the exact owner's pending inbox in request_seq order.
+
+    There is no durable ``claimed`` state. Idempotent scalar assignments may
+    safely repeat after a crash before the result write. If the result write
+    committed but finalization did not, the unique journal receipt is found
+    first. The current owner validates and finalizes it, then idempotently
+    re-converges RAM without allocating another event sequence.
+    """
+
+    from ..shared.thread_controls import (
+        adopt_next_pinned_control_request,
+        control_receipt_result,
+        fetch_control_receipt,
+        fetch_next_control_request,
+        owner_fence_current,
+    )
+
+    if (lease_token is None) == (agent_id is None):
+        raise ValueError("exactly one control owner credential is required")
+
+    applied = 0
+    async with _control_drain_lock:
+        while True:
+            if _session is None or _session.postgres_conn is None or _thread_id is None:
+                return applied
+            if lease_token is not None:
+                handle = _current_lease_var.get()
+                if (
+                    handle is None
+                    or handle.unit_id != str(_thread_id)
+                    or handle.lease_token != int(lease_token)
+                    or handle.lost.is_set()
+                ):
+                    if handle is not None:
+                        handle.lost.set()
+                    raise ControlInboxBlocked(f"control owner lost lease {lease_token}")
+
+            started = time.perf_counter()
+            async with _session.postgres_conn.acquire() as conn:
+                async with conn.transaction():
+                    owns_thread = await owner_fence_current(
+                        conn,
+                        thread_id=_thread_id,
+                        lease_token=lease_token,
+                        agent_id=agent_id,
+                    )
+                    if not owns_thread:
+                        if lease_token is not None:
+                            handle = _current_lease_var.get()
+                            if handle is not None:
+                                handle.lost.set()
+                        raise ControlInboxBlocked(
+                            "control owner fence is no longer current"
+                        )
+                    if agent_id is not None:
+                        await adopt_next_pinned_control_request(
+                            conn,
+                            thread_id=_thread_id,
+                            agent_id=agent_id,
+                        )
+                    request = await fetch_next_control_request(
+                        conn,
+                        thread_id=_thread_id,
+                        lease_token=lease_token,
+                        agent_id=agent_id,
+                    )
+                    if request is None:
+                        return applied
+                    receipt = await fetch_control_receipt(
+                        conn,
+                        thread_id=_thread_id,
+                        request_id=request.id,
+                    )
+
+            if receipt is not None:
+                receipt_result = control_receipt_result(
+                    request_id=request.id,
+                    client_request_id=request.client_request_id,
+                    request_seq=request.request_seq,
+                    verb=request.verb,
+                    request_payload=request.payload,
+                    event_kind=receipt.kind,
+                    event_payload=receipt.payload,
+                )
+                if receipt_result is None:
+                    raise ControlInboxBlocked(
+                        "control receipt does not match its durable request: "
+                        f"{request.id}"
+                    )
+                outcome, error_code, _scalar = receipt_result
+                result = await _finalize_durable_control(
+                    request,
+                    lease_token=lease_token,
+                    agent_id=agent_id,
+                    outcome=outcome,
+                    error_code=error_code,
+                )
+                if result not in {outcome, "already_terminal"}:
+                    if result == "lost_owner" and lease_token is not None:
+                        handle = _current_lease_var.get()
+                        if handle is not None:
+                            handle.lost.set()
+                    raise ControlInboxBlocked(
+                        "control receipt recovery failed: "
+                        f"request={request.id} result={result}"
+                    )
+                if result == outcome:
+                    _apply_control_request(request)
+                else:
+                    await _reconcile_durable_control_scalars(
+                        lease_token=lease_token,
+                        agent_id=agent_id,
+                    )
+                applied += 1
+                logger.info(
+                    "session-control timing: thread=%s verb=%s seq=%d "
+                    "recovered_receipt=true total=%.3fs",
+                    _thread_id,
+                    request.verb,
+                    request.request_seq,
+                    time.perf_counter() - started,
+                )
+                continue
+
+            event_kind, outcome, error_code = _describe_control_request(request)
+            effect_params: Dict[str, Any] = {}
+            if outcome == "applied" and request.verb == "workspace.undo":
+                if _session is None:
+                    raise ControlInboxBlocked(
+                        f"workspace undo lost its session: {request.id}"
+                    )
+                try:
+                    effect_params = await _session.undo_turn(
+                        control_request_id=str(request.id)
+                    )
+                except WorkspaceUndoUnavailable as exc:
+                    # Tier/history refusal is known before any mutation and can
+                    # therefore receive a durable rejected acknowledgement.
+                    event_kind = "control.rejected"
+                    outcome = "rejected"
+                    error_code = exc.code
+                except WorkspaceUndoRetryable as exc:
+                    # Git may already contain the effect marker. Leave the
+                    # request pending so this or a successor claimant recovers
+                    # it; never journal a rejection after possible mutation.
+                    raise ControlInboxBlocked(
+                        f"workspace undo remains retryable: {request.id}"
+                    ) from exc
+                except Exception as exc:
+                    raise ControlInboxBlocked(
+                        f"workspace undo failed before acknowledgement: {request.id}"
+                    ) from exc
+            params: Dict[str, Any] = {
+                "request_id": str(request.id),
+                "client_request_id": str(request.client_request_id),
+                "request_seq": request.request_seq,
+                "method": request.verb,
+            }
+            if outcome == "applied" and request.verb in {
+                "mode.set",
+                "narration.set",
+            }:
+                params["mode"] = str(request.payload.get("mode") or "")
+            elif outcome == "applied" and request.verb == "workspace.undo":
+                params.update(effect_params)
+            else:
+                params["error_code"] = error_code
+
+            journal_started = time.perf_counter()
+            try:
+                epoch, seq = await _broadcast_durable(
+                    event_kind,
+                    params,
+                    control_request_id=str(request.id),
+                    lease_token=lease_token,
+                    agent_id=agent_id,
+                )
+            except EventJournalUnavailable as exc:
+                raise ControlInboxBlocked(
+                    f"control journal acknowledgement failed: {request.id}"
+                ) from exc
+            journal_seconds = time.perf_counter() - journal_started
+            result = await _finalize_durable_control(
+                request,
+                lease_token=lease_token,
+                agent_id=agent_id,
+                outcome=outcome,
+                error_code=error_code,
+            )
+            if result not in {outcome, "already_terminal"}:
+                if result == "lost_owner" and lease_token is not None:
+                    handle = _current_lease_var.get()
+                    if handle is not None:
+                        handle.lost.set()
+                raise ControlInboxBlocked(
+                    "control finalization failed: "
+                    f"request={request.id} journal={epoch}/{seq} result={result}"
+                )
+            if result == outcome:
+                _apply_control_request(request)
+            else:
+                await _reconcile_durable_control_scalars(
+                    lease_token=lease_token,
+                    agent_id=agent_id,
+                )
+            applied += 1
+            logger.info(
+                "session-control timing: thread=%s verb=%s seq=%d "
+                "recovered_receipt=false journal=%.3fs total=%.3fs",
+                _thread_id,
+                request.verb,
+                request.request_seq,
+                journal_seconds,
+                time.perf_counter() - started,
+            )
+
+
+async def _drain_current_thread_controls() -> int:
+    """Authoritative pre-gate drain for whichever owner currently serves."""
+
+    if _control_owner_lease_token is not None:
+        await _reconcile_durable_control_scalars(
+            lease_token=_control_owner_lease_token,
+            agent_id=None,
+        )
+        return await _drain_thread_controls(
+            lease_token=_control_owner_lease_token,
+        )
+    if _control_owner_agent_id is not None:
+        await _reconcile_durable_control_scalars(
+            lease_token=None,
+            agent_id=_control_owner_agent_id,
+        )
+        return await _drain_thread_controls(agent_id=_control_owner_agent_id)
+    return 0
+
+
+async def _control_watcher_loop(
+    *,
+    postgres_conn: Any,
+    thread_id: str,
+    stop: asyncio.Event,
+    lease_token: Optional[int],
+    agent_id: Optional[str],
+) -> None:
+    """LISTEN for latency, with a bounded poll so delivery is never correctness."""
+
+    wake = asyncio.Event()
+
+    def _on_notify(_conn: Any, _pid: int, _channel: str, payload: str) -> None:
+        try:
+            notice = json.loads(payload)
+        except Exception:
+            return
+        if str(notice.get("thread_id") or "") == thread_id:
+            wake.set()
+
+    try:
+        async with postgres_conn.acquire() as listener:
+            await listener.add_listener(_CONTROL_NOTIFY_CHANNEL, _on_notify)
+            try:
+                # Register first, then drain: a request committed in the
+                # start-up window is either visible to this read or wakes the
+                # following one.
+                while not stop.is_set():
+                    try:
+                        await _drain_thread_controls(
+                            lease_token=lease_token,
+                            agent_id=agent_id,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning(
+                            "session-control drain failed; request remains pending "
+                            "for retry (thread=%s)",
+                            thread_id,
+                            exc_info=True,
+                        )
+                    wake.clear()
+                    if stop.is_set():
+                        break
+                    # Stop is a first-class waiter, not just a flag checked
+                    # after the five-second poll.  Stateless control-only
+                    # claims start and stop this watcher back-to-back; direct
+                    # task cancellation while asyncpg is entering LISTEN can
+                    # leave its connection-lost future unobserved.  A normal
+                    # stop now lets the listener unregister and return its
+                    # connection cooperatively.
+                    wake_waiter = asyncio.create_task(wake.wait())
+                    stop_waiter = asyncio.create_task(stop.wait())
+                    waiters = {wake_waiter, stop_waiter}
+                    try:
+                        await asyncio.wait(
+                            waiters,
+                            timeout=_CONTROL_POLL_SECONDS,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for waiter in waiters:
+                            if not waiter.done():
+                                waiter.cancel()
+                        await asyncio.gather(*waiters, return_exceptions=True)
+            finally:
+                with suppress(Exception):
+                    await listener.remove_listener(_CONTROL_NOTIFY_CHANNEL, _on_notify)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # A listener connection is only a latency optimization. Fall back to
+        # bounded polling on fresh pool connections until the owner stops.
+        logger.warning(
+            "session-control LISTEN unavailable; polling (thread=%s)",
+            thread_id,
+            exc_info=True,
+        )
+        while not stop.is_set():
+            try:
+                await _drain_thread_controls(
+                    lease_token=lease_token,
+                    agent_id=agent_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "session-control poll failed (thread=%s)",
+                    thread_id,
+                    exc_info=True,
+                )
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=_CONTROL_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+
+
+async def _start_thread_control_watcher(
+    *,
+    lease_token: Optional[int] = None,
+    agent_id: Optional[str] = None,
+) -> int:
+    """Take ownership, synchronously drain, then watch for later admissions."""
+
+    global _control_watcher_task, _control_watcher_stop
+    global _control_owner_lease_token, _control_owner_agent_id
+
+    if (lease_token is None) == (agent_id is None):
+        raise ValueError("exactly one control owner credential is required")
+    # A restart/re-attach may enter with the same exact binding while the old
+    # watcher still advertised capability. Close first, before cancelling that
+    # watcher, so a failed initial drain cannot leave public admission open
+    # with no consumer. A different successor credential is unaffected.
+    if agent_id is not None:
+        await _set_pinned_control_admission(
+            agent_id=str(agent_id),
+            open_for_admission=False,
+        )
+    await _stop_thread_control_watcher()
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        raise EventJournalUnavailable("cannot start control owner without a session")
+
+    _control_owner_lease_token = int(lease_token) if lease_token is not None else None
+    _control_owner_agent_id = str(agent_id) if agent_id is not None else None
+    try:
+        if _control_owner_agent_id is not None:
+            # Existing work can be consumed while the public gate is closed.
+            # Only an inbox-capable owner that completed this first drain
+            # advertises readiness to new REST admissions. Drain again after
+            # opening to cover the commit window before LISTEN registration.
+            drained = await _drain_current_thread_controls()
+            if not await _set_pinned_control_admission(
+                agent_id=_control_owner_agent_id,
+                open_for_admission=True,
+            ):
+                raise ControlInboxBlocked(
+                    "cannot reopen control admission without the exact pinned owner"
+                )
+            drained += await _drain_current_thread_controls()
+        else:
+            drained = await _drain_current_thread_controls()
+    except BaseException:
+        if _control_owner_agent_id is not None:
+            with suppress(BaseException):
+                await _set_pinned_control_admission(
+                    agent_id=_control_owner_agent_id,
+                    open_for_admission=False,
+                )
+        _control_owner_lease_token = None
+        _control_owner_agent_id = None
+        raise
+
+    stop = asyncio.Event()
+    _control_watcher_stop = stop
+    _control_watcher_task = asyncio.create_task(
+        _control_watcher_loop(
+            postgres_conn=_session.postgres_conn,
+            thread_id=str(_thread_id),
+            stop=stop,
+            lease_token=_control_owner_lease_token,
+            agent_id=_control_owner_agent_id,
+        ),
+        name=f"thread-control-watcher-{str(_thread_id)[:8]}",
+    )
+    return drained
+
+
+async def _stop_thread_control_watcher() -> None:
+    """Stop and await the owner consumer before lease completion/release."""
+
+    global _control_watcher_task, _control_watcher_stop
+    global _control_owner_lease_token, _control_owner_agent_id
+
+    task = _control_watcher_task
+    stop = _control_watcher_stop
+    # This helper is also used by partial-attach cleanup. Never cancel the
+    # only pinned consumer while its public capability is still advertised;
+    # teardown's earlier close+final-drain makes this an idempotent second
+    # close on the normal path.
+    if _control_owner_agent_id is not None:
+        await _set_pinned_control_admission(
+            agent_id=_control_owner_agent_id,
+            open_for_admission=False,
+        )
+    if stop is not None:
+        stop.set()
+    if task is not None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=_CONTROL_STOP_GRACE_SECONDS
+            )
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
+        except asyncio.TimeoutError:
+            # A wedged DB/listener must not pin lease completion forever.
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+    _control_watcher_task = None
+    _control_watcher_stop = None
+    _control_owner_lease_token = None
+    _control_owner_agent_id = None
+
+
+async def _finalize_durable_interrupt(
+    request: Any,
+    *,
+    lease_token: int,
+    outcome: str,
+    mode: Optional[str],
+    error_code: Optional[str],
+    accepted_lease_token: Optional[int] = None,
+    stale_recovery: bool = False,
+) -> str:
+    """Terminalize one interrupt from its committed journal receipt."""
+
+    from ..shared.thread_interrupts import finalize_interrupt_request
+
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return "lost_owner"
+    async with _session.postgres_conn.acquire() as conn:
+        async with conn.transaction():
+            return await finalize_interrupt_request(
+                conn,
+                request_id=request.id,
+                thread_id=_thread_id,
+                lease_token=int(lease_token),
+                target_turn_id=int(request.target_turn_id),
+                outcome=outcome,
+                mode=mode,
+                error_code=error_code,
+                accepted_lease_token=accepted_lease_token,
+                stale_recovery=stale_recovery,
+            )
+
+
+async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> int:
+    """Consume pending interrupts for one exact live lease/turn pair.
+
+    The RAM signal happens synchronously before allocating the durable receipt.
+    Only a committed receipt may terminalize the request. Receipt recovery
+    deliberately skips the RAM mutation: repeating a historical hard signal
+    after its target await already unwound could hit unrelated work inside the
+    same turn.
+    """
+
+    from ..shared.thread_interrupts import (
+        fetch_interrupt_receipt,
+        fetch_next_interrupt_request,
+        interrupt_receipt_result,
+        owner_fence_current,
+    )
+
+    applied_count = 0
+    async with _interrupt_drain_lock:
+        while True:
+            if _session is None or _session.postgres_conn is None or _thread_id is None:
+                return applied_count
+            handle = _current_lease_var.get()
+            if (
+                handle is None
+                or handle.unit_id != str(_thread_id)
+                or handle.lease_token != int(lease_token)
+                or handle.lost.is_set()
+            ):
+                if handle is not None:
+                    handle.lost.set()
+                raise InterruptInboxBlocked(f"interrupt owner lost lease {lease_token}")
+
+            started = time.perf_counter()
+            async with _session.postgres_conn.acquire() as conn:
+                async with conn.transaction():
+                    owns_thread = await owner_fence_current(
+                        conn,
+                        thread_id=_thread_id,
+                        lease_token=int(lease_token),
+                    )
+                    if not owns_thread:
+                        handle.lost.set()
+                        raise InterruptInboxBlocked(
+                            "interrupt owner fence is no longer current"
+                        )
+                    request = await fetch_next_interrupt_request(
+                        conn,
+                        thread_id=_thread_id,
+                        lease_token=int(lease_token),
+                        target_turn_id=int(target_turn_id),
+                    )
+                    if request is None:
+                        return applied_count
+                    receipt = await fetch_interrupt_receipt(
+                        conn,
+                        thread_id=_thread_id,
+                        request_id=request.id,
+                    )
+
+            if receipt is not None:
+                receipt_result = interrupt_receipt_result(
+                    request_id=request.id,
+                    client_request_id=request.client_request_id,
+                    target_turn_id=request.target_turn_id,
+                    event_kind=receipt.kind,
+                    event_payload=receipt.payload,
+                )
+                if receipt_result is None:
+                    raise InterruptInboxBlocked(
+                        "interrupt receipt does not match its durable request: "
+                        f"{request.id}"
+                    )
+                outcome, mode, error_code = receipt_result
+                result = await _finalize_durable_interrupt(
+                    request,
+                    lease_token=int(lease_token),
+                    outcome=outcome,
+                    mode=mode,
+                    error_code=error_code,
+                )
+                if result not in {outcome, "already_terminal"}:
+                    if result == "lost_owner":
+                        handle.lost.set()
+                    raise InterruptInboxBlocked(
+                        "interrupt receipt recovery failed: "
+                        f"request={request.id} result={result}"
+                    )
+                applied_count += 1
+                logger.info(
+                    "session-interrupt timing: thread=%s turn=%d "
+                    "recovered_receipt=true total=%.3fs",
+                    _thread_id,
+                    request.target_turn_id,
+                    time.perf_counter() - started,
+                )
+                continue
+
+            mode = _signal_interrupt_for_turn(request.target_turn_id)
+            outcome = "applied" if mode is not None else "rejected"
+            error_code = None if mode is not None else "target_turn_not_active"
+            params: Dict[str, Any] = {
+                "request_id": str(request.id),
+                "client_request_id": str(request.client_request_id),
+                "target_turn_id": request.target_turn_id,
+                "applied": outcome == "applied",
+            }
+            if mode is not None:
+                params["mode"] = mode
+            else:
+                params["error_code"] = error_code
+
+            journal_started = time.perf_counter()
+            try:
+                epoch, seq = await _broadcast_interrupt_durable(
+                    "interrupt.ack",
+                    params,
+                    interrupt_request_id=str(request.id),
+                    lease_token=int(lease_token),
+                )
+            except EventJournalUnavailable as exc:
+                raise InterruptInboxBlocked(
+                    f"interrupt journal acknowledgement failed: {request.id}"
+                ) from exc
+            journal_seconds = time.perf_counter() - journal_started
+            result = await _finalize_durable_interrupt(
+                request,
+                lease_token=int(lease_token),
+                outcome=outcome,
+                mode=mode,
+                error_code=error_code,
+            )
+            if result not in {outcome, "already_terminal"}:
+                if result == "lost_owner":
+                    handle.lost.set()
+                raise InterruptInboxBlocked(
+                    "interrupt finalization failed: "
+                    f"request={request.id} journal={epoch}/{seq} result={result}"
+                )
+            applied_count += 1
+            logger.info(
+                "session-interrupt timing: thread=%s turn=%d applied=%s "
+                "recovered_receipt=false journal=%.3fs total=%.3fs",
+                _thread_id,
+                request.target_turn_id,
+                outcome == "applied",
+                journal_seconds,
+                time.perf_counter() - started,
+            )
+
+
+async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
+    """Fence an abandoned turn before its successor emits any turn output.
+
+    A claim can beat the reaper's post-steal journal transaction. The attach
+    then initially seeds an ordered writer in the abandoned epoch. Close that
+    writer first, lock the stateless thread then the exact CURRENT queue token,
+    bump the epoch, and publish a fresh writer at seq 0.
+    Any old process or partial-delta flush is now rejected by the epoch/token
+    fence before this owner journals recovery receipts or starts a new turn.
+    """
+
+    global _event_writer, _events_epoch, _next_seq
+
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        raise EventJournalUnavailable("interrupt epoch recovery lost its session")
+    handle = _current_lease_var.get()
+    if (
+        handle is None
+        or handle.unit_id != str(_thread_id)
+        or handle.lease_token != int(lease_token)
+        or handle.lost.is_set()
+    ):
+        raise InterruptInboxBlocked("interrupt epoch recovery lost local lease")
+
+    old_writer = _event_writer
+    if old_writer is None or old_writer.thread_id != str(_thread_id):
+        raise EventJournalUnavailable("interrupt epoch recovery has no writer")
+    _event_writer = None
+    await old_writer.close()
+
+    old_epoch = _events_epoch
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            async with conn.transaction():
+                # Two statements make the cross-writer lock order explicit;
+                # a joined FOR clause does not guarantee acquisition order.
+                thread = await conn.fetchrow(
+                    "SELECT 1 FROM threads WHERE id = $1::uuid "
+                    "AND execution_lane = 'stateless' AND agent_id IS NULL "
+                    "FOR UPDATE",
+                    _thread_id,
+                )
+                if thread is None:
+                    handle.lost.set()
+                    raise InterruptInboxBlocked(
+                        "interrupt epoch recovery thread is no longer stateless"
+                    )
+                queue = await conn.fetchrow(
+                    "SELECT 1 FROM run_queue "
+                    "WHERE unit_id = $1::uuid AND unit_kind = 'session_turn' "
+                    "AND state = 'leased' AND lease_token = $2::bigint "
+                    "FOR UPDATE",
+                    _thread_id,
+                    int(lease_token),
+                )
+                if queue is None:
+                    handle.lost.set()
+                    raise InterruptInboxBlocked(
+                        "interrupt epoch recovery queue token is no longer current"
+                    )
+                new_epoch = await _event_journal.bump_epoch(
+                    conn,
+                    thread_id=str(_thread_id),
+                )
+    except BaseException:
+        # A failed transaction exit can be commit-ambiguous. Never recreate a
+        # writer in the old epoch by guessing that the bump rolled back; leave
+        # this token to expire and let the next exact claimant resolve the DB.
+        handle.lost.set()
+        raise
+
+    _events_epoch = int(new_epoch)
+    _next_seq = 0
+    try:
+        new_writer = _OrderedPersistentEventWriter(
+            postgres_conn=_session.postgres_conn,
+            thread_id=str(_thread_id),
+            epoch=_events_epoch,
+            on_terminal_failure=_event_persistence_failed,
+            lease=handle,
+        )
+        new_writer.start()
+    except BaseException:
+        handle.lost.set()
+        raise
+    _event_writer = new_writer
+    logger.info(
+        "session-interrupt recovery epoch: thread=%s token=%d old=%d new=%d",
+        _thread_id,
+        lease_token,
+        old_epoch,
+        _events_epoch,
+    )
+    return _events_epoch
+
+
+async def _reconcile_stale_thread_interrupts(
+    *, lease_token: int
+) -> tuple[int, Optional[int]]:
+    """Settle pending requests from superseded leases without signalling RAM.
+
+    The current exact owner supplies journal authority and holds the queue row
+    against a concurrent reaper/claim. The request retains its immutable OLD
+    accepted token; ``applied_lease_token`` stores that token solely because
+    the frozen schema requires equality. It does not attribute a
+    successor/system-writer owner-loss receipt to the expired process. The
+    successor never signals its own RAM from the stale request.
+    """
+
+    from ..shared.thread_interrupts import (
+        fetch_interrupt_receipt,
+        consume_applied_interrupt_input_live,
+        fetch_stale_interrupt_requests,
+        interrupt_receipt_result,
+        owner_fence_current_for_update,
+    )
+
+    reconciled = 0
+    async with _interrupt_drain_lock:
+        if _session is None or _session.postgres_conn is None or _thread_id is None:
+            return reconciled, None
+        while True:
+            handle = _current_lease_var.get()
+            if (
+                handle is None
+                or handle.unit_id != str(_thread_id)
+                or handle.lease_token != int(lease_token)
+                or handle.lost.is_set()
+            ):
+                if handle is not None:
+                    handle.lost.set()
+                raise InterruptInboxBlocked(
+                    f"stale-interrupt reconciler lost lease {lease_token}"
+                )
+
+            async with _session.postgres_conn.acquire() as conn:
+                async with conn.transaction():
+                    owns_thread = await owner_fence_current_for_update(
+                        conn,
+                        thread_id=_thread_id,
+                        lease_token=int(lease_token),
+                    )
+                    if not owns_thread:
+                        handle.lost.set()
+                        raise InterruptInboxBlocked(
+                            "stale-interrupt owner fence is no longer current"
+                        )
+                    requests = await fetch_stale_interrupt_requests(
+                        conn,
+                        thread_id=_thread_id,
+                        current_lease_token=int(lease_token),
+                    )
+                    if not requests:
+                        queue = await conn.fetchrow(
+                            "SELECT consumed_seq FROM run_queue "
+                            "WHERE unit_id = $1::uuid AND state = 'leased' "
+                            "AND lease_token = $2::bigint",
+                            _thread_id,
+                            int(lease_token),
+                        )
+                        return (
+                            reconciled,
+                            (
+                                int(queue["consumed_seq"])
+                                if queue is not None
+                                and queue["consumed_seq"] is not None
+                                else None
+                            ),
+                        )
+                    receipts = {
+                        request.id: await fetch_interrupt_receipt(
+                            conn,
+                            thread_id=_thread_id,
+                            request_id=request.id,
+                        )
+                        for request in requests
+                    }
+
+            # A stale row proves the claim beat the reaper's post-steal
+            # boundary. Rotate before any recovery frame or successor output.
+            await _rotate_thread_interrupt_recovery_epoch(lease_token=int(lease_token))
+
+            results: list[tuple[Any, str, Optional[str], Optional[str]]] = []
+            for request in requests:
+                receipt = receipts[request.id]
+                if receipt is not None:
+                    receipt_result = interrupt_receipt_result(
+                        request_id=request.id,
+                        client_request_id=request.client_request_id,
+                        target_turn_id=request.target_turn_id,
+                        event_kind=receipt.kind,
+                        event_payload=receipt.payload,
+                    )
+                    if receipt_result is None:
+                        raise InterruptInboxBlocked(
+                            "stale interrupt receipt does not match its request: "
+                            f"{request.id}"
+                        )
+                    outcome, mode, error_code = receipt_result
+                elif request.outcome is not None:
+                    raise InterruptInboxBlocked(
+                        "terminal stale interrupt is missing its durable receipt: "
+                        f"{request.id}"
+                    )
+                else:
+                    # Exact durable admission is itself stop intent. The old
+                    # owner may have signalled RAM and died before allocating
+                    # its receipt; rejecting here would re-run a turn the user
+                    # already stopped. The successor never signals its own
+                    # RAM, but durably settles the old target as a hard stop.
+                    outcome = "applied"
+                    mode = "hard"
+                    error_code = None
+                    params: Dict[str, Any] = {
+                        "request_id": str(request.id),
+                        "client_request_id": str(request.client_request_id),
+                        "target_turn_id": request.target_turn_id,
+                        "applied": True,
+                        "mode": mode,
+                        "reason": "owner_lost",
+                        "owner_loss_reason": "lease_expired",
+                    }
+                    try:
+                        await _broadcast_interrupt_durable(
+                            "interrupt.ack",
+                            params,
+                            interrupt_request_id=str(request.id),
+                            lease_token=int(lease_token),
+                            accepted_lease_token=int(request.accepted_lease_token),
+                            stale_recovery=True,
+                        )
+                    except EventJournalUnavailable as exc:
+                        raise InterruptInboxBlocked(
+                            f"stale interrupt journal settlement failed: {request.id}"
+                        ) from exc
+                results.append((request, outcome, mode, error_code))
+
+            # Match the reaper's generation shape: all correlated acks become
+            # durable first, then one terminal boundary closes the abandoned
+            # partial turn before any input watermark moves.
+            requests_by_target: Dict[int, list[Any]] = {}
+            for request in requests:
+                requests_by_target.setdefault(int(request.target_turn_id), []).append(
+                    request
+                )
+            for target_turn_id, target_requests in requests_by_target.items():
+                await _broadcast_event_durable(
+                    "turn.interrupted",
+                    {
+                        "reason": "lease_expired",
+                        "recovered_by_lease_token": int(lease_token),
+                        "target_turn_id": target_turn_id,
+                        "interrupt_request_ids": [
+                            str(request.id) for request in target_requests
+                        ],
+                        "accepted_lease_tokens": sorted(
+                            {
+                                int(request.accepted_lease_token)
+                                for request in target_requests
+                            }
+                        ),
+                    },
+                )
+
+            for request, outcome, mode, error_code in results:
+                if request.outcome == "applied":
+                    # Receipt-before-finalizer recovery may also encounter an
+                    # already-terminal applied row written by older code. The
+                    # same group helper stamps/reuses the exactly-once marker.
+                    async with _session.postgres_conn.acquire() as conn:
+                        async with conn.transaction():
+                            if not await owner_fence_current_for_update(
+                                conn,
+                                thread_id=_thread_id,
+                                lease_token=int(lease_token),
+                            ):
+                                handle.lost.set()
+                                raise InterruptInboxBlocked(
+                                    "stale applied interrupt lost current owner"
+                                )
+                            consumed = await consume_applied_interrupt_input_live(
+                                conn,
+                                thread_id=_thread_id,
+                                current_lease_token=int(lease_token),
+                                accepted_lease_token=int(request.accepted_lease_token),
+                                target_turn_id=int(request.target_turn_id),
+                                request_id=request.id,
+                            )
+                            if consumed is None:
+                                raise InterruptInboxBlocked(
+                                    "stale applied interrupt could not settle input"
+                                )
+                    result = "already_terminal"
+                elif request.outcome is not None:
+                    # Only unmarked applied terminal rows are selected.
+                    raise InterruptInboxBlocked(
+                        "unexpected terminal stale interrupt candidate: "
+                        f"{request.id}/{request.outcome}"
+                    )
+                else:
+                    result = await _finalize_durable_interrupt(
+                        request,
+                        lease_token=int(lease_token),
+                        outcome=outcome,
+                        mode=mode,
+                        error_code=error_code,
+                        accepted_lease_token=int(request.accepted_lease_token),
+                        stale_recovery=True,
+                    )
+                if result not in {outcome, "already_terminal"}:
+                    if result == "lost_owner":
+                        handle.lost.set()
+                    raise InterruptInboxBlocked(
+                        "stale interrupt finalization failed: "
+                        f"request={request.id} result={result}"
+                    )
+                reconciled += 1
+                logger.info(
+                    "session-interrupt stale recovery: thread=%s request=%s "
+                    "accepted_token=%d current_token=%d receipt=%s",
+                    _thread_id,
+                    request.id,
+                    request.accepted_lease_token,
+                    lease_token,
+                    receipts[request.id] is not None,
+                )
+
+            async with _session.postgres_conn.acquire() as conn:
+                async with conn.transaction():
+                    if not await owner_fence_current_for_update(
+                        conn,
+                        thread_id=_thread_id,
+                        lease_token=int(lease_token),
+                    ):
+                        handle.lost.set()
+                        raise InterruptInboxBlocked(
+                            "stale-interrupt owner lost before watermark refresh"
+                        )
+                    queue = await conn.fetchrow(
+                        "SELECT consumed_seq FROM run_queue "
+                        "WHERE unit_id = $1::uuid AND state = 'leased' "
+                        "AND lease_token = $2::bigint",
+                        _thread_id,
+                        int(lease_token),
+                    )
+                    return (
+                        reconciled,
+                        (
+                            int(queue["consumed_seq"])
+                            if queue is not None and queue["consumed_seq"] is not None
+                            else None
+                        ),
+                    )
+
+
+async def _interrupt_watcher_loop(
+    *,
+    postgres_conn: Any,
+    thread_id: str,
+    stop: asyncio.Event,
+    lease_token: int,
+    target_turn_id: int,
+) -> None:
+    """LISTEN for interrupt latency and poll for correctness."""
+
+    wake = asyncio.Event()
+
+    def _on_notify(_conn: Any, _pid: int, _channel: str, payload: str) -> None:
+        try:
+            notice = json.loads(payload)
+        except Exception:
+            return
+        if str(notice.get("thread_id") or "") == thread_id:
+            wake.set()
+
+    async def _drain_once() -> None:
+        try:
+            await _drain_thread_interrupts(
+                lease_token=lease_token,
+                target_turn_id=target_turn_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "session-interrupt drain failed; request remains pending "
+                "(thread=%s turn=%d)",
+                thread_id,
+                target_turn_id,
+                exc_info=True,
+            )
+
+    try:
+        async with postgres_conn.acquire() as listener:
+            await listener.add_listener(_INTERRUPT_NOTIFY_CHANNEL, _on_notify)
+            try:
+                while not stop.is_set():
+                    await _drain_once()
+                    wake.clear()
+                    if stop.is_set():
+                        break
+                    wake_waiter = asyncio.create_task(wake.wait())
+                    stop_waiter = asyncio.create_task(stop.wait())
+                    waiters = {wake_waiter, stop_waiter}
+                    try:
+                        await asyncio.wait(
+                            waiters,
+                            timeout=_INTERRUPT_POLL_SECONDS,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for waiter in waiters:
+                            if not waiter.done():
+                                waiter.cancel()
+                        await asyncio.gather(*waiters, return_exceptions=True)
+            finally:
+                with suppress(Exception):
+                    await listener.remove_listener(
+                        _INTERRUPT_NOTIFY_CHANNEL,
+                        _on_notify,
+                    )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "session-interrupt LISTEN unavailable; polling (thread=%s turn=%d)",
+            thread_id,
+            target_turn_id,
+            exc_info=True,
+        )
+        while not stop.is_set():
+            await _drain_once()
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=_INTERRUPT_POLL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+
+async def _start_thread_interrupt_watcher(
+    *, lease_token: int, target_turn_id: int
+) -> int:
+    """Synchronously drain then watch one exact stateless turn."""
+
+    async with _interrupt_watcher_lifecycle_lock:
+        return await _start_thread_interrupt_watcher_locked(
+            lease_token=lease_token,
+            target_turn_id=target_turn_id,
+        )
+
+
+async def _start_thread_interrupt_watcher_locked(
+    *, lease_token: int, target_turn_id: int
+) -> int:
+    """Start while holding ``_interrupt_watcher_lifecycle_lock``."""
+
+    global _interrupt_watcher_task, _interrupt_watcher_stop
+    global _interrupt_owner_lease_token, _interrupt_owner_turn_id
+
+    await _stop_thread_interrupt_watcher_locked()
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        raise EventJournalUnavailable("cannot start interrupt owner without a session")
+    _interrupt_owner_lease_token = int(lease_token)
+    _interrupt_owner_turn_id = int(target_turn_id)
+    try:
+        drained = await _drain_thread_interrupts(
+            lease_token=_interrupt_owner_lease_token,
+            target_turn_id=_interrupt_owner_turn_id,
+        )
+    except BaseException:
+        _interrupt_owner_lease_token = None
+        _interrupt_owner_turn_id = None
+        raise
+
+    stop = asyncio.Event()
+    _interrupt_watcher_stop = stop
+    _interrupt_watcher_task = asyncio.create_task(
+        _interrupt_watcher_loop(
+            postgres_conn=_session.postgres_conn,
+            thread_id=str(_thread_id),
+            stop=stop,
+            lease_token=_interrupt_owner_lease_token,
+            target_turn_id=_interrupt_owner_turn_id,
+        ),
+        name=f"thread-interrupt-watcher-{str(_thread_id)[:8]}",
+    )
+    return drained
+
+
+async def _stop_thread_interrupt_watcher() -> None:
+    """Stop and terminally join the consumer before any final drain.
+
+    This join is intentionally unbounded. Cancelling a drain that is awaiting
+    its ordered-writer receipt is ambiguous: the INSERT may still commit after
+    cancellation, and a replacement drain could then re-signal RAM and try to
+    write a duplicate receipt. Queue completion must wait until the original
+    consumer has reached a durable terminal outcome instead.
+    """
+
+    async with _interrupt_watcher_lifecycle_lock:
+        await _stop_thread_interrupt_watcher_locked()
+
+
+async def _stop_thread_interrupt_watcher_locked() -> None:
+    """Terminally join while holding the watcher lifecycle lock."""
+
+    global _interrupt_watcher_task, _interrupt_watcher_stop
+    global _interrupt_owner_lease_token, _interrupt_owner_turn_id
+
+    task = _interrupt_watcher_task
+    stop = _interrupt_watcher_stop
+    if stop is not None:
+        stop.set()
+    terminal = task is None
+    try:
+        if task is not None:
+            await asyncio.shield(task)
+            terminal = True
+    finally:
+        # If our caller is cancelled, shield leaves the consumer running and
+        # these owner globals intact. The queue transition is abandoned; a
+        # later cleanup can join the same unambiguous task. A task that itself
+        # failed/cancelled is terminal and may be cleared, while its exception
+        # still propagates so the executor marks the lease lost.
+        if task is not None and task.done():
+            terminal = True
+        if terminal:
+            _interrupt_watcher_task = None
+            _interrupt_watcher_stop = None
+            _interrupt_owner_lease_token = None
+            _interrupt_owner_turn_id = None
 
 
 def _emit_citation_verdict(citation_id: int, verification_status: str) -> None:
@@ -4225,19 +7244,26 @@ async def _loop_get_user_input() -> str:
     # reclassification against a thread the officer watchdog owns
     # (centurion.md §4). Officer also overrides polite mode: an explicit
     # reply gate after each turn contradicts autonomous cycling.
-    should_flip = (
+    should_consider_flip = (
         officer_cfg is None
         and _session is not None
         and _session.turn_count > 0
         and _orchestrator_client is not None
         and _thread_id is not None
-        and (headless_mode == "polite" or not _subscribers)
     )
-    if should_flip:
-        asyncio.create_task(
-            _safe_set_thread_status("awaiting_user"),
-            name="phase5-flip-awaiting-user",
-        )
+    if should_consider_flip:
+        if _stateless_mode():
+            # SSE presence is durable and replica-independent. Polite mode
+            # still pauses with a viewer; eager mode only pauses untethered.
+            await _safe_mark_stateless_natural_pause(
+                require_untethered=headless_mode != "polite"
+            )
+        elif headless_mode == "polite" or not _subscribers:
+            # Pinned behavior remains the exact process-local subscriber path.
+            asyncio.create_task(
+                _safe_set_thread_status("awaiting_user"),
+                name="phase5-flip-awaiting-user",
+            )
 
     # Parked window for the drain-suspend gate (_session_parked): exactly the
     # span where this coroutine is blocked on the queue. The finally also
@@ -4462,6 +7488,64 @@ async def _insert_permission_request(
         return None
     try:
         async with _session.postgres_conn.acquire() as conn:
+            if _stateless_mode():
+                # Permission admission is part of the exact serving claim.  A
+                # plain INSERT can wait behind public End's thread lock and
+                # then create a fresh pending approval after End has expired
+                # the old cards.  Serialize in the global threads -> queue
+                # order and hold both locks through the INSERT so End observes
+                # either the card (and expires it) or the completed fence.
+                handle = _current_lease_var.get()
+                if (
+                    handle is None
+                    or not handle.active
+                    or handle.lost.is_set()
+                    or str(handle.unit_id) != str(_thread_id)
+                    or int(handle.lease_token) <= 0
+                ):
+                    if handle is not None:
+                        handle.mark_lost()
+                    return None
+                async with conn.transaction():
+                    thread_live = await conn.fetchval(
+                        "SELECT id FROM threads WHERE id = $1::uuid "
+                        "AND execution_lane = 'stateless' "
+                        "AND status IN ('created', 'active', 'awaiting_user', "
+                        "               'suspended') "
+                        "AND NOT (COALESCE(metadata, '{}'::jsonb) "
+                        "         ? '_stateless_workspace_retirement_pending') "
+                        "FOR UPDATE",
+                        _thread_id,
+                    )
+                    queue_live = None
+                    if thread_live is not None:
+                        queue_live = await conn.fetchval(
+                            "SELECT unit_id FROM run_queue "
+                            "WHERE unit_id = $1::uuid "
+                            "AND unit_kind = 'session_turn' "
+                            "AND state = 'leased' "
+                            "AND lease_token = $2::bigint "
+                            "FOR SHARE",
+                            _thread_id,
+                            int(handle.lease_token),
+                        )
+                    if queue_live is None:
+                        handle.mark_lost()
+                        return None
+                    row_id = await conn.fetchval(
+                        "INSERT INTO thread_permission_requests "
+                        "(thread_id, tool_call_id, tool_name, tool_args) "
+                        "VALUES ($1, $2, $3, $4::jsonb) "
+                        "RETURNING id",
+                        _thread_id,
+                        tool_call_id,
+                        tool_name,
+                        json.dumps(_safe_serialize(tool_args)),
+                    )
+                return str(row_id) if row_id is not None else None
+
+            # Pinned permission admission retains its existing statement and
+            # autocommit shape.
             row_id = await conn.fetchval(
                 "INSERT INTO thread_permission_requests "
                 "(thread_id, tool_call_id, tool_name, tool_args) "
@@ -4566,6 +7650,69 @@ _active_permission_request_id: Optional[str] = None
 _gates_in_flight: Set[str] = set()
 
 
+def _permission_retirement_authority() -> Optional[Tuple[str, int | str]]:
+    """Capture the exact credential allowed to retire permission rows."""
+
+    if _stateless_mode():
+        lease_token = _current_stateless_lease_token()
+        return ("stateless", lease_token) if lease_token is not None else None
+    agent_id = _control_owner_agent_id or _registered_pinned_agent_id()
+    return ("pinned", agent_id) if agent_id is not None else None
+
+
+_RETIRE_STATELESS_PERMISSION_SQL = """
+    WITH owner AS MATERIALIZED (
+        SELECT queue.unit_id
+        FROM run_queue AS queue
+        WHERE queue.unit_id = $2::uuid
+          AND queue.unit_kind = 'session_turn'
+          AND queue.state = 'leased'
+          AND queue.lease_token = $3::bigint
+        FOR SHARE OF queue
+    ), expired AS (
+        UPDATE thread_permission_requests AS request
+        SET status = 'expired', decided_at = clock_timestamp(),
+            decided_by = 'system'
+        WHERE request.id = $1::uuid
+          AND request.thread_id = $2::uuid
+          AND request.status = 'pending'
+          AND EXISTS (SELECT 1 FROM owner)
+        RETURNING request.id
+    )
+    SELECT id FROM expired
+"""
+
+
+_RETIRE_PINNED_PERMISSION_SQL = """
+    WITH thread_owner AS MATERIALIZED (
+        SELECT thread.id
+        FROM threads AS thread
+        WHERE thread.id = $2::uuid
+          AND thread.execution_lane = 'pinned'
+          AND thread.agent_id = $3::uuid
+        FOR NO KEY UPDATE OF thread
+    ), agent_owner AS MATERIALIZED (
+        SELECT agent.id
+        FROM agents AS agent
+        WHERE agent.id = $3::uuid
+          AND agent.thread_id = $2::uuid
+          AND EXISTS (SELECT 1 FROM thread_owner)
+        FOR SHARE OF agent
+    ), expired AS (
+        UPDATE thread_permission_requests AS request
+        SET status = 'expired', decided_at = clock_timestamp(),
+            decided_by = 'system'
+        WHERE request.id = $1::uuid
+          AND request.thread_id = $2::uuid
+          AND request.status = 'pending'
+          AND EXISTS (SELECT 1 FROM thread_owner)
+          AND EXISTS (SELECT 1 FROM agent_owner)
+        RETURNING request.id
+    )
+    SELECT id FROM expired
+"""
+
+
 async def _retire_announced_permission_rows(
     reason: str, mode: Optional[str] = None
 ) -> None:
@@ -4594,8 +7741,11 @@ async def _retire_announced_permission_rows(
     only ever expire rows announced by the session it is running in.
 
     CAS (``WHERE id = $1 AND status = 'pending'``) so a genuine decision that
-    landed a microsecond earlier still wins; only rows this sweep really
-    expired are broadcast, so an attached client drops exactly those cards.
+    landed a microsecond earlier still wins. The same statement holds either
+    the exact stateless run-queue lease or the reciprocal pinned binding while
+    updating; a stale runtime therefore cannot expire a successor's gate.
+    Only rows this sweep really expired are broadcast, so an attached client
+    drops exactly those cards.
     """
     if not _announced_permission_rows:
         return
@@ -4606,6 +7756,13 @@ async def _retire_announced_permission_rows(
     # on every reattach with no way left to resolve them.
     if _session is None or _session.postgres_conn is None:
         return
+    authority = _permission_retirement_authority()
+    if authority is None or _thread_id is None:
+        logger.info(
+            "Skipped permission-row retirement without exact owner (%s)", reason
+        )
+        return
+    authority_kind, authority_credential = authority
     # Take ownership up front so a second sweep can't double-work the same
     # rows; anything we fail to reach goes back on the ledger below. No await
     # between this and the pop, so ownership is atomic.
@@ -4627,12 +7784,12 @@ async def _retire_announced_permission_rows(
         async with _session.postgres_conn.acquire() as conn:
             for tool_call_id, (request_id, _tool, _tid) in list(doomed.items()):
                 row_id = await conn.fetchval(
-                    "UPDATE thread_permission_requests "
-                    "SET status = 'expired', decided_at = now(), "
-                    "    decided_by = 'system' "
-                    "WHERE id = $1 AND status = 'pending' "
-                    "RETURNING id",
+                    _RETIRE_STATELESS_PERMISSION_SQL
+                    if authority_kind == "stateless"
+                    else _RETIRE_PINNED_PERMISSION_SQL,
                     request_id,
+                    _thread_id,
+                    authority_credential,
                 )
                 doomed.pop(tool_call_id, None)
                 if row_id is not None:
@@ -4672,6 +7829,12 @@ async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> N
     than inserting its own — see ``_loop_permission_check``.
     """
     if _session is None or _thread_id is None:
+        return
+    # A mode control can commit while the LLM is producing its tool batch.
+    # Drain under the exact current owner immediately before deciding which
+    # rows to announce; LISTEN is latency-only and may have missed a notice.
+    await _drain_current_thread_controls()
+    if _session is None:
         return
     # Belt-and-braces against a turn that ended without its cleanup hook
     # (e.g. the loop task cancelled outright): never let a previous batch's
@@ -4818,6 +7981,7 @@ async def _wait_for_permission_resolution(
                 if current in ("approved", "denied", "expired"):
                     return str(current)
 
+                wait_timeout = float(timeout)
                 while True:
                     waits = [asyncio.ensure_future(resolved.wait())]
                     if _hard_interrupt_event is not None:
@@ -4827,7 +7991,7 @@ async def _wait_for_permission_resolution(
                     try:
                         await asyncio.wait(
                             waits,
-                            timeout=timeout,
+                            timeout=wait_timeout,
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                     finally:
@@ -4847,6 +8011,67 @@ async def _wait_for_permission_resolution(
 
                     if resolved.is_set():
                         break
+
+                    if _stateless_mode():
+                        lease_token = _current_stateless_lease_token()
+                        if lease_token is None:
+                            # Lease loss is not a user decision. Leave the row
+                            # pending for the successor/retirement path.
+                            logger.info(
+                                "Permission wait lost stateless owner "
+                                "(req=%s) — leaving pending",
+                                request_id,
+                            )
+                            return "interrupted"
+                        try:
+                            expiry = await expire_permission_if_untethered(
+                                conn,
+                                thread_id=str(_thread_id),
+                                request_id=request_id,
+                                lease_token=lease_token,
+                            )
+                        except Exception as exc:
+                            # Unknown presence must retain the card. A broken
+                            # connection may recover; retry on a short bounded
+                            # slice rather than fabricating a denial/expiry.
+                            logger.warning(
+                                "Permission presence check failed (req=%s): %s",
+                                request_id,
+                                exc,
+                            )
+                            wait_timeout = min(float(timeout), 5.0)
+                            continue
+
+                        if expiry.status in ("approved", "denied", "expired"):
+                            return str(expiry.status)
+                        if not expiry.owner_live:
+                            logger.info(
+                                "Permission owner fence rejected (req=%s) "
+                                "— leaving pending",
+                                request_id,
+                            )
+                            return "interrupted"
+                        if expiry.live_for_seconds is not None:
+                            # A tab closed just before this timeout should be
+                            # reconsidered at its short presence deadline, not
+                            # after another full five-minute permission slice.
+                            wait_timeout = min(
+                                float(timeout),
+                                max(0.1, expiry.live_for_seconds + 0.05),
+                            )
+                            continue
+
+                        # A concurrent resolver may have won after the CTE's
+                        # statement snapshot. Re-read before looping.
+                        status_now = await conn.fetchval(
+                            "SELECT status FROM thread_permission_requests "
+                            "WHERE id = $1",
+                            request_id,
+                        )
+                        if status_now in ("approved", "denied", "expired"):
+                            return str(status_now)
+                        wait_timeout = float(timeout)
+                        continue
 
                     if not _subscribers:
                         # Untethered: nobody can answer. CAS-style expire —
@@ -4954,6 +8179,13 @@ async def _loop_permission_check(
             "permission_check fired with _session=None for tool %s — declining",
             tool_name,
         )
+        return PermissionOutcome.DECLINED
+
+    # Same authoritative edge as batch announcement, repeated for each gate:
+    # a committed mid-turn mode change must affect the very next tool call,
+    # even if DB NOTIFY delivery was delayed or lost.
+    await _drain_current_thread_controls()
+    if _session is None:
         return PermissionOutcome.DECLINED
 
     mode = _session.permission_mode
@@ -5084,14 +8316,16 @@ async def _loop_permission_check(
         # surfaces via the sitrep instead.
         if (
             _officer_cfg() is None
-            and not _subscribers
             and _orchestrator_client is not None
             and _thread_id is not None
         ):
-            asyncio.create_task(
-                _safe_set_thread_status("awaiting_user"),
-                name="phase5-flip-awaiting-user-sudo",
-            )
+            if _stateless_mode():
+                await _safe_mark_stateless_natural_pause(require_untethered=True)
+            elif not _subscribers:
+                asyncio.create_task(
+                    _safe_set_thread_status("awaiting_user"),
+                    name="phase5-flip-awaiting-user-sudo",
+                )
 
         # Publish the row we are blocked on so a concurrent sweep (mode.set from
         # the WS task) can't expire it under us and turn a live question into a
@@ -5180,7 +8414,208 @@ async def _resilient_cloud_sync(op: str, runner, turn_id: int) -> bool:
     return False
 
 
-async def _run_turn_end_cloud_push(sync: Any, turn_id: int) -> None:
+@dataclass(frozen=True)
+class _CloudGenerationClaim:
+    thread_id: str
+    lease_token: int
+    workspace_generation: str
+    postgres: Any
+    lease_handle: Any
+
+
+def _capture_cloud_generation_claim(sync: Any) -> _CloudGenerationClaim:
+    """Freeze the current claim identity for callbacks/background work."""
+
+    handle = _current_lease_var.get()
+    if (
+        handle is None
+        or not handle.active
+        or not _thread_id
+        or str(handle.unit_id) != str(_thread_id)
+        or _session is None
+        or _session.postgres_conn is None
+        or not str(getattr(sync, "workspace_generation", ""))
+    ):
+        raise LeaseLostError(
+            "stateless cloud sync lacks an exact queue/workspace generation"
+        )
+    return _CloudGenerationClaim(
+        thread_id=str(_thread_id),
+        lease_token=int(handle.lease_token),
+        workspace_generation=str(sync.workspace_generation),
+        postgres=_session.postgres_conn,
+        lease_handle=handle,
+    )
+
+
+async def _assert_cloud_generation_owner(claim: _CloudGenerationClaim) -> None:
+    """Recheck queue token + workspace incarnation before an external write."""
+
+    from ..shared.cloud_sync_generations import cloud_sync_lease_is_current
+
+    current = await cloud_sync_lease_is_current(
+        claim.postgres,
+        thread_id=claim.thread_id,
+        lease_token=claim.lease_token,
+        workspace_generation=claim.workspace_generation,
+    )
+    if current:
+        return
+    claim.lease_handle.mark_lost()
+    raise LeaseLostError(
+        "cloud sync write rejected by queue/workspace generation fence"
+    )
+
+
+async def _ack_cloud_generation(
+    claim: _CloudGenerationClaim, mount_id: str, requirement: Any
+) -> None:
+    from ..shared.cloud_sync_generations import acknowledge_cloud_sync_generation
+
+    acknowledged = await acknowledge_cloud_sync_generation(
+        claim.postgres,
+        thread_id=claim.thread_id,
+        lease_token=claim.lease_token,
+        mount_id=mount_id,
+        generation=requirement.required_generation,
+        workspace_generation=requirement.workspace_generation,
+        sync_scope_sha256=requirement.sync_scope_sha256,
+        baseline_sha256=requirement.baseline_sha256,
+    )
+    if acknowledged:
+        return
+    claim.lease_handle.mark_lost()
+    raise LeaseLostError(
+        f"cloud generation acknowledgement fenced for mount {mount_id}"
+    )
+
+
+async def _prepare_stateless_cloud_sync(sync: Any, turn_id: int) -> None:
+    """Recover predecessor, pull, then arm this claim before any tool work."""
+
+    from ..services.cloud_sync.coordinator import CloudSyncGenerationError
+    from ..shared.cloud_sync_generations import (
+        arm_cloud_sync_generations,
+        load_cloud_sync_requirements,
+    )
+
+    claim = _capture_cloud_generation_claim(sync)
+    await _assert_cloud_generation_owner(claim)
+    requirements = await load_cloud_sync_requirements(
+        claim.postgres,
+        thread_id=claim.thread_id,
+        lease_token=claim.lease_token,
+        workspace_generation=claim.workspace_generation,
+    )
+    # LOAD deliberately returns no rows when its owner CTE is fenced. Distinguish
+    # that from a genuine first claim before treating an empty set as safe.
+    await _assert_cloud_generation_owner(claim)
+
+    async def acknowledge(mount_id: str, requirement: Any) -> None:
+        await _ack_cloud_generation(claim, mount_id, requirement)
+
+    async def before_write() -> None:
+        await _assert_cloud_generation_owner(claim)
+
+    _broadcast("workspace_sync.reconciling", {"turn_id": turn_id})
+    recovered = await _resilient_cloud_sync(
+        "generation_recovery",
+        lambda: sync.reconcile_before_pull(
+            requirements,
+            before_write=before_write,
+            acknowledge=acknowledge,
+        ),
+        turn_id,
+    )
+    if not recovered:
+        raise CloudSyncGenerationError(
+            "predecessor cloud generation recovery failed; pull refused"
+        )
+
+    _broadcast("workspace_sync.pulling", {"turn_id": turn_id})
+    if not await _resilient_cloud_sync(
+        "pull",
+        lambda: sync.pull_all(before_write=before_write, force_unknown=True),
+        turn_id,
+    ):
+        raise CloudSyncGenerationError("stateless turn-start cloud pull failed")
+    _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
+
+    scopes = await sync.capture_generation_scopes()
+    armed = await arm_cloud_sync_generations(
+        claim.postgres,
+        thread_id=claim.thread_id,
+        lease_token=claim.lease_token,
+        scopes=scopes,
+    )
+    expected = {scope.mount_id for scope in scopes}
+    if set(armed) != expected:
+        raise CloudSyncGenerationError(
+            "cloud generation arm was fenced or left a partial mount set"
+        )
+    sync.validate_requirements(armed)
+    if _session is None:
+        raise LeaseLostError("session detached while arming cloud generation")
+    _session.cloud_sync_requirements = dict(armed)
+    logger.info(
+        "cloud generation armed: thread=%s lease=%d mounts=%d",
+        claim.thread_id,
+        claim.lease_token,
+        len(armed),
+    )
+
+
+async def _assert_no_pending_stateless_cloud_generation() -> None:
+    """Do not let an omitted cloud payload hide predecessor work."""
+
+    if _session is None or not _session.cloud_sync_workspace_generation:
+        return
+    from ..services.cloud_sync.coordinator import CloudSyncGenerationError
+    from ..shared.cloud_sync_generations import load_cloud_sync_requirements
+
+    handle = _current_lease_var.get()
+    if (
+        handle is None
+        or not handle.active
+        or not _thread_id
+        or str(handle.unit_id) != str(_thread_id)
+        or _session.postgres_conn is None
+    ):
+        raise LeaseLostError("stateless no-cloud check lacks an exact lease")
+    claim = _CloudGenerationClaim(
+        thread_id=str(_thread_id),
+        lease_token=int(handle.lease_token),
+        workspace_generation=_session.cloud_sync_workspace_generation,
+        postgres=_session.postgres_conn,
+        lease_handle=handle,
+    )
+    await _assert_cloud_generation_owner(claim)
+    requirements = await load_cloud_sync_requirements(
+        claim.postgres,
+        thread_id=claim.thread_id,
+        lease_token=claim.lease_token,
+        workspace_generation=claim.workspace_generation,
+    )
+    await _assert_cloud_generation_owner(claim)
+    pending = sorted(
+        mount_id
+        for mount_id, requirement in requirements.items()
+        if requirement.acknowledged_generation < requirement.required_generation
+    )
+    if pending:
+        raise CloudSyncGenerationError(
+            "pending cloud generation has no configured recovery target: "
+            + ", ".join(pending)
+        )
+
+
+async def _run_turn_end_cloud_push(
+    sync: Any,
+    turn_id: int,
+    *,
+    requirements: Optional[Dict[str, Any]] = None,
+    claim: Optional[_CloudGenerationClaim] = None,
+) -> None:
     """Body of the background turn-end push task.
 
     Same retry/backoff and the same ``workspace_sync.pushing/pushed/error``
@@ -5189,7 +8624,28 @@ async def _run_turn_end_cloud_push(sync: Any, turn_id: int) -> None:
     nulls the session mid-flight can't turn this into an AttributeError.
     """
     _broadcast("workspace_sync.pushing", {"turn_id": turn_id})
-    if await _resilient_cloud_sync("push", sync.push_all, turn_id):
+    runner = sync.push_all
+    op = "push"
+    if requirements is not None:
+        if claim is None:
+            raise LeaseLostError("generation push lacks a captured claim")
+
+        async def before_write() -> None:
+            await _assert_cloud_generation_owner(claim)
+
+        async def acknowledge(mount_id: str, requirement: Any) -> None:
+            await _ack_cloud_generation(claim, mount_id, requirement)
+
+        async def generation_runner() -> Any:
+            return await sync.push_generation(
+                requirements,
+                before_write=before_write,
+                acknowledge=acknowledge,
+            )
+
+        runner = generation_runner
+        op = "generation_push"
+    if await _resilient_cloud_sync(op, runner, turn_id):
         _broadcast("workspace_sync.pushed", {"turn_id": turn_id})
 
 
@@ -5232,6 +8688,12 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
 
     if _session is None or not _orchestrator_client or not _thread_id:
         return
+    if (
+        _session.workspace_manager is None
+        or not _session.workspace_manager.backend.supports_file_tools
+    ):
+        _cloud_sync_retry_pending = False
+        return
     try:
         ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
     except Exception:
@@ -5250,17 +8712,28 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
     if not cloud_cfg and ws_info.get("nc_session_folder"):
         cloud_cfg = _legacy_nc_cloud_cfg(ws_info["nc_session_folder"])
     if not cloud_cfg:
-        return  # still nothing to sync to — try again next turn
+        if _stateless_mode() and not ws_info.get("cloud_sync_degraded"):
+            # A successful authoritative response says there is deliberately
+            # no mirror. This is different from the transport ambiguity that
+            # set the retry flag and is safe to clear.
+            _cloud_sync_retry_pending = False
+        return  # still nothing to sync to — or explicit no-cloud configuration
 
     try:
         coordinator = _build_sync_coordinator(
             workspace_path=_session.workspace_manager.path,
             workspace_backend=_session.workspace_manager.backend,
             cloud_cfg=cloud_cfg,
+            thread_id=str(_thread_id),
+            workspace_generation=str(ws_info.get("workspace_generation") or ""),
         )
         if not coordinator:
             return
-        await coordinator.pull_all()
+        # A stateless successor must reconcile the prior required generation
+        # before its first pull. Construct-only here; the single fenced
+        # turn-start path below performs recovery -> pull -> arm in order.
+        if not _stateless_mode():
+            await coordinator.pull_all()
     except Exception as e:
         # Keep the flag set: the target exists but isn't usable yet. Don't
         # leave a half-built coordinator behind for the push at turn end.
@@ -5282,8 +8755,18 @@ async def _loop_on_turn_start(turn_id: int) -> None:
     if _session is None:
         _turn_event_open = False
         return
-    _turn_event_open = True
     _session.turn_count = turn_id
+    _turn_event_open = True
+    hook = _turn_start_external_hook
+    if hook is not None:
+        try:
+            await hook(turn_id)
+        except BaseException:
+            # Do not publish a turn as interruptible when its exact admission
+            # and consumer could not be armed. The loop will run its normal
+            # terminal callback for this failed turn.
+            _turn_event_open = False
+            raise
     _broadcast("turn.started", {"turn_id": turn_id})
 
     # Cloud sync never started for this session (lost the race against
@@ -5291,7 +8774,18 @@ async def _loop_on_turn_start(turn_id: int) -> None:
     # the pull below so a recovered session syncs from this turn on.
     if _cloud_sync_retry_pending and _session.workspace_sync is None:
         await _retry_cloud_sync_start(turn_id)
+        if (
+            _stateless_mode()
+            and _cloud_sync_retry_pending
+            and _session.workspace_sync is None
+        ):
+            from ..services.cloud_sync.coordinator import CloudSyncGenerationError
 
+            raise CloudSyncGenerationError(
+                "stateless cloud sync remains degraded; tool work refused"
+            )
+    if _stateless_mode() and _session.workspace_sync is None:
+        await _assert_no_pending_stateless_cloud_generation()
     # The previous turn's push may still be flushing in the background —
     # wait it out before pulling so each mount keeps strict push→pull
     # ordering (and the pull's remote listing reflects the last turn's
@@ -5304,11 +8798,14 @@ async def _loop_on_turn_start(turn_id: int) -> None:
     # On transient failure (Cloudflare/edge hiccup) we retry+surface via
     # workspace_sync.error rather than letting the exception kill the loop.
     if _session.workspace_sync:
-        _broadcast("workspace_sync.pulling", {"turn_id": turn_id})
-        if await _resilient_cloud_sync(
-            "pull", _session.workspace_sync.pull_all, turn_id
-        ):
-            _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
+        if _stateless_mode():
+            await _prepare_stateless_cloud_sync(_session.workspace_sync, turn_id)
+        else:
+            _broadcast("workspace_sync.pulling", {"turn_id": turn_id})
+            if await _resilient_cloud_sync(
+                "pull", _session.workspace_sync.pull_all, turn_id
+            ):
+                _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
 
     # User-message persistence moved to accept time (_accept_user_input) plus
     # the loop's per-append upsert (persist_message). The content-based save
@@ -5369,7 +8866,7 @@ def _should_notify_cloud_stage() -> bool:
     return overlay is not None and overlay.active
 
 
-async def _notify_cloud_stage() -> None:
+async def _notify_cloud_stage(thread_id: str | None = None) -> None:
     """Fire-and-forget turn-end staging ping (protected cloud, Slice C).
 
     Never raises — staging failure must not touch the turn. Mirrors the
@@ -5381,10 +8878,13 @@ async def _notify_cloud_stage() -> None:
     internal_key = os.getenv("MCP_INTERNAL_KEY", "")
     if internal_key:
         headers["X-Internal-Key"] = internal_key
+    target_thread_id = str(thread_id or _thread_id or "")
+    if not target_thread_id:
+        return
     try:
         async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
             await client.post(
-                f"{orchestrator_url}/api/agents/threads/{_thread_id}/cloud-stage"
+                f"{orchestrator_url}/api/agents/threads/{target_thread_id}/cloud-stage"
             )
     except Exception as e:
         logger.debug(f"cloud-stage ping failed (non-fatal): {e}")
@@ -5410,6 +8910,33 @@ async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -
     # a reattach during turn-end persistence never reopens an already-completed
     # assistant bubble merely because the broader loop is not parked yet.
     _turn_event_open = False
+    await _loop_on_turn_complete_body(turn_id, metrics)
+
+
+async def _loop_on_turn_settled(turn_id: int) -> None:
+    """Publish the physical-executor edge after all turn-owned work settles.
+
+    ``_loop_on_turn_complete`` persists the transcript before the Git mapping,
+    so it cannot be the detach authorization for a stateless claimant.  The
+    persistent loop invokes this callback in a ``finally`` after memory,
+    commit, push, and turn-ledger mapping; only then may the executor cancel or
+    reuse the loop on another pod/claim.
+    """
+
+    hook = _turn_complete_external_hook
+    if hook is not None:
+        try:
+            hook(turn_id)
+        except Exception:
+            logger.warning(
+                "External turn-settled hook failed (non-fatal)",
+                exc_info=True,
+            )
+
+
+async def _loop_on_turn_complete_body(
+    turn_id: int, metrics: Optional[dict] = None
+) -> None:
     # Runs on EVERY turn exit — completed, parked on an unanswered gate,
     # interrupted, or errored (run_persistent_loop catches and still calls
     # this). Announced rows no gate ever claimed must die with the turn, or
@@ -5463,16 +8990,44 @@ async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -
         # Only reachable with no task pending (turn start awaited it), but a
         # future caller must never let two pushes walk one mount concurrently.
         await _await_pending_cloud_push()
-        _pending_cloud_push_task = asyncio.create_task(
-            _run_turn_end_cloud_push(_session.workspace_sync, turn_id),
-            name=f"cloud-push-turn-{turn_id}",
-        )
+        if _stateless_mode():
+            requirements = dict(_session.cloud_sync_requirements)
+            if not requirements:
+                raise LeaseLostError(
+                    "stateless turn completed without an armed cloud generation"
+                )
+            claim = _capture_cloud_generation_claim(_session.workspace_sync)
+            _pending_cloud_push_task = asyncio.create_task(
+                _run_turn_end_cloud_push(
+                    _session.workspace_sync,
+                    turn_id,
+                    requirements=requirements,
+                    claim=claim,
+                ),
+                name=f"cloud-generation-push-turn-{turn_id}",
+            )
+        else:
+            _pending_cloud_push_task = asyncio.create_task(
+                _run_turn_end_cloud_push(_session.workspace_sync, turn_id),
+                name=f"cloud-push-turn-{turn_id}",
+            )
 
     # Slice C (design §5): ping the orchestrator to stage the protected
     # session's upperdir diff to S3. Fire-and-forget — never blocks the next
     # turn on a slow SSH+tar+upload round-trip.
     if _should_notify_cloud_stage():
-        asyncio.create_task(_notify_cloud_stage())
+        if _stateless_mode():
+            # Protected-cloud stages are deliberately pinned for S2. A legacy
+            # malformed stateless row must fail closed rather than leave an
+            # unfenced SSH/tar task running after claimant handoff.
+            raise LeaseLostError("protected-cloud staging requires pinned execution")
+        stage_thread_id = str(_thread_id or "")
+        _track_session_side_task(
+            asyncio.create_task(
+                _notify_cloud_stage(stage_thread_id),
+                name=f"cloud-stage-{stage_thread_id[:12]}",
+            )
+        )
 
 
 def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
@@ -5758,6 +9313,15 @@ async def _loop_completion_handler(loop_task: asyncio.Task) -> None:
         await loop_task
     except IdleTimeoutError:
         logger.info("Persistent loop exited via idle timeout")
+        if _stateless_mode():
+            # Stateless lane: the pod-side idle timer must never end the
+            # THREAD — thread lifecycle is orchestrator-owned, and an
+            # 'ended' status (or the session.ended frame the archive
+            # broadcasts) would force an epoch bump on the next claim's
+            # attach (client cache-wipe cascade). Just drop the cached
+            # session; the next claim rebuilds from thread_messages.
+            await _terminate_session("idle_timeout", mark_thread=False)
+            return
         try:
             await _handle_idle_archive()
         except Exception as e:
@@ -5769,10 +9333,10 @@ async def _loop_completion_handler(loop_task: asyncio.Task) -> None:
         raise
     except Exception as e:
         logger.warning(f"Persistent loop crashed: {e}", exc_info=True)
-        await _terminate_session("loop_crash")
+        await _terminate_session("loop_crash", mark_thread=not _stateless_mode())
     else:
         logger.info("Persistent loop completed cleanly")
-        await _terminate_session("loop_complete")
+        await _terminate_session("loop_complete", mark_thread=not _stateless_mode())
 
 
 def _safe_serialize(obj: Any) -> Any:
@@ -6347,7 +9911,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
     guarantees the initiator always gets a terminal frame — the DB write may
     already be committed by the time anything fails.
     """
-    global _loop_interrupt_flag, _events_epoch, _next_seq
+    global _loop_interrupt_flag, _events_epoch, _next_seq, _event_writer
 
     request_id = data.get("request_id")
 
@@ -6546,15 +10110,60 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
 
                 # 7. New event generation → every SSE viewer takes the
                 #    existing gone_beyond_horizon repaint against the
-                #    filtered history.
+                #    filtered history. Rewind is one of the two legitimate
+                #    deliberate bumpers (reaper steal is the other — doc
+                #    §5.3.2), so this must ALWAYS bump, never reuse-resolve.
+                #    Order matters: drain+close the old writer first so any
+                #    straggler frames flush under the epoch they are stamped
+                #    with (the fenced flush would reject them post-bump and
+                #    stop the writer); then bump (epoch+1, hwm=0); then start
+                #    a fresh writer owning the new epoch. The subsequent
+                #    rewind.done broadcast lands at (new_epoch, 1) and the
+                #    fenced flush pushes events_seq_hwm to 1 — which IS the
+                #    doc §5.3.2 item 5 allocator init above the rewind.done
+                #    row: the next attach seeds from GREATEST(hwm, MAX(seq))
+                #    and can never collide with it.
                 try:
-                    _events_epoch = await _resolve_event_journal_epoch(conn, _thread_id)
+                    old_writer = _event_writer
+                    if old_writer is not None:
+                        _event_writer = None
+                        await old_writer.close()
+                    _events_epoch = await _bump_event_journal_epoch(conn, _thread_id)
                     _next_seq = 0
+                    new_writer = _OrderedPersistentEventWriter(
+                        postgres_conn=conn,
+                        thread_id=_thread_id,
+                        epoch=_events_epoch,
+                        on_terminal_failure=_event_persistence_failed,
+                        pinned_agent_id=_registered_pinned_agent_id(),
+                    )
+                    new_writer.start()
+                    _event_writer = new_writer
                 except Exception:
                     logger.warning(
                         "Rewind epoch bump failed — viewers repaint on next attach",
                         exc_info=True,
                     )
+                    if _event_writer is None and _thread_id is not None:
+                        # Keep journaling alive under the still-current epoch
+                        # rather than leaving the rest of the session
+                        # unjournaled because the bump failed.
+                        try:
+                            recovery_writer = _OrderedPersistentEventWriter(
+                                postgres_conn=conn,
+                                thread_id=_thread_id,
+                                epoch=_events_epoch,
+                                on_terminal_failure=_event_persistence_failed,
+                                pinned_agent_id=_registered_pinned_agent_id(),
+                            )
+                            recovery_writer.start()
+                            _event_writer = recovery_writer
+                        except Exception:
+                            logger.warning(
+                                "Rewind writer recovery failed — journal "
+                                "frames will be dropped until reattach",
+                                exc_info=True,
+                            )
 
                 if rehydrate_failed:
                     # The DB sweep is already committed and durable — other
@@ -7420,33 +11029,116 @@ async def _handle_archive(ws: WebSocket) -> None:
             except Exception as e:
                 logger.warning(f"Title generation failed (non-fatal): {e}")
 
-            # 3. Mark thread as ended
-            try:
-                await _session.postgres_conn.end_thread(_thread_id)
-            except Exception as e:
-                logger.warning(f"Thread end update failed: {e}")
-
-        await _ws_send(ws, "session.ended", {"thread_id": _thread_id})
-        logger.info(f"Session archived: thread={_thread_id}")
+        archived_thread_id = _thread_id
+        await _ws_send(ws, "session.ended", {"thread_id": archived_thread_id})
+        # Common teardown closes control admission, performs the final owner
+        # drain, and uses the exact pinned-agent status CAS. A direct
+        # ``end_thread`` here could race a successor binding.
+        await _terminate_session("archive")
+        logger.info(f"Session archived: thread={archived_thread_id}")
     except Exception as e:
         logger.warning(f"Archive failed: {e}")
         await _ws_send(ws, "error", {"message": f"Archive failed: {e}"})
 
 
-async def _update_thread_status(status: str) -> None:
-    """Update thread status via orchestrator REST (preferred) or direct DB."""
+async def _update_thread_status(
+    status: str,
+    *,
+    pinned_agent_id: Optional[str] = None,
+) -> bool:
+    """Durably update status via REST, falling back when REST says ``False``."""
+    if _stateless_mode():
+        if (
+            pinned_agent_id is not None
+            or status not in {"active", "awaiting_user"}
+            or _session is None
+            or _session.postgres_conn is None
+            or _thread_id is None
+        ):
+            return False
+        lease_token = _current_stateless_lease_token()
+        if lease_token is None:
+            return False
+        try:
+            return await update_stateless_claim_status(
+                _session.postgres_conn,
+                thread_id=_thread_id,
+                lease_token=lease_token,
+                status=status,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Exact-lease stateless status update failed "
+                "(thread=%s status=%s token=%s): %s",
+                _thread_id,
+                status,
+                lease_token,
+                exc,
+            )
+            return False
     if _orchestrator_client and _thread_id:
         try:
-            await _orchestrator_client.update_thread_status(_thread_id, status)
-            return
+            if pinned_agent_id is None:
+                updated = await _orchestrator_client.update_thread_status(
+                    _thread_id,
+                    status,
+                )
+            else:
+                updated = await _orchestrator_client.update_thread_status(
+                    _thread_id,
+                    status,
+                    pinned_agent_id=pinned_agent_id,
+                )
+            if updated:
+                return True
         except Exception:
             pass
     # Fallback to direct DB
     if _session and _session.postgres_conn and _thread_id:
         try:
-            await _session.postgres_conn.update_thread_status(_thread_id, status)
+            if pinned_agent_id is not None:
+                if status != "ended":
+                    return False
+                async with _session.postgres_conn.acquire() as conn:
+                    async with conn.transaction():
+                        thread = await conn.fetchrow(
+                            "SELECT agent_id, execution_lane FROM threads "
+                            "WHERE id = $1::uuid FOR UPDATE",
+                            _thread_id,
+                        )
+                        if (
+                            thread is None
+                            or str(thread["execution_lane"] or "") != "pinned"
+                            or str(thread["agent_id"] or "") != str(pinned_agent_id)
+                        ):
+                            return False
+                        reciprocal = await conn.fetchval(
+                            "SELECT 1 FROM agents WHERE id = $1::uuid "
+                            "AND thread_id = $2::uuid FOR SHARE",
+                            pinned_agent_id,
+                            _thread_id,
+                        )
+                        if reciprocal is None:
+                            return False
+                        updated = await conn.fetchval(
+                            "UPDATE threads "
+                            "SET status = 'ended', "
+                            "    ended_at = CURRENT_TIMESTAMP, "
+                            "    control_admission_agent_id = NULL "
+                            "WHERE id = $1::uuid AND agent_id = $2::uuid "
+                            "AND status <> 'suspended' RETURNING id",
+                            _thread_id,
+                            pinned_agent_id,
+                        )
+                        return updated is not None
+            if status == "ended":
+                await _session.postgres_conn.end_thread(_thread_id)
+            else:
+                await _session.postgres_conn.update_thread_status(_thread_id, status)
+            return True
         except Exception as e:
             logger.warning(f"Failed to update thread status to {status}: {e}")
+    return False
 
 
 async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
@@ -7517,10 +11209,9 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
             except Exception as e:
                 logger.warning(f"Idle title generation failed: {e}")
 
-        # 3. Set thread to 'ended' (still resumable — `ended` is the only inactive state).
-        await _update_thread_status("ended")
-
-        # 4. Git commit + push
+        # 3. Git commit + push. The caller immediately enters common teardown,
+        # which alone closes admission, drains controls, and performs the exact
+        # pinned-owner lifecycle CAS.
         if _session.workspace_manager:
             git_mgr = getattr(_session.workspace_manager, "git_manager", None)
             if git_mgr and git_mgr.is_active:
@@ -7604,6 +11295,13 @@ async def _poll_workspace_ready(
         if vm_status == "ready" and ws.get("vm_ssh_host"):
             return {
                 "backend": "vm",
+                "workspace_generation": ws.get("workspace_generation"),
+                "workspace_runtime_incarnation": ws.get(
+                    "workspace_runtime_incarnation"
+                ),
+                # VM endpoints retain the historical AutoAddPolicy path; Slice
+                # 2 admits no stateless VM claimant with a pinned pod identity.
+                "workspace_ssh_host_key_fingerprint": None,
                 # Slice 1 has no trusted VM host-identity adapter.
                 "canvas_presentation_available": False,
                 "canvas_live_apps_available": False,
@@ -7670,8 +11368,22 @@ async def _poll_workspace_ready(
         status = ws.get("status", "none")
 
         if status == "ready" and ws.get("pod_ip"):
+            workspace_generation = ws.get("workspace_generation")
+            workspace_runtime_incarnation = ws.get("workspace_runtime_incarnation")
+            workspace_ssh_host_key_fingerprint = ws.get(
+                "workspace_ssh_host_key_fingerprint"
+            )
+            if not workspace_generation or not workspace_runtime_incarnation:
+                # Never let a detached fingerprint look like independently
+                # usable authority. Stateless setup consumes one triplet.
+                workspace_ssh_host_key_fingerprint = None
             return {
                 "backend": "sandbox",
+                "workspace_generation": workspace_generation,
+                "workspace_runtime_incarnation": workspace_runtime_incarnation,
+                "workspace_ssh_host_key_fingerprint": (
+                    workspace_ssh_host_key_fingerprint
+                ),
                 # This is an orchestrator-attested capability, not a property
                 # inferred from the backend label or endpoint reachability.
                 "canvas_presentation_available": (
@@ -7894,6 +11606,22 @@ async def _handle_workspace_upgrade(
         remote = ws_config["remote"]
         shell_config = _session.config.extra.get("shell", {})
         sudo_action = "allow" if backend_tier == "vm" else "freeze"
+        shell_owner_token = _session.shell_owner_token
+        workspace_generation = ws_config.get("workspace_generation")
+        workspace_runtime_incarnation = ws_config.get("workspace_runtime_incarnation")
+        workspace_ssh_host_key_fingerprint = ws_config.get(
+            "workspace_ssh_host_key_fingerprint"
+        )
+        if shell_owner_token is not None and (
+            not workspace_generation
+            or not workspace_runtime_incarnation
+            or not workspace_ssh_host_key_fingerprint
+        ):
+            raise WorkspaceUnavailableError(
+                "A stateless physical workspace upgrade requires an "
+                "orchestrator-attested backing, runtime incarnation, and SSH "
+                "host identity"
+            )
         new_backend = RemoteBackend(
             host=remote["host"],
             port=remote.get("port", 30022),
@@ -7907,6 +11635,17 @@ async def _handle_workspace_upgrade(
             max_retries=remote.get("max_retries", 5),
             retry_timeouts_as_booting=remote.get("retry_timeouts_as_booting", False),
             sudo_action=sudo_action,
+            workspace_generation=(
+                workspace_generation if shell_owner_token is not None else None
+            ),
+            runtime_incarnation=(
+                workspace_runtime_incarnation if shell_owner_token is not None else None
+            ),
+            expected_host_key_fingerprint=(
+                workspace_ssh_host_key_fingerprint
+                if shell_owner_token is not None
+                else None
+            ),
         )
         # Capability is attested by the orchestrator from a paired generation
         # and pinned workspace identity. Never infer it from "sandbox": a
@@ -7924,7 +11663,13 @@ async def _handle_workspace_upgrade(
         # 4. Connect the new backend now so the SEED copy (next) runs while BOTH
         #    backends are live — swap_backend would otherwise disconnect the old
         #    one. swap_backend then sees it connected and skips re-connecting.
+        if shell_owner_token is not None:
+            new_backend.set_shell_owner_token(shell_owner_token)
         await asyncio.to_thread(new_backend.connect)
+        if shell_owner_token is not None:
+            # Promote before the swap exposes this backend to tools. The same
+            # backing+runtime fence used on a cold attach protects hot upgrades.
+            await asyncio.to_thread(new_backend.claim_shell_owner)
 
         # 5. Seed the new workspace from the live virtual prefix (S3a). Pure
         #    in-process copy (the agent holds the object-store creds). Run off
@@ -8271,7 +12016,13 @@ def _is_low_signal_prompt(content: str) -> bool:
 
 
 async def _write_title_if_placeholder(
-    title: str, *, origin: str, allow_draft_overwrite: bool = False
+    title: str,
+    *,
+    origin: str,
+    allow_draft_overwrite: bool = False,
+    expected_session: Any | None = None,
+    expected_thread_id: str | None = None,
+    expected_generation: int | None = None,
 ) -> bool:
     """Write ``title`` while the thread is still untitled — or, when
     ``allow_draft_overwrite``, while it still shows the LLM-free draft — then
@@ -8282,9 +12033,18 @@ async def _write_title_if_placeholder(
     neither a placeholder nor the outstanding draft (i.e. a user rename) is left
     untouched. Returns True iff the title was written.
     """
-    if not title or not _session or not _session.postgres_conn or not _thread_id:
+    session = expected_session if expected_session is not None else _session
+    thread_id = expected_thread_id if expected_thread_id is not None else _thread_id
+    generation = (
+        expected_generation if expected_generation is not None else _session_generation
+    )
+    if not title or not session or not session.postgres_conn or not thread_id:
         return False
-    thread = await _session.postgres_conn.get_thread(_thread_id)
+    if not _session_identity_matches(session, str(thread_id), int(generation)):
+        return False
+    thread = await session.postgres_conn.get_thread(thread_id)
+    if not _session_identity_matches(session, str(thread_id), int(generation)):
+        return False
     current = thread.get("title", "") if thread else ""
     writable = _title_is_placeholder(current) or (
         allow_draft_overwrite
@@ -8293,14 +12053,18 @@ async def _write_title_if_placeholder(
     )
     if not writable:
         return False
-    async with _session.postgres_conn.acquire() as conn:
+    async with session.postgres_conn.acquire() as conn:
         await conn.execute(
             "UPDATE threads SET title = $2 WHERE id = $1",
-            _thread_id,
+            thread_id,
             title,
         )
+    if not _session_identity_matches(session, str(thread_id), int(generation)):
+        # The write was bound to the captured thread, so it cannot corrupt the
+        # successor; suppress only the process-global broadcast/marker update.
+        return False
     _broadcast("title.updated", {"title": title})
-    logger.info("%s-titled thread %s: %s", origin, _thread_id, title)
+    logger.info("%s-titled thread %s: %s", origin, thread_id, title)
     return True
 
 
@@ -8325,7 +12089,13 @@ def _draft_title_from_prompt(
     return draft or None
 
 
-async def _early_title_from_prompt(content: str) -> None:
+async def _early_title_from_prompt(
+    content: str,
+    *,
+    expected_session: Any | None = None,
+    expected_thread_id: str | None = None,
+    expected_generation: int | None = None,
+) -> None:
     """Fill the cockpit header the instant the user submits, with an LLM-free
     draft taken from the opening prompt — so it fills on submit instead of only
     after the (possibly long) first turn lands.
@@ -8337,16 +12107,33 @@ async def _early_title_from_prompt(content: str) -> None:
     """
     global _draft_title_value
     try:
-        if not _session or not _session.postgres_conn or not _thread_id:
+        session = expected_session if expected_session is not None else _session
+        thread_id = expected_thread_id if expected_thread_id is not None else _thread_id
+        generation = (
+            expected_generation
+            if expected_generation is not None
+            else _session_generation
+        )
+        if not session or not session.postgres_conn or not thread_id:
+            return
+        if not _session_identity_matches(session, str(thread_id), int(generation)):
             return
         if _is_low_signal_prompt(content):
             return
         # Cheap early-out on an already-titled thread (e.g. a resumed session).
-        thread = await _session.postgres_conn.get_thread(_thread_id)
+        thread = await session.postgres_conn.get_thread(thread_id)
+        if not _session_identity_matches(session, str(thread_id), int(generation)):
+            return
         if not _title_is_placeholder(thread.get("title", "") if thread else ""):
             return
         draft = _draft_title_from_prompt(content)
-        if draft and await _write_title_if_placeholder(draft, origin="Draft"):
+        if draft and await _write_title_if_placeholder(
+            draft,
+            origin="Draft",
+            expected_session=session,
+            expected_thread_id=str(thread_id),
+            expected_generation=int(generation),
+        ):
             _draft_title_value = draft
     except Exception as e:
         logger.warning(f"Early draft title failed (non-fatal): {e}")

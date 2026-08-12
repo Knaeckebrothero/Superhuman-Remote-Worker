@@ -21,6 +21,7 @@ import pytest
 
 import src.api.persistent_app as pa
 from src.persistent_graph import PermissionOutcome
+from src.shared.thread_presence import PermissionExpiryResult
 
 
 # =============================================================================
@@ -106,6 +107,32 @@ class TestPermissionCheckOutcomeMapping:
             outcome = await pa._loop_permission_check("web_search", {}, "tc_3")
 
         assert outcome is PermissionOutcome.APPROVED
+
+    @pytest.mark.asyncio
+    async def test_stateless_sudo_gate_uses_durable_presence_oracle(self):
+        session = _mock_session()
+        durable_pause = AsyncMock(return_value=True)
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_orchestrator_client", MagicMock()),
+            patch.object(pa, "_stateless_mode", return_value=True),
+            patch.object(pa, "_officer_cfg", return_value=None),
+            patch.object(pa, "_safe_mark_stateless_natural_pause", durable_pause),
+            patch.object(
+                pa, "_insert_permission_request", AsyncMock(return_value="req-sudo")
+            ),
+            patch.object(
+                pa,
+                "_wait_for_permission_resolution",
+                AsyncMock(return_value="approved"),
+            ),
+            patch.object(pa, "_broadcast", MagicMock()),
+        ):
+            outcome = await pa._loop_permission_check("run_command", {}, "tc-sudo")
+
+        assert outcome is PermissionOutcome.APPROVED
+        durable_pause.assert_awaited_once_with(require_untethered=True)
 
     @pytest.mark.asyncio
     async def test_autonomous_mode_approves(self):
@@ -229,6 +256,80 @@ class TestTetheredWaitDoesNotExpire:
 
         # Interrupted, not answered — must not read as approval.
         assert status != "approved"
+
+
+class TestStatelessDurablePresenceWait:
+    @pytest.mark.asyncio
+    async def test_absent_client_expires_under_exact_owner(self):
+        conn = _conn_returning(["pending"])
+        session = _session_with_conn(conn)
+        expiry = AsyncMock(
+            return_value=PermissionExpiryResult(
+                status="expired", owner_live=True, live_for_seconds=None
+            )
+        )
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "00000000-0000-0000-0000-000000000001"),
+            patch.object(pa, "_stateless_mode", return_value=True),
+            patch.object(pa, "_current_stateless_lease_token", return_value=9),
+            patch.object(pa, "expire_permission_if_untethered", expiry),
+            patch.object(pa, "_hard_interrupt_event", None),
+        ):
+            status = await pa._wait_for_permission_resolution("req-1", timeout=0.01)
+
+        assert status == "expired"
+        expiry.assert_awaited_once_with(
+            conn,
+            thread_id="00000000-0000-0000-0000-000000000001",
+            request_id="req-1",
+            lease_token=9,
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_client_rechecks_at_presence_expiry(self):
+        conn = _conn_returning(["pending"])
+        session = _session_with_conn(conn)
+        expiry = AsyncMock(
+            side_effect=[
+                PermissionExpiryResult(
+                    status="pending", owner_live=True, live_for_seconds=0.01
+                ),
+                PermissionExpiryResult(
+                    status="approved", owner_live=True, live_for_seconds=None
+                ),
+            ]
+        )
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "00000000-0000-0000-0000-000000000001"),
+            patch.object(pa, "_stateless_mode", return_value=True),
+            patch.object(pa, "_current_stateless_lease_token", return_value=9),
+            patch.object(pa, "expire_permission_if_untethered", expiry),
+            patch.object(pa, "_hard_interrupt_event", None),
+        ):
+            status = await pa._wait_for_permission_resolution("req-2", timeout=0.01)
+
+        assert status == "approved"
+        assert expiry.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_lost_owner_leaves_permission_pending(self):
+        conn = _conn_returning(["pending"])
+        session = _session_with_conn(conn)
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "00000000-0000-0000-0000-000000000001"),
+            patch.object(pa, "_stateless_mode", return_value=True),
+            patch.object(pa, "_current_stateless_lease_token", return_value=None),
+            patch.object(pa, "_hard_interrupt_event", None),
+        ):
+            status = await pa._wait_for_permission_resolution("req-3", timeout=0.01)
+
+        assert status == "interrupted"
+        assert not any(
+            "expired" in str(call).lower() for call in conn.execute.await_args_list
+        )
 
 
 # =============================================================================

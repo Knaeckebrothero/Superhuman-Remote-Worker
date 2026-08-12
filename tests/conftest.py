@@ -248,14 +248,30 @@ def job_b() -> dict:
     return {"id": _JID_B, "user_id": _UID_B, "project_id": _PID_B, "status": "created"}
 
 
+# ``execution_lane`` mirrors the column's own contract: threads.execution_lane
+# is NOT NULL DEFAULT 'pinned' (migration 0115a), so a real row can never carry
+# None. Omitting it here made these fixtures the only place in the system where
+# the lane is absent, which routes callers into the deliberate fail-closed
+# "unknown future lanes" branch (resume_thread) rather than the pinned path
+# they are exercising.
 @pytest.fixture
 def thread_a() -> dict:
-    return {"id": _TID_A, "user_id": _UID_A, "title": "thread A"}
+    return {
+        "id": _TID_A,
+        "user_id": _UID_A,
+        "title": "thread A",
+        "execution_lane": "pinned",
+    }
 
 
 @pytest.fixture
 def thread_b() -> dict:
-    return {"id": _TID_B, "user_id": _UID_B, "title": "thread B"}
+    return {
+        "id": _TID_B,
+        "user_id": _UID_B,
+        "title": "thread B",
+        "execution_lane": "pinned",
+    }
 
 
 @pytest.fixture

@@ -50,9 +50,22 @@ def test_validate_rejects_wrong_signature(svc):
 
 def test_validate_rejects_expired_token():
     """A token past its expiry (plus 2s leeway) is rejected."""
+    import jwt
+
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "sub": "u1",
+            "tid": "t1",
+            "aud": "agent",
+            "iat": now - 10,
+            "exp": now - 5,  # safely outside the validator's 2s leeway
+            "jti": "expired-test-token",
+        },
+        "test-secret",
+        algorithm="HS256",
+    )
     svc = SessionTokenService(secret="test-secret", ttl_seconds=1)
-    token, _ = svc.mint(user_id="u1", thread_id="t1")
-    time.sleep(4)  # exceed ttl (1s) + leeway (2s) with margin
 
     with pytest.raises(InvalidSessionTokenError):
         svc.validate(token)

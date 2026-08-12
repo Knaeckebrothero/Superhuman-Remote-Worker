@@ -470,3 +470,195 @@ class TestPrefixIsolation:
         assert job2.exists("secret.txt") is False
         assert job2.list_dir("") == []
         assert job1.read_file("secret.txt") == "job1 only"
+
+
+# =============================================================================
+# Scoped metadata index (begin_read_cache / end_read_cache)
+#
+# Every store op on this backend is a process spawn in production, so session
+# setup opens a scoped index to answer its dozens of existence probes from one
+# listing. The index must be INVISIBLE: identical answers to the uncached
+# backend, kept exact across local mutations, and gone the moment the scope
+# closes.
+# =============================================================================
+
+
+class _CountingStore(InMemoryObjectStore):
+    """InMemoryObjectStore that counts the metadata ops the index removes."""
+
+    def __init__(self):
+        super().__init__()
+        self.list_calls = 0
+        self.head_calls = 0
+
+    def list(self, prefix):
+        self.list_calls += 1
+        return super().list(prefix)
+
+    def head(self, key):
+        self.head_calls += 1
+        return super().head(key)
+
+
+@pytest.fixture
+def counting_store() -> _CountingStore:
+    return _CountingStore()
+
+
+@pytest.fixture
+def counting_backend(counting_store) -> VirtualWorkspaceBackend:
+    return VirtualWorkspaceBackend(counting_store, prefix=PREFIX)
+
+
+class TestScopedReadCache:
+    def test_inactive_by_default(self, backend):
+        assert backend._index is None
+
+    def test_probes_hit_store_once_inside_scope(self, counting_backend, counting_store):
+        counting_backend.write_file("a.txt", "x")
+        counting_backend.write_file("dir/b.txt", "y")
+        counting_store.list_calls = 0
+        counting_store.head_calls = 0
+
+        counting_backend.begin_read_cache()
+        for _ in range(5):
+            assert counting_backend.is_file("a.txt") is True
+            assert counting_backend.is_file("missing.txt") is False
+            assert counting_backend.is_dir("dir") is True
+            assert counting_backend.exists("dir/b.txt") is True
+        counting_backend.end_read_cache()
+
+        # One priming listing for 30 probes, and no per-probe head at all.
+        assert counting_store.list_calls == 1
+        assert counting_store.head_calls == 0
+
+    def test_answers_match_uncached_backend(self, backend):
+        backend.write_file("a.txt", "hello")
+        backend.write_file("dir/b.txt", "yy")
+        backend.mkdir("empty")
+        probes = ["a.txt", "dir", "dir/b.txt", "empty", "missing", "dir/missing"]
+
+        uncached = {
+            p: (backend.exists(p), backend.is_file(p), backend.is_dir(p))
+            for p in probes
+        }
+        listings = {p: backend.list_dir(p) for p in ["", "dir", "empty"]}
+        walked = backend.walk("")
+        stats = {p: backend.stat(p) for p in ["a.txt", "dir"]}
+
+        backend.begin_read_cache()
+        try:
+            assert {
+                p: (backend.exists(p), backend.is_file(p), backend.is_dir(p))
+                for p in probes
+            } == uncached
+            assert {p: backend.list_dir(p) for p in ["", "dir", "empty"]} == listings
+            assert backend.walk("") == walked
+            assert {p: backend.stat(p) for p in ["a.txt", "dir"]} == stats
+        finally:
+            backend.end_read_cache()
+
+    def test_local_writes_visible_inside_scope(self, backend):
+        backend.begin_read_cache()
+        try:
+            assert backend.exists("new.txt") is False
+            backend.write_file("new.txt", "content")
+            assert backend.is_file("new.txt") is True
+            assert backend.stat("new.txt") == 7
+            assert "new.txt" in backend.list_dir("")
+            backend.append_file("new.txt", "!!")
+            assert backend.stat("new.txt") == 9
+        finally:
+            backend.end_read_cache()
+        assert backend.read_file("new.txt") == "content!!"
+
+    def test_local_deletes_visible_inside_scope(self, backend):
+        backend.write_file("gone.txt", "x")
+        backend.write_file("tree/deep/f.txt", "y")
+        backend.begin_read_cache()
+        try:
+            assert backend.delete_file("gone.txt") is True
+            assert backend.exists("gone.txt") is False
+            assert backend.delete_directory("tree") is True
+            assert backend.is_dir("tree") is False
+        finally:
+            backend.end_read_cache()
+        assert backend.exists("gone.txt") is False
+        assert backend.is_dir("tree") is False
+
+    def test_mkdir_and_move_and_copy_tracked(self, backend):
+        backend.write_file("src.txt", "abc")
+        backend.begin_read_cache()
+        try:
+            backend.mkdir("fresh")
+            assert backend.is_dir("fresh") is True
+            backend.copy("src.txt", "copy.txt")
+            assert backend.is_file("copy.txt") is True
+            assert backend.stat("copy.txt") == 3
+            backend.move("src.txt", "moved.txt")
+            assert backend.is_file("src.txt") is False
+            assert backend.is_file("moved.txt") is True
+        finally:
+            backend.end_read_cache()
+        assert backend.is_dir("fresh") is True
+        assert backend.read_file("moved.txt") == "abc"
+        assert backend.exists("src.txt") is False
+
+    def test_external_write_seen_after_scope_closes(self, backend, store):
+        """The documented boundary: another process writing to the same prefix
+        mid-scope is picked up by the first op after the scope closes."""
+        backend.begin_read_cache()
+        try:
+            assert backend.exists("uploaded.pdf") is False
+            store.put(PREFIX + "uploaded.pdf", b"externally uploaded")
+            assert backend.exists("uploaded.pdf") is False  # stale, by design
+        finally:
+            backend.end_read_cache()
+        assert backend.exists("uploaded.pdf") is True
+
+    def test_begin_is_idempotent(self, counting_backend, counting_store):
+        counting_backend.write_file("a.txt", "x")
+        counting_store.list_calls = 0
+        counting_backend.begin_read_cache()
+        counting_backend.begin_read_cache()
+        counting_backend.begin_read_cache()
+        try:
+            assert counting_store.list_calls == 1
+        finally:
+            counting_backend.end_read_cache()
+
+    def test_end_without_begin_is_safe(self, backend):
+        backend.end_read_cache()
+        assert backend._index is None
+
+    def test_prefix_isolation_holds_inside_scope(self, store):
+        job1 = VirtualWorkspaceBackend(store, prefix="jobs/1/")
+        job2 = VirtualWorkspaceBackend(store, prefix="jobs/2/")
+        job1.write_file("secret.txt", "job1 only")
+        job2.begin_read_cache()
+        try:
+            assert job2.exists("secret.txt") is False
+            assert job2.list_dir("") == []
+        finally:
+            job2.end_read_cache()
+
+    def test_mkdir_skips_rewrite_for_existing_dir_in_scope(
+        self, counting_backend, counting_store
+    ):
+        """Scaffolding re-creates the same directories on every attach; inside
+        the scope that must cost zero store writes."""
+        counting_backend.mkdir("output")
+        counting_backend.write_file("notes/a.txt", "x")
+        counting_backend.begin_read_cache()
+        try:
+            before = len(counting_store._data)
+            counting_backend.mkdir("output")  # marker already there
+            counting_backend.mkdir("notes")  # exists via its file
+            assert len(counting_store._data) == before
+            assert counting_backend.is_dir("output") is True
+            assert counting_backend.is_dir("notes") is True
+            counting_backend.mkdir("fresh")  # genuinely new → written
+            assert counting_backend.is_dir("fresh") is True
+        finally:
+            counting_backend.end_read_cache()
+        assert counting_backend.is_dir("fresh") is True

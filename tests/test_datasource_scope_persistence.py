@@ -383,7 +383,7 @@ async def test_create_thread_always_materializes_empty_selection_metadata():
 
     await db.create_thread()
 
-    metadata = json.loads(conn.fetchrow.await_args.args[6])
+    metadata = json.loads(conn.fetchrow.await_args.args[7])
     assert metadata == {"datasource_ids": []}
 
 
@@ -401,7 +401,7 @@ async def test_create_thread_locks_policy_and_persists_revision_snapshot():
     )
 
     conn.transaction.assert_called_once()
-    metadata = json.loads(conn.fetchrow.await_args.args[6])
+    metadata = json.loads(conn.fetchrow.await_args.args[7])
     assert metadata == {
         "datasource_ids": [DATASOURCE_ID],
         "datasource_selection": {

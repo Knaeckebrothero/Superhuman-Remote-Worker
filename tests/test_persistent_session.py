@@ -6,9 +6,11 @@ _setup_context_manager(), _setup_shell_manager(), _setup_memory(),
 swap_backend(), get_workspace_content(), cleanup().
 """
 
+import asyncio
+import time
 import uuid
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -16,6 +18,7 @@ from src.api.persistent_session import (
     PersistentSession,
     _EXCLUDED_TOOLS,
 )
+from src.core.backends.remote import WorkspaceHostIdentityMismatch
 from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
 from src.core.workspace_backend import WorkspaceUnavailableError
 
@@ -821,6 +824,144 @@ class TestSetupWorkspace:
         assert session.workspace_manager is not None
 
     @pytest.mark.asyncio
+    async def test_stateless_owner_is_bound_and_promoted_during_remote_attach(self):
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+        )
+        session = _make_session(config=cfg)
+        session.shell_owner_token = 23
+        order = []
+        mock_remote = MagicMock()
+        mock_remote.set_shell_owner_token.side_effect = lambda token: order.append(
+            ("token", token)
+        )
+        mock_remote.connect.side_effect = lambda: order.append(("connect", None))
+        mock_remote.claim_shell_owner.side_effect = lambda: order.append(
+            ("claim", None)
+        )
+        remote_constructor = MagicMock(return_value=mock_remote)
+        workspace_override = {
+            "backend": "sandbox",
+            "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+            "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
+        }
+
+        with (
+            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.core.backends.remote": MagicMock(
+                        RemoteBackend=remote_constructor
+                    )
+                },
+            ),
+        ):
+            MockWM.return_value.path = "/tmp/test"
+            MockWM.return_value.initialize = MagicMock()
+            await session._setup_workspace(workspace_override=workspace_override)
+
+        assert order == [("token", 23), ("connect", None), ("claim", None)]
+        assert remote_constructor.call_args.kwargs["workspace_generation"] == (
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        )
+        assert remote_constructor.call_args.kwargs["runtime_incarnation"] == (
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        )
+        assert (
+            remote_constructor.call_args.kwargs["expected_host_key_fingerprint"]
+            == "SHA256:trusted"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "workspace_override",
+        [
+            {
+                "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
+            },
+            {
+                "workspace_runtime_incarnation": (
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                ),
+                "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
+            },
+            {
+                "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "workspace_runtime_incarnation": (
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                ),
+            },
+        ],
+        ids=["missing-runtime", "missing-backing", "missing-host"],
+    )
+    async def test_stateless_remote_attach_requires_paired_workspace_authority(
+        self, workspace_override
+    ):
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+        )
+        session = _make_session(config=cfg)
+        session.shell_owner_token = 24
+        workspace_override = {
+            "backend": "sandbox",
+            "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+            **workspace_override,
+        }
+
+        with pytest.raises(
+            WorkspaceUnavailableError,
+            match="backing, runtime incarnation, and SSH host identity",
+        ):
+            await session._setup_workspace(workspace_override=workspace_override)
+
+    @pytest.mark.asyncio
+    async def test_stateless_host_key_mismatch_fails_without_setup_retry(self):
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+        )
+        session = _make_session(config=cfg)
+        session.shell_owner_token = 25
+        mock_remote = MagicMock()
+        mock_remote.connect.side_effect = WorkspaceHostIdentityMismatch(
+            "host key fingerprint mismatch"
+        )
+        workspace_override = {
+            "backend": "sandbox",
+            "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+            "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
+        }
+        sleep = AsyncMock()
+
+        with (
+            patch("src.api.persistent_session.asyncio.sleep", sleep),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.core.backends.remote": MagicMock(
+                        RemoteBackend=MagicMock(return_value=mock_remote)
+                    )
+                },
+            ),
+            pytest.raises(
+                WorkspaceUnavailableError,
+                match="SSH identity attestation failed",
+            ),
+        ):
+            await session._setup_workspace(workspace_override=workspace_override)
+
+        sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_attested_sandbox_override_enables_canvas_presentation(self):
         cfg = _make_config(
             ws_backend="sandbox",
@@ -829,9 +970,13 @@ class TestSetupWorkspace:
         session = _make_session(config=cfg)
         mock_remote = MagicMock()
         mock_remote.connect = MagicMock()
+        remote_constructor = MagicMock(return_value=mock_remote)
         workspace_override = {
             "backend": "sandbox",
             "remote": {"host": "paired.test", "port": 30022},
+            # A pinned attach during rollout may see the pre-existing durable
+            # backing generation before its pod context carries the new UID.
+            "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "canvas_presentation_available": True,
             "canvas_live_apps_available": True,
             "canvas_shared_browser_available": True,
@@ -844,7 +989,7 @@ class TestSetupWorkspace:
                 "sys.modules",
                 {
                     "src.core.backends.remote": MagicMock(
-                        RemoteBackend=MagicMock(return_value=mock_remote)
+                        RemoteBackend=remote_constructor
                     )
                 },
             ),
@@ -856,6 +1001,11 @@ class TestSetupWorkspace:
         assert mock_remote.supports_canvas_presentation is True
         assert mock_remote.supports_canvas_live_apps is True
         assert mock_remote.supports_canvas_shared_browser is True
+        assert remote_constructor.call_args.kwargs["workspace_generation"] is None
+        assert remote_constructor.call_args.kwargs["runtime_incarnation"] is None
+        assert (
+            remote_constructor.call_args.kwargs["expected_host_key_fingerprint"] is None
+        )
 
     @pytest.mark.asyncio
     async def test_vm_remote_backend_disables_canvas_presentation(self):
@@ -1192,13 +1342,12 @@ def _protected_cloud_mount_cfg() -> dict:
 
 
 class TestSetupCloudMountOverlayFailure:
-    """F-M6 (Task B10): pin the overlay-failure -> RO-lower-teardown branch
-    of ``_setup_cloud_mount``. This is the B9 fail-safe deviation from the
-    original brief (which left the RO lower mounted on overlay failure) —
-    a protected session whose overlay fails to mount must end up with NO
-    cloud access at all (cloud_mount_manager torn down + cleared) rather
-    than a half-protected session that still writes straight to the raw RO
-    lower thinking it's protected."""
+    """Pin lane-specific protected-overlay attach failure cleanup.
+
+    Pinned retains its B9 fail-safe teardown and degraded mode. Stateless
+    fails the attach and retires only its local controller because the lower
+    may be a healthy predecessor resident needed by the successor.
+    """
 
     @pytest.mark.asyncio
     async def test_overlay_failure_tears_down_ro_lower(self):
@@ -1301,6 +1450,163 @@ class TestSetupCloudMountOverlayFailure:
         assert session.cloud_mount_manager is fake_rclone_manager
         assert session.overlay_mount_manager is fake_overlay_manager
         fake_rclone_manager.aclose.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stateless_overlay_failure_preserves_adopted_lower(self):
+        """An overlay mismatch/failure is an attach failure, not terminal end.
+
+        The lower may have been adopted from the predecessor. Retire this
+        claimant's local controller and fail attach closed; never unmount the
+        workspace resident that a successor can converge.
+        """
+
+        session = _make_session(
+            shell_owner_token=13,
+            workspace_manager=SimpleNamespace(path="/workspace", backend=MagicMock()),
+        )
+        fake_rclone_manager = MagicMock()
+        fake_rclone_manager.start_all = AsyncMock(return_value=None)
+        fake_rclone_manager.mounts = []
+        fake_rclone_manager.detach_for_handoff = AsyncMock(return_value=None)
+        fake_rclone_manager.aclose = AsyncMock(return_value=None)
+
+        fake_overlay_manager = MagicMock()
+        fake_overlay_manager.mount = MagicMock(
+            side_effect=RuntimeError("overlay identity mismatch")
+        )
+
+        with (
+            patch(
+                "src.services.cloud_mount.RcloneMountManager",
+                return_value=fake_rclone_manager,
+            ),
+            patch(
+                "src.services.cloud_overlay.OverlayMountManager",
+                return_value=fake_overlay_manager,
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="identity mismatch"):
+                await session._setup_cloud_mount(_protected_cloud_mount_cfg())
+
+        fake_rclone_manager.detach_for_handoff.assert_awaited_once_with()
+        fake_rclone_manager.aclose.assert_not_awaited()
+        assert session.cloud_mount_manager is None
+        assert session.overlay_mount_manager is None
+
+
+class TestStatelessCloudMountClaimSetup:
+    @pytest.mark.asyncio
+    async def test_adopt_probe_finishes_before_shell_and_tools_are_exposed(self):
+        """The manager's start_all contract includes a real directory probe.
+
+        Pin its position in the complete setup sequence: a claimant cannot
+        construct either the shell manager or tools until adoption/heal and
+        that first workspace read have completed.
+        """
+
+        order = []
+        session = _make_session(shell_owner_token=17)
+
+        async def setup_workspace(**_kwargs):
+            order.append("workspace")
+            session.workspace_manager = SimpleNamespace(
+                path="/workspace",
+                backend=MagicMock(),
+            )
+
+        manager = MagicMock()
+
+        async def adopt_heal_and_probe():
+            order.append("cloud_adopt_heal_probe")
+
+        manager.start_all = AsyncMock(side_effect=adopt_heal_and_probe)
+        manager.mounts = []
+        session._setup_workspace = AsyncMock(side_effect=setup_workspace)
+        session._setup_shell_manager = MagicMock(
+            side_effect=lambda: order.append("shell")
+        )
+        session._setup_knowledge = MagicMock()
+        session._setup_tools = MagicMock(side_effect=lambda _db: order.append("tools"))
+        session._bind_tools = MagicMock()
+        session._setup_context_manager = MagicMock()
+        session._setup_memory = MagicMock()
+        session._refresh_runtime_facts = MagicMock()
+        session._drain_store_stats = MagicMock(return_value="n/a")
+        session.tools = []
+
+        with (
+            patch(
+                "src.services.cloud_mount.RcloneMountManager",
+                return_value=manager,
+            ),
+            patch(
+                "src.api.persistent_session.get_phase_system_prompt",
+                return_value="prompt",
+            ),
+        ):
+            await session._setup_steps(
+                {},
+                time.perf_counter(),
+                llm=MagicMock(),
+                auxiliary_llm=None,
+                postgres_conn=None,
+                vector_conn=None,
+                workspace_override={"backend": "remote"},
+                git_remote_url=None,
+                cloud_mount_cfg={"driver": "rclone", "mounts": []},
+            )
+
+        assert order[:4] == [
+            "workspace",
+            "cloud_adopt_heal_probe",
+            "shell",
+            "tools",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_mount_probe_failure_fails_stateless_setup_closed(self):
+        session = _make_session(
+            shell_owner_token=23,
+            workspace_manager=SimpleNamespace(
+                path="/workspace",
+                backend=MagicMock(),
+            ),
+        )
+        manager = MagicMock()
+        manager.start_all = AsyncMock(
+            side_effect=RuntimeError("first directory probe: ENOTCONN")
+        )
+
+        with patch(
+            "src.services.cloud_mount.RcloneMountManager",
+            return_value=manager,
+        ):
+            with pytest.raises(RuntimeError, match="ENOTCONN"):
+                await session._setup_cloud_mount({"driver": "rclone", "mounts": []})
+
+        assert session.cloud_mount_manager is None
+        assert "ENOTCONN" in session.cloud_mount_error
+
+    @pytest.mark.asyncio
+    async def test_pinned_mount_failure_retains_historical_degraded_mode(self):
+        session = _make_session(
+            shell_owner_token=None,
+            workspace_manager=SimpleNamespace(
+                path="/workspace",
+                backend=MagicMock(),
+            ),
+        )
+        manager = MagicMock()
+        manager.start_all = AsyncMock(side_effect=RuntimeError("mount unavailable"))
+
+        with patch(
+            "src.services.cloud_mount.RcloneMountManager",
+            return_value=manager,
+        ):
+            await session._setup_cloud_mount({"driver": "rclone", "mounts": []})
+
+        assert session.cloud_mount_manager is None
+        assert session.cloud_mount_error == "mount unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -2603,6 +2909,19 @@ class TestSetupKnowledge:
 # ---------------------------------------------------------------------------
 
 
+class TestShellOwnerLifecycle:
+    def test_session_forwards_owner_token_and_terminal_retirement(self):
+        session = _make_session()
+        backend = MagicMock()
+        session.workspace_manager = MagicMock(backend=backend)
+
+        session.set_shell_owner_token(17)
+        session.retire_shell_owner()
+
+        backend.set_shell_owner_token.assert_called_once_with(17)
+        backend.retire_shell_owner.assert_called_once_with()
+
+
 class TestSwapBackend:
     def test_raises_when_workspace_manager_none(self):
         """RuntimeError raised when workspace_manager is None."""
@@ -2645,9 +2964,9 @@ class TestSwapBackend:
         new_backend.connect.assert_not_called()
 
     def test_disconnects_old_backend_when_connected(self):
-        """Disconnects old backend when it has disconnect+is_connected and is connected."""
+        """Legacy backends without retire still receive transport disconnect."""
         session = _make_session()
-        old_backend = MagicMock()
+        old_backend = MagicMock(spec=["is_connected", "disconnect"])
         old_backend.is_connected.return_value = True
         old_backend.disconnect = MagicMock()
 
@@ -2663,10 +2982,37 @@ class TestSwapBackend:
 
         old_backend.disconnect.assert_called_once()
 
+    def test_remote_backend_swap_destroys_old_shell_before_retire(self):
+        """A workspace retirement destroys tmux; it is not a claim handoff."""
+        session = _make_session()
+        old_backend = MagicMock()
+        old_backend.supports_shell = True
+        old_backend.is_connected.return_value = True
+        mock_wm = MagicMock()
+        mock_wm.backend = old_backend
+        session.workspace_manager = mock_wm
+
+        new_backend = MagicMock()
+        new_backend.is_connected.return_value = True
+        lifecycle = MagicMock()
+        lifecycle.attach_mock(old_backend.retire_shell_owner, "retire_shell_owner")
+        lifecycle.attach_mock(old_backend.shell_cleanup, "shell_cleanup")
+        lifecycle.attach_mock(old_backend.retire, "retire")
+
+        with patch.object(session, "_setup_shell_manager"):
+            session.swap_backend(new_backend)
+
+        assert lifecycle.mock_calls[:3] == [
+            call.retire_shell_owner(),
+            call.shell_cleanup(),
+            call.retire(),
+        ]
+        old_backend.disconnect.assert_not_called()
+
     def test_old_backend_disconnect_exception_non_fatal(self):
         """Exception during old backend disconnect is non-fatal."""
         session = _make_session()
-        old_backend = MagicMock()
+        old_backend = MagicMock(spec=["is_connected", "disconnect"])
         old_backend.is_connected.return_value = True
         old_backend.disconnect.side_effect = RuntimeError("disconnect failed")
 
@@ -3031,6 +3377,23 @@ def test_runtime_backend_id_comes_from_active_backend_features(backend, expected
 
 class TestCleanup:
     @pytest.mark.asyncio
+    async def test_quiesces_memory_and_citation_before_cleanup(self):
+        session = _make_session(shell_owner_token=19)
+        citation = SimpleNamespace(aclose=AsyncMock())
+        context = MagicMock()
+        context.citation_engine = citation
+        context.close_citation_engine = MagicMock()
+        session.tool_context = context
+        session.memory_service = SimpleNamespace(close_background=AsyncMock())
+
+        await session.quiesce_background_tasks()
+        await session.quiesce_background_tasks()  # idempotent
+
+        citation.aclose.assert_awaited_once_with()
+        context.close_citation_engine.assert_called_once_with()
+        session.memory_service.close_background.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
     async def test_cleanup_withdraws_runtime_facts_and_loaded_tool_names(self):
         session = _make_session()
         context = SimpleNamespace(
@@ -3062,6 +3425,179 @@ class TestCleanup:
         mock_sm.cleanup.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_cleanup_preserves_shell_but_retires_local_owner_on_handoff(self):
+        session = _make_session()
+        shell_manager = MagicMock()
+        backend = MagicMock()
+        backend.is_connected.return_value = True
+        session.shell_manager = shell_manager
+        session.workspace_manager = MagicMock(backend=backend)
+
+        await session.cleanup(preserve_shell=True)
+
+        shell_manager.cleanup.assert_not_called()
+        backend.retire_shell_owner.assert_called_once_with()
+        backend.retire.assert_called_once_with()
+        backend.disconnect.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stateless_handoff_retires_local_daemon_controllers_only(self):
+        session = _make_session(shell_owner_token=31)
+        shell_manager = MagicMock()
+        backend = MagicMock()
+        backend.is_connected.return_value = True
+        session.shell_manager = shell_manager
+        session.workspace_manager = MagicMock(backend=backend)
+
+        overlay = MagicMock()
+        cloud = MagicMock()
+        cloud.detach_for_handoff = AsyncMock()
+        cloud.aclose = AsyncMock()
+        session.overlay_mount_manager = overlay
+        session.cloud_mount_manager = cloud
+
+        monitor_started = asyncio.Event()
+
+        async def monitor():
+            monitor_started.set()
+            await asyncio.Event().wait()
+
+        session._cloud_overlay_monitor_task = asyncio.create_task(monitor())
+        await monitor_started.wait()
+
+        await session.cleanup(
+            preserve_shell=True,
+            preserve_workspace_daemons=True,
+        )
+
+        assert session._cloud_overlay_monitor_task is None
+        overlay.detach_local.assert_called_once_with()
+        overlay.unmount.assert_not_called()
+        cloud.detach_for_handoff.assert_awaited_once_with()
+        cloud.aclose.assert_not_awaited()
+        shell_manager.cleanup.assert_not_called()
+        backend.retire.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_stateless_handoff_local_controller_failure_blocks_retirement(self):
+        session = _make_session(shell_owner_token=32)
+        backend = MagicMock()
+        session.workspace_manager = MagicMock(backend=backend)
+        overlay = MagicMock()
+        overlay.detach_local.side_effect = RuntimeError("controller still running")
+        session.overlay_mount_manager = overlay
+
+        with pytest.raises(
+            WorkspaceUnavailableError,
+            match="local workspace controllers remain active",
+        ):
+            await session.cleanup(
+                preserve_shell=True,
+                preserve_workspace_daemons=True,
+            )
+
+        backend.retire.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            "shell_owner_token",
+            "preserve_shell",
+            "preserve_workspace_daemons",
+        ),
+        [(None, True, True), (41, False, False)],
+        ids=["pinned-rejects-preserve", "stateless-terminal-end"],
+    )
+    async def test_non_handoff_cleanup_unmounts_workspace_daemons(
+        self,
+        shell_owner_token,
+        preserve_shell,
+        preserve_workspace_daemons,
+    ):
+        session = _make_session(shell_owner_token=shell_owner_token)
+        session.workspace_manager = MagicMock(backend=MagicMock(spec=[]))
+        session.shell_manager = MagicMock()
+        overlay = MagicMock()
+        cloud = MagicMock()
+        cloud.detach_for_handoff = AsyncMock()
+        cloud.aclose = AsyncMock()
+        session.overlay_mount_manager = overlay
+        session.cloud_mount_manager = cloud
+
+        await session.cleanup(
+            preserve_shell=preserve_shell,
+            preserve_workspace_daemons=preserve_workspace_daemons,
+        )
+
+        if shell_owner_token is None:
+            overlay.unmount.assert_called_once_with()
+            cloud.aclose.assert_awaited_once_with()
+        else:
+            overlay.unmount.assert_called_once_with(strict=True)
+            cloud.aclose.assert_awaited_once_with(strict=True)
+        overlay.detach_local.assert_not_called()
+        cloud.detach_for_handoff.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_terminal_resource_teardown_runs_after_shell_admission_closes(self):
+        order = []
+        session = _make_session(shell_owner_token=51)
+        backend = MagicMock()
+        backend.retire_shell_owner.side_effect = lambda: order.append(
+            "shell_admission_closed"
+        )
+        backend.retire.side_effect = lambda: order.append("backend_retired")
+        session.workspace_manager = MagicMock(backend=backend)
+        session.shell_manager = MagicMock()
+        session.shell_manager.cleanup.side_effect = lambda: order.append(
+            "shell_destroyed"
+        )
+
+        overlay = MagicMock()
+        overlay.unmount.side_effect = lambda *, strict=False: order.append(
+            "overlay_unmounted"
+        )
+        cloud = MagicMock()
+        cloud.aclose = AsyncMock(
+            side_effect=lambda *, strict=False: order.append("rclone_unmounted")
+        )
+        session.overlay_mount_manager = overlay
+        session.cloud_mount_manager = cloud
+
+        await session.cleanup()
+
+        assert order == [
+            "shell_admission_closed",
+            "overlay_unmounted",
+            "rclone_unmounted",
+            "shell_destroyed",
+            "backend_retired",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_cleanup_destroys_shell_before_backend_retirement_on_genuine_end(
+        self,
+    ):
+        session = _make_session()
+        shell_manager = MagicMock()
+        backend = MagicMock()
+        backend.is_connected.return_value = True
+        session.shell_manager = shell_manager
+        session.workspace_manager = MagicMock(backend=backend)
+        lifecycle = MagicMock()
+        lifecycle.attach_mock(backend.retire_shell_owner, "retire_shell_owner")
+        lifecycle.attach_mock(shell_manager.cleanup, "shell_cleanup")
+        lifecycle.attach_mock(backend.retire, "retire")
+
+        await session.cleanup()
+
+        assert lifecycle.mock_calls[:3] == [
+            call.retire_shell_owner(),
+            call.shell_cleanup(),
+            call.retire(),
+        ]
+
+    @pytest.mark.asyncio
     async def test_shell_cleanup_exception_non_fatal(self):
         """Shell cleanup exception doesn't prevent further cleanup."""
         session = _make_session()
@@ -3075,8 +3611,36 @@ class TestCleanup:
         await session.cleanup()
 
     @pytest.mark.asyncio
-    async def test_cleanup_disconnects_remote_backend(self):
-        """cleanup() disconnects remote backend when connected."""
+    async def test_stateless_terminal_cleanup_requires_remote_ack_and_is_retryable(
+        self,
+    ):
+        session = _make_session(shell_owner_token=52)
+        backend = MagicMock()
+        session.workspace_manager = MagicMock(backend=backend)
+        session.shell_manager = MagicMock()
+        session.shell_manager.cleanup.side_effect = [
+            WorkspaceUnavailableError("SSH response lost"),
+            None,
+        ]
+
+        with pytest.raises(
+            WorkspaceUnavailableError,
+            match="shell retirement remains unacknowledged",
+        ):
+            await session.cleanup()
+
+        backend.retire_claim_resource_owner.assert_called_once_with()
+        backend.disconnect.assert_called_once_with()
+        backend.retire.assert_not_called()
+
+        await session.cleanup()
+
+        assert session.shell_manager.cleanup.call_count == 2
+        backend.retire.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_retires_remote_backend(self):
+        """cleanup() terminally retires a remote backend instance."""
         session = _make_session()
         session.shell_manager = None
         mock_backend = MagicMock()
@@ -3087,14 +3651,16 @@ class TestCleanup:
 
         await session.cleanup()
 
-        mock_backend.disconnect.assert_called_once()
+        mock_backend.retire_shell_owner.assert_called_once()
+        mock_backend.retire.assert_called_once()
+        mock_backend.disconnect.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_cleanup_skips_disconnected_backend(self):
         """cleanup() skips disconnect when backend not connected."""
         session = _make_session()
         session.shell_manager = None
-        mock_backend = MagicMock()
+        mock_backend = MagicMock(spec=["is_connected", "disconnect"])
         mock_backend.is_connected.return_value = False
         mock_wm = MagicMock()
         mock_wm.backend = mock_backend
@@ -3109,7 +3675,7 @@ class TestCleanup:
         """Backend disconnect exception is non-fatal."""
         session = _make_session()
         session.shell_manager = None
-        mock_backend = MagicMock()
+        mock_backend = MagicMock(spec=["is_connected", "disconnect"])
         mock_backend.is_connected.return_value = True
         mock_backend.disconnect.side_effect = RuntimeError("disconnect failed")
         mock_wm = MagicMock()

@@ -1822,9 +1822,10 @@ class TestLoopPlanTool:
 class TestLoopJobsNeverPendingReview:
     """A pending_review loop job wedges its loop forever (the advance fires
     only on terminal statuses) — found live when a campaign member finished
-    without declaring job_complete. Loop jobs must map to completed instead;
-    non-loop jobs keep the human-review gate. Legitimate pause freezes
-    (version_upgrade etc.) must survive the exemption."""
+    without declaring job_complete. Loop jobs with no declared freeze must map
+    to completed instead; non-loop jobs keep the human-review gate. Legitimate
+    pause freezes survive the exemption, while an unknown declared freeze must
+    fail visibly instead of phantom-completing partial work."""
 
     @staticmethod
     def _job(loop: bool, **over) -> dict:
@@ -1867,14 +1868,26 @@ class TestLoopJobsNeverPendingReview:
         )
         assert status == "pending_review"
 
-    def test_loop_pause_freezes_still_pause(self):
+    @pytest.mark.parametrize("freeze_type", ["version_upgrade", "batch_boundary"])
+    def test_loop_pause_freezes_still_pause(self, freeze_type):
         from services.completion import determine_job_status
 
-        job = self._job(loop=True, freeze_data={"freeze_type": "version_upgrade"})
+        job = self._job(loop=True, freeze_data={"freeze_type": freeze_type})
         status, _ = determine_job_status(
             job, {"should_stop": True, "goal_achieved": False}
         )
         assert status == "paused"
+
+    def test_loop_unknown_declared_freeze_never_completes(self):
+        from services.completion import determine_job_status
+
+        job = self._job(
+            loop=True, freeze_data={"freeze_type": "future_boundary_from_new_agent"}
+        )
+        status, err = determine_job_status(
+            job, {"should_stop": True, "goal_achieved": False}
+        )
+        assert (status, err) == ("pending_review", None)
 
 
 class TestAgentLoaderBindsLoopCategory:

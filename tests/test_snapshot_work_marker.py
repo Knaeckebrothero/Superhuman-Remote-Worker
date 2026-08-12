@@ -28,7 +28,7 @@ async def test_marker_written_to_thread_context_on_success():
     ):
         proc = MagicMock()
         proc.stdout.read = AsyncMock(side_effect=[b"data", b""])
-        proc.stderr.read = AsyncMock(return_value=b"")
+        proc.stderr.read = AsyncMock(side_effect=[b""])
         proc.wait = AsyncMock(return_value=0)
         proc.returncode = 0
         cse.return_value = proc
@@ -69,7 +69,7 @@ async def test_no_marker_write_when_work_marker_none():
     ):
         proc = MagicMock()
         proc.stdout.read = AsyncMock(side_effect=[b"data", b""])
-        proc.stderr.read = AsyncMock(return_value=b"")
+        proc.stderr.read = AsyncMock(side_effect=[b""])
         proc.wait = AsyncMock(return_value=0)
         proc.returncode = 0
         cse.return_value = proc

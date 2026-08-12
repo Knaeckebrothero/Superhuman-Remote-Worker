@@ -31,6 +31,8 @@ class FakeRemoteBackend:
         for name, out in self.outputs_by_script.items():
             if name in command:
                 return out
+        if "overlay_adopt_probe.sh" in command:
+            return "__SRW_OVERLAY_ABSENT__\n"
         return "__SRW_OVERLAY_OK__\n"
 
 
@@ -104,6 +106,7 @@ def test_reset_upper_unmount_plain_u_with_uz_fallback():
     )
     assert "fusermount3 -u /cloud/merged" in unmount_script
     assert "fusermount3 -uz /cloud/merged" in unmount_script
+    assert "overlay remained mounted during reset" in unmount_script
     # the plain attempt must be tried before the lazy fallback
     plain_idx = unmount_script.index("fusermount3 -u /cloud/merged")
     lazy_idx = unmount_script.index("fusermount3 -uz /cloud/merged")

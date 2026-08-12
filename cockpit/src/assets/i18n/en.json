@@ -1402,7 +1402,8 @@
       "textCount": "{{count}} text blocks",
       "toolCount": "{{count}} tool calls",
       "foldMore": "+{{count}} more",
-      "foldFailed": "⚠ {{count}} failed"
+      "foldFailed": "⚠ {{count}} failed",
+      "parked": "This turn stopped after repeated executor failures and needs operator intervention."
     },
     "queued": {
       "notSent": "Not sent",
@@ -1566,6 +1567,11 @@
       "approveAll": "Approve all",
       "autoAccept": "Auto-accept",
       "stop": "Stop"
+    },
+    "control": {
+      "backpressure": "Too many session setting changes are waiting. Try again shortly.",
+      "admissionFailed": "The session setting could not be changed. Try again.",
+      "ownerRejected": "The serving agent rejected this session setting. Reload and try again."
     },
     "workspaceOffer": {
       "title": "Workspace upgrade requested",

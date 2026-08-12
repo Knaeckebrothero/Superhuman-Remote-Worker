@@ -15,3 +15,10 @@ Session-scoped locks (held for a task's lifetime) go here too.
 # Session-scoped leadership lock — services/leader_election.py.
 # "SRW_LEAD" packed into int64. Distinct from LOCK_ID / MAINT_LOCK_ID.
 LEADER_ID = 0x5352575F4C454144
+
+# Session-scoped run-queue reaper lock — the leader-gated per-row lease reaper
+# over run_queue (src/shared/run_queue/, wired by the stateless-agents S1
+# control plane). "SRW_REAP" packed into int64. The reaper's per-row CAS steal
+# is safe without the lock (documented dual-leader window); the lock only
+# avoids duplicate sweep work.
+RUN_QUEUE_REAPER_ID = 0x5352575F52454150

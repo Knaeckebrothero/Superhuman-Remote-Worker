@@ -113,20 +113,30 @@ class TestDelegation:
     def test_send_delegates(self, manager, backend):
         result = manager.send("default", "echo hi", enter=True)
         backend.shell_send.assert_called_once_with(
-            "default", "echo hi", enter=True, working_dir=None
+            "default", "echo hi", enter=True, working_dir=None, allow_busy=False
         )
         assert result == "Sent to 'default'"
 
     def test_send_without_enter_delegates(self, manager, backend):
         manager.send("default", "C-c", enter=False)
         backend.shell_send.assert_called_once_with(
-            "default", "C-c", enter=False, working_dir=None
+            "default", "C-c", enter=False, working_dir=None, allow_busy=False
         )
 
     def test_send_forwards_working_dir(self, manager, backend):
         manager.send("default", "npm run dev", working_dir="repo")
         backend.shell_send.assert_called_once_with(
-            "default", "npm run dev", enter=True, working_dir="repo"
+            "default",
+            "npm run dev",
+            enter=True,
+            working_dir="repo",
+            allow_busy=False,
+        )
+
+    def test_send_forwards_explicit_busy_input(self, manager, backend):
+        manager.send("default", "yes", allow_busy=True)
+        backend.shell_send.assert_called_once_with(
+            "default", "yes", enter=True, working_dir=None, allow_busy=True
         )
 
     def test_cancel_delegates(self, manager, backend):

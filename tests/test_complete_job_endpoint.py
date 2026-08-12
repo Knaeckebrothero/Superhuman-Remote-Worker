@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncpg
 import pytest
 
 # Add project root to path
@@ -498,6 +499,69 @@ class TestVerificationTriggerGuards:
 
         create_job_mock.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_index_loser_skips_critic_side_effects(self, monkeypatch):
+        """The unique index, not the optimistic live-critic read, owns races."""
+        from orchestrator import main
+
+        violation = asyncpg.UniqueViolationError("duplicate critic round")
+        violation.constraint_name = "jobs_verification_uniq"
+        create_job_mock = AsyncMock(side_effect=violation)
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
+        trigger_dispatch = MagicMock()
+        monkeypatch.setattr(main, "_trigger_dispatch", trigger_dispatch)
+
+        job = self._passing_job()
+        actions: list[str] = []
+        await main._trigger_verification_on_complete(
+            job, self._passing_result(), actions
+        )
+
+        create_job_mock.assert_awaited_once()
+        trigger_dispatch.assert_not_called()
+        assert actions == [
+            f"critic round 0 already exists for {job['id']} — spawn skipped"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unrelated_unique_violation_still_raises(self, monkeypatch):
+        """Only the exact critic-index loser is a successful dedupe."""
+        from orchestrator import main
+
+        violation = asyncpg.UniqueViolationError("other duplicate")
+        violation.constraint_name = "some_other_unique_index"
+        monkeypatch.setattr(
+            main.postgres_db,
+            "create_job",
+            AsyncMock(side_effect=violation),
+        )
+        monkeypatch.setattr(
+            main,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
+
+        with pytest.raises(asyncpg.UniqueViolationError) as exc_info:
+            await main._trigger_verification_on_complete(
+                self._passing_job(), self._passing_result(), []
+            )
+        assert exc_info.value.constraint_name == "some_other_unique_index"
+
 
 class TestVerificationTriggerIntegration:
     """Test the full flow: determine_job_status → verification trigger eligibility."""
@@ -701,6 +765,24 @@ class TestOrchestratorClientReportCompletion:
         assert payload["should_stop"] is True
         assert payload["goal_achieved"] is True
         assert payload["freeze_data"]["freeze_type"] == "job_complete"
+        assert "lease_token" not in payload
+        assert call_kwargs["timeout"] == 60.0
+
+    @pytest.mark.asyncio
+    async def test_stateless_completion_sends_token_with_wide_timeout(self, client):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"new_status": "completed", "actions": []}
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            await client.report_completion(
+                "job-123", {"should_stop": True}, lease_token=17
+            )
+
+        call_kwargs = mock_http.post.call_args.kwargs
+        assert call_kwargs["json"]["lease_token"] == 17
+        assert call_kwargs["timeout"] == 300.0
 
     @pytest.mark.asyncio
     async def test_sends_error(self, client):

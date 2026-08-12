@@ -1,6 +1,43 @@
-import pytest
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
+
+import pytest
+
 from src.database.postgres_db import PostgresDB
+
+
+@pytest.mark.asyncio
+async def test_agent_db_end_thread_closes_control_admission():
+    """The direct-DB fallback must close the same capability as REST end."""
+    db = PostgresDB.__new__(PostgresDB)
+    conn = AsyncMock()
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    db.acquire = acquire
+    await db.end_thread("t1")
+
+    sql = " ".join(conn.execute.await_args.args[0].split())
+    assert "status = 'ended'" in sql
+    assert "control_admission_agent_id = NULL" in sql
+
+
+@pytest.mark.asyncio
+async def test_agent_db_terminal_status_closes_control_admission():
+    db = PostgresDB.__new__(PostgresDB)
+    conn = AsyncMock()
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    db.acquire = acquire
+    await db.update_thread_status("t1", "suspended")
+
+    sql = " ".join(conn.execute.await_args.args[0].split())
+    assert "WHEN $2 IN ('ended', 'suspended') THEN NULL" in sql
 
 
 @pytest.mark.asyncio

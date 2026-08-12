@@ -144,6 +144,7 @@ class CitationEngine:
         #: In-flight verification tasks — kept referenced so the event loop
         #: doesn't GC them mid-flight; discarded on completion.
         self._verify_tasks: set[asyncio.Task] = set()
+        self._verification_closed = False
 
         # Embedding service (SRW singleton, lazy) + chunker
         self._embedding_service = None
@@ -818,7 +819,7 @@ class CitationEngine:
         held in ``_verify_tasks`` so it isn't GC'd mid-flight. No-op when no
         verifier is wired or there is no running loop (e.g. a sync context).
         """
-        if self._verify_aux is None:
+        if self._verify_aux is None or self._verification_closed:
             return
         try:
             task = asyncio.create_task(self._run_verification(citation_id))
@@ -856,6 +857,37 @@ class CitationEngine:
         if not pending:
             return
         await asyncio.wait(pending, timeout=timeout)
+
+    async def aclose(self, timeout: float = 5.0) -> None:
+        """Disarm verdict delivery and terminally join verifier tasks.
+
+        Persistent agent processes are reused across threads.  Merely clearing
+        ``ToolContext.citation_verdict_callback`` does not affect the callback
+        copied into this engine, so an old verifier could otherwise broadcast
+        into the next thread.  Disarm first, reject new schedules, then cancel
+        and join every current verifier before claimant ownership is released.
+        """
+
+        self._verification_closed = True
+        self._on_verdict = None
+        pending = {task for task in self._verify_tasks if not task.done()}
+        if not pending:
+            return
+        for task in pending:
+            task.cancel()
+        done, still_pending = await asyncio.wait(
+            pending,
+            timeout=max(0.0, timeout),
+        )
+        for task in done:
+            try:
+                task.result()
+            except (asyncio.CancelledError, Exception):
+                pass
+        if still_pending:
+            raise RuntimeError(
+                f"{len(still_pending)} citation verifier task(s) ignored cancellation"
+            )
 
     @staticmethod
     def _validate_confidence(confidence: str) -> Confidence:

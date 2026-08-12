@@ -185,7 +185,11 @@ class TestListInstances:
                 "srw/build-sha": "sha2",
             },
         )
-        thread_row = {"id": "thread-uuid-1", "status": "ended"}
+        thread_row = {
+            "id": "thread-uuid-1",
+            "status": "ended",
+            "execution_lane": "pinned",
+        }
         mgr, _, _, _, db = _make_manager(
             pods=[pod], thread_rows={"thread-uuid-1": thread_row}
         )
@@ -198,6 +202,7 @@ class TestListInstances:
         inst = instances[0]
         assert inst.bound_to == "thread-uuid-1"
         assert inst.metadata["thread_status"] == "ended"
+        assert inst.metadata["execution_lane"] == "pinned"
         # Job table must NOT have been consulted for thread workspaces.
         db.get_job.assert_not_called()
 
@@ -220,6 +225,164 @@ class TestListInstances:
             instances = await mgr.list_instances()
         assert len(instances) == 1
         assert "job_status" not in instances[0].metadata
+
+
+# =============================================================================
+# Stateless thread lifecycle refusal
+# =============================================================================
+
+
+class TestStatelessThreadLifecycleRefusal:
+    """The acknowledged terminal/loss protocol exclusively retires these pods."""
+
+    @staticmethod
+    def _pod(phase: str = "Running"):
+        return _make_pod(
+            "ws-thread-stateless",
+            labels={
+                "srw/thread-id": "thread-stateless",
+                "srw.io/component": "agent-workspace",
+            },
+            phase=phase,
+        )
+
+    @staticmethod
+    def _row(*, execution_lane: str = "stateless", turns: int = 0, snapshot_turns=None):
+        return {
+            "id": "thread-stateless",
+            "status": "ended",
+            "execution_lane": execution_lane,
+            "total_turns": turns,
+            "metadata": {
+                "workspace_container": {
+                    "status": "ready",
+                    "pod_ip": "10.0.0.17",
+                    "last_snapshot_turns": snapshot_turns,
+                }
+            },
+        }
+
+    @staticmethod
+    def _empty_pvc_sweep(container):
+        listed = MagicMock()
+        listed.items = []
+        container._core_api.list_namespaced_persistent_volume_claim.return_value = (
+            listed
+        )
+
+    @staticmethod
+    def _assert_no_effects(container, snapshot, db):
+        snapshot.capture_vm_snapshot.assert_not_called()
+        container.delete_workspace.assert_not_called()
+        container.create_workspace.assert_not_called()
+        container.delete_workspace_pvc.assert_not_called()
+        container._delete_service.assert_not_called()
+        db.merge_thread_workspace_context.assert_not_called()
+        db.merge_workspace_container_context.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("turns", "snapshot_turns"),
+        [(7, 2), (0, None)],
+        ids=["dirty", "clean"],
+    )
+    async def test_ended_stateless_tick_has_no_reap_effects(
+        self, monkeypatch, turns, snapshot_turns
+    ):
+        monkeypatch.delenv("WORKSPACE_IMAGE", raising=False)
+        row = self._row(turns=turns, snapshot_turns=snapshot_turns)
+        mgr, container, _, snapshot, db = _make_manager(
+            pods=[self._pod()], thread_rows={"thread-stateless": row}
+        )
+        self._empty_pvc_sweep(container)
+        mgr._tcp_probe = AsyncMock(return_value=True)
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            report = await InstanceLifecycleReconciler([mgr]).tick()
+
+        assert report["workspace"]["listed"] == 1
+        assert report["workspace"]["unhealthy"] == 0
+        assert report["workspace"]["reaped"] == 0
+        assert report["workspace"]["reap_attempts"] == 0
+        assert report["workspace"]["reap_forced"] == 0
+        self._assert_no_effects(container, snapshot, db)
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_stateless_tick_cannot_take_force_delete(self, monkeypatch):
+        monkeypatch.delenv("WORKSPACE_IMAGE", raising=False)
+        row = self._row(turns=3, snapshot_turns=1)
+        mgr, container, _, snapshot, db = _make_manager(
+            pods=[self._pod(phase="Failed")],
+            thread_rows={"thread-stateless": row},
+        )
+        self._empty_pvc_sweep(container)
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            report = await InstanceLifecycleReconciler([mgr]).tick()
+
+        assert report["workspace"]["listed"] == 1
+        assert report["workspace"]["unhealthy"] == 0
+        self._assert_no_effects(container, snapshot, db)
+
+    @pytest.mark.asyncio
+    async def test_direct_legacy_mutators_are_belted(self):
+        mgr, container, _, snapshot, db = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="ws-thread-stateless",
+            bound_to="thread-stateless",
+            metadata={
+                "labels": {"srw/thread-id": "thread-stateless"},
+                "execution_lane": "stateless",
+                "thread_status": "ended",
+                "pod_phase": "Failed",
+                "pod_ip": "10.0.0.17",
+                "total_turns": 7,
+                "last_snapshot_turns": 2,
+                "snapshot_attempts": 5,
+            },
+        )
+
+        assert await mgr.is_healthy(inst) is True
+        assert await mgr.is_idle(inst) is False
+        assert await mgr.is_reapable(inst) is False
+        await mgr.record_attempt(inst)
+        assert await mgr.snapshot(inst) is None
+        await mgr.give_up(inst, grace_s=0)
+        await mgr.drain(inst, grace_s=0)
+        await mgr.delete(inst, grace_s=0)
+
+        self._assert_no_effects(container, snapshot, db)
+
+    @pytest.mark.asyncio
+    async def test_pinned_ended_dirty_thread_keeps_legacy_reap_behavior(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("WORKSPACE_IMAGE", raising=False)
+        row = self._row(execution_lane="pinned", turns=7, snapshot_turns=2)
+        mgr, container, _, snapshot, _ = _make_manager(
+            pods=[self._pod()], thread_rows={"thread-stateless": row}
+        )
+        self._empty_pvc_sweep(container)
+        mgr._tcp_probe = AsyncMock(return_value=True)
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            report = await InstanceLifecycleReconciler([mgr]).tick()
+
+        assert report["workspace"]["reaped"] == 1
+        snapshot.capture_vm_snapshot.assert_awaited_once()
+        container.delete_workspace.assert_awaited_once_with(
+            WorkspaceOwner.session("thread-stateless")
+        )
 
 
 # =============================================================================
@@ -675,9 +838,11 @@ class TestMissingRowOrphan:
         )
         await mgr.delete(inst, grace_s=0)
         container.delete_workspace_pvc.assert_awaited_once_with(
-            WorkspaceOwner.job("jgone")
+            WorkspaceOwner.job("jgone"), require_exact_owner=True
         )
-        container._delete_service.assert_awaited_once_with(WorkspaceOwner.job("jgone"))
+        container._delete_service.assert_awaited_once_with(
+            WorkspaceOwner.job("jgone"), require_exact_owner=True
+        )
 
     @staticmethod
     def _wire_empty_pvcs(container):
@@ -1022,10 +1187,12 @@ class TestDeleteTerminalPvc:
         await mgr.delete(inst, grace_s=0)
         container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
         container.delete_workspace_pvc.assert_awaited_once_with(
-            WorkspaceOwner.job("j1")
+            WorkspaceOwner.job("j1"), require_exact_owner=True
         )
         # The stable-DNS Service shares the PVC lifecycle — reclaimed on terminal.
-        container._delete_service.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+        container._delete_service.assert_awaited_once_with(
+            WorkspaceOwner.job("j1"), require_exact_owner=True
+        )
 
     @pytest.mark.asyncio
     async def test_reaped_emptydir_with_snapshot_marked_suspended(self):
@@ -1238,9 +1405,11 @@ class TestDeleteTerminalPvc:
             WorkspaceOwner.session("t1")
         )
         container.delete_workspace_pvc.assert_awaited_once_with(
-            WorkspaceOwner.session("t1")
+            WorkspaceOwner.session("t1"), require_exact_owner=True
         )
-        container._delete_service.assert_awaited_once_with(WorkspaceOwner.session("t1"))
+        container._delete_service.assert_awaited_once_with(
+            WorkspaceOwner.session("t1"), require_exact_owner=True
+        )
 
     @pytest.mark.asyncio
     async def test_unknown_binding_never_reclaims(self):
@@ -1322,7 +1491,7 @@ class TestGiveUpTerminal:
         await mgr.give_up(inst, grace_s=0)
         # delete() reclaimed the PVC (terminal); give_up must NOT recreate a pod.
         container.delete_workspace_pvc.assert_awaited_once_with(
-            WorkspaceOwner.job("j1")
+            WorkspaceOwner.job("j1"), require_exact_owner=True
         )
         container.create_workspace.assert_not_called()
 
@@ -1354,9 +1523,13 @@ class TestReapOrphans:
         ):
             n = await mgr.reap_orphans()
         assert n == 1
-        container._delete_pvc.assert_awaited_once_with("pvc-workspace-jdone")
+        container._delete_pvc.assert_awaited_once_with(
+            "pvc-workspace-jdone", expected_owner=WorkspaceOwner.job("jdone")
+        )
         # The orphan's stable-DNS Service is reclaimed alongside its PVC.
-        container._delete_service.assert_awaited_once_with(WorkspaceOwner.job("jdone"))
+        container._delete_service.assert_awaited_once_with(
+            WorkspaceOwner.job("jdone"), require_exact_owner=True
+        )
 
     @pytest.mark.asyncio
     async def test_reaps_pvc_whose_job_row_is_gone(self):
@@ -1369,7 +1542,9 @@ class TestReapOrphans:
         ):
             n = await mgr.reap_orphans()
         assert n == 1
-        container._delete_pvc.assert_awaited_once_with("pvc-workspace-jgone")
+        container._delete_pvc.assert_awaited_once_with(
+            "pvc-workspace-jgone", expected_owner=WorkspaceOwner.job("jgone")
+        )
 
     @pytest.mark.asyncio
     async def test_skips_active_job_pvc(self):
@@ -1471,9 +1646,12 @@ class TestReapOrphanSessionPvcs:
         ):
             n = await mgr.reap_orphans()
         assert n == 1
-        container._delete_pvc.assert_awaited_once_with("pvc-ws-thread-tgone")
+        container._delete_pvc.assert_awaited_once_with(
+            "pvc-ws-thread-tgone",
+            expected_owner=WorkspaceOwner.session("tgone"),
+        )
         container._delete_service.assert_awaited_once_with(
-            WorkspaceOwner.session("tgone")
+            WorkspaceOwner.session("tgone"), require_exact_owner=True
         )
 
     @pytest.mark.asyncio
@@ -1490,7 +1668,10 @@ class TestReapOrphanSessionPvcs:
         ):
             n = await mgr.reap_orphans()
         assert n == 1
-        container._delete_pvc.assert_awaited_once_with("pvc-agent-s-tgone")
+        container._delete_pvc.assert_awaited_once_with(
+            "pvc-agent-s-tgone",
+            expected_owner=WorkspaceOwner.session("tgone"),
+        )
 
     @pytest.mark.asyncio
     async def test_both_claims_of_one_thread_share_a_single_service_delete(self):
@@ -1509,7 +1690,7 @@ class TestReapOrphanSessionPvcs:
             n = await mgr.reap_orphans()
         assert n == 2
         container._delete_service.assert_awaited_once_with(
-            WorkspaceOwner.session("tgone")
+            WorkspaceOwner.session("tgone"), require_exact_owner=True
         )
 
     @pytest.mark.asyncio
@@ -1611,7 +1792,10 @@ class TestReapOrphanSessionPvcs:
         ):
             n = await mgr.reap_orphans()
         assert n == 1
-        container._delete_pvc.assert_awaited_once_with("pvc-ws-thread-tgone")
+        container._delete_pvc.assert_awaited_once_with(
+            "pvc-ws-thread-tgone",
+            expected_owner=WorkspaceOwner.session("tgone"),
+        )
 
 
 def test_pod_volume_is_ephemeral_helper():

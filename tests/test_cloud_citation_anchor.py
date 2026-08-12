@@ -229,6 +229,9 @@ async def test_get_or_register_doc_source_materializes_remote_file(tmp_path):
         yield local_pdf
 
     ws = MagicMock()
+    ws.workspace_relative_path.side_effect = lambda path: path.removeprefix(
+        "/home/agent-host/workspace/"
+    )
     ws.local_copy = MagicMock(side_effect=fake_local_copy)
 
     ctx = ToolContext()
@@ -239,7 +242,10 @@ async def test_get_or_register_doc_source_materializes_remote_file(tmp_path):
     mock_engine.add_doc_source = AsyncMock(return_value=mock_source)
     ctx.citation_engine = mock_engine
 
-    sid = await ctx.get_or_register_doc_source("/cloud/compliance/x.pdf", name="x.pdf")
+    sid = await ctx.get_or_register_doc_source(
+        "/home/agent-host/workspace/cloud/compliance/x.pdf",
+        name="x.pdf",
+    )
 
     assert sid == 3
     ws.local_copy.assert_called_once_with("cloud/compliance/x.pdf")
@@ -250,17 +256,12 @@ async def test_get_or_register_doc_source_materializes_remote_file(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_get_or_register_doc_source_local_path_passes_through(tmp_path):
-    """A path already present on the local fs (e.g. the agent.py background
-    auto-register over a local docs dir) is registered directly — no download."""
+async def test_get_or_register_doc_source_without_workspace_uses_local_path(tmp_path):
+    """A deliberately local caller without a workspace can pass a local path."""
     local_doc = tmp_path / "report.pdf"
     local_doc.write_bytes(b"%PDF-1.7 fake")
 
-    ws = MagicMock()
-    ws.local_copy = MagicMock()  # must NOT be called for an already-local path
-
     ctx = ToolContext()
-    ctx.workspace_manager = ws
     mock_engine = MagicMock()
     mock_source = MagicMock()
     mock_source.id = 5
@@ -270,7 +271,38 @@ async def test_get_or_register_doc_source_local_path_passes_through(tmp_path):
     sid = await ctx.get_or_register_doc_source(str(local_doc), name="report.pdf")
 
     assert sid == 5
-    ws.local_copy.assert_not_called()
     mock_engine.add_doc_source.assert_awaited_once_with(
         str(local_doc), name="report.pdf", metadata=None
     )
+
+
+@pytest.mark.asyncio
+async def test_get_or_register_doc_source_ignores_agent_local_collision(tmp_path):
+    """A bound workspace is authoritative even when the host path exists."""
+    host_decoy = tmp_path / "documents" / "report.pdf"
+    host_decoy.parent.mkdir()
+    host_decoy.write_bytes(b"%PDF host decoy")
+    workspace_copy = tmp_path / "materialized.pdf"
+    workspace_copy.write_bytes(b"%PDF workspace authority")
+
+    @contextmanager
+    def fake_local_copy(rel):
+        assert rel == "documents/report.pdf"
+        yield workspace_copy
+
+    ws = MagicMock()
+    ws.workspace_relative_path.side_effect = lambda path: path
+    ws.local_copy = MagicMock(side_effect=fake_local_copy)
+    ctx = ToolContext(workspace_manager=ws)
+    mock_engine = MagicMock()
+    mock_source = MagicMock(id=9)
+    mock_engine.add_doc_source = AsyncMock(return_value=mock_source)
+    ctx.citation_engine = mock_engine
+
+    sid = await ctx.get_or_register_doc_source(
+        "documents/report.pdf", name="report.pdf"
+    )
+
+    assert sid == 9
+    ws.local_copy.assert_called_once_with("documents/report.pdf")
+    assert mock_engine.add_doc_source.await_args.args[0] == str(workspace_copy)

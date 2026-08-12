@@ -61,6 +61,9 @@ class MemoryManager:
         #: this the event loop only holds a weak ref and a long-running task
         #: (the chunked pre_compaction extraction) can be GC'd mid-flight.
         self._bg_tasks: Set[asyncio.Task] = set()
+        # Once a persistent-session claimant begins teardown, no detached
+        # memory writer may be admitted behind its quiescence barrier.
+        self._background_closed = False
 
     # ------------------------------------------------------------------
     # Binding
@@ -321,6 +324,8 @@ class MemoryManager:
         event loop can't GC a long-running extraction mid-flight — the bare
         ``create_task(capture(...))`` at the legacy call sites holds no ref.
         """
+        if self._background_closed:
+            raise RuntimeError("memory background capture is closed")
         task = asyncio.create_task(self.capture(event))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
@@ -350,6 +355,48 @@ class MemoryManager:
                 timeout,
             )
         return len(pending)
+
+    async def close_background(
+        self,
+        *,
+        drain_timeout: float = 10.0,
+        cancel_timeout: float = 5.0,
+    ) -> int:
+        """Terminally quiesce detached capture tasks.
+
+        Unlike :meth:`drain_background`, this is an ownership boundary, not a
+        best-effort job-end convenience.  It first closes admission, gives
+        already-started writes a bounded chance to finish, then cancels and
+        *joins* any remainder.  Returning therefore proves that no old session
+        task can write RecallStore after a queue transition.  A task that
+        suppresses cancellation is surfaced to the caller so the physical
+        lease remains held for the reaper rather than exposing a successor.
+        """
+
+        self._background_closed = True
+        pending = {task for task in self._bg_tasks if not task.done()}
+        if not pending:
+            return 0
+        count = len(pending)
+        _, pending = await asyncio.wait(pending, timeout=max(0.0, drain_timeout))
+        if pending:
+            for task in pending:
+                task.cancel()
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=max(0.0, cancel_timeout),
+            )
+            # Retrieve contained task results to avoid late warning emission.
+            for task in done:
+                try:
+                    task.result()
+                except (asyncio.CancelledError, Exception):
+                    pass
+        if pending:
+            raise RuntimeError(
+                f"{len(pending)} memory background task(s) ignored cancellation"
+            )
+        return count
 
     # ------------------------------------------------------------------
     # Model-facing extensions

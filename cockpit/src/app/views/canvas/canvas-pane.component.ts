@@ -35,6 +35,7 @@ import {
   selectCanvasRenderer,
 } from './canvas-rendering';
 import {CanvasContentController} from './canvas-content.controller';
+import {CanvasAwarenessController} from './canvas-awareness.controller';
 import {CanvasEditController} from './canvas-edit.controller';
 import {CanvasEditorComponent} from './canvas-editor.component';
 import {CanvasViewerController} from './canvas-viewer.controller';
@@ -100,6 +101,7 @@ export function browserOpenErrorKey(code: string | null): string {
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   providers: [
+    CanvasAwarenessController,
     CanvasBrowserController,
     CanvasContentController,
     CanvasEditController,
@@ -708,6 +710,7 @@ export class CanvasPaneComponent {
       this.contentEtag(),
       this.contentStatus() === 'ready',
       this.contentStatus() === 'source_changed',
+      this.popout(),
     ));
     effect(() => this.viewer.syncPresentation(
       this.active() && this.effectiveRenderer() === 'app',

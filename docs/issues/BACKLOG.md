@@ -666,3 +666,110 @@ been observed converging (return → fix → approve). Two live-gate attempts di
 before round 2 on unrelated infrastructure — the second on the silent-push
 defect above, which is now fixed. See
 `verification_fail_closed_followups.md` for what a third run needs.
+
+## Session log 2026-08-08 (stateless agents — S1 spine build night)
+
+Overnight subagent-driven implementation of `docs/features/stateless_agents.md`
+§9/S1, all on branch `feature/stateless-agents` (chart-gated off; lane
+per-thread via `threads.execution_lane`, default `pinned`). Five build
+milestones + a live fault-injection matrix on k3d; full lab notebook in
+`docs/research/stateless_agents/implementation_log.md`.
+
+Shipped: migrations 0115 (`run_queue` + `execution_lane`) / 0116
+(`events_seq_hwm`); `src/shared/run_queue/` (claim/heartbeat/fence/complete/
+reap, 73 real-PG tests) + `src/shared/event_journal/`; conditional epoch
+resolution (reuse unless terminal — kills the reattach cache-wipe cascade for
+the pinned lane too, live-verified); `--mode stateless` turn executor with
+lease-fenced persistence and pop-first embedding-env scrub (closes a live
+cross-tenant residue); orchestrator enqueue-on-input / claim-bundle (lease
+proof) / leader reaper (`turn.interrupted` frames) / admin read model;
+`agent-stateless` helm Deployment. Fault matrix all PASS: steal at t+88 s with
+exactly-once answers, frozen-zombie heartbeat abort (`lease lost` live line),
+skip-if-answered < 8 s, FIFO drain across a steal, epoch +1 per steal / 0 per
+clean handoff. Found+fixed live: NULL consumed-watermark floor re-answered
+pre-queue history → creation now initializes `consumed_seq = input_seq - 1`.
+Final gate 539 + 73 tests green, ruff clean.
+
+**Open (ranked):** (1) affinity fingerprint never matches (volatile bundle
+credentials) → every turn pays the full ~100 s re-attach; fix = stable-subset
+fingerprint + DB-side last-pod claim bias, then drain-in-lease batching.
+(2) attach-cost decomposition/caching per doc §5.3.3. (3) provisioning gate
+(3 recorded locations; `/prepare` needs a cockpit design decision) + cockpit
+compat. (4) live cross-tenant scrub probe (needs a second user identity);
+interrupt on the lane is 501.
+
+## Session log 2026-08-08 (stateless agents — S1 performance tuning)
+
+**Turn latency 99.6 s → 5.4 s cold / 3.0 s warm** on the same k3d thread, all
+numbers from running pods. Branch `feature/stateless-agents`.
+
+Shipped: attach-time + teardown cloud `pull_all` skipped on the stateless lane
+(duplicate full-tree walks, 41 s each); one `Depth: infinity` PROPFIND replaces
+the `webdav3` per-directory walk (39.9 s → 0.55 s, capability-probed with a
+permanent fallback); bulk `list_files_with_sizes` + parallel stat batches;
+attach fingerprint excludes `resolved_config.resolved_at` (the sole volatile
+field, and the reason the warm cache never hit); **migration 0117**
+`run_queue.last_leased_by` + a 2 s affinity grace in the general claim, cleared
+on release and reaper steal; executor stays in fast poll cadence while warm and
+drops a warm session after 300 s idle; scoped metadata index on the virtual
+backend (setup 51 rclone spawns / 7.2 s → 13 / 1.5 s) plus idempotent `mkdir`.
+
+Measured and deliberately NOT built: a persisted resolved-config cache (server
+resolution is **70 ms**/claim) and drain-in-lease (with affinity working, a
+3-message burst drains on one pod in 11 s with `attach=0.00s`; the only saving
+left is the 0.05–0.09 s bundle fetch). Both recorded with their numbers in
+`docs/features/stateless_agents.md` §5.3.3/§5.3.4 so neither gets re-proposed
+from code reading.
+
+Verified: fault matrix re-run after the claim-SQL change — pod force-deleted
+mid-turn → steal at t+97 s → exactly one answer, epoch +1, affinity hint
+cleared. 81 real-PG run_queue tests (harness now applies 0115 **and** 0117),
+11 new scoped-index tests. Full gate: **15 013 passed / 12 failed**, ruff
+clean; 11 of the 12 reproduce on `develop` (py3.14 env noise). The 12th was
+real and pre-existing on this branch — `APP_CURRENT_MIGRATION_HEAD` was left
+at `0114` when session 1 added 0115/0116, so that tripwire had been red since
+the spine landed. Fixed to 0117.
+
+Commits `c290f525`→`6a360848` (5), on top of session 1's `e506fdfa`→`af5c38a0`.
+Not pushed; `develop` untouched. Sibling docs updated with the pieces that
+live outside the feature doc: `no_workspace_agent_mode.md` §5.1 (virtual-tier
+op count + scoped metadata index), `cloud_collaboration_model.md` §4 (one
+Depth-infinity PROPFIND per turn boundary; why the lane's attach/teardown
+pulls were removed).
+
+Gotchas re-confirmed: Tilt ships partially-edited images (`updateStatus: ok`
+proves nothing — `kubectl exec … grep` every pod); **`git checkout` while Tilt
+is up DEPLOYS that branch** — a few seconds on `develop` left a pod
+crash-looping on `--mode: invalid choice: 'stateless'`; `kill -9 1` inside a
+container is ignored, use `kubectl delete pod --force --grace-period=0`;
+admin-cli `id_token` expires in ~15 min and fails as a silent 401.
+
+Left: the remaining 13 setup store ops; `AFFINITY_GRACE_SECONDS` should derive
+from the poll interval if cadences ever diverge; warm-TTL value unmeasured;
+the fault harness needs a deliberately long turn now that turns are <5 s.
+
+## Session log 2026-08-09 (stateless agents — consolidation)
+
+Three branches merged back to one: `feature/stateless-agents` (unpushed,
+`develop` untouched). `feature/stateless-sessions-s1-completion` fast-forwarded
+in; `feature/stateless-workers-s3` merged with four conflicts; both topic
+branches safe-deleted after verifying they were fully merged.
+
+The conflict worth remembering: S1 restructured `register_agent` so hostname is
+no longer an ownership credential, which moved the job-pause block out of the
+`if existing:` branch, while S3 had added the `execution_lane='pinned'`
+predicate to that same query. Taking either side alone silently drops the
+other's fix. `schema_current.sql` auto-merged and was regenerated from the
+merged migration set to confirm rather than assume — no diff.
+
+Gate: 15,180 passed against the same 11 environment failures, ruff clean,
+migrations 0115–0121 all applied on k3d, a turn answers end to end, worker lane
+still off (zero `worker_batch` rows, zero non-pinned jobs).
+
+Docs de-staled: §9.1's S1 and S2/S3/S4 sections rewritten as one current picture
+(they had become layered dated appendices from three work streams); both Codex
+briefs bannered as historical with what is still open; the completion-path
+inventory's line numbers marked as drifted anchors post-merge.
+
+Status of record is `docs/features/stateless_agents.md` §9.1. Session lane
+functionally complete; worker lane blocked on Gate 3 (§5.4.5).

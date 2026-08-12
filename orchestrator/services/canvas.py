@@ -36,6 +36,8 @@ from pydantic import (
     model_validator,
 )
 
+from services.stateless_workspace_gate import stateless_session_workspace_check
+
 logger = logging.getLogger(__name__)
 
 MAIN_CANVAS_ID = "main"
@@ -309,6 +311,61 @@ class CanvasEditError(CanvasError):
         self.status_code = status_code
         self.code = code
         self.message = message
+
+
+_STATELESS_CANVAS_WRITE_STATUSES = frozenset(
+    {"created", "active", "idle", "awaiting_user"}
+)
+
+
+def _require_stateless_canvas_workspace_writer(thread: Any) -> None:
+    """Fence orchestrator-owned workspace I/O against stateless retirement.
+
+    The caller holds ``threads FOR SHARE`` for the whole remote operation. An
+    End/reaper writer that published its marker first is rejected here; one
+    arriving after this check waits for the share lock until the remote writer
+    and Canvas revision commit finish. Pinned rows deliberately bypass this
+    policy and retain their historical behavior.
+    """
+
+    if str(thread.get("execution_lane") or "") != "stateless":
+        return
+
+    refused = str(thread.get("status") or "") not in _STATELESS_CANVAS_WRITE_STATUSES
+    _, session_workspace_refusal = stateless_session_workspace_check(thread)
+    if session_workspace_refusal is not None:
+        refused = True
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = None
+    if not isinstance(metadata, dict):
+        refused = True
+        metadata = {}
+
+    # Presence of either retirement marker is authority to stop admitting new
+    # workspace I/O, even if a malformed/legacy value is falsey.  The loss
+    # ledger is unresolved-only and its writer removes the key when settled,
+    # so every present value remains authority to stop.
+    if "_stateless_workspace_retirement_pending" in metadata:
+        refused = True
+    if "_stateless_claim_retirement" in metadata:
+        refused = True
+    if "_stateless_claim_loss_hold" in metadata:
+        refused = True
+    if "_stateless_claim_losses" in metadata:
+        refused = True
+    if "protected_cloud" in metadata and metadata["protected_cloud"] is not False:
+        refused = True
+
+    if refused:
+        raise CanvasEditError(
+            409,
+            "canvas_editing_unavailable",
+            "This stateless session is not accepting Canvas workspace writes",
+        )
 
 
 def canvas_file_lock_key(thread_id: str, canonical_path: str) -> int:
@@ -872,7 +929,7 @@ class CanvasService:
                     async with conn.transaction():
                         thread_row = await conn.fetchrow(
                             """
-                            SELECT id, user_id, metadata
+                            SELECT id, user_id, status, execution_lane, metadata
                             FROM threads
                             WHERE id = $1
                             FOR SHARE
@@ -887,6 +944,7 @@ class CanvasService:
                                 "canvas_not_authorized",
                                 "Canvas thread authorization changed",
                             )
+                        _require_stateless_canvas_workspace_writer(thread_row)
                         row = await conn.fetchrow(
                             """
                             SELECT thread_id, canvas_id, source, title, renderer,
@@ -1041,7 +1099,7 @@ class CanvasService:
                 async with conn.transaction():
                     thread_row = await conn.fetchrow(
                         """
-                        SELECT id, user_id, metadata
+                        SELECT id, user_id, status, execution_lane, metadata
                         FROM threads
                         WHERE id = $1
                         FOR SHARE
@@ -1056,6 +1114,7 @@ class CanvasService:
                             "canvas_not_authorized",
                             "Canvas thread authorization changed",
                         )
+                    _require_stateless_canvas_workspace_writer(thread_row)
                     row = await conn.fetchrow(
                         """
                         SELECT thread_id, canvas_id, source, title, renderer,
@@ -1163,7 +1222,7 @@ class CanvasService:
                 async with conn.transaction():
                     thread_row = await conn.fetchrow(
                         """
-                        SELECT id, user_id, metadata
+                        SELECT id, user_id, status, execution_lane, metadata
                         FROM threads
                         WHERE id = $1
                         FOR SHARE
@@ -1172,6 +1231,7 @@ class CanvasService:
                     )
                     if thread_row is None:
                         return CanvasMutation(changed=False, record=None)
+                    _require_stateless_canvas_workspace_writer(thread_row)
                     row = await conn.fetchrow(
                         """
                         SELECT thread_id, canvas_id, source, title, renderer,

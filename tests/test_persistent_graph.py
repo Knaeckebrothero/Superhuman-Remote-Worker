@@ -72,6 +72,16 @@ def _make_callbacks(**overrides) -> PersistentLoopCallbacks:
     return PersistentLoopCallbacks(**defaults)
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_backoff(monkeypatch):
+    """Preserve retry attempts while removing production wall-clock delays.
+
+    Retry timing itself is covered in test_session_transient_llm_retry.py; this
+    module tests turn outcomes, fallback routing, and callback ordering.
+    """
+    monkeypatch.setattr("src.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+
+
 def _make_config(**overrides):
     """Minimal config mock."""
     cfg = MagicMock()
@@ -830,7 +840,10 @@ class TestMemoryExtractionTrigger:
         mock_recall.retrieve = AsyncMock(return_value=[])
         mock_aux = MagicMock()
 
-        with patch("src.persistent_graph.asyncio.create_task") as mock_task:
+        with patch(
+            "src.services.auxiliary.extract_and_store_memories",
+            new_callable=AsyncMock,
+        ) as extract:
             await run_persistent_loop(
                 llm_with_tools=llm,
                 tools=[],
@@ -845,8 +858,88 @@ class TestMemoryExtractionTrigger:
                 auxiliary_llm=mock_aux,
             )
 
-            # Should fire once (at turn 5)
-            assert mock_task.call_count == 1
+            # It fires once (at turn 5) and is awaited before turn settlement;
+            # a detached task could outlive and inherit a repointed lease.
+            extract.assert_awaited_once()
+            assert extract.await_args.kwargs["source_turn_start"] == 0
+            assert extract.await_args.kwargs["source_turn_end"] == 5
+
+    @pytest.mark.asyncio
+    async def test_turn_settled_waits_for_workspace_push_and_mapping(self):
+        """Physical detach cannot cancel between Git commit and mapping."""
+
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "test_tool", "args": {}, "id": "tc1"}],
+        )
+        final_response = _make_llm_response("done")
+        stream_count = 0
+
+        async def _astream(messages, **_kwargs):
+            nonlocal stream_count
+            stream_count += 1
+            yield response_with_tool if stream_count == 1 else final_response
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+        tool = _make_tool("test_tool", "result")
+        git_mgr = MagicMock()
+        git_mgr.is_active = True
+        git_mgr.has_uncommitted_changes.return_value = True
+        git_mgr.commit.return_value = True
+        git_mgr.has_unpushed_commits.return_value = True
+        git_mgr.push.return_value = True
+        git_mgr.get_current_commit.return_value = "a" * 40
+        tool_ctx = MagicMock()
+        tool_ctx.workspace_manager.git_manager = git_mgr
+        tool_ctx.consume_freeze_request.return_value = None
+
+        turns = 0
+
+        async def _input():
+            nonlocal turns
+            turns += 1
+            if turns == 1:
+                return "make a file"
+            raise asyncio.CancelledError
+
+        mapping_entered = asyncio.Event()
+        release_mapping = asyncio.Event()
+        settled = AsyncMock()
+
+        async def _map(_sha):
+            mapping_entered.set()
+            await release_mapping.wait()
+
+        callbacks = _make_callbacks(
+            get_user_input=_input,
+            on_workspace_commit=AsyncMock(side_effect=_map),
+            on_turn_settled=settled,
+        )
+        loop_task = asyncio.create_task(
+            run_persistent_loop(
+                llm_with_tools=llm,
+                tools=[tool],
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ),
+                config=_make_config(),
+                system_prompt="sys",
+                callbacks=callbacks,
+                messages=[],
+                tool_context=tool_ctx,
+            )
+        )
+
+        await asyncio.wait_for(mapping_entered.wait(), timeout=2)
+        callbacks.on_turn_complete.assert_awaited_once()
+        git_mgr.push.assert_called_once()
+        settled.assert_not_awaited()
+
+        release_mapping.set()
+        await asyncio.wait_for(loop_task, timeout=2)
+        settled.assert_awaited_once_with(1)
 
     @pytest.mark.asyncio
     async def test_does_not_fire_when_recall_store_none(self):
@@ -2350,6 +2443,44 @@ class TestContextCompaction:
 
         git_mgr.commit.assert_called_once()
         git_mgr.push.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("push_ok", [False, True])
+    async def test_compaction_maps_only_after_durable_push(self, push_ok):
+        ctx_mgr = _make_compacting_ctx_mgr(lambda msgs: msgs[:2])
+        git_mgr = MagicMock()
+        git_mgr.is_active = True
+        git_mgr.has_uncommitted_changes.return_value = True
+        git_mgr.commit.return_value = True
+        git_mgr.get_current_commit.return_value = "c" * 40
+        git_mgr.push.return_value = push_ok
+        tool_ctx = MagicMock()
+        tool_ctx.workspace_manager.git_manager = git_mgr
+        mapping = AsyncMock()
+        callbacks = _make_callbacks(on_workspace_commit=mapping)
+
+        await _execute_turn(
+            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
+            tool_map={},
+            context_manager=ctx_mgr,
+            messages=[
+                SystemMessage(content="sys"),
+                HumanMessage(content="q1"),
+                AIMessage(content="a1"),
+                HumanMessage(content="q2"),
+            ],
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+            tool_context=tool_ctx,
+        )
+
+        git_mgr.push.assert_called_once()
+        if push_ok:
+            mapping.assert_awaited_once_with("c" * 40)
+        else:
+            mapping.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_compaction_adopts_result_into_session_list(self):

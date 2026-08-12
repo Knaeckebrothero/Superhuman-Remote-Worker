@@ -95,6 +95,8 @@ class RcloneObjectStore(ObjectStore):
         self._meta_timeout = meta_timeout
         self._rclone_bin = rclone_bin
 
+        # verb -> (count, seconds). Diagnostic only; see drain_op_stats.
+        self.op_stats: Dict[str, tuple] = {}
         # Child-process environment: parent env is inherited at call time; here
         # we only assemble the remote-defining overlay so secrets are scoped to
         # the rclone children, never the agent's own environment.
@@ -125,9 +127,11 @@ class RcloneObjectStore(ObjectStore):
         timeout: Optional[int] = None,
     ) -> subprocess.CompletedProcess:
         import os
+        import time as _t
 
         env = dict(os.environ)
         env.update(self._env_overlay)
+        _t0 = _t.perf_counter()
         try:
             return subprocess.run(
                 [self._rclone_bin, *args],
@@ -142,6 +146,28 @@ class RcloneObjectStore(ObjectStore):
             ) from exc
         except subprocess.TimeoutExpired as exc:
             raise ObjectStoreError(f"rclone {args[0]} timed out") from exc
+        finally:
+            # Every op here is a process spawn against an object store. Their
+            # count is the whole performance story of the virtual tier, so
+            # keep a running tally the session can log per phase.
+            verb = args[0] if args else "?"
+            count, total = self.op_stats.get(verb, (0, 0.0))
+            self.op_stats[verb] = (count + 1, total + (_t.perf_counter() - _t0))
+
+    def drain_op_stats(self) -> str:
+        """Human-readable op tally since the last drain, then reset."""
+        if not self.op_stats:
+            return "none"
+        parts = [
+            f"{verb}x{count}={total:.2f}s"
+            for verb, (count, total) in sorted(
+                self.op_stats.items(), key=lambda kv: -kv[1][1]
+            )
+        ]
+        n = sum(c for c, _ in self.op_stats.values())
+        secs = sum(t for _, t in self.op_stats.values())
+        self.op_stats = {}
+        return f"{n} ops {secs:.2f}s [{' '.join(parts)}]"
 
     @staticmethod
     def _stderr(proc: subprocess.CompletedProcess) -> str:

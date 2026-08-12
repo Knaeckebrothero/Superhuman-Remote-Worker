@@ -39,8 +39,15 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
-RUNNER_HOOK = REPO_ROOT / "docker" / "ci-runner" / "job-started-guard.sh"
-RUNNER_DOCKERFILE = REPO_ROOT / "docker" / "Dockerfile.ci-runner"
+RUNNER_DOC = REPO_ROOT / "docs" / "ci_self_hosted_runners.md"
+
+# Strings the runner-image contract is recorded under. See check 8 for why this
+# is a documentation check rather than a file check.
+RUNNER_CONTRACT = (
+    "job-started-guard.sh",
+    "ARC_ALLOWED_REPOSITORY",
+    "ghcr.io/knaeckebrothero/github-actions-runner",
+)
 
 # --- the three legal runs-on lines ------------------------------------------
 # Compared after collapsing runs of whitespace, which cannot change what an
@@ -113,15 +120,9 @@ WORKFLOWS: dict[str, Policy] = {
             "never be allowed to run on the machines it is protecting"
         ),
     ),
-    "ci-runner-image.yml": Policy(
-        triggers=frozenset({"push", "pull_request", "schedule", "workflow_dispatch"}),
-        hosted_only=True,
-        why=(
-            "it builds the self-hosted runner image; running it on a self-hosted "
-            "runner means a broken image cannot be fixed without one"
-        ),
-    ),
 }
+# NOTE: there is no ci-runner-image.yml entry. The runner image is built in
+# Scripts-and-Notebooks (devops/github-actions-runner/), not here — see check 8.
 
 
 class _StrictLoader(yaml.SafeLoader):
@@ -313,41 +314,42 @@ def check() -> list[str]:
                         f"the canonical runs-on lines and nowhere else."
                     )
 
-    # 8. The run-time half must still exist and still refuse pull requests.
-    #    Deleting it would leave only merge-time protection, which does not stop
-    #    a fork PR from running at all.
-    if not RUNNER_DOCKERFILE.is_file():
+    # 8. The run-time half must stay documented.
+    #
+    #    This check used to assert that docker/Dockerfile.ci-runner and
+    #    docker/ci-runner/job-started-guard.sh existed here and still contained
+    #    their fork checks. The image now lives in Scripts-and-Notebooks
+    #    (devops/github-actions-runner/) — deliberately, because the guard is the
+    #    one control a pull request cannot edit, and that is only true while it
+    #    is outside every repository it protects. A file check is therefore no
+    #    longer possible from here.
+    #
+    #    So this is weaker than what it replaced, and worth being honest about:
+    #    it verifies the CONTRACT IS STILL WRITTEN DOWN, not that it is still
+    #    enforced. The enforcement proof moved with the image and is stronger
+    #    there — the runner-image workflow runs 13 accept/refuse cases against
+    #    the built image and gates `docker push` on them, so a regressed guard
+    #    cannot reach the registry at all.
+    #
+    #    What this still buys: the pointer cannot silently vanish. Someone
+    #    removing the self-hosted runner story from this repo has to delete the
+    #    documented contract too, and CI notices.
+    if not RUNNER_DOC.is_file():
         r.add(
-            "docker/Dockerfile.ci-runner is missing — the self-hosted runner image "
-            "carries the only fork guard a pull request cannot edit."
-        )
-    elif "ACTIONS_RUNNER_HOOK_JOB_STARTED" not in RUNNER_DOCKERFILE.read_text(
-        encoding="utf-8"
-    ):
-        r.add(
-            "docker/Dockerfile.ci-runner does not set "
-            "ACTIONS_RUNNER_HOOK_JOB_STARTED — the guard script would be present "
-            "but never invoked."
-        )
-
-    if not RUNNER_HOOK.is_file():
-        r.add(
-            "docker/ci-runner/job-started-guard.sh is missing — "
-            "ACTIONS_RUNNER_HOOK_JOB_STARTED has nothing to run."
+            "docs/ci_self_hosted_runners.md is missing — it records the runner "
+            "image contract (the fork guard, its allowlist variable, and where "
+            "the image is built). It is the only trace of that contract in this "
+            "repository."
         )
     else:
-        hook = RUNNER_HOOK.read_text(encoding="utf-8")
-        for needle, what in (
-            ("GITHUB_EVENT_NAME", "the event allowlist"),
-            ("refs/pull/", "the pull-request ref check"),
-            ("GITHUB_HEAD_REF", "the pull-request head-ref check"),
-            ("GITHUB_BASE_REF", "the pull-request base-ref check"),
-            ("GITHUB_REPOSITORY", "the repository check"),
-        ):
-            if needle not in hook:
+        doc = RUNNER_DOC.read_text(encoding="utf-8")
+        for needle in RUNNER_CONTRACT:
+            if needle not in doc:
                 r.add(
-                    f"docker/ci-runner/job-started-guard.sh no longer contains "
-                    f"{needle!r} — {what} appears to have been removed."
+                    f"docs/ci_self_hosted_runners.md no longer mentions {needle!r} "
+                    f"— the runner-image contract has drifted. If the image moved "
+                    f"or the guard changed, update the doc and RUNNER_CONTRACT in "
+                    f"this script together."
                 )
 
     return r.errors

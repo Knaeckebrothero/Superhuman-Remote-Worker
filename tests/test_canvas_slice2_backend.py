@@ -74,14 +74,18 @@ def _thread() -> dict[str, Any]:
             "_workspace_binding": {
                 "generation": str(GENERATION),
                 "kind": "remote",
-                "backing_id": "test-backing",
+                "backing_id": "k8s-pvc:srw:test",
                 "ssh_host_key_fingerprint": "SHA256:test",
             },
             "workspace_container": {
                 "status": "ready",
-                "host": "workspace.test",
-                "port": 22,
+                "provisioner": "k8s",
+                "pod_ip": "workspace.test",
+                "pod_port": 30022,
+                "pod_name": "workspace-test",
+                "namespace": "srw",
                 "_canvas_workspace_generation": str(GENERATION),
+                "_runtime_incarnation": "22222222-bbbb-4bbb-8bbb-222222222222",
             },
         },
     }
@@ -125,6 +129,7 @@ class _EditDB:
         self.advisory_owner: _EditConnection | None = None
         self.acquire_count = 0
         self.now = NOW
+        self.thread_lock_queries: list[str] = []
 
     @asynccontextmanager
     async def acquire(self):
@@ -162,11 +167,8 @@ class _EditConnection:
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         normalized = " ".join(query.split())
         if "FROM threads" in normalized:
-            return {
-                "id": THREAD_ID,
-                "user_id": USER_ID,
-                "metadata": self.db.thread["metadata"],
-            }
+            self.db.thread_lock_queries.append(normalized)
+            return dict(self.db.thread)
         if normalized.startswith("SELECT thread_id"):
             return dict(self.db.row)
         if normalized.startswith("UPDATE canvases SET source_version"):
@@ -483,6 +485,321 @@ async def test_refresh_uses_transaction_locked_thread_snapshot() -> None:
     assert mutation.record is not None
     assert mutation.record.presentation_revision == 2
     assert mutation.record.source_version == next_version
+
+
+def _mark_stateless_canvas_thread(db: _EditDB, lifecycle: str) -> None:
+    db.thread["execution_lane"] = "stateless"
+    db.thread["status"] = "active"
+    metadata = dict(db.thread["metadata"])
+    if lifecycle == "ended":
+        db.thread["status"] = "ended"
+    elif lifecycle == "suspended":
+        db.thread["status"] = "suspended"
+    elif lifecycle == "workspace-retirement":
+        metadata["_stateless_workspace_retirement_pending"] = True
+    elif lifecycle == "claim-retirement":
+        metadata["_stateless_claim_retirement"] = {"terminal_token": 8}
+    elif lifecycle == "claim-loss":
+        metadata["_stateless_claim_losses"] = {
+            "7": {"pod": "agent-a", "pod_uid": "uid-a", "quiesced": False}
+        }
+    elif lifecycle == "claim-loss-hold":
+        metadata["_stateless_claim_loss_hold"] = {"lease_token": 8}
+    elif lifecycle == "protected-cloud":
+        metadata["protected_cloud"] = True
+    else:  # pragma: no cover - closed test vocabulary
+        raise AssertionError(lifecycle)
+    db.thread["metadata"] = metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["edit", "refresh"])
+@pytest.mark.parametrize(
+    "lifecycle",
+    [
+        "ended",
+        "suspended",
+        "workspace-retirement",
+        "claim-retirement",
+        "claim-loss",
+        "claim-loss-hold",
+        "protected-cloud",
+    ],
+)
+async def test_stateless_lifecycle_marker_precedes_canvas_workspace_writer(
+    operation: str,
+    lifecycle: str,
+) -> None:
+    """A marker holding the thread row wins before any remote callback."""
+
+    db = _EditDB()
+    _mark_stateless_canvas_thread(db, lifecycle)
+    service = CanvasService(db)
+    writer_called = False
+
+    async def forbidden_writer(*_args) -> str:
+        nonlocal writer_called
+        writer_called = True
+        raise AssertionError("stateless terminal state reached the workspace writer")
+
+    record = _record()
+    assert record.source_fingerprint is not None
+    with pytest.raises(CanvasEditError) as error:
+        if operation == "edit":
+            await service.edit_file(
+                THREAD_ID,
+                expected_presentation_revision=record.presentation_revision,
+                expected_source_fingerprint=record.source_fingerprint,
+                expected_source_version=record.source_version,
+                expected_thread_user_id=USER_ID,
+                writer=forbidden_writer,
+            )
+        else:
+            await service.refresh_file(
+                THREAD_ID,
+                expected_etag=build_public_canvas_representation(record).etag,
+                expected_thread_user_id=USER_ID,
+                refresher=forbidden_writer,
+            )
+
+    assert error.value.status_code == 409
+    assert error.value.code == "canvas_editing_unavailable"
+    assert writer_called is False
+    assert db.row["presentation_revision"] == 1
+    assert len(db.thread_lock_queries) == 1
+    lock_sql = db.thread_lock_queries[0]
+    assert "SELECT id, user_id, status, execution_lane, metadata" in lock_sql
+    assert lock_sql.endswith("FOR SHARE")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "_stateless_workspace_retirement_pending",
+        "_stateless_claim_retirement",
+        "_stateless_claim_loss_hold",
+        "_stateless_claim_losses",
+    ],
+    ids=["workspace-retirement", "claim-retirement", "loss-hold", "losses"],
+)
+@pytest.mark.parametrize(
+    "marker_value",
+    [None, False, 0, "", [], {}],
+    ids=["null", "false", "zero", "empty-string", "empty-list", "empty-map"],
+)
+async def test_present_falsey_lifecycle_marker_blocks_canvas_writer(
+    marker, marker_value
+) -> None:
+    db = _EditDB()
+    db.thread.update(execution_lane="stateless", status="active")
+    db.thread["metadata"] = {
+        **db.thread["metadata"],
+        marker: marker_value,
+    }
+    writer_called = False
+
+    async def forbidden_writer(*_args) -> str:
+        nonlocal writer_called
+        writer_called = True
+        raise AssertionError("malformed lifecycle marker reached Canvas writer")
+
+    record = _record()
+    assert record.source_fingerprint is not None
+    with pytest.raises(CanvasEditError) as error:
+        await CanvasService(db).edit_file(
+            THREAD_ID,
+            expected_presentation_revision=record.presentation_revision,
+            expected_source_fingerprint=record.source_fingerprint,
+            expected_source_version=record.source_version,
+            expected_thread_user_id=USER_ID,
+            writer=forbidden_writer,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.code == "canvas_editing_unavailable"
+    assert writer_called is False
+    assert db.row["presentation_revision"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "protected_cloud",
+    [None, True, 0, "", [], {}],
+    ids=["null", "true", "zero", "empty-string", "empty-list", "empty-map"],
+)
+async def test_present_nonfalse_protected_cloud_blocks_canvas_writer(
+    protected_cloud,
+) -> None:
+    db = _EditDB()
+    db.thread.update(execution_lane="stateless", status="active")
+    db.thread["metadata"] = {
+        **db.thread["metadata"],
+        "protected_cloud": protected_cloud,
+    }
+    writer_called = False
+
+    async def forbidden_writer(*_args) -> str:
+        nonlocal writer_called
+        writer_called = True
+        raise AssertionError("protected stateless thread reached Canvas writer")
+
+    record = _record()
+    assert record.source_fingerprint is not None
+    with pytest.raises(CanvasEditError) as error:
+        await CanvasService(db).edit_file(
+            THREAD_ID,
+            expected_presentation_revision=record.presentation_revision,
+            expected_source_fingerprint=record.source_fingerprint,
+            expected_source_version=record.source_version,
+            expected_thread_user_id=USER_ID,
+            writer=forbidden_writer,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.code == "canvas_editing_unavailable"
+    assert writer_called is False
+    assert db.row["presentation_revision"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session_class",
+    ["vm", "unknown", "officer", "conference"],
+)
+async def test_pinned_only_session_or_workspace_class_blocks_canvas_writer(
+    session_class,
+) -> None:
+    db = _EditDB()
+    db.thread.update(execution_lane="stateless", status="active")
+    if session_class == "vm":
+        db.thread["metadata"]["vm"] = {"status": "ready", "host": "vm.test"}
+    elif session_class == "unknown":
+        db.thread["metadata"]["config_override"]["workspace"]["backend"] = "future-tier"
+    else:
+        db.thread["metadata"]["config_override"]["officer"] = {
+            "enabled": session_class == "officer",
+            "conference": session_class == "conference",
+        }
+
+    writer_called = False
+
+    async def forbidden_writer(*_args) -> str:
+        nonlocal writer_called
+        writer_called = True
+        raise AssertionError("pinned-only session class reached Canvas writer")
+
+    record = _record()
+    assert record.source_fingerprint is not None
+    with pytest.raises(CanvasEditError) as error:
+        await CanvasService(db).edit_file(
+            THREAD_ID,
+            expected_presentation_revision=record.presentation_revision,
+            expected_source_fingerprint=record.source_fingerprint,
+            expected_source_version=record.source_version,
+            expected_thread_user_id=USER_ID,
+            writer=forbidden_writer,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.code == "canvas_editing_unavailable"
+    assert writer_called is False
+    assert db.row["presentation_revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_pinned_terminal_markers_do_not_change_canvas_writer_semantics() -> None:
+    """The new lifecycle policy is scoped strictly to the stateless lane."""
+
+    db = _EditDB()
+    db.thread.update(execution_lane="pinned", status="ended")
+    db.thread["metadata"] = {
+        **db.thread["metadata"],
+        "_stateless_workspace_retirement_pending": True,
+        "_stateless_claim_losses": {"7": {"malformed": True}},
+        "protected_cloud": True,
+    }
+    called = False
+
+    async def writer(*_args) -> str:
+        nonlocal called
+        called = True
+        return "sha256:" + "f" * 64
+
+    record = _record()
+    assert record.source_fingerprint is not None
+    mutation = await CanvasService(db).edit_file(
+        THREAD_ID,
+        expected_presentation_revision=record.presentation_revision,
+        expected_source_fingerprint=record.source_fingerprint,
+        expected_source_version=record.source_version,
+        expected_thread_user_id=USER_ID,
+        writer=writer,
+    )
+
+    assert called is True
+    assert mutation.record is not None
+    assert mutation.record.presentation_revision == 2
+
+
+@pytest.mark.asyncio
+async def test_canvas_writer_first_serializes_stateless_retirement_marker() -> None:
+    """End's thread update waits while a previously admitted writer holds SHARE."""
+
+    db = _EditDB()
+    db.thread.update(execution_lane="stateless", status="active")
+    service = CanvasService(db)
+    writer_started = asyncio.Event()
+    release_writer = asyncio.Event()
+    marker_acquired = asyncio.Event()
+    events: list[str] = []
+
+    async def writer(*_args) -> str:
+        events.append("writer-start")
+        writer_started.set()
+        await release_writer.wait()
+        events.append("writer-finish")
+        return "sha256:" + "e" * 64
+
+    async def publish_end_marker() -> None:
+        events.append("marker-wait")
+        # ``row_lock`` models the conflicting threads FOR UPDATE taken by End.
+        async with db.row_lock:
+            events.append("marker-acquired")
+            db.thread["status"] = "ended"
+            marker_acquired.set()
+
+    record = _record()
+    assert record.source_fingerprint is not None
+    editing = asyncio.create_task(
+        service.edit_file(
+            THREAD_ID,
+            expected_presentation_revision=record.presentation_revision,
+            expected_source_fingerprint=record.source_fingerprint,
+            expected_source_version=record.source_version,
+            expected_thread_user_id=USER_ID,
+            writer=writer,
+        )
+    )
+    await asyncio.wait_for(writer_started.wait(), timeout=1)
+    marker = asyncio.create_task(publish_end_marker())
+    await asyncio.sleep(0)
+    assert marker_acquired.is_set() is False
+
+    release_writer.set()
+    mutation = await editing
+    await marker
+
+    assert mutation.record is not None
+    assert mutation.record.presentation_revision == 2
+    assert events == [
+        "writer-start",
+        "marker-wait",
+        "writer-finish",
+        "marker-acquired",
+    ]
+    assert len(db.thread_lock_queries) == 1
+    assert db.thread_lock_queries[0].endswith("FOR SHARE")
 
 
 def test_advisory_lock_key_is_stable_signed_and_path_scoped() -> None:

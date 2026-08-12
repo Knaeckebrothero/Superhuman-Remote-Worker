@@ -118,6 +118,7 @@ class TestListInstances:
         job = {
             "id": "job-uuid-1",
             "status": "paused",
+            "execution_lane": "pinned",
             "context": {
                 "vm": {
                     "status": "ready",
@@ -136,6 +137,7 @@ class TestListInstances:
         assert inst.bound_to == "job-uuid-1"
         assert inst.version == "abc123"
         assert inst.metadata["scope"] == "job"
+        assert inst.metadata["execution_lane"] == "pinned"
         assert inst.metadata["job_status"] == "paused"
         assert inst.metadata["vm_status"] == "ready"
         assert inst.metadata["ssh_host"] == "10.0.0.42"
@@ -160,6 +162,7 @@ class TestListInstances:
         thread = {
             "id": "thread-uuid-1",
             "status": "ended",
+            "execution_lane": "stateless",
             "metadata": {
                 "vm": {
                     "status": "ready",
@@ -173,6 +176,7 @@ class TestListInstances:
         assert len(instances) == 1
         inst = instances[0]
         assert inst.metadata["scope"] == "thread"
+        assert inst.metadata["execution_lane"] == "stateless"
         assert inst.metadata["thread_status"] == "ended"
         assert inst.version == "xyz789"
 
@@ -313,6 +317,184 @@ class TestListInstances:
         mgr, *_ = _make_manager(job_rows=jobs)
         instances = await mgr.list_instances()
         assert all(i.metadata["job_dispatchable"] is False for i in instances)
+
+
+# =============================================================================
+# Stateless VM lifecycle refusal
+# =============================================================================
+
+
+class TestStatelessVMLifecycleRefusal:
+    """Generic lifecycle cleanup cannot bypass stateless terminal/loss ACKs."""
+
+    @staticmethod
+    def _thread_row(*, lane="stateless", turns=0, snapshot_turns=None):
+        return {
+            "id": "thread-stateless",
+            "status": "ended",
+            "execution_lane": lane,
+            "total_turns": turns,
+            "metadata": {
+                "vm": {
+                    "status": "ready",
+                    "ssh_host": "10.0.0.27",
+                    "last_snapshot_turns": snapshot_turns,
+                }
+            },
+        }
+
+    @staticmethod
+    def _job_row(*, lane="stateless"):
+        return {
+            "id": "job-stateless",
+            "status": "completed",
+            "execution_lane": lane,
+            "context": {"vm": {"status": "ready", "ssh_host": "10.0.0.28"}},
+        }
+
+    @staticmethod
+    def _finish_tick_wiring(provisioner, db, job_rows, thread_rows):
+        # list_instances consumes the first two fetches. purge_kept_disks is the
+        # third fetch in the optional orphan hook at the end of the same tick.
+        conn = db.acquire.return_value.__aenter__.return_value
+        conn.fetch.side_effect = [job_rows, thread_rows, []]
+        provisioner.list_vms = AsyncMock(return_value=[])
+
+    @staticmethod
+    def _assert_no_effects(provisioner, snapshot, db):
+        snapshot.capture_vm_snapshot.assert_not_called()
+        provisioner.delete_vm.assert_not_called()
+        provisioner.delete_thread_vm.assert_not_called()
+        db.merge_vm_context.assert_not_called()
+        db.merge_thread_vm_context.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("turns", "snapshot_turns"),
+        [(8, 3), (0, None)],
+        ids=["dirty", "clean"],
+    )
+    async def test_ended_stateless_thread_tick_has_no_reap_effects(
+        self, monkeypatch, turns, snapshot_turns
+    ):
+        monkeypatch.delenv("DEFAULT_VM_IMAGE", raising=False)
+        thread = self._thread_row(turns=turns, snapshot_turns=snapshot_turns)
+        mgr, provisioner, _, snapshot, db = _make_manager(thread_rows=[thread])
+        self._finish_tick_wiring(provisioner, db, [], [thread])
+        mgr._tcp_probe = AsyncMock(return_value=True)
+
+        report = await InstanceLifecycleReconciler([mgr]).tick()
+
+        assert report["vm"]["listed"] == 1
+        assert report["vm"]["unhealthy"] == 0
+        assert report["vm"]["reaped"] == 0
+        assert report["vm"]["reap_attempts"] == 0
+        assert report["vm"]["reap_forced"] == 0
+        mgr._tcp_probe.assert_not_called()
+        self._assert_no_effects(provisioner, snapshot, db)
+
+    @pytest.mark.asyncio
+    async def test_completed_stateless_job_tick_has_no_reap_effects(self, monkeypatch):
+        monkeypatch.delenv("DEFAULT_VM_IMAGE", raising=False)
+        job = self._job_row()
+        mgr, provisioner, _, snapshot, db = _make_manager(job_rows=[job])
+        self._finish_tick_wiring(provisioner, db, [job], [])
+        mgr._tcp_probe = AsyncMock(return_value=True)
+
+        report = await InstanceLifecycleReconciler([mgr]).tick()
+
+        assert report["vm"]["listed"] == 1
+        assert report["vm"]["reaped"] == 0
+        mgr._tcp_probe.assert_not_called()
+        self._assert_no_effects(provisioner, snapshot, db)
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_stateless_vm_cannot_take_force_delete(self, monkeypatch):
+        monkeypatch.delenv("DEFAULT_VM_IMAGE", raising=False)
+        mgr, provisioner, _, snapshot, db = _make_manager()
+        inst = Instance(
+            kind="vm",
+            id="vm-stateless",
+            bound_to="thread-stateless",
+            metadata={
+                "scope": "thread",
+                "execution_lane": "stateless",
+                "thread_status": "ended",
+                "vm_status": "failed",
+                "total_turns": 8,
+                "last_snapshot_turns": 3,
+            },
+        )
+        mgr.list_instances = AsyncMock(return_value=[inst])
+        mgr.reap_orphans = AsyncMock(return_value=0)
+
+        report = await InstanceLifecycleReconciler([mgr]).tick()
+
+        assert report["vm"]["listed"] == 1
+        assert report["vm"]["unhealthy"] == 0
+        self._assert_no_effects(provisioner, snapshot, db)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scope", ["thread", "job"])
+    async def test_direct_legacy_mutators_are_belted_for_both_scopes(self, scope):
+        mgr, provisioner, _, snapshot, db = _make_manager()
+        inst = Instance(
+            kind="vm",
+            id=f"vm-{scope}-stateless",
+            bound_to=f"{scope}-stateless",
+            metadata={
+                "scope": scope,
+                "execution_lane": "stateless",
+                "thread_status": "ended" if scope == "thread" else None,
+                "job_status": "completed" if scope == "job" else None,
+                "vm_status": "failed",
+                "ssh_host": "10.0.0.29",
+                "snapshot_attempts": 5,
+            },
+        )
+
+        assert await mgr.is_healthy(inst) is True
+        assert await mgr.is_idle(inst) is False
+        assert await mgr.is_reapable(inst) is False
+        await mgr.record_attempt(inst)
+        assert await mgr.snapshot(inst) is None
+        await mgr.give_up(inst, grace_s=0)
+        await mgr.drain(inst, grace_s=0)
+        await mgr.delete(inst, grace_s=0)
+
+        self._assert_no_effects(provisioner, snapshot, db)
+
+    @pytest.mark.asyncio
+    async def test_pinned_ended_dirty_thread_keeps_legacy_reap_behavior(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("DEFAULT_VM_IMAGE", raising=False)
+        thread = self._thread_row(lane="pinned", turns=8, snapshot_turns=3)
+        mgr, provisioner, _, snapshot, db = _make_manager(thread_rows=[thread])
+        self._finish_tick_wiring(provisioner, db, [], [thread])
+        mgr._tcp_probe = AsyncMock(return_value=True)
+
+        report = await InstanceLifecycleReconciler([mgr]).tick()
+
+        assert report["vm"]["reaped"] == 1
+        snapshot.capture_vm_snapshot.assert_awaited_once()
+        provisioner.delete_thread_vm.assert_awaited_once_with(
+            "thread-stateless", purge_disk=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_pinned_completed_job_keeps_legacy_reap_behavior(self, monkeypatch):
+        monkeypatch.delenv("DEFAULT_VM_IMAGE", raising=False)
+        job = self._job_row(lane="pinned")
+        mgr, provisioner, _, snapshot, db = _make_manager(job_rows=[job])
+        self._finish_tick_wiring(provisioner, db, [job], [])
+        mgr._tcp_probe = AsyncMock(return_value=True)
+
+        report = await InstanceLifecycleReconciler([mgr]).tick()
+
+        assert report["vm"]["reaped"] == 1
+        snapshot.capture_vm_snapshot.assert_awaited_once()
+        provisioner.delete_vm.assert_awaited_once_with("job-stateless", purge_disk=True)
 
 
 # =============================================================================
@@ -1288,6 +1470,18 @@ class TestKeptDiskSweep:
         mgr, provisioner, _ = self._mgr_with_kept([])
         assert await mgr.purge_kept_disks() == 0
         provisioner.delete_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exact_stateless_job_is_refused_even_if_reader_returns_it(self):
+        # The SQL excludes this row; the application check is the second belt
+        # against stale/mocked readers and future query refactors.
+        mgr, provisioner, db = self._mgr_with_kept(
+            [{"id": "job-stateless", "execution_lane": "stateless"}]
+        )
+
+        assert await mgr.purge_kept_disks() == 0
+        provisioner.delete_vm.assert_not_awaited()
+        db.merge_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_db_error_purges_nothing(self):
