@@ -724,6 +724,43 @@ class TestReindexKbIncremental:
         assert order == ["links", "stamp"]
 
     @pytest.mark.asyncio
+    async def test_link_targets_include_wikilinks_and_related_frontmatter(self):
+        # This vault is an Obsidian vault: most edges are [[wikilinks]] in the
+        # body and `related:` frontmatter, not [text](x.md). Both must reach the
+        # link table or a seeded vault indexes with no graph at all.
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        text = (
+            "---\nid: changed\ntype: learning\nstatus: active\n"
+            'related:\n  - "[[from_frontmatter]]"\n---\n'
+            "# changed\n\nSee [Md](md_link.md) and [[body_wikilink]].\n"
+        )
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=[{"path": "knowledge/changed.md", "type": "blob", "sha": "NEW"}],
+            indexed={"knowledge/changed.md": "OLD"},
+            contents={"knowledge/changed.md": text},
+        )
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+        assert result["status"] == "completed"
+        targets = store.replace_note_links.await_args[1]["targets"]
+        assert sorted(targets) == [
+            "body_wikilink",
+            "from_frontmatter",
+            "md_link",
+        ]
+
+    @pytest.mark.asyncio
     async def test_deleted_note_removed_from_index(self):
         kb = uuid.uuid4()
         wm = KbWatermark(

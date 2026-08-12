@@ -534,3 +534,100 @@ class TestNoteHelpers:
         assert is_reserved("knowledge/index.md") is True
         assert is_reserved("knowledge/log.md") is True
         assert is_reserved("knowledge/chose-jwt.md") is False
+
+
+# =============================================================================
+# Wikilink extraction — Obsidian [[target]] syntax alongside markdown links.
+#
+# The vault this indexes is an Obsidian vault: links are overwhelmingly
+# [[wikilinks]] in the body and in `related:` frontmatter, not [text](x.md).
+# Measured over the 577 live-slice docs: 1721 body wikilinks + 947 frontmatter
+# wikilinks vs 512 markdown links — the parser saw 16% of the real graph.
+# =============================================================================
+
+
+class TestWikilinkTargets:
+    """_internal_link_targets understands [[wikilinks]], not just [text](x.md)."""
+
+    def test_extracts_plain_wikilink(self):
+        from src.tools.knowledge.gardener import _internal_link_targets
+
+        assert _internal_link_targets("see [[other_note]] for detail") == [
+            "other_note"
+        ]
+
+    def test_strips_alias_after_pipe(self):
+        from src.tools.knowledge.gardener import _internal_link_targets
+
+        assert _internal_link_targets("see [[other_note|nicer label]]") == [
+            "other_note"
+        ]
+
+    def test_strips_anchor(self):
+        from src.tools.knowledge.gardener import _internal_link_targets
+
+        assert _internal_link_targets("see [[other_note#a section]]") == [
+            "other_note"
+        ]
+
+    def test_reduces_path_to_basename(self):
+        from src.tools.knowledge.gardener import _internal_link_targets
+
+        assert _internal_link_targets("see [[features/other_note]]") == [
+            "other_note"
+        ]
+
+    def test_ignores_embed_transclusion(self):
+        from src.tools.knowledge.gardener import _internal_link_targets
+
+        assert _internal_link_targets("![[some_image.png]]") == []
+
+    def test_still_extracts_markdown_links(self):
+        from src.tools.knowledge.gardener import _internal_link_targets
+
+        assert _internal_link_targets("see [label](other_note.md)") == ["other_note"]
+
+    def test_collects_both_syntaxes_in_one_body(self):
+        from src.tools.knowledge.gardener import _internal_link_targets
+
+        got = _internal_link_targets("[a](one.md) and [[two]] and [[three|x]]")
+        assert got == ["one", "two", "three"]
+
+
+class TestFrontmatterLinkTargets:
+    """`related:` frontmatter is a relationship declaration — it is part of the
+    link graph, and it is where 947 of this vault's edges live."""
+
+    def test_extracts_related_wikilinks(self):
+        from src.tools.knowledge.gardener import frontmatter_link_targets
+
+        assert frontmatter_link_targets(
+            {"related": ["[[alpha]]", "[[bravo]]"]}
+        ) == ["alpha", "bravo"]
+
+    def test_accepts_bare_slugs(self):
+        from src.tools.knowledge.gardener import frontmatter_link_targets
+
+        assert frontmatter_link_targets({"related": ["alpha"]}) == ["alpha"]
+
+    def test_strips_alias_and_anchor(self):
+        from src.tools.knowledge.gardener import frontmatter_link_targets
+
+        assert frontmatter_link_targets(
+            {"related": ["[[alpha|A]]", "[[bravo#s]]"]}
+        ) == ["alpha", "bravo"]
+
+    def test_missing_related_is_empty(self):
+        from src.tools.knowledge.gardener import frontmatter_link_targets
+
+        assert frontmatter_link_targets({"tags": ["x"]}) == []
+
+    def test_none_frontmatter_is_empty(self):
+        from src.tools.knowledge.gardener import frontmatter_link_targets
+
+        assert frontmatter_link_targets(None) == []
+
+    def test_scalar_related_is_accepted(self):
+        from src.tools.knowledge.gardener import frontmatter_link_targets
+
+        assert frontmatter_link_targets({"related": "[[alpha]]"}) == ["alpha"]
