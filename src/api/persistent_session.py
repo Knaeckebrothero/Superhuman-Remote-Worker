@@ -2000,6 +2000,25 @@ class PersistentSession:
                 except ValueError:
                     logger.debug(f"Tool not implemented: {name}")
 
+        # A name survives the bind only if it is BOTH configured and produced by
+        # its category factory. When those two disagree — e.g. the name list
+        # resolves `shell.mode` stateless while the factory built the persistent
+        # tools — the intersection can empty a whole category with nothing in the
+        # log. `tool_names` is already backend-filtered above, so a miss here is
+        # a genuine anomaly rather than the capability gate doing its job.
+        # See docs/issues/live_config_update_buries_extra_and_empties_the_shell_group.md.
+        unbound = [
+            name
+            for name in dict.fromkeys(tool_names)
+            if name not in {getattr(t, "name", None) for t in self.tools or []}
+        ]
+        if unbound:
+            logger.warning(
+                "%d configured tool(s) did not bind: %s",
+                len(unbound),
+                ", ".join(unbound),
+            )
+
         if not self.tools:
             # Floor rule (live_session_settings.md Slice B, provider research):
             # never rebind to an EMPTY toolset when history may contain tool

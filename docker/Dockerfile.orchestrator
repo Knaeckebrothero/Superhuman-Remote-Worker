@@ -86,6 +86,10 @@ COPY --chown=srw:srw src/ ./src/
 # Copy agent config directory (expert definitions, defaults, prompts, templates)
 COPY --chown=srw:srw config/ ./config/
 
+# Keep the metering package and the main entrypoint image-atomic. This import
+# catches selective/stale build contexts before an image can be published.
+RUN python -c "import services.infrastructure_metering.compute_activation"
+
 # Marker so get_project_root() finds /app (no .git in container)
 RUN touch /app/pyproject.toml && chown srw:srw /app/pyproject.toml
 

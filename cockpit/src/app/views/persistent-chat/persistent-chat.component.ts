@@ -28,6 +28,7 @@ import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
 import {KatexDirective} from '../../core/markdown/katex.directive';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
+import {uploadSummary} from '../../core/services/upload-stage';
 import {
     AssistantTurn,
     collapsedAnswer,
@@ -61,7 +62,7 @@ import {ChatPreferencesService, type ChatTextSize, type ReadingWidth} from '../.
 import {DeviceCapabilitiesService} from '../../core/services/device-capabilities.service';
 import {VoiceCapabilitiesService} from '../../core/services/voice-capabilities.service';
 import {VoiceRecordingService} from '../../core/services/voice-recording.service';
-import {FilePreview, FileType} from '../../core/models/file.model';
+import {FilePreview, FilePreviewResult, FileType, RejectedFile} from '../../core/models/file.model';
 import {RecordingConfig} from '../../core/models/recording.model';
 import {environment} from '../../core/environment';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
@@ -76,6 +77,7 @@ import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
 import {AppToolCardComponent} from '../../ui/tool-card';
+import {JobBatchCardComponent} from '../../ui/tool-card/job-batch-card.component';
 import {AppReadAloudComponent} from '../../ui/read-aloud';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppToastService} from '../../ui/toast';
@@ -102,6 +104,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
     {command: '/compact', descriptionKey: 'chat.slash.compact'},
     {command: '/done', descriptionKey: 'chat.slash.done'},
     {command: '/undo', descriptionKey: 'chat.slash.undo'},
+    {command: '/rewind', descriptionKey: 'chat.slash.rewind'},
     {command: '/auto', descriptionKey: 'chat.slash.auto'},
     {command: '/supervised', descriptionKey: 'chat.slash.supervised'},
     {command: '/autonomous', descriptionKey: 'chat.slash.autonomous'},
@@ -357,6 +360,87 @@ export function canSendMessage(canCompose: boolean, text: string, attachmentCoun
 }
 
 /**
+ * Which label a queued bubble shows for its send stage. One line, one concept:
+ * the upload and the POST are phases of the same commitment, so the label
+ * changes and the indicator does not. Win32's rule — never reset progress
+ * between phases, never reach 100% before the operation completes.
+ *
+ * `percent` picks the percentage-bearing variant. It is absent (or null)
+ * whenever the fraction is unknowable — a file uploading with no computable
+ * body length — and then the plain "Uploading 2 of 3…" line is the honest one.
+ */
+export function uploadStageKey(
+    summary: {done: number; total: number; allDone: boolean; percent?: number | null} | null,
+): string | null {
+    if (!summary || summary.total === 0) return null;
+    if (summary.allDone) return 'chat.upload.sending';
+    return summary.percent == null ? 'chat.upload.stage' : 'chat.upload.stagePercent';
+}
+
+/**
+ * The coarse twin of a stage key: what the polite live region says.
+ *
+ * The visible label updates ~4×/s once a percentage is in it, and a live
+ * region that re-reads "34%… 36%… 39%" is unusable. Stripping the percentage
+ * makes the announced string change only when a file lands or the phase flips,
+ * which is exactly the pace a screen reader wants. The percentage is still
+ * reachable on demand via the progressbar's aria-valuetext.
+ */
+export function uploadStageAnnounceKey(key: string): string {
+    return key === 'chat.upload.stagePercent' ? 'chat.upload.stage' : key;
+}
+
+/** What the queued bubble's stage line needs to render itself. */
+export interface UploadStageView {
+    /** Visible label key — may carry the percentage. */
+    key: string;
+    params: Record<string, string | number>;
+    /** Key for the polite live region: the same line minus the percentage. */
+    announceKey: string;
+    /** Whether THIS item draws the send indicator (only the outbox head does). */
+    bar: boolean;
+    /** Indicator position 0-100, or null for indeterminate. */
+    percent: number | null;
+}
+
+/**
+ * The full stage-line decision for a queued bubble, covering both queue
+ * positions the outbox actually produces — `_flushOutbox` only ever touches
+ * `outbox()[0]`, so a non-head item's own files sit untouched at `'queued'`
+ * for as long as it waits.
+ *
+ * The head reports its own progress via `uploadStageKey`, unchanged. A
+ * non-head item's own summary is deliberately never consulted: showing its
+ * files would read "Uploading 0 of n…" for work that has not started and
+ * never lies about being in flight. The honest line names what it is
+ * actually blocked on — the head's first not-yet-`done` file — matching
+ * `docs/features/session_attachment_send_flow.md`'s "Waiting for
+ * Zeugniss.pdf…" example (the Signal #3720 case: a FIFO queue silently
+ * swallowing a message typed behind a big upload). If the head has no files
+ * of its own (a plain text send ahead of it), there is nothing honest to
+ * name, so this falls back to the bubble's plain queued treatment.
+ */
+export function uploadStageFor(
+    isHead: boolean,
+    ownSummary: {done: number; total: number; allDone: boolean; percent?: number | null} | null,
+    headBlockingFileName: string | null,
+): {key: string; params: Record<string, string | number>} | null {
+    if (isHead) {
+        const key = uploadStageKey(ownSummary);
+        if (!key || !ownSummary) return null;
+        const params: Record<string, string | number> = {
+            done: ownSummary.done,
+            total: ownSummary.total,
+        };
+        // Only when a percentage is actually known — the plain key ignores the
+        // param, but shipping a stale one invites a future template to read it.
+        if (ownSummary.percent != null) params['percent'] = ownSummary.percent;
+        return {key, params};
+    }
+    return headBlockingFileName ? {key: 'chat.upload.waitingOn', params: {name: headBlockingFileName}} : null;
+}
+
+/**
  * Empty-composer morph (messenger convention): the round action button offers
  * dictation while there is nothing to send yet, and flips to send on the
  * first keystroke or queued attachment. Suppressed while a turn is in flight
@@ -426,6 +510,16 @@ export function formatPermissionArgs(args: Record<string, unknown> | null | unde
         .join(', ');
 }
 
+/** Title key for the approval card: singular reads oddly as "1 tool(s)". */
+export function permissionTitleKey(count: number): string {
+    return count === 1 ? 'chat.permission.singleTitle' : 'chat.permission.batchTitle';
+}
+
+/** Approve-button key. "Approve all" on a lone call implies hidden extras. */
+export function permissionApproveKey(count: number): string {
+    return count === 1 ? 'chat.permission.approve' : 'chat.permission.approveAll';
+}
+
 /** The workspace-upgrade card to render, or null when there's nothing to show. */
 export type WorkspaceOfferCard =
     | {state: 'provisioning'; tier: string; elapsed?: number; willContinue: boolean}
@@ -462,6 +556,78 @@ export function pickWorkspaceOfferCard(
  */
 export function composeDenyPrefill(existingText: string, starter: string): string {
     return existingText.trim().length > 0 ? existingText : starter;
+}
+
+/** True when the composer text is the /rewind command (any casing, with or
+ *  without trailing arguments — arguments are ignored, the picker decides). */
+export function isRewindCommand(text: string): boolean {
+    return text.toLowerCase().split(/\s+/)[0] === '/rewind';
+}
+
+/**
+ * User turns eligible as rewind targets, newest first — the /rewind picker's
+ * list. Same gate as the inline hover button: only historical turns (already
+ * persisted server-side) that are not still queued in the send outbox can
+ * anchor a rewind.
+ */
+export function pickRewindCandidates(turns: readonly Turn[], outboxIds: ReadonlySet<string>): UserTurn[] {
+    const users: UserTurn[] = [];
+    for (const turn of turns) {
+        if (turn.kind === 'user' && turn.historical && !outboxIds.has(turn.id)) {
+            users.push(turn);
+        }
+    }
+    return users.reverse();
+}
+
+/** Show the picker's filter input only when the list is long enough that
+ *  scanning beats scrolling; short sessions keep the plain hint line. */
+export const REWIND_FILTER_MIN_CANDIDATES = 6;
+
+/** Case-insensitive substring filter over picker candidates. An empty or
+ *  whitespace query keeps everything. */
+export function filterRewindCandidates(candidates: readonly UserTurn[], query: string): UserTurn[] {
+    const q = query.trim().toLowerCase();
+    if (!q) return [...candidates];
+    return candidates.filter((t) => t.content.toLowerCase().includes(q));
+}
+
+/**
+ * Date-aware timestamp for the rewind surfaces. Sessions span days, so a bare
+ * clock time ("19:08") is ambiguous there: today stays time-only, yesterday is
+ * labeled (caller passes the localized word), older dates get a short
+ * localized date — with the year only once it differs.
+ */
+export function formatRewindStamp(ts: number, now: number, locale: string, yesterdayLabel: string): string {
+    const d = new Date(ts);
+    const n = new Date(now);
+    const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    const sameDay = (a: Date, b: Date) =>
+        a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+    if (sameDay(d, n)) return hm;
+    const yesterday = new Date(n);
+    yesterday.setDate(n.getDate() - 1);
+    if (sameDay(d, yesterday)) return `${yesterdayLabel} ${hm}`;
+    const opts: Intl.DateTimeFormatOptions = {month: 'short', day: 'numeric'};
+    if (d.getFullYear() !== n.getFullYear()) opts.year = 'numeric';
+    return `${new Intl.DateTimeFormat(locale || undefined, opts).format(d)}, ${hm}`;
+}
+
+/**
+ * How many visible messages (user + assistant turns; system lines and
+ * compaction markers don't read as "messages") come after the target — what a
+ * conversation rewind hides besides returning the target prompt itself to the
+ * composer. -1 when the target isn't in the loaded window.
+ */
+export function countTurnsAfter(turns: readonly Turn[], targetId: string): number {
+    const at = turns.findIndex((t) => t.id === targetId);
+    if (at === -1) return -1;
+    let count = 0;
+    for (let i = at + 1; i < turns.length; i++) {
+        const kind = turns[i].kind;
+        if (kind === 'user' || kind === 'assistant') count++;
+    }
+    return count;
 }
 
 /**
@@ -509,6 +675,25 @@ export function extractClipboardFiles(
         }
     }
     return files;
+}
+
+/**
+ * Turn a createFilePreviews() rejection list into a single translation key +
+ * params for the composer's `chat.attachmentError` banner. Only one message
+ * can show at a time, so when a selection trips both reasons at once the
+ * size rejection wins: a file that silently exceeded the byte cap is more
+ * surprising than one dropped for the (generous, 20-file) composer count
+ * cap, and the count message doesn't need a filename anyway. Pure so it's
+ * unit-testable without mounting PersistentChatComponent (NG0951).
+ */
+export function describeAttachmentRejection(
+    rejected: readonly RejectedFile[],
+): {key: string; params?: Record<string, unknown>} | null {
+    if (rejected.length === 0) return null;
+    const oversized = rejected.find((r) => r.reason === 'size');
+    return oversized
+        ? {key: 'chat.upload.tooLarge', params: {name: oversized.name}}
+        : {key: 'chat.upload.tooManyFiles'};
 }
 
 /**
@@ -683,6 +868,7 @@ export function clearDraft(threadId: string | null): void {
         AppIconComponent,
         AppDialogComponent,
         AppToolCardComponent,
+        JobBatchCardComponent,
         AppReadAloudComponent,
         AppInlineEditableTextComponent,
         CitationsPanelComponent,
@@ -1122,7 +1308,8 @@ export function clearDraft(threadId: string | null): void {
               <div class="message message-user"
                    [class.historical]="turn.historical"
                    [class.queued]="queued"
-                   [class.stalled]="stalled">
+                   [class.stalled]="stalled"
+                   [attr.aria-busy]="queued ? 'true' : null">
                 <div class="avatar">
                   @if (stalled) {
                     <!-- Not "waiting to send" — the send actually failed. -->
@@ -1152,8 +1339,8 @@ export function clearDraft(threadId: string | null): void {
                   }
                   @if (turn.attachments?.length) {
                     <div class="user-attachments">
-                      @for (att of turn.attachments; track att.path) {
-                        <span class="user-attachment-chip" [title]="att.path">
+                      @for (att of turn.attachments; track att.id) {
+                        <span class="user-attachment-chip" [title]="att.path ?? att.name">
                           <app-icon size="sm">{{
                             att.mimeType.startsWith('image/') ? 'image' :
                             att.mimeType.startsWith('video/') ? 'videocam' :
@@ -1164,6 +1351,43 @@ export function clearDraft(threadId: string | null): void {
                         </span>
                       }
                     </div>
+                  }
+                  @if (queued && !stalled) {
+                    @let stage = uploadStage(turn.id);
+                    @if (stage) {
+                      <div class="upload-stage">
+                        <div class="upload-stage-line">
+                          <app-icon size="sm">upload</app-icon>
+                          <!-- Visible label carries the percentage; it changes
+                               ~4×/s, so it is hidden from the a11y tree and the
+                               polite region beside it announces the coarse
+                               phase only (see uploadStageAnnounceKey). -->
+                          <span aria-hidden="true">{{ stage.key | transloco: stage.params }}</span>
+                          <span class="upload-stage-announce"
+                                aria-live="polite">{{ stage.announceKey | transloco: stage.params }}</span>
+                        </div>
+                        @if (stage.bar) {
+                          <!-- ONE indicator spanning the upload AND the POST:
+                               it never resets between the two and never reaches
+                               100%, because the accepted send removes this
+                               bubble instead of filling the bar. No
+                               aria-valuenow => indeterminate; aria-valuetext
+                               carries the phase, since a bare "90%" while
+                               "Sending…" would mislead. progressbar is not a
+                               live region and announces nothing on its own. -->
+                          <div class="upload-bar"
+                               [class.indeterminate]="stage.percent === null"
+                               role="progressbar"
+                               [attr.aria-label]="'chat.upload.progressLabel' | transloco"
+                               aria-valuemin="0"
+                               aria-valuemax="100"
+                               [attr.aria-valuenow]="stage.percent"
+                               [attr.aria-valuetext]="stage.key | transloco: stage.params">
+                            <div class="upload-bar-fill" [style.width.%]="stage.percent"></div>
+                          </div>
+                        }
+                      </div>
+                    }
                   }
                   <!-- Stalled queue: the flush has no timed auto-retry, so
                        without these the bubble spins on "sending" forever. -->
@@ -1300,6 +1524,15 @@ export function clearDraft(threadId: string | null): void {
                             }
                           }
                         }
+                      } @else if (group.kind === 'job_batch') {
+                        <!-- A fan-out: one card, a row per job. Job calls never
+                             fold (they carry live status and review actions), so
+                             without this a three-job dispatch rendered a "2×
+                             tool calls" chip plus one card. -->
+                        <div class="event-tool">
+                          <app-job-batch-card [views]="jobBatchViews(group)"
+                                              (diffRequested)="openJobDiff($event)" />
+                        </div>
                       } @else {
                         @switch (group.event.kind) {
                           @case ('tool_call') {
@@ -1488,7 +1721,7 @@ export function clearDraft(threadId: string | null): void {
           <div class="mile mile-permission">
             <div class="mile-label">{{ 'chat.permission.title' | transloco }}</div>
             <div class="mile-title">
-              {{ 'chat.permission.batchTitle' | transloco: {count: chat.pendingPermissions().length} }}
+              {{ permissionTitleKey(chat.pendingPermissions().length) | transloco: {count: chat.pendingPermissions().length} }}
             </div>
             <ul class="permission-list">
               @for (perm of chat.pendingPermissions(); track perm.id) {
@@ -1500,7 +1733,7 @@ export function clearDraft(threadId: string | null): void {
               }
             </ul>
             <div class="mile-actions">
-              <app-button variant="success" size="sm" (clicked)="chat.approveAll()">{{ 'chat.permission.approveAll' | transloco }}</app-button>
+              <app-button variant="success" size="sm" (clicked)="chat.approveAll()">{{ permissionApproveKey(chat.pendingPermissions().length) | transloco }}</app-button>
               <app-button variant="info" size="sm" (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
               <app-button variant="danger" size="sm" (clicked)="chat.stop()">{{ 'chat.permission.stop' | transloco }}</app-button>
             </div>
@@ -1872,7 +2105,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected() || chat.isUploadingAttachments()"
+                [disabled]="!chat.isConnected()"
                 [title]="'chat.composer.attach' | transloco"
                 [class.active]="attachmentMenuOpen()"
                 (click)="attachmentMenuOpen() ? closeAttachmentMenu() : openAttachmentMenu()"
@@ -1902,7 +2135,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected() || chat.isUploadingAttachments()"
+                [disabled]="!chat.isConnected()"
                 [title]="'chat.composer.takePhoto' | transloco"
                 (click)="pickCamera()"
               >
@@ -1985,35 +2218,104 @@ export function clearDraft(threadId: string | null): void {
         }
       </app-dialog>
 
+      <!-- /rewind target picker -->
+      <app-dialog
+        [open]="rewindPickerOpen()"
+        (closed)="closeRewindPicker()"
+        [title]="'chat.rewind.pickerTitle' | transloco"
+        size="md">
+        @if (rewindCandidates().length === 0) {
+          <p class="rewind-picker-empty">{{ 'chat.rewind.pickerEmpty' | transloco }}</p>
+        } @else {
+          <div class="rewind-picker" (keydown)="onRewindPickerKeydown($event)">
+            @if (rewindCandidates().length >= rewindFilterMin) {
+              <input
+                class="rewind-picker-filter"
+                type="text"
+                [placeholder]="'chat.rewind.pickerFilter' | transloco"
+                [attr.aria-label]="'chat.rewind.pickerFilter' | transloco"
+                (input)="rewindPickerQuery.set($any($event.target).value)" />
+            } @else {
+              <p class="rewind-picker-hint">{{ 'chat.rewind.pickerHint' | transloco }}</p>
+            }
+            @if (filteredRewindCandidates().length === 0) {
+              <p class="rewind-picker-empty">{{ 'chat.rewind.pickerNoMatches' | transloco }}</p>
+            } @else {
+              <div class="rewind-picker-list">
+                @for (turn of filteredRewindCandidates(); track turn.id) {
+                  <button type="button" class="rewind-picker-item"
+                          [title]="turn.content"
+                          (click)="pickRewindTarget(turn)">
+                    <span class="rewind-picker-time">{{ rewindStamp(turn.timestamp) }}</span>
+                    <span class="rewind-picker-text">{{ turn.content }}</span>
+                  </button>
+                }
+              </div>
+            }
+          </div>
+        }
+        <ng-container appDialogActions>
+          <app-button variant="ghost" size="sm" (clicked)="closeRewindPicker()">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+        </ng-container>
+      </app-dialog>
+
       <!-- Rewind action dialog -->
       <app-dialog
         [open]="rewindTarget() !== null"
         (closed)="closeRewindSheet()"
         [title]="'chat.rewind.title' | transloco"
-        size="sm">
+        size="md">
         <p class="rewind-quote">"{{ rewindQuote() }}"</p>
-        <p>{{ 'chat.rewind.body' | transloco }}</p>
+        <p class="rewind-target-meta">
+          {{ rewindTargetStamp() }}
+          @if (rewindHiddenCount() > 0) {
+            <span> · {{ (rewindHiddenCount() === 1 ? 'chat.rewind.hidesOne' : 'chat.rewind.hidesMany') | transloco: {count: rewindHiddenCount()} }}</span>
+          }
+        </p>
+        <div class="rewind-options">
+          <button type="button" class="rewind-option"
+                  [disabled]="chat.rewindInFlight()"
+                  (click)="confirmRewind('both')">
+            <app-icon size="sm" class="rewind-option-icon">history</app-icon>
+            <span class="rewind-option-text">
+              <span class="rewind-option-title">{{ 'chat.rewind.both' | transloco }}</span>
+              <span class="rewind-option-desc">{{ 'chat.rewind.bothDesc' | transloco }}</span>
+            </span>
+          </button>
+          <button type="button" class="rewind-option"
+                  [disabled]="chat.rewindInFlight()"
+                  (click)="confirmRewind('conversation')">
+            <app-icon size="sm" class="rewind-option-icon">chat_bubble</app-icon>
+            <span class="rewind-option-text">
+              <span class="rewind-option-title">{{ 'chat.rewind.conversation' | transloco }}</span>
+              <span class="rewind-option-desc">{{ 'chat.rewind.conversationDesc' | transloco }}</span>
+            </span>
+          </button>
+          <button type="button" class="rewind-option"
+                  [disabled]="chat.rewindInFlight()"
+                  (click)="confirmRewind('code')">
+            <app-icon size="sm" class="rewind-option-icon">folder</app-icon>
+            <span class="rewind-option-text">
+              <span class="rewind-option-title">{{ 'chat.rewind.code' | transloco }}</span>
+              <span class="rewind-option-desc">{{ 'chat.rewind.codeDesc' | transloco }}</span>
+            </span>
+          </button>
+        </div>
+        <div class="rewind-options rewind-options-secondary">
+          <button type="button" class="rewind-option"
+                  (click)="confirmSummarizeUpTo()">
+            <app-icon size="sm" class="rewind-option-icon">compress</app-icon>
+            <span class="rewind-option-text">
+              <span class="rewind-option-title">{{ 'chat.rewind.summarize' | transloco }}</span>
+              <span class="rewind-option-desc">{{ 'chat.rewind.summarizeDesc' | transloco }}</span>
+            </span>
+          </button>
+        </div>
+        <p class="rewind-caveat">{{ 'chat.rewind.refillHint' | transloco }}</p>
         <p class="rewind-caveat">{{ 'chat.rewind.caveat' | transloco }}</p>
         <ng-container appDialogActions>
-          <app-button variant="warning" size="sm"
-                      [disabled]="chat.rewindInFlight()"
-                      (clicked)="confirmRewind('both')">
-            {{ 'chat.rewind.both' | transloco }}
-          </app-button>
-          <app-button variant="warning" size="sm"
-                      [disabled]="chat.rewindInFlight()"
-                      (clicked)="confirmRewind('conversation')">
-            {{ 'chat.rewind.conversation' | transloco }}
-          </app-button>
-          <app-button variant="info" size="sm"
-                      [disabled]="chat.rewindInFlight()"
-                      (clicked)="confirmRewind('code')">
-            {{ 'chat.rewind.code' | transloco }}
-          </app-button>
-          <app-button variant="info" size="sm"
-                      (clicked)="confirmSummarizeUpTo()">
-            {{ 'chat.rewind.summarize' | transloco }}
-          </app-button>
           <app-button variant="ghost" size="sm" (clicked)="closeRewindSheet()">
             {{ 'common.cancel' | transloco }}
           </app-button>
@@ -2707,20 +3009,16 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.chat.isStreaming() || this.chat.isAwaitingTurn()) {
             return this.transloco.translate('chat.input.working');
         }
-        if (this.chat.isUploadingAttachments()) return this.transloco.translate('chat.input.uploading');
         // Mobile keyboards send newline on Enter, so the desktop key hints are wrong there.
         return this.transloco.translate(
             this.viewport.isMobile() ? 'chat.input.defaultMobile' : 'chat.input.default',
         );
     });
 
-    /** True while sends are queued (waiting for readiness / flushing) or files
-     *  are uploading — drives the send-button spinner. */
-    readonly isPendingSend = computed(
-        () =>
-            this.chat.outbox().length > 0 ||
-            this.chat.isUploadingAttachments(),
-    );
+    /** True while sends are queued — waiting for readiness, flushing, or mid
+     *  upload (an item stays in the outbox until every attachment resolves and
+     *  the POST is accepted) — drives the send-button spinner. */
+    readonly isPendingSend = computed(() => this.chat.outbox().length > 0);
 
     // Note: queueing is now supported, so canSend no longer blocks on a pending
     // send — the user can line up a second message while the first is in flight.
@@ -2834,6 +3132,14 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
         const threadId = this.chat.threadId();
         this.showSlashMenu.set(false);
+        // /rewind is pure UI — open the target picker instead of handing the
+        // text to the service, which would send it to the agent as chat.
+        if (isRewindCommand(text)) {
+            this.inputText = '';
+            clearDraft(threadId);
+            this.openRewindPicker();
+            return;
+        }
         // Mobile: dismiss the on-screen keyboard now the message is on its way,
         // so the reply renders into the reclaimed height. The keyboard collapse
         // grows .messages, which the ResizeObserver catches and re-pins
@@ -2895,12 +3201,29 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
     }
 
+    /**
+     * Queue accepted previews and surface a rejection (if any) in the
+     * composer's error banner. Centralizes what all four attach entry points
+     * (file picker, paste, camera, drop) do with a createFilePreviews()
+     * result, including an ordering that matters: addAttachments() always
+     * clears attachmentError (see persistent-chat.service.ts), so the
+     * rejection must be set AFTER queuing previews, not before, or a
+     * selection that both accepts some files and rejects others would have
+     * its error wiped the instant it's set.
+     */
+    private applyFilePreviews({previews, rejected}: FilePreviewResult): void {
+        this.chat.addAttachments(previews);
+        const rejection = describeAttachmentRejection(rejected);
+        if (rejection) {
+            this.chat.attachmentError.set(this.transloco.translate(rejection.key, rejection.params));
+        }
+    }
+
     /** Handler for both `<input type=file>` (file picker and mobile camera). */
     async onFilesSelected(event: Event): Promise<void> {
         const input = event.target as HTMLInputElement;
         if (!input.files || input.files.length === 0) return;
-        const previews = await this.fileHandling.createFilePreviews(Array.from(input.files));
-        this.chat.addAttachments(previews);
+        this.applyFilePreviews(await this.fileHandling.createFilePreviews(Array.from(input.files)));
         // Allow re-selecting the same file later.
         input.value = '';
     }
@@ -2916,8 +3239,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         const files = extractClipboardFiles(event.clipboardData?.items, Date.now());
         if (files.length === 0) return; // text paste — let the default run
         event.preventDefault();
-        const previews = await this.fileHandling.createFilePreviews(files);
-        if (previews.length > 0) this.chat.addAttachments(previews);
+        this.applyFilePreviews(await this.fileHandling.createFilePreviews(files));
     }
 
     /** Drop one queued attachment. */
@@ -3081,8 +3403,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
                             type: 'image/jpeg',
                             lastModified: Date.now(),
                         });
-                        const previews = await this.fileHandling.createFilePreviews([file]);
-                        this.chat.addAttachments(previews);
+                        this.applyFilePreviews(await this.fileHandling.createFilePreviews([file]));
                     }
                     cleanup();
                 },
@@ -3146,8 +3467,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // disconnected, the upload would fail anyway.
         if (!this.chat.isConnected()) return;
 
-        const previews = await this.fileHandling.createFilePreviews(Array.from(files));
-        if (previews.length > 0) this.chat.addAttachments(previews);
+        this.applyFilePreviews(await this.fileHandling.createFilePreviews(Array.from(files)));
     }
 
     onInputChange(value: string): void {
@@ -3276,6 +3596,87 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     closeRewindSheet(): void {
         this.rewindTarget.set(null);
+    }
+
+    /** /rewind target picker (newest prompt first). Same eligibility gate as
+     *  the inline hover button: only historical turns that aren't still in
+     *  the send outbox can anchor a rewind. */
+    readonly rewindPickerOpen = signal(false);
+    readonly rewindPickerQuery = signal('');
+    readonly rewindFilterMin = REWIND_FILTER_MIN_CANDIDATES;
+
+    readonly rewindCandidates = computed<UserTurn[]>(() =>
+        pickRewindCandidates(this.chat.visibleTurns(), this.chat.outboxIds()));
+
+    readonly filteredRewindCandidates = computed<UserTurn[]>(() =>
+        filterRewindCandidates(this.rewindCandidates(), this.rewindPickerQuery()));
+
+    openRewindPicker(): void {
+        this.rewindPickerQuery.set('');
+        this.rewindPickerOpen.set(true);
+        // The dialog's focus trap auto-captures onto its close button; move
+        // initial focus where the interaction starts — the filter when it's
+        // shown, the newest prompt otherwise. Delayed so it runs after the
+        // trap's own deferred capture.
+        setTimeout(() => {
+            document
+                .querySelector<HTMLElement>('.rewind-picker-filter, .rewind-picker-item')
+                ?.focus();
+        }, 50);
+    }
+
+    closeRewindPicker(): void {
+        this.rewindPickerOpen.set(false);
+    }
+
+    pickRewindTarget(turn: UserTurn): void {
+        this.rewindPickerOpen.set(false);
+        this.openRewindSheet(turn);
+    }
+
+    /** Arrow-key navigation across picker rows; ArrowDown from the filter
+     *  input drops into the list. Enter activates the focused row natively. */
+    onRewindPickerKeydown(event: KeyboardEvent): void {
+        const key = event.key;
+        if (key !== 'ArrowDown' && key !== 'ArrowUp' && key !== 'Home' && key !== 'End') return;
+        const items = Array.from(document.querySelectorAll<HTMLElement>('.rewind-picker-item'));
+        if (items.length === 0) return;
+        const active = document.activeElement as HTMLElement | null;
+        // Leave Home/End alone inside the filter input — they mean caret jumps there.
+        const inFilter = active?.classList.contains('rewind-picker-filter') ?? false;
+        if (inFilter && (key === 'Home' || key === 'End')) return;
+        event.preventDefault();
+        const idx = active ? items.indexOf(active) : -1;
+        let next: number;
+        if (key === 'Home') next = 0;
+        else if (key === 'End') next = items.length - 1;
+        else if (idx === -1) next = key === 'ArrowDown' ? 0 : items.length - 1;
+        else next = Math.min(items.length - 1, Math.max(0, idx + (key === 'ArrowDown' ? 1 : -1)));
+        items[next]?.focus();
+        items[next]?.scrollIntoView({block: 'nearest'});
+    }
+
+    rewindStamp(ts: number): string {
+        return formatRewindStamp(
+            ts,
+            Date.now(),
+            this.transloco.getActiveLang(),
+            this.transloco.translate('chat.rewind.yesterday'),
+        );
+    }
+
+    /** Meta line under the action-sheet quote: when the target was sent, and
+     *  how many later messages a conversation rewind hides (omitted at 0 —
+     *  "hides 0 messages" reads worse than saying nothing). */
+    rewindTargetStamp(): string {
+        const target = this.rewindTarget();
+        return target ? this.rewindStamp(target.timestamp) : '';
+    }
+
+    rewindHiddenCount(): number {
+        const target = this.rewindTarget();
+        if (!target) return 0;
+        return Math.max(0, countTurnsAfter(this.chat.visibleTurns(), target.id));
     }
 
     confirmRewind(mode: 'both' | 'conversation' | 'code'): void {
@@ -3633,6 +4034,25 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     /**
+     * Views for a job fan-out, memoized per group object.
+     *
+     * Memoized for the same reason as {@link toolView}: `<app-job-batch-card>`
+     * is OnPush with an array input, so building a fresh array each change
+     * detection would defeat it. The key is safe because `groupedEvents()` is
+     * itself memoized per turn — a group object is stable until the turn changes,
+     * and a changed turn produces new groups.
+     */
+    private readonly jobBatchViewsCache = new WeakMap<object, ToolCardView[]>();
+
+    jobBatchViews(group: EventGroup & {kind: 'job_batch'}): ToolCardView[] {
+        const cached = this.jobBatchViewsCache.get(group);
+        if (cached) return cached;
+        const views = group.events.map((e) => this.toolView(e));
+        this.jobBatchViewsCache.set(group, views);
+        return views;
+    }
+
+    /**
      * Whether a folded run renders as a chip. The "Tool calls → Expanded"
      * preference is the escape hatch: with it on, nothing folds and every event
      * renders inline, exactly as before.
@@ -3755,6 +4175,35 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     /**
+     * The queued bubble's upload stage line: which i18n key to show and its
+     * interpolation params, or null once there's nothing left to report.
+     * Thin glue over `uploadStageFor` — gathers whether `localId` is the
+     * outbox head, its own upload summary (used only when it is the head),
+     * and the head's first not-yet-done file (used only when it isn't), then
+     * lets the pure function decide. See `uploadStageFor` for why a non-head
+     * item's own files are never shown.
+     */
+    uploadStage(localId: string): UploadStageView | null {
+        const head = this.chat.outbox()[0];
+        const isHead = head?.localId === localId;
+        const ownFiles = this.chat.outboxItem(localId)?.pendingFiles;
+        const ownSummary = ownFiles ? uploadSummary(ownFiles) : null;
+        const headBlockingFileName = head?.pendingFiles?.find((f) => f.status !== 'done')?.name ?? null;
+        const line = uploadStageFor(isHead, ownSummary, headBlockingFileName);
+        if (!line) return null;
+        return {
+            ...line,
+            announceKey: uploadStageAnnounceKey(line.key),
+            // ONE indicator per message, and only on the item whose bytes are
+            // actually moving: a queued non-head item is waiting on the head's
+            // upload, so giving it a bar of its own would draw two bars for one
+            // set of bytes.
+            bar: isHead && !!ownSummary && ownSummary.total > 0,
+            percent: isHead ? (ownSummary?.percent ?? null) : null,
+        };
+    }
+
+    /**
      * True when the current turn is historical and the next turn isn't —
      * the boundary between session reload and live activity.
      */
@@ -3784,6 +4233,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /** Full argument content so the user can see WHAT each call does before
      *  approving the batch — see formatPermissionArgs (must never truncate:
      *  that's the whole safety model for a destructive call in the batch). */
+    /** Template bridges to the pure key-pickers (see their definitions). */
+    permissionTitleKey = permissionTitleKey;
+    permissionApproveKey = permissionApproveKey;
+
     permissionArgs(perm: PermissionRequest): string {
         return formatPermissionArgs(perm.args);
     }
@@ -3925,15 +4378,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     hasCompletedTools(calls: ToolCallInfo[]): boolean {
-        return calls.some(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error');
+        return calls.some(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error' || tc.status === 'expired');
     }
 
     completedOnly(calls: ToolCallInfo[]): ToolCallInfo[] {
-        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error');
+        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error' || tc.status === 'expired');
     }
 
     completedToolCount(calls: ToolCallInfo[]): number {
-        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error').length;
+        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error' || tc.status === 'expired').length;
     }
 
     currentToolLabel(calls: ToolCallInfo[]): string {

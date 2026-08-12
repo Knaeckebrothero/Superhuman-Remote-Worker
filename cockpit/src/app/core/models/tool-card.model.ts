@@ -11,7 +11,7 @@ import {DiffLine} from '../util/line-diff';
  * `core/tools/tool-descriptors.ts`. Design: `docs/features/unified_tool_cards.md`.
  */
 
-export type ToolCardStatus = 'pending' | 'running' | 'ok' | 'error' | 'denied';
+export type ToolCardStatus = 'pending' | 'running' | 'ok' | 'error' | 'denied' | 'expired';
 
 /** How a result/param body should be presented. */
 export type ToolResultKind =
@@ -109,6 +109,19 @@ export interface CanvasPresentationSummary {
  * text).
  */
 export const NOTIFY_USER_TOOL = 'notify_user';
+
+/**
+ * The fleet tool whose calls are a durable, *actionable* handle rather than a
+ * record of finished work. Shared by the card descriptor, the id parser and the
+ * turn fold logic.
+ *
+ * Never folded into a "N× tool calls" chip, for the same reason as
+ * {@link NOTIFY_USER_TOOL} but a stronger one: the card carries live status and
+ * the Approve / Continue-with-feedback / Cancel buttons, so hiding it behind a
+ * counter hides work that is *waiting on the user*. Contiguous calls group into
+ * a `job_batch` instead — see `groupEvents` in `core/models/turn.model.ts`.
+ */
+export const JOB_TOOL = 'create_worker_job';
 
 export type NotifyUrgency = 'log' | 'digest' | 'page';
 

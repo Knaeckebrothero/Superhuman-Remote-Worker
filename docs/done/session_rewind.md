@@ -41,6 +41,10 @@ point, and re-drive from there with a different prompt. The model is Claude Code
 > Code comments (incl. migration 0110's DB column comment, which is applied and
 > immutable) reference this doc's old `docs/features/` path — intentional,
 > not drift to "fix".
+> **2026-08-08:** pushed + deployed to dev (chart `sha-fc10d83`, helm v535),
+> verified live by owner. UI fast-follow shipped same day: `/rewind` slash
+> command with target picker + action-sheet redesign — see
+> [UX fast-follow](#ux-fast-follow-2026-08-08--rewind-command--dialog-redesign).
 > Implementation complete across all tasks (Tasks 1–9 merged develop; Task 10 docs
 > + live-gate checklist below). The design call happened 2026-08-07; the result is
 > the [Decided design](#decided-design-2026-08-07) section below. The concept capture,
@@ -216,6 +220,47 @@ state after turn N. Commands with external effects can't be undone."* On
 success: turns collapse via the epoch repaint, the composer prefills with the
 original prompt, focus lands there. Non-owner viewers see no affordance and just
 repaint. Rewind during streaming is allowed — the server interrupts first.
+
+### UX fast-follow (2026-08-08) — `/rewind` command + dialog redesign
+
+Owner-requested after first live use ("the current version needs to be
+improved visually"). Commits: `18bdb8fa` (command + picker + redesign),
+`9e32aa75` (usability pass below).
+
+- **`/rewind` composer command** — added to the slash menu. Opens a target
+  picker (user prompts newest first, time + first line, scrollable) instead of
+  sending anything; picking a row opens the action sheet for that message.
+  Same eligibility gate as the hover affordance (`historical && !outbox`), and
+  it fixes discoverability on touch devices where hover doesn't exist. The
+  picker lists the loaded transcript window — very old prompts need a scroll-up
+  first (accepted v1 limit).
+- **Action sheet redesign** — the five mismatched footer buttons
+  (warning/warning/info/info/ghost) became an option list in the dialog body:
+  icon + title + one-line description per row, restore group visually separated
+  from *Summarize up to here*, caveat as small print, only *Cancel* left in the
+  footer. The old `chat.rewind.body` paragraph was folded into the per-option
+  descriptions (i18n key removed; `*Desc` + `picker*` keys added, en + de-DE).
+- Pure helpers `isRewindCommand` / `pickRewindCandidates` exported from
+  `persistent-chat.component.ts` for vitest (7 new cases; template wiring
+  verified via Playwright on k3d, both themes, per the codebase's split).
+- Plumbing unchanged: rows call the same `confirmRewind(mode)` /
+  `confirmSummarizeUpTo()` as before.
+
+**Usability pass (same day, owner: "the /rewind menu is very small"):** both
+rewind dialogs went `sm`(320px)→`md`(480px). Picker: two-line message preview
+(`-webkit-line-clamp`, full text via `title`), date-aware stamps
+(`formatRewindStamp`: time-only today, localized "Yesterday HH:MM", short date
+beyond — year only when it differs), type-to-filter input shown at
+≥`REWIND_FILTER_MIN_CANDIDATES` (6) prompts (`filterRewindCandidates`,
+substring, case-insensitive), initial focus lands in filter/first row past the
+dialog's close-button auto-capture (50ms defer), Arrow/Home/End roving
+(`onRewindPickerKeydown`; ArrowDown from the filter drops into the list), list
+grows to `min(55vh, 460px)`. Action sheet: meta line under the quote —
+target's stamp `· hides N later messages` (`countTurnsAfter`: user+assistant
+turns after target in the loaded window; clause omitted at 0) — plus a
+composer-refill hint line before the caveat. 12 more vitest cases on the new
+pure helpers; verified live on k3d both themes incl. a 7-prompt seeded fixture
+thread (`bbbbbbbb-1111-…`, local DB only) exercising filter + stamp variants.
 
 ### Failure containment
 

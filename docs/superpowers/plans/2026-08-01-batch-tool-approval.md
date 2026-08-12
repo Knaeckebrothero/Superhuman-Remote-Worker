@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **STATUS: COMPLETE (2026-08-09).** All 7 tasks executed and reviewed; 4 whole-branch-review defects fixed afterwards and live-gated. Residuals: `docs/issues/batch_tool_approval_residuals.md`. Kept as the execution record — do not re-run.
+
 **Goal:** Show every tool call in a parallel batch in one approval card, decided with one click, instead of one card at a time gated behind each tool finishing.
 
 **Architecture:** Pre-announce the whole batch — insert all pending permission rows and broadcast one frame — *before* the tool loop starts executing. The existing per-call gate loop is left untouched; it drains instantly because `_loop_permission_check` already short-circuits on a decided row. Approved tools still execute sequentially.
@@ -10,7 +12,7 @@
 
 ## Global Constraints
 
-- Spec: `docs/superpowers/specs/2026-08-01-batch-tool-approval-design.md`. Predecessor (shipped, live-gated): `docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md`.
+- Spec: `docs/superpowers/specs/2026-08-01-batch-tool-approval-design.md`. Predecessor (shipped, live-gated): `docs/done/supervised_parallel_gates_timeout_fabricates_denial.md`.
 - Work on `develop`. Commit per task. **Never push without asking.**
 - Execution stays **sequential** — do not parallelise tool execution.
 - `Approve all` covers every call in the batch, including shell/write calls. No per-tool risk classification.
@@ -18,7 +20,7 @@
 - Batch event name: `permission.request_batch`, payload `{"requests": [{id, approval_id, tool, args}, ...]}`.
 - `thread_permission_requests` has **no** unique constraint on `(thread_id, tool_call_id)` — duplicate inserts are silently possible.
 - Local pytest is noisy on Python 3.14; CI (3.12) is the real gate. `test_database_phase1` (needs local Postgres) and `test_endpoint_inventory` (unrelated in-flight work) fail locally already — ignore those two.
-- Run `python -m ruff check src/` before each commit; `npx tsc --noEmit -p tsconfig.json` from `cockpit/` for frontend tasks.
+- Run `python -m ruff check src/` before each commit; `npx tsc --noEmit -p tsconfig.app.json` from `cockpit/` for frontend tasks. **Not** `-p tsconfig.json` — that root config is `files: []` + project references and type-checks NOTHING (exits 0 regardless). See `docs/issues/cockpit_verification_gaps_typecheck_noop_and_unmountable_component.md`.
 
 ---
 

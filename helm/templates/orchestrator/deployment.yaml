@@ -468,6 +468,13 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_REATTACH_FRESH_FALLBACK
+            # Reclaim-on-idle (Task 7): the orchestrator runs
+            # suspend_thread_workspace, so it must see this flag too.
+            - name: WORKSPACE_RECLAIM_ON_IDLE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_RECLAIM_ON_IDLE
             # Gitea
             - name: GITEA_URL
               valueFrom:

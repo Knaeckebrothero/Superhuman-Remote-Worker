@@ -5033,6 +5033,25 @@ COMMENT ON COLUMN public.datasource_project_reconcile_queue.claim_token IS 'Neve
 
 
 --
+-- Name: datasource_tombstones; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.datasource_tombstones (
+    id uuid NOT NULL,
+    name text NOT NULL,
+    deleted_at timestamp with time zone DEFAULT now() NOT NULL,
+    deleted_by uuid
+);
+
+
+--
+-- Name: TABLE datasource_tombstones; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.datasource_tombstones IS 'Names of deleted connectors, kept so drifted session config can label a dangling datasource_id instead of showing a bare uuid.';
+
+
+--
 -- Name: datasources; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -8602,6 +8621,14 @@ ALTER TABLE ONLY public.contacts
 
 ALTER TABLE ONLY public.datasource_project_reconcile_queue
     ADD CONSTRAINT datasource_project_reconcile_queue_pkey PRIMARY KEY (project_id, datasource_id);
+
+
+--
+-- Name: datasource_tombstones datasource_tombstones_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.datasource_tombstones
+    ADD CONSTRAINT datasource_tombstones_pkey PRIMARY KEY (id);
 
 
 --

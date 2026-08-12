@@ -28,11 +28,13 @@ const tool = (id: string, status: ToolCallStatus = 'completed', category?: strin
     ({kind: 'tool_call', id, tool: 'read_file', args: {}, status, startedAt: 0, category});
 const notify = (id: string): ToolCallEvent =>
     ({kind: 'tool_call', id, tool: 'notify_user', args: {message: 'm', urgency: 'log'}, status: 'completed', startedAt: 0});
+const job = (id: string, status: ToolCallStatus = 'completed'): ToolCallEvent =>
+    ({kind: 'tool_call', id, tool: 'create_worker_job', args: {description: 'd'}, status, startedAt: 0});
 const comp = (id: string): CompactionEvent => ({kind: 'compaction', id, summary: 'compacted', startedAt: 0});
 
-/** Ids in a group, folded or single — keeps the grouping assertions readable. */
+/** Ids in a group, folded / batched / single — keeps the assertions readable. */
 const idsOf = (g: EventGroup): string[] =>
-    g.kind === 'folded' ? g.events.map(e => e.id) : [g.event.id];
+    g.kind === 'single' ? [g.event.id] : g.events.map(e => e.id);
 const shapeOf = (gs: EventGroup[]) => gs.map(g => `${g.kind}(${idsOf(g).join(',')})`);
 
 describe('firstTextOf', () => {
@@ -285,6 +287,55 @@ describe('groupEvents', () => {
     it('ids the group by its first member so @for track stays stable', () => {
         const g = groupEvents([tool('b0'), tht('b1'), tool('b2')]);
         expect(g[0].id).toBe('b0');
+    });
+
+    describe('job fan-out', () => {
+        it('groups contiguous job calls into one batch', () => {
+            expect(shapeOf(groupEvents([job('b0'), job('b1'), job('b2')])))
+                .toEqual(['job_batch(b0,b1,b2)']);
+        });
+
+        it('FIXES the fan-out that used to hide two of three job cards', () => {
+            // Before: job calls were foldable and pinnedEventIds() pins only the
+            // turn's LAST tool call, so this rendered as 'folded(b0,b1)' plus
+            // 'single(b2)' — two actionable cards buried in a "2× tool calls"
+            // chip that gave no hint they were there. The regression this guards
+            // is re-adding create_worker_job to isFoldable().
+            const g = groupEvents([job('b0'), job('b1'), job('b2')]);
+            expect(g.map(x => x.kind)).not.toContain('folded');
+            expect(g).toHaveLength(1);
+        });
+
+        it('leaves a lone job call as an ordinary card', () => {
+            // A one-row batch is a card with a redundant header.
+            expect(shapeOf(groupEvents([job('b0')]))).toEqual(['single(b0)']);
+        });
+
+        it('never folds a job call buried in a run of ordinary tools', () => {
+            // The notify_user case, but for an actionable card. b5 is the latest
+            // tool call and pins; b2 stands alone because it can never fold.
+            const g = groupEvents([tool('b0'), tool('b1'), job('b2'), tool('b3'), tool('b4'), tool('b5')]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1)', 'single(b2)', 'folded(b3,b4)', 'single(b5)']);
+        });
+
+        it('breaks the batch on anything the agent said or did between dispatches', () => {
+            const g = groupEvents([job('b0'), job('b1'), txt('b2', 'and now'), job('b3'), job('b4')]);
+            expect(shapeOf(g)).toEqual(['job_batch(b0,b1)', 'single(b2)', 'job_batch(b3,b4)']);
+        });
+
+        it('batches while still in flight, preserving order', () => {
+            const g = groupEvents([job('b0'), job('b1', 'running'), job('b2', 'pending')]);
+            expect(shapeOf(g)).toEqual(['job_batch(b0,b1,b2)']);
+        });
+
+        it('ids the batch by its first member so @for track stays stable', () => {
+            expect(groupEvents([job('b0'), job('b1')])[0].id).toBe('b0');
+        });
+
+        it('does not disturb a turn with no job calls', () => {
+            const g = groupEvents([tool('b0'), tool('b1'), tool('b2')]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1)', 'single(b2)']);
+        });
     });
 
     it('collapses the screenshot case to one chip plus the live edge', () => {

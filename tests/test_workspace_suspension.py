@@ -9,6 +9,7 @@ Tests cover:
 
 import sys
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -26,7 +27,10 @@ from orchestrator.services.workspace_suspension import (  # noqa: E402
     WorkspaceSuspensionService,
     _strict_session_restore_authority,
 )
-from services.ssh_helpers import EXTRACT_HOME_REMOTE_CMD  # noqa: E402
+from orchestrator.services.ssh_helpers import (  # noqa: E402
+    EXTRACT_HOME_REMOTE_CMD,
+    EXTRACT_REMOTE_CMD,
+)
 from services.workspace_lifecycle import WorkspaceOwner  # noqa: E402
 
 
@@ -73,6 +77,10 @@ def make_service(*, s3_available=True, k8s_available=True):
     type(mock_snapshot).is_available = PropertyMock(return_value=s3_available)
     mock_snapshot.capture_vm_snapshot = AsyncMock(return_value=True)
     mock_snapshot.download_snapshot = AsyncMock(return_value=True)
+    # Reclaim-on-idle's fail-safe gate (C2). Defaults to a clean verify so
+    # tests that flip WORKSPACE_RECLAIM_ON_IDLE on don't all need to wire
+    # this individually; tests of the unverified path override it.
+    mock_snapshot.verify_snapshot = AsyncMock(return_value=(True, "ok"))
 
     mock_container = MagicMock()
     type(mock_container).is_available = PropertyMock(return_value=k8s_available)
@@ -311,8 +319,13 @@ class TestRestoreWorkspace:
 
         assert result is True
         svc._container_provisioner.create_workspace.assert_awaited_once()
+        # Pod (not VM) restore extracts home-only: the extract runs as
+        # agent-host and must not try to overwrite root-owned /usr/local.
         mock_extract.assert_awaited_once_with(
-            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "10.0.0.99", ssh_port=30022
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "10.0.0.99",
+            ssh_port=30022,
+            scoped_home=True,
         )
         # Status transitions: restoring → ready
         calls = svc._db.merge_workspace_container_context.call_args_list
@@ -355,6 +368,65 @@ class TestRestoreWorkspace:
         result = await svc.restore_workspace("some-id")
 
         assert result is False
+
+
+# =============================================================================
+# Test: _extract_snapshot command selection (pod home-only vs VM full)
+# =============================================================================
+
+
+class TestExtractSnapshotScopedHome:
+    """``_extract_snapshot`` selects the extract command by target kind.
+
+    A snapshot carries both ``/home/agent-host`` and ``/usr/local``. A **pod**
+    extract runs as the unprivileged agent-host user and cannot overwrite the
+    image-provided, root-owned ``/usr/local`` — the full extract then exits
+    rc=2 and restore is (correctly) reported failed, so pod restore-from-S3
+    silently never worked (confirmed on the dev cluster). Pods must extract
+    home-only (``scoped_home=True`` -> ``EXTRACT_HOME_REMOTE_CMD``, matching the
+    proven ``ide_session`` k8s-pod path); VMs (root, the snapshot IS the disk)
+    keep the full extract. See docs/features/workspace_durability_tiering.md §C1.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pod_extract_uses_home_only_command(self):
+        svc = make_service()
+        with patch(
+            "orchestrator.services.workspace_suspension.stream_extract_snapshot",
+            new=AsyncMock(return_value=(0, b"")),
+        ) as mock_stream:
+            ok = await svc._extract_snapshot("id-pod", "10.0.0.9", scoped_home=True)
+
+        assert ok is True
+        assert mock_stream.call_args.kwargs["remote_cmd"] == EXTRACT_HOME_REMOTE_CMD
+
+    @pytest.mark.asyncio
+    async def test_vm_extract_uses_full_command(self):
+        svc = make_service()
+        with patch(
+            "orchestrator.services.workspace_suspension.stream_extract_snapshot",
+            new=AsyncMock(return_value=(0, b"")),
+        ) as mock_stream:
+            ok = await svc._extract_snapshot("id-vm", "10.0.0.9", scoped_home=False)
+
+        assert ok is True
+        assert mock_stream.call_args.kwargs["remote_cmd"] == EXTRACT_REMOTE_CMD
+
+    @pytest.mark.asyncio
+    async def test_default_preserves_full_command(self):
+        """Omitting ``scoped_home`` keeps the legacy full extract, so only the
+        explicitly-pod callers change behavior."""
+        svc = make_service()
+        with patch(
+            "orchestrator.services.workspace_suspension.stream_extract_snapshot",
+            new=AsyncMock(return_value=(0, b"")),
+        ) as mock_stream:
+            ok = await svc._extract_snapshot("id-default", "10.0.0.9")
+
+        assert ok is True
+        # Omitting the override preserves stream_extract_snapshot's full
+        # extract default without perturbing strict-authority call shapes.
+        assert "remote_cmd" not in mock_stream.call_args.kwargs
 
 
 # =============================================================================
@@ -880,8 +952,11 @@ class TestSuspendRestoreRoundTrip:
             WorkspaceOwner.job(job_id)
         )
 
-        # Snapshot extracted to new pod IP
-        mock_extract.assert_awaited_once_with(job_id, "10.0.0.99", ssh_port=30022)
+        # Snapshot extracted to new pod IP — home-only for a pod (agent-host
+        # can't overwrite root-owned /usr/local).
+        mock_extract.assert_awaited_once_with(
+            job_id, "10.0.0.99", ssh_port=30022, scoped_home=True
+        )
 
         # Final status is ready
         calls = svc._db.merge_workspace_container_context.call_args_list
@@ -2017,3 +2092,233 @@ class TestStrictTerminalSessionRestore:
             "10.42.2.91",
             30022,
         ]
+
+
+# =============================================================================
+# Test: reclaim-on-idle (Task 7) — opt-in, fail-safe PVC drop on session
+# suspend once the S3 snapshot is confirmed restorable.
+# docs/features/workspace_durability_tiering.md §D3
+# =============================================================================
+
+
+class TestReclaimOnIdleFlagParsing:
+    """``_reclaim_on_idle_enabled`` truthy-token parsing, mirroring
+    ``canvas_snapshots.snapshots_enabled()``'s style."""
+
+    @pytest.mark.parametrize("value", ["true", "1", "yes", "on", "TRUE", "On", " yes "])
+    def test_truthy_tokens_enable(self, monkeypatch, value):
+        from orchestrator.services.workspace_suspension import (
+            _reclaim_on_idle_enabled,
+        )
+
+        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", value)
+        assert _reclaim_on_idle_enabled() is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", "off", "garbage", ""])
+    def test_falsy_tokens_disable(self, monkeypatch, value):
+        from orchestrator.services.workspace_suspension import (
+            _reclaim_on_idle_enabled,
+        )
+
+        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", value)
+        assert _reclaim_on_idle_enabled() is False
+
+    def test_unset_defaults_disabled(self, monkeypatch):
+        from orchestrator.services.workspace_suspension import (
+            _reclaim_on_idle_enabled,
+        )
+
+        monkeypatch.delenv("WORKSPACE_RECLAIM_ON_IDLE", raising=False)
+        assert _reclaim_on_idle_enabled() is False
+
+
+class TestReclaimOnIdle:
+    """Task 7: on a session's idle-suspend, drop the hot-cache workspace PVC
+    once ``verify_snapshot`` confirms the S3 archive is restorable — so idle
+    sessions stop pinning volumes. Default OFF (zero behavior change); when
+    ON, an unverifiable snapshot must KEEP the PVC (fail-safe) rather than
+    risk the only copy of the live working tree."""
+
+    @pytest.mark.asyncio
+    async def test_flag_off_never_deletes_the_pvc(self, monkeypatch):
+        """Regression guarantee: with the flag unset, suspend behaves exactly
+        as before this feature existed — no verify call, no PVC delete."""
+        monkeypatch.delenv("WORKSPACE_RECLAIM_ON_IDLE", raising=False)
+        svc = make_service()
+        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
+
+        ok = await svc.suspend_thread_workspace("tid-pod")
+
+        assert ok is True
+        svc._snapshot_service.verify_snapshot.assert_not_awaited()
+        svc._container_provisioner.delete_workspace_pvc.assert_not_awaited()
+        merged = {}
+        for call in svc._db.merge_thread_workspace_context.await_args_list:
+            merged.update(call.args[1])
+        assert merged["status"] == "suspended"
+        assert "volume_reclaimed" not in merged
+
+    @pytest.mark.asyncio
+    async def test_flag_on_verified_snapshot_reclaims_the_pvc(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", "true")
+        svc = make_service()
+        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
+        svc._snapshot_service.verify_snapshot = AsyncMock(return_value=(True, "ok"))
+
+        ok = await svc.suspend_thread_workspace("tid-pod")
+
+        assert ok is True
+        svc._snapshot_service.verify_snapshot.assert_awaited_once_with(
+            "tid-pod", entity_type="threads"
+        )
+        svc._container_provisioner.delete_workspace_pvc.assert_awaited_once_with(
+            WorkspaceOwner.session("tid-pod")
+        )
+        merged = {}
+        for call in svc._db.merge_thread_workspace_context.await_args_list:
+            merged.update(call.args[1])
+        assert merged["status"] == "suspended"
+        assert merged["volume_reclaimed"] is True
+
+    @pytest.mark.asyncio
+    async def test_flag_on_unverified_snapshot_keeps_the_pvc(self, monkeypatch, caplog):
+        """The fail-safe case: verify_snapshot says the archive is NOT
+        trustworthy, so the PVC must survive — the session stays resumable
+        off the retained volume instead of risking the S3 copy."""
+        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", "true")
+        svc = make_service()
+        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
+        svc._snapshot_service.verify_snapshot = AsyncMock(
+            return_value=(False, "sha256 mismatch")
+        )
+
+        with caplog.at_level(logging.WARNING):
+            ok = await svc.suspend_thread_workspace("tid-pod")
+
+        assert ok is True, "an unverified snapshot must not fail the suspend itself"
+        svc._container_provisioner.delete_workspace_pvc.assert_not_awaited()
+        merged = {}
+        for call in svc._db.merge_thread_workspace_context.await_args_list:
+            merged.update(call.args[1])
+        assert merged["status"] == "suspended"
+        assert "volume_reclaimed" not in merged
+        assert "sha256 mismatch" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_pvc_delete_failure_does_not_fail_the_suspend(self, monkeypatch):
+        """A PVC-delete failure (provisioner returns False, e.g. a non-404 API
+        error) must not lose the session — it stays resumable off the
+        retained PVC rather than the suspend itself failing."""
+        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", "true")
+        svc = make_service()
+        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
+        svc._snapshot_service.verify_snapshot = AsyncMock(return_value=(True, "ok"))
+        svc._container_provisioner.delete_workspace_pvc = AsyncMock(return_value=False)
+
+        ok = await svc.suspend_thread_workspace("tid-pod")
+
+        assert ok is True
+        # Prove the reclaim was actually attempted (and failed gracefully) —
+        # not merely skipped, which would make this assertion vacuous.
+        svc._container_provisioner.delete_workspace_pvc.assert_awaited_once()
+        merged = {}
+        for call in svc._db.merge_thread_workspace_context.await_args_list:
+            merged.update(call.args[1])
+        assert merged["status"] == "suspended"
+        assert "volume_reclaimed" not in merged
+
+    @pytest.mark.asyncio
+    async def test_pvc_delete_exception_does_not_fail_the_suspend(self, monkeypatch):
+        """Same guarantee when the provisioner call raises outright rather
+        than returning False — the reclaim is best-effort, the suspend is
+        not."""
+        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", "true")
+        svc = make_service()
+        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
+        svc._snapshot_service.verify_snapshot = AsyncMock(return_value=(True, "ok"))
+        svc._container_provisioner.delete_workspace_pvc = AsyncMock(
+            side_effect=RuntimeError("k8s api unavailable")
+        )
+
+        ok = await svc.suspend_thread_workspace("tid-pod")
+
+        assert ok is True
+        svc._container_provisioner.delete_workspace_pvc.assert_awaited_once()
+        merged = {}
+        for call in svc._db.merge_thread_workspace_context.await_args_list:
+            merged.update(call.args[1])
+        assert merged["status"] == "suspended"
+        assert "volume_reclaimed" not in merged
+
+    @pytest.mark.asyncio
+    async def test_agent_pvc_delete_not_attempted_via_agent_provisioner(
+        self, monkeypatch
+    ):
+        """The session AGENT pod's PVC (``pvc-agent-s-<id>``) is a SEPARATE
+        claim managed by ``AgentProvisioner`` — the type actually wired into
+        ``self._agent_provisioner`` (see orchestrator/main.py). That class
+        exposes no PVC-delete method (only the separate, unwired
+        ``PersistentProvisioner`` has ``delete_agent_pvc``, for a
+        differently-named legacy claim). A ``spec``'d mock without
+        ``delete_agent_pvc`` raises ``AttributeError`` if reclaim ever tries
+        to call it, so this pins today's "workspace PVC only" scope and
+        catches any future drift immediately. The pre-existing
+        delete_agent_pod_by_thread call must still fire unchanged."""
+        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", "true")
+        svc = make_service()
+        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
+        svc._snapshot_service.verify_snapshot = AsyncMock(return_value=(True, "ok"))
+        agent_prov = MagicMock(spec=["is_available", "delete_agent_pod_by_thread"])
+        agent_prov.delete_agent_pod_by_thread = AsyncMock(return_value=True)
+        svc._agent_provisioner = agent_prov
+
+        ok = await svc.suspend_thread_workspace("tid-pod")
+
+        assert ok is True
+        svc._container_provisioner.delete_workspace_pvc.assert_awaited_once()
+        agent_prov.delete_agent_pod_by_thread.assert_awaited_once_with("tid-pod")
+
+
+class TestRestoreAfterReclaimOnIdle:
+    """Confirms — without changing restore logic — that a PVC dropped by
+    reclaim-on-idle is handled correctly on the next touch.
+
+    A reclaimed PVC is, to the restore path, indistinguishable from "first
+    PVC-backed create" or the single-replica node-loss fallback: ``delete``
+    then ``create_workspace`` mints a FRESH claim under the same deterministic
+    name, which K8s gives a brand new UID. ``_volume_survived_teardown``
+    compares the binding's ``backing_id`` (which embeds that UID, not the
+    name), so the changed id correctly reads as "not the same volume" and
+    falls through to the S3 extract — exactly the desired behavior, with no
+    special-casing needed in restore_thread_workspace."""
+
+    @pytest.mark.asyncio
+    async def test_extract_fires_when_the_reclaimed_pvc_comes_back_fresh(self):
+        before = make_container_thread()
+        before["metadata"]["workspace_container"]["pod_ip"] = "10.42.2.32"
+        before["metadata"]["_workspace_binding"] = {
+            "backing_kind": "remote",
+            "backing_id": "k8s-pvc:srw:11111111-old-reclaimed",
+        }
+
+        after = make_container_thread()
+        after["metadata"]["workspace_container"]["pod_ip"] = "10.42.2.99"
+        # create_workspace minted a brand new PVC under the same deterministic
+        # name — reclaim deleted the old claim, so this UID is necessarily new.
+        after["metadata"]["_workspace_binding"] = {
+            "backing_kind": "remote",
+            "backing_id": "k8s-pvc:srw:99999999-fresh",
+        }
+
+        svc = make_service()
+        svc._db.get_thread = AsyncMock(side_effect=[before, after])
+        svc._extract_snapshot = AsyncMock(return_value=True)
+
+        ok = await svc.restore_thread_workspace("tid-pod")
+
+        assert ok is True
+        svc._extract_snapshot.assert_awaited_once()
+        merged = {}
+        for call in svc._db.merge_thread_workspace_context.await_args_list:
+            merged.update(call.args[1])
+        assert merged["status"] == "ready"

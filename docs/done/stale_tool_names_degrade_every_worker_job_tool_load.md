@@ -11,12 +11,13 @@ tags:
 **Filed:** 2026-07-28, split out of
 `docs/done/session_tool_group_checkbox_disagrees_with_the_agent.md` (the session
 half is fixed; this is the worker half).
-**Status:** FIXED 2026-07-29 — removed from `worker_base.yaml` and all four
-expert configs; every shipped config now resolves with zero unknown tool names.
-Not yet deployed, so dev worker jobs still log the warning until the next
-rollout. Verified locally: the merged tool list for `worker_base`, `developer`,
-`designer` and `scholar` contains no unknown names, so the batch load no longer
-raises.
+**Status:** FIXED 2026-07-29, **live-verified on dev 2026-08-01**. Removed from
+`worker_base.yaml` and all four expert configs; every shipped config now
+resolves with zero unknown tool names. Worker agent `srw-agent-j-3662d0eb`,
+running `sha-99c9aba` (the first deployed image carrying the fix), shows **zero**
+`Tool loading warning: Unknown tools:` occurrences across its whole log and
+loads its toolset in one batch line — `Loaded 34 tools: ['read_file', …]` —
+rather than the per-tool fallback. Two other live agent pods agree.
 **Severity:** low-to-medium — no functional loss today (the fallback loads every
 *valid* tool), but it burns the batch-validation safety net on every single
 worker job and hides real bind failures at DEBUG. It is a latent-severity bug:

@@ -80,10 +80,11 @@ export type ReducerAction =
     | {
         type: 'permission_decision';
         toolUseId: string;
-        decision: 'approved' | 'denied';
+        decision: 'approved' | 'denied' | 'expired';
         timestamp: number;
     }
     | { type: 'remove_turn'; id: string }
+    | { type: 'update_attachments'; id: string; attachments: ChatAttachment[] }
     | { type: 'add_compaction'; id: string; summary: string; timestamp: number };
 
 export function reduce(state: ConversationState, action: ReducerAction): ConversationState {
@@ -111,6 +112,23 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                         timestamp: action.timestamp,
                     },
                 ],
+            };
+
+        case 'update_attachments':
+            // Re-key an already-rendered user bubble's chips as its uploads
+            // resolve: `path` appears, the server may have renamed a file
+            // (`_1` collision suffix), and one .zip expands into several
+            // chips. Patching in place is the only correct shape — a second
+            // `user_message` with the same id would APPEND a duplicate
+            // bubble, and remove+re-add would move it to the foot of the
+            // transcript, below messages the user queued behind it.
+            return {
+                ...state,
+                turns: state.turns.map((t) =>
+                    t.kind === 'user' && t.id === action.id
+                        ? {...t, attachments: action.attachments}
+                        : t,
+                ),
             };
 
         case 'remove_turn':
@@ -468,10 +486,18 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                     return turn;
                 }
                 const existing = turn.events[idx] as ToolCallEvent;
+                // 'expired' = the gate was never answered (TTL, or swept at
+                // turn end). The call did not run and the user did not refuse
+                // — it must not render as a denial, and must not keep
+                // spinning as 'pending' either.
                 const newStatus =
-                    action.decision === 'denied' && existing.status === 'pending'
-                        ? ('denied' as const)
-                        : existing.status;
+                    existing.status !== 'pending'
+                        ? existing.status
+                        : action.decision === 'denied'
+                          ? ('denied' as const)
+                          : action.decision === 'expired'
+                            ? ('expired' as const)
+                            : existing.status;
                 const updated: ToolCallEvent = {
                     ...existing,
                     decision: action.decision,

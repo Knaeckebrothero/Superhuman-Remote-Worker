@@ -6,7 +6,7 @@ import type {
     SessionToolCategory,
     SessionToolGroupsResponse,
 } from '../../core/services/api.service';
-import {SettingsMode} from './agent-settings.types';
+import {SettingsMode, TierReachability} from './agent-settings.types';
 import {ExecutionGroupComponent} from './execution-group.component';
 import {ModelGroupComponent} from './model-group.component';
 import {ToolsGroupComponent} from './tools-group.component';
@@ -79,7 +79,11 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [disabled]="disabled()"
             [showProjectMemory]="showProjectMemory()"
             [gatedCapabilities]="gatedCapabilities()"
+            [liveTier]="liveTier()"
+            [tierReachability]="tierReachability()"
+            [upgradeInProgress]="upgradeInProgress()"
             (change)="onChange()"
+            (tierChangeRequested)="tierChangeRequested.emit($event)"
           />
           <app-model-group
             [config]="config()"
@@ -113,8 +117,8 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [error]="datasourceLoadError()"
             [contextKey]="datasourceContextKey()"
             [disabled]="disabled()"
-            [isLiteBackend]="mode() === 'live' ? liteBackend() : (advancedAccordion?.isLiteBackend() ?? false)"
-            [initialSelectedIds]="mode() === 'live' ? initialDatasourceIds() : null"
+            [isLiteBackend]="mode() === 'live' ? liteBackend() : (executionGroup?.isLiteBackend() ?? false)"
+            [initialSelectedIds]="mode() === 'live' || mode() === 'session' ? initialDatasourceIds() : null"
             [datasourceDefaultsEnabled]="datasourceDefaultsEnabled()"
             [lockedIds]="lockedDatasourceIds()"
             (change)="onChange()"
@@ -152,6 +156,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
               [strategicModelOverride]="modelGroup?.strategicModel() ?? null"
               [tacticalModelOverride]="modelGroup?.tacticalModel() ?? null"
               [sessionModelOverride]="modelGroup?.sessionModel() ?? null"
+              [backendOverride]="executionGroup?.workspaceBackend() ?? null"
               (change)="onChange()"
             />
           </div>
@@ -273,8 +278,13 @@ export class AgentSettingsComponent {
   datasourceContextKey = input('standalone');
   /** Fail-closed rollout gate for server-computed create defaults. */
   datasourceDefaultsEnabled = input(false);
-  /** Live mode: the session's currently attached selection — the picker's
-   *  default when untouched (live_session_settings.md Slice B). */
+  /** The picker's default when untouched — live mode: the session's
+   *  currently attached selection (live_session_settings.md Slice B).
+   *  Session-create mode: a source thread's surviving connectors, already
+   *  intersected against `datasources()` by the caller
+   *  (session_config_drift_resume.md §8.3 — "Start a new session"). Null
+   *  keeps the create-flow server `default_selected` set; job mode never
+   *  reads this input. */
   initialDatasourceIds = input<string[] | null>(null);
   /** Live mode: entries frozen at their current state (kb-type — knowledge
    *  bindings only rewire on attach). */
@@ -282,12 +292,21 @@ export class AgentSettingsComponent {
   /** Live mode: whether the session runs a lite backend (virtual/none) — the
    *  Advanced accordion that normally derives this is hidden in live mode. */
   liteBackend = input(false);
+  /** Live mode: the running session's workspace tier, and which tiers it can
+   *  move to. Forwarded to the execution group, which renders the tier row as
+   *  a launcher for the upgrade verb rather than as a setting. */
+  liveTier = input<string | null>(null);
+  tierReachability = input<Record<string, TierReachability>>({});
+  upgradeInProgress = input<{tier: string; elapsed?: number} | null>(null);
   /** Expert detail loading state. */
   loadingExpert = input(false);
 
   /** Emitted whenever any setting changes. */
   change = output<void>();
   retryDatasources = output<void>();
+  /** Live mode: a workspace tier the user picked. The host confirms it and
+   *  dispatches the upgrade verb — this surface only reports the intent. */
+  tierChangeRequested = output<string>();
   /** Emitted when instructions content changes. */
   instructionsChange = output<string | null>();
 
@@ -376,6 +395,17 @@ export class AgentSettingsComponent {
   /** Return selected datasource IDs (not part of config_override). */
   getSelectedDatasourceIds(): string[] {
     return this.datasourcesGroup?.getSelectedIds() ?? [];
+  }
+
+  /** Session mode: pin the single model picker to an explicit value, the same
+   *  as the user picking it themselves — used to carry a source thread's
+   *  model forward on "Start a new session"
+   *  (session_config_drift_resume.md §8.3). Must be called AFTER
+   *  `prefillFromConfig` for whichever expert ends up selected: that call
+   *  resets the model group to the expert's own config-derived default, and
+   *  would silently win over an override applied before it. */
+  setSessionModelOverride(model: string): void {
+    this.modelGroup?.onSessionModelChange(model);
   }
 
   /** Category → the enumeration a requested locked-on addition writes.

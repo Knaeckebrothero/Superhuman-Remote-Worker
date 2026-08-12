@@ -1339,6 +1339,49 @@ classifier misses ~17% of overeager actions). Maps to open question #1.
 
 ---
 
+## 7b. Cockpit surface — the tier row (2026-08-08)
+
+The live pane used to carry a `workspace-group` block at its foot: the tier as
+static text, plus up to two "Upgrade to sandbox" / "Upgrade to VM" buttons that
+dispatched the verb on a single unconfirmed click. Two problems with that. It
+looked nothing like the rest of the pane, and a click on a secondary button was
+the entire ceremony for provisioning a dedicated VM — a cold image import of
+6–25 min per §Q7, and one-way.
+
+It is now the same **Workspace** row the creation forms show, in the Settings
+tab's EXECUTION group (`execution-group.component.ts`), reading the shared
+`advanced.options.*` vocabulary in every mode.
+
+**The row is a launcher, not a setting.** On a live session it displays the
+running tier and never holds a pending one: a pick emits
+`tierChangeRequested` and the select snaps straight back, so a cancelled
+confirmation leaves nothing stale and the value moves only when the upgrade
+actually lands. It is also excluded from `getOverrides()` in live mode — the
+tier moves through the upgrade verb, and letting it ride the pane's debounced
+`config.update` would make a second, silent writer of the same fact.
+
+**Refusals are legible before the click.** The pane computes a
+`TierReachability` map from tier + grants (`virtual → sandbox|vm`,
+`sandbox → vm`, everything else refused) and each unreachable tier renders as a
+disabled option carrying its reason — "can't move down a tier", "needs
+approval". The alternative, letting the pick through and rejecting it after,
+spends a click to deliver a "no". A `none` session can reach nothing at all
+(no durable anchor — see §Non-goals), so the row degrades to static text rather
+than offering a select whose every option is refused.
+
+**Confirmation is scoped to this surface.** `upgradeWorkspace` has three
+callers; only the pane confirms. The agent's offer card already carries the
+agent's reason for asking, and `/upgrade-workspace` is typed intent — a dialog
+on either would be nagging.
+
+*Known divergence, deliberately not fixed here:* the live pane gates VM on the
+`vm_workspace` PDP grant while the creation forms gate on
+`is_admin || can_use_vm`. Same question, two sources. This change makes the
+divergence more visible (VM now reads "needs approval" in live, while it is
+simply absent at creation) but unifying the two gates is its own change.
+
+---
+
 ## 8. References
 
 - Codebase precedent: [[vm_backend]] (container→VM), [[no_workspace_agent_mode]]

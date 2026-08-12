@@ -1,7 +1,7 @@
 import {APP_INITIALIZER, ApplicationConfig, isDevMode, provideBrowserGlobalErrorListeners} from '@angular/core';
 import {provideRouter, withViewTransitions} from '@angular/router';
 import {provideServiceWorker} from '@angular/service-worker';
-import {HttpClient, provideHttpClient, withFetch, withInterceptors} from '@angular/common/http';
+import {HttpClient, provideHttpClient, withInterceptors} from '@angular/common/http';
 import {registerLocaleData} from '@angular/common';
 import localeDe from '@angular/common/locales/de';
 import {firstValueFrom} from 'rxjs';
@@ -71,7 +71,22 @@ export const appConfig: ApplicationConfig = {
     provideBrowserGlobalErrorListeners(),
     provideRouter(routes, withViewTransitions()),
     provideClientHydration(withEventReplay()),
-    provideHttpClient(withFetch(), withInterceptors([authInterceptor, viewAsInterceptor])),
+    // No withFetch(): Angular's FetchBackend emits no UploadProgress events at
+    // all (@angular/common/fesm2022/_module-chunk.mjs — the package's only
+    // HttpEventType.UploadProgress emission lives in HttpXhrBackend), so
+    // attachment upload progress is impossible on it and `reportProgress: true`
+    // is a silent no-op there. withXhr() does not exist in Angular 21, so the
+    // only way to get the XHR backend is to stop asking for fetch.
+    //
+    // Safe here because nothing ever runs this config in Node: angular.json
+    // sets `ssr: false` and declares no `server` entry, so the build emits no
+    // server bundle and prerenders nothing (dist/cockpit/prerendered-routes.json
+    // is `{"routes": {}}`; index.html ships an empty <app-root> with no `ngh`
+    // hydration markers). If SSR is ever switched on, app.config.server.ts's
+    // provideServerRendering() supplies XhrFactory → ServerXhr, which is exactly
+    // what an XHR-backed HttpClient needs off-browser.
+    // docs/features/session_attachment_send_flow.md §9.2
+    provideHttpClient(withInterceptors([authInterceptor, viewAsInterceptor])),
     provideTransloco({
       config: {
         availableLangs: [...SUPPORTED_LANGS],

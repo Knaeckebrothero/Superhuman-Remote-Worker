@@ -29,6 +29,7 @@ import {AppDialogComponent} from '../../ui/dialog';
 import {CanvasPaneComponent} from '../canvas/canvas-pane.component';
 import {canvasSourceKey} from '../canvas/canvas-rendering';
 import {SettingsPaneComponent} from './settings-pane.component';
+import {ConfigDriftDialogComponent} from './config-drift-dialog.component';
 
 export interface BrowserReplacementTarget {
     readonly threadId: string;
@@ -62,6 +63,7 @@ export function browserReplacementTargetMatches(
         AppIconButtonComponent,
         AppButtonComponent,
         AppDialogComponent,
+        ConfigDriftDialogComponent,
     ],
     template: `
       @if (canvasAvailable()) {
@@ -152,6 +154,15 @@ export function browserReplacementTargetMatches(
           </app-button>
         </ng-container>
       </app-dialog>
+
+      @if (chat.pendingDrift(); as drift) {
+        <app-config-drift-dialog
+          [items]="drift"
+          (resumeAnyway)="onResumeAnyway($event)"
+          (startNew)="onStartNewSession()"
+          (dismissed)="chat.pendingDrift.set(null)"
+        />
+      }
     `,
     styles: `
       :host {
@@ -240,7 +251,10 @@ export function browserReplacementTargetMatches(
 export class ChatPageComponent implements OnInit, OnDestroy {
     private readonly route = inject(ActivatedRoute);
     private readonly router = inject(Router);
-    private readonly chat = inject(PersistentChatService);
+    // Not private: the template reads chat.pendingDrift() directly for the
+    // config-drift dialog, matching how persistent-chat.component.ts exposes
+    // the same service.
+    readonly chat = inject(PersistentChatService);
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
     private readonly canvas = inject(CanvasService);
@@ -499,6 +513,32 @@ export class ChatPageComponent implements OnInit, OnDestroy {
             )
         ) return;
         this.startSharedBrowser(target.presentationRevision);
+    }
+
+    /** "Resume without them": the acknowledged ids re-drive POST /resume,
+     *  which either succeeds (drifted config is dropped) or 428s again with
+     *  whatever still disagrees. Clearing pendingDrift up front — rather than
+     *  waiting on the response — is what unmounts the dialog immediately, so
+     *  there is nothing left in the DOM to double-click. */
+    async onResumeAnyway(ids: string[]): Promise<void> {
+        this.chat.pendingDrift.set(null);
+        await this.chat.resumeSession(ids);
+    }
+
+    /** "Start a new session": leaves this thread ended and hands off to
+     *  session-create with a single `from=<threadId>` query param (§8.3).
+     *  session-create fetches that thread itself and prefills project/expert/
+     *  model/connectors from whatever of its config still resolves —
+     *  deliberately NOT a list of surviving ids in the URL, so a connector
+     *  that drifts between this click and the create page loading is still
+     *  dropped correctly. */
+    onStartNewSession(): void {
+        this.chat.pendingDrift.set(null);
+        const threadId = this.chat.threadId();
+        void this.router.navigate(
+            ['/sessions/new'],
+            threadId ? {queryParams: {from: threadId}} : undefined,
+        );
     }
 
     private startSharedBrowser(expectedPresentationRevision?: number): void {

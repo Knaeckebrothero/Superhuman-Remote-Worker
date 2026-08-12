@@ -117,6 +117,34 @@ export const IMAGE_QUALITY_TIERS = [
   { value: 'high', label: 'High', description: 'Model-family max — best for OCR, charts, UI screenshots' },
 ] as const;
 
+/** Workspace backends, in the order the selector lists them. `i18nKey` names
+ *  the shared label under `advanced.options.*` — one vocabulary for the
+ *  creation forms and the live session pane alike. */
+export const WORKSPACE_BACKENDS = [
+  { value: 'sandbox', i18nKey: 'container' },
+  { value: 'vm', i18nKey: 'vmQemu' },
+  { value: 'virtual', i18nKey: 'virtual' },
+  { value: 'none', i18nKey: 'none' },
+] as const;
+
+/**
+ * Whether a running session can move to a given workspace tier.
+ *
+ * `current` is the tier it is on; `ok` is reachable. Everything else is a
+ * reason the move is refused, and doubles as the i18n key suffix under
+ * `agentSettings.execution.tierUnreachable.*` — the reason renders in the
+ * option itself, so the "no" arrives before the click rather than after it.
+ *
+ * Reachability is the live pane's to decide (it holds the tier and the
+ * grants); the settings group only renders what it is told.
+ */
+export type TierReachability =
+  | 'current'
+  | 'ok'
+  | 'downgrade'
+  | 'needsApproval'
+  | 'unsupported';
+
 /** Deep-read a nested path from a config object. */
 export function readConfigPath(config: Record<string, unknown>, path: string): unknown {
   return path.split('.').reduce((obj: any, key) => obj?.[key], config) ?? null;

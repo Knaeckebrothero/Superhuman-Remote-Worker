@@ -20,7 +20,7 @@ related:
 
 > Every agent tool call — in a live session or the debug audit trail — should render through **one** schema-driven card: tool name, input parameters, the result the model saw, and optional execution details. Expanding any card should look the same and tell you the same things, regardless of tool or data source.
 
-**Status:** Slice 1 (schema + registry + `<app-tool-card>` + persistent-chat wiring) shipped + **live-verified on k3d 2026-06-17**. Slices 2–3 pending. **Slice 4 — the job card: BUILT + partially live-gated 2026-07-29** (API contract verified, three bugs found and fixed; visual pass still owed) — see [Slice 4 — what shipped](#slice-4--what-shipped-2026-07-29) and [Live gate](#live-gate-on-dev-2026-07-29--partial-and-it-found-three-bugs). It is the first card that outlives its tool call and the first to carry actions, so it extends the schema rather than just adding a descriptor.
+**Status:** Slice 1 (schema + registry + `<app-tool-card>` + persistent-chat wiring) shipped + **live-verified on k3d 2026-06-17**. Slices 2–3 pending. **Slice 4 — the job card: BUILT + LIVE-GATED.** API contract verified on dev 2026-07-29 (three bugs found and fixed); UI gate passed on local k3d 2026-08-08, `Open diff` closed 2026-08-09 — **every path the slice owns is now verified.** See [what shipped](#slice-4--what-shipped-2026-07-29), the [dev gate](#live-gate-on-dev-2026-07-29--partial-and-it-found-three-bugs) and the [UI gate](#ui-gate-on-local-k3d-2026-08-08--passed). It is the first card that outlives its tool call and the first to carry actions, so it extends the schema rather than just adding a descriptor.
 **Closes:** `session_turn_rendering.md` deferred decision #5 ("whether tool_result content gets its own collapse level inside the tool card or is always visible").
 
 ## Live verification (slice 1, 2026-06-17)
@@ -418,21 +418,26 @@ Decisions worth keeping:
 
 **Deliberately not built** (each is separable, none blocks the above):
 
-- **Turn-level batch grouping.** The audit found the seam (`groupEvents`) but
-  also that `pinnedEventIds()` always pins a turn's last tool call, so job calls
-  must be exempted from `isFoldable`/pinning *before* the grouping pass — a real
-  edit to a load-bearing function with 53 tests. That is a separate change from
-  the card itself, and it only matters for fan-outs.
-- **Resume-with-feedback.** Needs a text-input affordance; Approve + Open-diff is
-  most of the review loop.
+- ~~**Turn-level batch grouping.**~~ **Built 2026-08-09** — see below. The
+  audit's warning was right about the mechanism and wrong about the stakes: this
+  was not cosmetic, it was hiding actionable cards.
+- ~~**Resume-with-feedback.**~~ **Built 2026-08-09** — see below. Deferring it
+  turned out to be wrong: Approve + Cancel is "ship it" or "kill it", and the
+  usual answer to a job that stopped for review is neither.
 - **Proposed state.** Still deferred by design (see the decision log).
 - **The audit/debug surface.** The card is shared, so it renders there too, but
   polling from that surface is untested.
 
-**Verification:** 20 unit tests (pure functions — `TestBed` does not work under
-vitest here); full cockpit suite 1453 passing; i18n parity green in both
-locales; `ng build` clean with initial at 2.65 MB, under the 2.75 MB hard
-ceiling (the 2.25 MB warning was already breached before this change).
+**Verification:** 20 unit tests (pure functions); full cockpit suite 1453
+passing; i18n parity green in both locales; `ng build` clean with initial at
+2.65 MB, under the 2.75 MB hard ceiling (the 2.25 MB warning was already
+breached before this change).
+
+> **Correction (2026-08-09):** this line originally read "pure functions —
+> `TestBed` does not work under vitest here". Too strong. TestBed *does* mount
+> this panel, with the two workarounds `markdown-tool-card.spec.ts` already
+> documents — see the follow-up section's note. The pure-function preference
+> stands for `PersistentChatComponent` (NG0951), not for small leaf components.
 
 ### Live gate on dev (2026-07-29) — partial, and it found three bugs
 
@@ -463,11 +468,209 @@ output (now pinned as a test — note the receipt repeats the id inside a
 `get_worker_job(...)` hint, so label-anchoring matters), and `diff_status` was
 `None` on the test job, so Open-diff correctly stayed hidden.
 
-**Still owed:** the visual pass — card renders with the descriptor title rather
-than the generic fallback, status chip updates live, polling stops at terminal,
-Approve appears only at `pending_review`, Open-diff opens the drawer. Dev
-currently has **no job with `diff_status='pending'`**, so exercising Open-diff
-needs a Mode-A diff job seeded first.
+### UI gate on local k3d (2026-08-08) — PASSED
+
+The remote dev cockpit sits behind Keycloak, and driving that login is not
+something automation should do, so the UI pass ran against the **local k3d
+stack** (`https://localhost`, namespace `srw`, already authenticated as the
+repo's `test` fixture user). Playwright, real session, real job
+(`3b51895c` / `1998565d`).
+
+| Check | Result |
+|---|---|
+| Descriptor, not the generic fallback | title `Schedule job`, hint = the task |
+| Live status while running | badge `processing` + spinner, panel visible **without expanding** the card |
+| It actually polls | repeated `GET /api/jobs/{id}` |
+| Survives history replay | after a full reload the card rebuilt from the persisted tool result, id intact |
+| Actions gated on **fresh** status | running → `Cancel job` only; at `pending_review` → `Approve`, `Open diff`, `Cancel job` |
+| **The `asRecord` fix** | summary rendered: *"Successfully wrote a two-line note about idempotency…"* — impossible before it |
+| Approve end-to-end | click → DB flips to `completed`, `freeze_data` cleared, card refreshes to `completed` with **no** buttons |
+| Summary disappears after approval | correct — approval clears `freeze_data`, as the code comment predicts |
+| **Polling stops at terminal** | 7 polls before, 7 after 2.5 poll intervals |
+| Console | zero card-originated errors |
+
+Two notes for whoever repeats this. A Tilt rebuild landed mid-run and 504'd the
+page; every console error in the transcript is `ERR_NETWORK_CHANGED` on the three
+SSE streams retrying through it, none from `/api/jobs`. That accident produced
+useful evidence: the SSE streams kept retrying while the job poller stayed
+stopped, so the terminal gate is a real predicate and not just a dead network.
+
+**`Open diff` — closed 2026-08-09.** `diff_status='pending'` requires a project
+with a Mode-A cloud folder plus a captured baseline commit, which is the
+*diff-capture pipeline* — not something slice 4 touched. What slice 4 owns is
+narrower and was tested directly by flipping `diff_status` on the k3d test job:
+
+- Gating is independent and correct: `completed` + `diff_status='pending'`
+  renders **only** `Open diff` — no Approve (not `pending_review`), no Cancel
+  (terminal).
+- The click mounts `app-job-diff-review`, the header renders the interpolated
+  i18n key (`Job 1998565d — changes`), and the drawer fetches
+  `/api/jobs/{id}/diff` — bound to the **jobId**, confirming it is the job
+  drawer and not the session's cloud-diff one.
+- With no real baseline it degrades gracefully ("No changes to review") rather
+  than erroring.
+
+The row was restored afterwards.
+
+**Correction (2026-08-09):** an earlier draft of this section said the Mode-A
+diff-capture pipeline "remains untested". That was wrong — [[job_cloud_export]]
+was live-verified end to end on 2026-05-21, with a real diff round-tripped
+OpenCloud → Gitea → Cockpit → OpenCloud. The only untested combination is the
+narrow one where *this card's* button opens a drawer over a diff produced by
+that pipeline rather than over a flag flipped by hand; both halves are verified
+separately, and the drawer is the same pre-existing component the Jobs page
+already uses.
+
+### Slice 4 follow-up — resume-with-feedback (2026-08-09)
+
+Deferred above as "Approve + Open-diff is most of the review loop". On review
+that was the wrong call: the card offered **ship it** or **kill it**, and the
+common outcome of reading a job that stopped is *"close, but do X"* — which
+still sent the user to the Jobs page. That is the exact trip this slice exists
+to remove, so the shipped card had a shape its own design argues against.
+
+Small, because the server side already existed: `POST /api/jobs/{id}/resume`
+takes a `feedback` body and `ApiService.resumeJob(jobId, feedback?, agentId?)`
+was already wired for the Jobs page and the Inbox.
+
+| Piece | Where |
+|---|---|
+| `canResumeJobStatus()` — which statuses offer the action | `core/util/job-status.ts` |
+| Composer (textarea + Send / Dismiss, Ctrl/⌘+Enter) | `ui/tool-card/job-tool-card-panel.component.ts` |
+| 4 i18n keys × 2 locales | `assets/i18n/{en,de-DE}.json` |
+| 9 tests | `ui/tool-card/job-tool-card-panel.spec.ts` |
+
+Decisions:
+
+- **The composer replaces the action row, it does not sit under it.** A
+  "Dismiss" next to a "Cancel job" is a one-click accident, and the card lives
+  inline in a transcript where vertical space is other people's messages.
+- **Gating is narrower than the server allows.** The endpoint accepts every
+  status except `completed`; the card offers `pending_review`, `failed`,
+  `cancelled` — "stopped, and will not restart itself". Notably **not**
+  `paused`, which the dispatcher re-picks on its own and which the card is
+  already showing a spinner for; a "continue" button under a spinner reads as
+  broken.
+- **A rejected resume keeps the draft.** `run()` now returns the API result
+  instead of discarding it, so a 403 from the resume PEP or a 409 on an
+  unresolvable stored config (`main.py:13597`) leaves the composer open with the
+  text still in it. Clearing on failure would throw away what the user wrote and
+  leave only a toast.
+- **Send re-checks the status, it does not trust the moment the composer
+  opened.** A poll can land mid-typing and take the job somewhere unresumable —
+  the agent approves it while the user is writing. Same rule as every other
+  button on this card: gated on the status *now*. The draft stays on screen and
+  only the dead action is blocked; collapsing the composer would silently eat
+  what was typed. Guarded in the handler too, since Ctrl+Enter does not go
+  through the disabled attribute.
+
+**On testing:** this is the first spec here to mount a tool-card child in
+TestBed, and both workarounds are load-bearing. `ɵresolveComponentResources()`
+in `beforeAll` (the badge/icon children declare `styleUrl`, unfetchable under
+jsdom), and the input must be **assigned as a signal field** rather than set
+via `componentRef.setInput` — this pipeline drops signal-input metadata, so the
+binding silently never lands and the constructor `effect()` throws NG0950 on
+`entity()`. Both are documented in `markdown-tool-card.spec.ts`; neither is
+discoverable from the failure message alone.
+
+**Verification:** 9 new tests, full cockpit suite 1839 passing, i18n parity
+green, `ng build --configuration production` clean — initial 2.68 MB against a
+2.75 MB hard ceiling, and both warnings (initial > 2.25 MB, and
+`persistent-chat.component.scss` > 36 kB) predate this change.
+
+#### Live gate on local k3d (2026-08-09) — PASSED
+
+Same route as the 08-08 gate: Playwright against `https://localhost`, already
+authenticated as the `test` fixture user. No rebuild was needed — the Tiltfile
+`sync()`s `cockpit/src/` into the running container, so the edit was already
+serving. Driven on the same job (`1998565d` in thread `3b51895c`), flipped to
+`pending_review` for the run and restored afterwards.
+
+| Check | Result |
+|---|---|
+| Button renders with its real i18n string | `Continue with feedback`, not a raw key — alongside Approve / Open diff / Cancel job |
+| Composer replaces the action row | textarea + `Send & continue` / `Dismiss` only; Approve and Cancel job gone |
+| Send disabled on an empty draft | yes |
+| Layout inside the card | textarea 660 px = card width exactly; `document.body` does not scroll horizontally |
+| The request | `POST /api/jobs/{id}/resume` → **200** |
+| **The text reached the server, trimmed** | `context.queued_feedback` = `"Live gate 2026-08-09: add a third line citing the source."` — the leading/trailing spaces typed into the box are gone, so `.trim()` ran on the wire value |
+| Server took the review branch | `queued_feedback_reason` = *"This job was frozen for review; a reviewer resumed it with the feedback below."* |
+| Composer closes on success | yes, and the draft cleared |
+| Card re-gates on the new status | badge `pending_review` → `paused`, buttons collapse to `Cancel job` alone |
+| Console | zero errors |
+
+The resume was **real, not simulated**: the job's workspace had been deleted, so
+the server shed the stale context and re-queued it, and the dispatcher then
+provisioned a fresh agent + workspace pod within a minute. Both were deleted and
+the job row restored (`completed`, `queued_feedback` cleared) — worth knowing if
+you repeat this, because the side effect is a live job run, not a status flip.
+
+### Slice 4 follow-up — batch grouping (2026-08-09)
+
+**This was filed as cosmetic. It wasn't — it was a visibility bug.**
+
+Job calls were foldable, and `pinnedEventIds()` pins only a turn's *last* tool
+call. So a three-job fan-out rendered as a **"2× tool calls" chip plus one
+inline card**: two live cards, each carrying Approve / Continue-with-feedback /
+Cancel, were hidden behind a counter that gave no hint they existed. Work
+waiting on the user was one unexplained click away from invisible. The
+deferral note called this "only matters for fan-outs", which is true and misses
+that a fan-out is exactly when you have the most to review.
+
+| Piece | Where |
+|---|---|
+| `JOB_TOOL` — one constant, was a literal in 2 places | `core/models/tool-card.model.ts` |
+| `isFoldable()` excludes job calls; `isJobCall()`; `MIN_JOB_BATCH` | `core/models/turn.model.ts` |
+| `{kind: 'job_batch'}` + the `batchJobCalls()` post-pass | same |
+| `<app-job-batch-card>` — header + a row per job | `ui/tool-card/job-batch-card.component.ts` |
+| `jobBatchViews()`, memoized per group | `views/persistent-chat/persistent-chat.component.ts` |
+| 4 i18n keys × 2 locales; 8 + 7 tests | — |
+
+Decisions:
+
+- **A post-pass, not a branch in the fold loop.** A job call is never foldable,
+  so it always reaches the post-pass as its own `single`; merging there keeps
+  order exact and means anything between two dispatches (text, a folded chip, a
+  thought) breaks the batch — which is right, because it means the agent said or
+  did something in between.
+- **Two deviations from the `Delegate-A` mockup, both forced.** It shows
+  per-agent role, step counts, token counts and elapsed time; a worker job has
+  none of those, so the row shows status + description + the real actions
+  instead of inventing metrics. And it shows *collapsed* as the resting state —
+  this defaults to **open**, because auto-collapsing would recreate the exact
+  bug above. Collapse is manual and never automatic: a card that shut itself
+  when the last job completed would slam closed under someone mid-read.
+- **A failed dispatch says so.** `parseJobEntity` yields no entity for a call
+  that errored, so that row renders the error rather than an empty panel
+  polling nothing.
+- **The header counts only rows it has seen.** Not-yet-polled is neither done
+  nor in review; the panels own the polling, so the header can never start a
+  poller for a job no row is rendering.
+
+**Verification:** 15 new tests (8 grouping, 7 card), **all 53 pre-existing
+`groupEvents` tests still green** — the load-bearing edit changed no existing
+behaviour; full suite 1854 passing; i18n parity green; `tsc -p tsconfig.app.json`
+and `ng build --configuration production` clean at 2.68 MB.
+
+#### Live gate on local k3d (2026-08-09) — PASSED
+
+Playwright on `https://localhost`. A real fan-out needs one assistant message
+with N `create_worker_job` calls, so the fixture was three `thread_messages`
+rows (one `ai` with a 3-call `tool_calls` array + three `tool` results) pointing
+at three **real** jobs in differing states. Deleted afterwards; thread back to
+its original 10 rows.
+
+| Check | Result |
+|---|---|
+| **No fold chip anywhere in the transcript** | `.tool-group-label` count = 0 — the defect is gone |
+| One card, three rows | `3 jobs dispatched` · `3/3 done` |
+| Row labels are the dispatch descriptions | "survey the corpus" / "draft the brief" / "catalogue the sources" |
+| Rows carry live per-job status | badges `completed`, `failed`, `cancelled` — three different rows, three different states |
+| Actions still gated per row | only the `failed` row offered `Continue with feedback`; the terminal ones offered nothing |
+| Two-job case | renders a batch too (`2 jobs dispatched`, `2/2 done`) |
+| Collapse | `aria-expanded` false, rows 0, header still reads `3 jobs dispatched · 3/3 done` |
+| Layout | no horizontal overflow |
+| Console | zero errors |
 
 ### Open questions (slice 4)
 
@@ -492,7 +695,7 @@ needs a Mode-A diff job seeded first.
 1. **Slice 1 (this change)** — schema + registry + chat adapter + `<app-tool-card>` + wire into `persistent-chat.component.ts` (replace the `#toolDetails` card body; keep the run-fold/grouping around it). Ship + verify on k3d.
 2. **Slice 2 (follow-up)** — audit adapter (`toolCardViewFromAudit`) is written and unit-tested in slice 1 to prove the schema is source-agnostic; slice 2 points `agent-activity.component.ts`'s tool step at `<app-tool-card>` and deletes its bespoke tool rendering.
 3. **Slice 3 (polish)** — Prism syntax highlighting for `code` results (deps already present: `prismjs`); `chat-history.component.ts` as a third consumer; delete the now-dead SCSS/helpers in persistent-chat.
-4. **Slice 4 (the job card) — BUILT 2026-07-29.** `entity` on the schema, a `create_worker_job` descriptor, live status + Approve / Open-diff / Cancel. Batch grouping, resume-with-feedback and the proposed state stay deferred; see [what shipped](#slice-4--what-shipped-2026-07-29). Live gate owed.
+4. **Slice 4 (the job card) — BUILT 2026-07-29, live-gated 2026-08-08 and 2026-08-09.** `entity` on the schema, a `create_worker_job` descriptor, live status + Approve / Open-diff / Cancel, **resume-with-feedback**, and **batch grouping** for fan-outs. All four actions and the batch card are gated live. Only the proposed state stays deferred, by design; see [what shipped](#slice-4--what-shipped-2026-07-29).
 
 ## Acceptance (slice 1)
 

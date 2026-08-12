@@ -8,6 +8,7 @@ import {
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
+    UserTurn,
 } from '../models/turn.model';
 import {reduce, ReducerAction} from './turn-reducer';
 
@@ -66,6 +67,66 @@ describe('turn-reducer — user_message / system_message', () => {
         expect(state.turns).toEqual([
             {kind: 'system', id: 's1', content: 'Session ended.', timestamp: 200},
         ]);
+    });
+});
+
+describe('user_message attachments before upload', () => {
+    it('keeps distinct ids for attachments that have no server path yet', () => {
+        const state = reduce(EMPTY_CONVERSATION, {
+            type: 'user_message',
+            id: 'user-1',
+            content: 'here',
+            attachments: [
+                {id: 'p1', name: 'a.pdf', size: 1, mimeType: 'application/pdf'},
+                {id: 'p2', name: 'b.pdf', size: 2, mimeType: 'application/pdf'},
+            ],
+            timestamp: 1,
+        });
+
+        const turn = state.turns[state.turns.length - 1];
+        expect(turn.kind).toBe('user');
+        const ids = (turn as UserTurn).attachments?.map((a) => a.id);
+        expect(ids).toEqual(['p1', 'p2']);
+        expect(new Set(ids).size).toBe(2);
+    });
+});
+
+describe('turn-reducer — update_attachments', () => {
+    it('patches the chips of an already-rendered bubble in place', () => {
+        const state = play([
+            {
+                type: 'user_message',
+                id: 'user-1',
+                content: 'here',
+                attachments: [{id: 'p1', name: 'a.pdf', size: 1, mimeType: 'application/pdf'}],
+                timestamp: 1,
+            },
+            {type: 'user_message', id: 'user-2', content: 'and this', timestamp: 2},
+            {
+                type: 'update_attachments',
+                id: 'user-1',
+                // The upload resolved: real path, server-renamed on collision.
+                attachments: [
+                    {id: 'p1', name: 'a_1.pdf', size: 1, mimeType: 'application/pdf', path: 'uploads/a_1.pdf'},
+                ],
+            },
+        ]);
+
+        // Patched in place: no duplicate bubble, and the message the user
+        // queued behind it stays behind it.
+        expect(state.turns.map((t) => t.id)).toEqual(['user-1', 'user-2']);
+        expect((state.turns[0] as UserTurn).attachments).toEqual([
+            {id: 'p1', name: 'a_1.pdf', size: 1, mimeType: 'application/pdf', path: 'uploads/a_1.pdf'},
+        ]);
+    });
+
+    it('is a no-op when no turn matches the id', () => {
+        const state = play([
+            {type: 'user_message', id: 'u1', content: 'hi', timestamp: 1},
+            {type: 'update_attachments', id: 'gone', attachments: []},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        expect((state.turns[0] as UserTurn).attachments).toBeUndefined();
     });
 });
 
@@ -748,6 +809,47 @@ describe('turn-reducer — permissions', () => {
         expect(tc).toBeDefined();
         expect(tc.status).toBe('denied');
         expect(tc.id).toBe('tc-ghost');
+    });
+
+    it('permission_decision (expired) marks the call unanswered, NOT denied', () => {
+        // A gate that timed out or was swept at turn end is not a refusal.
+        // Painting it "denied" is the fabricated-denial bug, in the UI:
+        // docs/done/supervised_parallel_gates_timeout_fabricates_denial.md
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {
+                type: 'permission_request',
+                toolUseId: 'tc1',
+                tool: 'web_search',
+                args: {},
+                timestamp: 1100,
+            },
+            {
+                type: 'permission_decision',
+                toolUseId: 'tc1',
+                decision: 'expired',
+                timestamp: 1200,
+            },
+        ]);
+        const tc = activeTurn(state).events[0] as ToolCallEvent;
+        expect(tc.status).toBe('expired');
+        expect(tc.status).not.toBe('denied');
+        expect(tc.decision).toBe('expired');
+    });
+
+    it('permission_decision (expired) without a prior request fabricates nothing', () => {
+        // The denied path synthesises a marker so a deny-before-start is
+        // visible. An expired gate must NOT invent a row the user never saw.
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {
+                type: 'permission_decision',
+                toolUseId: 'tc-ghost',
+                decision: 'expired',
+                timestamp: 1100,
+            },
+        ]);
+        expect(activeTurn(state).events).toHaveLength(0);
     });
 
     it('permission_decision (approved) records the decision but does not change a running call', () => {

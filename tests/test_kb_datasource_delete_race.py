@@ -55,9 +55,15 @@ async def test_delete_waits_for_writer_then_stale_reindex_cannot_resurrect_index
         _datasource_id: str,
         *,
         authority_project_scope_id: str | None = None,
+        deleted_by: str | None = None,
     ) -> bool:
         nonlocal alive
         assert authority_project_scope_id is None
+        # This test calls _delete_kb_datasource_with_index directly with no
+        # deleted_by, so the default must reach here as None, not be dropped
+        # silently — the same passthrough the endpoint relies on (Task 12
+        # item C, fix round 1).
+        assert deleted_by is None
         events.append("app-delete")
         alive = False
         return True
