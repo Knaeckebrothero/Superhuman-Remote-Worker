@@ -18,6 +18,9 @@ from fastapi import HTTPException
 UNIT_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 POD_NAME = "stateless-agent-1"
 POD_UID = "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"
+WORKSPACE_GENERATION = "11111111-1111-4111-8111-111111111111"
+WORKSPACE_RUNTIME = "22222222-2222-4222-8222-222222222222"
+WORKSPACE_FINGERPRINT = "SHA256:" + ("A" * 43)
 
 LEASED_ROW = {
     "unit_kind": "session_turn",
@@ -122,6 +125,33 @@ def _patch(monkeypatch, orch_main, db, *, attach="SENTINEL"):
     )
     monkeypatch.setattr(orch_main, "_assemble_session_attach_payload", assembly)
     return inject, assembly
+
+
+def _worker_attestation(orch_main, **overrides):
+    values = {
+        "backing_id": ("k8s-pod:superhuman-remote-worker:" + WORKSPACE_GENERATION),
+        "workspace_generation": WORKSPACE_GENERATION,
+        "runtime_incarnation": WORKSPACE_RUNTIME,
+        "ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
+        "host": "10.0.0.9",
+        "pod_ip": "10.0.0.9",
+        "port": 30022,
+    }
+    values.update(overrides)
+    return orch_main.WorkspaceRuntimeAttestation(**values)
+
+
+def _patch_worker_attestation(monkeypatch, orch_main, *attestations):
+    if not attestations:
+        exact = _worker_attestation(orch_main)
+        attestations = (exact, exact)
+    attest = AsyncMock(side_effect=attestations)
+    monkeypatch.setattr(
+        orch_main.container_provisioner,
+        "attest_workspace_runtime",
+        attest,
+    )
+    return attest
 
 
 @pytest.mark.asyncio
@@ -416,13 +446,29 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
     monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
     inherit = AsyncMock(return_value=("proceed", None))
     monkeypatch.setattr(orch_main, "_resolve_subjob_inherited_workspace", inherit)
+    attest = _patch_worker_attestation(monkeypatch, orch_main)
 
     out = await orch_main.internal_unit_claim_bundle(
         UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
     )
 
     inherit.assert_awaited_once_with(job)
-    builder.assert_awaited_once_with(job, persist_dispatch_state=False)
+    builder.assert_awaited_once()
+    attested_job = builder.await_args.args[0]
+    assert attested_job is not job
+    assert attested_job["context"]["workspace_container"] == {
+        "status": "ready",
+        "provisioner": "k8s",
+        "pod_ip": "10.0.0.9",
+        "host": "10.0.0.9",
+        "port": 30022,
+    }
+    assert attested_job["config_override"]["workspace"]["remote"]["host"] == (
+        "10.0.0.9"
+    )
+    assert builder.await_args.kwargs == {"persist_dispatch_state": False}
+    assert attest.await_count == 2
+    assert attest.await_args_list[0].args[0] == orch_main.WorkspaceOwner.job(UNIT_ID)
     db.conn.fetchval.assert_awaited_once()
     assert "state = 'leased'" in db.conn.fetchval.await_args.args[0]
     assert out == {
@@ -434,6 +480,11 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
             "job_id": UNIT_ID,
             "description": "work",
             "config_name": "worker_base",
+            "workspace_generation": WORKSPACE_GENERATION,
+            "workspace_runtime_incarnation": WORKSPACE_RUNTIME,
+            "workspace_ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
+            "workspace_owner_kind": "job",
+            "workspace_owner_id": UNIT_ID,
         },
         "batch": {
             "target_wall_seconds": 360.0,
@@ -477,6 +528,7 @@ async def test_worker_bundle_stolen_during_assembly_is_rejected(monkeypatch):
         "_resolve_subjob_inherited_workspace",
         AsyncMock(return_value=("proceed", None)),
     )
+    _patch_worker_attestation(monkeypatch, orch_main)
 
     with pytest.raises(HTTPException) as exc:
         await orch_main.internal_unit_claim_bundle(
@@ -485,6 +537,104 @@ async def test_worker_bundle_stolen_during_assembly_is_rejected(monkeypatch):
 
     assert exc.value.status_code == 403
     assert exc.value.detail == "Lease validation failed"
+
+
+@pytest.mark.asyncio
+async def test_worker_bundle_rejects_workspace_drift_after_slow_assembly(monkeypatch):
+    from orchestrator import main as orch_main
+
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "execution_lane": "stateless",
+        "context": {
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.0.0.8",
+            }
+        },
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(
+        orch_main,
+        "_build_job_start_request",
+        AsyncMock(
+            return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="x")
+        ),
+    )
+    monkeypatch.setattr(
+        orch_main,
+        "_resolve_subjob_inherited_workspace",
+        AsyncMock(return_value=("proceed", None)),
+    )
+    initial = _worker_attestation(orch_main)
+    changed = _worker_attestation(
+        orch_main,
+        runtime_incarnation="33333333-3333-4333-8333-333333333333",
+    )
+    _patch_worker_attestation(monkeypatch, orch_main, initial, changed)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Stateless worker workspace authority unavailable"
+    db.conn.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inherited_worker_attests_parent_but_keeps_child_tmux_owner(monkeypatch):
+    from orchestrator import main as orch_main
+
+    parent_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "parent_job_id": parent_id,
+        "execution_lane": "stateless",
+        "context": {
+            "inherits_parent_workspace": True,
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "host": "stale.example",
+            },
+        },
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(
+        orch_main,
+        "_resolve_subjob_inherited_workspace",
+        AsyncMock(return_value=("proceed", None)),
+    )
+    builder = AsyncMock(
+        return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="child")
+    )
+    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    attest = _patch_worker_attestation(monkeypatch, orch_main)
+
+    out = await orch_main.internal_unit_claim_bundle(
+        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    )
+
+    assert attest.await_count == 2
+    assert all(
+        call.args[0] == orch_main.WorkspaceOwner.job(parent_id)
+        for call in attest.await_args_list
+    )
+    assert builder.await_args.args[0]["context"]["workspace_container"]["host"] == (
+        "10.0.0.9"
+    )
+    assert out["job"]["job_id"] == UNIT_ID
+    assert out["job"]["workspace_owner_kind"] == "job"
+    assert out["job"]["workspace_owner_id"] == parent_id
 
 
 @pytest.mark.asyncio

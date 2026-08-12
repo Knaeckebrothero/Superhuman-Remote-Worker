@@ -351,6 +351,8 @@ class RemoteBackend(WorkspaceBackend):
         workspace_generation: Optional[str] = None,
         runtime_incarnation: Optional[str] = None,
         expected_host_key_fingerprint: Optional[str] = None,
+        workspace_owner_kind: Optional[str] = None,
+        workspace_owner_id: Optional[str] = None,
     ):
         if paramiko is None:
             raise ImportError(
@@ -393,6 +395,35 @@ class RemoteBackend(WorkspaceBackend):
             raise ValueError(
                 "workspace generation and runtime incarnation must be supplied together"
             )
+        if (workspace_owner_kind is None) != (workspace_owner_id is None):
+            raise ValueError("workspace owner kind and id must be supplied together")
+        if workspace_owner_kind is not None and self._workspace_generation is None:
+            raise ValueError(
+                "workspace owner authority requires generation and runtime incarnation"
+            )
+        if workspace_owner_kind is not None:
+            if workspace_owner_kind not in {"job", "session"}:
+                raise ValueError("workspace owner kind must be 'job' or 'session'")
+            try:
+                canonical_owner_id = str(uuid.UUID(str(workspace_owner_id)))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ValueError("workspace owner id must be a UUID") from exc
+            if str(workspace_owner_id) != canonical_owner_id:
+                raise ValueError("workspace owner id must be a canonical UUID")
+            self._workspace_owner_kind = workspace_owner_kind
+            self._workspace_owner_id = canonical_owner_id
+        else:
+            # Persistent-session callers predate the explicit owner fields;
+            # their remote job id has always been the session owner id.
+            self._workspace_owner_kind = "session"
+            self._workspace_owner_id = self._job_id
+        # Sharing is an identity fact, never a caller-selectable cleanup mode:
+        # a worker whose tmux job id differs from the explicit workspace owner
+        # must not run workspace-wide process retirement.
+        self._shared_workspace = (
+            workspace_owner_kind is not None
+            and self._workspace_owner_id != self._job_id
+        )
         self._expected_host_key_fingerprint = _validated_expected_host_key_fingerprint(
             expected_host_key_fingerprint
         )
@@ -555,13 +586,26 @@ class RemoteBackend(WorkspaceBackend):
             and self._runtime_incarnation is not None
         )
 
+    @property
+    def shared_workspace(self) -> bool:
+        """True when this tmux job operates inside another owner's workspace."""
+
+        return self._shared_workspace
+
     def _workspace_process_tag(self) -> str:
         """Exact cooperative process identity inherited by workspace residents."""
 
-        if not self.workspace_incarnation_fenced or not self._job_id:
+        if (
+            not self.workspace_incarnation_fenced
+            or not self._workspace_owner_kind
+            or not self._workspace_owner_id
+        ):
             raise AssertionError("workspace process tag requires exact session runtime")
         assert self._runtime_incarnation is not None
-        return f"v1:session:{self._job_id}:{self._runtime_incarnation}"
+        return (
+            f"v1:{self._workspace_owner_kind}:{self._workspace_owner_id}:"
+            f"{self._runtime_incarnation}"
+        )
 
     def _shell_process_tag(self, generation: str) -> str:
         if not self.workspace_incarnation_fenced or not self._job_id:
@@ -641,24 +685,29 @@ class RemoteBackend(WorkspaceBackend):
             return lines
         return "".join(f"{indent}{line}\n" for line in lines.splitlines())
 
-    def _stateless_workspace_process_zero_shell(self, *, terminate: bool) -> str:
-        """Kill/verify exact runtime-tagged descendants, excluding this SSH chain."""
+    def _stateless_process_zero_shell(
+        self,
+        *,
+        env_name: str,
+        tag_argument: str,
+        terminate: bool,
+    ) -> str:
+        """Kill/verify exactly tagged descendants, excluding this SSH chain."""
 
-        tag = self._workspace_process_tag()
         mode = "terminate" if terminate else "verify"
         # Python avoids spawning grep/tr children whose inherited environment
         # could match the very tag being scanned. It also handles /proc stat
         # names with spaces and excludes the complete verifier ancestor chain
         # (entrypoint/sshd/flock/sh), while still finding disowned siblings.
         return f"""
-python3 - {shlex.quote(tag)} {mode} <<'__SRW_PROCESS_ZERO_PY__'
+python3 - {shlex.quote(env_name)} {tag_argument} {mode} <<'__SRW_PROCESS_ZERO_PY__'
 import os
 import signal
 import sys
 import time
 
-tag = ({_WORKSPACE_PROCESS_TAG_ENV!r} + "=" + sys.argv[1]).encode()
-terminate = sys.argv[2] == "terminate"
+tag = (sys.argv[1] + "=" + sys.argv[2]).encode()
+terminate = sys.argv[3] == "terminate"
 
 ancestors = set()
 pid = os.getpid()
@@ -726,6 +775,42 @@ if ambiguous or final_ambiguous:
     raise SystemExit(86)
 __SRW_PROCESS_ZERO_PY__
 """
+
+    def _stateless_workspace_process_zero_shell(self, *, terminate: bool) -> str:
+        """Kill/verify all processes belonging to this dedicated workspace."""
+
+        return self._stateless_process_zero_shell(
+            env_name=_WORKSPACE_PROCESS_TAG_ENV,
+            tag_argument=shlex.quote(self._workspace_process_tag()),
+            terminate=terminate,
+        )
+
+    def _stateless_shell_process_zero_shell(self, *, terminate: bool) -> str:
+        """Kill/verify only this tmux owner's exact shell generation."""
+
+        if not self.workspace_incarnation_fenced or not self._job_id:
+            raise AssertionError("shell process zero requires exact runtime authority")
+        assert self._workspace_generation is not None
+        assert self._runtime_incarnation is not None
+        prefix = shlex.quote(
+            f"v1:{self._job_id}:{self._workspace_generation}:"
+            f"{self._runtime_incarnation}:"
+        )
+        return (
+            f'_srw_process_zero_tag={prefix}"$_srw_generation"\n'
+            + self._stateless_process_zero_shell(
+                env_name=_SHELL_PROCESS_TAG_ENV,
+                tag_argument='"$_srw_process_zero_tag"',
+                terminate=terminate,
+            )
+        )
+
+    def _stateless_terminal_process_zero_shell(self, *, terminate: bool) -> str:
+        """Use child-shell scope for shared workspaces, workspace scope otherwise."""
+
+        if self._shared_workspace:
+            return self._stateless_shell_process_zero_shell(terminate=terminate)
+        return self._stateless_workspace_process_zero_shell(terminate=terminate)
 
     def retire_claim_resource_owner(self) -> None:
         """Wait out admitted resource I/O, then reject later local callers."""
@@ -2103,6 +2188,7 @@ __SRW_PROCESS_ZERO_PY__
         return (
             self._tmux_state_shell()
             + "_srw_load_state || exit 78\n"
+            + '[ "$_srw_process_tagged" = true ] || exit 81\n'
             + f'[ "$_srw_workspace_generation" = {expected_workspace} ] '
             + "|| exit 80\n"
             + f'[ "$_srw_runtime_incarnation" = {expected_runtime} ] '
@@ -2110,7 +2196,7 @@ __SRW_PROCESS_ZERO_PY__
             + '[ "$_srw_status" = retired ] || exit 75\n'
             + f'[ "$_srw_token" = {token} ] || exit 75\n'
             + f"! tmux has-session -t {target} 2>/dev/null || exit 79\n"
-            + self._stateless_workspace_process_zero_shell(terminate=False)
+            + self._stateless_terminal_process_zero_shell(terminate=False)
         )
 
     def _tmux_exec_checked(
@@ -2489,10 +2575,10 @@ __SRW_PROCESS_ZERO_PY__
         current runtime has no same-named tmux session; a conflicting live
         session is ambiguous and fails closed.
 
-        Version-1 records are migrated in place when their exact tmux session
-        is still live.  If that process disappeared (pod replacement or an
-        interrupted terminal retirement), the current authoritative claimant
-        creates a fresh generation instead of being stranded forever.
+        Protocol-v1 and protocol-v2 records predate mandatory inherited
+        process tags. They are refused with exit 81 without mutation, whether
+        active or retired; proving a safe live-process migration requires a
+        separate explicitly authorized protocol.
         """
         if (
             self._shell_owner_token is None
@@ -2598,45 +2684,7 @@ __SRW_PROCESS_ZERO_PY__
             "    fi\n    " + create_shell.replace("\n", "\n    ") + "\n  fi\n"
         )
 
-        legacy_record = (
-            "  exit 81\n"
-            f'  [ "$_srw_token" -le {shlex.quote(token)} ] || exit 75\n'
-            f'  if [ "$_srw_status" = retired ] && '
-            f'[ {shlex.quote(token)} -le "$_srw_token" ]; then exit 75; fi\n'
-            f"  if tmux has-session -t {target} 2>/dev/null; then\n"
-            + "    "
-            + inspect_tmux.replace("\n", "\n    ").rstrip()
-            + "\n"
-            f'    [ -z "$_srw_tmux_owner" ] || '
-            f'[ "$_srw_tmux_owner" = {shlex.quote(expected_owner)} ] || exit 73\n'
-            + "    "
-            + current_or_older_token
-            + '    [ -z "$_srw_tmux_generation" ] || '
-            '[ "$_srw_tmux_generation" = "$_srw_generation" ] || exit 79\n'
-            '    [ -z "$_srw_tmux_workspace_generation" ] || exit 80\n'
-            '    [ -z "$_srw_tmux_runtime_incarnation" ] || exit 80\n'
-            '    if [ "$_srw_status" = active ]; then\n'
-            + "      "
-            + exact_owner
-            + "      "
-            + exact_generation
-            + f"      tmux set-option -t {target} {_TMUX_OWNER_TOKEN_OPTION} "
-            f"{shlex.quote(token)} || exit 77\n"
-            f"      tmux set-option -t {target} "
-            f"{_TMUX_WORKSPACE_GENERATION_OPTION} "
-            f"{shlex.quote(expected_workspace)} || exit 77\n"
-            f"      tmux set-option -t {target} "
-            f"{_TMUX_RUNTIME_INCARNATION_OPTION} "
-            f"{shlex.quote(expected_runtime)} || exit 77\n"
-            f"      _srw_write_state active {shlex.quote(token)} "
-            '"$_srw_generation"\n'
-            "      printf existing\n"
-            "    else\n"
-            f"      tmux kill-session -t {target} || exit 77\n      "
-            + create_shell.replace("\n", "\n      ")
-            + "\n    fi\n"
-            "  else\n    " + create_shell.replace("\n", "\n    ") + "\n  fi\n"
-        )
+        legacy_record = "  exit 81\n"
 
         inner = (
             self._tmux_state_shell() + "if _srw_load_state; then _srw_marker=present; "
@@ -3935,6 +3983,18 @@ __SRW_PROCESS_ZERO_PY__
                     assert self._runtime_incarnation is not None
                     expected_workspace = shlex.quote(self._workspace_generation)
                     expected_runtime = shlex.quote(self._runtime_incarnation)
+                    if self._shared_workspace:
+                        # Eager claim installs the exact child marker before
+                        # graph work. Without it there is no safe shell
+                        # generation with which to find disowned child
+                        # processes; a random fallback would falsely prove
+                        # zero and allow queue completion.
+                        missing_marker_retirement = "  exit 79\n"
+                    else:
+                        missing_marker_retirement = (
+                            "  _srw_retire_incarnation=absent\n"
+                            f"  _srw_generation={shlex.quote(fallback_generation)}\n"
+                        )
                     load_for_retirement = (
                         "if _srw_load_state; then\n"
                         '  [ "$_srw_process_tagged" = true ] || exit 81\n'
@@ -3958,9 +4018,8 @@ __SRW_PROCESS_ZERO_PY__
                         "  fi\n"
                         "else\n"
                         '  _srw_rc=$?; [ "$_srw_rc" -eq 1 ] || exit "$_srw_rc"\n'
-                        "  _srw_retire_incarnation=absent\n"
-                        f"  _srw_generation={shlex.quote(fallback_generation)}\n"
-                        "fi\n"
+                        + missing_marker_retirement
+                        + "fi\n"
                     )
                     tmux_incarnation_check = (
                         "  _srw_tmux_workspace_generation=$(tmux display-message -p "
@@ -4019,7 +4078,7 @@ __SRW_PROCESS_ZERO_PY__
                     + '"$_srw_generation"\n'
                     + "fi\n"
                     + (
-                        self._stateless_workspace_process_zero_shell(terminate=True)
+                        self._stateless_terminal_process_zero_shell(terminate=True)
                         if self.workspace_incarnation_fenced
                         else ""
                     )

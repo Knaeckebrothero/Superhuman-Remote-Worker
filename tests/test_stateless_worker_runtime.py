@@ -13,11 +13,16 @@ import pytest
 
 import src.api.persistent_app as pa
 import src.api.turn_executor as turn_executor
-from src.agent import UniversalAgent
+from src.agent import UniversalAgent, _stateless_worker_remote_authority
+from src.core.workspace_backend import WorkspaceUnavailableError
 from src.graph import route_entry
 from src.shared.run_queue import ClaimedUnit, EnqueueResult
 from src.shared.job_steering import CheckpointSteeringAcker, context_delivery_key
 from src.shared.worker_queue import WorkerClaim, WorkerRenewal, WorkerRotation
+
+WORKSPACE_GENERATION = "11111111-1111-4111-8111-111111111111"
+WORKSPACE_RUNTIME = "22222222-2222-4222-8222-222222222222"
+WORKSPACE_FINGERPRINT = "SHA256:" + ("A" * 43)
 
 
 def _claim(
@@ -68,6 +73,11 @@ def _bundle(claim: WorkerClaim) -> dict:
             "description": "continue the task",
             "config_name": "worker_base",
             "context": {},
+            "workspace_generation": WORKSPACE_GENERATION,
+            "workspace_runtime_incarnation": WORKSPACE_RUNTIME,
+            "workspace_ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
+            "workspace_owner_kind": "job",
+            "workspace_owner_id": job_id,
         },
         "batch": {
             "target_wall_seconds": 60.0,
@@ -75,6 +85,88 @@ def _bundle(claim: WorkerClaim) -> dict:
             "iteration_cap": 3,
         },
     }
+
+
+def test_worker_bundle_preserves_exact_workspace_authority_in_metadata():
+    claim = _claim()
+    request, _ = turn_executor.StatelessTurnExecutor._parse_worker_bundle(
+        _bundle(claim), claim
+    )
+
+    metadata = turn_executor.StatelessTurnExecutor._worker_job_metadata(request)
+
+    assert metadata["workspace_generation"] == WORKSPACE_GENERATION
+    assert metadata["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME
+    assert metadata["workspace_ssh_host_key_fingerprint"] == WORKSPACE_FINGERPRINT
+    assert metadata["workspace_owner_kind"] == "job"
+    assert metadata["workspace_owner_id"] == str(claim.unit.unit_id)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("workspace_generation", None),
+        ("workspace_runtime_incarnation", "not-a-uuid"),
+        ("workspace_ssh_host_key_fingerprint", "SHA256:short"),
+        ("workspace_owner_kind", "session"),
+        ("workspace_owner_id", "NOT-CANONICAL"),
+    ],
+)
+def test_worker_bundle_rejects_missing_or_malformed_workspace_authority(
+    field, replacement
+):
+    claim = _claim()
+    bundle = _bundle(claim)
+    if replacement is None:
+        bundle["job"].pop(field)
+    else:
+        bundle["job"][field] = replacement
+
+    with pytest.raises(ValueError):
+        turn_executor.StatelessTurnExecutor._parse_worker_bundle(bundle, claim)
+
+
+def test_agent_worker_authority_maps_all_remote_backend_fields():
+    metadata = {
+        "workspace_generation": WORKSPACE_GENERATION,
+        "workspace_runtime_incarnation": WORKSPACE_RUNTIME,
+        "workspace_ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
+        "workspace_owner_kind": "job",
+        "workspace_owner_id": "33333333-3333-4333-8333-333333333333",
+    }
+
+    assert _stateless_worker_remote_authority(metadata, 7) == {
+        "workspace_generation": WORKSPACE_GENERATION,
+        "runtime_incarnation": WORKSPACE_RUNTIME,
+        "expected_host_key_fingerprint": WORKSPACE_FINGERPRINT,
+        "workspace_owner_kind": "job",
+        "workspace_owner_id": "33333333-3333-4333-8333-333333333333",
+    }
+    assert _stateless_worker_remote_authority({}, None) == {}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"workspace_generation": None},
+        {"workspace_runtime_incarnation": None},
+        {"workspace_ssh_host_key_fingerprint": None},
+        {"workspace_owner_kind": "session"},
+        {"workspace_owner_id": None},
+    ],
+)
+def test_agent_worker_authority_fails_closed_on_incomplete_or_non_job_owner(mutation):
+    metadata = {
+        "workspace_generation": WORKSPACE_GENERATION,
+        "workspace_runtime_incarnation": WORKSPACE_RUNTIME,
+        "workspace_ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
+        "workspace_owner_kind": "job",
+        "workspace_owner_id": "33333333-3333-4333-8333-333333333333",
+    }
+    metadata.update(mutation)
+
+    with pytest.raises(WorkspaceUnavailableError):
+        _stateless_worker_remote_authority(metadata, 7)
 
 
 class _FakeAgent:

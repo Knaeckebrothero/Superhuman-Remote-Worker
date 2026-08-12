@@ -62,9 +62,11 @@ import json
 import logging
 import os
 import random
+import re
 import socket
 import time
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from uuid import UUID
 
 from .lease_context import LeaseHandle, LeaseLostError, current_lease
 from .models import JobStartRequest
@@ -1072,6 +1074,42 @@ class StatelessTurnExecutor:
         request = JobStartRequest.model_validate(bundle.get("job") or {})
         if request.job_id != job_id:
             raise ValueError("worker claim bundle job payload id mismatch")
+        authority = {
+            "workspace_generation": request.workspace_generation,
+            "workspace_runtime_incarnation": request.workspace_runtime_incarnation,
+            "workspace_ssh_host_key_fingerprint": (
+                request.workspace_ssh_host_key_fingerprint
+            ),
+            "workspace_owner_kind": request.workspace_owner_kind,
+            "workspace_owner_id": request.workspace_owner_id,
+        }
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in authority.values()
+        ):
+            raise ValueError("worker claim bundle is missing workspace authority")
+        if request.workspace_owner_kind != "job":
+            raise ValueError("worker claim workspace owner kind is invalid")
+        for field in (
+            "workspace_generation",
+            "workspace_runtime_incarnation",
+            "workspace_owner_id",
+        ):
+            value = str(authority[field])
+            try:
+                canonical = str(UUID(value))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"worker claim {field} is invalid") from exc
+            if value != canonical:
+                raise ValueError(f"worker claim {field} is invalid")
+        if (
+            re.fullmatch(
+                r"SHA256:[A-Za-z0-9+/]{43}",
+                str(request.workspace_ssh_host_key_fingerprint),
+            )
+            is None
+        ):
+            raise ValueError("worker claim SSH host identity is invalid")
         batch = bundle.get("batch")
         if not isinstance(batch, dict):
             raise ValueError("worker claim bundle is missing its batch envelope")
@@ -1107,6 +1145,17 @@ class StatelessTurnExecutor:
             ("repositories", "repositories"),
             ("branch_name", "branch_name"),
             ("project_id", "project_id"),
+            ("workspace_generation", "workspace_generation"),
+            (
+                "workspace_runtime_incarnation",
+                "workspace_runtime_incarnation",
+            ),
+            (
+                "workspace_ssh_host_key_fingerprint",
+                "workspace_ssh_host_key_fingerprint",
+            ),
+            ("workspace_owner_kind", "workspace_owner_kind"),
+            ("workspace_owner_id", "workspace_owner_id"),
         ):
             value = getattr(request, field)
             if value:
