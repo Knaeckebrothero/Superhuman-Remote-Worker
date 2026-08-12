@@ -129,6 +129,104 @@ def _owned_pod(
     )
 
 
+class TestWorkspaceRuntimeAttestation:
+    OWNER = WorkspaceOwner.job("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    RUNTIME = "11111111-1111-4111-8111-111111111111"
+    FINGERPRINT = "SHA256:" + ("A" * 43)
+
+    @classmethod
+    def _provisioner(cls):
+        from orchestrator.services.container_provisioner import ContainerProvisioner
+
+        provisioner = ContainerProvisioner()
+        provisioner._k8s_available = True
+        provisioner._core_api = MagicMock()
+        provisioner._resolve_network_tier = AsyncMock(return_value="internet-only")
+        manifest = provisioner._build_pod_manifest(
+            cls.OWNER.pod_name,
+            cls.OWNER,
+            "workspace:test",
+            "500m",
+            "1Gi",
+            "2",
+            "4Gi",
+            network_tier="internet-only",
+        )
+        provisioner._core_api.read_namespaced_pod.return_value = _pod_from_manifest(
+            manifest,
+            uid=cls.RUNTIME,
+        )
+        return provisioner
+
+    @pytest.mark.asyncio
+    async def test_attests_exact_job_backing_runtime_endpoint_and_host_key(self):
+        provisioner = self._provisioner()
+        backing_id = (
+            "k8s-pod:superhuman-remote-worker:11111111-1111-4111-8111-111111111111"
+        )
+        provisioner._trusted_pod_ssh_identity = AsyncMock(
+            return_value=(backing_id, self.FINGERPRINT, self.RUNTIME)
+        )
+
+        attested = await provisioner.attest_workspace_runtime(self.OWNER)
+
+        assert attested.backing_id == backing_id
+        assert attested.workspace_generation == self.RUNTIME
+        assert attested.runtime_incarnation == self.RUNTIME
+        assert attested.ssh_host_key_fingerprint == self.FINGERPRINT
+        assert attested.host == "10.42.0.100"
+        assert attested.pod_ip == "10.42.0.100"
+        assert attested.port == 30022
+        provisioner._trusted_pod_ssh_identity.assert_awaited_once_with(
+            self.OWNER.pod_name,
+            pvc_name=None,
+            expected_owner=self.OWNER,
+            expected_runtime_incarnation=self.RUNTIME,
+            expected_network_tier="internet-only",
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("backing_id", "fingerprint", "confirmed_runtime"),
+        [
+            (
+                "k8s-pod:wrong:11111111-1111-4111-8111-111111111111",
+                FINGERPRINT,
+                RUNTIME,
+            ),
+            (
+                "k8s-pod:superhuman-remote-worker:not-a-uuid",
+                FINGERPRINT,
+                RUNTIME,
+            ),
+            (
+                "k8s-pod:superhuman-remote-worker:11111111-1111-4111-8111-111111111111",
+                "SHA256:short",
+                RUNTIME,
+            ),
+            (
+                "k8s-pod:superhuman-remote-worker:11111111-1111-4111-8111-111111111111",
+                FINGERPRINT,
+                "22222222-2222-4222-8222-222222222222",
+            ),
+        ],
+    )
+    async def test_refuses_malformed_or_drifting_attestation(
+        self, backing_id, fingerprint, confirmed_runtime
+    ):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        provisioner = self._provisioner()
+        provisioner._trusted_pod_ssh_identity = AsyncMock(
+            return_value=(backing_id, fingerprint, confirmed_runtime)
+        )
+
+        with pytest.raises(WorkspaceRuntimeAuthorityError):
+            await provisioner.attest_workspace_runtime(self.OWNER)
+
+
 class TestContainerProvisionerInit:
     """Tests for ContainerProvisioner initialization."""
 
@@ -1934,6 +2032,130 @@ class TestStrictStatelessWorkspaceCreation:
         p._adopt_configmap = AsyncMock(return_value=True)
         p._seed_workspace_state = AsyncMock(return_value=None)
         return p
+
+    @pytest.mark.asyncio
+    async def test_attest_workspace_runtime_returns_exact_pvc_authority(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAttestation,
+        )
+
+        p = self._provisioner()
+        owner = self._owner()
+        pvc_name = f"pvc-ws-thread-{self.THREAD_ID[:12]}"
+        backing_uid = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+        fingerprint = f"SHA256:{'A' * 43}"
+        p._core_api.read_namespaced_pod.return_value = self._pod(pvc_name=pvc_name)
+        p._trusted_pod_ssh_identity = AsyncMock(
+            return_value=(
+                f"k8s-pvc:{p._namespace}:{backing_uid}",
+                fingerprint,
+                self.RUNTIME,
+            )
+        )
+
+        attestation = await p.attest_workspace_runtime(owner)
+
+        assert attestation == WorkspaceRuntimeAttestation(
+            backing_id=f"k8s-pvc:{p._namespace}:{backing_uid}",
+            workspace_generation=backing_uid,
+            runtime_incarnation=self.RUNTIME,
+            ssh_host_key_fingerprint=fingerprint,
+            host=f"{owner.pod_name}.{p._namespace}.svc.cluster.local",
+            pod_ip="10.42.0.8",
+        )
+        p._trusted_pod_ssh_identity.assert_awaited_once_with(
+            owner.pod_name,
+            pvc_name=pvc_name,
+            expected_owner=owner,
+            expected_runtime_incarnation=self.RUNTIME,
+            expected_network_tier="internet-only",
+        )
+
+    @pytest.mark.asyncio
+    async def test_attest_workspace_runtime_rejects_post_probe_pod_uid_drift(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        p = self._provisioner()
+        pvc_name = f"pvc-ws-thread-{self.THREAD_ID[:12]}"
+        p._core_api.read_namespaced_pod.return_value = self._pod(pvc_name=pvc_name)
+        p._trusted_pod_ssh_identity = AsyncMock(
+            return_value=(
+                f"k8s-pvc:{p._namespace}:77777777-8888-4999-8aaa-bbbbbbbbbbbb",
+                f"SHA256:{'A' * 43}",
+                "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+            )
+        )
+
+        with pytest.raises(WorkspaceRuntimeAuthorityError, match="Pod UID changed"):
+            await p.attest_workspace_runtime(self._owner())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("drift", ["owner", "phase", "pod-ip", "readiness"])
+    async def test_attest_workspace_runtime_rejects_pod_authority_drift(self, drift):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        p = self._provisioner()
+        pod = self._pod(
+            pvc_name=f"pvc-ws-thread-{self.THREAD_ID[:12]}",
+            owner_id=(
+                "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff" if drift == "owner" else None
+            ),
+        )
+        if drift == "phase":
+            pod.status.phase = "Pending"
+        elif drift == "pod-ip":
+            pod.status.pod_ip = ""
+        elif drift == "readiness":
+            pod.status.container_statuses[0].ready = False
+        p._core_api.read_namespaced_pod.return_value = pod
+        p._trusted_pod_ssh_identity = AsyncMock()
+
+        with pytest.raises(WorkspaceRuntimeAuthorityError):
+            await p.attest_workspace_runtime(self._owner())
+
+        p._trusted_pod_ssh_identity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("backing_id", "fingerprint", "message"),
+        [
+            (
+                "k8s-pod:superhuman-remote-worker:77777777-8888-4999-8aaa-bbbbbbbbbbbb",
+                f"SHA256:{'A' * 43}",
+                "backing identity is malformed",
+            ),
+            (
+                "k8s-pvc:superhuman-remote-worker:not-a-uuid",
+                f"SHA256:{'A' * 43}",
+                "workspace backing UID is invalid",
+            ),
+            (
+                "k8s-pvc:superhuman-remote-worker:77777777-8888-4999-8aaa-bbbbbbbbbbbb",
+                "SHA256:short",
+                "fingerprint is malformed",
+            ),
+        ],
+    )
+    async def test_attest_workspace_runtime_rejects_malformed_identity_material(
+        self, backing_id, fingerprint, message
+    ):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        p = self._provisioner()
+        pvc_name = f"pvc-ws-thread-{self.THREAD_ID[:12]}"
+        p._core_api.read_namespaced_pod.return_value = self._pod(pvc_name=pvc_name)
+        p._trusted_pod_ssh_identity = AsyncMock(
+            return_value=(backing_id, fingerprint, self.RUNTIME)
+        )
+
+        with pytest.raises(WorkspaceRuntimeAuthorityError, match=message):
+            await p.attest_workspace_runtime(self._owner())
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("authority", [True, None])

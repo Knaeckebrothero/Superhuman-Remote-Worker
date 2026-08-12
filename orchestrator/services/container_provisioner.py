@@ -18,6 +18,8 @@ Selection logic:
 import asyncio
 import logging
 import os
+import re
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID, uuid4
 
@@ -65,6 +67,19 @@ class WorkspaceSSHAuthenticationError(RuntimeError):
 
 class WorkspaceRuntimeAuthorityError(RuntimeError):
     """A deterministic Pod name no longer identifies the authorized runtime."""
+
+
+@dataclass(frozen=True)
+class WorkspaceRuntimeAttestation:
+    """Exact control-plane identity for one live workspace SSH endpoint."""
+
+    backing_id: str
+    workspace_generation: str
+    runtime_incarnation: str
+    ssh_host_key_fingerprint: str
+    host: str
+    pod_ip: str
+    port: int = 30022
 
 
 def _canonical_runtime_uuid(value: Any, *, label: str) -> str:
@@ -326,6 +341,107 @@ class ContainerProvisioner:
     # =========================================================================
     # Public API
     # =========================================================================
+
+    async def attest_workspace_runtime(
+        self, owner: WorkspaceOwner
+    ) -> WorkspaceRuntimeAttestation:
+        """Attest the exact live backing, Pod, endpoint, and SSH host identity.
+
+        This is deliberately a fresh control-plane read, not a projection of
+        ``jobs.context``.  The immutable Pod/PVC/Service/seed ownership checks
+        and the host-key exec are performed by ``_trusted_pod_ssh_identity``;
+        its post-exec re-reads close deterministic-name replacement races.
+        """
+
+        if not self._k8s_available or self._core_api is None:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Kubernetes authority is unavailable"
+            )
+
+        expected_network_tier = await self._resolve_network_tier(
+            owner.id, kind=owner.network_tier_kind
+        )
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod authority probe failed"
+            ) from exc
+
+        runtime_incarnation = self._require_workspace_pod_owner(
+            pod,
+            owner=owner,
+            allow_owner_unlabeled=False,
+            expected_network_tier=expected_network_tier,
+        )
+        status = getattr(pod, "status", None)
+        pod_ip = str(getattr(status, "pod_ip", "") or "")
+        container_statuses = getattr(status, "container_statuses", None)
+        if (
+            getattr(status, "phase", None) != "Running"
+            or not pod_ip
+            or not isinstance(container_statuses, (list, tuple))
+            or not container_statuses
+            or any(
+                getattr(item, "ready", None) is not True for item in container_statuses
+            )
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod is not exactly Kubernetes-ready"
+            )
+
+        pvc_name = self._workspace_pvc_name_from_pod(pod, owner=owner)
+        try:
+            (
+                backing_id,
+                fingerprint,
+                confirmed_runtime,
+            ) = await self._trusted_pod_ssh_identity(
+                owner.pod_name,
+                pvc_name=pvc_name,
+                expected_owner=owner,
+                expected_runtime_incarnation=runtime_incarnation,
+                expected_network_tier=expected_network_tier,
+            )
+        except WorkspaceRuntimeAuthorityError:
+            raise
+        except Exception as exc:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace SSH identity attestation failed"
+            ) from exc
+
+        if confirmed_runtime != runtime_incarnation:
+            raise WorkspaceRuntimeAuthorityError("workspace Pod UID changed")
+        expected_backing_kind = "pvc" if pvc_name else "pod"
+        expected_prefix = f"k8s-{expected_backing_kind}:{self._namespace}:"
+        if not backing_id.startswith(expected_prefix):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace backing identity is malformed"
+            )
+        try:
+            workspace_generation = _canonical_runtime_uuid(
+                backing_id.removeprefix(expected_prefix),
+                label="workspace backing UID",
+            )
+        except ValueError as exc:
+            raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
+        if re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", fingerprint) is None:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace SSH host-key fingerprint is malformed"
+            )
+
+        return WorkspaceRuntimeAttestation(
+            backing_id=backing_id,
+            workspace_generation=workspace_generation,
+            runtime_incarnation=runtime_incarnation,
+            ssh_host_key_fingerprint=fingerprint,
+            host=self._workspace_dns(owner) if pvc_name else pod_ip,
+            pod_ip=pod_ip,
+        )
 
     async def create_workspace(
         self,

@@ -500,6 +500,16 @@ class TestRemoteBackendInit:
                 runtime_incarnation=runtime_incarnation,
             )
 
+    def test_workspace_owner_authority_requires_incarnation_fence(self):
+        with pytest.raises(ValueError, match="requires generation and runtime"):
+            RemoteBackend(
+                host="host",
+                workspace_path="/ws",
+                job_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                workspace_owner_kind="job",
+                workspace_owner_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            )
+
     @pytest.mark.parametrize(
         "fingerprint",
         [
@@ -1975,6 +1985,8 @@ class TestRemoteBackendTmuxFences:
         assert "flock -o -w 30" in command
         assert "bash -c" in command
         assert "__SRW_RESOURCE_ZERO__" in command
+        assert '"$_srw_process_tagged" = true' in command
+        assert "exit 81" in command
         assert execute.call_args.kwargs == {"timeout": 29, "retain_tail": True}
 
     def test_tmux_lock_command_defaults_to_sh_and_rejects_other_shells(self):
@@ -2121,6 +2133,100 @@ class TestRemoteBackendTmuxFences:
         first_option = command.index("tmux set-option", new_session)
         assert " -e SRW_WORKSPACE_PROCESS_TAG=" in command[new_session:first_option]
         assert " -e SRW_SHELL_PROCESS_TAG=" in command[new_session:first_option]
+
+    def test_worker_process_tag_uses_exact_job_workspace_owner(self):
+        job_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        backend = RemoteBackend(
+            host="workspace.test",
+            workspace_path="/home/agent-host/workspace",
+            job_id=job_id,
+            workspace_generation=_WORKSPACE_GENERATION,
+            runtime_incarnation=_RUNTIME_INCARNATION,
+            workspace_owner_kind="job",
+            workspace_owner_id=job_id,
+        )
+
+        assert backend._workspace_process_tag() == (
+            f"v1:job:{job_id}:{_RUNTIME_INCARNATION}"
+        )
+        assert backend.shared_workspace is False
+
+    def test_shared_child_terminal_cleanup_is_exact_shell_scoped(self):
+        child_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        parent_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        backend = RemoteBackend(
+            host="workspace.test",
+            workspace_path="/home/agent-host/workspace",
+            job_id=child_id,
+            workspace_generation=_WORKSPACE_GENERATION,
+            runtime_incarnation=_RUNTIME_INCARNATION,
+            workspace_owner_kind="job",
+            workspace_owner_id=parent_id,
+        )
+        backend.set_shell_owner_token(31)
+
+        with patch.object(backend, "_tmux_exec_checked") as execute:
+            backend.shell_cleanup()
+
+        command = execute.call_args.args[0]
+        assert backend._workspace_process_tag() == (
+            f"v1:job:{parent_id}:{_RUNTIME_INCARNATION}"
+        )
+        assert backend.shared_workspace is True
+        assert "python3 - SRW_SHELL_PROCESS_TAG" in command
+        assert "python3 - SRW_WORKSPACE_PROCESS_TAG" not in command
+        assert f"v1:{child_id}:{_WORKSPACE_GENERATION}:" in command
+        assert "_srw_retire_incarnation=absent" not in command
+
+    def test_shared_child_process_zero_leaves_parent_tagged_process_alive(self):
+        child_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        parent_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        backend = RemoteBackend(
+            host="workspace.test",
+            workspace_path="/home/agent-host/workspace",
+            job_id=child_id,
+            workspace_generation=_WORKSPACE_GENERATION,
+            runtime_incarnation=_RUNTIME_INCARNATION,
+            workspace_owner_kind="job",
+            workspace_owner_id=parent_id,
+        )
+        generation = "c" * 32
+        shell_tag = backend._shell_process_tag(generation)
+        workspace_tag = backend._workspace_process_tag()
+        child = subprocess.Popen(
+            ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"],
+            env={
+                **os.environ,
+                "SRW_WORKSPACE_PROCESS_TAG": workspace_tag,
+                "SRW_SHELL_PROCESS_TAG": shell_tag,
+            },
+            start_new_session=True,
+        )
+        parent = subprocess.Popen(
+            ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"],
+            env={**os.environ, "SRW_WORKSPACE_PROCESS_TAG": workspace_tag},
+            start_new_session=True,
+        )
+        try:
+            command = (
+                f"_srw_generation={generation}\n"
+                + backend._stateless_terminal_process_zero_shell(terminate=True)
+            )
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            assert completed.returncode in {0, 86}, completed.stderr
+            child.wait(timeout=3)
+            assert parent.poll() is None
+        finally:
+            for process in (child, parent):
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=3)
 
     def test_terminal_process_zero_kills_disowned_tagged_child_and_excludes_ancestors(
         self,
@@ -2275,26 +2381,42 @@ class TestRemoteBackendTmuxFences:
         assert completed.returncode == 81
         assert state_file.read_text() == successor_state
 
-    def test_legacy_live_session_migration_installs_both_authority_options(self):
+    @pytest.mark.parametrize(
+        "legacy_state",
+        [
+            lambda backend: (f"1|{backend._tmux_owner_digest}|active|20|{'a' * 32}\n"),
+            lambda backend: (
+                f"2|{backend._tmux_owner_digest}|{_WORKSPACE_GENERATION}|"
+                f"{_RUNTIME_INCARNATION}|active|20|{'a' * 32}\n"
+            ),
+            lambda backend: (
+                f"2|{backend._tmux_owner_digest}|{_WORKSPACE_GENERATION}|"
+                f"{_RUNTIME_INCARNATION}|retired|20|{'a' * 32}\n"
+            ),
+        ],
+        ids=["v1-active", "v2-active", "v2-retired"],
+    )
+    def test_pre_process_tag_records_exit_81_without_mutation(
+        self, tmp_path, legacy_state
+    ):
         backend = self._incarnation_backend(token=23)
-
         with patch.object(
             backend, "_tmux_exec_checked", return_value="existing"
         ) as execute:
             backend._stateless_create_or_observe_tmux_session()
-
         command = execute.call_args.args[0]
-        legacy_branch = command.index('[ -z "$_srw_workspace_generation" ] &&')
-        workspace_set = command.index(
-            f"{_TMUX_WORKSPACE_GENERATION_OPTION} {_WORKSPACE_GENERATION}",
-            legacy_branch,
+        state_dir = tmp_path / ".srw" / "tmux"
+        state_dir.mkdir(parents=True)
+        state_file = state_dir / backend._tmux_state_filename
+        original = legacy_state(backend)
+        state_file.write_text(original)
+
+        completed = self._run_generated_tmux_command_without_session(
+            backend, command, tmp_path
         )
-        runtime_set = command.index(
-            f"{_TMUX_RUNTIME_INCARNATION_OPTION} {_RUNTIME_INCARNATION}",
-            workspace_set,
-        )
-        rewrite = command.index("_srw_write_state active", runtime_set)
-        assert legacy_branch < workspace_set < runtime_set < rewrite
+
+        assert completed.returncode == 81
+        assert state_file.read_text() == original
 
     def test_stateless_cleanup_writes_tombstone_before_kill(self, remote_backend):
         backend, _, _ = remote_backend

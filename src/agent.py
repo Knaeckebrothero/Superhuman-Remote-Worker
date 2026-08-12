@@ -53,6 +53,7 @@ from .core.workspace import (
     WorkspaceManagerConfig,
     get_checkpoints_path,
 )
+from .core.workspace_backend import WorkspaceUnavailableError
 from .graph import (
     WORKER_BATCH_MIN_WALL_SECONDS,
     build_phase_alternation_graph,
@@ -73,6 +74,37 @@ from .utils.db_url import (
 # ensured. AsyncPostgresSaver.setup() is idempotent, but there's no need to run
 # it on every job.
 _PG_CHECKPOINT_SCHEMA_READY = False
+
+
+def _stateless_worker_remote_authority(
+    metadata: Dict[str, Any], worker_lease_token: Optional[int]
+) -> Dict[str, Any]:
+    """Build RemoteBackend authority kwargs for a leased worker claim."""
+
+    if worker_lease_token is None:
+        return {}
+    fields = {
+        "workspace_generation": metadata.get("workspace_generation"),
+        "runtime_incarnation": metadata.get("workspace_runtime_incarnation"),
+        "expected_host_key_fingerprint": metadata.get(
+            "workspace_ssh_host_key_fingerprint"
+        ),
+        "workspace_owner_kind": metadata.get("workspace_owner_kind"),
+        "workspace_owner_id": metadata.get("workspace_owner_id"),
+    }
+    if any(
+        not isinstance(value, str) or not value.strip() for value in fields.values()
+    ):
+        raise WorkspaceUnavailableError(
+            "A stateless worker claim requires an orchestrator-attested workspace "
+            "owner, backing, runtime incarnation, and SSH host identity"
+        )
+    if fields["workspace_owner_kind"] != "job":
+        raise WorkspaceUnavailableError(
+            "A stateless worker claim requires a job-owned workspace authority"
+        )
+    return fields  # RemoteBackend performs canonical UUID/fingerprint validation.
+
 
 # >>> TEMPORARY QUICKFIX (2026-07-30) — delete with the upstream fix.
 # docs/done/codex_stream_disconnect_shape_nudge.md
@@ -1785,7 +1817,14 @@ class UniversalAgent:
             try:
                 self._shell_manager.cleanup()
             except Exception:
-                pass
+                # Terminal job disposition may already have deleted a root
+                # workspace, and terminal rows are not reclaimable for another
+                # cleanup attempt. Keep teardown best-effort; Kubernetes exact-
+                # UID deletion owns root process death. Shared workspaces still
+                # use the child-shell-only retirement command below this seam.
+                logger.warning(
+                    "ShellManager cleanup was not acknowledged", exc_info=True
+                )
             self._shell_manager = None
 
     def _capture_worker_environment(self, metadata: Dict[str, Any]) -> None:
@@ -2882,6 +2921,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
                 remote_cfg = self.config.workspace.remote
                 shell_config = self.config.extra.get("shell", {})
+                worker_remote_authority = _stateless_worker_remote_authority(
+                    metadata,
+                    self._worker_lease_token,
+                )
                 workspace_backend = RemoteBackend(
                     host=remote_cfg["host"],
                     port=remote_cfg.get("port", 22),
@@ -2902,6 +2945,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     ),
                     sudo_action=shell_config.get("sudo_action", "freeze"),
                     sudo_block_message=shell_config.get("sudo_block_message"),
+                    **worker_remote_authority,
                 )
                 if self._worker_lease_token is not None:
                     workspace_backend.set_shell_owner_token(self._worker_lease_token)
