@@ -19,6 +19,7 @@ snapshot), runs the sweeps, and drops the database. Skipped when the env var
 is unset so plain unit-test runs stay hermetic.
 """
 
+import json
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -73,6 +74,10 @@ SWEEPS = [
     (
         "cancel_stale_verification_subjobs",
         lambda db: db.cancel_stale_verification_subjobs(stale_hours=6),
+    ),
+    (
+        "list_stale_stateless_verification_subjobs",
+        lambda db: db.list_stale_stateless_verification_subjobs(stale_hours=6),
     ),
     (
         "unstick_reviewing_parents",
@@ -197,6 +202,20 @@ async def test_job_execution_lease_lifecycle_against_real_postgres():
                 "INSERT INTO agents (config_name, hostname, status) "
                 "VALUES ('defaults', 'lease-test-agent', 'ready') RETURNING id"
             )
+            stateless_job_id = await conn.fetchval(
+                "INSERT INTO jobs (description, status, execution_lane, "
+                "assigned_agent_id, lease_expires_at) "
+                "VALUES ('stateless lease test', 'processing', 'stateless', $1, "
+                "NOW() - interval '1 second') RETURNING id",
+                agent_id,
+            )
+
+        # Direct resume/manual-assignment guards consume get_job(), so the lane
+        # must survive that read model instead of silently defaulting to pinned.
+        assert (await db.get_job(str(job_id)))["execution_lane"] == "pinned"
+        assert (await db.get_job(str(stateless_job_id)))[
+            "execution_lane"
+        ] == "stateless"
 
         # Claim sets the pickup lease.
         assert await db.claim_job_for_agent(str(job_id), str(agent_id))
@@ -228,13 +247,127 @@ async def test_job_execution_lease_lifecycle_against_real_postgres():
         assert row["assigned_agent_id"] is None
         assert row["lease_expires_at"] is None
 
+        # Gate 1: an expired jobs-row lease on the stateless lane is ignored;
+        # only the run_queue reaper may recover this job.
+        async with db.acquire() as conn:
+            stateless_row = await conn.fetchrow(
+                "SELECT status, assigned_agent_id, lease_expires_at "
+                "FROM jobs WHERE id = $1",
+                stateless_job_id,
+            )
+        assert stateless_row["status"] == "processing"
+        assert stateless_row["assigned_agent_id"] == agent_id
+        assert stateless_row["lease_expires_at"] is not None
+
         # NULL-lease processing row (pre-deploy shape): left alone.
         async with db.acquire() as conn:
-            await conn.execute(
+            legacy_job_id = await conn.fetchval(
                 "INSERT INTO jobs (description, status) "
-                "VALUES ('legacy processing', 'processing')"
+                "VALUES ('legacy processing', 'processing') RETURNING id"
+            )
+            pinned_boundary_id = await conn.fetchval(
+                "INSERT INTO jobs (description, status, freeze_data) "
+                "VALUES ('pinned batch boundary', 'paused', $1::jsonb) "
+                "RETURNING id",
+                '{"freeze_type": "batch_boundary", "reason": "test"}',
             )
         assert await db.recover_expired_lease_jobs() == []
+
+        # The belt-and-suspenders orphan sweep has four mutation arms. Seed
+        # one stateless row for every arm and prove all four remain untouched.
+        freeze = '{"freeze_type": "batch_boundary", "reason": "test"}'
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE agents SET status = 'offline' WHERE id = $1", agent_id
+            )
+            orphan_rows = await conn.fetch(
+                """
+                INSERT INTO jobs (
+                    description, status, execution_lane, assigned_agent_id,
+                    freeze_data
+                ) VALUES
+                    ('stateless processing orphan', 'processing', 'stateless', $1, NULL),
+                    ('stateless waiting orphan', 'waiting', 'stateless', $1, NULL),
+                    ('stateless paused orphan', 'paused', 'stateless', $1, NULL),
+                    ('stateless frozen pause', 'paused', 'stateless', NULL, $2::jsonb)
+                RETURNING id, description
+                """,
+                agent_id,
+                freeze,
+            )
+        # The pinned legacy row is recovered and the pinned boundary freeze is
+        # cleared through the shared SQL-array registry; none of the four
+        # stateless rows may contribute to the count.
+        assert await db.recover_orphaned_jobs() == 2
+        async with db.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT status FROM jobs WHERE id = $1", legacy_job_id
+                )
+                == "paused"
+            )
+            pinned_boundary = await conn.fetchrow(
+                "SELECT freeze_data, context FROM jobs WHERE id = $1",
+                pinned_boundary_id,
+            )
+            rows = await conn.fetch(
+                "SELECT description, status, assigned_agent_id, freeze_data "
+                "FROM jobs WHERE id = ANY($1::uuid[]) ORDER BY description",
+                [row["id"] for row in orphan_rows],
+            )
+        assert pinned_boundary["freeze_data"] is None
+        pinned_context = pinned_boundary["context"]
+        if isinstance(pinned_context, str):
+            pinned_context = json.loads(pinned_context)
+        assert pinned_context["last_freeze_data"]["freeze_type"] == "batch_boundary"
+        by_description = {row["description"]: row for row in rows}
+        assert by_description["stateless processing orphan"]["status"] == "processing"
+        assert (
+            by_description["stateless waiting orphan"]["assigned_agent_id"] == agent_id
+        )
+        assert (
+            by_description["stateless paused orphan"]["assigned_agent_id"] == agent_id
+        )
+        assert by_description["stateless frozen pause"]["freeze_data"] is not None
+
+        # Same-host registered-agent replacement has its own recovery UPDATE,
+        # outside the two periodic sweep functions. It must pause only pinned
+        # work; stateless work is unrelated to the registered-agent lifecycle.
+        async with db.acquire() as conn:
+            registration_rows = await conn.fetch(
+                """
+                INSERT INTO jobs (
+                    description, status, execution_lane, assigned_agent_id
+                ) VALUES
+                    ('pinned registration recovery', 'processing', 'pinned', $1),
+                    ('stateless registration recovery', 'processing', 'stateless', $1)
+                RETURNING id, description
+                """,
+                agent_id,
+            )
+        await db.register_agent(
+            config_name="defaults",
+            pod_ip="10.42.0.200",
+            hostname="lease-test-agent",
+        )
+        async with db.acquire() as conn:
+            registration_after = await conn.fetch(
+                "SELECT description, status, assigned_agent_id FROM jobs "
+                "WHERE id = ANY($1::uuid[])",
+                [row["id"] for row in registration_rows],
+            )
+        registration_by_name = {row["description"]: row for row in registration_after}
+        assert (
+            registration_by_name["pinned registration recovery"]["status"] == "paused"
+        )
+        assert (
+            registration_by_name["stateless registration recovery"]["status"]
+            == "processing"
+        )
+        assert (
+            registration_by_name["stateless registration recovery"]["assigned_agent_id"]
+            == agent_id
+        )
     finally:
         if db is not None:
             await db.disconnect()

@@ -9,16 +9,20 @@ mounted filesystem.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import json
 import logging
 import os
 import re
 import secrets
 import shlex
+import threading
 import time
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..keycloak_token import KeycloakTokenClient
 
@@ -29,6 +33,21 @@ _FAILED = "__SRW_RCLONE_MOUNT_FAILED__"
 _CACHE_USAGE = "__SRW_RCLONE_CACHE_USAGE__"
 _RC_CORE = "__SRW_RCLONE_RC_CORE__"
 _RC_VFS = "__SRW_RCLONE_RC_VFS__"
+_RESIDENT_ADOPTED = "__SRW_RCLONE_RESIDENT_ADOPTED__"
+_RESIDENT_HEAL = "__SRW_RCLONE_RESIDENT_HEAL__"
+_RESIDENT_IDENTITY_VERSION = "1"
+_TERMINAL_DRAIN_STATUS_PY = (
+    "import json,sys; c=json.loads(sys.argv[1]); v=json.loads(sys.argv[2]); "
+    'd=v.get("diskCache") if isinstance(v,dict) else None; '
+    't=c.get("transferring") if isinstance(c,dict) else None; '
+    'core_ok=isinstance(c,dict) and "error" not in c and '
+    'all(type(c.get(k)) is int and c[k] >= 0 for k in ("bytes","errors","transfers")) '
+    'and ("transferring" not in c or (isinstance(t,list) and not t)); '
+    'vfs_ok=isinstance(d,dict) and type(d.get("uploadsQueued")) is int and '
+    'd["uploadsQueued"] == 0 and type(d.get("uploadsInProgress")) is int and '
+    'd["uploadsInProgress"] == 0; ok=core_ok and vfs_ok; '
+    "raise SystemExit(0 if ok else 1)"
+)
 
 _CACHE_FLAG_MAP = {
     "vfs_cache_mode": "--vfs-cache-mode",
@@ -125,6 +144,9 @@ class RcloneMountState:
     config_path: str
     filter_path: str
     pid_file: str
+    identity_file: str
+    resident_generation: str
+    resident_spec_digest: str
     rc_addr: str
     rc_user: str
     rc_pass: str
@@ -174,8 +196,15 @@ class RcloneMountManager:
         # (same enumerate order as _start_all_sync, which is all-or-nothing,
         # so self._states[i] corresponds to mount index i).
         self._token_clients: dict[int, KeycloakTokenClient] = {}
+        # Latest bearer minted for each mount.  The same value seeds both the
+        # first mount and any later ENOTCONN restart; keeping only the initial
+        # token here would let a restart overwrite a refreshed workspace token
+        # with an expired one.
         self._initial_tokens: dict[int, str] = {}
+        self._token_state_lock = threading.Lock()
         self._refresh_task: asyncio.Task | None = None
+        self._detached = False
+        self._script_nonce = secrets.token_hex(8)
         # Original mount dicts + their index, retained so restart_mount() can
         # re-run the same generators (_unmount_script/_mount_script) that
         # _start_all_sync used, keyed by mount_id (design §11.6 #1 — Slice B
@@ -290,6 +319,8 @@ echo "{_OK}"
         return "\n".join(lines)
 
     async def start_all(self) -> None:
+        if self._detached:
+            raise RcloneMountError("cloud mount controller has been detached")
         await self._prepare_keycloak_tokens()
         loop = asyncio.get_running_loop()
         try:
@@ -299,7 +330,60 @@ echo "{_OK}"
             raise
         self._start_token_refresh()
 
-    async def aclose(self) -> None:
+    async def detach_for_handoff(self) -> None:
+        """Retire only the agent-local controller, preserving remote mounts.
+
+        This is the stateless claim-switch path.  It performs no remote
+        mutation: the healthy rclone process and VFS cache remain owned by the
+        workspace runtime for the successor to adopt.  Waiting for the refresh
+        task and then retiring the backend's separate claim-resource admission
+        makes return from this method the local quiescence acknowledgement.
+        """
+
+        self._detached = True
+        await self._stop_local_controller()
+        retire = getattr(self.workspace_backend, "retire_claim_resource_owner", None)
+        if retire is not None:
+            await asyncio.to_thread(retire)
+        self._states = []
+        self._mounts_by_id = {}
+        self._mount_index_by_id = {}
+
+    async def aclose(self, *, strict: bool = False) -> None:
+        """Terminally stop the controller and its workspace-side mounts.
+
+        ``strict`` is the stateless claimant-quiescence boundary: every exact
+        resident must report its mount/process gone before the controller is
+        detached. Pinned callers retain the historical best-effort cleanup.
+        """
+
+        if self._detached:
+            return
+        await self._stop_local_controller()
+        loop = asyncio.get_running_loop()
+        closed = False
+        try:
+            await loop.run_in_executor(None, self._close_sync, strict)
+            closed = True
+        except Exception:
+            if strict:
+                # Keep exact resident state and claim-resource admission so a
+                # second teardown can retry. The queue claimant must not
+                # publish completion/release after this exception.
+                raise
+            logger.debug("rclone terminal cleanup failed", exc_info=True)
+        finally:
+            if not strict or closed:
+                retire = getattr(
+                    self.workspace_backend, "retire_claim_resource_owner", None
+                )
+                if retire is not None:
+                    await asyncio.to_thread(retire)
+                self._detached = True
+
+    async def _stop_local_controller(self) -> None:
+        """Cancel/close only process-local refresh authority."""
+
         if self._refresh_task is not None:
             self._refresh_task.cancel()
             try:
@@ -310,8 +394,6 @@ echo "{_OK}"
                 logger.debug("cloud mount token refresh task exit", exc_info=True)
             self._refresh_task = None
         await self._aclose_token_clients()
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._close_sync)
 
     # ------------------------------------------------------- Keycloak bearers
 
@@ -351,7 +433,7 @@ echo "{_OK}"
                     f"initial bearer token: {exc}"
                 ) from exc
             self._token_clients[index] = client
-            self._initial_tokens[index] = bearer.token
+            self._remember_token(index, bearer.token)
 
     async def _aclose_token_clients(self) -> None:
         for client in self._token_clients.values():
@@ -360,7 +442,17 @@ echo "{_OK}"
             except Exception:
                 pass
         self._token_clients.clear()
-        self._initial_tokens.clear()
+        with self._token_state_lock:
+            self._initial_tokens.clear()
+
+    def _remember_token(self, index: int, token: str) -> None:
+        """Retain the newest bearer for both the live helper and remounts."""
+        with self._token_state_lock:
+            self._initial_tokens[index] = token
+
+    def _token_for_index(self, index: int) -> str | None:
+        with self._token_state_lock:
+            return self._initial_tokens.get(index)
 
     def _start_token_refresh(self) -> None:
         if not self._token_clients or self._refresh_task is not None:
@@ -395,14 +487,7 @@ echo "{_OK}"
         while True:
             try:
                 await asyncio.sleep(delay)
-                for index, client in self._token_clients.items():
-                    state = self._state_for_index(index)
-                    if state is None or not state.uses_keycloak_auth:
-                        continue
-                    bearer = await client.get_bearer(force_refresh=True)
-                    await loop.run_in_executor(
-                        None, self._push_token_sync, state, bearer.token
-                    )
+                await self._refresh_keycloak_tokens_once(loop=loop)
                 delay = self._next_refresh_delay()
             except asyncio.CancelledError:
                 raise
@@ -414,6 +499,23 @@ echo "{_OK}"
                     exc_info=True,
                 )
                 delay = _TOKEN_REFRESH_MIN_INTERVAL_SECONDS
+
+    async def _refresh_keycloak_tokens_once(
+        self, *, loop: asyncio.AbstractEventLoop | None = None
+    ) -> None:
+        """Mint and publish one refresh cycle for every active bearer mount."""
+        if loop is None:
+            loop = asyncio.get_running_loop()
+        for index, client in self._token_clients.items():
+            state = self._state_for_index(index)
+            if state is None or not state.uses_keycloak_auth:
+                continue
+            bearer = await client.get_bearer(force_refresh=True)
+            # Store before the remote push.  If that push loses a race with an
+            # ENOTCONN restart, the restart still seeds the newly-minted token
+            # instead of resurrecting the expired attach-time bearer.
+            self._remember_token(index, bearer.token)
+            await loop.run_in_executor(None, self._push_token_sync, state, bearer.token)
 
     def _state_for_index(self, index: int) -> RcloneMountState | None:
         if 0 <= index < len(self._states):
@@ -427,13 +529,42 @@ echo "{_OK}"
         file so rclone's helper never reads a half-written token. chmod is
         re-applied because the tmp file is created with default SFTP mode.
         """
-        tmp_rel = f"{state.state_rel}/bearer.token.new"
-        self.workspace_backend.write_home_file(tmp_rel, token + "\n")
-        tmp_abs = self.workspace_backend.resolve_home_path(tmp_rel)
-        self.workspace_backend.exec_command(
-            f"chmod 600 {shlex.quote(tmp_abs)} && "
-            f"mv -f {shlex.quote(tmp_abs)} {shlex.quote(state.token_path)}",
+        if not bool(getattr(self.workspace_backend, "claim_resource_fenced", False)):
+            # Historical pinned path: SFTP keeps the bearer out of the remote
+            # process command line, and a unique sibling avoids writer
+            # collisions before the atomic rename.
+            tmp_rel = f"{state.state_rel}/bearer.token.new.{secrets.token_hex(8)}"
+            self.workspace_backend.write_home_file(tmp_rel, token + "\n")
+            tmp_abs = self.workspace_backend.resolve_home_path(tmp_rel)
+            quoted_tmp = shlex.quote(tmp_abs)
+            self.workspace_backend.exec_command(
+                f"chmod 600 -- {quoted_tmp} && "
+                f"mv -f -- {quoted_tmp} {shlex.quote(state.token_path)}; "
+                "rc=$?; "
+                f"rm -f -- {quoted_tmp}; "
+                'exit "$rc"',
+                timeout=15,
+            )
+            return
+
+        # Stage, chmod, and publish inside ONE claim-fenced remote command.
+        # An SFTP upload followed by a fenced mv looks harmless, but it still
+        # lets a cancelled N mutate the workspace after N+1 owns the lock.
+        # Base64 keeps arbitrary bearer bytes out of shell syntax; this is
+        # still a cooperative workload-user boundary, not secret isolation.
+        encoded = base64.b64encode((token + "\n").encode("utf-8")).decode("ascii")
+        quoted_dir = shlex.quote(state.state_dir)
+        self._exec_resource(
+            "set -e; umask 077; "
+            f"mkdir -p -- {quoted_dir}; "
+            f"tmp=$(mktemp {quoted_dir}/.bearer.token.XXXXXXXX) || exit 78; "
+            "trap 'rm -f -- \"$tmp\"' EXIT HUP INT TERM; "
+            f'printf %s {shlex.quote(encoded)} | base64 -d > "$tmp"; '
+            'chmod 600 -- "$tmp"; '
+            f'mv -f -- "$tmp" {shlex.quote(state.token_path)}; '
+            "trap - EXIT HUP INT TERM",
             timeout=15,
+            operation=f"publish bearer token for {state.mount_id}",
         )
 
     def _start_all_sync(self) -> None:
@@ -449,25 +580,328 @@ echo "{_OK}"
             raise RcloneMountError("rclone cloud_mount requires remote home writes")
 
         states: list[RcloneMountState] = []
-        for index, mount in enumerate(self.cloud_cfg.get("mounts") or []):
-            state = self._state_for_mount(mount, index)
-            script = self._mount_script(
-                mount, state, initial_token=self._initial_tokens.get(index)
+        attempted_states: list[RcloneMountState] = []
+        mounts_by_id: dict[str, dict[str, Any]] = {}
+        mount_index_by_id: dict[str, int] = {}
+        try:
+            for index, mount in enumerate(self.cloud_cfg.get("mounts") or []):
+                state = self._state_for_mount(mount, index)
+                started = time.perf_counter()
+                state, disposition = self._start_or_adopt_mount(
+                    mount,
+                    state,
+                    index=index,
+                    record_owned=attempted_states.append,
+                )
+                states.append(state)
+                mounts_by_id[state.mount_id] = mount
+                mount_index_by_id[state.mount_id] = index
+                logger.info(
+                    "rclone resident timing: thread=%s mount_id=%s "
+                    "disposition=%s total=%.3fs target=%s",
+                    self.thread_id,
+                    state.mount_id,
+                    disposition,
+                    time.perf_counter() - started,
+                    state.target_path,
+                )
+
+            if not self.cloud_cfg.get("skip_workspace_links"):
+                self._install_workspace_links(states)
+        except Exception:
+            self._rollback_start_sync(attempted_states)
+            self._states = []
+            self._mounts_by_id = {}
+            self._mount_index_by_id = {}
+            raise
+
+        self._states = states
+        self._mounts_by_id = mounts_by_id
+        self._mount_index_by_id = mount_index_by_id
+
+    async def retire_existing(self, *, drain: bool = True) -> dict[str, int]:
+        """Strictly drain and remove already-resident mounts without starting any.
+
+        Public stateless End reconstructs this manager from the same
+        orchestrator-resolved mount payload used at attach.  It must never run
+        ``start_all``: an absent resident is success, while starting one would
+        create new writeback work during snapshot retirement.  Every mutation
+        runs through RemoteBackend's terminal-token adoption primitive.
+        """
+
+        if self.cloud_cfg.get("driver") != "rclone":
+            raise RcloneMountError("terminal cloud cleanup requires rclone driver")
+        execute = getattr(self.workspace_backend, "exec_terminal_claim_resource", None)
+        if not callable(execute):
+            raise RcloneMountError(
+                "terminal cloud cleanup requires a terminal-fenced backend"
             )
-            self._run_remote_script(f"mount_{state.remote_name}.sh", script, timeout=90)
-            states.append(state)
-            self._mounts_by_id[state.mount_id] = mount
-            self._mount_index_by_id[state.mount_id] = index
-            logger.info(
-                "rclone cloud mount started: thread=%s mount_id=%s target=%s",
-                self.thread_id,
-                state.mount_id,
-                state.target_path,
+        mounts = list(self.cloud_cfg.get("mounts") or [])
+        expected = [
+            self._state_for_mount(dict(mount), index)
+            for index, mount in enumerate(mounts)
+        ]
+
+        def _retire() -> None:
+            for state in reversed(expected):
+                self._run_terminal_remote_script(
+                    f"terminal_unmount_{state.remote_name}.sh",
+                    self._terminal_unmount_script(state, drain=drain),
+                    timeout=90,
+                )
+            self._run_terminal_remote_script(
+                "terminal_verify_rclone_zero.sh",
+                self._terminal_zero_script(),
+                timeout=30,
             )
 
-        if not self.cloud_cfg.get("skip_workspace_links"):
-            self._install_workspace_links(states)
-        self._states = states
+        await asyncio.to_thread(_retire)
+        return {"rclone_mounts": len(expected), "rclone_processes": 0}
+
+    def _start_or_adopt_mount(
+        self,
+        mount: dict[str, Any],
+        state: RcloneMountState,
+        *,
+        index: int,
+        record_owned: Callable[[RcloneMountState], None],
+    ) -> tuple[RcloneMountState, str]:
+        """Cold-mount pinned resources; adopt-or-heal stateless residents."""
+
+        token = self._token_for_index(index)
+        if not bool(getattr(self.workspace_backend, "claim_resource_fenced", False)):
+            script = self._mount_script(mount, state, initial_token=token)
+            record_owned(state)
+            self._run_remote_script(f"mount_{state.remote_name}.sh", script, timeout=90)
+            return state, "cold"
+
+        # A successor always publishes its newly minted bearer before the
+        # real directory probe.  An idle resident whose old token expired can
+        # therefore recover on its first WebDAV request without an agent-side
+        # daemon staying alive between turns.
+        if state.uses_keycloak_auth:
+            if not token:
+                raise RcloneMountError(
+                    f"mount {state.mount_id}: no fresh bearer available for adoption"
+                )
+            self._push_token_sync(state, token)
+
+        probe = self._run_remote_script(
+            f"probe_{state.remote_name}.sh",
+            self._resident_probe_script(mount, state),
+            timeout=30,
+            require_ok=False,
+        )
+        parsed = self._parse_resident_probe(state, probe)
+        if parsed is not None and self._resident_adoption_safe(mount):
+            return parsed, "adopted"
+
+        # Missing/dead residents reach here only after the probe proved there
+        # is no unknown live process at the target.  A valid-but-unhealthy
+        # resident carries its persisted RC identity in ``state`` and is
+        # stopped by the exact PID/cmdline checks in _unmount_script.
+        healed_state = parsed or self._resident_state_from_probe(state, probe) or state
+        self._run_remote_script(
+            f"unmount_{healed_state.remote_name}.sh",
+            self._unmount_script(healed_state),
+            timeout=45,
+            # A remount must never proceed from best-effort cleanup. In
+            # particular, stale ENOTCONN FUSE targets can make mountpoint(1)
+            # lie; the exact script must prove mount-table absence and an
+            # accessible backing directory before returning _OK.
+            require_ok=True,
+        )
+        healed_state = replace(
+            state,
+            resident_generation=uuid.uuid4().hex,
+            rc_pass=secrets.token_urlsafe(24),
+        )
+        script = self._mount_script(mount, healed_state, initial_token=token)
+        record_owned(healed_state)
+        self._run_remote_script(
+            f"mount_{healed_state.remote_name}.sh", script, timeout=90
+        )
+        return healed_state, "healed"
+
+    @staticmethod
+    def _resident_adoption_safe(mount: dict[str, Any]) -> bool:
+        """Whether every mount-affecting input can be checked without secrets.
+
+        Unknown source keys and arbitrary provider flags can carry credentials
+        or change process semantics. Rather than persist a digest oracle, those
+        configurations conservatively remount on every claim.
+        """
+
+        source = mount.get("source") or {}
+        source_keys = {str(key) for key in dict(source.get("config") or {})}
+        if source_keys - {"url", "vendor", "user", "encoding"}:
+            return False
+        if mount.get("provider_flags"):
+            return False
+        auth_type = str((mount.get("auth") or {}).get("type") or "")
+        return auth_type in {"", "basic", *_KEYCLOAK_AUTH_TYPES}
+
+    def _resident_probe_script(
+        self,
+        mount: dict[str, Any],
+        state: RcloneMountState,
+    ) -> str:
+        """Validate persisted identity and perform a real mounted readdir.
+
+        The identity is workload-user writable and therefore cooperative.  We
+        parse it as inert data, validate every field, and corroborate its PID
+        against ``/proc`` before either adoption or an exact stop is allowed.
+        """
+
+        basic_check = ":"
+        auth = mount.get("auth") or {}
+        if auth.get("type") == "basic" and auth.get("password") is not None:
+            encoded = base64.b64encode(str(auth["password"]).encode()).decode()
+            basic_check = f"""
+_srw_stored_pass=$(sed -n 's/^pass = //p' {shlex.quote(state.config_path)} | head -n1)
+if [ -z "$_srw_stored_pass" ] || [ "$(rclone reveal "$_srw_stored_pass" 2>/dev/null)" != "$(printf %s {shlex.quote(encoded)} | base64 -d)" ]; then
+  printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {_RESIDENT_HEAL} "$_srw_spec" "$_srw_generation" "$_srw_pid" "$_srw_pass"
+  exit 0
+fi
+"""
+        return f"""#!/usr/bin/env bash
+set -euo pipefail
+identity={shlex.quote(state.identity_file)}
+target={shlex.quote(state.target_path)}
+if [ ! -f "$identity" ]; then
+  mountpoint -q "$target" && exit 83
+  echo "{_RESIDENT_HEAL}"
+  exit 0
+fi
+[ "$(wc -l < "$identity")" -eq 1 ] || exit 84
+IFS='|' read -r _srw_version _srw_spec _srw_status _srw_generation _srw_pid _srw_pass _srw_extra < "$identity"
+[ "$_srw_version" = {_RESIDENT_IDENTITY_VERSION} ] || exit 84
+printf %s "$_srw_spec" | grep -Eq '^[0-9a-f]{{64}}$' || exit 84
+[ -z "$_srw_extra" ] || exit 84
+case "$_srw_status" in active|creating) ;; *) exit 84 ;; esac
+printf %s "$_srw_generation" | grep -Eq '^[0-9a-f]{{32}}$' || exit 84
+printf %s "$_srw_pid" | grep -Eq '^[0-9]+$' || exit 84
+printf %s "$_srw_pass" | grep -Eq '^[A-Za-z0-9_-]{{20,128}}$' || exit 84
+if [ "$_srw_pid" = 0 ]; then
+  for _srw_i in $(seq 1 20); do
+    [ -s {shlex.quote(state.pid_file)} ] && break
+    sleep 0.1
+  done
+  if [ -s {shlex.quote(state.pid_file)} ]; then
+    _srw_pid=$(cat {shlex.quote(state.pid_file)})
+    printf %s "$_srw_pid" | grep -Eq '^[1-9][0-9]*$' || exit 84
+  else
+    mountpoint -q "$target" && exit 85
+    printf '%s\\t%s\\t%s\\t0\\t%s\\n' {_RESIDENT_HEAL} "$_srw_spec" "$_srw_generation" "$_srw_pass"
+    exit 0
+  fi
+fi
+_srw_pid_matches() {{
+  [ -r "/proc/$_srw_pid/cmdline" ] || return 1
+  _srw_args=$(tr '\\0' '\\n' < "/proc/$_srw_pid/cmdline") || return 1
+  _srw_exe=$(printf '%s\\n' "$_srw_args" | head -n1)
+  [ "$(basename "$_srw_exe")" = rclone ] || return 1
+  for _srw_expected in mount {shlex.quote(state.config_path)} {shlex.quote(state.target_path)} {shlex.quote(state.rc_addr)}; do
+    printf '%s\\n' "$_srw_args" | grep -Fqx -- "$_srw_expected" || return 1
+  done
+}}
+if ! _srw_pid_matches; then
+  mountpoint -q "$target" && exit 85
+  printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {_RESIDENT_HEAL} "$_srw_spec" "$_srw_generation" "$_srw_pid" "$_srw_pass"
+  exit 0
+fi
+if [ "$_srw_status" = creating ]; then
+  printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {_RESIDENT_HEAL} "$_srw_spec" "$_srw_generation" "$_srw_pid" "$_srw_pass"
+  exit 0
+fi
+if [ "$_srw_spec" != {shlex.quote(state.resident_spec_digest)} ]; then
+  printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {_RESIDENT_HEAL} "$_srw_spec" "$_srw_generation" "$_srw_pid" "$_srw_pass"
+  exit 0
+fi
+{basic_check}
+if ! rclone rc --rc-addr {shlex.quote(state.rc_addr)} --rc-user {shlex.quote(state.rc_user)} --rc-pass "$_srw_pass" vfs/refresh recursive=false >/dev/null 2>&1; then
+  printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {_RESIDENT_HEAL} "$_srw_spec" "$_srw_generation" "$_srw_pid" "$_srw_pass"
+  exit 0
+fi
+if mountpoint -q "$target" && timeout 15 find "$target" -mindepth 1 -maxdepth 1 -print -quit >/dev/null; then
+  printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {_RESIDENT_ADOPTED} "$_srw_spec" "$_srw_generation" "$_srw_pid" "$_srw_pass"
+else
+  printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {_RESIDENT_HEAL} "$_srw_spec" "$_srw_generation" "$_srw_pid" "$_srw_pass"
+fi
+"""
+
+    @staticmethod
+    def _resident_probe_fields(
+        output: str, tag: str
+    ) -> tuple[str, str, str, str] | None:
+        for line in output.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 5 and parts[0] == tag:
+                spec_digest, generation, pid, rc_pass = parts[1:]
+                if (
+                    re.fullmatch(r"[0-9a-f]{64}", spec_digest)
+                    and re.fullmatch(r"[0-9a-f]{32}", generation)
+                    and re.fullmatch(r"(?:0|[1-9][0-9]*)", pid)
+                    and re.fullmatch(r"[A-Za-z0-9_-]{20,128}", rc_pass)
+                ):
+                    return spec_digest, generation, pid, rc_pass
+                raise RcloneMountError(
+                    "resident rclone probe returned malformed identity"
+                )
+        return None
+
+    def _parse_resident_probe(
+        self,
+        state: RcloneMountState,
+        output: str,
+    ) -> RcloneMountState | None:
+        fields = self._resident_probe_fields(output, _RESIDENT_ADOPTED)
+        if fields is None:
+            return None
+        spec_digest, generation, _pid, rc_pass = fields
+        if _pid == "0":
+            raise RcloneMountError("resident rclone adoption has no live PID")
+        if spec_digest != state.resident_spec_digest:
+            raise RcloneMountError("resident rclone adoption spec does not match")
+        return replace(state, resident_generation=generation, rc_pass=rc_pass)
+
+    def _resident_state_from_probe(
+        self,
+        state: RcloneMountState,
+        output: str,
+    ) -> RcloneMountState | None:
+        fields = self._resident_probe_fields(output, _RESIDENT_HEAL)
+        if fields is None:
+            if _RESIDENT_HEAL in output:
+                return None
+            raise RcloneMountError("resident rclone probe returned no disposition")
+        spec_digest, generation, _pid, rc_pass = fields
+        return replace(
+            state,
+            resident_spec_digest=spec_digest,
+            resident_generation=generation,
+            rc_pass=rc_pass,
+        )
+
+    def _rollback_start_sync(self, states: list[RcloneMountState]) -> None:
+        """Best-effort reverse rollback after a partial mount startup."""
+        for state in reversed(states):
+            try:
+                self._run_remote_script(
+                    f"unmount_{state.remote_name}.sh",
+                    self._unmount_script(state),
+                    timeout=45,
+                    require_ok=False,
+                )
+            except Exception:
+                logger.warning(
+                    "rclone partial-start rollback failed: thread=%s "
+                    "mount_id=%s target=%s",
+                    self.thread_id,
+                    state.mount_id,
+                    state.target_path,
+                    exc_info=True,
+                )
 
     def restart_mount(self, mount_id: str) -> None:
         """Unmount then remount ONE mount in place (ENOTCONN heal path).
@@ -489,20 +923,29 @@ echo "{_OK}"
                 f"restart_mount: unknown or inactive mount_id {mount_id!r}"
             )
 
+        started = time.perf_counter()
         self._run_remote_script(
             f"unmount_{state.remote_name}.sh",
             self._unmount_script(state),
             timeout=45,
-            require_ok=False,
+            require_ok=True,
+        )
+        state = replace(
+            state,
+            resident_generation=uuid.uuid4().hex,
+            rc_pass=secrets.token_urlsafe(24),
         )
         script = self._mount_script(
-            mount, state, initial_token=self._initial_tokens.get(index)
+            mount, state, initial_token=self._token_for_index(index)
         )
         self._run_remote_script(f"mount_{state.remote_name}.sh", script, timeout=90)
+        self._states[index] = state
         logger.info(
-            "rclone cloud mount restarted: thread=%s mount_id=%s target=%s",
+            "rclone resident timing: thread=%s mount_id=%s disposition=healed "
+            "total=%.3fs target=%s",
             self.thread_id,
             state.mount_id,
+            time.perf_counter() - started,
             state.target_path,
         )
 
@@ -521,6 +964,7 @@ echo "{_OK}"
         config_path = f"{state_dir}/rclone.conf"
         filter_path = f"{state_dir}/rclone-excludes.txt"
         pid_file = f"{state_dir}/rclone.pid"
+        identity_file = f"{state_dir}/resident.identity"
         hard_cache_limit = str(cache.get("hard_cache_limit") or "")
         hard_cache_limit_bytes = _parse_size_to_bytes(hard_cache_limit) or 0
         port = 43000 + (
@@ -531,6 +975,47 @@ echo "{_OK}"
             % 10000
         )
         auth_type = str((mount.get("auth") or {}).get("type") or "")
+        # Identity is intentionally NON-SECRET.  A digest of a password or
+        # client_secret would be a durable offline oracle in the workload
+        # user's home.  Static-basic equality is checked transiently inside
+        # the fenced adoption probe; Keycloak residents consume the freshly
+        # published bearer instead.
+        source = mount.get("source") or {}
+        source_config = {
+            str(key): value
+            for key, value in dict(source.get("config") or {}).items()
+            if str(key) in {"url", "vendor", "user", "encoding"}
+        }
+        auth = mount.get("auth") or {}
+        safe_spec = {
+            "mount_id": mount_id,
+            "mount_kind": str(mount.get("mount_kind") or "cloud"),
+            "target_path": str(mount.get("target_path") or f"/cloud/{safe_name}"),
+            "workspace_name": workspace_name,
+            "backend": mount.get("backend"),
+            "source": {
+                "type": source.get("type"),
+                "root": source.get("root"),
+                "config": source_config,
+            },
+            "auth": {
+                "type": auth.get("type"),
+                "issuer": auth.get("issuer"),
+                "client_id": auth.get("client_id"),
+                "target_user_sub": auth.get("target_user_sub"),
+            },
+            "access": mount.get("access"),
+            "cache": self._cache_for_mount(mount),
+            "filters": mount.get("filters"),
+            "effective_default_ignores": self._default_ignore_lines(mount),
+            "adoption_safe": self._resident_adoption_safe(mount),
+            "min_rclone_version": mount.get("min_rclone_version"),
+            "remote_name": remote_name,
+            "state_dir": state_dir,
+        }
+        resident_spec_digest = hashlib.sha256(
+            json.dumps(safe_spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         return RcloneMountState(
             mount_id=mount_id,
             mount_kind=str(mount.get("mount_kind") or "cloud"),
@@ -542,6 +1027,9 @@ echo "{_OK}"
             config_path=config_path,
             filter_path=filter_path,
             pid_file=pid_file,
+            identity_file=identity_file,
+            resident_generation=uuid.uuid4().hex,
+            resident_spec_digest=resident_spec_digest,
             rc_addr=f"127.0.0.1:{port}",
             rc_user=f"srw-{self.thread_id[:8]}",
             rc_pass=secrets.token_urlsafe(24),
@@ -607,8 +1095,11 @@ echo "{_OK}"
             create_args.extend([str(key), str(value)])
 
         cache = self._cache_for_mount(mount)
+        claim_fenced = bool(
+            getattr(self.workspace_backend, "claim_resource_fenced", False)
+        )
         mount_args = [
-            "nohup",
+            *([] if claim_fenced else ["nohup"]),
             "rclone",
             "--config",
             state.config_path,
@@ -653,6 +1144,50 @@ echo "{_OK}"
         default_ignore_block = self._write_text_file_block(
             default_ignore_file, default_ignore_content
         )
+        if claim_fenced:
+            existing_mount_block = (
+                f"mountpoint -q {shlex.quote(state.target_path)} && exit 86"
+            )
+        else:
+            existing_mount_block = f"""if mountpoint -q {shlex.quote(state.target_path)}; then
+  fusermount3 -u {shlex.quote(state.target_path)} 2>/dev/null || fusermount -u {shlex.quote(state.target_path)} 2>/dev/null || true
+fi
+if mountpoint -q {shlex.quote(state.target_path)}; then
+  fusermount3 -uz {shlex.quote(state.target_path)} 2>/dev/null || fusermount -uz {shlex.quote(state.target_path)} 2>/dev/null || true
+fi"""
+        if claim_fenced:
+            identity_template = shlex.quote(
+                f"{state.state_dir}/.resident.identity.XXXXXXXX"
+            )
+            identity_setup_block = f"""_srw_write_identity() {{
+  _srw_status="$1"
+  _srw_pid="$2"
+  _srw_tmp=$(mktemp {identity_template})
+  trap 'rm -f -- "$_srw_tmp"' EXIT HUP INT TERM
+  printf '%s|%s|%s|%s|%s|%s\\n' {_RESIDENT_IDENTITY_VERSION} {shlex.quote(state.resident_spec_digest)} "$_srw_status" {shlex.quote(state.resident_generation)} "$_srw_pid" {shlex.quote(state.rc_pass)} > "$_srw_tmp"
+  chmod 600 "$_srw_tmp"
+  mv -f -- "$_srw_tmp" {shlex.quote(state.identity_file)}
+  trap - EXIT HUP INT TERM
+}}
+_srw_write_identity creating 0"""
+            launch_block = f"""nohup bash -c 'pid_file="$1"; shift; printf "%s\\n" "$$" > "$pid_file"; exec "$@"' bash {shlex.quote(state.pid_file)} "${{MOUNT_ARGS[@]}}" > {shlex.quote(log_file)} 2>&1 &
+for _i in $(seq 1 50); do
+  [ -s {shlex.quote(state.pid_file)} ] && break
+  sleep 0.1
+done
+_srw_pid=$(cat {shlex.quote(state.pid_file)})
+printf %s "$_srw_pid" | grep -Eq '^[1-9][0-9]*$'
+_srw_write_identity creating "$_srw_pid"
+"""
+            active_identity_block = f"""_srw_pid=$(cat {shlex.quote(state.pid_file)})
+    printf %s "$_srw_pid" | grep -Eq '^[1-9][0-9]*$'
+    _srw_write_identity active "$_srw_pid"
+"""
+        else:
+            identity_setup_block = ":"
+            launch_block = f""""${{MOUNT_ARGS[@]}}" > {shlex.quote(log_file)} 2>&1 &
+echo "$!" > {shlex.quote(state.pid_file)}"""
+            active_identity_block = ":"
 
         return f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -668,12 +1203,9 @@ if ! mkdir -p {shlex.quote(target_parent)} {shlex.quote(state.target_path)} 2>/d
 fi
 {token_setup_block}
 
-if mountpoint -q {shlex.quote(state.target_path)}; then
-  fusermount3 -u {shlex.quote(state.target_path)} 2>/dev/null || fusermount -u {shlex.quote(state.target_path)} 2>/dev/null || true
-fi
-if mountpoint -q {shlex.quote(state.target_path)}; then
-  fusermount3 -uz {shlex.quote(state.target_path)} 2>/dev/null || fusermount -uz {shlex.quote(state.target_path)} 2>/dev/null || true
-fi
+{existing_mount_block}
+
+{identity_setup_block}
 
 {create_command} >/dev/null
 chmod 600 {shlex.quote(state.config_path)}
@@ -704,11 +1236,11 @@ append_mount_flag() {{
 if [ -s {shlex.quote(state.filter_path)} ]; then
   MOUNT_ARGS+=(--exclude-from {shlex.quote(state.filter_path)})
 fi
-"${{MOUNT_ARGS[@]}}" > {shlex.quote(log_file)} 2>&1 &
-echo "$!" > {shlex.quote(state.pid_file)}
+{launch_block}
 
 for _i in $(seq 1 30); do
   if mountpoint -q {shlex.quote(state.target_path)}; then
+    {active_identity_block}
     echo "{_OK}"
     exit 0
   fi
@@ -769,27 +1301,38 @@ exit 1
         script_lines.append(f'echo "{_OK}"')
         self._run_remote_script("install_cloud_links.sh", "\n".join(script_lines))
 
-    def _close_sync(self) -> None:
+    def _close_sync(self, strict: bool = False) -> None:
+        failures: list[tuple[str, Exception]] = []
         for state in reversed(self._states):
             try:
                 self._run_remote_script(
                     f"unmount_{state.remote_name}.sh",
                     self._unmount_script(state),
                     timeout=45,
-                    require_ok=False,
+                    require_ok=strict,
                 )
-            except Exception:
+            except Exception as exc:
+                failures.append((state.mount_id, exc))
                 logger.debug(
                     "rclone cloud mount cleanup failed for %s",
                     state.mount_id,
                     exc_info=True,
                 )
+        if strict and failures:
+            failed_ids = ", ".join(mount_id for mount_id, _exc in failures)
+            raise RcloneMountError(
+                f"rclone residents did not retire: {failed_ids}"
+            ) from failures[0][1]
         self._states = []
         self._mounts_by_id = {}
         self._mount_index_by_id = {}
 
     def _unmount_script(self, state: RcloneMountState) -> str:
-        return f"""#!/usr/bin/env bash
+        if not bool(getattr(self.workspace_backend, "claim_resource_fenced", False)):
+            # Preserve the historical pinned-lane teardown byte-for-byte in
+            # substance. Pinned mounts predate resident identities and must
+            # not become unkillable when that optional file is absent.
+            return f"""#!/usr/bin/env bash
 set +e
 rclone rc --rc-addr {shlex.quote(state.rc_addr)} --rc-user {shlex.quote(state.rc_user)} --rc-pass {shlex.quote(state.rc_pass)} core/quit >/dev/null 2>&1
 sleep 2
@@ -807,7 +1350,225 @@ if [ -s {shlex.quote(state.pid_file)} ]; then
     kill -9 "${{pid}}" 2>/dev/null
   fi
 fi
-rm -f {shlex.quote(state.token_path)} {shlex.quote(state.token_helper_path)}
+rm -f {shlex.quote(state.token_path)} {shlex.quote(state.token_helper_path)} {shlex.quote(state.token_path + ".new.")}*
+echo "{_OK}"
+"""
+        return f"""#!/usr/bin/env bash
+set -u
+identity={shlex.quote(state.identity_file)}
+target={shlex.quote(state.target_path)}
+_srw_mount_present() {{
+  if command -v findmnt >/dev/null 2>&1; then
+    # -C prevents canonicalization/stat of an ENOTCONN target. Read the kernel
+    # mount table and compare the mountpoint string itself.
+    findmnt -rn -C -M "$target" >/dev/null 2>&1
+  else
+    mountpoint -q "$target"
+  fi
+}}
+if [ ! -f "$identity" ]; then
+  _srw_mount_present && exit 87
+  rm -f -- {shlex.quote(state.pid_file)} {shlex.quote(state.token_path)} {shlex.quote(state.token_helper_path)}
+  echo "{_OK}"
+  exit 0
+fi
+[ "$(wc -l < "$identity")" -eq 1 ] || exit 84
+IFS='|' read -r _srw_version _srw_spec _srw_status _srw_generation _srw_pid _srw_pass _srw_extra < "$identity"
+[ "$_srw_version" = {_RESIDENT_IDENTITY_VERSION} ] || exit 84
+[ "$_srw_spec" = {shlex.quote(state.resident_spec_digest)} ] || exit 84
+case "$_srw_status" in active|creating) ;; *) exit 84 ;; esac
+[ "$_srw_generation" = {shlex.quote(state.resident_generation)} ] || exit 84
+[ "$_srw_pass" = {shlex.quote(state.rc_pass)} ] || exit 84
+[ -z "$_srw_extra" ] || exit 84
+if [ "$_srw_pid" = 0 ] && [ -s {shlex.quote(state.pid_file)} ]; then
+  _srw_pid=$(cat {shlex.quote(state.pid_file)})
+fi
+printf %s "$_srw_pid" | grep -Eq '^[1-9][0-9]*$' || {{
+  mountpoint -q "$target" && exit 85
+  rm -f -- "$identity" {shlex.quote(state.pid_file)}
+  echo "{_OK}"
+  exit 0
+}}
+_srw_pid_matches() {{
+  [ -r "/proc/$_srw_pid/cmdline" ] || return 1
+  _srw_args=$(tr '\\0' '\\n' < "/proc/$_srw_pid/cmdline") || return 1
+  _srw_exe=$(printf '%s\\n' "$_srw_args" | head -n1)
+  [ "$(basename "$_srw_exe")" = rclone ] || return 1
+  for _srw_expected in mount {shlex.quote(state.config_path)} {shlex.quote(state.target_path)} {shlex.quote(state.rc_addr)}; do
+    printf '%s\\n' "$_srw_args" | grep -Fqx -- "$_srw_expected" || return 1
+  done
+}}
+if [ -e "/proc/$_srw_pid" ]; then
+  # A live PID must still be the exact resident before either process or mount
+  # mutation. A dead PID, in contrast, leaves a known stale FUSE/ENOTCONN
+  # target that this exact spec+generation identity is allowed to unmount.
+  _srw_pid_matches || exit 85
+  timeout 10 rclone rc --rc-addr {shlex.quote(state.rc_addr)} --rc-user {shlex.quote(state.rc_user)} --rc-pass {shlex.quote(state.rc_pass)} core/quit >/dev/null 2>&1 || true
+  sleep 2
+  if _srw_pid_matches; then kill "$_srw_pid" 2>/dev/null || true; fi
+  sleep 2
+  if _srw_pid_matches; then kill -9 "$_srw_pid" 2>/dev/null || true; fi
+  sleep 1
+  # PID reuse after the stop is also fail-closed. Never unmount beside a live
+  # process whose command line is no longer the attested rclone resident.
+  if [ -e "/proc/$_srw_pid" ] && ! _srw_pid_matches; then exit 85; fi
+fi
+# Do not gate detach on mountpoint(1): on a genuinely stale FUSE target it may
+# return "not mounted" because stat(2) itself fails with ENOTCONN. The exact
+# dead/stopped resident identity above authorizes an unconditional detach.
+timeout 10 fusermount3 -u "$target" 2>/dev/null || timeout 10 fusermount -u "$target" 2>/dev/null || true
+if _srw_mount_present || ! [ -d "$target" ]; then
+  timeout 10 fusermount3 -uz "$target" 2>/dev/null || timeout 10 fusermount -uz "$target" 2>/dev/null || true
+fi
+if _srw_mount_present || ! [ -d "$target" ]; then
+  # Workspace images normally permit their agent user to manage its FUSE
+  # mount. A bounded lazy umount is the final recovery for a dead transport.
+  timeout 10 sudo -n umount -l -- "$target" >/dev/null 2>&1 || true
+fi
+_srw_target_ready=
+for _srw_i in $(seq 1 20); do
+  if ! _srw_mount_present && mkdir -p -- "$target" 2>/dev/null && [ -d "$target" ]; then
+    _srw_target_ready=yes
+    break
+  fi
+  sleep 0.1
+done
+[ "$_srw_target_ready" = yes ] || exit 88
+rm -f -- "$identity" {shlex.quote(state.pid_file)} {shlex.quote(state.token_path)} {shlex.quote(state.token_helper_path)}
+echo "{_OK}"
+"""
+
+    def _terminal_unmount_script(self, state: RcloneMountState, *, drain: bool) -> str:
+        """Exact resident adoption, VFS drain, teardown, and zero proof."""
+
+        drain_flag = "yes" if drain else "no"
+        return f"""#!/usr/bin/env bash
+set -euo pipefail
+identity={shlex.quote(state.identity_file)}
+target={shlex.quote(state.target_path)}
+expected_spec={shlex.quote(state.resident_spec_digest)}
+expected_config={shlex.quote(state.config_path)}
+expected_rc={shlex.quote(state.rc_addr)}
+drain={shlex.quote(drain_flag)}
+_srw_mount_present() {{
+  if command -v findmnt >/dev/null 2>&1; then
+    findmnt -rn -C -M "$target" >/dev/null 2>&1
+  else
+    mountpoint -q "$target"
+  fi
+}}
+_srw_pid_matches() {{
+  [ -r "/proc/$_srw_pid/cmdline" ] || return 1
+  _srw_args=$(tr '\\0' '\\n' < "/proc/$_srw_pid/cmdline") || return 1
+  [ "$(basename "$(printf '%s\n' "$_srw_args" | head -n1)")" = rclone ] || return 1
+  for _srw_expected in mount "$expected_config" "$target" "$expected_rc"; do
+    printf '%s\n' "$_srw_args" | grep -Fqx -- "$_srw_expected" || return 1
+  done
+}}
+_srw_any_exact_process() {{
+  for _srw_cmdline in /proc/[0-9]*/cmdline; do
+    if [ ! -r "$_srw_cmdline" ]; then
+      _srw_proc=${{_srw_cmdline%/cmdline}}
+      [ ! -e "$_srw_proc" ] && continue
+      _srw_uid=$(awk '/^Uid:/{{print $2; exit}}' "$_srw_proc/status" 2>/dev/null) || exit 86
+      [ "$_srw_uid" = "$(id -u)" ] && exit 86
+      continue
+    fi
+    _srw_args=$(tr '\\0' '\\n' < "$_srw_cmdline" 2>/dev/null) || {{ [ ! -e "${{_srw_cmdline%/cmdline}}" ] && continue; exit 86; }}
+    [ "$(basename "$(printf '%s\n' "$_srw_args" | head -n1)")" = rclone ] || continue
+    printf '%s\n' "$_srw_args" | grep -Fqx -- "$expected_config" || continue
+    printf '%s\n' "$_srw_args" | grep -Fqx -- "$target" || continue
+    printf '%s\n' "$_srw_args" | grep -Fqx -- "$expected_rc" || continue
+    return 0
+  done
+  return 1
+}}
+if [ ! -f "$identity" ]; then
+  ! _srw_mount_present || exit 87
+  ! _srw_any_exact_process || exit 85
+  echo "{_OK}"
+  exit 0
+fi
+[ "$(wc -l < "$identity")" -eq 1 ] || exit 84
+IFS='|' read -r _srw_version _srw_spec _srw_status _srw_generation _srw_pid _srw_pass _srw_extra < "$identity"
+[ "$_srw_version" = {_RESIDENT_IDENTITY_VERSION} ] || exit 84
+[ "$_srw_spec" = "$expected_spec" ] || exit 84
+case "$_srw_status" in active|creating) ;; *) exit 84 ;; esac
+printf '%s' "$_srw_generation" | grep -Eq '^[0-9a-f]{{32}}$' || exit 84
+printf '%s' "$_srw_pid" | grep -Eq '^[1-9][0-9]*$' || exit 84
+[ -n "$_srw_pass" ] && [ -z "$_srw_extra" ] || exit 84
+if [ -e "/proc/$_srw_pid" ]; then
+  _srw_pid_matches || exit 85
+  if [ "$drain" = yes ]; then
+    _srw_drained=
+    for _srw_i in $(seq 1 60); do
+      if _srw_core=$(timeout 5 rclone rc --rc-addr "$expected_rc" --rc-user {shlex.quote(state.rc_user)} --rc-pass "$_srw_pass" core/stats 2>/dev/null) &&
+         _srw_vfs=$(timeout 5 rclone rc --rc-addr "$expected_rc" --rc-user {shlex.quote(state.rc_user)} --rc-pass "$_srw_pass" vfs/stats 2>/dev/null) &&
+         python3 -c {shlex.quote(_TERMINAL_DRAIN_STATUS_PY)} "$_srw_core" "$_srw_vfs" 2>/dev/null; then
+        _srw_drained=yes
+        break
+      fi
+      sleep 0.5
+    done
+    [ "$_srw_drained" = yes ] || exit 89
+  fi
+  timeout 10 rclone rc --rc-addr "$expected_rc" --rc-user {shlex.quote(state.rc_user)} --rc-pass "$_srw_pass" core/quit >/dev/null 2>&1 || true
+  for _srw_i in $(seq 1 20); do _srw_pid_matches || break; sleep 0.1; done
+  if _srw_pid_matches; then kill "$_srw_pid" 2>/dev/null || true; fi
+  for _srw_i in $(seq 1 20); do _srw_pid_matches || break; sleep 0.1; done
+  if _srw_pid_matches; then kill -9 "$_srw_pid" 2>/dev/null || true; fi
+  for _srw_i in $(seq 1 20); do _srw_pid_matches || break; sleep 0.1; done
+  ! _srw_pid_matches || exit 85
+fi
+timeout 10 fusermount3 -u "$target" >/dev/null 2>&1 || timeout 10 fusermount -u "$target" >/dev/null 2>&1 || true
+if _srw_mount_present; then
+  timeout 10 fusermount3 -uz "$target" >/dev/null 2>&1 || timeout 10 fusermount -uz "$target" >/dev/null 2>&1 || true
+fi
+if _srw_mount_present; then
+  timeout 10 sudo -n umount -l -- "$target" >/dev/null 2>&1 || true
+fi
+! _srw_mount_present || exit 88
+! _srw_any_exact_process || exit 85
+rm -f -- "$identity" {shlex.quote(state.pid_file)} {shlex.quote(state.token_path)} {shlex.quote(state.token_helper_path)}
+echo "{_OK}"
+"""
+
+    def _terminal_zero_script(self) -> str:
+        base = self.workspace_backend.resolve_home_path(
+            f".cache/srw/rclone/{self.thread_id}"
+        )
+        expected = [
+            self._state_for_mount(dict(mount), index)
+            for index, mount in enumerate(self.cloud_cfg.get("mounts") or [])
+        ]
+        mount_checks = "\n".join(
+            (
+                "if command -v findmnt >/dev/null 2>&1; then "
+                f"findmnt -rn -C -M {shlex.quote(state.target_path)} "
+                ">/dev/null 2>&1 && exit 88; "
+                f"else mountpoint -q {shlex.quote(state.target_path)} && exit 88; fi"
+            )
+            for state in expected
+        )
+        return f"""#!/usr/bin/env bash
+set -euo pipefail
+base={shlex.quote(base)}
+{mount_checks}
+if [ -d "$base" ] && find "$base" -name resident.identity -type f -print -quit | grep -q .; then
+  exit 84
+fi
+for _srw_cmdline in /proc/[0-9]*/cmdline; do
+  if [ ! -r "$_srw_cmdline" ]; then
+    _srw_proc=${{_srw_cmdline%/cmdline}}
+    [ ! -e "$_srw_proc" ] && continue
+    _srw_uid=$(awk '/^Uid:/{{print $2; exit}}' "$_srw_proc/status" 2>/dev/null) || exit 86
+    [ "$_srw_uid" = "$(id -u)" ] && exit 86
+    continue
+  fi
+  _srw_args=$(tr '\\0' '\\n' < "$_srw_cmdline" 2>/dev/null) || {{ [ ! -e "${{_srw_cmdline%/cmdline}}" ] && continue; exit 86; }}
+  [ "$(basename "$(printf '%s\n' "$_srw_args" | head -n1)")" = rclone ] || continue
+  printf '%s\n' "$_srw_args" | grep -F -- "$base/" >/dev/null && exit 85
+done
 echo "{_OK}"
 """
 
@@ -951,7 +1712,13 @@ echo "{_OK}"
         timeout: int = 30,
         require_ok: bool = True,
     ) -> str:
-        rel_path = f".cache/srw/rclone/{self.thread_id}/scripts/{name}"
+        # Each controller gets a unique inert staging directory.  An old
+        # claimant may finish an SFTP upload after handoff, but it cannot
+        # overwrite the successor's script and every chmod/execute/remove is
+        # admitted atomically by exec_claim_resource below.
+        rel_path = (
+            f".cache/srw/rclone/{self.thread_id}/scripts/{self._script_nonce}/{name}"
+        )
         self.workspace_backend.write_home_file(rel_path, script)
         script_path = self.workspace_backend.resolve_home_path(rel_path)
         command = (
@@ -959,12 +1726,64 @@ echo "{_OK}"
             f"bash {shlex.quote(script_path)}; "
             f"rc=$?; rm -f {shlex.quote(script_path)}; exit $rc"
         )
-        output = self.workspace_backend.exec_command(command, timeout=timeout)
+        output = self._exec_resource(
+            command,
+            timeout=timeout,
+            operation=f"run rclone script {name}",
+        )
         if require_ok and _OK not in output:
             raise RcloneMountError(output.strip() or "rclone mount failed")
         if _FAILED in output and require_ok:
             raise RcloneMountError(output.strip() or "rclone mount failed")
         return output
+
+    def _run_terminal_remote_script(
+        self,
+        name: str,
+        script: str,
+        *,
+        timeout: int,
+    ) -> str:
+        """Stage an inert script, then execute it under End's terminal token."""
+
+        rel_path = (
+            f".cache/srw/rclone/{self.thread_id}/scripts/{self._script_nonce}/{name}"
+        )
+        self.workspace_backend.write_home_file(rel_path, script)
+        script_path = self.workspace_backend.resolve_home_path(rel_path)
+        command = (
+            f"chmod 700 {shlex.quote(script_path)} && "
+            f"bash {shlex.quote(script_path)}; "
+            f"rc=$?; rm -f {shlex.quote(script_path)}; exit $rc"
+        )
+        execute = getattr(self.workspace_backend, "exec_terminal_claim_resource", None)
+        if not callable(execute):
+            raise RcloneMountError(
+                "terminal rclone cleanup has no terminal resource fence"
+            )
+        output = execute(
+            command,
+            timeout=timeout,
+            operation=f"terminal rclone cleanup {name}",
+        )
+        if _OK not in output or _FAILED in output:
+            raise RcloneMountError(output.strip() or "terminal rclone cleanup failed")
+        return output
+
+    def _exec_resource(
+        self,
+        command: str,
+        *,
+        timeout: int,
+        operation: str,
+    ) -> str:
+        execute = getattr(self.workspace_backend, "exec_claim_resource", None)
+        if execute is None:
+            # Compatibility for narrowly mocked/custom backends. Production
+            # WorkspaceBackend implements the primitive; pinned semantics are
+            # its ordinary exec_command path.
+            return self.workspace_backend.exec_command(command, timeout=timeout)
+        return execute(command, timeout=timeout, operation=operation)
 
     @staticmethod
     def _remote_path(remote_name: str, root: str) -> str:

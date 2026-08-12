@@ -1591,3 +1591,79 @@ class TestArchivePodLogs:
             assert await p.delete_agent_pod("srw-agent-j-xyz") is True
         p._archive_pod_logs.assert_awaited_once_with("srw-agent-j-xyz")
         p._core_api.delete_namespaced_pod.assert_called_once()
+
+
+class TestExactClaimantPodAuthority:
+    @staticmethod
+    def _pod(*, uid="uid-a", phase="Running", deleting=False, terminated=False):
+        pod = MagicMock()
+        pod.metadata.uid = uid
+        pod.metadata.deletion_timestamp = "now" if deleting else None
+        pod.status.phase = phase
+        state = MagicMock()
+        state.terminated = object() if terminated else None
+        status = MagicMock()
+        status.state = state
+        pod.status.container_statuses = [status]
+        return pod
+
+    @pytest.mark.asyncio
+    async def test_same_name_uid_replacement_is_not_old_claimant(self):
+        p, _ = _make_provisioner()
+        p._core_api.read_namespaced_pod.return_value = self._pod(uid="uid-new")
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert (
+                await p.agent_pod_authority("pod-a", expected_pod_uid="uid-old")
+                == "replacement"
+            )
+
+    @pytest.mark.asyncio
+    async def test_deleting_and_unknown_are_not_quiescence_proof(self):
+        p, _ = _make_provisioner()
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            p._core_api.read_namespaced_pod.return_value = self._pod(deleting=True)
+            assert (
+                await p.agent_pod_authority("pod-a", expected_pod_uid="uid-a")
+                == "unknown"
+            )
+            p._core_api.read_namespaced_pod.return_value = self._pod(phase="Unknown")
+            assert (
+                await p.agent_pod_authority("pod-a", expected_pod_uid="uid-a")
+                == "unknown"
+            )
+
+    @pytest.mark.asyncio
+    async def test_exact_terminal_containers_are_positive_proof(self):
+        p, _ = _make_provisioner()
+        p._core_api.read_namespaced_pod.return_value = self._pod(
+            phase="Failed", terminated=True
+        )
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert (
+                await p.agent_pod_authority("pod-a", expected_pod_uid="uid-a")
+                == "exact_terminal"
+            )
+
+    @pytest.mark.asyncio
+    async def test_exact_delete_is_graceful_and_uid_preconditioned(self):
+        p, _ = _make_provisioner()
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert await p.delete_agent_pod_exact("pod-a", expected_pod_uid="uid-a")
+        p._core_api.delete_namespaced_pod.assert_called_once_with(
+            name="pod-a",
+            namespace="test-ns",
+            grace_period_seconds=180,
+            body={"preconditions": {"uid": "uid-a"}},
+        )

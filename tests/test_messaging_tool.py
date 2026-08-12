@@ -41,6 +41,7 @@ class _CapturingAsyncClient:
     """
 
     last_init_headers: dict[str, str] | None = None
+    last_post_json: dict | None = None
 
     def __init__(self, *args, **kwargs):
         type(self).last_init_headers = dict(kwargs.get("headers") or {})
@@ -52,6 +53,7 @@ class _CapturingAsyncClient:
         return False
 
     async def post(self, url, json=None, **kwargs):
+        type(self).last_post_json = dict(json or {})
         resp = MagicMock()
         resp.status_code = 200
         resp.json = MagicMock(
@@ -115,3 +117,27 @@ async def test_send_message_omits_user_id_header_when_context_lacks_user(monkeyp
     assert headers is not None
     assert headers.get("X-Internal-Key") == "test-internal-key"
     assert "X-MCP-User-Id" not in headers
+
+
+@pytest.mark.asyncio
+async def test_blocking_stateless_message_carries_exact_worker_token(monkeypatch):
+    monkeypatch.setenv("MCP_INTERNAL_KEY", "test-internal-key")
+    _CapturingAsyncClient.last_post_json = None
+    monkeypatch.setattr(
+        "src.tools.communication.messaging.httpx.AsyncClient",
+        _CapturingAsyncClient,
+    )
+
+    ctx = ToolContext(
+        _job_id="job-1",
+        _stateless_worker=True,
+        _worker_lease_token=17,
+    )
+    send = _tool_by_name(create_communication_tools(ctx), "send_message")
+
+    await send.ainvoke(
+        {"to": "user", "subject": "need input", "message": "reply", "mode": "blocking"}
+    )
+
+    assert _CapturingAsyncClient.last_post_json is not None
+    assert _CapturingAsyncClient.last_post_json["lease_token"] == 17

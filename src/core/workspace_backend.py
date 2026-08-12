@@ -438,6 +438,19 @@ class WorkspaceBackend(ABC):
         """
         ...
 
+    def replace_file(self, src: str, dst: str) -> None:
+        """Atomically replace one exact file target when the backend can.
+
+        Unlike ``move``, an existing destination directory is never treated as
+        a container. Cloud generation pulls use this narrower contract before
+        acknowledging durable bytes; ordinary tool-facing move semantics stay
+        unchanged for pinned and stateless sessions.
+        """
+
+        if self.is_dir(dst):
+            raise ValueError(f"Destination is a directory: {dst}")
+        self.move(src, dst)
+
     @abstractmethod
     def copy(self, src: str, dst: str) -> None:
         """Copy a file within the workspace.
@@ -538,6 +551,44 @@ class WorkspaceBackend(ABC):
         """
         raise NotImplementedError("exec_command not supported by this backend")
 
+    @property
+    def claim_resource_fenced(self) -> bool:
+        """Whether workspace-resident resource mutations have claim fencing.
+
+        Generic and pinned backends retain their established unfenced
+        behaviour.  A stateless ``RemoteBackend`` overrides this once it has
+        been bound to a queue lease token.
+        """
+
+        return False
+
+    def exec_claim_resource(
+        self,
+        command: str,
+        timeout: int = 30,
+        *,
+        operation: str = "workspace resource mutation",
+    ) -> str:
+        """Execute one claim-scoped workspace resource operation.
+
+        The default intentionally preserves pinned/custom-backend behaviour.
+        Remote stateless workspaces override this with the cooperative durable
+        token fence used by their resident tmux resource.  This primitive is
+        separate from shell admission: retiring local shell tools must not
+        prevent terminal mount cleanup while the claim still owns the lease.
+        """
+
+        del operation
+        return self.exec_command(command, timeout=timeout)
+
+    def retire_claim_resource_owner(self) -> None:
+        """Close local admission for claim-scoped resource operations.
+
+        Backends without a claim resource fence have nothing to retire.
+        """
+
+        return None
+
     # --- Shell operations ---
     #
     # Non-abstract: default to NotImplementedError. Override in backends
@@ -573,6 +624,7 @@ class WorkspaceBackend(ABC):
         text: str,
         enter: bool = True,
         working_dir: Optional[str] = None,
+        allow_busy: bool = False,
     ) -> str:
         """Send keystrokes to a tab.
 
@@ -582,6 +634,9 @@ class WorkspaceBackend(ABC):
             enter: Whether to press Enter after sending.
             working_dir: Optional workspace-relative directory for a command.
                 Backends must not apply it to raw keystrokes.
+            allow_busy: Permit input to an already-running foreground process.
+                This is for explicit keystroke/input mode, never a new async
+                command.
 
         Returns:
             Confirmation message.
@@ -679,6 +734,16 @@ class WorkspaceBackend(ABC):
 
     def shell_cleanup(self) -> None:
         """Kill the entire shell session."""
+        raise NotImplementedError("Shell operations not supported by this backend")
+
+    def shell_reset_after_timeout(self) -> None:
+        """Synchronously stop an owned timed-out shell before reconnecting.
+
+        Unlike transport-only ``disconnect()``, this must prove that the exact
+        owned shell was stopped before it returns. Implementations with durable
+        ownership fences must preserve those fences while creating a clean
+        shell generation for the same owner.
+        """
         raise NotImplementedError("Shell operations not supported by this backend")
 
     def shell_is_alive(self) -> bool:

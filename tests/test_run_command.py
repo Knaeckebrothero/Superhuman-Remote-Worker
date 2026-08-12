@@ -299,6 +299,7 @@ class TestShellExecuteWorkingDir:
             "npm run dev",
             enter=True,
             working_dir="repo",
+            allow_busy=False,
         )
 
     def test_keys_mode_ignores_working_dir(self, manager, backend):
@@ -316,6 +317,7 @@ class TestShellExecuteWorkingDir:
             "C-c",
             enter=False,
             working_dir=None,
+            allow_busy=True,
         )
         backend.shell_run.assert_not_called()
 

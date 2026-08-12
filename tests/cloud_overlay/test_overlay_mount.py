@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,77 @@ class FakeRemoteBackend:
         for name, out in self.outputs_by_script.items():
             if name in command:
                 return out
+        if "overlay_adopt_probe.sh" in command:
+            return "__SRW_OVERLAY_ABSENT__\n"
+        return "__SRW_OVERLAY_OK__\n"
+
+
+class SharedOverlayRuntime:
+    """Workspace-side state shared by two claim-scoped backend instances."""
+
+    def __init__(self) -> None:
+        self.current_token = 1
+        self.overlay_state = "absent"
+        self.upper_bytes = b""
+        self.work_epoch = 0
+        self.files: dict[str, str] = {}
+        self.operations: list[tuple[int, str]] = []
+
+
+class ClaimFencedBackend:
+    def __init__(self, runtime: SharedOverlayRuntime, token: int) -> None:
+        self.runtime = runtime
+        self.token = token
+
+    def resolve_home_path(self, relative_path: str) -> str:
+        return f"/home/agent-host/{relative_path}"
+
+    def write_home_file(self, relative_path: str, content) -> None:
+        self.runtime.files[relative_path] = (
+            content.decode("utf-8") if isinstance(content, bytes) else content
+        )
+
+    @property
+    def claim_resource_fenced(self) -> bool:
+        return True
+
+    def exec_command(self, command: str, timeout: int = 30) -> str:
+        raise AssertionError("stateless overlay commands must use the claim fence")
+
+    def exec_claim_resource(
+        self,
+        command: str,
+        timeout: int = 30,
+        *,
+        operation: str,
+    ) -> str:
+        del timeout
+        if self.token != self.runtime.current_token:
+            raise RuntimeError("stale claim-resource owner")
+        self.runtime.operations.append((self.token, operation))
+        if "overlay_adopt_probe.sh" in command:
+            if self.runtime.overlay_state == "healthy":
+                return "__SRW_OVERLAY_ADOPTED__\n__SRW_OVERLAY_OK__\n"
+            if self.runtime.overlay_state == "creating-healthy":
+                self.runtime.overlay_state = "healthy"
+                return "__SRW_OVERLAY_ADOPTED__\n__SRW_OVERLAY_OK__\n"
+            if self.runtime.overlay_state == "dead":
+                return "__SRW_OVERLAY_DEAD__ ENOTCONN\n"
+            if self.runtime.overlay_state == "mismatch":
+                return "__SRW_OVERLAY_MISMATCH__\n"
+            return "__SRW_OVERLAY_ABSENT__\n"
+        if "overlay_mount.sh" in command:
+            self.runtime.overlay_state = "healthy"
+        elif "overlay_heal_unmount.sh" in command:
+            self.runtime.overlay_state = "absent"
+        elif "overlay_remount.sh" in command:
+            self.runtime.work_epoch += 1
+            self.runtime.overlay_state = "healthy"
+        elif "overlay_unmount.sh" in command:
+            self.runtime.overlay_state = "absent"
+        elif "overlay_probe.sh" in command:
+            if self.runtime.overlay_state != "healthy":
+                return "__SRW_OVERLAY_DEAD__ ENOTCONN\n"
         return "__SRW_OVERLAY_OK__\n"
 
 
@@ -54,6 +126,28 @@ def _manager(backend) -> OverlayMountManager:
     )
 
 
+def test_generated_overlay_scripts_are_valid_bash():
+    mgr = _manager(FakeRemoteBackend())
+    scripts = {
+        "adopt": mgr._adopt_probe_script(),
+        "stateless-cold": mgr._mount_script(),
+        "pinned-mount": mgr._mount_script(replace_existing=True),
+        "unmount": mgr._unmount_script(),
+        "plain-unmount": mgr._plain_unmount_script(),
+        "remount": mgr._mount_body_only_script(),
+        "probe": mgr._probe_script(),
+        "heal-unmount": mgr._heal_unmount_script(),
+        "reset-unmount": mgr._reset_unmount_script(),
+        "wipe-upper": mgr._wipe_upper_script(),
+        "usage": mgr._usage_script(),
+    }
+    for name, script in scripts.items():
+        result = subprocess.run(
+            ["bash", "-n"], input=script, text=True, capture_output=True, check=False
+        )
+        assert result.returncode == 0, f"{name}: {result.stderr}"
+
+
 def test_mount_script_builds_fuse_overlayfs_over_ro_lower_and_repoints_symlink():
     backend = FakeRemoteBackend()
     _manager(backend).mount()
@@ -68,6 +162,8 @@ def test_mount_script_builds_fuse_overlayfs_over_ro_lower_and_repoints_symlink()
     )
     assert "mkdir -p /home/agent-host/.overlay/upper" in s
     assert "mountpoint -q /cloud/lower" in s  # refuses if the lower isn't up
+    assert "fusermount3 -u /cloud/merged" in s  # pinned path remains idempotent
+    assert not any(path.endswith("overlay_adopt_probe.sh") for path in backend.files)
     # symlink workspace/cloud -> merged (NOT the raw lower)
     assert "ln -sfn /cloud/merged" in s
     assert "${workspace}/cloud" in s
@@ -171,6 +267,197 @@ def test_health_check_false_when_no_sentinel_in_output():
     assert _manager(backend).health_check() is False
 
 
+def test_successor_adopts_shared_healthy_overlay_without_unmounting_upper():
+    runtime = SharedOverlayRuntime()
+    first = _manager(ClaimFencedBackend(runtime, token=1))
+
+    assert first.mount() == "cold"
+    cold_script = next(
+        body
+        for path, body in runtime.files.items()
+        if path.endswith("overlay_mount.sh")
+    )
+    assert "resident.identity" in cold_script
+    assert first._identity_digest in cold_script
+    runtime.upper_bytes = b"unapplied staged bytes"
+    first.detach_local()
+    assert first.active is False
+    assert runtime.overlay_state == "healthy"
+
+    runtime.current_token = 2
+    successor = _manager(ClaimFencedBackend(runtime, token=2))
+    before = len(runtime.operations)
+    assert successor.mount() == "adopted"
+
+    successor_ops = [op for _token, op in runtime.operations[before:]]
+    assert successor_ops == ["cloud overlay overlay_adopt_probe"]
+    assert runtime.upper_bytes == b"unapplied staged bytes"
+    assert runtime.work_epoch == 0
+    assert runtime.overlay_state == "healthy"
+
+
+def test_stateless_adoption_fails_closed_on_exact_overlay_config_change():
+    runtime = SharedOverlayRuntime()
+    first_backend = ClaimFencedBackend(runtime, token=1)
+    first = _manager(first_backend)
+    assert first.mount() == "cold"
+    runtime.upper_bytes = b"belongs to the original overlay layout"
+
+    changed_cfg = _cfg()
+    changed_cfg["upper"] = "/home/agent-host/.overlay/other-upper"
+    changed = OverlayMountManager(
+        thread_id="thread-12345678",
+        overlay_cfg=changed_cfg,
+        workspace_backend=ClaimFencedBackend(runtime, token=2),
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    assert changed._identity_digest != first._identity_digest
+    adopt_script = changed._adopt_probe_script()
+    assert changed._identity_digest in adopt_script
+    assert "__SRW_OVERLAY_MISMATCH__" in adopt_script
+
+    runtime.current_token = 2
+    runtime.overlay_state = "mismatch"
+    before = len(runtime.operations)
+    with pytest.raises(OverlayMountError, match="identity does not match"):
+        changed.mount(lambda: pytest.fail("mismatch must not restart the lower"))
+
+    assert [op for _token, op in runtime.operations[before:]] == [
+        "cloud overlay overlay_adopt_probe"
+    ]
+    assert runtime.upper_bytes == b"belongs to the original overlay layout"
+    assert runtime.work_epoch == 0
+
+
+def test_successor_converges_crash_after_mount_before_active_publication():
+    runtime = SharedOverlayRuntime()
+    predecessor = _manager(ClaimFencedBackend(runtime, token=1))
+    cold_script = predecessor._mount_script()
+    creating = predecessor._identity_value("creating")
+    active = predecessor._identity_value("active")
+    fuse_index = cold_script.index("fuse-overlayfs -o")
+    assert cold_script.index(creating) < fuse_index
+    assert cold_script.rindex(active) > fuse_index
+
+    # Fault boundary: fuse succeeded and upper bytes exist, but the process
+    # died before replacing `creating` with `active`.
+    runtime.overlay_state = "creating-healthy"
+    runtime.upper_bytes = b"bytes captured before predecessor crash"
+    runtime.current_token = 2
+    successor = _manager(ClaimFencedBackend(runtime, token=2))
+
+    assert successor.mount() == "adopted"
+    assert runtime.overlay_state == "healthy"
+    assert runtime.upper_bytes == b"bytes captured before predecessor crash"
+    assert runtime.work_epoch == 0
+    adopt_script = successor._adopt_probe_script()
+    assert creating in adopt_script
+    assert active in adopt_script
+
+
+def test_successor_recreates_only_work_after_crash_between_unmount_and_remount():
+    runtime = SharedOverlayRuntime()
+    # Fault boundary: heal/refresh unmounted the merged view, then its agent
+    # died before the fresh-work remount. The staged upper must survive while
+    # the single-mount workdir is recreated by the successor's ABSENT path.
+    runtime.overlay_state = "absent"
+    runtime.upper_bytes = b"staged bytes captured before unmount"
+    runtime.current_token = 2
+    successor = _manager(ClaimFencedBackend(runtime, token=2))
+
+    assert successor.mount() == "cold"
+    assert runtime.overlay_state == "healthy"
+    assert runtime.upper_bytes == b"staged bytes captured before unmount"
+
+    cold_script = next(
+        body
+        for path, body in runtime.files.items()
+        if path.endswith("overlay_mount.sh")
+    )
+    guard_index = cold_script.index("overlay appeared during cold mount")
+    work_reset_index = cold_script.index("rm -rf -- /home/agent-host/.overlay/work")
+    mount_index = cold_script.index("fuse-overlayfs -o")
+    assert guard_index < work_reset_index < mount_index
+    assert "mkdir -p -- /home/agent-host/.overlay/work" in cold_script
+    assert "rm -rf -- /home/agent-host/.overlay/upper" not in cold_script
+
+    # Pinned replacement remains byte-for-byte in lifecycle semantics: its
+    # historical path does not gain the stateless recovery wipe.
+    pinned_script = successor._mount_script(replace_existing=True)
+    assert "rm -rf -- /home/agent-host/.overlay/work" not in pinned_script
+
+
+def test_successor_heals_dead_overlay_once_with_fresh_work_and_preserved_upper():
+    runtime = SharedOverlayRuntime()
+    runtime.current_token = 2
+    runtime.overlay_state = "dead"
+    runtime.upper_bytes = b"staged before lower died"
+    backend = ClaimFencedBackend(runtime, token=2)
+    successor = _manager(backend)
+    lower_restarts = 0
+
+    def _restart_exact_lower() -> None:
+        nonlocal lower_restarts
+        lower_restarts += 1
+
+    assert successor.mount(_restart_exact_lower) == "healed"
+    assert lower_restarts == 1
+    assert runtime.work_epoch == 1
+    assert runtime.upper_bytes == b"staged before lower died"
+    assert runtime.overlay_state == "healthy"
+
+    remount_script = next(
+        body
+        for path, body in runtime.files.items()
+        if path.endswith("overlay_remount.sh")
+    )
+    assert "rm -rf /home/agent-host/.overlay/work" in remount_script
+    assert "rm -rf /home/agent-host/.overlay/upper" not in remount_script
+
+
+def test_stale_predecessor_probe_and_heal_are_rejected_after_handoff():
+    runtime = SharedOverlayRuntime()
+    predecessor = _manager(ClaimFencedBackend(runtime, token=1))
+    assert predecessor.mount() == "cold"
+    runtime.upper_bytes = b"successor-owned staged bytes"
+
+    runtime.current_token = 2
+    successor = _manager(ClaimFencedBackend(runtime, token=2))
+    assert successor.mount() == "adopted"
+    operations_before_stale_calls = list(runtime.operations)
+    stale_callback_calls = 0
+
+    def _stale_restart() -> None:
+        nonlocal stale_callback_calls
+        stale_callback_calls += 1
+
+    with pytest.raises(RuntimeError, match="stale claim-resource owner"):
+        predecessor.health_check()
+    with pytest.raises(RuntimeError, match="stale claim-resource owner"):
+        predecessor.heal(_stale_restart)
+
+    assert runtime.operations == operations_before_stale_calls
+    assert stale_callback_calls == 0
+    assert runtime.upper_bytes == b"successor-owned staged bytes"
+    assert runtime.overlay_state == "healthy"
+
+
+def test_terminal_unmount_remains_remote_but_handoff_detach_is_local_only():
+    runtime = SharedOverlayRuntime()
+    manager = _manager(ClaimFencedBackend(runtime, token=1))
+    assert manager.mount() == "cold"
+    operation_count = len(runtime.operations)
+
+    manager.detach_local()
+    assert len(runtime.operations) == operation_count
+    assert runtime.overlay_state == "healthy"
+
+    # Terminal cleanup happens while the same claim still owns the fence.
+    manager.unmount()
+    assert runtime.operations[-1] == (1, "cloud overlay overlay_unmount")
+    assert runtime.overlay_state == "absent"
+
+
 def test_heal_lazy_unmounts_overlay_first_then_remounts_lower_then_overlay():
     backend = FakeRemoteBackend()
     mgr = _manager(backend)
@@ -198,6 +485,7 @@ def test_heal_lazy_unmounts_overlay_first_then_remounts_lower_then_overlay():
         b for p, b in backend.files.items() if p.endswith("overlay_heal_unmount.sh")
     )
     assert "fusermount3 -uz /cloud/merged" in unmount  # LAZY is correct on heal
+    assert "dead overlay remained mounted" in unmount
 
     remount = next(
         b for p, b in backend.files.items() if p.endswith("overlay_remount.sh")

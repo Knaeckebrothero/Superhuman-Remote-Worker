@@ -11,14 +11,21 @@ from __future__ import annotations
 import json
 import logging
 from typing import Optional
+from uuid import uuid4
 
+from services.container_provisioner import (
+    WORKSPACE_RUNTIME_CREATION_KEY,
+    WORKSPACE_RUNTIME_INCARNATION_KEY,
+)
+from services.stateless_workspace_gate import stateless_session_workspace_check
+from services.workspace_binding import ensure_virtual_thread_workspace_binding
 from services.workspace_lifecycle import (
     EnsureOutcome,
     EnsureResult,
     WorkspaceOwner,
     ensure_workspace,
 )
-from services.workspace_binding import ensure_virtual_thread_workspace_binding
+from services.workspace_suspension import WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY
 from src.core.backends.factory import LITE_BACKENDS, VM_BACKENDS
 
 logger = logging.getLogger(__name__)
@@ -49,7 +56,12 @@ def _thread_backend(thread: dict) -> Optional[str]:
 
 
 async def ensure_session_workspace(
-    thread_id: str, *, db, provisioner, suspension
+    thread_id: str,
+    *,
+    db,
+    provisioner,
+    suspension,
+    _workspace_lifecycle_lock_held: bool = False,
 ) -> Optional[EnsureResult]:
     """Idempotently drive a session's *container* workspace toward ready.
 
@@ -60,6 +72,16 @@ async def ensure_session_workspace(
     thread = await db.get_thread(thread_id)
     if not thread or thread.get("status") == "ended":
         return None
+
+    if thread.get("execution_lane") == "stateless":
+        _, refusal = stateless_session_workspace_check(thread)
+        if refusal is not None:
+            logger.error(
+                "Stateless workspace ensure refused for thread %s: %s",
+                thread_id,
+                refusal,
+            )
+            return EnsureResult(EnsureOutcome.PENDING, status=_ws_status(thread))
 
     # Suspended-VM restore on reconnect — the VM-tier mirror of
     # ensure_workspace's 'suspended' branch below. VM suspend deletes the VM
@@ -122,12 +144,174 @@ async def ensure_session_workspace(
             thread_id,
         )
         return None
-    return await ensure_workspace(
+    workspace_context = _thread_metadata(thread).get("workspace_container") or {}
+    requires_runtime_attestation = bool(
+        thread.get("execution_lane") == "stateless"
+        and backend == "sandbox"
+        and workspace_context.get("provisioner") == "k8s"
+    )
+
+    # Every stateless physical entry (input poll, resume/prepare, and periodic
+    # reconcile) reaches this function.  Serialize the whole create/adopt or
+    # snapshot-restore effect across orchestrator replicas, then re-read under
+    # ownership so a loser observes the winner's durable Ready state instead
+    # of extracting the same snapshot twice.  Test doubles only participate
+    # when their class explicitly implements the production lock protocol;
+    # AsyncMock's dynamic attributes must not be mistaken for one.
+    lock_impl = getattr(type(db), "stateless_session_workspace_ensure_lock", None)
+    if (
+        requires_runtime_attestation
+        and not _workspace_lifecycle_lock_held
+        and callable(lock_impl)
+    ):
+        async with lock_impl(db, thread_id) as owner:
+            if not owner:
+                return EnsureResult(
+                    EnsureOutcome.PENDING,
+                    status=workspace_context.get("status"),
+                )
+            return await ensure_session_workspace(
+                thread_id,
+                db=db,
+                provisioner=provisioner,
+                suspension=suspension,
+                _workspace_lifecycle_lock_held=True,
+            )
+
+    result = await ensure_workspace(
         WorkspaceOwner.session(thread_id),
         provisioner=provisioner,
         suspension=suspension,
         current_status=_ws_status(thread),
+        expected_runtime_incarnation=(
+            workspace_context.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+            if requires_runtime_attestation
+            else None
+        ),
+        # Stateless physical attach treats the Pod UID as part of shell
+        # authority. A legacy Ready row with no UID must converge through the
+        # same idempotent create/adopt path as a missing pod.
+        require_runtime_incarnation=requires_runtime_attestation,
+        # Exact-boolean lifecycle sentinel: only JSON true authorizes restore.
+        # Passing raw preserves malformed present values so the lifecycle
+        # service can fail closed instead of truthiness-coercing them.
+        snapshot_restore_required=workspace_context.get(
+            WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY
+        ),
+        snapshot_restore_marker_present=(
+            WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY in workspace_context
+        ),
+        **await _stateless_creation_arguments(
+            thread_id,
+            db=db,
+            workspace_context=workspace_context,
+            requires_runtime_attestation=requires_runtime_attestation,
+            lifecycle_lock_held=_workspace_lifecycle_lock_held,
+        ),
     )
+
+    if requires_runtime_attestation:
+        # Terminal cleanup can race an already-started Kubernetes create. The
+        # public lifecycle first makes the durable thread ended; after
+        # actuation, give up any pod created for a row that is now gone or
+        # terminal. Suspended is deliberately *not* a give-up state here: the
+        # same ensure call may just have restored its workspace for a queued
+        # wake. This is the cross-replica backstop that prevents post-delete
+        # pod/PVC resurrection.
+        fresh = await db.get_thread(thread_id)
+        fresh_status = fresh.get("status") if fresh else None
+        if fresh is None or fresh_status == "ended":
+            release = getattr(provisioner, "release_workspace", None)
+            if callable(release):
+                await release(
+                    WorkspaceOwner.session(thread_id),
+                    reclaim_volume=fresh is None,
+                )
+            return None
+
+    return result
+
+
+async def _stateless_creation_arguments(
+    thread_id: str,
+    *,
+    db,
+    workspace_context: dict,
+    requires_runtime_attestation: bool,
+    lifecycle_lock_held: bool,
+) -> dict:
+    """Recover or claim the one-shot Pod-create authority for one ensure.
+
+    Every production stateless Kubernetes ensure is serialized by the shared
+    lifecycle advisory lock before reaching this helper.  The marker is
+    persisted before Kubernetes actuation.  This helper reports whether it is
+    still unattempted; the provisioner performs the durable false-to-true CAS
+    immediately before the sole Pod-create call.  An attempted marker is
+    read/adopt-only on every later retry.
+    """
+
+    if not requires_runtime_attestation:
+        return {}
+    if WORKSPACE_RUNTIME_CREATION_KEY not in workspace_context:
+        if workspace_context.get(WORKSPACE_RUNTIME_INCARNATION_KEY) is not None:
+            # A completed Ready runtime (or a failed strict extract on that
+            # exact runtime) has no outstanding Pod-create authority. Its
+            # UID-fenced ready/restore path does not need a create marker.
+            return {}
+        # Never manufacture provenance for a markerless physical row. Pod
+        # actuation precedes UID publication, so even a 404 may hide an old
+        # partitioned process. Fresh create and Resume pre-arm the marker at
+        # their own durable authority transitions.
+        return {"stateless_creation_refused": True}
+    prepare_impl = getattr(
+        type(db), "prepare_stateless_thread_workspace_creation", None
+    )
+    if not lifecycle_lock_held or not callable(prepare_impl):
+        logger.error(
+            "Stateless workspace creation refused without lifecycle/DB authority "
+            "for thread %s",
+            thread_id,
+        )
+        return {"stateless_creation_refused": True}
+
+    raw_restore = workspace_context.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY, False)
+    if (
+        WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY in workspace_context
+        and type(raw_restore) is not bool
+    ):
+        return {"stateless_creation_refused": True}
+    mode = "restore" if raw_restore is True else "create"
+    try:
+        plan = await prepare_impl(
+            db,
+            thread_id,
+            proposed_generation=str(uuid4()),
+            mode=mode,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to prepare stateless workspace creation for thread %s",
+            thread_id,
+        )
+        return {"stateless_creation_refused": True}
+    if not isinstance(plan, dict) or plan.get("state") not in {"pending", "runtime"}:
+        return {"stateless_creation_refused": True}
+    marker = plan.get("creation")
+    if marker is None:
+        return {}
+    if not isinstance(marker, dict):
+        return {"stateless_creation_refused": True}
+    generation = marker.get("generation")
+    attempted = marker.get("attempted")
+    if not isinstance(generation, str) or type(attempted) is not bool:
+        return {"stateless_creation_refused": True}
+    return {
+        "stateless_creation_generation": generation,
+        # This is only candidacy. ContainerProvisioner performs the durable
+        # false->true attempt CAS after PVC/seed preparation and immediately
+        # before the one permitted Pod-create call.
+        "allow_stateless_create": attempted is False,
+    }
 
 
 async def reconcile_session_workspaces(*, db, provisioner, suspension) -> int:

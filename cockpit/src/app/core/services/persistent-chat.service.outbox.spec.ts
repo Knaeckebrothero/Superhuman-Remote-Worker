@@ -752,6 +752,11 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             await flushTick();
 
             await ctx.service.connect('t2');
+            // This suite's deliberately minimal GET double predates the
+            // durable /state payload and therefore leaves an unrelated state
+            // hydration banner. Establish a clean live-thread baseline before
+            // the old thread's upload fails.
+            ctx.service.error.set(null);
             expect(ctx.service.error()).toBeNull();
 
             gate.error(new HttpErrorResponse({status: 413})); // terminal

@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, AsyncMock, call, patch
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage, SystemMessage
@@ -27,7 +27,7 @@ if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 
 from src.graph import create_audited_tool_node  # noqa: E402
-from src.core.loader import LimitsConfig  # noqa: E402
+from src.core.loader import InstructionFileEntry, LimitsConfig  # noqa: E402
 from src.core.workspace_backend import WorkspaceUnavailableError  # noqa: E402
 from src.tools.context import ToolContext  # noqa: E402
 
@@ -130,6 +130,89 @@ def mock_tool_node():
     """Create a mock ToolNode that returns configurable results."""
     mock = AsyncMock()
     return mock
+
+
+@pytest.mark.asyncio
+async def test_stateless_tool_batch_checkpoints_instruction_read_receipt(config):
+    entry = InstructionFileEntry(
+        trigger="before_tool:todo_complete",
+        skill="verify-before-done",
+        phases=["tactical"],
+        read_scope="phase",
+        max_read_age_turns=20,
+    )
+    context = ToolContext()
+    context._stateless_worker = True
+    context._instruction_files = [entry]
+    context.set_current_phase("tactical", phase_number=1, turn_count=4)
+    context.record_file_read(entry.path, "checkpoint this exact guide")
+    fake_read = MagicMock()
+    fake_read.name = "read_file"
+
+    with patch("src.graph.ToolNode") as mock_tool_node_class:
+        tool_node = AsyncMock()
+        tool_node.ainvoke.return_value = {
+            "messages": [make_tool_result("read_file", "guide", "call-read")]
+        }
+        mock_tool_node_class.return_value = tool_node
+        audited = create_audited_tool_node(
+            [fake_read],
+            config,
+            tool_context=context,
+        )
+        result = await audited(
+            make_state(
+                [make_tool_call("read_file", {"path": entry.path}, "call-read")],
+                phase_number=1,
+                is_strategic=False,
+            )
+        )
+
+    assert result["instruction_read_receipts"] == (
+        context.export_instruction_read_receipts()
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_tools_resume_restores_phase_before_instruction_gate(config):
+    entry = InstructionFileEntry(
+        trigger="before_tool:todo_complete",
+        skill="verify-before-done",
+        phases=["tactical"],
+        read_scope="phase",
+        max_read_age_turns=20,
+    )
+    context = ToolContext()
+    context._instruction_files = [entry]
+    # A fresh successor context has no phase, so phase-filtered bindings are
+    # intentionally not evaluated until the resumed graph node supplies it.
+    assert context.check_tool_enforcement("todo_complete") is None
+    fake_read = MagicMock()
+    fake_read.name = "read_file"
+
+    with patch("src.graph.ToolNode") as mock_tool_node_class:
+        tool_node = AsyncMock()
+        tool_node.ainvoke.return_value = {
+            "messages": [make_tool_result("read_file", "ok", "call-read")]
+        }
+        mock_tool_node_class.return_value = tool_node
+        audited = create_audited_tool_node(
+            [fake_read],
+            config,
+            tool_context=context,
+        )
+        state = make_state(
+            [make_tool_call("read_file", {"path": "notes.md"}, "call-read")],
+            phase_number=3,
+            is_strategic=False,
+        )
+        state["turn_count"] = 12
+        await audited(state)
+
+    assert context._current_phase == "tactical"
+    assert context._current_phase_number == 3
+    assert context._current_turn_count == 12
+    assert context.check_tool_enforcement("todo_complete") is not None
 
 
 # =============================================================================
@@ -913,8 +996,11 @@ class TestToolNodeTimeoutEscalation:
         assert "timed out" in (msgs[0].content or "").lower()
         assert elapsed >= 1.0
         assert elapsed < 2.0
-        backend.disconnect.assert_called_once()
-        backend.connect.assert_called_once()
+        assert backend.method_calls == [
+            call.shell_reset_after_timeout(),
+            call.disconnect(),
+            call.connect(),
+        ]
 
     @pytest.mark.asyncio
     async def test_tool_node_timeout_repeated_raises_workspace_unavailable(self):
@@ -958,6 +1044,7 @@ class TestToolNodeTimeoutEscalation:
                     )
                 )
 
+        assert backend.shell_reset_after_timeout.call_count == 1
         assert backend.disconnect.call_count == 1
         assert backend.connect.call_count == 1
 
@@ -1000,8 +1087,57 @@ class TestToolNodeTimeoutEscalation:
                     )
                 )
 
-        backend.disconnect.assert_called_once()
-        backend.connect.assert_called_once()
+        assert backend.method_calls == [
+            call.shell_reset_after_timeout(),
+            call.disconnect(),
+            call.connect(),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_tool_node_timeout_reset_failure_never_reconnects(self):
+        """An unproven shell reset must stop recovery before transport reuse."""
+
+        fake_tool = MagicMock()
+        fake_tool.name = "run_command"
+        cfg = FakeConfig(
+            limits=LimitsConfig(
+                tool_category_timeouts={"default": 1},
+            )
+        )
+
+        async def slow_ainvoke(_):
+            await asyncio.sleep(1.25)
+            return {"messages": [make_tool_result("run_command", "ok", "call_t")]}
+
+        backend = MagicMock()
+        backend.shell_reset_after_timeout.side_effect = RuntimeError("fence moved")
+        ctx = MagicMock()
+        ctx.workspace_manager = MagicMock(backend=backend)
+        ctx.consume_freeze_request.return_value = None
+        ctx.drain_pending_memories.return_value = []
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = slow_ainvoke
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node([fake_tool], cfg, tool_context=ctx)
+            with pytest.raises(WorkspaceUnavailableError):
+                await audited(
+                    make_state(
+                        [
+                            make_tool_call(
+                                "run_command",
+                                {"command": "sleep 5"},
+                                "call_t",
+                            )
+                        ]
+                    )
+                )
+
+        backend.shell_reset_after_timeout.assert_called_once_with()
+        backend.disconnect.assert_not_called()
+        backend.connect.assert_not_called()
 
 
 # =============================================================================

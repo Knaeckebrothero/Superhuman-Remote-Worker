@@ -8,6 +8,7 @@ Or from orchestrator directory:
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -97,7 +98,13 @@ from fastapi.responses import (  # noqa: E402
     StreamingResponse,
 )
 
-from pydantic import BaseModel, Field, field_validator, model_validator  # noqa: E402
+from pydantic import (  # noqa: E402
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from database import (  # noqa: E402
     PostgresDB,
@@ -179,6 +186,35 @@ from services.session_wake import (  # noqa: E402
     notify_all_officers,
     notify_officer,
     session_wake_sweeper_loop,
+)
+from services.session_state_snapshot import (  # noqa: E402
+    build_session_state_snapshot,
+)
+from services.thread_control_inbox import (  # noqa: E402
+    ControlAdmissionError,
+    ControlAdmissionNotReady,
+    admit_thread_control,
+    find_existing_thread_control,
+)
+from services.thread_interrupt_inbox import (  # noqa: E402
+    InterruptAdmissionError,
+    admit_thread_interrupt,
+    find_existing_thread_interrupt,
+)
+from src.shared.thread_presence import (  # noqa: E402
+    DEFAULT_PRESENCE_RENEW_SECONDS,
+    DEFAULT_PRESENCE_TTL_SECONDS,
+    promote_expired_stateless_pauses,
+    refresh_thread_presence,
+)
+from src.shared.session_retirement import (  # noqa: E402
+    STATELESS_STOP_KEYS,
+    stateless_stop_markers,
+)
+from services.stateless_workspace_gate import (  # noqa: E402
+    declared_thread_workspace_backend,
+    stateless_session_workspace_check,
+    thread_metadata_object,
 )
 from services.stale_verification_sweeper import (  # noqa: E402
     stale_verification_sweeper_loop,
@@ -314,6 +350,7 @@ from services.virtual_workspace import (  # noqa: E402
 from services.workspace_binding import (  # noqa: E402
     ensure_virtual_thread_workspace_binding,
     remote_canvas_presentation_available,
+    virtual_thread_backing_id,
 )
 from services.workspace import workspace_service  # noqa: E402
 from services.job_todos import (  # noqa: E402
@@ -413,7 +450,12 @@ from src.utils.ssh_key import (  # noqa: E402
 )
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
-from services.container_provisioner import container_provisioner  # noqa: E402
+from services.container_provisioner import (  # noqa: E402
+    WORKSPACE_RUNTIME_INCARNATION_KEY,
+    WorkspaceRuntimeAttestation,
+    WorkspaceRuntimeAuthorityError,
+    container_provisioner,
+)
 from services.workspace_lifecycle import (  # noqa: E402
     EnsureOutcome,
     WorkspaceOwner,
@@ -452,7 +494,10 @@ from services.lifecycle import (  # noqa: E402
     VMInstanceManager,
     WorkspaceInstanceManager,
 )
-from services.workspace_suspension import workspace_suspension_service  # noqa: E402
+from services.workspace_suspension import (  # noqa: E402
+    WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY,
+    workspace_suspension_service,
+)
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
 from services.ide_proxy import ide_proxy_service  # noqa: E402
@@ -1416,6 +1461,20 @@ AUTO_ASSIGN_ENABLED = os.environ.get("AUTO_ASSIGN_ENABLED", "true").lower() in (
     "yes",
 )
 
+# Session admission reads the same default-off gate that renders the generic
+# stateless executor Deployment. Helm supplies this explicitly to the
+# orchestrator; an unset/local process preserves pinned behavior.
+STATELESS_SESSION_ENABLED = os.environ.get(
+    "STATELESS_SESSION_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+
+# Worker jobs remain pinned unless this independent admission gate is opened.
+# Session-pool enablement is intentionally not sufficient: worker rollout and
+# rollback have different safety gates and capacity requirements.
+STATELESS_WORKER_ENABLED = os.environ.get(
+    "STATELESS_WORKER_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+
 # Dispatcher lock prevents concurrent dispatch (double-assignment)
 _dispatch_lock = asyncio.Lock()
 
@@ -1856,6 +1915,49 @@ async def ro_reader_reconciler_loop(shutdown_event: asyncio.Event) -> None:
             pass
 
     logger.info("RO reader reconciler stopped")
+
+
+_stateless_workspace_ensure_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+def _schedule_stateless_workspace_ensure(thread_id: str) -> asyncio.Task[None]:
+    """Single-flight a stateless workspace reconcile.
+
+    Input and resume must stay durable/fast, while the internal workspace poll
+    is allowed to observe provisioning over the already-heartbeating queue
+    lease. Repeated user input and two-second agent polls therefore converge on
+    one background create/adopt operation instead of starting task storms.
+    """
+    current = _stateless_workspace_ensure_tasks.get(thread_id)
+    if current is not None and not current.done():
+        return current
+
+    async def _ensure() -> None:
+        try:
+            # The service owns the cross-replica advisory lock because direct
+            # resume/prepare and periodic-reconcile callers share this path.
+            await ensure_session_workspace(
+                thread_id,
+                db=postgres_db,
+                provisioner=container_provisioner,
+                suspension=workspace_suspension_service,
+            )
+        except Exception:
+            logger.exception(
+                "Stateless workspace reconcile failed for thread %s", thread_id
+            )
+
+    task = asyncio.create_task(
+        _ensure(), name=f"stateless-workspace-ensure-{thread_id[:8]}"
+    )
+    _stateless_workspace_ensure_tasks[thread_id] = task
+
+    def _forget(finished: asyncio.Task[None]) -> None:
+        if _stateless_workspace_ensure_tasks.get(thread_id) is finished:
+            _stateless_workspace_ensure_tasks.pop(thread_id, None)
+
+    task.add_done_callback(_forget)
+    return task
 
 
 async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
@@ -3630,21 +3732,23 @@ async def _inject_dispatch_credentials(
     return config_override
 
 
-async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
-    """Start a new job on an agent. Returns True on success.
+async def _build_job_start_request(
+    job: dict,
+    *,
+    persist_dispatch_state: bool = True,
+) -> "JobStartRequest | None":
+    """Build the canonical credential-complete worker start bundle.
 
-    Extracted from assign_job_to_agent() endpoint. Handles datasource resolution,
-    config overrides, HTTP POST to agent pod, and status updates.
+    Both the pinned push dispatcher and stateless claim-bundle endpoint use
+    this exact seam. It deliberately performs no delivery or assignment;
+    callers retain their lane-specific authority. Pinned dispatch preserves
+    the historical status/cache writes on a refused bundle. Stateless claim
+    assembly disables those writes because credential resolution can outlive
+    its queue lease; the final exact-token recheck then makes the whole build
+    read-only from a stale claimant's point of view.
     """
-
     job_id = str(job["id"])
-    agent_id = str(agent["id"])
-
-    if not agent.get("pod_ip"):
-        logger.warning(f"Agent {agent_id} has no pod IP — skipping dispatch")
-        return False
-
-    _log_token = bind_log_context(job_id=job_id, agent_id=agent_id)
+    _log_token = bind_log_context(job_id=job_id)
     try:
         # Extract upload IDs from context if present
         job_context = job.get("context") or {}
@@ -3722,12 +3826,13 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             logger.warning(
                 "Dispatch: connector_unavailable for job %s", job_id, exc_info=True
             )
-            await postgres_db.update_job_status(
-                job_id,
-                status="failed",
-                error_message="connector_unavailable",
-            )
-            return False
+            if persist_dispatch_state:
+                await postgres_db.update_job_status(
+                    job_id,
+                    status="failed",
+                    error_message="connector_unavailable",
+                )
+            return None
 
         has_knowledge_scope = bool(job.get("project_id")) or any(
             str(ds.get("type") or "").lower() == "kb" for ds in (resolved_ds or [])
@@ -3823,20 +3928,22 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     "backend='sandbox' or 'vm', or detach the repository."
                 )
                 logger.error("Dispatch: job %s rejected — %s", job_id, msg)
-                await postgres_db.update_job_status(
-                    job_id=job_id, status="failed", error_message=msg
-                )
-                return False
+                if persist_dispatch_state:
+                    await postgres_db.update_job_status(
+                        job_id=job_id, status="failed", error_message=msg
+                    )
+                return None
             try:
                 config_override = _inject_lite_workspace_config(
                     config_override, prefix=f"jobs/{job_id}/"
                 )
             except LiteWorkspaceConfigError as exc:
                 logger.error("Dispatch: job %s lite-config error: %s", job_id, exc)
-                await postgres_db.update_job_status(
-                    job_id=job_id, status="failed", error_message=str(exc)
-                )
-                return False
+                if persist_dispatch_state:
+                    await postgres_db.update_job_status(
+                        job_id=job_id, status="failed", error_message=str(exc)
+                    )
+                return None
             logger.info(
                 "Dispatch: job %s using lite workspace (backend=%s, no pod)",
                 job_id,
@@ -3874,10 +3981,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 "was not ready; it should be held until ready rather than dispatched."
             )
             logger.error("Dispatch: job %s refused — %s", job_id, msg)
-            await postgres_db.update_job_status(
-                job_id=job_id, status="failed", error_message=msg
-            )
-            return False
+            if persist_dispatch_state:
+                await postgres_db.update_job_status(
+                    job_id=job_id, status="failed", error_message=msg
+                )
+            return None
 
         # Orchestrator-resolved config (supersedes agent-side Decision 6): when
         # experts are enabled, resolve the full config here with the same loader
@@ -3950,9 +4058,10 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         include_kb_profile=has_knowledge_scope,
                     ),
                 )
-                await postgres_db.store_resolved_config(
-                    job_id, redact_config_override(resolved_config)
-                )
+                if persist_dispatch_state:
+                    await postgres_db.store_resolved_config(
+                        job_id, redact_config_override(resolved_config)
+                    )
                 logger.info(
                     "Dispatch: resolved config for job %s (expert_id=%s)",
                     job_id,
@@ -3960,12 +4069,13 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 )
             except GrantDenied as gd:
                 logger.warning("Dispatch denied for job %s: %s", job_id, gd)
-                await postgres_db.update_job_status(
-                    job_id,
-                    status="failed",
-                    error_message=_grant_violations_detail(gd.violations),
-                )
-                return False
+                if persist_dispatch_state:
+                    await postgres_db.update_job_status(
+                        job_id,
+                        status="failed",
+                        error_message=_grant_violations_detail(gd.violations),
+                    )
+                return None
             except Exception:
                 logger.exception(
                     "Dispatch: resolve_config failed for job %s; falling back "
@@ -4010,10 +4120,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     job_id,
                     _unrouted,
                 )
-                await postgres_db.update_job_status(
-                    job_id, status="failed", error_message=msg
-                )
-                return False
+                if persist_dispatch_state:
+                    await postgres_db.update_job_status(
+                        job_id, status="failed", error_message=msg
+                    )
+                return None
 
         # Build job start request. resolved_config and config_override are
         # mutually exclusive on the wire: a delivered blob is complete, so we
@@ -4039,42 +4150,83 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             project_id=str(job["project_id"]) if job.get("project_id") else None,
         )
 
-        # Send to agent pod
+        return job_start
+
+    except Exception as e:
+        logger.error(
+            "Dispatch: failed to build start bundle for job %s: %s",
+            job_id,
+            e,
+            exc_info=True,
+        )
+        return None
+    finally:
+        reset_log_context(_log_token)
+
+
+async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
+    """Build and push a fresh job to a registered pinned agent."""
+    job_id = str(job["id"])
+    agent_id = str(agent["id"])
+
+    # Defense in depth for callers that bypass get_dispatchable_jobs (notably
+    # the manual admin assignment endpoint). A stateless row must never be
+    # POSTed to a pinned agent; its sole claim authority is run_queue (§5.4.4).
+    if job.get("execution_lane", "pinned") != "pinned":
+        logger.warning(
+            "Dispatch: refusing pinned start for %s job %s",
+            job.get("execution_lane"),
+            job_id,
+        )
+        return False
+    if not agent.get("pod_ip"):
+        logger.warning("Agent %s has no pod IP — skipping dispatch", agent_id)
+        return False
+
+    _log_token = bind_log_context(job_id=job_id, agent_id=agent_id)
+    try:
+        job_start = await _build_job_start_request(job)
+        if job_start is None:
+            return False
+
         agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/start"
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 agent_url,
                 json=job_start.model_dump(exclude_none=True),
             )
-
         if response.status_code not in (200, 202):
             logger.warning(
-                f"Dispatch: agent {agent_id} rejected job {job_id}: {response.text}"
+                "Dispatch: agent %s rejected job %s: %s",
+                agent_id,
+                job_id,
+                response.text,
             )
             return False
 
-        # Update job status and assign to agent
         await postgres_db.update_job_status(
             job_id=job_id,
             status="processing",
             assigned_agent_id=agent_id,
         )
-
-        # Update agent status via heartbeat simulation
         await postgres_db.heartbeat(
             agent_id=agent_id,
             status="working",
             current_job_id=job_id,
         )
-
         logger.info(
-            f"Dispatch: assigned job {job_id} (priority={job.get('priority', '?')}) to agent {agent_id}"
+            "Dispatch: assigned job %s (priority=%s) to agent %s",
+            job_id,
+            job.get("priority", "?"),
+            agent_id,
         )
         return True
-
-    except Exception as e:
+    except Exception as exc:
         logger.error(
-            f"Dispatch: failed to assign job {job_id} to agent {agent_id}: {e}",
+            "Dispatch: failed to assign job %s to agent %s: %s",
+            job_id,
+            agent_id,
+            exc,
             exc_info=True,
         )
         return False
@@ -4087,6 +4239,16 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
 
     job_id = str(job["id"])
     agent_id = str(agent["id"])
+
+    # Same coexistence fence as the fresh-start helper. Resume is a direct
+    # POST to a registered pod and therefore belongs exclusively to pinned jobs.
+    if job.get("execution_lane", "pinned") != "pinned":
+        logger.warning(
+            "Resume dispatch: refusing pinned resume for %s job %s",
+            job.get("execution_lane"),
+            job_id,
+        )
+        return False
 
     if not agent.get("pod_ip"):
         logger.warning(f"Agent {agent_id} has no pod IP — skipping resume dispatch")
@@ -4474,6 +4636,62 @@ def _agent_sha_is_current(metadata: dict | None) -> bool:
     return build_sha in expected
 
 
+def _thread_uses_pinned_execution(thread: Any) -> bool:
+    """Whether a thread may bind a registered/persistent agent.
+
+    This is deliberately an exact whitelist. ``execution_lane`` is
+    app-validated rather than CHECK-constrained, so missing, corrupt, or
+    future values must not silently inherit the pinned provisioning plane.
+    """
+    from src.shared.run_queue import LANE_PINNED
+
+    return bool(thread and thread.get("execution_lane") == LANE_PINNED)
+
+
+async def _bind_registered_persistent_agent(
+    thread_id: str,
+    agent_id: str,
+    expected_agent_id: str | None,
+) -> bool:
+    """Lane-qualified final half of persistent-agent registration.
+
+    ``register_agent`` has already written ``agents.thread_id``.  The thread
+    advisory lock serializes sanctioned transitions, while this conditional
+    update also fails closed if an out-of-band lane edit lands between the
+    precheck and the final bind.  A refused bind clears only this exact
+    agent/thread association; it never deletes a possibly pre-existing
+    hostname-upsert row.
+    """
+    async with postgres_db.acquire() as conn:
+        if expected_agent_id is None:
+            bound = await conn.execute(
+                "UPDATE threads SET agent_id = $2, "
+                "control_admission_agent_id = NULL "
+                "WHERE id = $1 AND execution_lane = $3 AND agent_id IS NULL",
+                thread_id,
+                agent_id,
+                "pinned",
+            )
+        else:
+            bound = await conn.execute(
+                "UPDATE threads SET agent_id = $2, "
+                "control_admission_agent_id = NULL "
+                "WHERE id = $1 AND execution_lane = $3 AND agent_id = $4",
+                thread_id,
+                agent_id,
+                "pinned",
+                expected_agent_id,
+            )
+        if bound == "UPDATE 1":
+            return True
+        await conn.execute(
+            "UPDATE agents SET thread_id = NULL WHERE id = $1 AND thread_id = $2",
+            agent_id,
+            thread_id,
+        )
+        return False
+
+
 async def _find_idle_persistent_agent() -> Optional[dict]:
     """Find an idle persistent or dual-mode agent in the pool.
 
@@ -4540,22 +4758,77 @@ async def _send_session_attach(
         )
 
 
-async def _send_session_attach_locked(
-    agent: dict,
+async def _reserve_session_attach_binding(agent_id: str, thread_id: str) -> bool:
+    """Atomically reserve both sides of a pinned warm-pool binding.
+
+    Reservation happens before HTTP delivery.  That ordering makes the
+    documented "flip only while detached" transition test atomic: either the
+    lane flip wins while ``agent_id`` is NULL, or this reservation wins while
+    the lane is still pinned.  We never need to tear down an already-started
+    session merely because a post-delivery lane CAS lost.
+    """
+    try:
+        async with postgres_db.acquire() as conn:
+            async with conn.transaction():
+                # Match control admission's lock order: threads -> agents.
+                # Taking these in the opposite order creates a deterministic
+                # deadlock when a control is admitted during a warm bind.
+                thread_bound = await conn.execute(
+                    "UPDATE threads SET agent_id = $2, "
+                    "control_admission_agent_id = NULL "
+                    "WHERE id = $1 AND execution_lane = $3 "
+                    "AND agent_id IS NULL",
+                    thread_id,
+                    agent_id,
+                    "pinned",
+                )
+                if thread_bound != "UPDATE 1":
+                    raise RuntimeError(
+                        "thread is no longer detached on the pinned lane"
+                    )
+
+                agent_bound = await conn.execute(
+                    "UPDATE agents SET thread_id = $2, status = 'session' "
+                    "WHERE id = $1 AND thread_id IS NULL "
+                    "AND current_job_id IS NULL AND status = 'ready'",
+                    agent_id,
+                    thread_id,
+                )
+                if agent_bound != "UPDATE 1":
+                    raise RuntimeError("agent is no longer idle")
+        return True
+    except Exception as exc:
+        logger.info(
+            "Session attach reservation refused for agent %s / thread %s: %s",
+            agent_id,
+            thread_id,
+            exc,
+        )
+        return False
+
+
+async def _assemble_session_attach_payload(
     thread_id: str,
+    *,
     config_override: Optional[dict] = None,
-    project_ids: Optional[list] = None,
-    datasources: Optional[list] = None,
     config_name: Optional[str] = None,
-) -> bool:
-    """Send a session attach request to an idle persistent agent.
+) -> Optional[dict[str, Any]]:
+    """Assemble the session-attach payload for a thread — the ONE assembly.
 
-    ``config_name`` is the thread's config — pool pods boot as workers
-    (``worker_base``), so the agent must re-resolve the session base config
-    from this name instead of its boot config
-    (docs/issues/session_config_name_plumbing.md, hole B).
+    Factored out of ``_send_session_attach_locked`` so the stateless-lane
+    claim bundle (``GET /internal/units/{unit_id}/claim-bundle``) and the
+    legacy pinned-lane sender deliver identical attach payloads under
+    identical fail-closed rules: lite workspace config injection, datasource
+    reauthorization (the attach boundary owns the authoritative re-read),
+    and ``_resolve_session_config`` grant/error handling.
 
-    Returns True if the agent accepted the session.
+    ``project_ids``/``datasources`` are deliberately NOT parameters: they are
+    mutable authorization grants recomputed here from the thread's current
+    state, never trusted from callers. Returns the payload dict, or ``None``
+    on ANY refusal — callers must treat ``None`` as "do not attach" and must
+    not distinguish refusal reasons (no enumeration oracle; details go to the
+    server log only). Call under ``postgres_db.thread_datasource_lock`` to
+    serialize with live connector-selection updates.
     """
     # Lite tiers (virtual/none) carry no SSH endpoint. For `virtual` we attach
     # the object-store mounts here — deployment-sourced credentials, in-flight
@@ -4567,7 +4840,7 @@ async def _send_session_attach_locked(
         )
     except LiteWorkspaceConfigError as exc:
         logger.error("Session attach: thread %s lite-config error: %s", thread_id, exc)
-        return False
+        return None
 
     # Orchestrator-resolved config for the warm-pool agent: this is the expert
     # delivery channel the warm path lacked (the 3-minute-stall bug). Re-resolve
@@ -4582,10 +4855,10 @@ async def _send_session_attach_locked(
             "Session attach: failed to load thread %s; refusing (fail closed)",
             thread_id,
         )
-        return False
+        return None
     if not _thread:
         logger.warning("Session attach: thread %s vanished; refusing", thread_id)
-        return False
+        return None
 
     _meta = _thread.get("metadata") or {}
     if isinstance(_meta, str):
@@ -4625,14 +4898,14 @@ async def _send_session_attach_locked(
             "scope is no longer available",
             thread_id,
         )
-        return False
+        return None
     except Exception:
         logger.exception(
             "Session attach: access revalidation failed for thread %s; "
             "refusing (fail closed)",
             thread_id,
         )
-        return False
+        return None
 
     try:
         if _thread:
@@ -4641,7 +4914,7 @@ async def _send_session_attach_locked(
             )
     except GrantDenied as gd:
         logger.warning("Session attach denied for thread %s: %s", thread_id, gd)
-        return False
+        return None
     except Exception:
         logger.exception(
             "Session attach: resolve failed for thread %s; using fallback", thread_id
@@ -4654,10 +4927,32 @@ async def _send_session_attach_locked(
             "Session attach: resolve errored for thread %s; refusing (fail closed)",
             thread_id,
         )
-        return False
+        return None
 
-    agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/attach"
-    payload = {
+    # Control-inbox scalar persistence is first-class on ``threads``. Overlay
+    # materialized values at the final delivery edge for BOTH resolution modes
+    # so a handoff cannot resurrect an older config value. Narration remains
+    # NULL for legacy rows whose value is inherited through an expert/account
+    # layer that migration SQL cannot resolve; those rows keep the resolved
+    # value until creation/control materializes one.
+    interactive_scalars = {
+        "permission_mode": str(_thread.get("permission_mode") or "supervised"),
+    }
+    if _thread.get("narration_mode") is not None:
+        interactive_scalars["narration_mode"] = str(_thread["narration_mode"])
+    if resolved_config is not None:
+        resolved_config = dict(resolved_config)
+        resolved_agent = dict(resolved_config.get("agent") or {})
+        resolved_interactive = dict(resolved_agent.get("interactive") or {})
+        resolved_interactive.update(interactive_scalars)
+        resolved_agent["interactive"] = resolved_interactive
+        resolved_config["agent"] = resolved_agent
+    else:
+        config_override = _deep_merge_dicts(
+            dict(config_override or {}), {"interactive": interactive_scalars}
+        )
+
+    return {
         "thread_id": thread_id,
         "config_override": None if resolved_config else config_override,
         "resolved_config": resolved_config,
@@ -4665,6 +4960,56 @@ async def _send_session_attach_locked(
         "datasources": datasources,
         "config_name": config_name,
     }
+
+
+async def _send_session_attach_locked(
+    agent: dict,
+    thread_id: str,
+    config_override: Optional[dict] = None,
+    project_ids: Optional[list] = None,
+    datasources: Optional[list] = None,
+    config_name: Optional[str] = None,
+) -> bool:
+    """Send a session attach request to an idle persistent agent.
+
+    ``config_name`` is the thread's config — pool pods boot as workers
+    (``worker_base``), so the agent must re-resolve the session base config
+    from this name instead of its boot config
+    (docs/issues/session_config_name_plumbing.md, hole B).
+
+    ``project_ids``/``datasources`` are accepted for caller compatibility but
+    ignored: the assembly recomputes both from the thread's current state
+    (they are mutable authorization grants — see
+    ``_assemble_session_attach_payload``, which owns the payload build and
+    every fail-closed rule).
+
+    Returns True once the agent accepted the session *or* delivery became
+    ambiguous after the DB reservation.  Callers must not provision a fallback
+    executor on that outcome.  False means no reservation remains.
+    """
+    del project_ids, datasources  # recomputed inside the assembly (see docstring)
+    thread = await postgres_db.get_thread(thread_id)
+    if not _thread_uses_pinned_execution(thread):
+        logger.warning(
+            "Session attach: refusing pinned delivery for thread %s on "
+            "execution lane %r",
+            thread_id,
+            thread.get("execution_lane") if thread else None,
+        )
+        return False
+    payload = await _assemble_session_attach_payload(
+        thread_id,
+        config_override=config_override,
+        config_name=config_name,
+    )
+    if payload is None:
+        return False
+
+    agent_id = str(agent["id"])
+    if not await _reserve_session_attach_binding(agent_id, thread_id):
+        return False
+
+    agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/attach"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(agent_url, json=payload)
@@ -4676,33 +5021,22 @@ async def _send_session_attach_locked(
                 agent["pod_ip"],
                 agent["pod_port"],
             )
-            # Update both sides of the agent↔thread binding
-            try:
-                async with postgres_db.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE agents SET thread_id = $2 WHERE id = $1",
-                        str(agent["id"]),
-                        thread_id,
-                    )
-                    await conn.execute(
-                        "UPDATE threads SET agent_id = $2 WHERE id = $1",
-                        thread_id,
-                        str(agent["id"]),
-                    )
-            except Exception:
-                logger.warning("Failed to update agent/thread binding in DB")
             return True
-        else:
-            logger.warning(
-                "Persistent agent %s rejected session attach: %s %s",
-                agent["id"],
-                response.status_code,
-                response.text[:200],
-            )
-            return False
+        logger.error(
+            "Persistent agent %s returned ambiguous attach response %s; "
+            "retaining reservation to prevent duplicate execution: %s",
+            agent["id"],
+            response.status_code,
+            response.text[:200],
+        )
+        return True
     except Exception:
-        logger.exception("Failed to send session attach to agent %s", agent["id"])
-        return False
+        logger.exception(
+            "Session attach delivery to agent %s is ambiguous; retaining "
+            "the DB reservation to prevent duplicate execution",
+            agent["id"],
+        )
+        return True
 
 
 class LiteWorkspaceConfigError(Exception):
@@ -4740,17 +5074,88 @@ def _thread_workspace_backend(thread: Any) -> Optional[str]:
     Used by the session-start paths to size the readiness budget for a VM-backed
     thread on resume, where the caller may not carry the config_override.
     """
-    if not isinstance(thread, dict):
+    return declared_thread_workspace_backend(thread)
+
+
+def _stateless_session_class_refusal(config: Any) -> str | None:
+    """Return why this session class still requires its pinned wake plane."""
+    if not isinstance(config, dict):
+        return "session class configuration is malformed"
+    officer = config.get("officer")
+    if officer is None:
         return None
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            return None
-    if not isinstance(metadata, dict):
-        return None
-    return _backend_from_override(metadata.get("config_override"))
+    if not isinstance(officer, dict):
+        return "session class configuration is malformed"
+    for field, reason in (
+        ("conference", "conference sessions still use pinned lifecycle wakes"),
+        ("enabled", "officer sessions still use the pinned watchdog and wake drain"),
+    ):
+        if field not in officer or officer[field] is False:
+            continue
+        if officer[field] is True:
+            return reason
+        return "session class configuration is malformed"
+    return None
+
+
+def _materialized_session_class_override(
+    effective_config: Any,
+) -> dict[str, bool]:
+    """Freeze lifecycle-affecting class bits into the request layer.
+
+    Experts and account defaults are deliberately mutable for ordinary config,
+    but ``officer`` and ``conference`` select a pinned-only background wake
+    plane.  Materializing both booleans at creation makes that topology choice
+    stable across later expert/account edits and gives every synchronous
+    stateless admission boundary an authoritative value in thread metadata.
+    """
+    if not isinstance(effective_config, dict):
+        raise HTTPException(status_code=400, detail="Session config is malformed")
+    officer = effective_config.get("officer")
+    if officer is None:
+        officer = {}
+    if not isinstance(officer, dict):
+        raise HTTPException(status_code=400, detail="Officer config is malformed")
+    for field in ("enabled", "conference"):
+        if field in officer and type(officer[field]) is not bool:
+            raise HTTPException(
+                status_code=400,
+                detail=f"officer.{field} must be a boolean",
+            )
+    return {
+        "enabled": officer.get("enabled") is True,
+        "conference": officer.get("conference") is True,
+    }
+
+
+def _require_stateless_workspace(thread: dict[str, Any]) -> str:
+    """Require an exact stateless-supported workspace and session class.
+
+    Lite workspaces remain supported. Sandbox support is intentionally narrow:
+    the row must carry the orchestrator-owned Kubernetes lifecycle evidence,
+    and a ready endpoint must be paired with its backing generation, pinned SSH
+    identity, and runtime incarnation. VM, Docker and unknown/future states fail
+    closed. Officer/conference sessions remain pinned until their background
+    wake machinery becomes queue-aware.
+    """
+    backend, refusal_reason = stateless_session_workspace_check(thread)
+    if refusal_reason is not None:
+        logger.warning(
+            "Stateless session refused before attach: thread=%s "
+            "workspace_backend=%r reason=%s",
+            thread.get("id"),
+            backend,
+            refusal_reason,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Stateless execution requires an attested Kubernetes sandbox "
+                "or a supported lite workspace (virtual/none); this session's "
+                f"workspace is unavailable ({refusal_reason})"
+            ),
+        )
+    return backend
 
 
 def _session_ready_timeout_s(backend: Optional[str]) -> int:
@@ -4798,6 +5203,43 @@ SESSION_DEFAULT_WORKSPACE_BACKEND = "virtual"
 # per-session opt-in only and is excluded from the default chain
 # (_default_session_workspace_backend) and the settings-PATCH validator.
 SESSION_CREATE_WORKSPACE_BACKENDS = SESSION_WORKSPACE_BACKENDS + ("vm",)
+
+
+def _resolve_thread_execution_lane(
+    *,
+    workspace_backend: str | None,
+    effective_config: dict[str, Any],
+) -> Literal["pinned", "stateless"]:
+    """Resolve topology-neutral session admission with pinned fallback.
+
+    The public create contract does not expose the execution plane. When the
+    default-off pool gate is enabled, an ordinary supported workspace uses the
+    stateless lane; unsupported infrastructure and pinned-only session classes
+    retain the existing dedicated-agent path.
+    """
+
+    class_refusal = _stateless_session_class_refusal(effective_config)
+    if class_refusal is not None:
+        return "pinned"
+
+    if not STATELESS_SESSION_ENABLED:
+        return "pinned"
+
+    if workspace_backend == "sandbox":
+        if container_provisioner.is_available and container_provisioner.in_cluster:
+            return "stateless"
+        return "pinned"
+
+    if workspace_backend == "virtual":
+        virtual_spec = _virtual_workspace_rclone_spec()
+        if virtual_spec and virtual_spec.get("type") != "memory":
+            return "stateless"
+        return "pinned"
+
+    if workspace_backend == "none":
+        return "stateless"
+
+    return "pinned"
 
 
 def _default_session_workspace_backend(user_settings: dict[str, Any] | None) -> str:
@@ -5513,6 +5955,45 @@ def _job_needs_sandbox(job: dict) -> bool:
     return container_provisioner.is_available or docker_provisioner.is_available
 
 
+def _resolve_requested_job_execution_lane(
+    requested_lane: Literal["pinned", "stateless"] | None,
+    *,
+    needs_vm: bool,
+    needs_sandbox: bool,
+) -> Literal["pinned", "stateless"] | None:
+    """Apply the default-off, k8s-sandbox-only worker admission gate.
+
+    ``None`` is preserved so Postgres can distinguish an omitted root (pinned)
+    from an omitted child (authoritative parent-lane inheritance).
+    """
+    if needs_vm:
+        # This is a capability decision, not a silent arbitrary lane flip: the
+        # first stateless worker pool intentionally has no VM mesh sidecar.
+        return "pinned"
+    if requested_lane != "stateless":
+        return requested_lane
+    if not STATELESS_WORKER_ENABLED:
+        raise HTTPException(
+            status_code=409, detail="Stateless worker admission is disabled"
+        )
+    if not (container_provisioner.is_available and container_provisioner.in_cluster):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Stateless workers require an in-cluster Kubernetes "
+                "workspace provisioner"
+            ),
+        )
+    if not needs_sandbox:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Stateless workers currently require a Kubernetes sandbox workspace"
+            ),
+        )
+    return "stateless"
+
+
 def _get_container_context(job: dict) -> dict:
     """Extract the workspace_container sub-dict from job context."""
     ctx = job.get("context") or {}
@@ -5522,6 +6003,49 @@ def _get_container_context(job: dict) -> dict:
         except (json.JSONDecodeError, TypeError):
             ctx = {}
     return ctx.get("workspace_container", {})
+
+
+def _stateless_worker_workspace_owner(job: dict) -> WorkspaceOwner:
+    """Resolve whose Kubernetes workspace a stateless worker must attest."""
+
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    parent_id = job.get("parent_job_id")
+    if parent_id and ctx.get("inherits_parent_workspace"):
+        return WorkspaceOwner.job(str(parent_id))
+    return WorkspaceOwner.job(str(job["id"]))
+
+
+async def _attest_stateless_worker_workspace(
+    owner: WorkspaceOwner,
+) -> WorkspaceRuntimeAttestation:
+    """Return one exact worker workspace identity or a generic claim refusal."""
+
+    try:
+        return await container_provisioner.attest_workspace_runtime(owner)
+    except WorkspaceRuntimeAuthorityError as exc:
+        logger.warning(
+            "Stateless worker workspace attestation refused for %s %s: %s",
+            owner.kind,
+            owner.id,
+            exc,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Stateless worker workspace attestation failed for %s %s: %s",
+            owner.kind,
+            owner.id,
+            exc,
+            exc_info=True,
+        )
+    raise HTTPException(
+        status_code=409,
+        detail="Stateless worker workspace authority unavailable",
+    )
 
 
 def _container_ssh_key_path(container_ctx: dict) -> str:
@@ -5741,10 +6265,6 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
 
     own_container = ctx.get("workspace_container") or {}
     own_vm = ctx.get("vm") or {}
-    # Flag set but the copied snapshot hasn't landed on context yet — nothing to
-    # resolve this tick; the branches below key off which backend was inherited.
-    if not own_container and not own_vm:
-        return ("proceed", None)
 
     try:
         parent = await postgres_db.get_job(str(parent_id))
@@ -5772,11 +6292,19 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
             parent_ctx = {}
     parent_container = parent_ctx.get("workspace_container") or {}
     parent_vm = parent_ctx.get("vm") or {}
+    # The inherit flag is authoritative even if an explicit reprovision resume
+    # shed the child's stale copied snapshot. Infer the inherited backend from
+    # the parent's current live context in that case; never let a flag-only
+    # child fall through to self-provisioning or a bundle with no remote.
+    inherit_container = bool(own_container) or (not own_vm and bool(parent_container))
+    inherit_vm = bool(own_vm) or (
+        not own_container and not parent_container and bool(parent_vm)
+    )
 
     # Parent's workspace is ready → overlay the live context and dispatch. All
     # downstream machinery (_job_needs_sandbox/_job_needs_vm, the dispatch-time
     # injectors) then keys off the ready context and injects workspace.remote.
-    if own_container and parent_container.get("status") == "ready":
+    if inherit_container and parent_container.get("status") == "ready":
         ctx["workspace_container"] = parent_container
         job["context"] = ctx
         logger.info(
@@ -5787,7 +6315,7 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
             parent_container.get("host") or parent_container.get("pod_ip"),
         )
         return ("proceed", None)
-    if own_vm and parent_vm.get("status") == "ready":
+    if inherit_vm and parent_vm.get("status") == "ready":
         ctx["vm"] = parent_vm
         job["context"] = ctx
         logger.info(
@@ -5871,7 +6399,25 @@ async def _fail_subjob_and_unblock_parent(job: dict, message: str) -> None:
     failure is self-healing, not just today's inherit-timeout.
     """
     job_id = str(job["id"])
-    await postgres_db.update_job_status(job_id, status="failed", error_message=message)
+    stateless_worker = job.get("execution_lane") == "stateless"
+    updated = await postgres_db.update_job_status(
+        job_id,
+        status="failed",
+        error_message=message,
+        expected_status=(str(job.get("status")) if stateless_worker else None),
+    )
+    if stateless_worker and not updated:
+        # The dispatcher row is a stale snapshot. A control verb may have
+        # cancelled/completed the child while workspace inheritance was being
+        # resolved; never overwrite that winner or unblock the parent from a
+        # failure disposition that did not commit.
+        logger.info(
+            "Dispatcher: skipped stale stateless subjob failure for %s "
+            "(expected_status=%s)",
+            job_id,
+            job.get("status"),
+        )
+        return
     # The unblock handlers classify the outcome from job['status']; the in-memory
     # row still holds the pre-fail status, so sync it before delegating. Each
     # handler is a no-op for the wrong subjob type (scholar_target / creation_order
@@ -6837,6 +7383,16 @@ async def _suspend_thread_resources(thread_id: str) -> None:
 
 
 async def _suspend_thread_resources_inner(thread_id: str) -> None:
+    thread = await postgres_db.get_thread(thread_id)
+    if thread is not None and thread.get("execution_lane") == "stateless":
+        # Queue-served physical sessions require the terminal claimant /
+        # resident / runtime protocol. Legacy suspension must not fall through
+        # to name-only agent deletion when the central service refuses it.
+        logger.info(
+            "Skipping legacy resource suspension for stateless thread %s",
+            thread_id,
+        )
+        return
     suspended = False
     try:
         if workspace_suspension_service.is_enabled:
@@ -7285,13 +7841,24 @@ async def _try_dispatch_pending_jobs() -> None:
     registers as ready. Jobs with a ready VM get workspace config injected
     into config_override before dispatch.
     """
-    if not AUTO_ASSIGN_ENABLED:
+    if not AUTO_ASSIGN_ENABLED and not STATELESS_WORKER_ENABLED:
         return
 
     async with _dispatch_lock:
         try:
-            # Get pending jobs (created + paused, priority ordered)
-            pending_jobs = await postgres_db.get_dispatchable_jobs(limit=50)
+            # Both lanes retain the same leader-owned workspace preflight. The
+            # pinned set proceeds to registered-agent matching; a ready
+            # stateless set is admitted to run_queue and never reaches that
+            # half of this function.
+            pending_jobs = (
+                await postgres_db.get_dispatchable_jobs(limit=50)
+                if AUTO_ASSIGN_ENABLED
+                else []
+            )
+            if STATELESS_WORKER_ENABLED:
+                pending_jobs.extend(
+                    await postgres_db.get_admittable_stateless_jobs(limit=50)
+                )
             if not pending_jobs:
                 return
 
@@ -7299,6 +7866,91 @@ async def _try_dispatch_pending_jobs() -> None:
             dispatchable_jobs = []
             for job in pending_jobs:
                 job_id = str(job["id"])
+                stateless_worker = job.get("execution_lane") == "stateless"
+
+                # Defense for inherited/operator-created rows. An explicit VM
+                # request is the one supported plane transition: pin it before
+                # provisioning so the VM-mesh registered-agent path owns it.
+                if stateless_worker and _job_needs_vm(job):
+                    moved_to_pinned = False
+                    async with postgres_db.acquire() as conn:
+                        async with conn.transaction():
+                            await conn.fetchrow(
+                                "SELECT state FROM run_queue "
+                                "WHERE unit_id = $1::uuid "
+                                "AND unit_kind = 'worker_batch' FOR UPDATE",
+                                job_id,
+                            )
+                            moved = await conn.fetchrow(
+                                "UPDATE jobs SET execution_lane = 'pinned', "
+                                "updated_at = CURRENT_TIMESTAMP "
+                                "WHERE id = $1::uuid "
+                                "AND execution_lane = 'stateless' "
+                                "AND status::text = $2::text "
+                                "RETURNING id",
+                                job_id,
+                                str(job.get("status") or ""),
+                            )
+                            if moved is not None:
+                                moved_to_pinned = True
+                                await conn.execute(
+                                    "UPDATE run_queue SET state = 'done', "
+                                    "lease_token = lease_token + 1, "
+                                    "leased_by = NULL, last_leased_by = NULL, "
+                                    "leased_until = NULL, run_after = now(), "
+                                    "queued_at = now() "
+                                    "WHERE unit_id = $1::uuid "
+                                    "AND unit_kind = 'worker_batch'",
+                                    job_id,
+                                )
+                    if moved_to_pinned:
+                        logger.info(
+                            "Dispatcher: moved VM job %s from stateless to pinned lane",
+                            job_id,
+                        )
+                    else:
+                        logger.debug(
+                            "Dispatcher: VM lane repair lost the status CAS for job %s",
+                            job_id,
+                        )
+                    continue
+                _stateless_container = _get_container_context(job)
+                _stateless_has_k8s_workspace = (
+                    _stateless_container.get("status") == "ready"
+                    and _stateless_container.get("provisioner") == "k8s"
+                    and bool(
+                        _stateless_container.get("host")
+                        or _stateless_container.get("pod_ip")
+                    )
+                )
+                if stateless_worker and not (
+                    _job_needs_sandbox(job) or _stateless_has_k8s_workspace
+                ):
+                    logger.error(
+                        "Dispatcher: refusing stateless job %s without a sandbox "
+                        "workspace",
+                        job_id,
+                    )
+                    await postgres_db.update_job_status(
+                        job_id,
+                        status="failed",
+                        error_message=(
+                            "Stateless workers currently require a Kubernetes "
+                            "sandbox workspace"
+                        ),
+                        expected_status=str(job.get("status")),
+                    )
+                    continue
+                if stateless_worker and not (
+                    container_provisioner.is_available
+                    and container_provisioner.in_cluster
+                ):
+                    logger.warning(
+                        "Dispatcher: stateless job %s waiting for the in-cluster "
+                        "Kubernetes workspace provisioner",
+                        job_id,
+                    )
+                    continue
 
                 # Subjobs (scholar / critic) share their parent's workspace but
                 # copy its context by value at spawn time — stale when the parent
@@ -7770,7 +8422,12 @@ async def _try_dispatch_pending_jobs() -> None:
                             msg,
                         )
                         await postgres_db.update_job_status(
-                            job_id, status="failed", error_message=msg
+                            job_id,
+                            status="failed",
+                            error_message=msg,
+                            expected_status=(
+                                str(job.get("status")) if stateless_worker else None
+                            ),
                         )
                         continue
                     if res.outcome is EnsureOutcome.PENDING:
@@ -7810,6 +8467,29 @@ async def _try_dispatch_pending_jobs() -> None:
                             "Dispatcher: job %s — no workspace provisioner needed",
                             job_id,
                         )
+                if stateless_worker:
+                    (
+                        admitted,
+                        queue_result,
+                    ) = await postgres_db.admit_stateless_worker_job(
+                        job_id,
+                        fair_key=(str(job["user_id"]) if job.get("user_id") else None),
+                        priority=int(job.get("priority") or 0),
+                    )
+                    if not admitted:
+                        logger.warning(
+                            "Dispatcher: stateless admission CAS lost for job %s; "
+                            "workspace/lane/status changed after preflight",
+                            job_id,
+                        )
+                        continue
+                    logger.info(
+                        "Dispatcher: admitted stateless worker job %s "
+                        "(queue=%s, workspace=k8s-ready)",
+                        job_id,
+                        queue_result,
+                    )
+                    continue
                 dispatchable_jobs.append(job)
 
             if not dispatchable_jobs:
@@ -7977,7 +8657,11 @@ async def auto_assign_dispatcher(shutdown_event: asyncio.Event) -> None:
     Runs every 30 seconds as a catch-all. Event-driven triggers (job creation,
     agent heartbeat) also call _try_dispatch_pending_jobs() for faster response.
     """
-    logger.info("Auto-assign dispatcher started (enabled=%s)", AUTO_ASSIGN_ENABLED)
+    logger.info(
+        "Auto-assign dispatcher started (pinned=%s, stateless_workers=%s)",
+        AUTO_ASSIGN_ENABLED,
+        STATELESS_WORKER_ENABLED,
+    )
     while not shutdown_event.is_set():
         try:
             await _try_dispatch_pending_jobs()
@@ -8003,7 +8687,7 @@ def _trigger_dispatch() -> None:
     """
     from services.leader_election import is_leader
 
-    if AUTO_ASSIGN_ENABLED and is_leader.is_set():
+    if (AUTO_ASSIGN_ENABLED or STATELESS_WORKER_ENABLED) and is_leader.is_set():
         asyncio.create_task(_try_dispatch_pending_jobs())
 
 
@@ -8338,6 +9022,14 @@ class JobCreate(BaseModel):
     delegation_context: str | None = Field(
         None, description="Shared context string from parent delegation"
     )
+    execution_lane: Literal["pinned", "stateless"] | None = Field(
+        None,
+        description=(
+            "Execution plane opt-in. Omitted root jobs remain pinned; omitted "
+            "child jobs inherit their authoritative parent lane. Stateless "
+            "worker admission is deployment-gated and Kubernetes-sandbox only."
+        ),
+    )
 
     @model_validator(mode="after")
     def reject_null_datasource_selection(self) -> "JobCreate":
@@ -8390,6 +9082,26 @@ class JobStartRequest(BaseModel):
         default=None,
         description="Shared context from parent delegation",
     )
+    workspace_generation: str | None = Field(
+        default=None,
+        description="Control-plane-attested Kubernetes backing UID",
+    )
+    workspace_runtime_incarnation: str | None = Field(
+        default=None,
+        description="Control-plane-attested current workspace Pod UID",
+    )
+    workspace_ssh_host_key_fingerprint: str | None = Field(
+        default=None,
+        description="Control-plane-attested SSH host-key fingerprint",
+    )
+    workspace_owner_kind: Literal["job", "session"] | None = Field(
+        default=None,
+        description="Kind used by the workspace entrypoint process tag",
+    )
+    workspace_owner_id: str | None = Field(
+        default=None,
+        description="Owner UUID used by the workspace entrypoint process tag",
+    )
 
 
 class JobCompleteRequest(BaseModel):
@@ -8400,6 +9112,13 @@ class JobCompleteRequest(BaseModel):
     error: dict[str, Any] | None = Field(None, description="Error dict if job failed")
     freeze_data: dict[str, Any] | None = Field(
         None, description="Freeze data from the graph state"
+    )
+    lease_token: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "Current worker_batch fencing token. Required only for stateless jobs."
+        ),
     )
 
 
@@ -10094,6 +10813,15 @@ async def lifespan(app: FastAPI):
     thread_events_prune_task = asyncio.create_task(
         thread_events_prune_sweeper(_shutdown_event)
     )
+    # Stateless-lane lease reaper (stateless_agents.md §5.2): leader-gated on
+    # its OWN advisory lock (RUN_QUEUE_REAPER_ID — not run_when_leader, so the
+    # sweep can survive a main-leader handover independently); per-row CAS
+    # steals + turn.interrupted/turn.parked journal frames.
+    from services.run_queue_reaper import run_queue_reaper_loop
+
+    run_queue_reaper_task = asyncio.create_task(
+        run_queue_reaper_loop(postgres_db, _shutdown_event)
+    )
     security_events_prune_task = asyncio.create_task(
         security_events_prune_sweeper(_shutdown_event)
     )
@@ -10174,7 +10902,13 @@ async def lifespan(app: FastAPI):
     # priority-10 dispatchable jobs and parasitically preempt real work. See
     # docs/done/preemption_before_first_checkpoint_replays_job_opening.md.
     stale_verification_sweeper_task = asyncio.create_task(
-        stale_verification_sweeper_loop(postgres_db, _shutdown_event)
+        stale_verification_sweeper_loop(
+            postgres_db,
+            _shutdown_event,
+            stateless_cancel_fn=(
+                postgres_db.cancel_and_settle_stale_stateless_verification_subjob
+            ),
+        )
     )
     # Backstop for session wakes: deliver any completion notice whose
     # opportunistic post-commit send was lost, or whose terminal path has no
@@ -10340,6 +11074,7 @@ async def lifespan(app: FastAPI):
     await dispatcher_task
     await sudo_sweeper_task
     await thread_events_prune_task
+    await run_queue_reaper_task
     await security_events_prune_task
     await checkpoint_retention_task
     await headless_notify_task
@@ -10828,6 +11563,7 @@ def _redact_nested_workspace_state(
             key in context
             for key in (
                 "_canvas_workspace_generation",
+                WORKSPACE_RUNTIME_INCARNATION_KEY,
                 "_docker_workspace_lease_id",
                 "_docker_workspace_trust_mode",
                 "_docker_workspace_attested",
@@ -10841,6 +11577,7 @@ def _redact_nested_workspace_state(
             changed = True
         context = dict(context)
         context.pop("_canvas_workspace_generation", None)
+        context.pop(WORKSPACE_RUNTIME_INCARNATION_KEY, None)
         context.pop("_docker_workspace_lease_id", None)
         context.pop("_docker_workspace_trust_mode", None)
         context.pop("_docker_workspace_attested", None)
@@ -11397,6 +12134,25 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     creator = None
             await _check_vm_permission(creator, job_needs_vm=True)
 
+        # Stateless worker admission is an explicit, independently gated
+        # opt-in. The first slice can reach only Kubernetes workspace pods;
+        # VM jobs keep their established pinned lane because the stateless
+        # worker Deployment has no mesh sidecar. Omitted children are resolved
+        # from the authoritative parent lane inside PostgresDB.create_job, so a
+        # stateless parent cannot silently revive the registered-agent plane.
+        execution_lane = _resolve_requested_job_execution_lane(
+            job.execution_lane,
+            needs_vm=needs_vm,
+            needs_sandbox=_job_needs_sandbox(
+                {"context": context, "config_override": config_override}
+            ),
+        )
+        if job.execution_lane == "stateless" and execution_lane == "pinned":
+            logger.info(
+                "Job create: VM request keeps job on pinned lane "
+                "(stateless worker opt-in ignored)"
+            )
+
         # Capability PEP on the merged override — same fail-fast rationale as
         # the VM gate above, so an over-reaching override is refused here
         # instead of dying at dispatch. See the helper for what it deliberately
@@ -11569,6 +12325,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             datasource_policy_revisions=selected_ds_revisions,
             authority_user_id=(str(effective_user_id) if effective_user_id else None),
             authority_project_ids=(target_project_ids if effective_user_id else None),
+            execution_lane=execution_lane,
         )
 
         # Create Gitea repo/branch + grant creator access + seed the Mode A
@@ -11654,6 +12411,19 @@ async def delete_job(request: Request, job_id: str) -> dict[str, str]:
                 detail="Job has child jobs; delete them first",
             )
 
+        # A stateless saver is authorized by its run_queue generation, not by
+        # the continued existence of the jobs row. Permanently fence that
+        # generation and prove the canonical checkpoint thread empty before
+        # workspace teardown; pruning after row deletion would let a live
+        # predecessor recreate orphaned checkpoints.
+        if job.get("execution_lane") == "stateless":
+            prepared = await postgres_db.prepare_stateless_job_for_delete(job_id)
+            if not prepared:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Stateless job changed while deletion was being prepared",
+                )
+
         # Tear down workspace/VM resources while the row still exists — the
         # provisioners resolve them through the job's context, and once the
         # row is gone the lifecycle reconciler refuses to reap the pod
@@ -11738,7 +12508,15 @@ async def delete_job(request: Request, job_id: str) -> dict[str, str]:
         except Exception as e:
             logger.warning(f"Failed to clean up vector DB tables for job {job_id}: {e}")
 
-        success = await postgres_db.delete_job(job_id)
+        if job.get("execution_lane") == "stateless":
+            success = await postgres_db.delete_job(
+                job_id,
+                prepared_stateless=True,
+            )
+        else:
+            # Pinned deletion keeps its historical collaborator signature and
+            # behavior; only stateless checkpoints need the queue fence above.
+            success = await postgres_db.delete_job(job_id)
         if not success:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
         return {"status": "deleted"}
@@ -11782,7 +12560,7 @@ async def subjob_merge(request: Request, job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-async def _cascade_cancel_to_children(job_id: str) -> None:
+async def _cascade_cancel_to_children(job_id: str) -> bool:
     """Cancel all non-terminal descendant jobs of a parent.
 
     Fetches the full descendant tree (recursive), signals processing agents
@@ -11790,7 +12568,7 @@ async def _cascade_cancel_to_children(job_id: str) -> None:
     """
     children = await postgres_db.get_descendant_jobs(job_id)
     if not children:
-        return
+        return True
 
     # Signal processing agents concurrently
     async def _signal_cancel(child: dict) -> None:
@@ -11824,28 +12602,76 @@ async def _cascade_cancel_to_children(job_id: str) -> None:
         except Exception as e:
             logger.warning(f"Workspace cleanup failed for child {child_id}: {e}")
 
+    pinned_children = [c for c in children if c.get("execution_lane") != "stateless"]
+    stateless_children = [c for c in children if c.get("execution_lane") == "stateless"]
+
     await asyncio.gather(
-        *[_signal_cancel(c) for c in children],
-        *[_cleanup_child(c) for c in children],
+        *[_signal_cancel(c) for c in pinned_children],
+        *[_cleanup_child(c) for c in pinned_children],
         return_exceptions=True,
     )
 
-    # Bulk cancel in DB
-    child_ids = [str(c["id"]) for c in children]
-    async with postgres_db.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE jobs
-            SET status = 'cancelled',
-                assigned_agent_id = NULL,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ANY($1::uuid[])
-              AND status NOT IN ('completed', 'cancelled')
-            """,
-            child_ids,
-        )
+    async def _cancel_stateless_child(child: dict) -> bool:
+        child_id = str(child["id"])
+        cancelled, _queue_closed = await postgres_db.cancel_stateless_job(child_id)
+        if cancelled:
+            return await _wait_for_stateless_cancel_settle(child_id)
+        refreshed = await postgres_db.get_job(child_id)
+        if not refreshed:
+            return True
+        if refreshed.get("status") in ("completed", "failed"):
+            return True
+        if refreshed.get("status") != "cancelled":
+            return False
+        refreshed_context = refreshed.get("context") or {}
+        if isinstance(refreshed_context, str):
+            try:
+                refreshed_context = json.loads(refreshed_context)
+            except (TypeError, ValueError):
+                refreshed_context = {}
+        if refreshed_context.get("_stateless_cancel_cleanup_pending") is True:
+            return await _wait_for_stateless_cancel_settle(child_id)
+        return True
 
-    logger.info(f"Cascade-cancelled {len(child_ids)} descendant(s) of job {job_id}")
+    stateless_results = await asyncio.gather(
+        *[_cancel_stateless_child(c) for c in stateless_children],
+        return_exceptions=True,
+    )
+    stateless_settled = True
+    for child, result in zip(stateless_children, stateless_results, strict=True):
+        if result is True:
+            continue
+        stateless_settled = False
+        if isinstance(result, BaseException):
+            logger.error(
+                "Cascade cancellation could not settle stateless child %s",
+                child.get("id"),
+                exc_info=(type(result), result, result.__traceback__),
+            )
+        else:
+            logger.error(
+                "Cascade cancellation timed out with stateless child %s still live",
+                child.get("id"),
+            )
+
+    # Bulk cancel in DB
+    pinned_ids = [str(c["id"]) for c in pinned_children]
+    if pinned_ids:
+        async with postgres_db.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'cancelled',
+                    assigned_agent_id = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ANY($1::uuid[])
+                  AND status NOT IN ('completed', 'cancelled')
+                """,
+                pinned_ids,
+            )
+
+    logger.info(f"Cascade-cancelled {len(children)} descendant(s) of job {job_id}")
+    return stateless_settled
 
 
 async def _cascade_pause_to_children(job_id: str) -> None:
@@ -11859,6 +12685,12 @@ async def _cascade_pause_to_children(job_id: str) -> None:
     processing = [c for c in children if c["status"] == "processing"]
     if not processing:
         return
+    pinned_processing = [
+        c for c in processing if c.get("execution_lane") != "stateless"
+    ]
+    stateless_processing = [
+        c for c in processing if c.get("execution_lane") == "stateless"
+    ]
 
     async def _signal_pause(child: dict) -> None:
         child_id = str(child["id"])
@@ -11885,13 +12717,93 @@ async def _cascade_pause_to_children(job_id: str) -> None:
         await postgres_db.pause_job(child_id)
 
     await asyncio.gather(
-        *[_signal_pause(c) for c in processing],
+        *[_signal_pause(c) for c in pinned_processing],
         return_exceptions=True,
     )
+    for child in stateless_processing:
+        await postgres_db.pause_stateless_job(str(child["id"]))
 
     logger.info(
         f"Cascade-paused {len(processing)} processing descendant(s) of job {job_id}"
     )
+
+
+async def _wait_for_stateless_cancel_settle(
+    job_id: str,
+    *,
+    timeout_seconds: float = 130.0,
+    poll_seconds: float = 0.5,
+) -> bool:
+    """Wait for a cancelled worker owner to teardown, then prune/archive.
+
+    The status write is the preemption signal and must happen first. A live
+    holder discovers it on renewal, tears down local/tmux ownership, then
+    closes its exact queue lease. A killed holder is reclaimed within the
+    queue TTL/reaper horizon. Only after that boundary is it safe to delete the
+    shared checkpoint and workspace underneath the former owner.
+    """
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            async with postgres_db.stateless_cancel_cleanup_lock(
+                job_id
+            ) as cleanup_owner:
+                if not cleanup_owner:
+                    settled = False
+                else:
+                    cleanup_pending = (
+                        await postgres_db.stateless_cancel_cleanup_pending(job_id)
+                    )
+                    if cleanup_pending is False:
+                        # A prior owner already cleared the durable marker (or
+                        # permanent DELETE removed the row). Never repeat the
+                        # destructive workspace cleanup after Resume can run.
+                        return True
+                    if cleanup_pending is None:
+                        settled = False
+                    else:
+                        settled = await postgres_db.finalize_cancelled_stateless_job(
+                            job_id
+                        )
+                    if settled:
+                        workspace_clean = True
+                        try:
+                            await _archive_and_cleanup_workspace(job_id)
+                        except Exception as exc:
+                            workspace_clean = False
+                            logger.warning(
+                                "Workspace cleanup failed for cancelled stateless "
+                                "job %s: %s",
+                                job_id,
+                                exc,
+                            )
+                        if workspace_clean:
+                            cleanup_completed = (
+                                await postgres_db.complete_stateless_cancel_cleanup(
+                                    job_id
+                                )
+                            )
+                            if cleanup_completed:
+                                return True
+                            settled = False
+                        else:
+                            # Keep the durable Resume block until workspace teardown
+                            # has actually returned successfully. Clearing it after an
+                            # exception would let a new claim attach while cancellation's
+                            # destructive cleanup is only half complete.
+                            settled = False
+        except Exception:
+            logger.warning(
+                "Stateless cancel settle check failed for job %s; retrying",
+                job_id,
+                exc_info=True,
+            )
+            settled = False
+
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(max(0.01, poll_seconds), remaining))
 
 
 @app.put("/api/jobs/{job_id}/cancel")
@@ -11905,6 +12817,73 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
     """
     _, job = await require_internal_or_job_access(request, postgres_db, job_id)
     try:
+        if job.get("execution_lane") == "stateless":
+            success, _queue_closed = await postgres_db.cancel_stateless_job(job_id)
+            if not success:
+                refreshed = await postgres_db.get_job(job_id)
+                if refreshed and refreshed.get("execution_lane") == "pinned":
+                    # The defensive VM repair may have won the queue lock and
+                    # moved this legacy row after our initial lane read. Fall
+                    # through to the established pinned cancellation path.
+                    job = refreshed
+                elif (
+                    refreshed
+                    and (refreshed.get("context") or {}).get(
+                        "_stateless_delete_pending"
+                    )
+                    is True
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Job deletion is already in progress",
+                    )
+                elif not refreshed or refreshed.get("status") != "cancelled":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Job cannot be cancelled (already completed or cancelled)"
+                        ),
+                    )
+
+            if job.get("execution_lane") == "stateless":
+                # Publish descendant cancellation before any root-workspace
+                # teardown. Stateless children can share this exact parent pod;
+                # waiting below must include their live holders or cleanup could
+                # pull the workspace out from under a still-running critic/scholar.
+                descendants_settled = await _cascade_cancel_to_children(job_id)
+
+                if descendants_settled:
+                    # The current token remains live so renewal can return the
+                    # cancelled status. Wait through the same bounded cooperative
+                    # stop horizon as the pinned cancel route, then clean up only
+                    # after the exact holder has closed (or the reaper reconciled)
+                    # the queue row.
+                    settled = await _wait_for_stateless_cancel_settle(job_id)
+                    if not settled:
+                        logger.error(
+                            "Stateless cancel cleanup timed out for job %s; terminal "
+                            "workspace lifecycle remains the teardown backstop",
+                            job_id,
+                        )
+                else:
+                    logger.error(
+                        "Stateless cancel left root workspace %s intact because a "
+                        "descendant worker was not proven quiescent",
+                        job_id,
+                    )
+
+                job["status"] = "cancelled"
+                try:
+                    await _handle_scholar_completion(job, [])
+                except Exception as exc:
+                    logger.warning(
+                        "Error handling scholar cancellation for %s: %s", job_id, exc
+                    )
+                await maybe_wake_session(postgres_db, job_id, "cancelled")
+                _kick_session_wake_drain(postgres_db)
+                _trigger_dispatch()
+                return {"status": "cancelled"}
+
         # If job is assigned to an agent, send cancel request to agent pod
         assigned_agent_id = job.get("assigned_agent_id")
         if assigned_agent_id:
@@ -12016,6 +12995,17 @@ async def pause_job(request: Request, job_id: str) -> dict[str, str]:
                 detail=f"Job cannot be paused (status: {job['status']})",
             )
 
+        if job.get("execution_lane") == "stateless":
+            success = await postgres_db.pause_stateless_job(job_id)
+            if not success:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Job cannot be paused (status may have changed)",
+                )
+            await maybe_wake_session(postgres_db, job_id, "paused")
+            await _cascade_pause_to_children(job_id)
+            return {"status": "paused", "job_id": job_id}
+
         # Send pause request to agent pod
         assigned_agent_id = job.get("assigned_agent_id")
         if assigned_agent_id:
@@ -12121,6 +13111,11 @@ class MessageSendRequest(BaseModel):
     )
     project_id: str | None = Field(
         None, description="Project ID for member resolution (auto-filled from job)"
+    )
+    lease_token: int | None = Field(
+        None,
+        ge=1,
+        description="Exact stateless worker lease; ignored for pinned jobs",
     )
 
 
@@ -12359,11 +13354,51 @@ async def send_agent_message(
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "job_id": job_id,
             }
-            await postgres_db.update_job_status(
-                job_id=job_id,
-                status="waiting_for_reply",
-                freeze_data=freeze_data,
-            )
+            if job.get("execution_lane") == "stateless":
+                if request.lease_token is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Blocking message does not hold the worker lease",
+                    )
+                async with postgres_db.acquire() as conn:
+                    async with conn.transaction():
+                        queue = await conn.fetchrow(
+                            "SELECT state, lease_token FROM run_queue "
+                            "WHERE unit_id = $1::uuid "
+                            "AND unit_kind = 'worker_batch' FOR UPDATE",
+                            job_id,
+                        )
+                        exact_lease = bool(
+                            queue
+                            and queue["state"] == "leased"
+                            and int(queue["lease_token"]) == int(request.lease_token)
+                        )
+                        if not exact_lease:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Blocking message does not hold the worker lease",
+                            )
+                        updated = await conn.fetchrow(
+                            "UPDATE jobs SET status = 'waiting_for_reply', "
+                            "freeze_data = $1::jsonb, "
+                            "updated_at = CURRENT_TIMESTAMP "
+                            "WHERE id = $2::uuid "
+                            "AND execution_lane = 'stateless' "
+                            "AND status = 'processing' RETURNING id",
+                            json.dumps(freeze_data),
+                            job_id,
+                        )
+                        if updated is None:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Job changed before blocking message was committed",
+                            )
+            else:
+                await postgres_db.update_job_status(
+                    job_id=job_id,
+                    status="waiting_for_reply",
+                    freeze_data=freeze_data,
+                )
 
         file_path = f"messages/{thread_id}/{sequence:03d}_sent.md"
 
@@ -12717,6 +13752,7 @@ async def _route_inbound_reply(
     await postgres_db.append_queued_reply(
         job_id,
         {
+            "id": str(uuid4()),
             "thread_id": thread_id,
             "message": message,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -12799,6 +13835,25 @@ class GuidanceAckRequest(BaseModel):
         description="thread ids whose context.queued_replies were drained "
         "at a phase boundary",
     )
+    reply_keys: list[str] = Field(
+        default_factory=list,
+        description="exact durable identities of queued replies absorbed by "
+        "a stateless-worker checkpoint",
+    )
+    feedback_keys: list[str] = Field(
+        default_factory=list,
+        description="exact generations of queued feedback absorbed by a "
+        "stateless-worker checkpoint",
+    )
+    delegation_keys: list[str] = Field(
+        default_factory=list,
+        description="exact generations of delegation results absorbed by a "
+        "stateless-worker checkpoint",
+    )
+    checkpoint_id: str | None = Field(
+        default=None,
+        description="durable LangGraph checkpoint proving stateless delivery",
+    )
 
 
 @app.post("/api/jobs/{job_id}/guidance/ack")
@@ -12808,9 +13863,12 @@ async def ack_job_guidance(
     """Ack delivered supervisor guidance / drained queued replies.
     **Internal** (P4b) — requires ``X-Internal-Key``.
 
-    The agent calls this after the entries reached LLM-visible context.
+    The pinned agent calls this after entries reached LLM-visible context. A
+    stateless worker calls it only after the checkpoint that absorbed those
+    entries committed; ``checkpoint_id`` is verified before anything moves.
     Entries move atomically ``context.pending_guidance`` (by id) /
-    ``context.queued_replies`` (by thread id) → ``context.consumed_replies``
+    ``context.queued_replies`` (by exact key for stateless workers, legacy
+    thread id for pinned workers) → ``context.consumed_replies``
     with a ``consumed_at`` stamp — which stops heartbeat redelivery /
     boundary re-materialization, and lets the sender confirm delivery by
     reading job context. At-least-once by design: a lost ack just means
@@ -12822,9 +13880,15 @@ async def ack_job_guidance(
             job_id,
             guidance_ids=body.guidance_ids,
             reply_threads=body.reply_threads,
+            reply_keys=body.reply_keys,
+            feedback_keys=body.feedback_keys,
+            delegation_keys=body.delegation_keys,
+            checkpoint_id=body.checkpoint_id,
         )
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     if moved is None:
@@ -13778,6 +14842,25 @@ async def resume_job(
             )
 
     try:
+        resume_context = job.get("context") or {}
+        if isinstance(resume_context, str):
+            try:
+                resume_context = json.loads(resume_context)
+            except (TypeError, ValueError):
+                resume_context = {}
+        if (
+            job.get("execution_lane") == "stateless"
+            and isinstance(resume_context, dict)
+            and (
+                resume_context.get("_stateless_delete_pending") is True
+                or resume_context.get("_stateless_cancel_cleanup_pending") is True
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Job lifecycle cleanup is already in progress",
+            )
+
         # Allow resuming jobs in any status except completed
         # This handles cancelled jobs (user wants to retry) and cases where
         # agents disappear without marking jobs as failed
@@ -13796,7 +14879,12 @@ async def resume_job(
             else "An operator explicitly resumed this job with the feedback below."
         )
 
-        async def _queue_for_dispatch(message: str) -> dict[str, str]:
+        async def _queue_for_dispatch(
+            message: str,
+            *,
+            workspace_preflight_required: bool = False,
+            workspace_context_key: str | None = None,
+        ) -> dict[str, str]:
             """Park the job as 'paused' (dispatchable, unassigned) and kick the
             auto-dispatcher. Used both when no agent is ready and when the
             picked agent rejects the resume (its DB 'ready' was stale). Stashes
@@ -13806,15 +14894,98 @@ async def resume_job(
             (``get_dispatchable_jobs`` requires ``freeze_data IS NULL``).
             """
             feedback = request.feedback if request else None
-            await postgres_db.queue_job_for_resume(
-                job_id,
+            context_merge = (
                 {
                     "queued_feedback": feedback,
                     "queued_feedback_reason": feedback_reason,
                 }
                 if feedback
-                else None,
+                else None
             )
+            expected_status = str(job["status"])
+            if (
+                job.get("execution_lane") == "stateless"
+                and workspace_preflight_required
+            ):
+                if workspace_context_key is None:
+                    raise RuntimeError(
+                        "stateless workspace preflight requires a context key"
+                    )
+                queued = await postgres_db.prepare_stateless_job_for_workspace_resume(
+                    job_id,
+                    workspace_context_key,
+                    context_merge,
+                    expected_status=expected_status,
+                )
+            elif job.get("execution_lane") == "stateless":
+                queued = await postgres_db.queue_stateless_job_for_resume(
+                    job_id,
+                    context_merge,
+                    priority=int(job.get("priority") or 0),
+                    fair_key=(str(job["user_id"]) if job.get("user_id") else None),
+                    expected_status=expected_status,
+                )
+            else:
+                # Missing stateless workspaces deliberately return through the
+                # leader preflight before any queue row becomes runnable.
+                queued = await postgres_db.queue_job_for_resume(
+                    job_id,
+                    context_merge,
+                    expected_status=expected_status,
+                )
+            if not queued and job.get("execution_lane") == "stateless":
+                # A legacy/operator-created VM row may be repaired to the
+                # pinned lane while this request waits for the queue lock.
+                # Refresh exactly once and retry the historical pinned verb;
+                # its status CAS still prevents a concurrent terminal control
+                # from being resurrected.
+                refreshed = await postgres_db.get_job(job_id)
+                if (
+                    refreshed
+                    and refreshed.get("execution_lane") == "pinned"
+                    and str(refreshed.get("status") or "") == expected_status
+                ):
+                    if workspace_preflight_required:
+                        if workspace_context_key is None:
+                            raise RuntimeError(
+                                "workspace preflight requires a context key"
+                            )
+                        await postgres_db.shed_workspace_context(
+                            job_id, workspace_context_key
+                        )
+                    queued = await postgres_db.queue_job_for_resume(
+                        job_id,
+                        context_merge,
+                        expected_status=expected_status,
+                    )
+                    if queued:
+                        job.update(refreshed)
+            if not queued:
+                refreshed = await postgres_db.get_job(job_id)
+                refreshed_context = (refreshed or {}).get("context") or {}
+                if isinstance(refreshed_context, str):
+                    try:
+                        refreshed_context = json.loads(refreshed_context)
+                    except (TypeError, ValueError):
+                        refreshed_context = {}
+                if (
+                    refreshed
+                    and refreshed.get("execution_lane") == "stateless"
+                    and isinstance(refreshed_context, dict)
+                    and (
+                        refreshed_context.get("_stateless_delete_pending") is True
+                        or refreshed_context.get("_stateless_cancel_cleanup_pending")
+                        is True
+                    )
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Job lifecycle cleanup is already in progress",
+                    )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Job changed while it was being queued for resume",
+                )
             logger.info(
                 f"Queued job {job_id} for auto-dispatch (previous status: "
                 f"{job['status']}, feedback: {bool(feedback)})"
@@ -13833,12 +15004,20 @@ async def resume_job(
         # a job the dispatcher will actually re-provision rather than re-park.
         missing_workspace = _resume_missing_workspace(job)
         if missing_workspace:
-            await postgres_db.shed_workspace_context(
-                job_id, _WORKSPACE_CONTEXT_KEYS[missing_workspace]
-            )
+            workspace_context_key = _WORKSPACE_CONTEXT_KEYS[missing_workspace]
+            if job.get("execution_lane") != "stateless":
+                await postgres_db.shed_workspace_context(job_id, workspace_context_key)
             return await _queue_for_dispatch(
-                f"No live {missing_workspace} workspace — queued for re-provisioning"
+                f"No live {missing_workspace} workspace — queued for re-provisioning",
+                workspace_preflight_required=True,
+                workspace_context_key=workspace_context_key,
             )
+
+        # Stateless jobs never select or POST to a registered agent. A live
+        # k8s workspace is already proven above; the Class-A resume write and
+        # worker_batch enqueue commit together in queue-first order.
+        if job.get("execution_lane") == "stateless":
+            return await _queue_for_dispatch("Stateless job queued for worker claim")
 
         # Determine which agent to use
         # Convert to string since DB returns asyncpg UUID objects
@@ -14037,18 +15216,31 @@ async def approve_job(
             # Phase boundary or VM upgrade freeze: approve to continue execution
             # (not complete). For vm_upgrade_required, this is the "resume without
             # VM" path — the agent continues in the container and adapts.
-            # Remove job_frozen.json from local workspace
             local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
-            if local_frozen.exists():
-                local_frozen.unlink()
-
-            # Update DB: status → processing, clear freeze_data
-            async with postgres_db.acquire() as conn:
-                await conn.execute(
-                    "UPDATE jobs SET status = 'processing', freeze_data = NULL, "
-                    "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
+            if job.get("execution_lane") == "stateless":
+                queued = await postgres_db.queue_stateless_job_for_resume(
                     job_id,
+                    priority=int(job.get("priority") or 0),
+                    fair_key=(str(job["user_id"]) if job.get("user_id") else None),
+                    expected_status=str(job["status"]),
                 )
+                if not queued:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Job changed while approval was re-enqueuing it",
+                    )
+            else:
+                if local_frozen.exists():
+                    local_frozen.unlink()
+                # Pinned agent is still parked in-process and resumes directly.
+                async with postgres_db.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE jobs SET status = 'processing', freeze_data = NULL, "
+                        "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
+                        job_id,
+                    )
+            if job.get("execution_lane") == "stateless" and local_frozen.exists():
+                local_frozen.unlink()
 
             msg = (
                 f"Job {job_id} phase boundary approved (resume execution)"
@@ -14078,6 +15270,35 @@ async def approve_job(
 
         completion_json = json.dumps(completion_data, indent=2, ensure_ascii=False)
 
+        stateless_approval_committed = False
+        if job.get("execution_lane") == "stateless":
+            # Linearize the stateless approval before any durable artifact
+            # advertises completion. Cancel/resume take the same queue->jobs
+            # lock order, so a stale verb fails without deleting the frozen
+            # evidence or writing job_completion.json.
+            async with postgres_db.acquire() as conn:
+                async with conn.transaction():
+                    await conn.fetchrow(
+                        "SELECT state FROM run_queue WHERE unit_id = $1::uuid "
+                        "AND unit_kind = 'worker_batch' FOR UPDATE",
+                        job_id,
+                    )
+                    updated = await conn.fetchrow(
+                        "UPDATE jobs SET status = 'completed', freeze_data = NULL, "
+                        "completed_at = CURRENT_TIMESTAMP, "
+                        "updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = $1::uuid AND execution_lane = 'stateless' "
+                        "AND status::text = $2::text RETURNING id",
+                        job_id,
+                        str(job["status"]),
+                    )
+                    if updated is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Job changed while approval was being committed",
+                        )
+            stateless_approval_committed = True
+
         # 4. Write job_completion.json and remove job_frozen.json
         wrote_to_gitea = False
         if gitea_client.is_initialized:
@@ -14105,13 +15326,14 @@ async def approve_job(
                 frozen_path.unlink()
 
         # 5. Update DB: status → completed, clear freeze_data, set completed_at
-        async with postgres_db.acquire() as conn:
-            await conn.execute(
-                "UPDATE jobs SET status = 'completed', freeze_data = NULL, "
-                "completed_at = CURRENT_TIMESTAMP, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
-                job_id,
-            )
+        if not stateless_approval_committed:
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET status = 'completed', freeze_data = NULL, "
+                    "completed_at = CURRENT_TIMESTAMP, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
+                    job_id,
+                )
 
         logger.info(f"Job {job_id} approved (gitea={wrote_to_gitea})")
 
@@ -14262,27 +15484,60 @@ async def _upgrade_job_to_vm_internal(job_id: str) -> dict[str, Any]:
             "upgrade_command": frozen_data.get("command", ""),
         }
 
-        # 5. Remove freeze file from local workspace
-        local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
-        if local_frozen.exists():
-            local_frozen.unlink()
-
-        # 6. Update DB in ONE statement: merge the VM keys into context.vm, clear
+        # 5. Update DB in ONE statement: merge the VM keys into context.vm, clear
         #    freeze, set status to paused (dispatchable), unassign agent. Fused so
         #    the context is visible the instant the status flips — a split would
         #    open a dispatch window on half-written context.
         async with postgres_db.acquire() as conn:
-            await conn.execute(
-                "UPDATE jobs SET context = jsonb_set("
-                "        COALESCE(context, '{}'::jsonb), '{vm}', "
-                "        COALESCE(context->'vm', '{}'::jsonb) || $1::jsonb"
-                "    ), "
-                "    status = 'paused', freeze_data = NULL, "
-                "    assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
-                "WHERE id = $2::uuid",
-                json.dumps(vm_updates),
-                job_id,
-            )
+            async with conn.transaction():
+                if job.get("execution_lane") == "stateless":
+                    # Queue-first handoff: the VM lane belongs to registered
+                    # agents in this slice. Closing the durable worker row and
+                    # flipping execution_lane commit together, so neither
+                    # execution plane can observe a runnable half-transition.
+                    await conn.fetchrow(
+                        "SELECT state FROM run_queue "
+                        "WHERE unit_id = $1::uuid "
+                        "AND unit_kind = 'worker_batch' FOR UPDATE",
+                        job_id,
+                    )
+                updated = await conn.fetchrow(
+                    "UPDATE jobs SET context = jsonb_set("
+                    "        COALESCE(context, '{}'::jsonb), '{vm}', "
+                    "        COALESCE(context->'vm', '{}'::jsonb) || $1::jsonb"
+                    "    ), "
+                    "    status = 'paused', freeze_data = NULL, "
+                    "    assigned_agent_id = NULL, execution_lane = 'pinned', "
+                    "    updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = $2::uuid AND status::text = $3::text "
+                    "AND execution_lane = $4::text RETURNING id",
+                    json.dumps(vm_updates),
+                    job_id,
+                    str(job["status"]),
+                    str(job.get("execution_lane") or "pinned"),
+                )
+                if updated is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Job changed while it was being upgraded to a VM",
+                    )
+                if job.get("execution_lane") == "stateless":
+                    await conn.execute(
+                        "UPDATE run_queue SET state = 'done', "
+                        "lease_token = lease_token + 1, leased_by = NULL, "
+                        "last_leased_by = NULL, leased_until = NULL, "
+                        "run_after = now(), queued_at = now() "
+                        "WHERE unit_id = $1::uuid "
+                        "AND unit_kind = 'worker_batch'",
+                        job_id,
+                    )
+
+        # Only remove the local freeze after the queue-first status/lane CAS
+        # commits. A concurrent cancel must not lose its operator evidence to
+        # an upgrade request that no longer owns the job transition.
+        local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
+        if local_frozen.exists():
+            local_frozen.unlink()
 
         logger.info(
             f"Job {job_id} approved for VM upgrade "
@@ -14411,23 +15666,42 @@ async def _resume_job_without_vm_internal(
         "decided_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Remove local freeze artifact (parity with the upgrade arm)
+    # Remove local freeze artifact (parity with the upgrade arm). Stateless
+    # waits until its queue/status CAS succeeds below; a stale control request
+    # must leave the operator evidence intact.
     local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
-    if local_frozen.exists():
+    if job.get("execution_lane") != "stateless" and local_frozen.exists():
         local_frozen.unlink()
 
     # ONE statement: sticky denial + queued feedback + clear freeze + unassign
     # + paused (dispatchable) — fused so the dispatcher can never observe a
     # half-written decision.
-    async with postgres_db.acquire() as conn:
-        await conn.execute(
-            "UPDATE jobs SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
-            "status = 'paused', freeze_data = NULL, "
-            "assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
-            "WHERE id = $2::uuid",
-            json.dumps({"sudo_denial": sudo_denial, "queued_feedback": feedback}),
+    resume_context = {"sudo_denial": sudo_denial, "queued_feedback": feedback}
+    if job.get("execution_lane") == "stateless":
+        queued = await postgres_db.queue_stateless_job_for_resume(
             job_id,
+            resume_context,
+            priority=int(job.get("priority") or 0),
+            fair_key=(str(job["user_id"]) if job.get("user_id") else None),
+            expected_status=str(job["status"]),
         )
+        if not queued:
+            raise HTTPException(
+                status_code=409,
+                detail="Job changed while it was being re-enqueued without a VM",
+            )
+        if local_frozen.exists():
+            local_frozen.unlink()
+    else:
+        async with postgres_db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
+                "status = 'paused', freeze_data = NULL, "
+                "assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = $2::uuid",
+                json.dumps(resume_context),
+                job_id,
+            )
 
     logger.info(
         f"Job {job_id} resumed without VM "
@@ -14451,7 +15725,11 @@ async def _resume_job_without_vm_internal(
 
 
 async def _internal_resume_job(
-    job_id: str, feedback: str, reason: str | None = None
+    job_id: str,
+    feedback: str,
+    reason: str | None = None,
+    *,
+    expected_status: str | None = None,
 ) -> None:
     """Queue a job for resume via the auto-dispatcher.
 
@@ -14477,11 +15755,64 @@ async def _internal_resume_job(
     updates: dict[str, Any] = {"queued_feedback": feedback}
     if reason:
         updates["queued_feedback_reason"] = reason
-    if not await postgres_db.queue_job_for_resume(job_id, updates):
+    job = await postgres_db.get_job(job_id)
+    if not job:
         logger.warning(f"_internal_resume_job: job {job_id} not found")
         return
+    observed_status = str(job.get("status") or "")
+    if expected_status is not None and observed_status != expected_status:
+        logger.warning(
+            "_internal_resume_job: expected status %s but job %s is %s",
+            expected_status,
+            job_id,
+            observed_status,
+        )
+        return
+    if observed_status in ("completed", "failed", "cancelled"):
+        logger.warning(
+            "_internal_resume_job: refusing to resurrect terminal job %s (%s)",
+            job_id,
+            observed_status,
+        )
+        return
 
-    logger.info(f"Queued job {job_id} for auto-dispatch with feedback")
+    if job.get("execution_lane") == "stateless":
+        queued = await postgres_db.queue_stateless_job_for_resume(
+            job_id,
+            updates,
+            priority=int(job.get("priority") or 0),
+            fair_key=(str(job["user_id"]) if job.get("user_id") else None),
+            expected_status=observed_status,
+        )
+        if not queued:
+            refreshed = await postgres_db.get_job(job_id)
+            if (
+                refreshed
+                and refreshed.get("execution_lane") == "pinned"
+                and str(refreshed.get("status") or "") == observed_status
+            ):
+                queued = await postgres_db.queue_job_for_resume(
+                    job_id,
+                    updates,
+                    expected_status=observed_status,
+                )
+                if queued:
+                    job = refreshed
+    else:
+        queued = await postgres_db.queue_job_for_resume(
+            job_id,
+            updates,
+            expected_status=observed_status,
+        )
+    if not queued:
+        logger.warning("_internal_resume_job: queue CAS lost for job %s", job_id)
+        return
+
+    logger.info(
+        "Queued job %s for %s resume with feedback",
+        job_id,
+        job.get("execution_lane", "pinned"),
+    )
     _trigger_dispatch()
 
 
@@ -14899,10 +16230,26 @@ async def _handle_scholar_completion(
         logger.info(f"Scholar {job_id} completed — unblocking parent {target_id}")
         actions.append(f"scholar {job_id} completed, parent {target_id} unblocked")
 
-    await postgres_db.merge_job_context(target_id, ctx_delta)
-    await postgres_db.update_job_status(
-        target_id, status="created", assigned_agent_id=""
-    )
+    if parent.get("execution_lane") == "stateless":
+        resumed = await postgres_db.queue_stateless_job_for_resume(
+            target_id,
+            ctx_delta,
+            priority=int(parent.get("priority") or 0),
+            fair_key=(str(parent["user_id"]) if parent.get("user_id") else None),
+            expected_status="waiting",
+        )
+        if not resumed:
+            logger.debug(
+                "Scholar %s parent %s changed before stateless unblock",
+                job_id,
+                target_id,
+            )
+            return
+    else:
+        await postgres_db.merge_job_context(target_id, ctx_delta)
+        await postgres_db.update_job_status(
+            target_id, status="created", assigned_agent_id=""
+        )
     _trigger_dispatch()
 
 
@@ -14993,26 +16340,31 @@ async def _handle_delegation_child_completion(
             }
         )
 
-    # Store results in the parent context for resume injection. Whole-key merge —
-    # a bounded rebuild from DB children, so a concurrent sibling writer is a
-    # harmless duplicate write, never a lost update.
-    await postgres_db.merge_job_context(
-        target_id, {"delegation_results": child_results}
-    )
-
-    # Unblock parent: waiting → paused (dispatcher picks it up via /job/resume,
-    # preserving checkpoint state from before delegation). The CAS claim also
-    # clears the delegation freeze — get_dispatchable_jobs requires
-    # freeze_data IS NULL, so update_job_status (which cannot clear it) would
-    # leave the re-queued parent dispatcher-invisible forever
-    # (docs/issues/delegation_freeze_lifecycle_gaps.md, Gap 1).
-    if not await postgres_db.claim_delegation_resume(target_id):
+    delegation_context = {"delegation_results": child_results}
+    if parent.get("execution_lane") == "stateless":
+        # Queue-first re-enqueue + jobs-row transition. The context value and
+        # its one-shot delivery id land in the same transaction, so a failed
+        # enqueue cannot expose an unclaimable delivery generation.
+        resumed = await postgres_db.queue_stateless_job_for_resume(
+            target_id,
+            delegation_context,
+            priority=int(parent.get("priority") or 0),
+            fair_key=(str(parent["user_id"]) if parent.get("user_id") else None),
+            expected_status="waiting",
+        )
+    else:
+        # Pinned parity: store the bounded rebuild before the historical
+        # waiting→paused CAS, then wake its registered-agent dispatcher.
+        await postgres_db.merge_job_context(target_id, delegation_context)
+        resumed = await postgres_db.claim_delegation_resume(target_id)
+        if resumed:
+            _trigger_dispatch()
+    if not resumed:
         logger.debug(
             f"Delegation child {job_id}: parent {target_id} already re-queued "
             "by a concurrent writer — skipping duplicate unblock"
         )
         return
-    _trigger_dispatch()
 
     completed_count = sum(1 for c in child_results if c["status"] == "completed")
     total_count = len(child_results)
@@ -15076,7 +16428,8 @@ async def _check_delegation_timeouts() -> int:
         async with postgres_db.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, freeze_data, config_override, context
+                SELECT id, freeze_data, config_override, context,
+                       execution_lane, priority, user_id
                 FROM jobs
                 WHERE status = 'waiting'
                   AND freeze_data IS NOT NULL
@@ -15145,17 +16498,60 @@ async def _check_delegation_timeouts() -> int:
 
             # Cancel non-terminal children
             cancelled_count = 0
+            children_settled = True
             for child in children:
                 child_status = child.get("status", "")
-                if child_status not in ("completed", "failed", "cancelled"):
-                    child_id = str(child["id"])
-                    try:
-                        await postgres_db.cancel_job(child_id)
-                        cancelled_count += 1
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to cancel timed-out child {child_id}: {e}"
-                        )
+                if child_status in ("completed", "failed"):
+                    continue
+                child_id = str(child["id"])
+                try:
+                    if child.get("execution_lane") == "stateless":
+                        if child_status == "cancelled":
+                            child_context = child.get("context") or {}
+                            if isinstance(child_context, str):
+                                try:
+                                    child_context = json.loads(child_context)
+                                except (TypeError, ValueError):
+                                    child_context = {}
+                            settled = child_context.get(
+                                "_stateless_cancel_cleanup_pending"
+                            ) is not True or await _wait_for_stateless_cancel_settle(
+                                child_id
+                            )
+                        else:
+                            (
+                                cancelled,
+                                _queue_closed,
+                            ) = await postgres_db.cancel_stateless_job(child_id)
+                            settled = bool(
+                                cancelled
+                                and await _wait_for_stateless_cancel_settle(child_id)
+                            )
+                            if cancelled:
+                                cancelled_count += 1
+                        if not settled:
+                            children_settled = False
+                            logger.error(
+                                "Delegation timeout cannot resume parent %s: "
+                                "stateless child %s still owns its worker lease",
+                                job_id,
+                                child_id,
+                            )
+                            continue
+                    elif child_status != "cancelled":
+                        cancelled = await postgres_db.cancel_job(child_id)
+                        if cancelled:
+                            cancelled_count += 1
+                except Exception as e:
+                    children_settled = False
+                    logger.warning(f"Failed to cancel timed-out child {child_id}: {e}")
+
+            if not children_settled:
+                # The parent and its children share one workspace. Releasing
+                # the parent while a stateless child still has a fenced writer
+                # would allow two pods to mutate that workspace concurrently.
+                # Leave the waiting parent for the next sweep.
+                continue
 
             # Build partial results and resume parent
             # Re-trigger the completion handler by faking an "all done" state
@@ -15197,33 +16593,31 @@ async def _check_delegation_timeouts() -> int:
                     }
                 )
 
-            # Whole-key merge (bounded rebuild from DB children) — same contract
-            # as the sibling completion writer; concurrent writers are harmless
-            # duplicates. Written before the status flip below so the dispatcher
-            # always resumes with delegation_results present.
-            await postgres_db.merge_job_context(
-                job_id,
-                {
-                    "delegation_results": child_results,
-                    "delegation_timed_out": True,
-                },
-            )
-
-            # Atomically re-queue the parent (waiting → paused). Under the
-            # transient dual-leader window two sweepers can both reach here for
-            # the same parent; the CAS ensures exactly one re-queues it, so the
-            # parent is never resumed twice with partial results. The loser
-            # skips the dispatch trigger. (Context is written before this flip
-            # so the dispatcher always resumes with delegation_results present.)
-            claimed = await postgres_db.claim_delegation_resume(job_id)
+            delegation_context = {
+                "delegation_results": child_results,
+                "delegation_timed_out": True,
+            }
+            if row.get("execution_lane") == "stateless":
+                claimed = await postgres_db.queue_stateless_job_for_resume(
+                    job_id,
+                    delegation_context,
+                    priority=int(row.get("priority") or 0),
+                    fair_key=(str(row["user_id"]) if row.get("user_id") else None),
+                    expected_status="waiting",
+                )
+            else:
+                # Historical pinned path: context first, then the HA-safe
+                # waiting→paused CAS and dispatcher wake.
+                await postgres_db.merge_job_context(job_id, delegation_context)
+                claimed = await postgres_db.claim_delegation_resume(job_id)
+                if claimed:
+                    _trigger_dispatch()
             if not claimed:
                 logger.debug(
                     f"Delegation timeout for {job_id} already handled by "
                     f"another sweeper; skipping resume"
                 )
                 continue
-            _trigger_dispatch()
-
             logger.info(
                 f"Delegation timeout handled for {job_id}: "
                 f"cancelled {cancelled_count} children, parent re-queued"
@@ -15919,6 +17313,22 @@ async def _trigger_verification_on_complete(
                 [project_id] if critic_owner_id and project_id else []
             ),
         )
+    except asyncpg.UniqueViolationError as exc:
+        # The optimistic has_live_verification_critic read is intentionally
+        # not the authority: two completions can pass it concurrently. The
+        # immutable partial index owns that race. Handle only its named loser;
+        # an unrelated create_job uniqueness failure is still a real error.
+        if getattr(exc, "constraint_name", None) != "jobs_verification_uniq":
+            raise
+        logger.info(
+            "Critic skipped for job %s: round %d already has a critic",
+            job_id,
+            len(rounds),
+        )
+        actions.append(
+            f"critic round {len(rounds)} already exists for {job_id} — spawn skipped"
+        )
+        return
     except DatasourcePolicyConflictError:
         reason = (
             "Verification could not start because the target's connector "
@@ -17493,6 +18903,34 @@ async def complete_job(
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+        completion_entry_status = str(job.get("status") or "")
+        stateless_completion = job.get("execution_lane", "pinned") == "stateless"
+
+        # Thin S3 entry fence. Rotation never reaches this route; a genuine
+        # terminal stateless report must prove the exact live worker lease.
+        # Keep the check before the terminal-status early return and every
+        # mutation/side effect. Pinned callers remain tokenless.
+        if stateless_completion:
+            from src.shared.worker_queue import worker_lease_is_current
+
+            lease_current = False
+            if body.lease_token is not None:
+                async with postgres_db.acquire() as conn:
+                    lease_current = await worker_lease_is_current(
+                        conn,
+                        job_id=job_id,
+                        lease_token=body.lease_token,
+                    )
+            if not lease_current:
+                logger.warning(
+                    "Stateless completion fence rejected job=%s lease_token=%s",
+                    job_id,
+                    body.lease_token,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Completion report does not hold the current worker lease",
+                )
 
         # Post-execution handoff states are monotonic.  The agent that reported
         # one may still be unwinding while this handler archives its workspace
@@ -17520,7 +18958,34 @@ async def complete_job(
                 "actions": [f"late callback ignored; job already {job['status']}"],
             }
 
-        result = body.model_dump()
+        # Stateless END checkpoints are intentionally re-reported after an
+        # ambiguous HTTP failure. Several human/tool paths publish their final
+        # status before the report (waiting/waiting_for_reply), and the handler
+        # itself may have committed paused/failed/cancelled before its response
+        # was lost. The exact queue token above makes these benign callbacks
+        # safe; return 2xx so the holder can close the queue instead of
+        # release/re-report looping forever. Pinned behavior stays unchanged.
+        if stateless_completion and job["status"] in (
+            "paused",
+            "failed",
+            "cancelled",
+            "waiting",
+            "waiting_for_reply",
+        ):
+            logger.info(
+                "Job %s: accepting exact-token stateless terminal retry while "
+                "status is %s",
+                job_id,
+                job["status"],
+            )
+            return {
+                "status": "handled",
+                "job_id": job_id,
+                "new_status": job["status"],
+                "actions": [f"exact-token terminal retry; job already {job['status']}"],
+            }
+
+        result = body.model_dump(exclude={"lease_token"})
         actions: list[str] = []
 
         if job["status"] not in (
@@ -17601,7 +19066,7 @@ async def complete_job(
 
         # Clear any remaining queued_replies from job context on completion.
         # The agent may have consumed them during phase transitions.
-        if result.get("should_stop"):
+        if result.get("should_stop") and not stateless_completion:
             try:
                 async with postgres_db.acquire() as conn:
                     await conn.execute(
@@ -17986,13 +19451,27 @@ async def complete_job(
         # docs/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C.
         from services.completion import apply_deliverable_gate
 
+        async def _queue_deliverable_gate_resume(
+            resume_job_id: str,
+            feedback: str,
+            reason: str | None = None,
+        ) -> None:
+            await _internal_resume_job(
+                resume_job_id,
+                feedback,
+                reason,
+                expected_status=(
+                    completion_entry_status if stateless_completion else None
+                ),
+            )
+
         new_status, _gate_actions, _gate_bounced = await apply_deliverable_gate(
             job,
             result,
             new_status,
             db=postgres_db,
             gitea=gitea_client,
-            queue_resume=_internal_resume_job,
+            queue_resume=_queue_deliverable_gate_resume,
             vector_db=vector_db,
         )
         actions.extend(_gate_actions)
@@ -18124,6 +19603,10 @@ async def complete_job(
 
         if new_status:
             kwargs: dict[str, Any] = {"status": new_status}
+            had_assigned_agent = False
+            fd_row: dict[str, Any] | None = None
+            stash_and_clear_freeze = False
+
             if error_message:
                 kwargs["error_message"] = error_message
             # Persist the agent's structured error alongside the failure so the
@@ -18133,7 +19616,51 @@ async def complete_job(
             # without the other. docs/issues/loop_advances_into_active_model_cooldown.md
             if new_status == "failed" and isinstance(result.get("error"), dict):
                 kwargs["error_details"] = result["error"]
-            await postgres_db.update_job_status(job_id, **kwargs)
+
+            # Class A: every field that defines this jobs-row disposition rides
+            # one UPDATE. ``None`` means "omit" to update_job_status, so the
+            # established empty-string sentinel is required to clear the agent.
+            if new_status == "paused":
+                had_assigned_agent = bool(job.get("assigned_agent_id"))
+                kwargs["assigned_agent_id"] = ""
+
+                raw_fd = job.get("freeze_data")
+                if isinstance(raw_fd, str):
+                    try:
+                        raw_fd = json.loads(raw_fd)
+                    except (json.JSONDecodeError, ValueError):
+                        raw_fd = None
+                if isinstance(raw_fd, dict):
+                    fd_row = raw_fd
+                    from src.shared.job_freeze_types import (
+                        AUTO_REDISPATCH_FREEZE_TYPES,
+                    )
+
+                    stash_and_clear_freeze = (
+                        fd_row.get("freeze_type") in AUTO_REDISPATCH_FREEZE_TYPES
+                    )
+                    if stash_and_clear_freeze:
+                        kwargs["stash_and_clear_freeze"] = True
+                        kwargs["freeze_data"] = fd_row
+
+            if stateless_completion:
+                kwargs["expected_status"] = completion_entry_status
+            disposition_updated = await postgres_db.update_job_status(job_id, **kwargs)
+            if stateless_completion and not disposition_updated:
+                current = await postgres_db.get_job(job_id)
+                current_status = str((current or {}).get("status") or "unknown")
+                logger.warning(
+                    "Stateless completion disposition lost control race "
+                    "job=%s lease_token=%s entry_status=%s current_status=%s",
+                    job_id,
+                    body.lease_token,
+                    completion_entry_status,
+                    current_status,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Completion report lost an out-of-band job control race",
+                )
             actions.append(f"status -> {new_status}")
             logger.info(f"Job {job_id} status set to '{new_status}'")
 
@@ -18143,18 +19670,10 @@ async def complete_job(
             # attached — and the dispatcher only picks up paused jobs with
             # assigned_agent_id IS NULL, so without this clear they wedge until
             # gc_offline_agents' 24h FK cascade frees them.
-            if new_status == "paused" and job.get("assigned_agent_id"):
-                try:
-                    async with postgres_db.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE jobs SET assigned_agent_id = NULL "
-                            "WHERE id = $1::uuid",
-                            job_id,
-                        )
-                    job["assigned_agent_id"] = None
+            if new_status == "paused":
+                job["assigned_agent_id"] = None
+                if had_assigned_agent:
                     actions.append("cleared agent on paused job (re-dispatchable)")
-                except Exception as e:
-                    logger.warning(f"Failed to clear agent on paused job {job_id}: {e}")
 
             # Auto-redispatch pauses must ALSO shed the row-level freeze blob:
             # get_dispatchable_jobs requires ``freeze_data IS NULL`` (partial
@@ -18163,92 +19682,54 @@ async def complete_job(
             # resume state itself lives in the checkpoint + pushed branch, not
             # here. Pauses awaiting explicit action (vm_upgrade_required,
             # user-feedback freezes) keep their freeze_data untouched.
-            if new_status == "paused":
-                from services.completion import AUTO_REDISPATCH_FREEZE_TYPES
+            if new_status == "paused" and stash_and_clear_freeze:
+                job["freeze_data"] = None
+                actions.append("freeze stashed to context (auto-redispatch)")
 
-                fd_row = job.get("freeze_data")
-                if isinstance(fd_row, str):
-                    try:
-                        fd_row = json.loads(fd_row)
-                    except (json.JSONDecodeError, ValueError):
-                        fd_row = None
-                if (
-                    isinstance(fd_row, dict)
-                    and fd_row.get("freeze_type") in AUTO_REDISPATCH_FREEZE_TYPES
-                ):
-                    try:
-                        await postgres_db.merge_job_context(
-                            job_id, {"last_freeze_data": fd_row}
-                        )
-                        async with postgres_db.acquire() as conn:
-                            await conn.execute(
-                                "UPDATE jobs SET freeze_data = NULL "
-                                "WHERE id = $1::uuid",
-                                job_id,
-                            )
-                        job["freeze_data"] = None
-                        actions.append("freeze stashed to context (auto-redispatch)")
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to stash/clear freeze on paused job {job_id}: {e}"
-                        )
-
-                    # Progress-aware drain backstop (defense-in-depth for the
-                    # version_upgrade drain livelock,
-                    # docs/issues/version_upgrade_drain_livelock.md). Detects a
-                    # re-dispatch loop that is NOT advancing (freeze phase_number
-                    # stuck) and alerts, rather than letting it churn invisibly.
-                    # Pure decision in services.completion; I/O stays here.
-                    try:
-                        from services.completion import auto_continue_drain_update
-
-                        ctx = job.get("context") or {}
-                        if isinstance(ctx, str):
-                            ctx = json.loads(ctx)
-                        cap = int(os.environ.get("AUTO_CONTINUE_DRAIN_ALERT_CAP", "10"))
-                        drains, last_phase, should_alert = auto_continue_drain_update(
-                            ctx or {}, fd_row, cap=cap
-                        )
-                        await postgres_db.merge_job_context(
-                            job_id,
-                            {
-                                "auto_continue_drains": drains,
-                                "auto_continue_last_phase": last_phase,
-                            },
-                        )
-                        if should_alert:
-                            logger.error(
-                                f"Job {job_id}: {drains} consecutive "
-                                f"{fd_row.get('freeze_type')} re-dispatches with NO "
-                                f"phase progress (stuck at phase {last_phase}) — the "
-                                f"agent-side resume-clear may be failing; alerting "
-                                f"operator."
-                            )
-                            try:
-                                await _notify_operator_freeze(
-                                    job, job_id, fd_row.get("freeze_type"), fd_row
-                                )
-                            except Exception as _ne:
-                                logger.warning(
-                                    f"Failed to alert on drain-stall for "
-                                    f"{job_id}: {_ne}"
-                                )
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to update auto-continue drain counter for "
-                            f"{job_id}: {e}"
-                        )
-
-            # Set completed_at for terminal statuses
-            if new_status == "completed":
+                # Progress-aware drain backstop (defense-in-depth for the
+                # version_upgrade drain livelock,
+                # docs/issues/version_upgrade_drain_livelock.md). Detects a
+                # re-dispatch loop that is NOT advancing (freeze phase_number
+                # stuck) and alerts, rather than letting it churn invisibly.
+                # Pure decision in services.completion; I/O stays here.
                 try:
-                    async with postgres_db.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE jobs SET completed_at = NOW() WHERE id = $1::uuid",
-                            job_id,
+                    from services.completion import auto_continue_drain_update
+
+                    ctx = job.get("context") or {}
+                    if isinstance(ctx, str):
+                        ctx = json.loads(ctx)
+                    cap = int(os.environ.get("AUTO_CONTINUE_DRAIN_ALERT_CAP", "10"))
+                    drains, last_phase, should_alert = auto_continue_drain_update(
+                        ctx or {}, fd_row, cap=cap
+                    )
+                    await postgres_db.merge_job_context(
+                        job_id,
+                        {
+                            "auto_continue_drains": drains,
+                            "auto_continue_last_phase": last_phase,
+                        },
+                    )
+                    if should_alert:
+                        logger.error(
+                            f"Job {job_id}: {drains} consecutive "
+                            f"{fd_row.get('freeze_type')} re-dispatches with NO "
+                            f"phase progress (stuck at phase {last_phase}) — the "
+                            f"agent-side resume-clear may be failing; alerting "
+                            f"operator."
                         )
+                        try:
+                            await _notify_operator_freeze(
+                                job, job_id, fd_row.get("freeze_type"), fd_row
+                            )
+                        except Exception as _ne:
+                            logger.warning(
+                                f"Failed to alert on drain-stall for {job_id}: {_ne}"
+                            )
                 except Exception as e:
-                    logger.warning(f"Failed to set completed_at for {job_id}: {e}")
+                    logger.warning(
+                        f"Failed to update auto-continue drain counter for "
+                        f"{job_id}: {e}"
+                    )
 
             # Update job dict with new status for downstream checks
             job["status"] = new_status
@@ -18726,6 +20207,34 @@ def _is_browser_navigation(request: Request) -> bool:
     return "text/html" in request.headers.get("accept", "")
 
 
+async def _require_stateless_ide_lifecycle(entity_id: str) -> None:
+    """Refuse IDE admission once stateless terminal/loss fencing begins."""
+
+    thread = await postgres_db.get_thread(entity_id)
+    if thread is None or str(thread.get("execution_lane") or "") != "stateless":
+        return
+    try:
+        stopped = bool(stateless_stop_markers(thread.get("metadata")))
+    except RuntimeError:
+        stopped = True
+    backend, workspace_refusal = stateless_session_workspace_check(thread)
+    if (
+        str(thread.get("status") or "") not in {"created", "active", "awaiting_user"}
+        or stopped
+        or backend != "sandbox"
+        or workspace_refusal is not None
+    ):
+        ide_proxy_service.evict(entity_id)
+        raise HTTPException(
+            status_code=409,
+            detail="Stateless workspace lifecycle is not admitting IDE traffic",
+        )
+    # The proxy cache is keyed only by entity ID. A completed retirement can
+    # replace U1/IP1 with U2/IP2 under that same ID, so every fresh stateless
+    # lifecycle check invalidates the old coordinate before resolution/use.
+    ide_proxy_service.evict(entity_id)
+
+
 @app.api_route(
     "/api/ide/{job_id}/proxy/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
@@ -18769,6 +20278,8 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
         )
         raise HTTPException(status_code=403, detail="IDE access denied")
 
+    await _require_stateless_ide_lifecycle(job_id)
+
     pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
     if not pod_ip:
         raise HTTPException(status_code=503, detail="IDE session not active")
@@ -18806,6 +20317,23 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
     client = _get_ide_http_client()
 
     try:
+        # Recheck at the upstream credential/use boundary. A request that
+        # passed authorization before End waited on unrelated work must never
+        # reach the code-server after the terminal marker is durable.
+        await _require_stateless_ide_lifecycle(job_id)
+        pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
+        if not pod_ip:
+            raise HTTPException(status_code=503, detail="IDE session not active")
+        if not orchestrator_can_reach(pod_ip):
+            raise HTTPException(
+                status_code=503,
+                detail="IDE is not yet available for VM-backed workspaces.",
+            )
+        host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
+        upstream_url = f"http://{host}/{path}"
+        if request.url.query:
+            upstream_url += f"?{request.url.query}"
+        upstream_headers["host"] = host
         upstream_resp = await client.request(
             method=request.method,
             url=upstream_url,
@@ -18873,6 +20401,12 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
         await ws.close(code=4403, reason="IDE access denied")
         return
 
+    try:
+        await _require_stateless_ide_lifecycle(job_id)
+    except HTTPException:
+        await ws.close(code=4409, reason="Workspace lifecycle fenced")
+        return
+
     pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
     if not pod_ip:
         await ws.close(code=4503, reason="IDE session not active")
@@ -18885,15 +20419,26 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
         await ws.close(code=4503, reason="IDE not available for VM workspaces")
         return
 
-    await ws.accept()
-
-    # Build upstream WS URL (pod_ip may include port for Docker Compose)
-    ws_host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
-    upstream_url = f"ws://{ws_host}/{path}"
-    if ws.url.query:
-        upstream_url += f"?{ws.url.query}"
-
     try:
+        try:
+            await _require_stateless_ide_lifecycle(job_id)
+        except HTTPException:
+            await ws.close(code=4409, reason="Workspace lifecycle fenced")
+            return
+        pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
+        if not pod_ip:
+            await ws.close(code=4503, reason="IDE session not active")
+            return
+        if not orchestrator_can_reach(pod_ip):
+            await ws.close(code=4503, reason="IDE not available for VM workspaces")
+            return
+        # Resolve again only after the final lifecycle check/cache eviction, so
+        # an End U1 -> Resume U2 transition cannot route this handshake to IP1.
+        ws_host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
+        upstream_url = f"ws://{ws_host}/{path}"
+        if ws.url.query:
+            upstream_url += f"?{ws.url.query}"
+        await ws.accept()
         async with websockets.connect(
             upstream_url,
             max_size=16 * 1024 * 1024,  # 16 MB max message
@@ -19653,12 +21198,6 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     await postgres_db.update_job_cloud_diff(job_id, diff_status="accepted")
     await postgres_db.update_job_merge_status(job_id, merge_status="cloud-applied")
     await postgres_db.update_job_status(job_id, status="completed")
-    async with postgres_db.acquire() as conn:
-        await conn.execute(
-            "UPDATE jobs SET completed_at = COALESCE(completed_at, NOW()) "
-            "WHERE id = $1::uuid",
-            job_id,
-        )
     delivery = {
         "delivery_status": "cloud-applied",
         "needs_review": False,
@@ -19751,12 +21290,6 @@ async def reject_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     await postgres_db.update_job_cloud_diff(job_id, diff_status="rejected")
     await postgres_db.update_job_merge_status(job_id, merge_status="cloud-rejected")
     await postgres_db.update_job_status(job_id, status="completed")
-    async with postgres_db.acquire() as conn:
-        await conn.execute(
-            "UPDATE jobs SET completed_at = COALESCE(completed_at, NOW()) "
-            "WHERE id = $1::uuid",
-            job_id,
-        )
     delivery = {
         "delivery_status": "cloud-rejected",
         "needs_review": False,
@@ -20477,6 +22010,15 @@ async def assign_job_to_agent(
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        if job.get("execution_lane", "pinned") != "pinned":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Stateless jobs are claimed from the run queue and cannot "
+                    "be assigned directly to a registered agent"
+                ),
+            )
 
         if job["status"] not in ("created", "failed", "paused"):
             raise HTTPException(
@@ -24948,7 +26490,7 @@ async def register_agent(
     """
     await require_internal(request)
     try:
-        result = await postgres_db.register_agent(
+        register_kwargs = dict(
             config_name=registration.config_name,
             pod_ip=registration.pod_ip,
             hostname=registration.hostname,
@@ -24960,49 +26502,106 @@ async def register_agent(
             product_provenance=registration.product_provenance.model_dump(mode="json"),
             pod_uid=registration.pod_uid,
         )
-        # Bind persistent agent to its thread. Defense-in-depth against the
-        # double-provisioning race (docs/issues/persistent_thread_double_provisioning_race.md):
-        # take the per-thread advisory lock and refuse the bind if a *different*
-        # live agent already owns this thread — turns a silent overwrite into
-        # a loud 409 the orphan pod can react to by shutting down.
         if registration.agent_mode == "persistent" and registration.thread_id:
-            new_id = str(result["agent_id"])
+            # The lane check must precede the hostname upsert.  Its result ID
+            # may name a pre-existing legitimate row, so "upsert then delete on
+            # refusal" can delete another binding through the FK cascade.
             async with postgres_db.thread_advisory_lock(registration.thread_id):
                 thread = await postgres_db.get_thread(registration.thread_id)
+                if not _thread_uses_pinned_execution(thread):
+                    # Authoritative bind-boundary fence. A dedicated pod can
+                    # start while the row is pinned but register only after an
+                    # operator has moved the detached thread to the queue lane;
+                    # entry-time checks cannot close that boot window.
+                    logger.warning(
+                        "register_agent: refusing persistent bind for thread %s "
+                        "on execution lane %r before agent upsert",
+                        registration.thread_id,
+                        thread.get("execution_lane") if thread else None,
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="thread execution lane does not accept persistent agents",
+                    )
+
+                # Defense-in-depth against the double-provisioning race
+                # (docs/issues/persistent_thread_double_provisioning_race.md):
+                # refuse a different live owner before the hostname upsert can
+                # pause its jobs, change its binding, or delete it through an
+                # attempted loser rollback. A same-host restart targets that
+                # exact authorized row; every genuinely new binding inserts a
+                # fresh row because hostname is not unique or an ownership
+                # credential.
                 existing_id = thread.get("agent_id") if thread else None
-                if existing_id and str(existing_id) != new_id:
+                expected_upsert_id: str | None = None
+                if existing_id:
                     existing = await postgres_db.get_agent(str(existing_id))
                     existing_status = (existing or {}).get("status")
-                    if existing and existing_status not in (
-                        None,
-                        "offline",
-                        "failed",
-                    ):
+                    if not existing:
                         logger.warning(
-                            "register_agent: duplicate persistent registration "
-                            "for thread %s; winner=%s loser=%s — refusing.",
+                            "register_agent: thread %s references missing agent %s; "
+                            "refusing before agent upsert.",
                             registration.thread_id,
                             existing_id,
-                            new_id,
                         )
-                        try:
-                            await postgres_db.delete_agent(new_id)
-                        except Exception as del_err:
-                            logger.warning(
-                                "register_agent: failed to roll back loser %s: %s",
-                                new_id,
-                                del_err,
-                            )
+                        raise HTTPException(
+                            status_code=409,
+                            detail="thread agent ownership is inconsistent",
+                        )
+                    if (
+                        registration.hostname
+                        and existing.get("hostname") == registration.hostname
+                    ):
+                        expected_upsert_id = str(existing_id)
+                    elif existing_status not in ("offline", "failed"):
+                        logger.warning(
+                            "register_agent: duplicate persistent registration "
+                            "for thread %s; winner=%s hostname=%r — refusing "
+                            "before agent upsert.",
+                            registration.thread_id,
+                            existing_id,
+                            registration.hostname,
+                        )
                         raise HTTPException(
                             status_code=409,
                             detail="thread already bound to another live agent",
                         )
-                try:
-                    await postgres_db.update_thread_agent(
-                        registration.thread_id, new_id
+
+                result = await postgres_db.register_agent(
+                    **register_kwargs,
+                    expected_agent_id=expected_upsert_id,
+                    insert_only=expected_upsert_id is None,
+                )
+                new_id = str(result["agent_id"])
+                if expected_upsert_id is not None and new_id != expected_upsert_id:
+                    logger.warning(
+                        "register_agent: exact persistent restart target changed "
+                        "for thread %s; expected=%s got=%s",
+                        registration.thread_id,
+                        expected_upsert_id,
+                        new_id,
                     )
-                except Exception as bind_err:
-                    logger.warning(f"Thread binding failed (non-fatal): {bind_err}")
+                    raise HTTPException(
+                        status_code=409,
+                        detail="persistent agent identity changed during registration",
+                    )
+                if not await _bind_registered_persistent_agent(
+                    registration.thread_id,
+                    new_id,
+                    str(existing_id) if existing_id else None,
+                ):
+                    logger.warning(
+                        "register_agent: final pinned-lane bind lost for "
+                        "thread %s (agent=%s)",
+                        registration.thread_id,
+                        new_id,
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="thread execution lane changed before agent binding",
+                    )
+        else:
+            result = await postgres_db.register_agent(**register_kwargs)
         return AgentRegistrationResponse(**result)
     except HTTPException:
         raise
@@ -25075,6 +26674,9 @@ async def agent_create_thread(
             capture=create_capture,
         )
         effective_backend = _backend_from_override(create_capture["merged_fragment"])
+        effective_narration_mode = (
+            create_capture["merged_fragment"].get("interactive") or {}
+        ).get("narration_mode") or "auto"
         config_override: dict[str, Any] = {}
         if effective_backend:
             config_override = {"workspace": {"backend": effective_backend}}
@@ -25083,6 +26685,7 @@ async def agent_create_thread(
             user_id=None,
             config_name=config_name,
             permission_mode=body.permission_mode,
+            narration_mode=effective_narration_mode,
             title=body.title,
             datasource_ids=[],
             datasource_selection_provenance={
@@ -25582,6 +27185,250 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
             metadata = {}
     ws = metadata.get("workspace_container") or {}
     vm = metadata.get("vm") or {}
+    binding = metadata.get("_workspace_binding") or {}
+    workspace_backend = _thread_workspace_backend(thread)
+    if thread.get("execution_lane") == "stateless" and workspace_backend == "sandbox":
+        workspace_status = str(ws.get("status") or "")
+        restore_marker_present = WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY in ws
+        raw_restore_required = ws.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY)
+        if restore_marker_present and type(raw_restore_required) is not bool:
+            # This response carries SSH/cloud credentials. A malformed
+            # present-only lifecycle sentinel is neither "no debt" nor safe
+            # restore intent; refuse it before probing or scheduling effects.
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless snapshot restore authority is malformed",
+            )
+        snapshot_restore_required = raw_restore_required is True
+        if snapshot_restore_required:
+            # Container creation publishes its attested endpoint before a
+            # snapshot restore has finished extracting into that endpoint.
+            # The durable restore-intent bit is therefore part of readiness:
+            # never hand a claimant an empty/partial tree while extraction is
+            # still running (or after it failed).  The serialized lifecycle
+            # owner clears this bit only after a successful reattach/extract.
+            _schedule_stateless_workspace_ensure(thread_id)
+            ws = {
+                **ws,
+                "status": "restoring",
+                "pod_ip": None,
+                "host": None,
+                "port": None,
+                "pod_port": None,
+                "_canvas_workspace_generation": None,
+                WORKSPACE_RUNTIME_INCARNATION_KEY: None,
+            }
+        elif workspace_status == "ready":
+            # This internal poll is the physical attach credential boundary. A
+            # cached Ready row is only evidence about the Pod UID that authored
+            # it; a 404 or same-name replacement must not hand its stale SSH
+            # endpoint to the claimant. Unknown control-plane health also fails
+            # closed locally, but does not recreate anything until
+            # absence/drift is confirmed.
+            expected_runtime: str | None
+            try:
+                expected_runtime = str(
+                    UUID(str(ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY)))
+                )
+            except (TypeError, ValueError):
+                expected_runtime = None
+            if expected_runtime is None:
+                exact_pod_live: bool | None = False
+            else:
+                exact_pod_live = await container_provisioner.workspace_pod_live(
+                    WorkspaceOwner.session(thread_id),
+                    expected_runtime_incarnation=expected_runtime,
+                )
+            if exact_pod_live is True:
+                # The Kubernetes read crossed an await point while workspace
+                # lifecycle writers remained free to replace/invalidate the
+                # row. Re-read and compare the complete endpoint attestation;
+                # a delayed True for U1 must never authorize credentials after
+                # durable state has moved to U2/non-ready.
+                refreshed_thread = await postgres_db.get_thread(thread_id)
+                if refreshed_thread is None:
+                    raise HTTPException(status_code=404, detail="Thread not found")
+                refreshed_metadata = thread_metadata_object(refreshed_thread)
+                refreshed_ws = refreshed_metadata.get("workspace_container") or {}
+                refreshed_binding = refreshed_metadata.get("_workspace_binding") or {}
+                refreshed_backend = _thread_workspace_backend(refreshed_thread)
+                if (
+                    refreshed_thread.get("execution_lane") != "stateless"
+                    or refreshed_backend != "sandbox"
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Workspace authority changed during attach",
+                    )
+                if refreshed_ws != ws or refreshed_binding != binding:
+                    logger.info(
+                        "Stateless workspace attestation changed during probe: "
+                        "thread=%s old_runtime=%s new_runtime=%s",
+                        thread_id,
+                        expected_runtime,
+                        refreshed_ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY),
+                    )
+                    thread = refreshed_thread
+                    metadata = refreshed_metadata
+                    ws = refreshed_ws
+                    vm = metadata.get("vm") or {}
+                    binding = refreshed_binding
+                    workspace_backend = refreshed_backend
+                    refreshed_status = str(ws.get("status") or "")
+                    if refreshed_status in {
+                        "",
+                        "none",
+                        "deleted",
+                        "failed",
+                        "suspended",
+                        "restoring",
+                        "created",
+                        "creating",
+                        "pending",
+                    }:
+                        _schedule_stateless_workspace_ensure(thread_id)
+                    ws = {
+                        **ws,
+                        "status": (
+                            "creating"
+                            if refreshed_status == "ready"
+                            else refreshed_status
+                        ),
+                        "pod_ip": None,
+                        "host": None,
+                        "port": None,
+                        "pod_port": None,
+                        "_canvas_workspace_generation": None,
+                        WORKSPACE_RUNTIME_INCARNATION_KEY: None,
+                    }
+                    # The refreshed U2/non-ready row has not been probed by
+                    # this request. Do not reuse U1's result or start a Ready-U2
+                    # ensure; the next poll will attest U2 directly.
+                    exact_pod_live = None
+            if exact_pod_live is not True:
+                if exact_pod_live is False:
+                    _schedule_stateless_workspace_ensure(thread_id)
+                logger.info(
+                    "Stateless workspace attestation pending: thread=%s probe=%r",
+                    thread_id,
+                    exact_pod_live,
+                )
+                # Response-local invalidation only. The single-flight ensure
+                # owns durable lifecycle writes; meanwhile the agent keeps this
+                # leased claim alive and polls again instead of accepting stale
+                # SSH bytes.
+                ws = {
+                    **ws,
+                    "status": "creating",
+                    "pod_ip": None,
+                    "host": None,
+                    "port": None,
+                    "pod_port": None,
+                    "_canvas_workspace_generation": None,
+                    WORKSPACE_RUNTIME_INCARNATION_KEY: None,
+                }
+        elif workspace_status in {
+            "",
+            "none",
+            "deleted",
+            "failed",
+            "suspended",
+            "restoring",
+            "created",
+            "creating",
+            "pending",
+        }:
+            # A claimant can arrive after the original input-side ensure has
+            # failed, or after a lifecycle sweep changed stale Ready evidence
+            # to deleted. The durable input already exists, so this polling
+            # boundary is the retry trigger; no second user action is required.
+            # The required-runtime lifecycle arm also re-adopts a live
+            # in-progress pod whose original readiness waiter was interrupted.
+            _schedule_stateless_workspace_ensure(thread_id)
+            ws = {
+                **ws,
+                "pod_ip": None,
+                "host": None,
+                "port": None,
+                "pod_port": None,
+                "_canvas_workspace_generation": None,
+                WORKSPACE_RUNTIME_INCARNATION_KEY: None,
+            }
+    workspace_generation: str | None = None
+    workspace_runtime_incarnation: str | None = None
+    workspace_ssh_host_key_fingerprint: str | None = None
+    if isinstance(binding, dict):
+        try:
+            candidate_generation = str(UUID(str(binding.get("generation"))))
+        except (TypeError, ValueError):
+            candidate_generation = ""
+        if (
+            workspace_backend == "virtual"
+            and binding.get("kind") == "virtual"
+            and candidate_generation
+        ):
+            # A virtual generation is authoritative only for the deployment's
+            # current durable object-store namespace.  Kind + UUID alone are
+            # historical evidence: after an object-store rotation they could
+            # attest bytes under the old ``threads/<id>/`` backing while this
+            # claimant is attached to the new one.
+            virtual_spec = _virtual_workspace_rclone_spec()
+            if (
+                isinstance(virtual_spec, dict)
+                and virtual_spec.get("type") != "memory"
+                and binding.get("backing_id")
+                == virtual_thread_backing_id(thread_id, virtual_spec)
+            ):
+                workspace_generation = candidate_generation
+        elif (
+            workspace_backend != "virtual"
+            and binding.get("kind") == "remote"
+            and ws.get("status") == "ready"
+            and str(ws.get("_canvas_workspace_generation") or "")
+            == candidate_generation
+        ):
+            # A remote binding alone is historical evidence. Pair it with the
+            # exact ready endpoint generation before cloud sync may call those
+            # workspace bytes the source of an acknowledged generation.
+            try:
+                candidate_runtime_incarnation = str(
+                    UUID(str(ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY)))
+                )
+            except (TypeError, ValueError):
+                candidate_runtime_incarnation = None
+            if thread.get("execution_lane") == "stateless":
+                # For a movable claimant the complete ready authority is one
+                # indivisible tuple. The fingerprint is the use-side fence:
+                # stable Service DNS must not carry U1 authority onto a U2 pod
+                # between this response and Paramiko's key exchange.
+                if (
+                    candidate_runtime_incarnation is not None
+                    and remote_canvas_presentation_available(metadata, ws)
+                ):
+                    workspace_generation = candidate_generation
+                    workspace_runtime_incarnation = candidate_runtime_incarnation
+                    workspace_ssh_host_key_fingerprint = binding[
+                        "ssh_host_key_fingerprint"
+                    ]
+            else:
+                # Pinned sessions retain their historical generation/runtime
+                # response contract and their existing SSH trust policy.
+                workspace_generation = candidate_generation
+                workspace_runtime_incarnation = candidate_runtime_incarnation
+    if (
+        thread.get("execution_lane") == "stateless"
+        and workspace_backend == "virtual"
+        and workspace_generation is None
+    ):
+        # A virtual workspace is durable only through its orchestrator-owned
+        # object-store binding.  Never hand a stateless claimant cloud
+        # credentials with an unbound/ambiguous source namespace: the
+        # generation fence could otherwise bless bytes from no authoritative
+        # workspace incarnation.
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless virtual workspace binding is unavailable",
+        )
     (
         canvas_presentation_available,
         canvas_live_apps_available,
@@ -25600,27 +27447,39 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         thread, metadata, project_ids=project_ids
     )
     mount_rows = await postgres_db.list_thread_mounts(thread_id)
-    cloud_mount_cfg = await _build_agent_cloud_mount(
-        thread,
-        mount_rows=mount_rows,
-        metadata=metadata,
+    suppress_disposable_cloud = bool(
+        thread.get("execution_lane") == "stateless" and workspace_backend == "none"
     )
-    if cloud_mount_cfg:
+    if suppress_disposable_cloud:
+        # ScratchBackend has no file tools and promises no durable workspace.
+        # Do not advertise either the structured or legacy cloud surface: a
+        # stateless claimant must not turn that explicitly disposable tier
+        # into an accidental session-folder mirror. Pinned sessions retain
+        # their historical cloud payload until that lane is retired/migrated.
+        cloud_mount_cfg = None
         cloud_sync_cfg = None
-    elif metadata.get("protected_cloud"):
-        # Protected thread with no engageable protected mount (flag off, VM
-        # tier, or a refused/absent grant): NO live sync fallback of any kind
-        # (fail-closed; agent sees degraded-cloud state, never a live write
-        # path on a thread the user marked protected).
-        cloud_sync_cfg = None
-    elif _cloud_workspace_driver() == "rclone_mount":
-        # rclone requested but unavailable/unsupported: fall back to the
-        # regular session folder only. Do not eagerly clone thread_mounts such
-        # as a default user home; that is the startup failure this driver is
-        # meant to avoid.
-        cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=[])
     else:
-        cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
+        cloud_mount_cfg = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=mount_rows,
+            metadata=metadata,
+        )
+        if cloud_mount_cfg:
+            cloud_sync_cfg = None
+        elif metadata.get("protected_cloud"):
+            # Protected thread with no engageable protected mount (flag off,
+            # VM tier, or a refused/absent grant): NO live sync fallback of
+            # any kind (fail-closed; agent sees degraded-cloud state, never a
+            # live write path on a thread the user marked protected).
+            cloud_sync_cfg = None
+        elif _cloud_workspace_driver() == "rclone_mount":
+            # rclone requested but unavailable/unsupported: fall back to the
+            # regular session folder only. Do not eagerly clone thread_mounts
+            # such as a default user home; that is the startup failure this
+            # driver is meant to avoid.
+            cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=[])
+        else:
+            cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
     # Issue 13 follow-up: if the main cloud is up but this thread resolved NO
     # sync target (session-folder provisioning failed upstream, or user-home /
     # project-mount resolution produced nothing usable), the agent would
@@ -25632,7 +27491,8 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
     except Exception:
         _cloud_up = False
     cloud_sync_degraded = bool(
-        _cloud_up
+        not suppress_disposable_cloud
+        and _cloud_up
         and not cloud_mount_cfg
         and not cloud_sync_cfg
         and (metadata.get("protected_cloud") or not thread.get("nc_session_folder"))
@@ -25700,15 +27560,28 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "status": ws.get("status", "none"),
+        # Internal claim/attach identity, never exposed by owner-facing thread
+        # routes. Durable cloud generations bind their source bytes to this
+        # orchestrator-owned workspace incarnation and recheck it before each
+        # external PUT.
+        "workspace_generation": workspace_generation,
+        # Separate from the backing generation: a PVC-backed workspace keeps
+        # its generation across pod replacement, while this Kubernetes Pod UID
+        # changes and fences the prior runtime's shell ownership record.
+        "workspace_runtime_incarnation": workspace_runtime_incarnation,
+        # Internal stateless-attach authority only. It is emitted iff the exact
+        # ready generation/runtime tuple above is accepted, and is consumed as
+        # an exact Paramiko host-key pin before any SFTP, exec, or tmux claim.
+        "workspace_ssh_host_key_fingerprint": (workspace_ssh_host_key_fingerprint),
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
         "pod_ip": ws.get("pod_ip") or ws.get("host"),
         "pod_name": ws.get("pod_name"),
         "pod_port": ws.get("pod_port") or ws.get("port"),
         "namespace": ws.get("namespace"),
         "git_remote_url": ws.get("git_remote_url"),
-        # Public capability only: private generation/fingerprint material stays
-        # in metadata. A ready endpoint without a paired trusted binding must
-        # not cause the agent to advertise Canvas tools which can never work.
+        # Public capability only. A ready endpoint without a paired trusted
+        # binding must not cause the agent to advertise Canvas tools which can
+        # never work.
         "canvas_presentation_available": canvas_presentation_available,
         "canvas_live_apps_available": canvas_live_apps_available,
         "canvas_shared_browser_available": canvas_shared_browser_available,
@@ -25734,7 +27607,9 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
             externalize_urls=bool(vm.get("status") == "ready" and vm.get("ssh_host")),
         ),
         # Nextcloud session folder (legacy; preserved one release for back-compat)
-        "nc_session_folder": thread.get("nc_session_folder"),
+        "nc_session_folder": (
+            None if suppress_disposable_cloud else thread.get("nc_session_folder")
+        ),
         # Structured cloud-sync config (backend + webdav URL + auth).
         # Agent consumes this via ``src.services.cloud_sync.build_workspace_sync``.
         "cloud_sync": cloud_sync_cfg,
@@ -25811,6 +27686,10 @@ async def agent_get_thread_lifecycle(
 
 class AgentThreadStatusRequest(BaseModel):
     status: str
+    # Optional exact owner credential for pinned teardown. Stateless callers
+    # and legacy status writes omit it; when supplied, the status transition is
+    # serialized with the reciprocal thread/agent binding.
+    agent_id: UUID | None = None
 
 
 class OfficerWakeRequest(BaseModel):
@@ -26336,6 +28215,96 @@ async def agent_update_thread_status(
             status_code=400,
             detail=f"Status must be one of: {valid_statuses}",
         )
+    lane_thread = await postgres_db.get_thread(thread_id)
+    if (
+        lane_thread is not None
+        and lane_thread.get("execution_lane") == "stateless"
+        and body.agent_id is None
+    ):
+        # Queue-served lifecycle/presence writes carry an exact lease and use
+        # src.shared.session_retirement. A generic pod request has no owner
+        # credential and must never resurrect an ended/retiring thread.
+        raise HTTPException(
+            status_code=409,
+            detail="Stateless status updates require exact lease authority",
+        )
+    if body.agent_id is not None:
+        if body.status != "ended":
+            raise HTTPException(
+                status_code=400,
+                detail="Exact pinned-owner fencing is supported only for ended",
+            )
+        agent_id = body.agent_id
+        async with postgres_db.acquire() as conn:
+            async with conn.transaction():
+                thread_record = await conn.fetchrow(
+                    "SELECT id, agent_id, execution_lane, status, metadata, "
+                    "project_id, title "
+                    "FROM threads WHERE id = $1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if (
+                    thread_record is None
+                    or str(thread_record["execution_lane"] or "") != "pinned"
+                    or thread_record["agent_id"] != agent_id
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Pinned session ownership changed before teardown",
+                    )
+                reciprocal = await conn.fetchval(
+                    "SELECT 1 FROM agents WHERE id = $1::uuid "
+                    "AND thread_id = $2::uuid FOR SHARE",
+                    agent_id,
+                    thread_id,
+                )
+                if reciprocal is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Pinned session ownership is not reciprocal",
+                    )
+
+                thread_row = dict(thread_record)
+                officer = _officer_meta_enabled(_thread_officer_meta(thread_row))
+                if officer:
+                    updated = await conn.fetchval(
+                        "UPDATE threads "
+                        "SET status = 'suspended', agent_id = NULL, "
+                        "    control_admission_agent_id = NULL, "
+                        "    awaiting_user_since = NULL "
+                        "WHERE id = $1::uuid AND agent_id = $2::uuid "
+                        "RETURNING id",
+                        thread_id,
+                        agent_id,
+                    )
+                    result_status = "suspended"
+                else:
+                    updated = await conn.fetchval(
+                        "UPDATE threads "
+                        "SET status = 'ended', ended_at = CURRENT_TIMESTAMP, "
+                        "    control_admission_agent_id = NULL "
+                        "WHERE id = $1::uuid AND agent_id = $2::uuid "
+                        "AND status <> 'suspended' RETURNING id",
+                        thread_id,
+                        agent_id,
+                    )
+                    result_status = "ended"
+                if updated is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Pinned session ownership changed before teardown",
+                    )
+
+        if result_status == "suspended":
+            logger.info(
+                "Officer thread %s: exact-owner agent 'ended' mapped to "
+                "'suspended' (watchdog will respawn)",
+                thread_id[:8],
+            )
+        else:
+            asyncio.create_task(_suspend_thread_resources(thread_id))
+            await _conclude_conference_if_any(thread_row)
+        return {"status": result_status}
     try:
         if body.status == "ended":
             # Officer sessions (centurion.md §4): an agent-side 'ended' is a
@@ -26356,6 +28325,7 @@ async def agent_update_thread_status(
                     await conn.execute(
                         "UPDATE threads "
                         "SET status = 'suspended', agent_id = NULL, "
+                        "    control_admission_agent_id = NULL, "
                         "    awaiting_user_since = NULL "
                         "WHERE id = $1 AND status <> 'ended'",
                         thread_id,
@@ -26374,7 +28344,8 @@ async def agent_update_thread_status(
             async with postgres_db.acquire() as conn:
                 updated = await conn.fetchval(
                     "UPDATE threads "
-                    "SET status = 'ended', ended_at = CURRENT_TIMESTAMP "
+                    "SET status = 'ended', ended_at = CURRENT_TIMESTAMP, "
+                    "    control_admission_agent_id = NULL "
                     "WHERE id = $1 AND status <> 'suspended' "
                     "RETURNING id",
                     thread_id,
@@ -26463,6 +28434,12 @@ async def agent_suspend_thread(request: Request, thread_id: str) -> dict[str, An
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
     status = thread.get("status")
+    if thread.get("execution_lane") == "stateless":
+        return {
+            "suspended": False,
+            "status": status,
+            "reason": "stateless_terminal_protocol_required",
+        }
     if status == "suspended":
         # Idempotent — a retried call after a lost response must not fail.
         return {"suspended": True, "status": "suspended"}
@@ -26482,7 +28459,8 @@ async def agent_suspend_thread(request: Request, thread_id: str) -> dict[str, An
     async with postgres_db.acquire() as conn:
         updated = await conn.fetchval(
             "UPDATE threads "
-            "SET status = 'suspended', agent_id = NULL "
+            "SET status = 'suspended', agent_id = NULL, "
+            "    control_admission_agent_id = NULL "
             "WHERE id = $1 AND status IN ('created', 'active', 'awaiting_user') "
             "RETURNING id",
             thread_id,
@@ -26514,7 +28492,11 @@ async def agent_release_thread_agent(
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    await postgres_db.resume_thread(thread_id)
+    if not await postgres_db.resume_thread(thread_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Thread workspace retirement is still in progress",
+        )
     return {"status": "released"}
 
 
@@ -26576,6 +28558,66 @@ async def _apply_thread_config_update(
     (``actor`` is the resolved caller for owner-facing requests, None for
     internal ones — the recorded path distinguishes the two).
     """
+    if thread_row and thread_row.get("execution_lane") == "stateless":
+        # Generic config mutation is not the workspace-upgrade protocol. Refuse
+        # an already-drifted row and allow only same-tier workspace tuning.
+        current_backend = _require_stateless_workspace(thread_row)
+        if "officer" in config_override:
+            # Runtime PATCH historically accepted this block without the
+            # create-time validator. Normalize booleans and reject unknown
+            # fields before evaluating the proposed immutable session class.
+            normalized_officer = _validated_session_officer_override(config_override)
+            config_override["officer"] = normalized_officer or {}
+
+        metadata = thread_metadata_object(thread_row)
+        persisted_override = metadata.get("config_override") or {}
+        if not isinstance(persisted_override, dict):
+            persisted_override = {}
+        proposed_override = _deep_merge_dicts(
+            persisted_override,
+            config_override,
+        )
+        class_refusal = _stateless_session_class_refusal(proposed_override)
+        if class_refusal is not None:
+            # Creation materializes the fully resolved class booleans into the
+            # request layer, so this merge is authoritative even if the expert
+            # or account default changes later. Never persist a fragment that
+            # would move a live queue-served thread onto pinned-only wake
+            # machinery without an atomic lane-transition protocol.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A stateless session cannot enable pinned-only lifecycle "
+                    f"behavior ({class_refusal})"
+                ),
+            )
+        if "workspace" in config_override:
+            workspace_patch = config_override.get("workspace")
+            if not isinstance(workspace_patch, dict) or (
+                "backend" in workspace_patch
+                and workspace_patch.get("backend") != current_backend
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "A stateless session cannot change its workspace tier "
+                        "through generic config mutation"
+                    ),
+                )
+
+    interactive = config_override.get("interactive")
+    if isinstance(interactive, dict) and {
+        "permission_mode",
+        "narration_mode",
+    }.intersection(interactive):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "permission_mode and narration_mode must use the ordered "
+                "session control endpoint"
+            ),
+        )
+
     if "tools" in config_override:
         # Runtime updates use the same registry vocabulary as session creation
         # and job creation.  A fragment this boundary will not honour is a 400
@@ -26761,16 +28803,6 @@ async def _apply_thread_config_update(
     if not ok:
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    # Keep top-level permission_mode column in sync
-    pm = (config_override.get("interactive") or {}).get("permission_mode")
-    if pm and pm in ("supervised", "auto_accept", "autonomous"):
-        async with postgres_db.acquire() as conn:
-            await conn.execute(
-                "UPDATE threads SET permission_mode = $1 WHERE id = $2",
-                pm,
-                thread_id,
-            )
-
     # Persist the accepted selection only after every check above passed.
     # The category flip is NOT merged into config_override — the closed
     # session tools vocabulary would drop it anyway; the agent re-fetches
@@ -26821,9 +28853,8 @@ async def agent_update_thread_config(
     requires ``X-Internal-Key``. Ingress strips this path.
 
     Deep-merges the provided config_override into the existing
-    ``threads.metadata.config_override``.  If the override includes
-    ``interactive.permission_mode``, the top-level ``permission_mode``
-    column is updated as well for query consistency.
+    ``threads.metadata.config_override``. Ordered permission/narration
+    scalars are rejected here and must use the durable control inbox.
 
     Returns the enriched ``config_override`` so the agent can rebuild its
     LLM with the resolved ``base_url``/``api_key`` instead of sending the
@@ -26865,6 +28896,13 @@ async def agent_upgrade_thread_to_vm(
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
+    from src.shared.run_queue import LANE_PINNED
+
+    if thread.get("execution_lane") != LANE_PINNED:
+        raise HTTPException(
+            status_code=409,
+            detail="Workspace upgrades are not yet supported on the stateless lane",
+        )
 
     # Sec-1 — authorize BEFORE provisioning (fail-closed). This endpoint is the
     # target of both the sandbox→VM sudo path and the lite→vm delegation from
@@ -26994,6 +29032,13 @@ async def agent_upgrade_thread_to_workspace(
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
+    from src.shared.run_queue import LANE_PINNED
+
+    if thread.get("execution_lane") != LANE_PINNED:
+        raise HTTPException(
+            status_code=409,
+            detail="Workspace upgrades are not yet supported on the stateless lane",
+        )
 
     # Sec-1 — authorize the upgrade against the owner's capability grants BEFORE
     # provisioning (fail-closed). sandbox passes by default; a shell-restricted
@@ -27513,6 +29558,16 @@ class ThreadCreateRequest(BaseModel):
         ),
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_execution_lane_selector(cls, value: Any) -> Any:
+        """Keep session creation topology-neutral at the public boundary."""
+        if isinstance(value, dict) and "execution_lane" in value:
+            raise ValueError(
+                "execution_lane is orchestrator-managed and cannot be selected"
+            )
+        return value
+
     @model_validator(mode="after")
     def reject_null_datasource_selection(self) -> "ThreadCreateRequest":
         if "datasource_ids" in self.model_fields_set and self.datasource_ids is None:
@@ -28030,28 +30085,6 @@ async def create_thread(
         if req_officer:
             config_override.setdefault("officer", {}).update(req_officer)
 
-        # Conference embodiment (centurion.md §2/S9): needs one unambiguous
-        # project (identity is project-scoped), and at most ONE open
-        # conference per project — the single-writer rule; reattach instead
-        # of minting a rival embodiment.
-        if (config_override.get("officer") or {}).get("conference") is True:
-            if not primary_project_id:
-                raise HTTPException(
-                    status_code=400,
-                    detail="A conference session needs exactly one project — "
-                    "the officer's identity is project-scoped.",
-                )
-            _open_conf = await _find_open_conference_thread(primary_project_id)
-            if _open_conf:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "conference_open: this project already has an open "
-                        f"conference session ({_open_conf['id']}) — resume it "
-                        "instead of opening a second one."
-                    ),
-                )
-
         # Resolve the complete create-time policy view.  This is also the source
         # for infrastructure-affecting values and grants, preventing the create
         # path from validating only a thin request fragment while attach sees a
@@ -28074,6 +30107,37 @@ async def create_thread(
         effective_backend = _backend_from_override(effective_create_config)
         if effective_backend:
             config_override.setdefault("workspace", {})["backend"] = effective_backend
+
+        # Officer/conference selects pinned-only lifecycle machinery. Freeze
+        # the fully resolved booleans into the highest-priority request layer
+        # just like the physical workspace tier above. Later expert/account
+        # edits can still update ordinary config, but cannot silently move an
+        # existing stateless thread onto a different wake plane.
+        config_override.setdefault("officer", {}).update(
+            _materialized_session_class_override(effective_create_config)
+        )
+
+        # Conference embodiment (centurion.md §2/S9): validate the MATERIALIZED
+        # effective class, not only the user's explicit fragment. An expert or
+        # account default may select conference too, and must obey the same
+        # single-project/single-writer rules.
+        if (config_override.get("officer") or {}).get("conference") is True:
+            if not primary_project_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A conference session needs exactly one project — "
+                    "the officer's identity is project-scoped.",
+                )
+            _open_conf = await _find_open_conference_thread(primary_project_id)
+            if _open_conf:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "conference_open: this project already has an open "
+                        f"conference session ({_open_conf['id']}) — resume it "
+                        "instead of opening a second one."
+                    ),
+                )
 
         # Materialize one complete selection with the thread row. Cockpit sends
         # a reviewed array (including []); omission is temporarily gated for
@@ -28159,21 +30223,21 @@ async def create_thread(
         effective_permission_mode = (
             effective_create_config.get("interactive") or {}
         ).get("permission_mode") or "supervised"
+        effective_narration_mode = (
+            effective_create_config.get("interactive") or {}
+        ).get("narration_mode") or "auto"
 
-        thread_id = await postgres_db.create_thread(
-            user_id=str(user["id"]),
-            project_id=primary_project_id,
-            config_name=config_name,
-            permission_mode=effective_permission_mode,
-            title=request_body.title,
-            datasource_ids=selected_thread_datasource_ids,
-            datasource_selection_provenance=thread_selection_provenance,
-            datasource_policy_revisions=selected_thread_datasource_revisions,
-            authority_user_id=str(user["id"]),
-            authority_project_ids=effective_project_ids,
+        execution_lane = _resolve_thread_execution_lane(
+            workspace_backend=thread_backend,
+            effective_config=effective_create_config,
         )
+        if request_body.protected_cloud:
+            # Protected-cloud overlay staging is not yet lease/runtime fenced;
+            # keep it on the dedicated plane even when ordinary sandbox
+            # sessions are admitted to the stateless pool.
+            execution_lane = "pinned"
 
-        # Store config_override + datasource_ids in thread metadata. Project
+        # Store config_override + datasource ids in thread metadata. Project
         # attachment is the canonical concern of ``thread_mounts`` (Phase 1
         # of cloud_collaboration_model.md §9) — the legacy
         # ``metadata.project_ids`` JSONB key is no longer written.
@@ -28192,7 +30256,54 @@ async def create_thread(
             )
         if request_body.protected_cloud:
             metadata_patch["protected_cloud"] = True
-        if metadata_patch:
+
+        # Decide physical actuation before the INSERT. Every stateless thread
+        # commits its materialized class/tier in that transaction; a K8s thread
+        # additionally commits its one-shot create nonce. A crash after INSERT
+        # can then be reconciled safely instead of leaving an unclassified or
+        # ambiguous markerless row.
+        lite_session = thread_backend in LITE_BACKENDS
+        vm_session = thread_backend == "vm"
+        use_k8s = (
+            not lite_session
+            and not vm_session
+            and container_provisioner.is_available
+            and (
+                container_provisioner.in_cluster or not docker_provisioner.is_available
+            )
+        )
+        stateless_initial_metadata = execution_lane == "stateless"
+        if stateless_initial_metadata and use_k8s:
+            metadata_patch["workspace_container"] = {
+                "status": "pending",
+                "provisioner": "k8s",
+                "_stateless_runtime_creation": {
+                    "generation": str(uuid4()),
+                    "mode": "create",
+                    "attempted": False,
+                    "replaces_uid": None,
+                },
+            }
+
+        create_kwargs = dict(
+            user_id=str(user["id"]),
+            project_id=primary_project_id,
+            config_name=config_name,
+            permission_mode=effective_permission_mode,
+            narration_mode=effective_narration_mode,
+            title=request_body.title,
+            datasource_ids=selected_thread_datasource_ids,
+            datasource_selection_provenance=thread_selection_provenance,
+            datasource_policy_revisions=selected_thread_datasource_revisions,
+            authority_user_id=str(user["id"]),
+            authority_project_ids=effective_project_ids,
+            execution_lane=execution_lane,
+        )
+        if stateless_initial_metadata:
+            create_kwargs["initial_metadata"] = metadata_patch
+        thread_id = await postgres_db.create_thread(**create_kwargs)
+
+        if metadata_patch and not stateless_initial_metadata:
             async with postgres_db.acquire() as conn:
                 await conn.execute(
                     """
@@ -28263,16 +30374,6 @@ async def create_thread(
         # Lite (virtual/none) sessions run with no workspace pod — skip every
         # provisioning path below (no_workspace_agent_mode.md §4). The session
         # agent builds its lite backend from the mounts injected at attach.
-        lite_session = _backend_from_override(config_override) in LITE_BACKENDS
-        vm_session = _backend_from_override(config_override) == "vm"
-        use_k8s = (
-            not lite_session
-            and not vm_session
-            and container_provisioner.is_available
-            and (
-                container_provisioner.in_cluster or not docker_provisioner.is_available
-            )
-        )
         if lite_session:
             logger.info(
                 "Thread %s: lite workspace backend — no workspace pod provisioned",
@@ -28327,25 +30428,30 @@ async def create_thread(
                 _provision_thread_vm(thread_id, _vm_cpu, _vm_mem, _vm_agent_config)
             )
         elif use_k8s:
-            # Signal that workspace provisioning is starting so the agent
-            # keeps polling instead of falling back to local mode immediately.
-            await postgres_db.merge_thread_workspace_context(
-                thread_id, {"status": "pending"}
-            )
-
-            # Kubernetes mode: create pod on demand
-            async def _provision_thread_workspace(tid: str) -> None:
-                ok = await container_provisioner.create_workspace(
-                    WorkspaceOwner.session(tid)
+            if execution_lane == "stateless":
+                # Stateless create shares the same distributed lifecycle owner
+                # as input, resume, attach-poll recovery, and terminal cleanup.
+                # A direct provisioner task could otherwise outlive a public
+                # End and recreate/publish a pod after retirement completed.
+                _schedule_stateless_workspace_ensure(thread_id)
+            else:
+                await postgres_db.merge_thread_workspace_context(
+                    thread_id, {"status": "pending", "provisioner": "k8s"}
                 )
-                if not ok:
-                    logger.error(
-                        "Thread %s: workspace container provisioning failed. "
-                        "Check image availability, RBAC, and node resources.",
-                        tid,
-                    )
 
-            asyncio.create_task(_provision_thread_workspace(thread_id))
+                # Pinned keeps its historical direct provisioning path.
+                async def _provision_thread_workspace(tid: str) -> None:
+                    ok = await container_provisioner.create_workspace(
+                        WorkspaceOwner.session(tid)
+                    )
+                    if not ok:
+                        logger.error(
+                            "Thread %s: workspace container provisioning failed. "
+                            "Check image availability, RBAC, and node resources.",
+                            tid,
+                        )
+
+                asyncio.create_task(_provision_thread_workspace(thread_id))
         elif docker_provisioner.is_available:
             await postgres_db.merge_thread_workspace_context(
                 thread_id, {"status": "pending"}
@@ -28492,7 +30598,14 @@ async def create_thread(
         use_k8s_agent = agent_provisioner.is_available and (
             agent_provisioner.in_cluster or not docker_provisioner.is_available
         )
-        if use_k8s_agent:
+        if execution_lane == "stateless":
+            logger.info(
+                "Thread %s: admitted to stateless session pool "
+                "(workspace_backend=%s); dedicated agent provisioning skipped",
+                thread_id,
+                thread_backend,
+            )
+        elif use_k8s_agent:
             # Kubernetes mode: create agent pod on demand, with pool fallback
             effective_config = config_name
 
@@ -29258,6 +31371,227 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
     return result
 
 
+@app.get("/api/persistent/threads/{thread_id}/state")
+async def get_thread_session_state(
+    thread_id: str, request: Request, response: Response
+) -> dict[str, Any]:
+    """Lane-agnostic, owner-gated current state for a session Cockpit.
+
+    This is the REST twin of the agent's direct ``session.state`` welcome
+    frame.  It intentionally reads durable state for *both* execution lanes;
+    no lane or pod identity crosses the wire.  Journal-derived fields are
+    point-in-time values at ``event_cursor``.  A client must apply the snapshot
+    before replaying the journal from ``replay_cursor`` so the latest logical
+    turn is rebuilt before any not-yet-flushed agent edge advances it.
+    """
+
+    started = time.perf_counter()
+    _user, _thread = await require_thread_owner(request, postgres_db, thread_id)
+    auth_done = time.perf_counter()
+
+    # Model/temperature/narration are not all first-class thread columns yet.
+    # Resolve from the exact thread row captured inside the snapshot's
+    # repeatable-read transaction. A later config write then lands above the
+    # returned event cursor and SSE replays it, instead of the cursor hiding a
+    # scalar resolved from a different metadata revision.
+    config_seconds = 0.0
+
+    async def _resolve_snapshot_config(
+        snapshot_thread: dict[str, Any], snapshot_metadata: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        nonlocal config_seconds
+        config_started = time.perf_counter()
+        try:
+            return await _resolve_session_config(snapshot_thread, snapshot_metadata)
+        except GrantDenied:
+            logger.warning(
+                "Session-state config resolve denied for thread %s; using stored "
+                "display fields",
+                thread_id,
+            )
+            return None
+        finally:
+            config_seconds += time.perf_counter() - config_started
+
+    snapshot = await build_session_state_snapshot(
+        postgres_db,
+        thread_id,
+        config_resolver=_resolve_snapshot_config,
+    )
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    # Pending permissions include tool arguments. Never let a browser or an
+    # intermediary retain one user's current control state for another read.
+    response.headers["Cache-Control"] = "private, no-store"
+    finished = time.perf_counter()
+    logger.info(
+        "session-state timing: thread=%s auth=%.3fs config=%.3fs "
+        "snapshot=%.3fs total=%.3fs",
+        thread_id,
+        auth_done - started,
+        config_seconds,
+        max(0.0, finished - auth_done - config_seconds),
+        finished - started,
+    )
+    return snapshot
+
+
+class ThreadControlRequest(BaseModel):
+    """Strict public envelope for the durable control-inbox subset."""
+
+    client_request_id: UUID
+    method: Literal["mode.set", "narration.set", "workspace.undo"]
+    mode: (
+        Literal[
+            "supervised",
+            "auto_accept",
+            "autonomous",
+            "silent",
+            "verbose",
+            "auto",
+        ]
+        | None
+    ) = None
+
+    @model_validator(mode="after")
+    def validate_method_mode_pair(self) -> "ThreadControlRequest":
+        permission_modes = {"supervised", "auto_accept", "autonomous"}
+        narration_modes = {"silent", "verbose", "auto"}
+        if self.method == "mode.set" and self.mode not in permission_modes:
+            raise ValueError("mode.set requires a permission mode")
+        if self.method == "narration.set" and self.mode not in narration_modes:
+            raise ValueError("narration.set requires a narration mode")
+        if self.method == "workspace.undo" and self.mode is not None:
+            raise ValueError("workspace.undo does not accept a mode")
+        return self
+
+    def control_payload(self) -> dict[str, Any]:
+        """Canonical payload used for idempotency and durable admission."""
+
+        return {} if self.method == "workspace.undo" else {"mode": self.mode}
+
+
+@app.post(
+    "/api/persistent/threads/{thread_id}/controls",
+    status_code=202,
+)
+async def submit_thread_control(
+    thread_id: str,
+    body: ThreadControlRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Admit an owner-authorized control for the exact serving owner.
+
+    This endpoint serves both execution lanes and deliberately exposes neither
+    one. It persists a commit-ordered request, but neither the desired scalar
+    nor a journal frame: the current lease owner (or exact reciprocal pinned
+    binding) applies the request and journals the result with its own allocator.
+    """
+    from src.shared.run_queue import LANE_STATELESS
+
+    started = time.perf_counter()
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    thread_owner_id = thread.get("user_id")
+    policy_user_id = str(thread_owner_id or user["id"])
+    control_payload = body.control_payload()
+
+    try:
+        existing = await find_existing_thread_control(
+            postgres_db,
+            thread_id=thread_id,
+            owner_user_id=thread_owner_id,
+            client_request_id=body.client_request_id,
+            verb=body.method,
+            payload=control_payload,
+        )
+    except ControlAdmissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # A new stateless control can create a control-only queue claim just like
+    # human input. Refuse unsupported workspace bindings before that durable
+    # admission can wake an executor. Exact idempotent retries remain observable
+    # even if the thread's lane/tier changed after their commit.
+    if existing is None and thread.get("execution_lane") == LANE_STATELESS:
+        _require_stateless_workspace(thread)
+
+    if body.method == "mode.set" and existing is None:
+        # Same PDP as create/attach/config.update. A stale or direct client
+        # cannot persist a permission mode above the owner's current ceiling.
+        # A retry of an already committed UUID bypasses mutable policy: a lost
+        # 202 must stay observable even if grants changed afterward.
+        try:
+            await _enforce_session_create_grants(
+                {"interactive": {"permission_mode": body.mode}},
+                user_id=policy_user_id,
+                project_ids=(
+                    [str(thread["project_id"])] if thread.get("project_id") else []
+                ),
+            )
+        except HTTPException:
+            # Close the concurrent masked-commit race between the preflight
+            # and PDP without weakening authorization for a genuinely new id.
+            try:
+                existing = await find_existing_thread_control(
+                    postgres_db,
+                    thread_id=thread_id,
+                    owner_user_id=thread_owner_id,
+                    client_request_id=body.client_request_id,
+                    verb=body.method,
+                    payload=control_payload,
+                )
+            except ControlAdmissionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if existing is None:
+                raise
+
+    actor_id = str(user.get("id") or user.get("sub") or "rest_client")
+    try:
+        admitted = await admit_thread_control(
+            postgres_db,
+            thread_id=thread_id,
+            owner_user_id=thread_owner_id,
+            client_request_id=body.client_request_id,
+            verb=body.method,
+            payload=control_payload,
+            requested_by=actor_id,
+        )
+    except ControlAdmissionNotReady as exc:
+        # Registration intentionally keeps the exact pinned-owner capability
+        # closed until its writer and first inbox drain are ready.  A control
+        # clicked during that window is not a semantic conflict: 425 tells the
+        # lane-free client to retry the same UUID after its bounded backoff.
+        raise HTTPException(status_code=425, detail=str(exc)) from exc
+    except ControlAdmissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    await log_security_event(
+        postgres_db,
+        resource_type="thread",
+        event_type="session_control_requested",
+        user=user,
+        resource_id=thread_id,
+        detail=f"verb={body.method} request_seq={admitted.request_seq}",
+        request=request,
+    )
+    logger.info(
+        "session-control admission: thread=%s verb=%s seq=%d duplicate=%s total=%.3fs",
+        thread_id,
+        body.method,
+        admitted.request_seq,
+        admitted.duplicate,
+        time.perf_counter() - started,
+    )
+    return {
+        "accepted": True,
+        "request_id": str(admitted.id),
+        "client_request_id": str(admitted.client_request_id),
+        "request_seq": admitted.request_seq,
+        "method": admitted.verb,
+        "state": admitted.state,
+        "duplicate": admitted.duplicate,
+    }
+
+
 async def _session_tool_grants(thread: dict[str, Any]) -> dict[str, Any] | None:
     """The owner's capability grants, for explaining an ``unavailable``.
 
@@ -29962,6 +32296,636 @@ async def _thread_turn_in_flight(thread: dict) -> bool:
         return False
 
 
+def _stateless_retirement_marker(thread: dict[str, Any]) -> dict[str, Any]:
+    from src.shared.session_retirement import stateless_retirement_authority
+
+    marker = stateless_retirement_authority(thread_metadata_object(thread))
+    if marker is None:
+        raise RuntimeError("stateless retirement marker is absent")
+    return marker
+
+
+async def _reconcile_stateless_thread_retirement(
+    thread_id: str,
+    *,
+    force: bool,
+    permanent: bool,
+) -> dict[str, Any]:
+    """Converge one already-serialized stateless terminal lifecycle.
+
+    Queue closure is the first durable effect. Claimant quiescence, exact
+    remote shell retirement, snapshot/delete, and marker clearance then occur
+    in that order. Every ambiguous boundary leaves the ended thread + closed
+    queue marker intact so End or soft Resume can retry the same token.
+    """
+
+    from services.stateless_session_retirement import (
+        ShellRetirementUnavailable,
+        retire_stateless_session_shell,
+        retire_stateless_workspace_residents,
+        verify_stateless_workspace_residents_retired,
+    )
+    from src.shared.session_retirement import (
+        mark_session_claim_eviction_requested,
+        stateless_retirement_release_authorized,
+    )
+
+    # A transitional/legacy Kubernetes row can lack its immutable Pod UID.
+    # There is no safe absence proof for that shape: Pod creation precedes DB
+    # binding/runtime publication, so even a backing-less 404 can follow a
+    # crash plus force deletion while the partitioned process still runs.
+    workspace_absence_proven = False
+    preflight_thread = await postgres_db.get_thread(thread_id)
+    if preflight_thread is None:
+        return {"state": "missing"}
+    preflight_metadata = thread_metadata_object(preflight_thread)
+    preflight_workspace = preflight_metadata.get("workspace_container") or {}
+    preflight_binding = preflight_metadata.get("_workspace_binding") or {}
+    if isinstance(preflight_workspace, dict) and isinstance(preflight_binding, dict):
+        preflight_backing = str(preflight_binding.get("backing_id") or "")
+        preflight_physical = bool(
+            preflight_workspace.get("provisioner") == "k8s"
+            or preflight_backing.startswith("k8s-")
+        )
+        preflight_runtime = preflight_workspace.get("_runtime_incarnation")
+        settled_present = (
+            "_stateless_workspace_retirement_settled" in preflight_metadata
+        )
+        pending_authority = preflight_metadata.get("_stateless_claim_retirement")
+        pending_retains_runtime = bool(
+            isinstance(pending_authority, dict)
+            and pending_authority.get("runtime_incarnation")
+        )
+        if (
+            preflight_physical
+            and not preflight_runtime
+            and not settled_present
+            and not pending_retains_runtime
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Stateless workspace runtime identity is unavailable; "
+                    "workspace reconciliation must publish an exact UID first"
+                ),
+            )
+        restore_marker_present = "_snapshot_restore_required" in preflight_workspace
+        restore_required = preflight_workspace.get("_snapshot_restore_required", False)
+        if restore_marker_present and type(restore_required) is not bool:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace restore authority is malformed",
+            )
+        creation_pending = "_stateless_runtime_creation" in preflight_workspace
+        restore_pending = (
+            preflight_thread.get("status") != "ended" and restore_required is True
+        )
+        if creation_pending or restore_pending:
+            # Cancellation after the one-shot Pod call may leave a published
+            # UID but no Ready binding/fingerprint. Terminal retirement cannot
+            # infer those fields or mutate the thread to ended first: doing so
+            # would make exact continuation reject the lifecycle forever.
+            # A restore retry has a second edge: exact UID continuation can
+            # publish Ready while deliberately leaving the snapshot debt for a
+            # later extraction pass. Under the already-held distributed
+            # lifecycle lock, drive one exact reconciliation pass and then
+            # require *both* creation and restore authority to be clear before
+            # Begin. If another pass is needed, leave thread and queue lifecycle
+            # untouched and let the caller retry End.
+            await ensure_session_workspace(
+                thread_id,
+                db=postgres_db,
+                provisioner=container_provisioner,
+                suspension=workspace_suspension_service,
+                _workspace_lifecycle_lock_held=True,
+            )
+            preflight_thread = await postgres_db.get_thread(thread_id)
+            if preflight_thread is None:
+                return {"state": "missing"}
+            _, creation_refusal = stateless_session_workspace_check(preflight_thread)
+            preflight_metadata = thread_metadata_object(preflight_thread)
+            preflight_workspace = preflight_metadata.get("workspace_container") or {}
+            preflight_binding = preflight_metadata.get("_workspace_binding") or {}
+            post_restore_present = (
+                isinstance(preflight_workspace, dict)
+                and "_snapshot_restore_required" in preflight_workspace
+            )
+            post_restore_required = (
+                preflight_workspace.get("_snapshot_restore_required", False)
+                if isinstance(preflight_workspace, dict)
+                else None
+            )
+            post_restore_malformed = bool(
+                post_restore_present and type(post_restore_required) is not bool
+            )
+            post_restore_pending = bool(
+                preflight_thread.get("status") != "ended"
+                and post_restore_required is True
+            )
+            if (
+                creation_refusal is not None
+                or not isinstance(preflight_workspace, dict)
+                or preflight_workspace.get("status") != "ready"
+                or "_stateless_runtime_creation" in preflight_workspace
+                or post_restore_malformed
+                or post_restore_pending
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Stateless workspace creation and restore must reach "
+                        "exact Ready authority before retirement"
+                    ),
+                )
+
+    async def _begin_retirement(*, requested_force: bool) -> dict[str, Any]:
+        try:
+            return await postgres_db.begin_stateless_thread_workspace_retirement(
+                thread_id,
+                force=requested_force,
+                permanent=permanent,
+                workspace_absence_proven=workspace_absence_proven,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless retirement authority is malformed or changed",
+            ) from exc
+
+    closure = await _begin_retirement(requested_force=force)
+    state = str(closure.get("state") or "")
+    if state == "missing":
+        return {"state": "missing"}
+    if state == "busy":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "stateless_end_busy", **closure},
+        )
+    if state in {
+        "incompatible",
+        "unsafe_missing_queue",
+        "needs_runtime_preflight",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "stateless_retirement_unsafe", **closure},
+        )
+    if state == "settled":
+        if closure.get("permanent") is not permanent:
+            raise HTTPException(
+                status_code=503,
+                detail="Settled stateless retirement intent is malformed",
+            )
+        if permanent:
+            backing_id = closure.get("backing_id")
+            runtime_incarnation = closure.get("runtime_incarnation")
+            if isinstance(backing_id, str) and backing_id.startswith("k8s-"):
+                # Soft End already proved process zero and removed the exact
+                # Pod. Permanent upgrade only reclaims any retained PVC and
+                # idempotently removes the Service; it never reruns shell or
+                # snapshot effects or mints another queue token.
+                if not runtime_incarnation:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=("Settled workspace runtime authority is unavailable"),
+                    )
+                released = await container_provisioner.release_absent_workspace(
+                    WorkspaceOwner.session(thread_id),
+                    reclaim_volume=True,
+                    expected_runtime_incarnation=str(runtime_incarnation),
+                    strict=True,
+                )
+                if not released:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Settled workspace permanent cleanup is incomplete",
+                    )
+        return {
+            "state": "settled",
+            "thread": await postgres_db.get_thread(thread_id),
+            "closure": closure,
+        }
+    if state != "closed":
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless retirement could not close its queue",
+        )
+    if closure.get("retry") and closure.get("permanent") is not permanent:
+        raise HTTPException(
+            status_code=409,
+            detail="A different stateless retirement intent is still pending",
+        )
+
+    terminal_token = int(closure.get("terminal_token") or 0)
+    deadline = time.monotonic() + float(
+        os.environ.get("STATELESS_TERMINAL_CLAIM_ACK_TIMEOUT_S", "25")
+    )
+    while not closure.get("claimant_quiesced"):
+        raw_losses = closure.get("claim_losses") or []
+        if not isinstance(raw_losses, list) or not raw_losses or terminal_token <= 0:
+            raise HTTPException(
+                status_code=503,
+                detail="Terminal claimant-loss authority is incomplete",
+            )
+        for raw_loss in raw_losses:
+            if not isinstance(raw_loss, dict):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Terminal claimant-loss authority is malformed",
+                )
+            pod_name = str(raw_loss.get("pod") or "")
+            pod_uid = str(raw_loss.get("pod_uid") or "")
+            previous_token = int(raw_loss.get("lease_token") or 0)
+            if not pod_name or not pod_uid or previous_token <= 0:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Terminal claimant identity is incomplete",
+                )
+            authority = await agent_provisioner.agent_pod_authority(
+                pod_name,
+                expected_pod_uid=pod_uid,
+            )
+            if authority == "exact_terminal":
+                await postgres_db.acknowledge_stateless_thread_claimant_absent(
+                    thread_id,
+                    terminal_token=terminal_token,
+                    previous_lease_token=previous_token,
+                    previous_leased_by=pod_name,
+                    previous_pod_uid=pod_uid,
+                )
+            elif authority == "exact_live":
+                if await mark_session_claim_eviction_requested(
+                    postgres_db,
+                    thread_id=thread_id,
+                    previous_lease_token=previous_token,
+                    leased_by=pod_name,
+                    pod_uid=pod_uid,
+                ):
+                    await agent_provisioner.delete_agent_pod_exact(
+                        pod_name,
+                        expected_pod_uid=pod_uid,
+                    )
+        closure = await _begin_retirement(requested_force=True)
+        if closure.get("claimant_quiesced"):
+            break
+        if time.monotonic() >= deadline:
+            raise HTTPException(
+                status_code=503,
+                detail="Terminal claimant quiescence is not yet acknowledged",
+            )
+        await asyncio.sleep(0.25)
+
+    terminal_cloud_mount_cfg: dict[str, Any] | None = None
+    if closure.get("resident_cleanup_required") and not closure.get(
+        "resident_acknowledged"
+    ):
+        current = await postgres_db.get_thread(thread_id)
+        if current is None:
+            return {"state": "missing"}
+        metadata = thread_metadata_object(current)
+        workspace = metadata.get("workspace_container") or {}
+        marker = _stateless_retirement_marker(current)
+        runtime_incarnation = marker.get("runtime_incarnation")
+        if not runtime_incarnation:
+            raise HTTPException(
+                status_code=503,
+                detail="Resident cleanup runtime identity is unavailable",
+            )
+        runtime_authority = await container_provisioner.workspace_pod_authority(
+            WorkspaceOwner.session(thread_id),
+            expected_runtime_incarnation=str(runtime_incarnation),
+        )
+        if runtime_authority == "exact_terminal":
+            # Exact UID plus all containers observed terminated proves both
+            # shell and resident processes stopped. API-object absence alone
+            # is not proof: a partitioned kubelet may keep the old process
+            # running after a force deletion removes the object.
+            acknowledged = await postgres_db.acknowledge_stateless_thread_shell_absent(
+                thread_id,
+                terminal_token=terminal_token,
+                runtime_incarnation=str(runtime_incarnation),
+            )
+            if not acknowledged:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Absent resident retirement proof was not durable",
+                )
+        elif runtime_authority == "exact_live" and workspace.get("status") == "ready":
+            terminal_cloud_mount_cfg = await _build_agent_cloud_mount(
+                current,
+                mount_rows=await postgres_db.list_thread_mounts(thread_id),
+                metadata=metadata,
+            )
+            try:
+                proof = await retire_stateless_workspace_residents(
+                    current,
+                    terminal_token=terminal_token,
+                    cloud_mount_cfg=terminal_cloud_mount_cfg,
+                )
+            except ShellRetirementUnavailable as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace resident retirement is not yet acknowledged",
+                ) from exc
+            acknowledged = (
+                await postgres_db.acknowledge_stateless_thread_resident_retirement(
+                    thread_id,
+                    terminal_token=terminal_token,
+                    workspace_generation=proof.authority.workspace_generation,
+                    endpoint_generation=proof.authority.workspace_generation,
+                    runtime_incarnation=proof.authority.runtime_incarnation,
+                    host_key_fingerprint=proof.authority.host_key_fingerprint,
+                    proof=proof.as_dict(),
+                )
+            )
+            if not acknowledged:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace resident retirement acknowledgement was ambiguous",
+                )
+        else:
+            raise HTTPException(
+                status_code=503,
+                detail="Workspace resident runtime authority changed or is ambiguous",
+            )
+        closure = await _begin_retirement(requested_force=True)
+
+    if closure.get("shell_retirement_required") and not closure.get(
+        "remote_acknowledged"
+    ):
+        current = await postgres_db.get_thread(thread_id)
+        if current is None:
+            return {"state": "missing"}
+        metadata = thread_metadata_object(current)
+        workspace = metadata.get("workspace_container") or {}
+        marker = _stateless_retirement_marker(current)
+        runtime_incarnation = marker.get("runtime_incarnation")
+        if not runtime_incarnation:
+            raise HTTPException(
+                status_code=503,
+                detail="Remote shell runtime identity is unavailable",
+            )
+        runtime_authority = await container_provisioner.workspace_pod_authority(
+            WorkspaceOwner.session(thread_id),
+            expected_runtime_incarnation=str(runtime_incarnation),
+        )
+        if runtime_authority == "exact_live" and workspace.get("status") == "ready":
+            if (
+                closure.get("resident_cleanup_required")
+                and terminal_cloud_mount_cfg is None
+            ):
+                terminal_cloud_mount_cfg = await _build_agent_cloud_mount(
+                    current,
+                    mount_rows=await postgres_db.list_thread_mounts(thread_id),
+                    metadata=metadata,
+                )
+            try:
+                authority = await retire_stateless_session_shell(
+                    current,
+                    terminal_token=terminal_token,
+                )
+                if closure.get("resident_cleanup_required"):
+                    # Shell kill is a second mutation boundary. Re-scan under
+                    # the exact retired-T marker so a pane/background process
+                    # cannot repopulate the snapshot after the pre-kill proof.
+                    await verify_stateless_workspace_residents_retired(
+                        current,
+                        terminal_token=terminal_token,
+                        cloud_mount_cfg=terminal_cloud_mount_cfg,
+                    )
+            except ShellRetirementUnavailable as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Remote shell retirement is not yet acknowledged",
+                ) from exc
+            acknowledged = (
+                await postgres_db.acknowledge_stateless_thread_shell_retirement(
+                    thread_id,
+                    terminal_token=terminal_token,
+                    workspace_generation=authority.workspace_generation,
+                    endpoint_generation=authority.workspace_generation,
+                    runtime_incarnation=authority.runtime_incarnation,
+                    host_key_fingerprint=authority.host_key_fingerprint,
+                )
+            )
+        elif runtime_authority == "exact_terminal":
+            acknowledged = await postgres_db.acknowledge_stateless_thread_shell_absent(
+                thread_id,
+                terminal_token=terminal_token,
+                runtime_incarnation=str(runtime_incarnation),
+            )
+        else:
+            acknowledged = False
+        if not acknowledged:
+            raise HTTPException(
+                status_code=503,
+                detail="Remote shell retirement acknowledgement was ambiguous",
+            )
+
+    # The remote effects above and workspace destruction below are separate
+    # authority boundaries.  Re-lock/re-read the terminal row before *any*
+    # snapshot, Pod, Service, or PVC effect and require exact claimant,
+    # resident, and shell proofs.  The shared parser also rejects malformed
+    # JSON booleans/ACK tuples and post-ACK incarnation drift.
+    closure = await _begin_retirement(requested_force=True)
+    if str(closure.get("state") or "") != "closed":
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless retirement authority changed before workspace release",
+        )
+
+    current = await postgres_db.get_thread(thread_id)
+    if current is None:
+        return {"state": "missing"}
+    metadata = thread_metadata_object(current)
+    try:
+        release_authority = stateless_retirement_release_authorized(metadata)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless retirement proofs are incomplete or malformed",
+        ) from exc
+    if int(release_authority["terminal_token"]) != terminal_token:
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless retirement token changed before workspace release",
+        )
+    workspace = metadata.get("workspace_container") or {}
+    marker = _stateless_retirement_marker(current)
+    binding = metadata.get("_workspace_binding") or {}
+    backing_id = str(binding.get("backing_id") or "")
+    runtime_incarnation = marker.get("runtime_incarnation")
+    runtime_authority = "not_applicable"
+    if workspace.get("provisioner") == "k8s" and runtime_incarnation:
+        runtime_authority = await container_provisioner.workspace_pod_authority(
+            WorkspaceOwner.session(thread_id),
+            expected_runtime_incarnation=str(runtime_incarnation),
+        )
+    physical_workspace = bool(
+        workspace.get("provisioner") == "k8s"
+        or backing_id.startswith("k8s-")
+        or runtime_incarnation
+    )
+    if physical_workspace and not (
+        backing_id.startswith("k8s-pod:") or backing_id.startswith("k8s-pvc:")
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless workspace backing authority is incomplete",
+        )
+    requires_snapshot = bool(not permanent and backing_id.startswith("k8s-pod:"))
+    raw_snapshot_proof = workspace.get("_snapshot_restore_required", False)
+    if type(raw_snapshot_proof) is not bool:
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless snapshot proof is malformed",
+        )
+    snapshot_already_captured = raw_snapshot_proof is True
+    if runtime_authority in {"replacement", "unknown"}:
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless workspace runtime authority changed or is ambiguous",
+        )
+    if runtime_authority == "exact_absent":
+        if requires_snapshot and not snapshot_already_captured:
+            raise HTTPException(
+                status_code=503,
+                detail="Required emptyDir snapshot was not durably captured",
+            )
+        released = await container_provisioner.release_absent_workspace(
+            WorkspaceOwner.session(thread_id),
+            reclaim_volume=permanent,
+            expected_runtime_incarnation=str(runtime_incarnation),
+            strict=True,
+        )
+        if not released:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless absent workspace cleanup remains incomplete",
+            )
+    elif physical_workspace:
+        if not runtime_incarnation:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace runtime identity is unavailable",
+            )
+        if runtime_authority == "exact_terminal":
+            if requires_snapshot and not snapshot_already_captured:
+                # An emptyDir whose runtime is already terminal cannot be
+                # archived now. Do not destroy its object or clear retirement
+                # authority without a previously committed snapshot proof.
+                raise HTTPException(
+                    status_code=503,
+                    detail="Required emptyDir snapshot was not durably captured",
+                )
+            # Exact observed container termination is durable process-zero
+            # proof. Delete that immutable Pod object first; a subsequent
+            # exact-absence pass owns Service/PVC cleanup. If API deletion is
+            # still converging, leave the marker for retry.
+            if not await container_provisioner.delete_workspace(
+                WorkspaceOwner.session(thread_id),
+                expected_runtime_incarnation=str(runtime_incarnation),
+                wait_for_exact_absence=True,
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Terminal workspace Pod deletion remains incomplete",
+                )
+            released = await container_provisioner.release_absent_workspace(
+                WorkspaceOwner.session(thread_id),
+                reclaim_volume=permanent,
+                expected_runtime_incarnation=str(runtime_incarnation),
+                strict=True,
+            )
+            if not released:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Terminal workspace cleanup remains incomplete",
+                )
+        elif runtime_authority != "exact_live":
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace runtime identity is unavailable",
+            )
+        else:
+            expected_runtime = str(runtime_incarnation)
+            expected_fingerprint = (
+                str(marker.get("host_key_fingerprint"))
+                if marker.get("host_key_fingerprint")
+                else None
+            )
+
+            async def _snapshot_ack() -> bool:
+                return (
+                    await postgres_db.mark_stateless_thread_snapshot_restore_required(
+                        thread_id,
+                        terminal_token=terminal_token,
+                    )
+                )
+
+            try:
+                released = await asyncio.wait_for(
+                    container_provisioner.release_workspace(
+                        WorkspaceOwner.session(thread_id),
+                        reclaim_volume=permanent,
+                        require_snapshot=(
+                            requires_snapshot and not snapshot_already_captured
+                        ),
+                        expected_runtime_incarnation=expected_runtime,
+                        expected_host_key_fingerprint=expected_fingerprint,
+                        on_snapshot_captured=(
+                            _snapshot_ack
+                            if requires_snapshot and not snapshot_already_captured
+                            else None
+                        ),
+                        capture_snapshot=(
+                            requires_snapshot and not snapshot_already_captured
+                        ),
+                        strict_terminal_snapshot=True,
+                        strict=True,
+                    ),
+                    timeout=float(
+                        os.environ.get("STATELESS_TERMINAL_RELEASE_TIMEOUT_S", "300")
+                    ),
+                )
+            except asyncio.TimeoutError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless workspace retirement timed out",
+                ) from exc
+            if not released:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless workspace retirement remains incomplete",
+                )
+    elif workspace.get("provisioner") == "k8s":
+        # Missing context is not proof that the deterministic pod name is free.
+        # A never-provisioned sandbox may finish only after Kubernetes confirms
+        # no physical runtime exists; ambiguity keeps the marker retryable.
+        released = await container_provisioner.release_absent_workspace(
+            WorkspaceOwner.session(thread_id),
+            reclaim_volume=permanent,
+            strict=True,
+        )
+        if not released:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace absence could not be established",
+            )
+
+    if (
+        not permanent
+        and not await postgres_db.finish_stateless_thread_workspace_retirement(
+            thread_id
+        )
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless workspace retirement proofs did not settle",
+        )
+    return {"state": "settled", "thread": current, "closure": closure}
+
+
 @app.delete("/api/persistent/threads/{thread_id}")
 async def end_thread(
     thread_id: str,
@@ -29979,104 +32943,223 @@ async def end_thread(
                down an active session mid-turn, destroying its in-memory
                input queue (docs/issues/session_silent_failure_audit.md #11).
     """
-    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    _user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    stateless = thread.get("execution_lane") == "stateless"
+    initial_status = thread.get("status")
+    initial_stateless_authority: dict[str, Any] | None = None
 
-    if not force and await _thread_turn_in_flight(thread):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "turn_in_flight: the agent is mid-turn on this session. "
-                "Retry with ?force=true to end it anyway."
-            ),
-        )
+    async def _stand_down(authoritative_thread: dict[str, Any]) -> None:
+        """Run End-owned side effects only after lifecycle authority is held."""
 
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    ws_ctx = metadata.get("workspace_container") or {}
+        authoritative_metadata = thread_metadata_object(authoritative_thread)
+        officer_meta = (authoritative_metadata.get("config_override") or {}).get(
+            "officer"
+        ) or {}
+        if isinstance(officer_meta, dict) and officer_meta.get("enabled") in (
+            True,
+            "true",
+            "True",
+            1,
+        ):
+            try:
+                await postgres_db.merge_thread_config_override(
+                    thread_id, {"officer": {"enabled": False}}
+                )
+            except Exception:
+                logger.warning(
+                    "Officer stand-down merge failed for thread %s", thread_id
+                )
+        await _conclude_conference_if_any(authoritative_thread)
 
-    # Officer retirement (centurion.md §4): a deliberately ended officer must
-    # not be resurrected by the watchdog — lower the flag before teardown.
-    # Crash-ended officers (agent-side 'ended') keep the flag and are paged
-    # instead of auto-resurrected.
-    officer_meta = (metadata.get("config_override") or {}).get("officer") or {}
-    if isinstance(officer_meta, dict) and officer_meta.get("enabled") in (
-        True,
-        "true",
-        "True",
-        1,
-    ):
-        try:
-            await postgres_db.merge_thread_config_override(
-                thread_id, {"officer": {"enabled": False}}
-            )
-        except Exception:
-            logger.warning("Officer stand-down merge failed for thread %s", thread_id)
+    async def _delete_auxiliary_state(
+        authoritative_thread: dict[str, Any],
+    ) -> None:
+        """Best-effort external records removed only for permanent End."""
 
-    # Conference end (centurion.md §4): release the officer's hold and
-    # enqueue the brief wake before teardown. Never raises; no-op for
-    # ordinary sessions.
-    await _conclude_conference_if_any(thread)
-
-    # Snapshot + tear down workspace container/VM and agent pod. The workspace
-    # VOLUME only dies on ?permanent=true: a soft end leaves the thread in
-    # 'ended', which resume_thread accepts, so reclaiming the PVC here would
-    # hand the user back an empty workspace on resume (the same reasoning that
-    # keeps the Gitea repo and cloud folder alive below).
-    await _release_thread_resources(thread_id, reclaim_volume=permanent)
-
-    # Destructive cleanup of user-visible resources runs ONLY on permanent
-    # delete. A soft "end" keeps the Gitea repo and the cloud session folder
-    # around so resume restores the thread with its data intact — the workspace
-    # container is already snapshotted to S3 above, so the file tree survives
-    # there either way.
-    if permanent:
-        # Log-archive objects die with the thread (retention:
-        # docs/features/job_log_archive.md). Re-read metadata —
-        # _release_thread_resources above just deleted the agent pod, which
-        # stamps fresh log_archive_keys onto the row.
+        authoritative_metadata = thread_metadata_object(authoritative_thread)
+        authoritative_ws = authoritative_metadata.get("workspace_container") or {}
         if snapshot_service.is_available:
             try:
                 fresh = await postgres_db.get_thread(thread_id) or {}
-                fmeta = fresh.get("metadata") or {}
-                if isinstance(fmeta, str):
-                    fmeta = json.loads(fmeta)
-                for key in fmeta.get("log_archive_keys") or []:
+                for key in thread_metadata_object(fresh).get("log_archive_keys") or []:
                     await snapshot_service.delete_blob(str(key))
-            except Exception as e:
+            except Exception as exc:
                 logger.warning(
-                    f"Log archive cleanup failed for deleted thread {thread_id}: {e}"
+                    "Log archive cleanup failed for deleted thread %s: %s",
+                    thread_id,
+                    exc,
                 )
 
-        repo_name = ws_ctx.get("repo_name")
+        repo_name = authoritative_ws.get("repo_name")
         if repo_name and gitea_client.is_initialized:
             await gitea_client.delete_repo(repo_name)
 
-        session_handle_str = thread.get("main_cloud_session_handle") or thread.get(
-            "nc_session_folder"
-        )
+        session_handle_str = authoritative_thread.get(
+            "main_cloud_session_handle"
+        ) or authoritative_thread.get("nc_session_folder")
         if session_handle_str:
-            backend = main_cloud_router.for_thread(thread)
+            backend = main_cloud_router.for_thread(authoritative_thread)
             if backend.is_initialized:
                 try:
                     session_handle = SessionFolderHandle.from_db(
                         session_handle_str, backend=backend.backend_id
                     )
                     await backend.delete_session_folder(session_handle)
-                except Exception as e:
+                except Exception as exc:
                     logger.warning(
-                        f"Failed to delete main-cloud session folder for "
-                        f"thread {thread_id}: {e}"
+                        "Failed to delete main-cloud session folder for thread %s: %s",
+                        thread_id,
+                        exc,
                     )
 
-        await postgres_db.delete_thread(thread_id)
-        return {"status": "deleted"}
+    if not stateless:
+        # Pinned behavior is unchanged: its resident agent remains the in-flight
+        # authority and the legacy resource cleanup retains best-effort semantics.
+        if not force and await _thread_turn_in_flight(thread):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "turn_in_flight: the agent is mid-turn on this session. "
+                    "Retry with ?force=true to end it anyway."
+                ),
+            )
+        await _stand_down(thread)
+        await _release_thread_resources(thread_id, reclaim_volume=permanent)
+        if permanent:
+            await _delete_auxiliary_state(thread)
+            await postgres_db.delete_thread(thread_id)
+            return {"status": "deleted"}
+        await postgres_db.end_thread(thread_id)
+        return {"status": "ended"}
 
-    await postgres_db.end_thread(thread_id)
-    return {"status": "ended"}
+    # Every stateless tier uses the queue lifecycle, including lite sessions.
+    # The validator keeps VM/unknown tiers refused while admitting only the
+    # narrowed sandbox and lite authority shapes.
+    _require_stateless_workspace(thread)
+    initial_stateless_authority = (
+        await postgres_db.get_stateless_thread_lifecycle_authority(thread_id)
+    )
+    if initial_stateless_authority is None:
+        raise HTTPException(status_code=409, detail="Thread lifecycle changed")
+    try:
+        async with postgres_db.stateless_session_workspace_ensure_lock(
+            thread_id, wait=True
+        ) as cleanup_owner:
+            if not cleanup_owner:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless workspace lifecycle lock unavailable",
+                )
+            fresh_thread = await postgres_db.get_thread(thread_id)
+            if fresh_thread is None:
+                return {"status": "deleted"}
+            _require_stateless_workspace(fresh_thread)
+            fresh_authority = (
+                await postgres_db.get_stateless_thread_lifecycle_authority(thread_id)
+            )
+            if fresh_authority != initial_stateless_authority:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Thread lifecycle generation changed while waiting for "
+                        "cleanup ownership"
+                    ),
+                )
+            fresh_metadata = thread_metadata_object(fresh_thread)
+            marker_pending = bool(
+                "_stateless_workspace_retirement_pending" in fresh_metadata
+            )
+            fresh_status = fresh_thread.get("status")
+            if (
+                fresh_status != initial_status
+                and not (permanent and fresh_status == "ended")
+                and not marker_pending
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Thread lifecycle changed while waiting for cleanup ownership"
+                    ),
+                )
+
+            result = await _reconcile_stateless_thread_retirement(
+                thread_id,
+                force=force,
+                permanent=permanent,
+            )
+            if result.get("state") == "missing":
+                return {"status": "deleted"}
+
+            # These side effects are serialized after the fresh-state check;
+            # a stale End can no longer mutate a thread that End->Resume reopened.
+            await _stand_down(fresh_thread)
+            if permanent:
+                closure = result.get("closure") or {}
+                terminal_thread = result.get("thread") or fresh_thread
+                terminal_metadata = thread_metadata_object(terminal_thread)
+                terminal_binding = terminal_metadata.get("_workspace_binding") or {}
+                terminal_workspace = terminal_metadata.get("workspace_container") or {}
+                terminal_backing_id = (
+                    closure.get("backing_id")
+                    if isinstance(closure, dict) and closure.get("backing_id")
+                    else (
+                        terminal_binding.get("backing_id")
+                        if isinstance(terminal_binding, dict)
+                        else None
+                    )
+                )
+                terminal_snapshot_exists = bool(
+                    isinstance(closure, dict)
+                    and (
+                        closure.get("snapshot_restore_required") is True
+                        or (
+                            isinstance(terminal_workspace, dict)
+                            and terminal_workspace.get("_snapshot_restore_required")
+                            is True
+                        )
+                        or (str(terminal_backing_id or "").startswith("k8s-pod:"))
+                    )
+                )
+                if terminal_snapshot_exists and not snapshot_service.is_available:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Terminal workspace snapshot cleanup is unavailable",
+                    )
+                if (
+                    snapshot_service.is_available
+                    and not await snapshot_service.delete_snapshot(
+                        thread_id,
+                        entity_type="threads",
+                    )
+                ):
+                    # The thread/queue tombstone remains retryable. Never
+                    # delete the only ownership row while its terminal S3
+                    # prefix may survive indefinitely.
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Terminal workspace snapshot cleanup is incomplete",
+                    )
+                if declared_thread_workspace_backend(terminal_thread) == "virtual":
+                    from services.thread_uploads import (
+                        purge_attested_stateless_virtual_workspace,
+                    )
+
+                    if not await purge_attested_stateless_virtual_workspace(
+                        terminal_thread
+                    ):
+                        raise HTTPException(
+                            status_code=503,
+                            detail=("Terminal virtual workspace cleanup is incomplete"),
+                        )
+                await _delete_auxiliary_state(fresh_thread)
+                await postgres_db.delete_thread(thread_id)
+                return {"status": "deleted"}
+            return {"status": "ended"}
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Stateless workspace lifecycle lock acquisition timed out",
+        ) from exc
 
 
 # Resume-time session-folder provisioning is fire-and-forget so /resume stays
@@ -30267,6 +33350,20 @@ async def resume_thread(
     docs/done/session_config_drift_resume.md.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    from src.shared.run_queue import LANE_PINNED, LANE_STATELESS
+
+    execution_lane = thread.get("execution_lane")
+    if execution_lane == LANE_STATELESS:
+        # Resume is topology-neutral for a queue-served thread: validate the
+        # workspace/class before mutating, then reset lifecycle state without
+        # binding or provisioning a dedicated agent below.
+        _require_stateless_workspace(thread)
+    elif execution_lane != LANE_PINNED:
+        # Unknown future lanes must never inherit either current control plane.
+        raise HTTPException(
+            status_code=409,
+            detail="Session execution lane does not support resume",
+        )
     if thread.get("status") != "ended":
         raise HTTPException(
             status_code=409, detail=f"Thread is already {thread.get('status')}"
@@ -30334,7 +33431,76 @@ async def resume_thread(
             thread_id, {item.id: item.reason for item in drift}
         )
 
-    await postgres_db.resume_thread(thread_id)
+    if execution_lane == LANE_STATELESS:
+        try:
+            async with postgres_db.stateless_session_workspace_ensure_lock(
+                thread_id, wait=True
+            ) as resume_owner:
+                if not resume_owner:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Stateless workspace lifecycle lock unavailable",
+                    )
+                locked_thread = await postgres_db.get_thread(thread_id)
+                if not locked_thread:
+                    raise HTTPException(status_code=404, detail="Thread not found")
+                _require_stateless_workspace(locked_thread)
+                locked_metadata = thread_metadata_object(locked_thread)
+                if locked_thread.get("status") != "ended":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Thread lifecycle changed before resume",
+                    )
+                if "_stateless_workspace_retirement_pending" in locked_metadata:
+                    try:
+                        marker = _stateless_retirement_marker(locked_thread)
+                    except RuntimeError as exc:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Stateless retirement authority is malformed",
+                        ) from exc
+                    if marker.get("permanent") is True:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="A permanent thread deletion is still in progress",
+                        )
+                # Reconcile every ended stateless row, not only explicit
+                # in-progress markers. Legacy/pre-protocol rows may be ended
+                # while a Ready workspace and shell still exist; reopening one
+                # without a terminal ACK would bypass the lifecycle fence.
+                await _reconcile_stateless_thread_retirement(
+                    thread_id,
+                    force=True,
+                    permanent=False,
+                )
+                locked_thread = await postgres_db.get_thread(thread_id)
+                if not locked_thread:
+                    raise HTTPException(status_code=404, detail="Thread not found")
+                locked_metadata = thread_metadata_object(locked_thread)
+                if "_stateless_workspace_retirement_pending" in locked_metadata:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Stateless workspace retirement remains incomplete",
+                    )
+                if not await postgres_db.resume_thread(thread_id):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Thread could not be resumed while workspace cleanup is active"
+                        ),
+                    )
+                thread = await postgres_db.get_thread(thread_id) or locked_thread
+                metadata = thread_metadata_object(thread)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace lifecycle lock acquisition timed out",
+            ) from exc
+    elif not await postgres_db.resume_thread(thread_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Thread could not be resumed while workspace cleanup is active",
+        )
 
     # Reopening a conference re-establishes the officer's hold (centurion.md
     # §4) — the single-writer rule spans the meeting's whole lifetime, not
@@ -30395,8 +33561,8 @@ async def resume_thread(
         async def _late_cloud_setup(
             tid: str, usr: dict, existing_handle: str | None
         ) -> None:
-            # Pinned: this thread already exists and carries its origin
-            # backend in main_cloud_backend. Dispatch via for_thread so a
+            # This thread already exists and carries its origin backend in
+            # main_cloud_backend. Dispatch via for_thread so a
             # later active-backend swap can't re-provision it on the wrong
             # cloud (Issue 16). Mirrors the delete path above (~:12339).
             backend = main_cloud_router.for_thread(thread)
@@ -30457,8 +33623,10 @@ async def resume_thread(
             # what the agent can resolve.
             _register_late_cloud_setup(thread_id, _setup_task)
 
-    # Re-provision agent pod and restore workspace if suspended
-    if agent_provisioner.is_available:
+    # Only the exact pinned lane receives a registered agent. Queue-served
+    # sessions restore/recreate their workspace below and wait for user input
+    # to create the next run_queue turn.
+    if execution_lane == LANE_PINNED and agent_provisioner.is_available:
         config_name = canonical_config_name(thread.get("config_name", "session_base"))
 
         async def _reprovision(tid: str, cfg: str) -> None:
@@ -30479,6 +33647,13 @@ async def resume_thread(
             # which the cockpit drives in parallel with this endpoint.
             async with postgres_db.thread_advisory_lock(tid):
                 cur = await postgres_db.get_thread(tid)
+                if not _thread_uses_pinned_execution(cur):
+                    logger.warning(
+                        "Thread %s: resume reprovision refused for execution lane %r",
+                        tid,
+                        cur.get("execution_lane") if cur else None,
+                    )
+                    return
                 if cur and cur.get("agent_id"):
                     logger.info(
                         "Thread %s: already bound to agent %s — "
@@ -30544,6 +33719,27 @@ async def resume_thread(
                         )
                         return
 
+                    # The attach attempt crossed await points.  Do not trust
+                    # the snapshot from before it: a lane transition or a
+                    # sibling bind must suppress the dedicated-pod fallback.
+                    cur = await postgres_db.get_thread(tid)
+                    if not _thread_uses_pinned_execution(cur):
+                        logger.warning(
+                            "Thread %s: resume pod fallback refused for "
+                            "execution lane %r",
+                            tid,
+                            cur.get("execution_lane") if cur else None,
+                        )
+                        return
+                    if cur.get("agent_id"):
+                        logger.info(
+                            "Thread %s: attach reservation lost to agent %s; "
+                            "skipping duplicate pod fallback",
+                            tid,
+                            cur["agent_id"],
+                        )
+                        return
+
                 # No idle agent — create a dedicated session pod.
                 pod_name = await agent_provisioner.provision_agent(
                     purpose="session", thread_id=tid, config_name=cfg
@@ -30557,24 +33753,40 @@ async def resume_thread(
                 )
 
         asyncio.create_task(_reprovision(thread_id, config_name))
-    elif persistent_provisioner.is_available:
+    elif execution_lane == LANE_PINNED and persistent_provisioner.is_available:
         config_name = canonical_config_name(thread.get("config_name", "session_base"))
-        asyncio.create_task(
-            persistent_provisioner.create_agent_pod(thread_id, config_name=config_name)
-        )
+
+        async def _reprovision_legacy(tid: str, cfg: str) -> None:
+            cur = await postgres_db.get_thread(tid)
+            if not _thread_uses_pinned_execution(cur):
+                logger.warning(
+                    "Thread %s: legacy resume provisioning refused for "
+                    "execution lane %r",
+                    tid,
+                    cur.get("execution_lane") if cur else None,
+                )
+                return
+            await persistent_provisioner.create_agent_pod(tid, config_name=cfg)
+
+        asyncio.create_task(_reprovision_legacy(thread_id, config_name))
 
     # Ensure the session workspace is provisioned/restored (idempotent): restores
     # a suspended workspace, recreates a failed/missing one. Fire-and-forget so
     # resume stays fast — the agent tolerates a not-yet-ready workspace and the
-    # periodic reconcile retries on failure.
-    asyncio.create_task(
-        ensure_session_workspace(
-            thread_id,
-            db=postgres_db,
-            provisioner=container_provisioner,
-            suspension=workspace_suspension_service,
+    # periodic reconcile retries on failure. Queue-served sessions share the
+    # input/poll single-flight so a rapid resume + input cannot spawn competing
+    # create/adopt operations.
+    if execution_lane == LANE_STATELESS:
+        _schedule_stateless_workspace_ensure(thread_id)
+    else:
+        asyncio.create_task(
+            ensure_session_workspace(
+                thread_id,
+                db=postgres_db,
+                provisioner=container_provisioner,
+                suspension=workspace_suspension_service,
+            )
         )
-    )
 
     return {"status": "created", "thread_id": thread_id}
 
@@ -30601,6 +33813,17 @@ async def rewind_thread_detached(
     authority is live and a DB-only sweep would diverge it → 409.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    from src.shared.run_queue import LANE_STATELESS
+
+    if thread.get("execution_lane") == LANE_STATELESS:
+        # Stateless threads intentionally have agent_id=NULL even while their
+        # session_turn is queued/leased.  This detached DB-only workflow has no
+        # queue/turn fence and can race a live claimant, so fail closed until
+        # rewind is modeled as a durable stateless control request.
+        raise HTTPException(
+            status_code=409,
+            detail="Stateless session rewind requires a connected session",
+        )
     # mark_orphaned_threads_ended and agent_update_thread_status's ended
     # branch both leave a stale agent_id on real ended threads — status must
     # gate the check too, mirroring update_thread_config's established
@@ -30855,6 +34078,53 @@ async def _resolve_thread_for_forwarding(
     if not user.get("is_admin") and str(thread.get("user_id") or "") != str(user["id"]):
         raise HTTPException(status_code=403, detail="Not your thread")
 
+    if thread.get("execution_lane") == "stateless":
+        # Stateless restore/create is owned by the distributed nonce/UID
+        # lifecycle. Never fall through to the legacy name-based suspension
+        # restore below, even if an upstream forwarding route regresses its
+        # lane split.
+        _, refusal = stateless_session_workspace_check(thread)
+        if refusal is not None:
+            raise HTTPException(status_code=409, detail=refusal)
+        await ensure_session_workspace(
+            thread_id,
+            db=postgres_db,
+            provisioner=container_provisioner,
+            suspension=workspace_suspension_service,
+        )
+        thread = await postgres_db.get_thread(thread_id)
+        if not thread:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        if thread.get("execution_lane") != "stateless":
+            raise HTTPException(
+                status_code=409,
+                detail="Thread execution lane changed during workspace reconciliation",
+            )
+        if not user.get("is_admin") and str(thread.get("user_id") or "") != str(
+            user["id"]
+        ):
+            raise HTTPException(status_code=403, detail="Not your thread")
+        _, refusal = stateless_session_workspace_check(thread)
+        if refusal is not None:
+            raise HTTPException(status_code=409, detail=refusal)
+        fresh_metadata = thread.get("metadata") or {}
+        if isinstance(fresh_metadata, str):
+            try:
+                fresh_metadata = json.loads(fresh_metadata)
+            except (json.JSONDecodeError, TypeError):
+                fresh_metadata = {}
+        fresh_workspace = fresh_metadata.get("workspace_container") or {}
+        if (
+            not isinstance(fresh_workspace, dict)
+            or fresh_workspace.get("status") != "ready"
+            or fresh_workspace.get("_snapshot_restore_required") is True
+            or "_stateless_runtime_creation" in fresh_workspace
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace is still reconciling",
+            )
+
     # Restore suspended workspace before forwarding (mirrors persistent_ws_proxy)
     metadata = thread.get("metadata") or {}
     if isinstance(metadata, str):
@@ -30954,6 +34224,24 @@ async def _no_cursor_replay_start(conn, thread_id: str, epoch: int) -> int:
 THREAD_EVENTS_EPOCH_RECHECK_S: float = float(
     os.environ.get("THREAD_EVENTS_EPOCH_RECHECK_S", "2.0")
 )
+THREAD_CLIENT_PRESENCE_RENEW_S: float = max(
+    1.0,
+    float(
+        os.environ.get(
+            "THREAD_CLIENT_PRESENCE_RENEW_S",
+            str(DEFAULT_PRESENCE_RENEW_SECONDS),
+        )
+    ),
+)
+THREAD_CLIENT_PRESENCE_TTL_S: float = max(
+    THREAD_CLIENT_PRESENCE_RENEW_S * 2.0,
+    float(
+        os.environ.get(
+            "THREAD_CLIENT_PRESENCE_TTL_S",
+            str(DEFAULT_PRESENCE_TTL_SECONDS),
+        )
+    ),
+)
 
 
 @app.get("/api/persistent/threads/{thread_id}/stream")
@@ -30969,6 +34257,34 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
     mode (200ms poll, adaptive backoff to 1s after 5 empty polls).
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
+
+    # The existing owner-gated SSE connection is the lane-agnostic client
+    # attachment signal. No lane field crosses the wire. Pinned streams keep
+    # their exact behavior; a stateless stream must establish its durable TTL
+    # before the browser can believe it is attached.
+    track_presence = thread.get("execution_lane") == "stateless"
+    if track_presence:
+        try:
+            presence = await refresh_thread_presence(
+                postgres_db,
+                thread_id=thread_id,
+                ttl_seconds=THREAD_CLIENT_PRESENCE_TTL_S,
+                establish=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "thread_event_stream presence establish failed (thread=%s): %s",
+                thread_id,
+                exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Session presence is temporarily unavailable",
+            ) from exc
+        if not presence.served:
+            # The row changed lane or disappeared after the owner lookup. A
+            # reconnect re-runs authorization and resolves the current lane.
+            raise HTTPException(status_code=409, detail="Session lane changed")
 
     server_epoch = int(thread.get("events_epoch") or 0)
 
@@ -31007,6 +34323,8 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
         # (lines starting with `:`) are ignored by EventSource, so this is
         # side-effect-free on the client.
         yield ": open\n\n"
+
+        next_presence_renew = time.monotonic() + THREAD_CLIENT_PRESENCE_RENEW_S
 
         # Mismatched epoch → force re-sync.
         if cursor_epoch is not None and cursor_epoch != server_epoch:
@@ -31083,6 +34401,29 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
             while not cancelled:
                 if await request.is_disconnected():
                     break
+                if track_presence and time.monotonic() >= next_presence_renew:
+                    # A long-lived stream does not retain authorization from
+                    # its opening handshake forever. Re-run the same BFF-cookie
+                    # owner gate before every attested renewal; expiry or an
+                    # ownership change closes the stream and writes no TTL.
+                    _renew_user, renew_thread = await require_thread_owner(
+                        request, postgres_db, thread_id
+                    )
+                    if renew_thread.get("execution_lane") != "stateless":
+                        return
+                    presence = await refresh_thread_presence(
+                        postgres_db,
+                        thread_id=thread_id,
+                        ttl_seconds=THREAD_CLIENT_PRESENCE_TTL_S,
+                        establish=False,
+                    )
+                    if not presence.served:
+                        # Lane change/deletion: close. EventSource reconnects
+                        # through require_thread_owner and current DB truth.
+                        return
+                    next_presence_renew = (
+                        time.monotonic() + THREAD_CLIENT_PRESENCE_RENEW_S
+                    )
                 async with postgres_db.acquire() as conn:
                     rows = await conn.fetch(
                         "SELECT seq, kind, payload "
@@ -31214,12 +34555,210 @@ class ThreadInputRequest(BaseModel):
     turn_id: Optional[int] = None
 
 
+async def _load_thread_for_owner(thread_id: str, user: dict) -> dict:
+    """Load a thread under the same owner gate ``_resolve_thread_for_forwarding``
+    applies (404 unknown; fail-closed 403 for orphans and non-owners; admin
+    bypass) — WITHOUT its agent-resolution / workspace-restore side effects.
+
+    Used by the stateless-lane branches: queue-lane threads have no bound
+    agent, so the forwarding resolver's 503 would mask the lane entirely.
+    """
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if not user.get("is_admin") and str(thread.get("user_id") or "") != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+    return thread
+
+
+async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
+    """Admit one user turn for a stateless-lane thread (stateless_agents.md
+    §5.3.1): persist the message, advance the input watermark, and queue the
+    unit — all in ONE transaction, so "message durable ⟺ watermark advanced"
+    can never tear and a signal can never be lost.
+
+    The message row is indistinguishable from the agent's accept-time persist
+    of a plain-text human message (``src/api/persistent_app._accept_user_input``
+    → ``src/database/postgres_db.save_thread_message``): same ``msg_`` id mint
+    with the agent's own uuid5 row-id coercion, ``role='human'``,
+    ``turn_number = total_turns + 1``, all other columns at their NULL
+    defaults, and the same ``threads`` last_activity/total_turns bump.
+
+    Admission is ``record_input_seq`` — the input-during-anything path: it
+    creates a fresh ``'queued'`` row, revives ``'done'``, merges the watermark
+    into ``'queued'``, bumps ONLY the watermark on ``'leased'`` (the running
+    turn's completion re-queues via ``input_seq > consumed_seq``), and records
+    input on ``'parked'`` without reviving it (explicit unpark only). No
+    separate ``enqueue_unit`` call is needed: every branch leaves the unit
+    queued, leased-with-watermark, or deliberately parked.
+    """
+    from src.database.postgres_db import _coerce_row_id
+    from src.shared.run_queue import (
+        LANE_STATELESS,
+        UNIT_KIND_SESSION_TURN,
+        queue_depth_for,
+        record_input_seq,
+    )
+
+    # The unlocked preflight provides a fast refusal. The locked copy below is
+    # authoritative against lane/tier/lifecycle changes before message commit.
+    _require_stateless_workspace(thread)
+
+    thread_id = str(thread["id"])
+    # Mirror the agent's accept-time mint exactly; the row id is the same
+    # deterministic uuid5 the agent-side coercion would derive from this raw
+    # id, so a later executor re-persist upserts onto this row (ON CONFLICT
+    # (id)) instead of duplicating the user bubble.
+    raw_msg_id = f"msg_{uuid4().hex[:24]}"
+    row_id = _coerce_row_id(raw_msg_id)
+
+    async with postgres_db.acquire() as conn:
+        async with conn.transaction():
+            locked_thread = await conn.fetchrow(
+                "SELECT id, user_id, execution_lane, agent_id, status, "
+                "       total_turns, metadata "
+                "FROM threads WHERE id = $1 FOR UPDATE",
+                thread_id,
+            )
+            if (
+                locked_thread is None
+                or str(locked_thread["execution_lane"] or "") != LANE_STATELESS
+                or locked_thread["agent_id"] is not None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Thread is no longer eligible for stateless admission",
+                )
+            locked_thread_dict = dict(locked_thread)
+            locked_backend = _require_stateless_workspace(locked_thread_dict)
+            locked_status = str(locked_thread["status"] or "")
+            if locked_status not in {
+                "created",
+                "active",
+                "awaiting_user",
+                "suspended",
+            }:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Thread is not currently accepting stateless input "
+                        f"(status={locked_status or 'unknown'})"
+                    ),
+                )
+            needs_workspace_ensure = locked_backend == "sandbox"
+            if locked_status == "suspended":
+                # Wake and enqueue are one lifecycle transaction. Workspace
+                # restore remains a post-commit side effect, but no claimant
+                # can observe a runnable queue paired with a still-suspended
+                # thread (the claim/credential boundary correctly refuses
+                # suspended rows).
+                woke = await conn.fetchval(
+                    "UPDATE threads SET status = 'created', "
+                    "agent_id = NULL, control_admission_agent_id = NULL, "
+                    "awaiting_user_since = NULL, extend_count = 0 "
+                    "WHERE id = $1::uuid AND execution_lane = 'stateless' "
+                    "AND status = 'suspended' RETURNING id",
+                    thread_id,
+                )
+                if woke is None:
+                    raise RuntimeError(
+                        "stateless suspended-input wake lost thread authority"
+                    )
+            turn_number = int(locked_thread["total_turns"] or 0) + 1
+            fair_key = (
+                str(locked_thread["user_id"])
+                if locked_thread["user_id"] is not None
+                else None
+            )
+            seq = await conn.fetchval(
+                """
+                INSERT INTO thread_messages (id, thread_id, role, content, turn_number)
+                VALUES ($1, $2, 'human', $3, $4)
+                RETURNING seq
+                """,
+                row_id,
+                thread_id,
+                content,
+                turn_number,
+            )
+            # Same activity bump the agent's save_thread_message performs.
+            await conn.execute(
+                """
+                UPDATE threads
+                SET last_activity = CURRENT_TIMESTAMP,
+                    total_turns   = GREATEST(total_turns, COALESCE($2, 0))
+                WHERE id = $1
+                """,
+                thread_id,
+                turn_number,
+            )
+            state = await record_input_seq(
+                conn,
+                unit_id=thread_id,
+                unit_kind=UNIT_KIND_SESSION_TURN,
+                input_seq=int(seq),
+                fair_key=fair_key,
+            )
+
+        if needs_workspace_ensure:
+            # Queue admission commits before this side effect. The claimant may
+            # arrive first, but its internal workspace poll independently
+            # suppresses cached Ready credentials until the exact Pod UID is
+            # live. Always schedule sandbox reconciliation: a DB-Ready row can
+            # be stale even though its lifecycle string looks terminally good.
+            _schedule_stateless_workspace_ensure(thread_id)
+        # Post-commit watermark read (same conn): §5.3.1 response parity —
+        # queue_depth comes from unconsumed watermarks, not a process queue.
+        wm = await queue_depth_for(conn, unit_id=thread_id)
+
+    queue_depth = 1 if (wm is not None and wm.has_pending_input) else 0
+    logger.info(
+        "run_queue enqueue: thread=%s turn=%d input_seq=%d state=%s",
+        thread_id,
+        turn_number,
+        int(seq),
+        state,
+    )
+    return {
+        "accepted": True,
+        "turn_id": turn_number,
+        "queue": {
+            "state": state,
+            "queue_depth": queue_depth,
+            "message_id": raw_msg_id,
+            "input_seq": int(seq),
+        },
+    }
+
+
 @app.post("/api/persistent/threads/{thread_id}/input")
 async def thread_input(
     thread_id: str, body: ThreadInputRequest, request: Request
 ) -> dict[str, Any]:
     """Submit user input to a thread. Per-turn lock returns 409 on dupes."""
+    from src.shared.run_queue import LANE_STATELESS
+
     user = await require_approved_user(request, postgres_db)
+
+    # Stateless-lane admission (stateless_agents.md §5.3.1) resolves BEFORE
+    # agent forwarding — queue-lane threads have no bound agent, so
+    # _resolve_thread_for_forwarding would 503 on them. Owner gate identical
+    # to the resolver's; the pinned path below is untouched (its resolver
+    # re-loads the thread and re-applies the same checks).
+    lane_thread = await _load_thread_for_owner(thread_id, user)
+    if lane_thread.get("execution_lane") == LANE_STATELESS:
+        if not body.content or not isinstance(body.content, str):
+            raise HTTPException(
+                status_code=400, detail="content must be a non-empty string"
+            )
+        # The per-turn in-process lock below is deliberately SKIPPED on this
+        # lane: the run_queue itself serializes turns (input during a leased
+        # turn only advances the watermark; one row per unit dedups the
+        # queue), and the lock dict is per-process state — replica-unsafe
+        # under the 2-replica topology anyway. body.turn_id is ignored: the
+        # queue lane derives the turn number from DB truth (total_turns + 1).
+        return await _thread_input_stateless(lane_thread, body.content)
+
     thread, agent = await _resolve_thread_for_forwarding(thread_id, user)
 
     if not body.content or not isinstance(body.content, str):
@@ -31270,14 +34809,623 @@ async def thread_input(
     }
 
 
-@app.post("/api/persistent/threads/{thread_id}/interrupt")
-async def thread_interrupt(thread_id: str, request: Request) -> dict[str, Any]:
-    """Interrupt the in-flight turn. Mode (hard/graceful) is decided by
-    the agent based on whether a tool is currently mid-`ainvoke`."""
-    user = await require_approved_user(request, postgres_db)
+class ThreadInterruptRequest(BaseModel):
+    """Optional correlated envelope; an empty body is pinned back-compat."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    client_request_id: UUID | None = None
+    target_turn_id: int | None = Field(
+        default=None,
+        ge=1,
+        le=2_147_483_647,
+        strict=True,
+    )
+
+    @model_validator(mode="after")
+    def validate_complete_envelope(self) -> "ThreadInterruptRequest":
+        if (self.client_request_id is None) != (self.target_turn_id is None):
+            raise ValueError(
+                "client_request_id and target_turn_id must be supplied together"
+            )
+        return self
+
+
+@app.post(
+    "/api/persistent/threads/{thread_id}/interrupt",
+    responses={202: {"description": "Stateless interrupt admitted"}},
+)
+async def thread_interrupt(
+    thread_id: str,
+    request: Request,
+    body: ThreadInterruptRequest | None = None,
+) -> Any:
+    """Interrupt one exact in-flight turn without exposing its execution lane.
+
+    Pinned sessions retain their direct agent forward. A correlated client is
+    forwarded intact so the agent can reject a retry aimed at an older turn;
+    the historical empty body remains byte-for-byte ``{}``. Stateless sessions
+    commit an exact-lease request for the serving executor and return admission
+    only — that owner applies the verb and journals the authoritative ack.
+    """
+    from src.shared.run_queue import LANE_STATELESS
+
+    user, lane_thread = await require_thread_owner(request, postgres_db, thread_id)
+    correlated = body is not None and body.client_request_id is not None
+    if correlated and body is not None and body.target_turn_id is not None:
+        try:
+            existing = await find_existing_thread_interrupt(
+                postgres_db,
+                thread_id=thread_id,
+                owner_user_id=lane_thread.get("user_id"),
+                client_request_id=body.client_request_id,
+                target_turn_id=body.target_turn_id,
+            )
+        except InterruptAdmissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if existing is not None:
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "accepted": True,
+                    "request_id": str(existing.id),
+                    "client_request_id": str(existing.client_request_id),
+                    "target_turn_id": existing.target_turn_id,
+                    "state": existing.state,
+                    "duplicate": True,
+                },
+            )
+    if lane_thread.get("execution_lane") == LANE_STATELESS:
+        if not correlated or body is None or body.target_turn_id is None:
+            # Stateless interrupt did not exist for legacy clients. Refuse an
+            # uncorrelated command rather than letting it strike whichever
+            # lease/turn happens to be current.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "client_request_id and target_turn_id are required for "
+                    "stateless interrupt"
+                ),
+            )
+        try:
+            admitted = await admit_thread_interrupt(
+                postgres_db,
+                thread_id=thread_id,
+                owner_user_id=lane_thread.get("user_id"),
+                client_request_id=body.client_request_id,
+                target_turn_id=body.target_turn_id,
+                requested_by=str(user.get("id") or user.get("sub") or "rest_client"),
+            )
+        except InterruptAdmissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        logger.info(
+            "session-interrupt admission: thread=%s turn=%d token=%d duplicate=%s",
+            thread_id,
+            admitted.target_turn_id,
+            admitted.accepted_lease_token,
+            admitted.duplicate,
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "accepted": True,
+                "request_id": str(admitted.id),
+                "client_request_id": str(admitted.client_request_id),
+                "target_turn_id": admitted.target_turn_id,
+                "state": admitted.state,
+                "duplicate": admitted.duplicate,
+            },
+        )
+
     _, agent = await _resolve_thread_for_forwarding(thread_id, user)
-    result = await _forward_to_agent(agent, "/api/interrupt", {})
+    payload: dict[str, Any] = {}
+    if correlated and body is not None and body.target_turn_id is not None:
+        payload = {
+            "client_request_id": str(body.client_request_id),
+            "target_turn_id": body.target_turn_id,
+        }
+    result = await _forward_to_agent(agent, "/api/interrupt", payload)
     return {"accepted": True, "agent": result}
+
+
+@app.get("/internal/units/{unit_id}/claim-bundle")
+async def internal_unit_claim_bundle(
+    unit_id: str,
+    request: Request,
+    lease_token: int,
+    pod_name: str,
+    pod_uid: str,
+) -> dict[str, Any]:
+    """Claim bundle for a leased stateless unit — internal (agent executor).
+
+    The stateless turn executor calls this right after ``claim_unit`` to get
+    everything a turn needs: the queue watermarks (skip-if-answered) and the
+    full session-attach payload (config resolution, credentials in-flight,
+    reauthorized datasources) — assembled by the SAME
+    ``_assemble_session_attach_payload`` the pinned-lane sender uses, under
+    the same fail-closed rules.
+
+    Auth is two-layer (stateless_agents.md §5.6): the ``X-Internal-Key``
+    transport guard every agent→orchestrator call carries, PLUS proof of a
+    LIVE lease — (unit_id, lease_token) must match ``state='leased'`` with
+    the exact current token, checked server-side in one SELECT that also
+    reads the watermarks. Credentials therefore flow only to the executor
+    that currently holds the unit; a zombie with a stale token gets the same
+    generic 403 as a guess (no enumeration oracle).
+
+    Errors: 401 bad internal key; 403 token mismatch / not leased (single
+    generic detail); 404 unit row absent; 409 not a session unit, thread not
+    on the stateless lane, or attach assembly refused (generic reason).
+    """
+    await require_internal(request)
+    from src.shared.run_queue import (
+        LANE_STATELESS,
+        UNIT_KIND_SESSION_TURN,
+        UNIT_KIND_WORKER_BATCH,
+    )
+
+    try:
+        UUID(str(unit_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Unknown unit") from None
+
+    _t_start = time.perf_counter()
+    async with postgres_db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT queue.unit_kind, queue.state, queue.lease_token, "
+            "queue.leased_by, "
+            "queue.input_seq, queue.consumed_seq, thread.status AS thread_status, "
+            "thread.execution_lane AS thread_lane, thread.metadata AS thread_metadata "
+            "FROM run_queue AS queue LEFT JOIN threads AS thread "
+            "ON thread.id = queue.unit_id WHERE queue.unit_id = $1::uuid",
+            unit_id,
+        )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown unit")
+    if row["state"] != "leased" or int(row["lease_token"]) != int(lease_token):
+        # ONE generic detail for both cases — stale token and not-leased are
+        # deliberately indistinguishable to the caller.
+        raise HTTPException(status_code=403, detail="Lease validation failed")
+    if row["unit_kind"] == UNIT_KIND_WORKER_BATCH:
+        job = await postgres_db.get_job(unit_id)
+        if not job or job.get("execution_lane") != LANE_STATELESS:
+            raise HTTPException(
+                status_code=409, detail="Job is not on the stateless lane"
+            )
+
+        # Inheriting scholar/critic/delegation jobs deliberately keep only a
+        # snapshot of their parent's workspace in their own row. Resolve the
+        # parent's live endpoint through the same helper as pinned dispatch so
+        # a recreated shared pod cannot send this claimant to a stale address.
+        inherit_action, _ = await _resolve_subjob_inherited_workspace(job)
+        if inherit_action != "proceed":
+            raise HTTPException(
+                status_code=409,
+                detail="Stateless worker parent workspace is not ready",
+            )
+
+        container_ctx = _get_container_context(job)
+        if not (
+            container_ctx.get("status") == "ready"
+            and container_ctx.get("provisioner") == "k8s"
+            and bool(container_ctx.get("host") or container_ctx.get("pod_ip"))
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Stateless worker workspace is not Kubernetes-ready",
+            )
+
+        # Job context is only a lifecycle hint. Bind this claim to the exact
+        # live Kubernetes objects and SSH host key, using the parent owner for
+        # children that share its workspace. The attested endpoint replaces
+        # any stale copied/persisted host in this in-memory bundle only.
+        workspace_owner = _stateless_worker_workspace_owner(job)
+        initial_attestation = await _attest_stateless_worker_workspace(workspace_owner)
+        attested_job = dict(job)
+        raw_context = job.get("context") or {}
+        if isinstance(raw_context, str):
+            try:
+                raw_context = json.loads(raw_context)
+            except (json.JSONDecodeError, TypeError):
+                raw_context = {}
+        if not isinstance(raw_context, dict):
+            raw_context = {}
+        attested_context = copy.deepcopy(raw_context)
+        exact_container_ctx = copy.deepcopy(container_ctx)
+        exact_container_ctx.update(
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "host": initial_attestation.host,
+                "pod_ip": initial_attestation.pod_ip,
+                "port": initial_attestation.port,
+            }
+        )
+        attested_context["workspace_container"] = exact_container_ctx
+        attested_job["context"] = attested_context
+
+        raw_override = job.get("config_override")
+        if isinstance(raw_override, str):
+            try:
+                raw_override = json.loads(raw_override)
+            except (json.JSONDecodeError, TypeError):
+                raw_override = None
+        attested_job["config_override"] = _inject_container_workspace_config(
+            copy.deepcopy(raw_override) if isinstance(raw_override, dict) else None,
+            exact_container_ctx,
+            replace_endpoint=True,
+        )
+
+        job_start = await _build_job_start_request(
+            attested_job,
+            persist_dispatch_state=False,
+        )
+        if job_start is None:
+            raise HTTPException(status_code=409, detail="Job bundle assembly refused")
+        job_start = job_start.model_copy(
+            update={
+                "workspace_generation": (initial_attestation.workspace_generation),
+                "workspace_runtime_incarnation": (
+                    initial_attestation.runtime_incarnation
+                ),
+                "workspace_ssh_host_key_fingerprint": (
+                    initial_attestation.ssh_host_key_fingerprint
+                ),
+                "workspace_owner_kind": workspace_owner.kind,
+                "workspace_owner_id": workspace_owner.id,
+            }
+        )
+
+        # Credential/config assembly above can take seconds. Repeat the full
+        # control-plane + host-key attestation so a Pod/PVC/Service replacement
+        # during that window never crosses the response boundary under stale
+        # workspace authority.
+        confirmed_attestation = await _attest_stateless_worker_workspace(
+            workspace_owner
+        )
+        if confirmed_attestation != initial_attestation:
+            logger.warning(
+                "Stateless worker workspace authority changed during bundle "
+                "assembly for job %s",
+                unit_id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="Stateless worker workspace authority unavailable",
+            )
+
+        # Recheck the exact lease after both slow operations so a stolen zombie
+        # never receives either credentials or workspace authority.
+        async with postgres_db.acquire() as conn:
+            lease_still_current = bool(
+                await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM run_queue "
+                    "WHERE unit_id = $1::uuid "
+                    "AND unit_kind = 'worker_batch' "
+                    "AND state = 'leased' AND lease_token = $2::bigint)",
+                    unit_id,
+                    lease_token,
+                )
+            )
+        if not lease_still_current:
+            raise HTTPException(status_code=403, detail="Lease validation failed")
+
+        context = job.get("context") or {}
+        if isinstance(context, str):
+            try:
+                context = json.loads(context)
+            except (TypeError, ValueError):
+                context = {}
+        batch_context = context.get("worker_batch") or {}
+        if not isinstance(batch_context, dict):
+            batch_context = {}
+
+        def _positive_float(value: Any, fallback: float) -> float:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return fallback
+            return parsed if parsed > 0 else fallback
+
+        min_wall_seconds = _positive_float(
+            os.environ.get("WORKER_BATCH_MIN_WALL_SECONDS"), 300.0
+        )
+        target_wall_seconds = _positive_float(
+            batch_context.get(
+                "target_wall_seconds",
+                context.get("worker_batch_target_wall_seconds", 300.0),
+            ),
+            300.0,
+        )
+        target_wall_seconds = max(target_wall_seconds, min_wall_seconds)
+        iteration_cap_raw = batch_context.get(
+            "iteration_cap", context.get("worker_batch_iteration_cap")
+        )
+        try:
+            iteration_cap = int(iteration_cap_raw)
+        except (TypeError, ValueError):
+            iteration_cap = None
+        if iteration_cap is not None and iteration_cap <= 0:
+            iteration_cap = None
+
+        return {
+            "unit_id": unit_id,
+            "job_id": unit_id,
+            "unit_kind": UNIT_KIND_WORKER_BATCH,
+            "execution_lane": LANE_STATELESS,
+            "job": job_start.model_dump(exclude_none=True),
+            "batch": {
+                "target_wall_seconds": target_wall_seconds,
+                "iteration_cap": iteration_cap,
+                "min_wall_seconds": min_wall_seconds,
+            },
+        }
+
+    if row["unit_kind"] != UNIT_KIND_SESSION_TURN:
+        raise HTTPException(status_code=409, detail="Unit kind carries no attach")
+    claimant_pod = str(pod_name or "").strip()
+    claimant_uid = str(pod_uid or "").strip()
+    if (
+        not claimant_pod
+        or not claimant_uid
+        or str(row["leased_by"] or "") != claimant_pod
+    ):
+        raise HTTPException(status_code=403, detail="Lease validation failed")
+    initial_metadata = row["thread_metadata"]
+    if isinstance(initial_metadata, str):
+        try:
+            initial_metadata = json.loads(initial_metadata)
+        except (TypeError, ValueError):
+            initial_metadata = None
+    try:
+        initial_stop_markers = stateless_stop_markers(initial_metadata)
+    except RuntimeError:
+        initial_stop_markers = STATELESS_STOP_KEYS
+    if (
+        str(row["thread_lane"] or "") != LANE_STATELESS
+        or str(row["thread_status"] or "") not in {"created", "active", "awaiting_user"}
+        or bool(initial_stop_markers)
+    ):
+        raise HTTPException(status_code=403, detail="Lease validation failed")
+    _t_lease = time.perf_counter()
+
+    # unit_id == thread_id for session_turn units.
+    thread = await postgres_db.get_thread(unit_id)
+    if not thread or thread.get("execution_lane") != LANE_STATELESS:
+        raise HTTPException(
+            status_code=409, detail="Thread is not on the stateless lane"
+        )
+
+    # Defense at the credential/attach boundary for already-queued legacy
+    # rows and direct DB/operator mistakes.  Public input/control admission
+    # performs the same check before writing, but correctness cannot depend on
+    # every producer having done so.
+    _require_stateless_workspace(thread)
+
+    # Derive the assembly inputs exactly the way the resume dispatcher does
+    # (resume_thread._reprovision): the stored override from metadata (secrets
+    # stripped at rest) + in-flight credential re-injection. Secrets travel in
+    # this response only — never persisted to the thread row (§5.6).
+    md = thread.get("metadata") or {}
+    if isinstance(md, str):
+        try:
+            md = json.loads(md)
+        except (json.JSONDecodeError, TypeError):
+            md = {}
+    co = (md.get("config_override") or {}) if isinstance(md, dict) else {}
+    pids = await _thread_project_ids(unit_id)
+    include_kb_profile = await _thread_has_knowledge_scope(
+        project_ids=pids,
+        datasource_ids=(md.get("datasource_ids") if isinstance(md, dict) else None),
+    )
+    co = await _inject_thread_dispatch_credentials(
+        co,
+        user_id=str(thread["user_id"]) if thread.get("user_id") else None,
+        project_id=str(thread["project_id"]) if thread.get("project_id") else None,
+        include_kb_profile=include_kb_profile,
+    )
+    config_name = canonical_config_name(thread.get("config_name") or "session_base")
+    _t_creds = time.perf_counter()
+
+    # Same serialization the pinned sender takes (_send_session_attach): the
+    # assembly must not race a live connector-selection update.
+    async with postgres_db.thread_datasource_lock(unit_id):
+        attach = await _assemble_session_attach_payload(
+            unit_id, config_override=co, config_name=config_name
+        )
+    if attach is None:
+        # Generic by design — refusal reasons live in the server log only.
+        raise HTTPException(status_code=409, detail="Attach assembly refused")
+
+    # Credential/datasource assembly can block on connector locks and external
+    # stores for longer than the queue lease.  Recheck immediately before the
+    # response crosses the credential boundary, exactly like worker bundles:
+    # token N may have been reaped/stolen while the payload was being built.
+    from src.shared.session_retirement import (
+        ClaimantAuthority,
+        active_claim_authority,
+        unresolved_claim_losses,
+    )
+
+    lease_still_current = False
+    async with postgres_db.acquire() as conn:
+        async with conn.transaction():
+            final_thread = await conn.fetchrow(
+                "SELECT status::text AS status, execution_lane, metadata "
+                "FROM threads WHERE id = $1::uuid FOR UPDATE",
+                unit_id,
+            )
+            if final_thread is not None:
+                _final_backend, final_class_or_workspace_refusal = (
+                    stateless_session_workspace_check(final_thread)
+                )
+                final_metadata = final_thread["metadata"]
+                if isinstance(final_metadata, str):
+                    try:
+                        final_metadata = json.loads(final_metadata)
+                    except (TypeError, ValueError):
+                        final_metadata = None
+                try:
+                    losses = unresolved_claim_losses(final_metadata)
+                    active_claim = active_claim_authority(final_metadata)
+                    final_stop_markers = stateless_stop_markers(final_metadata)
+                except RuntimeError:
+                    losses = {0: ClaimantAuthority("invalid", "invalid")}
+                    active_claim = None
+                    final_stop_markers = STATELESS_STOP_KEYS
+                final_queue = await conn.fetchrow(
+                    "SELECT state, lease_token, leased_by FROM run_queue "
+                    "WHERE unit_id = $1::uuid AND unit_kind = 'session_turn' "
+                    "FOR UPDATE",
+                    unit_id,
+                )
+                expected_authority = ClaimantAuthority(claimant_pod, claimant_uid)
+                active_compatible = active_claim is None or (
+                    int(active_claim[0]) < int(lease_token)
+                    or (
+                        int(active_claim[0]) == int(lease_token)
+                        and active_claim[1] == expected_authority
+                    )
+                )
+                lease_still_current = bool(
+                    str(final_thread["execution_lane"] or "") == LANE_STATELESS
+                    and str(final_thread["status"] or "")
+                    in {"created", "active", "awaiting_user"}
+                    and final_class_or_workspace_refusal is None
+                    and isinstance(final_metadata, dict)
+                    and not final_stop_markers
+                    and not losses
+                    and final_metadata.get("protected_cloud") in (None, False)
+                    and active_compatible
+                    and final_queue is not None
+                    and str(final_queue["state"] or "") == "leased"
+                    and int(final_queue["lease_token"] or 0) == int(lease_token)
+                    and str(final_queue["leased_by"] or "") == claimant_pod
+                )
+                if lease_still_current:
+                    stamped = await conn.fetchval(
+                        """
+                        UPDATE threads
+                        SET metadata = jsonb_set(
+                            COALESCE(metadata, '{}'::jsonb),
+                            '{_stateless_active_claim}',
+                            jsonb_build_object(
+                                'lease_token', $2::bigint,
+                                'pod', $3::text,
+                                'pod_uid', $4::text,
+                                'credential_bound_at', to_jsonb(now())
+                            ),
+                            true
+                        )
+                        WHERE id = $1::uuid
+                          AND execution_lane = 'stateless'
+                          AND status IN
+                              ('created', 'active', 'awaiting_user')
+                          AND NOT (COALESCE(metadata, '{}'::jsonb)
+                                   ? '_stateless_workspace_retirement_pending')
+                          AND NOT (COALESCE(metadata, '{}'::jsonb)
+                                   ? '_stateless_claim_retirement')
+                          AND NOT (COALESCE(metadata, '{}'::jsonb)
+                                   ? '_stateless_claim_losses')
+                          AND NOT (COALESCE(metadata, '{}'::jsonb)
+                                   ? '_stateless_claim_loss_hold')
+                          AND COALESCE(metadata->'protected_cloud', 'false'::jsonb)
+                              = 'false'::jsonb
+                        RETURNING id
+                        """,
+                        unit_id,
+                        int(lease_token),
+                        claimant_pod,
+                        claimant_uid,
+                    )
+                    lease_still_current = bool(stamped)
+    if not lease_still_current:
+        raise HTTPException(status_code=403, detail="Lease validation failed")
+    _t_end = time.perf_counter()
+    logger.info(
+        "claim-bundle timing: unit=%s lease=%.3fs creds=%.3fs assemble=%.3fs "
+        "total=%.3fs",
+        unit_id,
+        _t_lease - _t_start,
+        _t_creds - _t_lease,
+        _t_end - _t_creds,
+        _t_end - _t_start,
+    )
+
+    return {
+        "unit_id": unit_id,
+        "thread_id": unit_id,
+        "unit_kind": UNIT_KIND_SESSION_TURN,
+        "execution_lane": LANE_STATELESS,
+        "watermarks": {
+            "input_seq": row["input_seq"],
+            "consumed_seq": row["consumed_seq"],
+        },
+        "attach": attach,
+    }
+
+
+@app.get("/api/admin/run-queue")
+async def admin_run_queue_read_model(request: Request) -> dict[str, Any]:
+    """Operator read model for the stateless run_queue (admin only).
+
+    ``src/shared/run_queue.list_active`` passthrough: current leases (with
+    ``lease_remaining_seconds`` — negative means expired, awaiting the
+    reaper) and parked units (the unpark worklist). Diagnostics only; never
+    an input to correctness decisions.
+    """
+    await _require_admin(request)
+    from src.shared.run_queue import list_active
+
+    async with postgres_db.acquire() as conn:
+        return await list_active(conn)
+
+
+@app.post("/api/admin/run-queue/{unit_id}/unpark")
+async def admin_run_queue_unpark(unit_id: str, request: Request) -> dict[str, Any]:
+    """Operator verb: parked → queued, attempts reset, runnable now (admin
+    only). The ONLY path out of 'parked' — neither enqueue nor input recording
+    revives a parked unit (§5.1). 404 when the unit is not currently parked.
+    """
+    await _require_admin(request)
+    from src.shared.run_queue import unpark_unit
+
+    try:
+        UUID(str(unit_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Unit is not parked") from None
+    async with postgres_db.acquire() as conn:
+        async with conn.transaction():
+            authority = await conn.fetchrow(
+                "SELECT execution_lane, metadata FROM threads "
+                "WHERE id = $1::uuid FOR UPDATE",
+                unit_id,
+            )
+            if (
+                authority is not None
+                and str(authority["execution_lane"] or "") == "stateless"
+            ):
+                metadata = authority["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        metadata = None
+                try:
+                    stopped = bool(stateless_stop_markers(metadata))
+                except RuntimeError:
+                    stopped = True
+                if stopped:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Unit is awaiting claimant quiescence",
+                    )
+            ok = await unpark_unit(conn, unit_id=unit_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Unit is not parked")
+    logger.info("run_queue unpark: unit=%s", unit_id)
+    return {"unit_id": unit_id, "state": "queued"}
 
 
 class ThreadApproveRequest(BaseModel):
@@ -31372,6 +35520,9 @@ async def thread_events_prune_sweeper(
     Runs every THREAD_EVENTS_PRUNE_INTERVAL_S (default 300s). Two queries:
       - DELETE rows for threads in 'ended' status older than 24h.
       - DELETE rows for threads NOT in 'ended' older than 7 days.
+      - Preserve any event that is still the only durable receipt for a
+        pending session-control or exact-turn interrupt request; crash
+        recovery terminalizes it first.
 
     Best-effort. Survives transient DB errors by logging and continuing.
     """
@@ -31387,6 +35538,19 @@ async def thread_events_prune_sweeper(
                     "    SELECT id FROM threads WHERE status = 'ended'"
                     "  ) "
                     "  AND created_at < now() - interval '24 hours' "
+                    "  AND NOT EXISTS ("
+                    "    SELECT 1 FROM thread_control_requests request "
+                    "    WHERE request.id = thread_events.control_request_id "
+                    "      AND request.outcome IS NULL"
+                    "  ) "
+                    "  AND NOT EXISTS ("
+                    "    SELECT 1 FROM thread_interrupt_requests request "
+                    "    WHERE request.id = thread_events.interrupt_request_id "
+                    "      AND (request.outcome IS NULL "
+                    "           OR (request.outcome = 'applied' "
+                    "               AND NOT (COALESCE(request.result, '{}'::jsonb) "
+                    "                        ? 'consumed_input_seq')))"
+                    "  ) "
                     "  RETURNING 1"
                     ") SELECT COUNT(*) FROM deleted"
                 )
@@ -31397,6 +35561,19 @@ async def thread_events_prune_sweeper(
                     "    SELECT id FROM threads WHERE status <> 'ended'"
                     "  ) "
                     "  AND created_at < now() - interval '7 days' "
+                    "  AND NOT EXISTS ("
+                    "    SELECT 1 FROM thread_control_requests request "
+                    "    WHERE request.id = thread_events.control_request_id "
+                    "      AND request.outcome IS NULL"
+                    "  ) "
+                    "  AND NOT EXISTS ("
+                    "    SELECT 1 FROM thread_interrupt_requests request "
+                    "    WHERE request.id = thread_events.interrupt_request_id "
+                    "      AND (request.outcome IS NULL "
+                    "           OR (request.outcome = 'applied' "
+                    "               AND NOT (COALESCE(request.result, '{}'::jsonb) "
+                    "                        ? 'consumed_input_seq')))"
+                    "  ) "
                     "  RETURNING 1"
                     ") SELECT COUNT(*) FROM deleted"
                 )
@@ -31732,13 +35909,16 @@ async def magic_link_post(token: str) -> HTMLResponse:
             status_code=409,
         )
 
-    # Phase 5: if the thread is suspended (attention-sleep watchdog fired
-    # since the email was sent), kick off restore + agent-pod re-creation.
-    # The agent's wake path (_loop_permission_check select-first guard)
-    # will pick up this UPDATE's decision once the new pod is alive — no
-    # second click required.
+    # Phase 5: if attention sleep fired since the email was sent, wake through
+    # the thread's existing execution plane. Pinned sessions retain workspace
+    # restore + agent-pod re-creation. Stateless sessions retain their exact
+    # queued/leased turn and converge the workspace without binding a pod. The
+    # permission-row id is the wake task's freshness fence.
     asyncio.create_task(
-        _phase5_wake_if_suspended(str(permission_row["thread_id"])),
+        _phase5_wake_if_suspended(
+            str(permission_row["thread_id"]),
+            permission_request_id=str(permission_row["id"]),
+        ),
         name=f"phase5-wake-{str(permission_row['thread_id'])[:8]}",
     )
 
@@ -31893,19 +36073,204 @@ async def magic_link_extend(token: str) -> HTMLResponse:
     return HTMLResponse(page)
 
 
-async def _phase5_wake_if_suspended(thread_id: str) -> None:
-    """Restore a suspended thread's workspace + agent pod after a magic-link
-    decision. Fire-and-forget — the HTTP response has already returned.
+async def _phase5_wake_stateless_if_suspended(
+    thread_id: str,
+    *,
+    permission_request_id: str | None,
+) -> None:
+    """Wake one queue-served permission continuation without binding a pod.
 
-    Pattern mirrors resume_persistent_thread (main.py:10640) — restore the
-    workspace from S3, then spawn the agent pod if the persistent
-    provisioner is wired. Idempotent: status checks short-circuit when the
-    workspace is already alive (e.g. a cockpit tab is open and the click
-    came from email anyway).
+    A magic-link task can run well after its originating request was resolved.
+    Revalidate every authority under the global ``threads -> run_queue`` lock
+    order: exact stateless lane/class/tier, no pinned-agent binding, the exact
+    terminal permission row, and a queued/leased session turn whose human input
+    is still unconsumed.  ``done`` is deliberately not revived: no durable
+    permission-continuation watermark exists yet, so a done row would hit the
+    executor's skip-if-answered edge and falsely claim the tool resumed.
+
+    The queue row itself is left untouched.  A live lease keeps ownership; a
+    queued retry keeps its token/fairness/affinity.  Workspace convergence uses
+    the owner-keyed session provisioner, which restores a Kubernetes sandbox,
+    refreshes a virtual binding, and is a no-op for ``none``.  It never creates
+    a persistent agent pod.
+    """
+    from src.shared.run_queue import (
+        LANE_STATELESS,
+        STATE_LEASED,
+        STATE_QUEUED,
+        UNIT_KIND_SESSION_TURN,
+    )
+
+    if permission_request_id is None:
+        logger.warning(
+            "magic-link wake: refusing unfenced stateless wake for thread %s",
+            thread_id,
+        )
+        return
+
+    should_ensure_workspace = False
+    async with postgres_db.acquire() as conn:
+        async with conn.transaction():
+            locked_thread = await conn.fetchrow(
+                "SELECT id, execution_lane, agent_id, status, metadata "
+                "FROM threads WHERE id = $1::uuid FOR UPDATE",
+                thread_id,
+            )
+            if locked_thread is None:
+                return
+            thread = dict(locked_thread)
+            if (
+                thread.get("execution_lane") != LANE_STATELESS
+                or thread.get("agent_id") is not None
+            ):
+                logger.warning(
+                    "magic-link wake: stateless authority moved for thread %s "
+                    "(lane=%r agent_id=%r)",
+                    thread_id,
+                    thread.get("execution_lane"),
+                    thread.get("agent_id"),
+                )
+                return
+            try:
+                _require_stateless_workspace(thread)
+            except HTTPException as exc:
+                logger.warning(
+                    "magic-link wake: refusing stateless workspace/class for "
+                    "thread %s: %s",
+                    thread_id,
+                    exc.detail,
+                )
+                return
+
+            # Keep the repository-wide threads -> run_queue lock order.  The
+            # lock makes the pending-input test atomic with a concurrent claim,
+            # completion, release or reaper steal.
+            queue = await conn.fetchrow(
+                "SELECT state, input_seq, consumed_seq "
+                "FROM run_queue "
+                "WHERE unit_id = $1::uuid AND unit_kind = $2 "
+                "FOR UPDATE",
+                thread_id,
+                UNIT_KIND_SESSION_TURN,
+            )
+            if queue is None:
+                logger.warning(
+                    "magic-link wake: no session queue authority for thread %s",
+                    thread_id,
+                )
+                return
+            queue_state = str(queue["state"] or "")
+            input_seq = queue["input_seq"]
+            consumed_seq = queue["consumed_seq"]
+            has_unconsumed_input = input_seq is not None and (
+                consumed_seq is None or int(input_seq) > int(consumed_seq)
+            )
+            if (
+                queue_state not in {STATE_QUEUED, STATE_LEASED}
+                or not has_unconsumed_input
+            ):
+                logger.warning(
+                    "magic-link wake: refusing stale stateless continuation for "
+                    "thread %s (queue_state=%s input_seq=%r consumed_seq=%r)",
+                    thread_id,
+                    queue_state,
+                    input_seq,
+                    consumed_seq,
+                )
+                return
+
+            decision = await conn.fetchval(
+                "SELECT status FROM thread_permission_requests "
+                "WHERE id = $2::uuid AND thread_id = $1::uuid "
+                "  AND status IN ('approved', 'denied')",
+                thread_id,
+                permission_request_id,
+            )
+            if decision not in {"approved", "denied"}:
+                logger.warning(
+                    "magic-link wake: exact permission fence rejected thread %s "
+                    "request %s",
+                    thread_id,
+                    permission_request_id,
+                )
+                return
+
+            thread_status = str(thread.get("status") or "")
+            if thread_status not in {"active", "awaiting_user", "suspended"}:
+                logger.warning(
+                    "magic-link wake: thread %s is not resumable (status=%r)",
+                    thread_id,
+                    thread_status,
+                )
+                return
+
+            if thread_status in {"awaiting_user", "suspended"}:
+                updated = await conn.fetchval(
+                    "UPDATE threads "
+                    "SET status = 'active', "
+                    "    awaiting_user_since = NULL, "
+                    "    extend_count = 0, "
+                    "    control_admission_agent_id = NULL "
+                    "WHERE id = $1::uuid "
+                    "  AND execution_lane = $2 "
+                    "  AND agent_id IS NULL "
+                    "  AND status IN ('suspended', 'awaiting_user') "
+                    "RETURNING id",
+                    thread_id,
+                    LANE_STATELESS,
+                )
+                if updated is None:
+                    return
+            should_ensure_workspace = True
+
+    if not should_ensure_workspace:
+        return
+    # Queue/lifecycle admission commits before this potentially slow side
+    # effect.  A claimant may arrive first, but its attach path polls the same
+    # durable workspace lifecycle until it is ready.
+    await ensure_session_workspace(
+        thread_id,
+        db=postgres_db,
+        provisioner=container_provisioner,
+        suspension=workspace_suspension_service,
+    )
+    logger.info(
+        "magic-link wake: stateless permission continuation admitted for "
+        "thread %s request %s",
+        thread_id,
+        permission_request_id,
+    )
+
+
+async def _phase5_wake_if_suspended(
+    thread_id: str,
+    *,
+    permission_request_id: str | None = None,
+) -> None:
+    """Wake a suspended thread after a magic-link decision.
+
+    Fire-and-forget — the HTTP response has already returned. Stateless
+    sessions delegate to the queue-fenced, topology-neutral helper above.
+    Pinned sessions preserve the historical resume pattern: restore from S3,
+    then spawn the agent pod if the persistent provisioner is wired.
     """
     try:
         thread = await postgres_db.get_thread(thread_id)
         if not thread:
+            return
+        if thread.get("execution_lane") == "stateless":
+            await _phase5_wake_stateless_if_suspended(
+                thread_id,
+                permission_request_id=permission_request_id,
+            )
+            return
+        if not _thread_uses_pinned_execution(thread):
+            logger.warning(
+                "magic-link wake: refusing pinned wake for thread %s on "
+                "execution lane %r",
+                thread_id,
+                thread.get("execution_lane"),
+            )
             return
         metadata = thread.get("metadata") or {}
         if isinstance(metadata, str):
@@ -31936,7 +36301,8 @@ async def _phase5_wake_if_suspended(thread_id: str) -> None:
                     "UPDATE threads "
                     "SET status = 'active', "
                     "    awaiting_user_since = NULL, "
-                    "    extend_count = 0 "
+                    "    extend_count = 0, "
+                    "    control_admission_agent_id = NULL "
                     "WHERE id = $1 AND status IN ('suspended', 'awaiting_user')",
                     thread_id,
                 )
@@ -32132,7 +36498,7 @@ async def _officer_watchdog_check_one(officer_row: dict, session_wake_svc) -> No
         sleep_max = 60
 
     thread = await postgres_db.get_thread(thread_id)
-    if thread is None or thread.get("status") == "ended":
+    if not _thread_uses_pinned_execution(thread) or thread.get("status") == "ended":
         return
     agent = await session_wake_svc._resolve_live_agent(postgres_db, thread)
     timer = await postgres_db.get_pending_officer_timer(thread_id)
@@ -32236,7 +36602,8 @@ async def _officer_watchdog_check_one(officer_row: dict, session_wake_svc) -> No
         await conn.execute(
             "UPDATE threads "
             "SET agent_id = NULL, status = 'active', "
-            "    awaiting_user_since = NULL "
+            "    awaiting_user_since = NULL, "
+            "    control_admission_agent_id = NULL "
             "WHERE id = $1 AND status IN ('active', 'suspended')",
             thread_id,
         )
@@ -32336,6 +36703,23 @@ async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
 
     while not shutdown_event.is_set():
         try:
+            # A disconnect intentionally leaves a short TTL grace so reloads
+            # and multi-tab handoffs never flicker. If a turn reached its
+            # natural pause inside that grace, converge it once the queue is
+            # durably done and the final client TTL has expired. This is
+            # independent of workspace suspension being enabled.
+            try:
+                promoted = await promote_expired_stateless_pauses(postgres_db, limit=50)
+                if promoted:
+                    logger.info(
+                        "presence expiry promoted %d stateless thread(s) "
+                        "to awaiting_user",
+                        len(promoted),
+                    )
+            except Exception as exc:
+                # Presence convergence is additive. It must never suppress the
+                # pre-existing awaiting_user suspension sweep on the same tick.
+                logger.warning("presence expiry promotion failed: %s", exc)
             if workspace_suspension_service.is_enabled:
                 async with postgres_db.acquire() as conn:
                     # Phase 6: per-thread TTL resolution. Priority order is
@@ -32349,6 +36733,7 @@ async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
                         "FROM threads t "
                         "LEFT JOIN users u ON u.id = t.user_id "
                         "WHERE t.status = 'awaiting_user' "
+                        "  AND t.execution_lane <> 'stateless' "
                         "  AND t.awaiting_user_since IS NOT NULL "
                         # Officer sessions never sleep via attention-sleep —
                         # their lifecycle belongs to the officer watchdog
@@ -32389,7 +36774,8 @@ async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
                         async with postgres_db.acquire() as conn:
                             updated = await conn.fetchval(
                                 "UPDATE threads "
-                                "SET status = 'suspended' "
+                                "SET status = 'suspended', "
+                                "    control_admission_agent_id = NULL "
                                 "WHERE id = $1 AND status = 'awaiting_user' "
                                 "RETURNING id",
                                 thread_id,
@@ -32513,41 +36899,106 @@ async def upload_files_to_thread(
     from services.thread_uploads import (
         ThreadUploadError,
         resolve_thread_upload_destination,
+        upload_files_to_attested_stateless_workspace,
         upload_files_to_thread_workspace,
     )
+    from src.shared.run_queue import LANE_STATELESS
 
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
 
-    # Decide the destination before materializing bodies. FastAPI has already
-    # parsed the multipart by now, so this saves the second in-memory copy
-    # rather than the transfer — but it also keeps a tier that can never accept
-    # files from looking like a transient failure.
-    try:
-        destination = resolve_thread_upload_destination(thread)
-    except ThreadUploadError as e:
-        logger.warning(
-            "Thread upload refused for %s: %d %s", thread_id, e.status_code, e.detail
-        )
-        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
-
-    payloads: list[tuple[str, bytes, str]] = []
-    for f in files:
-        contents = await f.read()
-        payloads.append(
-            (
-                f.filename or "unnamed",
-                contents,
-                f.content_type or "application/octet-stream",
+    async def _materialize_payloads() -> list[tuple[str, bytes, str]]:
+        payloads: list[tuple[str, bytes, str]] = []
+        for item in files:
+            payloads.append(
+                (
+                    item.filename or "unnamed",
+                    await item.read(),
+                    item.content_type or "application/octet-stream",
+                )
             )
-        )
+        return payloads
 
     try:
-        results = await upload_files_to_thread_workspace(
-            thread, payloads, destination=destination
-        )
+        if thread.get("execution_lane") != LANE_STATELESS:
+            destination = resolve_thread_upload_destination(thread)
+            results = await upload_files_to_thread_workspace(
+                thread,
+                await _materialize_payloads(),
+                destination=destination,
+            )
+        else:
+            # Serialize the entire body materialization + remote write against
+            # End/Resume. A marker-first upload never opens SFTP; a write-first
+            # End waits until the final exact-runtime proof and byte commit.
+            try:
+                async with postgres_db.stateless_session_workspace_ensure_lock(
+                    thread_id,
+                    wait=True,
+                ) as upload_owner:
+                    if not upload_owner:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Stateless workspace lifecycle lock unavailable",
+                        )
+                    fresh = await postgres_db.get_thread(thread_id)
+                    if fresh is None:
+                        raise HTTPException(status_code=404, detail="Thread not found")
+                    metadata = thread_metadata_object(fresh)
+                    try:
+                        stopped = bool(stateless_stop_markers(fresh.get("metadata")))
+                    except RuntimeError:
+                        stopped = True
+                    if (
+                        fresh.get("execution_lane") != LANE_STATELESS
+                        or fresh.get("status")
+                        not in {"created", "active", "awaiting_user"}
+                        or stopped
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Stateless session is not accepting uploads",
+                        )
+                    backend = _require_stateless_workspace(fresh)
+                    destination = resolve_thread_upload_destination(fresh)
+                    payloads = await _materialize_payloads()
+                    if backend == "virtual":
+                        results = await upload_files_to_thread_workspace(
+                            fresh,
+                            payloads,
+                            destination=destination,
+                        )
+                    else:
+                        workspace = metadata.get("workspace_container") or {}
+                        binding = metadata.get("_workspace_binding") or {}
+                        generation = str(binding.get("generation") or "")
+                        runtime_incarnation = str(
+                            workspace.get("_runtime_incarnation") or ""
+                        )
+                        fingerprint = str(binding.get("ssh_host_key_fingerprint") or "")
+
+                        async def _probe_runtime() -> str:
+                            return await container_provisioner.workspace_pod_authority(
+                                WorkspaceOwner.session(thread_id),
+                                expected_runtime_incarnation=runtime_incarnation,
+                            )
+
+                        results = await upload_files_to_attested_stateless_workspace(
+                            fresh,
+                            payloads,
+                            destination=destination,
+                            expected_workspace_generation=generation,
+                            expected_runtime_incarnation=runtime_incarnation,
+                            expected_host_key_fingerprint=fingerprint,
+                            authority_probe=_probe_runtime,
+                        )
+            except TimeoutError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless workspace lifecycle lock timed out",
+                ) from exc
     except ThreadUploadError as e:
         logger.warning(
             "Thread upload failed for %s: %d %s", thread_id, e.status_code, e.detail
@@ -32601,13 +37052,83 @@ async def delete_thread_upload(
     """
     from services.thread_uploads import (
         ThreadUploadError,
+        delete_file_from_attested_stateless_workspace,
         delete_file_from_thread_workspace,
+        resolve_thread_upload_destination,
     )
+    from src.shared.run_queue import LANE_STATELESS
 
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     try:
-        removed = await delete_file_from_thread_workspace(thread, path)
+        if thread.get("execution_lane") != LANE_STATELESS:
+            removed = await delete_file_from_thread_workspace(thread, path)
+        else:
+            try:
+                async with postgres_db.stateless_session_workspace_ensure_lock(
+                    thread_id,
+                    wait=True,
+                ) as delete_owner:
+                    if not delete_owner:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Stateless workspace lifecycle lock unavailable",
+                        )
+                    fresh = await postgres_db.get_thread(thread_id)
+                    if fresh is None:
+                        raise HTTPException(status_code=404, detail="Thread not found")
+                    metadata = thread_metadata_object(fresh)
+                    try:
+                        stopped = bool(stateless_stop_markers(fresh.get("metadata")))
+                    except RuntimeError:
+                        stopped = True
+                    if (
+                        fresh.get("execution_lane") != LANE_STATELESS
+                        or fresh.get("status")
+                        not in {"created", "active", "awaiting_user"}
+                        or stopped
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Stateless session is not accepting upload deletes",
+                        )
+                    backend = _require_stateless_workspace(fresh)
+                    destination = resolve_thread_upload_destination(fresh)
+                    if backend == "virtual":
+                        removed = await delete_file_from_thread_workspace(
+                            fresh,
+                            path,
+                            destination=destination,
+                        )
+                    else:
+                        workspace = metadata.get("workspace_container") or {}
+                        binding = metadata.get("_workspace_binding") or {}
+                        generation = str(binding.get("generation") or "")
+                        runtime_incarnation = str(
+                            workspace.get("_runtime_incarnation") or ""
+                        )
+                        fingerprint = str(binding.get("ssh_host_key_fingerprint") or "")
+
+                        async def _probe_runtime() -> str:
+                            return await container_provisioner.workspace_pod_authority(
+                                WorkspaceOwner.session(thread_id),
+                                expected_runtime_incarnation=runtime_incarnation,
+                            )
+
+                        removed = await delete_file_from_attested_stateless_workspace(
+                            fresh,
+                            path,
+                            destination=destination,
+                            expected_workspace_generation=generation,
+                            expected_runtime_incarnation=runtime_incarnation,
+                            expected_host_key_fingerprint=fingerprint,
+                            authority_probe=_probe_runtime,
+                        )
+            except TimeoutError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless workspace lifecycle lock timed out",
+                ) from exc
     except ThreadUploadError as e:
         logger.warning(
             "Thread upload delete refused for %s (%r): %d %s",

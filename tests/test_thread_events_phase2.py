@@ -15,10 +15,22 @@ Covers:
 """
 
 import asyncio
+import inspect
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+
+def test_pruner_preserves_receipts_until_owner_request_is_terminal():
+    import orchestrator.main as om
+
+    source = inspect.getsource(om.thread_events_prune_sweeper)
+    assert source.count("request.id = thread_events.control_request_id") == 2
+    assert source.count("request.id = thread_events.interrupt_request_id") == 2
+    assert source.count("request.outcome IS NULL") == 4
+    assert source.count("request.outcome = 'applied'") == 2
+    assert source.count("'consumed_input_seq'") == 2
 
 
 # ---------------------------------------------------------------------------
@@ -41,22 +53,37 @@ class TestEventJournalEpochAllocation:
         return pool
 
     @pytest.mark.asyncio
-    async def test_unconditionally_allocates_a_new_runtime_generation(self):
-        """An empty/pruned prior epoch must never be reused on reattach."""
+    async def test_reuses_live_epoch_and_seeds_seq_on_clean_reattach(self):
+        """New contract (doc §5.3.2): a live epoch with surviving rows is
+        REUSED on reattach — seq seeds at GREATEST(hwm, MAX(seq)) so cached
+        client cursors stay valid and no gone_beyond_horizon cascade fires.
+        The full bump/reuse matrix lives in test_event_journal_epoch.py; this
+        asserts the attach-path default is reuse."""
         import src.api.persistent_app as mod
 
         conn = MagicMock()
-        conn.fetchrow = AsyncMock(return_value={"events_epoch": 8})
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "events_epoch": 8,
+                "events_seq_hwm": 41,
+                "status": "active",
+            }
+        )
+        # Probe order: terminal-frame EXISTS → False, MAX(seq) → 37 (< hwm).
+        conn.fetchval = AsyncMock(side_effect=[False, 37])
+        conn.execute = AsyncMock()
 
-        epoch = await mod._resolve_event_journal_epoch(
-            self._pool(conn), "thread-pruned"
+        epoch, seq_seed = await mod._resolve_event_journal_epoch(
+            self._pool(conn), "thread-live"
         )
 
-        assert epoch == 8
+        assert (epoch, seq_seed) == (8, 41)
+        # hwm already covers max_seq → no correction UPDATE.
+        conn.execute.assert_not_awaited()
         sql, thread_id = conn.fetchrow.await_args.args
-        assert "events_epoch = events_epoch + 1" in " ".join(sql.split())
-        assert "MAX(seq)" not in sql
-        assert thread_id == "thread-pruned"
+        assert "events_seq_hwm" in sql
+        assert "events_epoch + 1" not in sql
+        assert thread_id == "thread-live"
 
     @pytest.mark.asyncio
     async def test_missing_thread_fails_closed(self):
@@ -147,12 +174,14 @@ class TestBroadcastCursor:
         """A DB-backed session routes broadcast persistence through its writer."""
         import src.api.persistent_app as mod
 
-        # Fake session with a no-op acquire that records the call.
+        # Fake session with a no-op acquire that records the fenced flush
+        # (fetchval returning the inserted count — the epoch-guard contract).
         recorded = []
 
         class _FakeConn:
-            async def execute(self, *args, **kwargs):
+            async def fetchval(self, *args, **kwargs):
                 recorded.append(args)
+                return len(json.loads(args[2]))
 
         class _Acquire:
             async def __aenter__(self):
@@ -172,6 +201,7 @@ class TestBroadcastCursor:
         writer = mod._OrderedPersistentEventWriter(
             postgres_conn=fake_conn,
             thread_id="thread-xyz",
+            epoch=0,
             on_terminal_failure=mod._event_persistence_failed,
         )
         writer.start()
@@ -181,13 +211,103 @@ class TestBroadcastCursor:
         await writer.close()
         mod._event_writer = None
 
-        assert recorded, "expected the ordered writer to call execute()"
-        # First arg is the INSERT SQL; subsequent args bind values.
+        assert recorded, "expected the ordered writer to call fetchval()"
+        # Args: (SQL, thread_id, rows_json, writer_epoch).
         sql = recorded[0][0]
         assert "INSERT INTO thread_events" in sql
         assert "ON CONFLICT" not in sql
+        assert "events_epoch = $3" in sql  # fenced on the writer's epoch
         rows = json.loads(recorded[0][2])
         assert [(row["seq"], row["kind"]) for row in rows] == [(1, "token")]
+        assert recorded[0][3] == 0
+
+    @pytest.mark.asyncio
+    async def test_durable_broadcast_waits_for_commit_and_links_request(self):
+        import src.api.persistent_app as mod
+
+        write_started = asyncio.Event()
+        allow_commit = asyncio.Event()
+        recorded = []
+
+        class _FakeConn:
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def fetchval(self, *args):
+                recorded.append(args)
+                if "INSERT INTO thread_events" in args[0]:
+                    write_started.set()
+                    await allow_commit.wait()
+                    return len(json.loads(args[2]))
+                return 1
+
+        class _Acquire:
+            async def __aenter__(self):
+                return _FakeConn()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        pool = MagicMock()
+        pool.acquire = lambda: _Acquire()
+        session = MagicMock()
+        session.postgres_conn = pool
+        request_id = "77777777-7777-4777-8777-777777777777"
+        agent_id = "88888888-8888-4888-8888-888888888888"
+        mod._session = session
+        mod._thread_id = "99999999-9999-4999-8999-999999999999"
+        mod._events_epoch = 3
+        mod._next_seq = 10
+        live = mod._subscribe("durable-control")
+        writer = mod._OrderedPersistentEventWriter(
+            postgres_conn=pool,
+            thread_id=mod._thread_id,
+            epoch=3,
+            on_terminal_failure=lambda _events, _reason: None,
+            pinned_agent_id=agent_id,
+        )
+        writer.start()
+        mod._event_writer = writer
+
+        durable = asyncio.create_task(
+            mod._broadcast_durable(
+                "mode.changed",
+                {
+                    "mode": "autonomous",
+                    "request_id": request_id,
+                    "request_seq": 1,
+                    "method": "mode.set",
+                },
+                control_request_id=request_id,
+                lease_token=None,
+                agent_id=agent_id,
+            )
+        )
+        await asyncio.wait_for(write_started.wait(), timeout=1)
+        assert not durable.done()
+        assert live.empty()
+        allow_commit.set()
+        assert await durable == (3, 11)
+        await asyncio.sleep(0)
+        assert live.get_nowait()["params"]["_seq"] == [3, 11]
+        await writer.close()
+        mod._event_writer = None
+
+        assert "execution_lane = 'pinned'" in recorded[0][0]
+        assert "FROM agents" in recorded[1][0]
+        assert "thread_control_requests" in recorded[2][0]
+        insert = next(
+            call for call in recorded if "INSERT INTO thread_events" in call[0]
+        )
+        rows = json.loads(insert[2])
+        assert rows[0]["control_request_id"] == request_id
+        assert recorded[0][2] == agent_id
 
 
 class TestOrderedPersistentEventWriter:
@@ -217,9 +337,10 @@ class TestOrderedPersistentEventWriter:
         max_active = 0
 
         class _Conn:
-            async def execute(self, _sql, _thread_id, rows_json):
+            async def fetchval(self, _sql, _thread_id, rows_json, _epoch):
                 nonlocal active, max_active
-                seqs = [row["seq"] for row in json.loads(rows_json)]
+                rows = json.loads(rows_json)
+                seqs = [row["seq"] for row in rows]
                 started.append(seqs)
                 active += 1
                 max_active = max(max_active, active)
@@ -228,11 +349,13 @@ class TestOrderedPersistentEventWriter:
                     await release_first.wait()
                 completed.append(seqs)
                 active -= 1
+                return len(rows)
 
         failures = []
         writer = mod._OrderedPersistentEventWriter(
             postgres_conn=self._pool(_Conn()),
             thread_id="thread-ordered",
+            epoch=0,
             on_terminal_failure=lambda events, reason: failures.append(
                 (events, reason)
             ),
@@ -268,12 +391,15 @@ class TestOrderedPersistentEventWriter:
         calls = []
 
         class _Conn:
-            async def execute(self, _sql, _thread_id, rows_json):
-                calls.append(json.loads(rows_json))
+            async def fetchval(self, _sql, _thread_id, rows_json, _epoch):
+                rows = json.loads(rows_json)
+                calls.append(rows)
+                return len(rows)
 
         writer = mod._OrderedPersistentEventWriter(
             postgres_conn=self._pool(_Conn()),
             thread_id="thread-batch",
+            epoch=4,
             on_terminal_failure=lambda _events, _reason: None,
             batch_size=10,
         )
@@ -289,13 +415,87 @@ class TestOrderedPersistentEventWriter:
         assert all(row["epoch"] == 4 for row in calls[0])
 
     @pytest.mark.asyncio
+    async def test_stateless_flush_locks_epoch_thread_then_bound_queue(self):
+        import src.api.persistent_app as mod
+        from src.api.lease_context import LeaseHandle
+
+        thread_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        calls = []
+
+        class _Txn:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, _exc_type, _exc, _tb):
+                return False
+
+        class _Conn:
+            def transaction(self):
+                return _Txn()
+
+            async def fetchval(self, sql, *args):
+                calls.append((sql, args))
+                if "INSERT INTO thread_events" in sql:
+                    return 1
+                return 1
+
+        lease = LeaseHandle()
+        lease.update(thread_id, 17)
+        writer = mod._OrderedPersistentEventWriter(
+            postgres_conn=self._pool(_Conn()),
+            thread_id=thread_id,
+            epoch=4,
+            on_terminal_failure=lambda _events, _reason: None,
+            lease=lease,
+        )
+
+        inserted = await writer._write_batch(
+            [mod._QueuedPersistentEvent(4, 1, "token", {"content": "one"})]
+        )
+
+        assert inserted == 1
+        assert len(calls) == 3
+        assert "FROM threads" in calls[0][0]
+        assert "events_epoch" in calls[0][0]
+        assert "FOR NO KEY UPDATE" in calls[0][0]
+        assert calls[0][1] == (thread_id, 4)
+        assert "FROM run_queue" in calls[1][0]
+        assert "lease_token" in calls[1][0]
+        assert calls[1][1] == (thread_id, 17)
+        assert "INSERT INTO thread_events" in calls[2][0]
+        assert calls[2][1][3:] == (thread_id, 17)
+
+    @pytest.mark.asyncio
+    async def test_stateless_flush_rejects_repointed_unit_before_sql(self):
+        import src.api.persistent_app as mod
+        from src.api.lease_context import LeaseHandle
+
+        lease = LeaseHandle()
+        lease.update("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 18)
+        pool = MagicMock()
+        writer = mod._OrderedPersistentEventWriter(
+            postgres_conn=pool,
+            thread_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            epoch=4,
+            on_terminal_failure=lambda _events, _reason: None,
+            lease=lease,
+        )
+
+        inserted = await writer._write_batch(
+            [mod._QueuedPersistentEvent(4, 1, "token", {"content": "one"})]
+        )
+
+        assert inserted == 0
+        pool.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_canvas_failure_retries_then_sends_unjournaled_reconcile(self):
         import src.api.persistent_app as mod
 
         attempts = 0
 
         class _Conn:
-            async def execute(self, _sql, _thread_id, _rows_json):
+            async def fetchval(self, _sql, _thread_id, _rows_json, _epoch):
                 nonlocal attempts
                 attempts += 1
                 raise RuntimeError("database unavailable")
@@ -306,6 +506,7 @@ class TestOrderedPersistentEventWriter:
             writer = mod._OrderedPersistentEventWriter(
                 postgres_conn=self._pool(_Conn()),
                 thread_id="thread-canvas",
+                epoch=2,
                 on_terminal_failure=mod._event_persistence_failed,
                 state_max_attempts=3,
                 retry_base_s=0,
@@ -334,8 +535,8 @@ class TestOrderedPersistentEventWriter:
         import src.api.persistent_app as mod
 
         class _Conn:
-            async def execute(self, _sql, _thread_id, _rows_json):
-                return None
+            async def fetchval(self, _sql, _thread_id, rows_json, _epoch):
+                return len(json.loads(rows_json))
 
         mod._subscribers.clear()
         with patch.object(mod, "_orchestrator_client", None):
@@ -343,6 +544,7 @@ class TestOrderedPersistentEventWriter:
             writer = mod._OrderedPersistentEventWriter(
                 postgres_conn=self._pool(_Conn()),
                 thread_id="thread-overflow",
+                epoch=1,
                 on_terminal_failure=mod._event_persistence_failed,
                 queue_maxsize=1,
             )
@@ -1005,3 +1207,111 @@ class TestThreadEventStreamEpochRecheck:
         for c in (c1, c2):
             assert "gone_beyond_horizon" not in c
         assert conn.epoch_reads == 0
+
+
+class TestThreadEventStreamPresence:
+    @staticmethod
+    def _owner_row(lane: str) -> tuple[dict, dict]:
+        return ({"id": "user-x"}, {"events_epoch": 3, "execution_lane": lane})
+
+    @pytest.mark.asyncio
+    async def test_stateless_establishes_after_owner_gate(self, monkeypatch):
+        import orchestrator.main as om
+        from src.shared.thread_presence import PresenceRefresh
+
+        auth = AsyncMock(return_value=self._owner_row("stateless"))
+        refresh = AsyncMock(return_value=PresenceRefresh(True, True))
+        monkeypatch.setattr(om, "require_thread_owner", auth)
+        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+
+        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        assert auth.await_count == 1
+        refresh.assert_awaited_once_with(
+            om.postgres_db,
+            thread_id="thread-x",
+            ttl_seconds=om.THREAD_CLIENT_PRESENCE_TTL_S,
+            establish=True,
+        )
+        iterator = response.body_iterator
+        assert await iterator.__anext__() == ": open\n\n"
+        await iterator.aclose()
+        # Closing is TTL grace, not a destructive presence delete.
+        assert refresh.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_periodic_renewal_reauthorizes_before_touch(self, monkeypatch):
+        import orchestrator.main as om
+        from src.shared.thread_presence import PresenceRefresh
+
+        auth = AsyncMock(
+            side_effect=[
+                self._owner_row("stateless"),
+                self._owner_row("stateless"),
+            ]
+        )
+        refresh = AsyncMock(
+            side_effect=[PresenceRefresh(True, True), RuntimeError("renew failed")]
+        )
+        monkeypatch.setattr(om, "require_thread_owner", auth)
+        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(om, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
+        fake_db = MagicMock()
+        fake_db.acquire = lambda: _Acquire(_ScriptedConn(epochs=[], min_seq=0))
+        monkeypatch.setattr(om, "postgres_db", fake_db)
+
+        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        iterator = response.body_iterator
+        assert await iterator.__anext__() == ": open\n\n"
+        with pytest.raises(StopAsyncIteration):
+            await iterator.__anext__()
+
+        assert auth.await_count == 2
+        assert refresh.await_count == 2
+        assert refresh.await_args_list[1].kwargs["establish"] is False
+
+    @pytest.mark.asyncio
+    async def test_renewal_auth_failure_closes_without_refresh(self, monkeypatch):
+        import orchestrator.main as om
+        from fastapi import HTTPException
+        from src.shared.thread_presence import PresenceRefresh
+
+        auth = AsyncMock(
+            side_effect=[
+                self._owner_row("stateless"),
+                HTTPException(status_code=401, detail="session expired"),
+            ]
+        )
+        refresh = AsyncMock(return_value=PresenceRefresh(True, True))
+        monkeypatch.setattr(om, "require_thread_owner", auth)
+        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(om, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
+        fake_db = MagicMock()
+        fake_db.acquire = lambda: _Acquire(_ScriptedConn(epochs=[], min_seq=0))
+        monkeypatch.setattr(om, "postgres_db", fake_db)
+
+        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        iterator = response.body_iterator
+        assert await iterator.__anext__() == ": open\n\n"
+        with pytest.raises(StopAsyncIteration):
+            await iterator.__anext__()
+
+        assert auth.await_count == 2
+        assert refresh.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_pinned_stream_never_touches_presence(self, monkeypatch):
+        import orchestrator.main as om
+
+        monkeypatch.setattr(
+            om,
+            "require_thread_owner",
+            AsyncMock(return_value=self._owner_row("pinned")),
+        )
+        refresh = AsyncMock()
+        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+
+        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        iterator = response.body_iterator
+        assert await iterator.__anext__() == ": open\n\n"
+        await iterator.aclose()
+        refresh.assert_not_called()

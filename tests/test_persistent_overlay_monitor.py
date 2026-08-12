@@ -9,7 +9,9 @@ failures are logged and retried on the next tick).
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -189,3 +191,111 @@ async def test_monitor_noop_when_overlay_manager_none(monkeypatch):
 
     # Must not raise even though overlay_mount_manager is None.
     await _run_loop_briefly(session, monkeypatch=monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_handoff_retires_claim_resource_between_cancelled_heal_steps(
+    monkeypatch,
+):
+    """Cancelling ``to_thread`` does not stop its worker thread.
+
+    Pause a heal after its first remote mutation, detach the physical claim,
+    then let the stale thread continue.  Handoff cleanup must retire the
+    separate claim-resource admission before it returns, so neither the lower
+    restart nor the final overlay remount can mutate the successor.
+    """
+
+    class FencedBackend:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._retired = False
+            self.successful_mutations: list[str] = []
+            self.rejected = threading.Event()
+
+        def exec_claim_resource(self, operation: str) -> None:
+            with self._lock:
+                if self._retired:
+                    self.rejected.set()
+                    raise RuntimeError("old claim-resource owner retired")
+                self.successful_mutations.append(operation)
+
+        def retire_claim_resource_owner(self) -> None:
+            with self._lock:
+                self._retired = True
+
+        def retire_shell_owner(self) -> None:
+            return None
+
+        def retire(self) -> None:
+            return None
+
+    class PausedOverlay:
+        def __init__(self, backend):
+            self.backend = backend
+            self.active = True
+            self.between_steps = threading.Event()
+            self.continue_heal = threading.Event()
+            self.detached = False
+
+        def health_check(self) -> bool:
+            return False
+
+        def heal(self, remount_lower) -> None:
+            self.backend.exec_claim_resource("overlay_unmount")
+            self.between_steps.set()
+            assert self.continue_heal.wait(timeout=5)
+            try:
+                remount_lower()
+            except RuntimeError:
+                return
+            self.backend.exec_claim_resource("overlay_remount")
+
+        def detach_local(self) -> None:
+            self.detached = True
+            self.active = False
+
+    class LocalCloudController:
+        def __init__(self, backend):
+            self.backend = backend
+            self.restart_calls = 0
+            self.detached = False
+
+        def restart_mount(self, _mount_id: str) -> None:
+            self.restart_calls += 1
+            self.backend.exec_claim_resource("rclone_restart")
+
+        async def detach_for_handoff(self) -> None:
+            self.detached = True
+            self.backend.retire_claim_resource_owner()
+
+    backend = FencedBackend()
+    overlay = PausedOverlay(backend)
+    cloud = LocalCloudController(backend)
+    session = _make_session(
+        shell_owner_token=73,
+        workspace_manager=SimpleNamespace(backend=backend),
+        overlay_mount_manager=overlay,
+        cloud_mount_manager=cloud,
+        _protected_mount_id="protected-t",
+    )
+    monkeypatch.setattr(
+        ps_module,
+        "_CLOUD_OVERLAY_MONITOR_INTERVAL_SECONDS",
+        0.001,
+    )
+    session._cloud_overlay_monitor_task = asyncio.create_task(
+        session._cloud_overlay_monitor_loop()
+    )
+    assert await asyncio.to_thread(overlay.between_steps.wait, 2)
+
+    await session.cleanup(
+        preserve_shell=True,
+        preserve_workspace_daemons=True,
+    )
+
+    assert overlay.detached is True
+    assert cloud.detached is True
+    overlay.continue_heal.set()
+    assert await asyncio.to_thread(backend.rejected.wait, 2)
+    assert cloud.restart_calls == 1
+    assert backend.successful_mutations == ["overlay_unmount"]

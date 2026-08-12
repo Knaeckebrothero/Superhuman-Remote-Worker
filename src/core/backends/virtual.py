@@ -110,6 +110,9 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         self._max_read_bytes = max_read_bytes
         self._search_file_bytes = search_file_bytes
         self._connected = False
+        # Scoped metadata index — see begin_read_cache(). None = inactive,
+        # which is the default and the state during all normal tool work.
+        self._index: dict[str, int] | None = None
 
     # =========================================================================
     # Path / prefix math (escape-proof by construction — no real filesystem)
@@ -158,6 +161,59 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         if self._prefix and key.startswith(self._prefix):
             return key[len(self._prefix) :]
         return key
+
+    # =========================================================================
+    # Scoped metadata index
+    # =========================================================================
+    #
+    # Every store op is a process spawn (rclone), so the op COUNT is the cost.
+    # Session attach measured 51 spawns / 7.2s on k3d (2026-08-08), 36 of them
+    # listings — because setup repeatedly asks "does this exist?" about one
+    # small tree: workspace scaffolding, instruction files, skill files, the
+    # legacy-tools sweep. One recursive listing answers all of them.
+    #
+    # The index is deliberately NOT ambient. It is opened around a known
+    # burst of metadata probes and closed straight after, so ordinary tool
+    # work keeps talking to the store directly and no caller ever has to
+    # reason about staleness. Within the scope it stays exact: local
+    # mutations update it in place (we know precisely which keys moved), and
+    # the only writer that could invalidate it is another process touching
+    # the same prefix mid-attach — whose write is picked up by the first
+    # uncached op after the scope closes.
+
+    def begin_read_cache(self) -> None:
+        """Open the scoped metadata index (idempotent). One store op."""
+        if self._index is not None:
+            return
+        index: dict[str, int] = {}
+        for info in self._store.list(self._prefix):
+            index[info.key] = info.size
+        self._index = index
+
+    def end_read_cache(self) -> None:
+        """Close the scope; subsequent probes hit the store again."""
+        self._index = None
+
+    def _indexed_size(self, key: str) -> int | None:
+        return self._index.get(key) if self._index is not None else None
+
+    def _indexed_has_prefix(self, prefix: str) -> bool:
+        return self._index is not None and any(
+            k.startswith(prefix) for k in self._index
+        )
+
+    def _index_put(self, key: str, size: int) -> None:
+        if self._index is not None:
+            self._index[key] = size
+
+    def _index_drop(self, key: str) -> None:
+        if self._index is not None:
+            self._index.pop(key, None)
+
+    def _index_drop_prefix(self, prefix: str) -> None:
+        if self._index is not None:
+            for k in [k for k in self._index if k.startswith(prefix)]:
+                del self._index[k]
 
     # =========================================================================
     # Properties
@@ -220,6 +276,7 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
             raise ValueError(f"Is a directory: {path}")
         data = content.encode("utf-8") if isinstance(content, str) else content
         self._store.put(self._prefix + norm, data)
+        self._index_put(self._prefix + norm, len(data))
 
     def append_file(self, path: str, content: str) -> None:
         # Read-modify-write: not atomic. Safe under single-writer-per-prefix.
@@ -230,6 +287,7 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         addition = content.encode("utf-8") if isinstance(content, str) else content
         existing = self._store.get(key) if self._store.head(key) is not None else b""
         self._store.put(key, existing + addition)
+        self._index_put(key, len(existing) + len(addition))
 
     def exists(self, path: str) -> bool:
         return self.is_file(path) or self.is_dir(path)
@@ -238,14 +296,27 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         norm = self._normalize_rel(path)
         if norm == "":
             return False  # the root is a directory, never a file
-        return self._store.head(self._prefix + norm) is not None
+        key = self._prefix + norm
+        if self._index is not None:
+            return key in self._index
+        return self._store.head(key) is not None
 
     def is_dir(self, path: str) -> bool:
         norm = self._normalize_rel(path)
         if norm == "":
             return True  # the workspace root always exists as a directory
         # A directory exists iff some object lives under "<prefix><norm>/".
-        return bool(self._store.list(self._prefix + norm + "/"))
+        dir_prefix = self._prefix + norm + "/"
+        if self._index is not None:
+            return self._indexed_has_prefix(dir_prefix)
+        return bool(self._store.list(dir_prefix))
+
+    def _list_keys(self, prefix: str) -> list[tuple[str, int]]:
+        """(key, size) pairs under ``prefix`` — from the scoped index when
+        it is open, else one store listing."""
+        if self._index is not None:
+            return [(k, v) for k, v in self._index.items() if k.startswith(prefix)]
+        return [(info.key, info.size) for info in self._store.list(prefix)]
 
     def list_dir(self, path: str = "", pattern: str = "*") -> list[str]:
         norm = self._normalize_rel(path)
@@ -259,8 +330,8 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
 
         files: set[str] = set()
         dirs: set[str] = set()
-        for info in self._store.list(dir_prefix):
-            remainder = info.key[len(dir_prefix) :]
+        for key, _size in self._list_keys(dir_prefix):
+            remainder = key[len(dir_prefix) :]
             if not remainder:
                 continue
             head, slash, _ = remainder.partition("/")
@@ -288,10 +359,25 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         S3a, the seed source).
         """
         out: list[str] = []
-        for info in self._store.list(self._dir_prefix(path)):
-            if posixpath.basename(info.key) == _DIR_MARKER:
+        for key, _size in self._list_keys(self._dir_prefix(path)):
+            if posixpath.basename(key) == _DIR_MARKER:
                 continue  # hide the empty-dir markers
-            out.append(self._strip_prefix(info.key))
+            out.append(self._strip_prefix(key))
+        return sorted(out)
+
+    def list_files_with_sizes(self, path: str = "") -> list[tuple[str, int]]:
+        """``walk()`` that keeps each file's size — still ONE store round trip.
+
+        Consumed by the cloud-sync layer (duck-typed capability probe): every
+        store op here is an rclone subprocess spawn, so a sync pass that
+        walks directories and then stats files one by one pays ~30 spawns
+        per turn; this primitive collapses the local half of that to one.
+        """
+        out: list[tuple[str, int]] = []
+        for key, size in self._list_keys(self._dir_prefix(path)):
+            if posixpath.basename(key) == _DIR_MARKER:
+                continue  # hide the empty-dir markers
+            out.append((self._strip_prefix(key), size))
         return sorted(out)
 
     def search_files(
@@ -340,11 +426,24 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         # Flat store has no real directories: drop a hidden marker so the
         # (possibly empty) directory is visible. Intermediate parents are
         # emergent from this key's prefix, so a single marker suffices.
-        self._store.put(self._prefix + norm + "/" + _DIR_MARKER, b"")
+        marker = self._prefix + norm + "/" + _DIR_MARKER
+        # mkdir is contractually idempotent, and workspace scaffolding calls
+        # it for the same directories on every attach. When the scoped index
+        # is open we can tell for FREE that the directory is already there
+        # and skip the write — the measured cost of those re-writes was 9
+        # store spawns per attach. Without the index, probing first would
+        # cost more than the write, so keep the unconditional put.
+        if self._index is not None and self._indexed_has_prefix(
+            self._prefix + norm + "/"
+        ):
+            return
+        self._store.put(marker, b"")
+        self._index_put(marker, 0)
 
     def delete_file(self, path: str) -> bool:
         if self.is_file(path):
             self._store.delete(self._object_key(path))
+            self._index_drop(self._object_key(path))
             return True
         if self.is_dir(path):
             # Only an empty directory (just its .keep marker) may go via
@@ -352,6 +451,7 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
             if self.list_dir(path):
                 raise ValueError(f"Cannot delete non-empty directory: {path}")
             self._store.delete(self._dir_prefix(path) + _DIR_MARKER)
+            self._index_drop(self._dir_prefix(path) + _DIR_MARKER)
             return True
         return False
 
@@ -364,8 +464,9 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
                 raise ValueError(f"Not a directory: {path}")
             return False
         deleted = False
-        for info in self._store.list(self._dir_prefix(path)):
-            self._store.delete(info.key)
+        for key, _size in self._list_keys(self._dir_prefix(path)):
+            self._store.delete(key)
+            self._index_drop(key)
             deleted = True
         return deleted
 
@@ -373,33 +474,49 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         if not self.exists(src):
             raise FileNotFoundError(f"Source not found: {src}")
         if self.is_file(src):
-            self._store.copy(self._object_key(src), self._object_key(dst))
-            self._store.delete(self._object_key(src))
+            src_key, dst_key = self._object_key(src), self._object_key(dst)
+            self._store.copy(src_key, dst_key)
+            self._store.delete(src_key)
+            size = self._indexed_size(src_key)
+            self._index_drop(src_key)
+            if size is not None:
+                self._index_put(dst_key, size)
             return
         # Directory move: relocate the whole subtree key-by-key.
         src_prefix = self._dir_prefix(src)
         dst_prefix = self._dir_prefix(dst)
-        for info in self._store.list(src_prefix):
-            new_key = dst_prefix + info.key[len(src_prefix) :]
-            self._store.copy(info.key, new_key)
-            self._store.delete(info.key)
+        for key, size in self._list_keys(src_prefix):
+            new_key = dst_prefix + key[len(src_prefix) :]
+            self._store.copy(key, new_key)
+            self._store.delete(key)
+            self._index_drop(key)
+            self._index_put(new_key, size)
 
     def copy(self, src: str, dst: str) -> None:
         if not self.exists(src):
             raise FileNotFoundError(f"Source not found: {src}")
         if self.is_dir(src) and not self.is_file(src):
             raise ValueError(f"Cannot copy directory: {src}. Use move for directories.")
-        self._store.copy(self._object_key(src), self._object_key(dst))
+        src_key, dst_key = self._object_key(src), self._object_key(dst)
+        self._store.copy(src_key, dst_key)
+        size = self._indexed_size(src_key)
+        if size is not None:
+            self._index_put(dst_key, size)
 
     def stat(self, path: str) -> int:
         key = self._object_key(path)
-        size = self._store.head(key)
-        if size is not None:
-            return size
+        if self._index is not None:
+            size = self._index.get(key)
+            if size is not None:
+                return size
+        else:
+            size = self._store.head(key)
+            if size is not None:
+                return size
         total = 0
         found = False
-        for info in self._store.list(self._dir_prefix(path)):
-            total += info.size
+        for _key, size in self._list_keys(self._dir_prefix(path)):
+            total += size
             found = True
         return total if found else 0
 

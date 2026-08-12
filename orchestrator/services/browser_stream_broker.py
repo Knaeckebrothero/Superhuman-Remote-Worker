@@ -7,6 +7,7 @@ import json
 import logging
 import shlex
 import struct
+from uuid import UUID
 
 from security.auth import resolve_ws_user
 from security.csrf import websocket_origin_allowed
@@ -23,6 +24,7 @@ from services.canvas_ssh import (
     resolve_remote_workspace_target,
 )
 from services.ssh_helpers import orchestrator_can_reach
+from services.stateless_workspace_gate import stateless_session_workspace_check
 
 T_HELLO, T_FRAME, T_STATE, T_INPUT, T_CONTROL, T_ERROR = 1, 2, 3, 4, 5, 6
 MAX_STREAM_FRAME = 8 * 1024 * 1024
@@ -79,6 +81,70 @@ def workspace_ready(thread: dict) -> bool:
     return _active_context(thread).get("status") == "ready"
 
 
+_STATELESS_BROWSER_START_STATUSES = frozenset(
+    {"created", "active", "idle", "awaiting_user"}
+)
+
+
+def _stateless_browser_start_allowed(thread: dict) -> bool:
+    """Whether a fresh daemon may be started for a stateless thread.
+
+    Pinned behavior is intentionally unchanged. Stateless End publishes its
+    closed lifecycle marker before workspace teardown; unresolved claimant
+    losses likewise mean an older controller may still have admitted I/O.
+    Neither state may race an auto-spawning ``browser-exec stream_info``.
+    """
+
+    if thread.get("execution_lane") != "stateless":
+        return True
+    _, workspace_refusal = stateless_session_workspace_check(thread)
+    if workspace_refusal is not None:
+        return False
+    if str(thread.get("status") or "") not in _STATELESS_BROWSER_START_STATUSES:
+        return False
+    metadata = _metadata(thread)
+    if "_stateless_workspace_retirement_pending" in metadata:
+        return False
+    if "_stateless_claim_retirement" in metadata:
+        return False
+    if "_stateless_claim_loss_hold" in metadata:
+        return False
+    # The loss ledger is unresolved-only: its writer removes the key when the
+    # last claimant is settled.  Any present value (including a falsey or
+    # malformed one) is therefore authority to hold admission, never evidence
+    # that quiescence completed.
+    if "_stateless_claim_losses" in metadata:
+        return False
+    if "protected_cloud" in metadata and metadata["protected_cloud"] is not False:
+        return False
+    return workspace_ready(thread)
+
+
+def _stateless_workspace_process_tag(thread: dict) -> str | None:
+    """Return the exact runtime tag inherited by a stateless browser daemon.
+
+    ``exec_stream_info`` uses the orchestrator's direct pinned SSH transport,
+    rather than ``RemoteBackend.exec_claim_resource``.  SSH does not forward
+    arbitrary environment variables, so the command itself must inject the
+    same Pod-incarnation tag that the workspace entrypoint and terminal
+    retirement scanner use.  Pinned sessions deliberately retain their
+    original command shape.
+    """
+
+    if thread.get("execution_lane") != "stateless":
+        return None
+    try:
+        thread_id = str(UUID(str(thread.get("id"))))
+        runtime_incarnation = str(
+            UUID(str(_active_context(thread).get("_runtime_incarnation")))
+        )
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise BrowserStreamUnavailable(
+            503, "stateless browser runtime authority is unavailable"
+        ) from exc
+    return f"v1:session:{thread_id}:{runtime_incarnation}"
+
+
 async def exec_stream_info(
     thread: dict,
     *,
@@ -93,6 +159,9 @@ async def exec_stream_info(
         args["initial_baton"] = initial_baton
     encoded_args = json.dumps(args, sort_keys=True, separators=(",", ":"))
     remote = f"browser-exec stream_info --json {shlex.quote(encoded_args)}"
+    process_tag = _stateless_workspace_process_tag(thread)
+    if process_tag is not None:
+        remote = f"env SRW_WORKSPACE_PROCESS_TAG={shlex.quote(process_tag)} {remote}"
     try:
         target = resolve_remote_workspace_target(
             dict(thread),
@@ -161,6 +230,71 @@ async def exec_stream_info(
             502, "browser-exec returned invalid stream identity"
         )
     return info
+
+
+async def _exec_stream_info_with_lifecycle(
+    thread: dict,
+    *,
+    thread_id: str,
+    db,
+    generation_resolver: GenerationResolver,
+) -> dict:
+    """Cold-start with stateless End serialization; pinned stays byte-for-byte.
+
+    The lifecycle advisory lock closes the check-to-spawn race with public End.
+    A second read under the same lock catches an End/claim-loss marker published
+    while the SSH command was in flight. Existing relays do not hold this lock:
+    terminal retirement stops the daemon itself, which closes their channels.
+    """
+
+    if thread.get("execution_lane") != "stateless":
+        return await exec_stream_info(
+            thread,
+            generation_resolver=generation_resolver,
+        )
+
+    lifecycle_lock = getattr(db, "stateless_session_workspace_ensure_lock", None)
+    if not callable(lifecycle_lock):
+        raise BrowserStreamUnavailable(
+            503, "stateless browser lifecycle authority is unavailable"
+        )
+    try:
+        async with lifecycle_lock(thread_id, wait=True) as cleanup_owner:
+            if not cleanup_owner:
+                raise BrowserStreamUnavailable(
+                    503, "stateless browser lifecycle authority is unavailable"
+                )
+            current = await db.get_thread(thread_id)
+            if (
+                not current
+                or current.get("execution_lane") != "stateless"
+                or str(current.get("user_id") or "") != str(thread.get("user_id") or "")
+                or not _stateless_browser_start_allowed(current)
+            ):
+                raise BrowserStreamUnavailable(
+                    409, "stateless browser lifecycle is closed"
+                )
+            info = await exec_stream_info(
+                current,
+                generation_resolver=generation_resolver,
+            )
+            current = await db.get_thread(thread_id)
+            if (
+                not current
+                or current.get("execution_lane") != "stateless"
+                or str(current.get("user_id") or "") != str(thread.get("user_id") or "")
+                or not _stateless_browser_start_allowed(current)
+            ):
+                raise BrowserStreamUnavailable(
+                    409, "stateless browser lifecycle changed during startup"
+                )
+            return info
+    except BrowserStreamUnavailable:
+        raise
+    except asyncio.TimeoutError as exc:
+        raise BrowserStreamUnavailable(
+            503, "stateless browser lifecycle authority timed out"
+        ) from exc
 
 
 def _resolve_target(thread: dict):
@@ -320,8 +454,10 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
                 current = await db.get_thread(thread_id)
                 return dict(current) if current else {}
 
-            info = await exec_stream_info(
+            info = await _exec_stream_info_with_lifecycle(
                 thread,
+                thread_id=thread_id,
+                db=db,
                 generation_resolver=generation_resolver,
             )
         except BrowserStreamUnavailable:
@@ -353,6 +489,17 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
             current_user.get("id") or ""
         ):
             await _reject_ws(ws, 4403, "Thread access denied")
+            return
+        if thread.get("execution_lane") == "stateless" and (
+            current_thread.get("execution_lane") != "stateless"
+            or not _stateless_browser_start_allowed(current_thread)
+        ):
+            # The lifecycle lock protects cold-start, but it is intentionally
+            # released before authentication and Canvas reads. End, claimant
+            # loss, or a class/tier repair can therefore land in that gap.
+            # Reapply the complete admission predicate at the final fresh-row
+            # linearization point before accepting or opening loopback.
+            await _reject_ws(ws, 4409, "Browser generation ended")
             return
         if not workspace_ready(current_thread):
             await _reject_ws(ws, 4503, "Workspace not ready")

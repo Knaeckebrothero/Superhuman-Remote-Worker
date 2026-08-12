@@ -12,19 +12,144 @@ import json
 import logging
 import os
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
+from uuid import UUID
 
 from services import resolve_ssh_key_path
+from services.container_provisioner import WORKSPACE_RUNTIME_INCARNATION_KEY
 from services.ssh_helpers import (
     EXTRACT_HOME_REMOTE_CMD,
     EXTRACT_REMOTE_CMD,
     stream_extract_snapshot,
 )
 from services.vm_provisioner import vm_persistent_rootdisk_enabled
+from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from services.workspace_lifecycle import WorkspaceOwner
 
 logger = logging.getLogger(__name__)
+
+
+# Durable thread-workspace intent.  A restore can fail after creating a fresh
+# emptyDir/PVC-backed pod; a later reconcile must retry snapshot extraction,
+# not fall through to generic create and publish that empty/partial workspace as
+# Ready.  The marker is set before every thread restore attempt and cleared only
+# after the snapshot/reattach path has completed successfully.
+WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY = "_snapshot_restore_required"
+
+
+@dataclass(frozen=True, slots=True)
+class _StrictSessionRestoreAuthority:
+    """Exact post-create authority retained across a terminal snapshot extract."""
+
+    workspace_generation: str
+    runtime_incarnation: str
+    endpoint_generation: str
+    backing_id: str
+    host_key_fingerprint: str
+    ssh_host: str
+    ssh_port: int
+    workspace_status: str
+
+
+def _thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("thread workspace metadata is malformed") from exc
+    if not isinstance(metadata, dict):
+        raise RuntimeError("thread workspace metadata is malformed")
+    return metadata
+
+
+def _canonical_uuid(value: Any, *, label: str) -> str:
+    try:
+        canonical = str(UUID(str(value)))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"strict restore {label} is unavailable") from exc
+    if value != canonical:
+        raise RuntimeError(f"strict restore {label} is not canonical")
+    return canonical
+
+
+def _strict_session_restore_authority(
+    thread: dict[str, Any],
+) -> _StrictSessionRestoreAuthority:
+    """Parse the exact provisioner-attested tuple used by a strict restore."""
+
+    metadata = _thread_metadata(thread)
+    workspace = metadata.get("workspace_container")
+    binding = metadata.get("_workspace_binding")
+    if not isinstance(workspace, dict) or not isinstance(binding, dict):
+        raise RuntimeError("strict restore workspace authority is malformed")
+    if workspace.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY) is not True:
+        raise RuntimeError("strict restore intent is not armed")
+    workspace_status = workspace.get("status")
+    if not isinstance(workspace_status, str) or workspace_status not in {
+        "ready",
+        "failed",
+        "restoring",
+        "deleted",
+        "suspended",
+        "created",
+        "creating",
+        "pending",
+    }:
+        raise RuntimeError("strict restore endpoint status is not quarantined")
+    if binding.get("kind") != "remote":
+        raise RuntimeError("strict restore backing is not remote")
+
+    workspace_generation = _canonical_uuid(
+        binding.get("generation"), label="workspace generation"
+    )
+    endpoint_generation = _canonical_uuid(
+        workspace.get(CANVAS_WORKSPACE_GENERATION_KEY),
+        label="endpoint generation",
+    )
+    if endpoint_generation != workspace_generation:
+        raise RuntimeError("strict restore endpoint generation changed")
+    runtime_incarnation = _canonical_uuid(
+        workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY),
+        label="runtime incarnation",
+    )
+
+    backing_id = binding.get("backing_id")
+    if not isinstance(backing_id, str) or not backing_id.startswith(
+        ("k8s-pod:", "k8s-pvc:")
+    ):
+        raise RuntimeError("strict restore backing identity is unavailable")
+    fingerprint = binding.get("ssh_host_key_fingerprint")
+    if (
+        not isinstance(fingerprint, str)
+        or not fingerprint.startswith("SHA256:")
+        or len(fingerprint) > 128
+        or any(char.isspace() for char in fingerprint)
+    ):
+        raise RuntimeError("strict restore SSH host-key fingerprint is unavailable")
+    ssh_host = workspace.get("pod_ip")
+    if (
+        not isinstance(ssh_host, str)
+        or not ssh_host
+        or any(ord(char) < 33 or ord(char) == 127 for char in ssh_host)
+    ):
+        raise RuntimeError("strict restore SSH endpoint is unavailable")
+    ssh_port_raw = workspace.get("port")
+    if type(ssh_port_raw) is not int or not 1 <= ssh_port_raw <= 65535:
+        raise RuntimeError("strict restore SSH endpoint port is invalid")
+
+    return _StrictSessionRestoreAuthority(
+        workspace_generation=workspace_generation,
+        runtime_incarnation=runtime_incarnation,
+        endpoint_generation=endpoint_generation,
+        backing_id=backing_id,
+        host_key_fingerprint=fingerprint,
+        ssh_host=ssh_host,
+        ssh_port=ssh_port_raw,
+        workspace_status=workspace_status,
+    )
 
 
 def _reclaim_on_idle_enabled() -> bool:
@@ -534,6 +659,94 @@ class WorkspaceSuspensionService:
                 )
             return False
 
+    async def _commit_strict_thread_restore_ready(
+        self,
+        thread_id: str,
+        expected: _StrictSessionRestoreAuthority,
+    ) -> bool:
+        """CAS one exact restored runtime from quarantined to Ready.
+
+        The Kubernetes UID probe happens immediately before this call. The row
+        lock then re-reads the complete binding/runtime/endpoint tuple, and the
+        guarded UPDATE clears restore intent in the same transaction which
+        publishes Ready. A concurrent replacement or lifecycle transition
+        therefore wins cleanly and this restore remains quarantined.
+        """
+
+        restored_at = datetime.now(timezone.utc).isoformat()
+        async with self._db.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT id::text AS id, status::text AS status, "
+                    "execution_lane, metadata FROM threads "
+                    "WHERE id = $1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if (
+                    row is None
+                    or str(row.get("execution_lane") or "") != "stateless"
+                    or str(row.get("status") or "")
+                    not in {"created", "active", "awaiting_user"}
+                ):
+                    return False
+                try:
+                    current = _strict_session_restore_authority(dict(row))
+                except RuntimeError:
+                    return False
+                if current != expected:
+                    return False
+
+                updated = await conn.fetchval(
+                    f"""
+                    UPDATE threads
+                    SET metadata = jsonb_set(
+                            metadata,
+                            '{{workspace_container}}',
+                            (metadata->'workspace_container') ||
+                                jsonb_build_object(
+                                    'status', 'ready',
+                                    'restored_at', $9::text,
+                                    '{WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY}',
+                                    false
+                                ),
+                            false
+                        ),
+                        last_activity = CURRENT_TIMESTAMP
+                    WHERE id = $1::uuid
+                      AND execution_lane = 'stateless'
+                      AND status IN ('created', 'active', 'awaiting_user')
+                      AND metadata #>
+                            '{{workspace_container,{WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY}}}'
+                            = 'true'::jsonb
+                      AND metadata #>> '{{_workspace_binding,kind}}' = 'remote'
+                      AND metadata #>> '{{_workspace_binding,generation}}' = $2::text
+                      AND metadata #>> '{{workspace_container,{CANVAS_WORKSPACE_GENERATION_KEY}}}'
+                            = $3::text
+                      AND metadata #>> '{{workspace_container,{WORKSPACE_RUNTIME_INCARNATION_KEY}}}'
+                            = $4::text
+                      AND metadata #>> '{{_workspace_binding,backing_id}}' = $5::text
+                      AND metadata #>>
+                            '{{_workspace_binding,ssh_host_key_fingerprint}}'
+                            = $6::text
+                      AND metadata #>> '{{workspace_container,pod_ip}}' = $7::text
+                      AND metadata #> '{{workspace_container,port}}'
+                            = to_jsonb($8::integer)
+                      AND metadata #>> '{{workspace_container,status}}' = $10::text
+                    RETURNING id
+                    """,
+                    thread_id,
+                    expected.workspace_generation,
+                    expected.endpoint_generation,
+                    expected.runtime_incarnation,
+                    expected.backing_id,
+                    expected.host_key_fingerprint,
+                    expected.ssh_host,
+                    expected.ssh_port,
+                    restored_at,
+                    expected.workspace_status,
+                )
+                return updated is not None
+
     async def _extract_snapshot(
         self,
         entity_id: str,
@@ -541,7 +754,10 @@ class WorkspaceSuspensionService:
         ssh_port: int = 22,
         entity_type: str = "jobs",
         *,
-        scoped_home: bool = False,
+        scoped_home: Optional[bool] = None,
+        expected_host_key_fingerprint: Optional[str] = None,
+        remote_cmd: Optional[str] = None,
+        require_pipefail: bool = False,
     ) -> bool:
         """Download snapshot from S3 and extract into the pod via SSH.
 
@@ -572,7 +788,10 @@ class WorkspaceSuspensionService:
             tar_path = tmp.name
 
             ok = await self._snapshot_service.download_snapshot(
-                entity_id, tar_path, entity_type=entity_type
+                entity_id,
+                tar_path,
+                entity_type=entity_type,
+                require_strict_terminal=require_pipefail,
             )
             if not ok:
                 logger.warning(
@@ -589,14 +808,29 @@ class WorkspaceSuspensionService:
                     entity_type.rstrip("s"),
                     entity_id,
                 )
+            extract_kwargs: dict[str, Any] = {
+                "key_path": key_path,
+                "require_pipefail": require_pipefail,
+            }
+            if expected_host_key_fingerprint is not None:
+                extract_kwargs.update(
+                    {
+                        "expected_host_key_fingerprint": (
+                            expected_host_key_fingerprint
+                        ),
+                    }
+                )
+            if remote_cmd is not None:
+                extract_kwargs["remote_cmd"] = remote_cmd
+            elif scoped_home is not None:
+                extract_kwargs["remote_cmd"] = (
+                    EXTRACT_HOME_REMOTE_CMD if scoped_home else EXTRACT_REMOTE_CMD
+                )
             rc, stderr = await stream_extract_snapshot(
                 ssh_host,
                 ssh_port,
                 tar_path,
-                key_path=key_path,
-                remote_cmd=(
-                    EXTRACT_HOME_REMOTE_CMD if scoped_home else EXTRACT_REMOTE_CMD
-                ),
+                **extract_kwargs,
             )
 
             if rc != 0:
@@ -611,11 +845,40 @@ class WorkspaceSuspensionService:
 
             return True
 
-    async def restore(self, owner: WorkspaceOwner) -> bool:
+    async def restore(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        expected_runtime_incarnation: str | None = None,
+        stateless_creation_generation: str | None = None,
+        allow_stateless_create: bool = False,
+    ) -> bool:
         """Owner-keyed restore: job -> restore_workspace, session -> restore_thread_workspace."""
         if owner.kind == "job":
+            if (
+                expected_runtime_incarnation is not None
+                or stateless_creation_generation is not None
+                or allow_stateless_create
+            ):
+                return False
             return await self.restore_workspace(owner.id)
-        return await self.restore_thread_workspace(owner.id)
+        if (
+            expected_runtime_incarnation is None
+            and stateless_creation_generation is None
+            and not allow_stateless_create
+        ):
+            return await self.restore_thread_workspace(owner.id)
+        if stateless_creation_generation is None and not allow_stateless_create:
+            return await self.restore_thread_workspace(
+                owner.id,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+            )
+        return await self.restore_thread_workspace(
+            owner.id,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+            stateless_creation_generation=stateless_creation_generation,
+            allow_stateless_create=allow_stateless_create,
+        )
 
     # =========================================================================
     # Thread suspension (mirrors job suspension for persistent agent threads)
@@ -634,6 +897,18 @@ class WorkspaceSuspensionService:
 
         thread = await self._db.get_thread(thread_id)
         if not thread:
+            return False
+
+        # Stateless session teardown is owned by the acknowledged retirement
+        # protocol.  The legacy idle-suspension path has no claim/incarnation
+        # authority and must never race that protocol by snapshotting or
+        # deleting its physical workspace (including an already-ended thread
+        # whose retirement marker is still pending).
+        if thread.get("execution_lane") == "stateless":
+            logger.info(
+                "Legacy workspace suspension refused for stateless thread %s",
+                thread_id,
+            )
             return False
 
         metadata = thread.get("metadata") or {}
@@ -756,6 +1031,8 @@ class WorkspaceSuspensionService:
                 "status": "suspended",
                 "suspended_at": datetime.now(timezone.utc).isoformat(),
             }
+            if not is_vm:
+                suspended_ctx[WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY] = True
 
             if is_vm and self._vm_provisioner and self._vm_provisioner.is_available:
                 await self._vm_provisioner.delete_thread_vm(
@@ -853,7 +1130,14 @@ class WorkspaceSuspensionService:
                 pass
             return False
 
-    async def restore_thread_workspace(self, thread_id: str) -> bool:
+    async def restore_thread_workspace(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_incarnation: str | None = None,
+        stateless_creation_generation: str | None = None,
+        allow_stateless_create: bool = False,
+    ) -> bool:
         """Provision a fresh workspace and extract the S3 snapshot into it.
 
         Dispatches to the correct provisioner based on workspace metadata.
@@ -899,15 +1183,93 @@ class WorkspaceSuspensionService:
         # the volume we are coming BACK to only exists before that call.
         prior_backing_id = _workspace_backing_id(metadata)
 
+        # A stateless sandbox resume after terminal retirement is a stricter
+        # protocol than legacy idle-suspension restore. The exact-true marker
+        # is its durable proof that an S3 extract (or same-PVC reattach) is
+        # required before this endpoint may be published. Do not manufacture
+        # that proof from truthiness or from entering this method.
+        strict_terminal_snapshot = bool(
+            thread.get("execution_lane") == "stateless" and not is_vm
+        )
+        if strict_terminal_snapshot:
+            raw_restore_required = ws_ctx.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY)
+            if raw_restore_required is not True:
+                logger.error(
+                    "Strict terminal restore refused without exact snapshot "
+                    "intent (thread %s)",
+                    thread_id,
+                )
+                return False
+        elif expected_runtime_incarnation is not None:
+            # Exact-runtime reuse is a stateless terminal-restore primitive;
+            # legacy pinned/VM callers must not silently change semantics.
+            return False
+        if stateless_creation_generation is not None and not strict_terminal_snapshot:
+            return False
+        if allow_stateless_create and stateless_creation_generation is None:
+            return False
+
+        reuse_existing_runtime = expected_runtime_incarnation is not None
+        if (
+            strict_terminal_snapshot
+            and not reuse_existing_runtime
+            and stateless_creation_generation is None
+        ):
+            logger.error(
+                "Strict terminal restore refused without durable create authority "
+                "(thread %s)",
+                thread_id,
+            )
+            return False
+        if reuse_existing_runtime:
+            current_runtime = ws_ctx.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+            if current_runtime != expected_runtime_incarnation:
+                logger.error(
+                    "Strict restore cached runtime changed for thread %s",
+                    thread_id,
+                )
+                return False
+            authority_probe = getattr(
+                self._container_provisioner, "workspace_pod_authority", None
+            )
+            if not callable(authority_probe):
+                return False
+            try:
+                authority = await authority_probe(
+                    WorkspaceOwner.session(thread_id),
+                    expected_runtime_incarnation=expected_runtime_incarnation,
+                )
+            except Exception:
+                logger.exception(
+                    "Strict restore cached runtime probe failed for thread %s",
+                    thread_id,
+                )
+                return False
+            if authority != "exact_live":
+                logger.error(
+                    "Strict restore cached runtime is no longer exact-live for "
+                    "thread %s",
+                    thread_id,
+                )
+                return False
+
         if is_vm:
-            await self._db.merge_thread_vm_context(thread_id, {"status": "restoring"})
-        else:
+            await self._db.merge_thread_vm_context(
+                thread_id,
+                {"status": "restoring"},
+            )
+        elif not reuse_existing_runtime:
             await self._db.merge_thread_workspace_context(
-                thread_id, {"status": "restoring"}
+                thread_id,
+                {
+                    "status": "restoring",
+                    WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY: True,
+                },
             )
 
         try:
             ssh_host = None
+            strict_authority: Optional[_StrictSessionRestoreAuthority] = None
             # Container tier only; a VM restore that reaches the extract below
             # never rides a kept disk (rootdisk_kept returned early).
             volume_reattached = False
@@ -958,21 +1320,31 @@ class WorkspaceSuspensionService:
 
             else:
                 # K8s container (default)
-                ok = await self._container_provisioner.create_workspace(
-                    WorkspaceOwner.session(thread_id)
-                )
-                if not ok:
-                    logger.error(
-                        "Failed to create pod for restore of thread %s", thread_id
+                if not reuse_existing_runtime:
+                    create_kwargs: dict[str, Any] = {}
+                    if stateless_creation_generation is not None:
+                        create_kwargs = {
+                            "stateless_creation_generation": (
+                                stateless_creation_generation
+                            ),
+                            "allow_stateless_create": allow_stateless_create,
+                        }
+                    ok = await self._container_provisioner.create_workspace(
+                        WorkspaceOwner.session(thread_id),
+                        **create_kwargs,
                     )
-                    await self._db.merge_thread_workspace_context(
-                        thread_id,
-                        {
-                            "status": "failed",
-                            "error": "pod creation failed on restore",
-                        },
-                    )
-                    return False
+                    if not ok:
+                        logger.error(
+                            "Failed to create pod for restore of thread %s", thread_id
+                        )
+                        await self._db.merge_thread_workspace_context(
+                            thread_id,
+                            {
+                                "status": "failed",
+                                "error": "pod creation failed on restore",
+                            },
+                        )
+                        return False
 
                 thread = await self._db.get_thread(thread_id)
                 metadata = thread.get("metadata") or {}
@@ -982,10 +1354,33 @@ class WorkspaceSuspensionService:
                     except (ValueError, TypeError):
                         metadata = {}
                 ws_ctx = metadata.get("workspace_container", {})
+                if (
+                    reuse_existing_runtime
+                    and ws_ctx.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+                    != expected_runtime_incarnation
+                ):
+                    logger.error(
+                        "Strict restore runtime changed before extraction for "
+                        "thread %s",
+                        thread_id,
+                    )
+                    return False
                 ssh_host = ws_ctx.get("pod_ip")
                 volume_reattached, reattach_reason = _volume_survived_teardown(
                     prior_backing_id, _workspace_backing_id(metadata)
                 )
+                if strict_terminal_snapshot:
+                    try:
+                        strict_authority = _strict_session_restore_authority(thread)
+                    except RuntimeError as exc:
+                        logger.error(
+                            "Strict terminal restore has no exact post-create "
+                            "authority for thread %s: %s",
+                            thread_id,
+                            exc,
+                        )
+                        return False
+                    ssh_host = strict_authority.ssh_host
 
             if not ssh_host:
                 error_msg = "no SSH host after provisioning for restore"
@@ -1009,7 +1404,11 @@ class WorkspaceSuspensionService:
             # with older ones. Everything else — emptyDir pods, a freshly minted
             # (empty) PVC, a volume discarded by the single-replica node-loss
             # fallback — has the S3 snapshot as its only copy and must extract.
-            ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx, is_vm=is_vm)
+            ssh_port = (
+                strict_authority.ssh_port
+                if strict_authority is not None
+                else _resolve_ssh_port(ws_ctx, vm_ctx, is_vm=is_vm)
+            )
             if volume_reattached:
                 logger.info(
                     "Workspace restore for thread %s rides the reattached "
@@ -1017,31 +1416,109 @@ class WorkspaceSuspensionService:
                     thread_id,
                     reattach_reason,
                 )
-            elif not await self._extract_snapshot(
-                thread_id,
-                ssh_host,
-                ssh_port=ssh_port,
-                entity_type="threads",
-                scoped_home=not is_vm,
-            ):
-                # Same reasoning as the job path: a workspace that failed to
-                # restore must not advertise itself as ready.
-                error_msg = "snapshot extraction failed on restore"
-                logger.error("%s (thread %s)", error_msg, thread_id)
-                if is_vm:
-                    await self._db.merge_thread_vm_context(
-                        thread_id, {"status": "failed", "error": error_msg}
-                    )
-                else:
-                    await self._db.merge_thread_workspace_context(
-                        thread_id, {"status": "failed", "error": error_msg}
-                    )
-                return False
+            else:
+                extract_kwargs: dict[str, Any] = {"scoped_home": not is_vm}
+                if strict_authority is not None:
+                    extract_kwargs = {
+                        "expected_host_key_fingerprint": (
+                            strict_authority.host_key_fingerprint
+                        ),
+                        # The workspace image owns /usr/local as root. The
+                        # stateless SSH principal restores only its durable
+                        # home tree; VM/legacy restores retain the full-root
+                        # command below.
+                        "remote_cmd": EXTRACT_HOME_REMOTE_CMD,
+                        "require_pipefail": True,
+                    }
+                extracted = await self._extract_snapshot(
+                    thread_id,
+                    ssh_host,
+                    ssh_port=ssh_port,
+                    entity_type="threads",
+                    **extract_kwargs,
+                )
+                if not extracted:
+                    # Same reasoning as the job path: a workspace that failed
+                    # to restore must not advertise itself as ready. A strict
+                    # restore leaves the exact-true intent armed; the internal
+                    # credential gate consequently keeps this ready-looking
+                    # provisioner row quarantined and the next ensure retries.
+                    error_msg = "snapshot extraction failed on restore"
+                    logger.error("%s (thread %s)", error_msg, thread_id)
+                    if strict_terminal_snapshot:
+                        return False
+                    if is_vm:
+                        await self._db.merge_thread_vm_context(
+                            thread_id, {"status": "failed", "error": error_msg}
+                        )
+                    else:
+                        await self._db.merge_thread_workspace_context(
+                            thread_id, {"status": "failed", "error": error_msg}
+                        )
+                    return False
 
+            if strict_authority is not None:
+                # Extraction success alone is not authority: the deterministic
+                # Pod name may have been deleted/replaced while bytes streamed.
+                # Re-probe the exact UID, then CAS the same binding/runtime/
+                # endpoint tuple under the thread row lock before clearing the
+                # restore marker and publishing Ready.
+                probe = getattr(self._container_provisioner, "workspace_pod_live", None)
+                if not callable(probe):
+                    logger.error(
+                        "Strict terminal restore cannot verify runtime UID for "
+                        "thread %s",
+                        thread_id,
+                    )
+                    return False
+                try:
+                    exact_live = await probe(
+                        WorkspaceOwner.session(thread_id),
+                        expected_runtime_incarnation=(
+                            strict_authority.runtime_incarnation
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Strict terminal restore runtime re-probe failed for thread %s",
+                        thread_id,
+                    )
+                    return False
+                if exact_live is not True:
+                    logger.error(
+                        "Strict terminal restore runtime changed or is ambiguous "
+                        "for thread %s",
+                        thread_id,
+                    )
+                    return False
+                if not await self._commit_strict_thread_restore_ready(
+                    thread_id,
+                    strict_authority,
+                ):
+                    logger.error(
+                        "Strict terminal restore authority changed before Ready "
+                        "commit for thread %s",
+                        thread_id,
+                    )
+                    return False
+
+                logger.info(
+                    "Strict terminal workspace restored for thread %s from %s "
+                    "(runtime=%s)",
+                    thread_id,
+                    "its own volume" if volume_reattached else "S3",
+                    strict_authority.runtime_incarnation,
+                )
+                return True
+
+            # Legacy job/VM/pinned-session semantics remain below. Strict
+            # terminal restores returned only after the transactional CAS.
             restored_ctx = {
                 "status": "ready",
                 "restored_at": datetime.now(timezone.utc).isoformat(),
             }
+            if not is_vm:
+                restored_ctx[WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY] = False
             if is_vm:
                 await self._db.merge_thread_vm_context(thread_id, restored_ctx)
             else:
@@ -1057,6 +1534,10 @@ class WorkspaceSuspensionService:
 
         except Exception:
             logger.exception("Failed to restore workspace for thread %s", thread_id)
+            if strict_terminal_snapshot:
+                # Keep the exact-true marker armed. A racing replacement must
+                # not be stamped failed (or Ready) by this stale restore.
+                return False
             if is_vm:
                 await self._db.merge_thread_vm_context(
                     thread_id, {"status": "failed", "error": "restore exception"}

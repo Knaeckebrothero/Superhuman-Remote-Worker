@@ -32,9 +32,12 @@ spec:
     - Egress
   ingress:
     # SSH + CDP from agent pods (RemoteBackend + browser automation).
-    # Agent pods are created by the orchestrator's provisioners (not by Helm),
-    # so they carry the custom `app: srw-agent` / `app: srw-persistent-agent`
-    # labels rather than Helm's `app.kubernetes.io/component` labels.
+    # Legacy agent pods are created by the orchestrator's provisioners (not by
+    # Helm), so they carry the custom `app: srw-agent` /
+    # `app: srw-persistent-agent` labels rather than Helm's
+    # `app.kubernetes.io/component` labels. The flag-gated stateless Deployment
+    # has its own non-overlapping `app` label and joins this allow-list only
+    # while that lane is enabled.
     - from:
         - podSelector:
             matchLabels:
@@ -42,6 +45,11 @@ spec:
         - podSelector:
             matchLabels:
               app: srw-persistent-agent
+        {{- if $.Values.agent.stateless.enabled }}
+        - podSelector:
+            matchLabels:
+              app: srw-agent-stateless
+        {{- end }}
       ports:
         - protocol: TCP
           port: 30022

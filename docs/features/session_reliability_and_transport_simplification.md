@@ -574,6 +574,15 @@ Playwright/perf the rest).
 **Depends on P1 (epoch handling at reopen) and P2 (wake funnel +
 kickstart plumbing).**
 
+**Blocked-by (added 2026-08-07): `docs/features/stateless_agents.md` §5.3.2
+epoch-stability.** Today `events_epoch` bumps on every runtime attach; under
+stateless per-turn claims that becomes per-turn. P5's idle-close does NOT
+neutralize it — it converts the ~2.2 s mid-stream horizon detection into an
+at-open `epoch_mismatch` that still forces the client's full cache-wipe reload
+on every reopen. Land the epoch redesign (bump only on steal/rewind, DB-side
+seq) first, or at minimum before any stateless session serves traffic, keeping
+the `/events/head` contract stable across both changes.
+
 ### Server
 
 - **`thread.activity` via DB trigger** (decision settled — v1 left it

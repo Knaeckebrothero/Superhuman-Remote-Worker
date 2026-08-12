@@ -197,19 +197,22 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
             return {...state, turns: [...state.turns, turn]};
         }
 
-        case 'system_message':
+        case 'system_message': {
+            const turn: Turn = {
+                kind: 'system',
+                id: action.id,
+                content: action.content,
+                timestamp: action.timestamp,
+            };
+            const idx = state.turns.findIndex((existing) => existing.id === action.id);
             return {
                 ...state,
-                turns: [
-                    ...state.turns,
-                    {
-                        kind: 'system',
-                        id: action.id,
-                        content: action.content,
-                        timestamp: action.timestamp,
-                    },
-                ],
+                turns:
+                    idx >= 0
+                        ? replaceAt(state.turns, idx, turn)
+                        : [...state.turns, turn],
             };
+        }
 
         case 'reattach_turn':
             return reattachTurn(state, action.turnId, action.timestamp);
@@ -306,7 +309,8 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
 
         case 'turn_completed':
         case 'turn_interrupted': {
-            const finalStatus = action.type === 'turn_interrupted' ? 'interrupted' : 'done';
+            const requestedStatus =
+                action.type === 'turn_interrupted' ? 'interrupted' : 'done';
             const directMatch = state.turns.some(
                 (t) => t.kind === 'assistant' && t.id === action.turnId,
             );
@@ -332,6 +336,11 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 turns: state.turns.map((t) => {
                     if (t.kind !== 'assistant') return t;
                     if (t.id === action.turnId) {
+                        const finalStatus =
+                            requestedStatus === 'done' &&
+                            t.status === 'interrupted'
+                                ? 'interrupted'
+                                : requestedStatus;
                         return {
                             ...t,
                             events: closeOpenEvents(t.events, action.finishedAt),
@@ -345,7 +354,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                             id: action.turnId,
                             recovered: undefined,
                             events: closeOpenEvents(t.events, action.finishedAt),
-                            status: finalStatus,
+                            status: requestedStatus,
                             finishedAt: action.finishedAt,
                         };
                     }
@@ -436,7 +445,11 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 );
                 if (idx >= 0) {
                     const existing = turn.events[idx] as ToolCallEvent;
-                    const updated: ToolCallEvent = {...existing, status: 'pending'};
+                    const updated: ToolCallEvent = {
+                        ...existing,
+                        status: 'pending',
+                        decision: undefined,
+                    };
                     return {...turn, events: replaceAt(turn.events, idx, updated)};
                 }
                 const newCall: ToolCallEvent = {

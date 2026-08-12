@@ -23,7 +23,10 @@ _orchestrator_dir = str(project_root / "orchestrator")
 if _orchestrator_dir not in sys.path:
     sys.path.insert(0, _orchestrator_dir)
 
-from orchestrator.services.workspace_suspension import WorkspaceSuspensionService  # noqa: E402
+from orchestrator.services.workspace_suspension import (  # noqa: E402
+    WorkspaceSuspensionService,
+    _strict_session_restore_authority,
+)
 from orchestrator.services.ssh_helpers import (  # noqa: E402
     EXTRACT_HOME_REMOTE_CMD,
     EXTRACT_REMOTE_CMD,
@@ -421,7 +424,9 @@ class TestExtractSnapshotScopedHome:
             ok = await svc._extract_snapshot("id-default", "10.0.0.9")
 
         assert ok is True
-        assert mock_stream.call_args.kwargs["remote_cmd"] == EXTRACT_REMOTE_CMD
+        # Omitting the override preserves stream_extract_snapshot's full
+        # extract default without perturbing strict-authority call shapes.
+        assert "remote_cmd" not in mock_stream.call_args.kwargs
 
 
 # =============================================================================
@@ -703,6 +708,60 @@ class TestRestoreExtractionFailure:
         ok = await svc._extract_snapshot("job-1", "10.0.0.99", ssh_port=30022)
 
         assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_strict_extract_forwards_host_pin_and_pipefail(self):
+        svc = make_service()
+        with (
+            patch(
+                "orchestrator.services.workspace_suspension.resolve_ssh_key_path",
+                return_value="/ssh/key",
+            ),
+            patch(
+                "orchestrator.services.workspace_suspension.stream_extract_snapshot",
+                new=AsyncMock(return_value=(0, b"")),
+            ) as extract,
+        ):
+            ok = await svc._extract_snapshot(
+                "thread-1",
+                "10.0.0.99",
+                ssh_port=30022,
+                entity_type="threads",
+                expected_host_key_fingerprint="SHA256:attested",
+                require_pipefail=True,
+            )
+
+        assert ok is True
+        svc._snapshot_service.download_snapshot.assert_awaited_once()
+        assert (
+            svc._snapshot_service.download_snapshot.await_args.kwargs[
+                "require_strict_terminal"
+            ]
+            is True
+        )
+        assert extract.await_args.args[:2] == ("10.0.0.99", 30022)
+        assert extract.await_args.kwargs == {
+            "key_path": "/ssh/key",
+            "expected_host_key_fingerprint": "SHA256:attested",
+            "require_pipefail": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_strict_extract_without_host_pin_never_starts_ssh(self):
+        svc = make_service()
+        create = AsyncMock(side_effect=AssertionError("pin validation precedes SSH"))
+
+        with patch("asyncio.create_subprocess_exec", new=create):
+            ok = await svc._extract_snapshot(
+                "thread-1",
+                "10.0.0.99",
+                ssh_port=30022,
+                entity_type="threads",
+                require_pipefail=True,
+            )
+
+        assert ok is False
+        create.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_restore_exception_during_extract(self):
@@ -1005,6 +1064,27 @@ class TestRestoreOwnerDispatch:
         svc.restore_thread_workspace.assert_awaited_once_with("t1")
         svc.restore_workspace.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_restore_session_forwards_exact_runtime_reuse_authority(self):
+        from services.workspace_lifecycle import WorkspaceOwner as WO
+
+        svc = make_service()
+        svc.restore_workspace = AsyncMock(return_value=True)
+        svc.restore_thread_workspace = AsyncMock(return_value=True)
+        runtime_uid = "11111111-1111-4111-8111-111111111111"
+
+        result = await svc.restore(
+            WO.session("t1"),
+            expected_runtime_incarnation=runtime_uid,
+        )
+
+        assert result is True
+        svc.restore_thread_workspace.assert_awaited_once_with(
+            "t1",
+            expected_runtime_incarnation=runtime_uid,
+        )
+        svc.restore_workspace.assert_not_awaited()
+
 
 # =============================================================================
 # Test: heartbeat activity tracking (replicated logic)
@@ -1086,6 +1166,67 @@ def make_vm_service():
     svc._vm_provisioner = vm_prov
     svc._agent_provisioner = None
     return svc, vm_prov
+
+
+class TestStatelessThreadSuspensionRefusal:
+    @staticmethod
+    def _service_with_agent_delete_probe():
+        svc = make_service()
+        agent_provisioner = MagicMock()
+        agent_provisioner.delete_agent_pod_by_thread = AsyncMock()
+        svc._agent_provisioner = agent_provisioner
+        return svc
+
+    @staticmethod
+    def _assert_no_suspension_side_effects(svc):
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        svc._container_provisioner.delete_workspace.assert_not_awaited()
+        svc._agent_provisioner.delete_agent_pod_by_thread.assert_not_awaited()
+        svc._db.merge_thread_workspace_context.assert_not_awaited()
+        svc._db.merge_thread_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("thread_status", ["active", "awaiting_user"])
+    async def test_ready_workspace_is_refused_for_stateless_thread(self, thread_status):
+        svc = self._service_with_agent_delete_probe()
+        thread = make_container_thread()
+        thread["status"] = thread_status
+        thread["execution_lane"] = "stateless"
+        svc._db.get_thread = AsyncMock(return_value=thread)
+
+        assert await svc.suspend_thread_workspace("tid-pod") is False
+
+        self._assert_no_suspension_side_effects(svc)
+
+    @pytest.mark.asyncio
+    async def test_ended_retirement_marker_is_refused_without_cleanup_race(self):
+        svc = self._service_with_agent_delete_probe()
+        thread = make_container_thread()
+        thread["status"] = "ended"
+        thread["execution_lane"] = "stateless"
+        thread["metadata"]["_stateless_workspace_retirement_pending"] = True
+        thread["metadata"]["_stateless_claim_retirement"] = {"terminal_token": 8}
+        svc._db.get_thread = AsyncMock(return_value=thread)
+
+        assert await svc.suspend_thread_workspace("tid-pod") is False
+
+        self._assert_no_suspension_side_effects(svc)
+
+    @pytest.mark.asyncio
+    async def test_malformed_metadata_is_refused_before_parsing(self):
+        svc = self._service_with_agent_delete_probe()
+        svc._db.get_thread = AsyncMock(
+            return_value={
+                "id": "tid-pod",
+                "status": "awaiting_user",
+                "execution_lane": "stateless",
+                "metadata": "{not-json",
+            }
+        )
+
+        assert await svc.suspend_thread_workspace("tid-pod") is False
+
+        self._assert_no_suspension_side_effects(svc)
 
 
 class TestThreadTierIsExplicit:
@@ -1575,6 +1716,7 @@ class TestSessionRestoreRidesTheReattachedVolume:
         for call in svc._db.merge_thread_workspace_context.await_args_list:
             merged.update(call.args[1])
         assert merged["status"] == "ready"
+        assert merged["_snapshot_restore_required"] is False
 
     @pytest.mark.asyncio
     async def test_emptydir_session_still_extracts(self):
@@ -1648,6 +1790,308 @@ class TestSessionRestoreRidesTheReattachedVolume:
         ]
         assert statuses[-1] == "failed"
         assert "ready" not in statuses
+        merged = {}
+        for call in svc._db.merge_thread_workspace_context.await_args_list:
+            merged.update(call.args[1])
+        assert merged["_snapshot_restore_required"] is True
+
+
+class TestStrictTerminalSessionRestore:
+    THREAD_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    GENERATION = "11111111-2222-4333-8444-555555555555"
+    RUNTIME = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+    FINGERPRINT = "SHA256:current-workspace-host"
+    BACKING_ID = "k8s-pod:srw:66666666-7777-4888-8999-aaaaaaaaaaaa"
+    CREATION = "99999999-aaaa-4bbb-8ccc-dddddddddddd"
+
+    async def _restore_new(self, svc):
+        return await svc.restore_thread_workspace(
+            self.THREAD_ID,
+            stateless_creation_generation=self.CREATION,
+            allow_stateless_create=True,
+        )
+
+    @classmethod
+    def _before(cls, *, marker=True, backing_id=None):
+        return {
+            "id": cls.THREAD_ID,
+            "status": "created",
+            "execution_lane": "stateless",
+            "metadata": {
+                "config_override": {"workspace": {"backend": "sandbox"}},
+                "workspace_container": {
+                    "status": "deleted",
+                    "provisioner": "k8s",
+                    "_snapshot_restore_required": marker,
+                },
+                "_workspace_binding": {
+                    "generation": "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+                    "kind": "remote",
+                    "backing_id": backing_id or "k8s-pod:srw:old-runtime",
+                    "ssh_host_key_fingerprint": "SHA256:old-host",
+                },
+            },
+        }
+
+    @classmethod
+    def _after(
+        cls,
+        *,
+        runtime=None,
+        endpoint_generation=None,
+        backing_id=None,
+        fingerprint=None,
+    ):
+        return {
+            "id": cls.THREAD_ID,
+            "status": "created",
+            "execution_lane": "stateless",
+            "metadata": {
+                "config_override": {"workspace": {"backend": "sandbox"}},
+                "workspace_container": {
+                    "status": "ready",
+                    "provisioner": "k8s",
+                    "pod_ip": "10.42.2.91",
+                    "port": 30022,
+                    "_snapshot_restore_required": True,
+                    "_canvas_workspace_generation": (
+                        endpoint_generation or cls.GENERATION
+                    ),
+                    "_runtime_incarnation": runtime or cls.RUNTIME,
+                },
+                "_workspace_binding": {
+                    "generation": cls.GENERATION,
+                    "kind": "remote",
+                    "backing_id": backing_id or cls.BACKING_ID,
+                    "ssh_host_key_fingerprint": fingerprint or cls.FINGERPRINT,
+                },
+            },
+        }
+
+    def _service(self, before=None, after=None):
+        svc = make_service()
+        svc._db.get_thread = AsyncMock(
+            side_effect=[before or self._before(), after or self._after()]
+        )
+        svc._extract_snapshot = AsyncMock(return_value=True)
+        svc._container_provisioner.workspace_pod_live = AsyncMock(return_value=True)
+        svc._commit_strict_thread_restore_ready = AsyncMock(return_value=True)
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_extract_is_pinned_and_exact_tuple_is_reproved_then_committed(self):
+        svc = self._service()
+
+        ok = await self._restore_new(svc)
+
+        assert ok is True
+        svc._extract_snapshot.assert_awaited_once_with(
+            self.THREAD_ID,
+            "10.42.2.91",
+            ssh_port=30022,
+            entity_type="threads",
+            expected_host_key_fingerprint=self.FINGERPRINT,
+            remote_cmd=EXTRACT_HOME_REMOTE_CMD,
+            require_pipefail=True,
+        )
+        svc._container_provisioner.workspace_pod_live.assert_awaited_once_with(
+            WorkspaceOwner.session(self.THREAD_ID),
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+        expected = svc._commit_strict_thread_restore_ready.await_args.args[1]
+        assert expected.workspace_generation == self.GENERATION
+        assert expected.endpoint_generation == self.GENERATION
+        assert expected.runtime_incarnation == self.RUNTIME
+        assert expected.host_key_fingerprint == self.FINGERPRINT
+        assert not any(
+            call.args[1].get("status") == "ready"
+            and call.args[1].get("_snapshot_restore_required") is False
+            for call in svc._db.merge_thread_workspace_context.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_cached_exact_live_restore_reuses_uid_without_name_create(self):
+        current = self._after()
+        svc = self._service(before=current, after=current)
+        svc._container_provisioner.workspace_pod_authority = AsyncMock(
+            return_value="exact_live"
+        )
+
+        ok = await svc.restore_thread_workspace(
+            self.THREAD_ID,
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+
+        assert ok is True
+        svc._container_provisioner.workspace_pod_authority.assert_awaited_once_with(
+            WorkspaceOwner.session(self.THREAD_ID),
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+        svc._container_provisioner.create_workspace.assert_not_awaited()
+        svc._extract_snapshot.assert_awaited_once()
+        svc._commit_strict_thread_restore_ready.assert_awaited_once()
+        assert not any(
+            call.args[1].get("status") == "restoring"
+            for call in svc._db.merge_thread_workspace_context.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "authority", ["exact_absent", "replacement", "unknown", "exact_terminal"]
+    )
+    async def test_cached_restore_internal_reprobe_refuses_nonlive_uid(self, authority):
+        current = self._after()
+        svc = self._service(before=current, after=current)
+        svc._container_provisioner.workspace_pod_authority = AsyncMock(
+            return_value=authority
+        )
+
+        ok = await svc.restore_thread_workspace(
+            self.THREAD_ID,
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+
+        assert ok is False
+        svc._container_provisioner.create_workspace.assert_not_awaited()
+        svc._extract_snapshot.assert_not_awaited()
+        svc._commit_strict_thread_restore_ready.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cached_restore_runtime_drift_refuses_before_probe(self):
+        current = self._after(runtime="99999999-aaaa-4bbb-8ccc-dddddddddddd")
+        svc = self._service(before=current, after=current)
+        svc._container_provisioner.workspace_pod_authority = AsyncMock(
+            return_value="exact_live"
+        )
+
+        assert (
+            await svc.restore_thread_workspace(
+                self.THREAD_ID,
+                expected_runtime_incarnation=self.RUNTIME,
+            )
+            is False
+        )
+
+        svc._container_provisioner.workspace_pod_authority.assert_not_awaited()
+        svc._container_provisioner.create_workspace.assert_not_awaited()
+        svc._extract_snapshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("probe_result", [False, None])
+    async def test_replacement_or_unknown_runtime_never_reaches_ready_cas(
+        self, probe_result
+    ):
+        svc = self._service()
+        svc._container_provisioner.workspace_pod_live.return_value = probe_result
+
+        ok = await self._restore_new(svc)
+
+        assert ok is False
+        svc._commit_strict_thread_restore_ready.assert_not_awaited()
+        assert not any(
+            call.args[1].get("_snapshot_restore_required") is False
+            for call in svc._db.merge_thread_workspace_context.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_runtime_probe_error_never_reaches_ready_cas(self):
+        svc = self._service()
+        svc._container_provisioner.workspace_pod_live.side_effect = RuntimeError(
+            "kubernetes API unavailable"
+        )
+
+        assert await self._restore_new(svc) is False
+
+        svc._commit_strict_thread_restore_ready.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_changed_endpoint_generation_fails_before_snapshot_bytes(self):
+        svc = self._service(
+            after=self._after(
+                endpoint_generation="99999999-aaaa-4bbb-8ccc-dddddddddddd"
+            )
+        )
+
+        assert await self._restore_new(svc) is False
+
+        svc._extract_snapshot.assert_not_awaited()
+        svc._container_provisioner.workspace_pod_live.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("marker", [False, None, 1, "true", {}])
+    async def test_non_exact_terminal_restore_marker_is_refused_before_create(
+        self, marker
+    ):
+        before = self._before(marker=marker)
+        svc = make_service()
+        svc._db.get_thread = AsyncMock(return_value=before)
+
+        assert await svc.restore_thread_workspace(self.THREAD_ID) is False
+
+        svc._container_provisioner.create_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_same_pvc_still_reprobes_and_cas_commits_without_extract(self):
+        backing = "k8s-pvc:srw:bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        svc = self._service(
+            before=self._before(backing_id=backing),
+            after=self._after(backing_id=backing),
+        )
+
+        assert await self._restore_new(svc) is True
+
+        svc._extract_snapshot.assert_not_awaited()
+        svc._container_provisioner.workspace_pod_live.assert_awaited_once()
+        svc._commit_strict_thread_restore_ready.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_transactional_ready_commit_rejects_tuple_drift(self):
+        expected = _strict_session_restore_authority(self._after())
+        drifted = self._after(runtime="99999999-aaaa-4bbb-8ccc-dddddddddddd")
+        svc = make_service()
+        conn = AsyncMock()
+        conn.transaction = MagicMock(return_value=_MockAsyncCtx(None))
+        conn.fetchrow = AsyncMock(return_value=drifted)
+        conn.fetchval = AsyncMock(return_value=self.THREAD_ID)
+        svc._db.acquire = MagicMock(return_value=_MockAsyncCtx(conn))
+
+        assert (
+            await svc._commit_strict_thread_restore_ready(self.THREAD_ID, expected)
+            is False
+        )
+
+        conn.fetchval.assert_not_awaited()
+        assert "FOR UPDATE" in conn.fetchrow.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_transactional_ready_commit_uses_exact_cas_tuple(self):
+        current = self._after()
+        expected = _strict_session_restore_authority(current)
+        svc = make_service()
+        conn = AsyncMock()
+        conn.transaction = MagicMock(return_value=_MockAsyncCtx(None))
+        conn.fetchrow = AsyncMock(return_value=current)
+        conn.fetchval = AsyncMock(return_value=self.THREAD_ID)
+        svc._db.acquire = MagicMock(return_value=_MockAsyncCtx(conn))
+
+        assert (
+            await svc._commit_strict_thread_restore_ready(self.THREAD_ID, expected)
+            is True
+        )
+
+        sql, *params = conn.fetchval.await_args.args
+        assert "= 'true'::jsonb" in sql
+        assert "RETURNING id" in sql
+        assert params[:8] == [
+            self.THREAD_ID,
+            self.GENERATION,
+            self.GENERATION,
+            self.RUNTIME,
+            self.BACKING_ID,
+            self.FINGERPRINT,
+            "10.42.2.91",
+            30022,
+        ]
 
 
 # =============================================================================

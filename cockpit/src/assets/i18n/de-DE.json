@@ -1402,7 +1402,8 @@
       "textCount": "{{count}} Textblöcke",
       "toolCount": "{{count}} Werkzeugaufrufe",
       "foldMore": "+{{count}} weitere",
-      "foldFailed": "⚠ {{count}} fehlgeschlagen"
+      "foldFailed": "⚠ {{count}} fehlgeschlagen",
+      "parked": "Dieser Zug wurde nach wiederholten Executor-Fehlern angehalten und erfordert einen Eingriff durch den Administrator."
     },
     "queued": {
       "notSent": "Nicht gesendet",
@@ -1566,6 +1567,11 @@
       "approveAll": "Alle genehmigen",
       "autoAccept": "Auto-akzeptieren",
       "stop": "Stoppen"
+    },
+    "control": {
+      "backpressure": "Zu viele Änderungen an den Sitzungseinstellungen warten. Versuche es gleich erneut.",
+      "admissionFailed": "Die Sitzungseinstellung konnte nicht geändert werden. Versuche es erneut.",
+      "ownerRejected": "Der ausführende Agent hat diese Sitzungseinstellung abgelehnt. Lade die Seite neu und versuche es erneut."
     },
     "workspaceOffer": {
       "title": "Workspace-Upgrade angefordert",

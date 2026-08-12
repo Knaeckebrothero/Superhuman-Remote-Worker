@@ -66,6 +66,7 @@ async def provision_or_assign(
     from services.session_provisioning_state import (
         agent_pod_provisioning_in_progress,
     )
+    from src.shared.run_queue import LANE_PINNED, LANE_STATELESS
 
     # A VM-backed session pays a cold KubeVirt boot (minutes). Tag the lifecycle
     # events so the cockpit renders the "Booting VM (this can take a few minutes)"
@@ -74,7 +75,6 @@ async def provision_or_assign(
     _is_vm = _backend_from_override(co) == "vm"
     _vm_tag: dict[str, str] = {"backend": "vm"} if _is_vm else {}
 
-    lifecycle_emit(uid, tid, "provisioning", **_vm_tag)
     pod_ip: str | None = None
     pod_port: int = 8001
     needs_binding_wait = False  # True iff fresh-pod path took over
@@ -82,6 +82,36 @@ async def provision_or_assign(
     try:
         async with postgres_db.thread_advisory_lock(tid):
             cur = await postgres_db.get_thread(tid)
+            execution_lane = cur.get("execution_lane") if cur else None
+            if execution_lane == LANE_STATELESS:
+                # The create-thread task is fire-and-forget, so the lane may
+                # have changed between scheduling and this authoritative
+                # refetch. A stateless row is already admission-ready; emitting
+                # provisioning -> failed here would contradict /connection and
+                # surface a false startup error in the cockpit.
+                logger.info(
+                    "Thread %s: create-path provisioning no longer applies "
+                    "after transition to the stateless lane",
+                    tid,
+                )
+                return
+            if execution_lane != LANE_PINNED:
+                # Missing, corrupt, and future lanes are not healthy state.
+                # Fail closed and retain the lifecycle failure for operators.
+                logger.warning(
+                    "Thread %s: refusing create-path provisioning for "
+                    "execution lane %r",
+                    tid,
+                    execution_lane,
+                )
+                lifecycle_emit(
+                    uid,
+                    tid,
+                    "failed",
+                    reason="Session execution lane does not use pinned provisioning",
+                )
+                return
+            lifecycle_emit(uid, tid, "provisioning", **_vm_tag)
             if cur and cur.get("agent_id"):
                 logger.info(
                     "Thread %s: already bound to agent %s — "
@@ -170,9 +200,37 @@ async def provision_or_assign(
                         )
                         pod_ip = idle_agent["pod_ip"]
                         pod_port = int(idle_agent.get("pod_port", 8001))
-                    # else fall through to fresh-pod path
+                    else:
+                        # The attach attempt awaited DB and HTTP boundaries.
+                        # Its entry snapshot is no longer authority: a lane
+                        # transition or sibling binding must suppress the
+                        # fresh-pod fallback.
+                        cur = await postgres_db.get_thread(tid)
+                        lane_after_attach = cur.get("execution_lane") if cur else None
+                        if lane_after_attach == LANE_STATELESS:
+                            logger.info(
+                                "Thread %s: suppressing pod fallback after "
+                                "transition to the stateless lane",
+                                tid,
+                            )
+                            return
+                        if lane_after_attach != LANE_PINNED:
+                            lifecycle_emit(
+                                uid,
+                                tid,
+                                "failed",
+                                reason=(
+                                    "Session execution lane does not use "
+                                    "pinned provisioning"
+                                ),
+                            )
+                            return
+                        if cur.get("agent_id") or agent_pod_provisioning_in_progress(
+                            cur
+                        ):
+                            needs_binding_wait = True
 
-                if pod_ip is None:
+                if pod_ip is None and not needs_binding_wait:
                     # No idle agent (or pool attach failed) — create a
                     # dedicated session pod. Only kick off the creation here;
                     # the binding wait happens AFTER the lock is released, so

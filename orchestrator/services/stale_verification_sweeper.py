@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +53,14 @@ REVIEWING_WALLCLOCK_CEILING_MINUTES = int(
     os.getenv("REVIEWING_WALLCLOCK_CEILING_MINUTES", "60")
 )
 
+StatelessCancelFn = Callable[..., Awaitable[bool]]
+
 
 async def stale_verification_sweeper_loop(
-    db: Any, shutdown_event: asyncio.Event
+    db: Any,
+    shutdown_event: asyncio.Event,
+    *,
+    stateless_cancel_fn: StatelessCancelFn | None = None,
 ) -> None:
     """Reap orphaned verification subjobs until ``shutdown_event`` is set."""
     logger.info(
@@ -73,6 +78,7 @@ async def stale_verification_sweeper_loop(
                 STALE_HOURS,
                 REVIEWING_STUCK_MINUTES,
                 wallclock_minutes=REVIEWING_WALLCLOCK_CEILING_MINUTES,
+                stateless_cancel_fn=stateless_cancel_fn,
             )
             if cancelled:
                 logger.info(
@@ -105,6 +111,7 @@ async def _sweep_tick(
     grace_minutes: int,
     notifier: Any = None,
     wallclock_minutes: int | None = None,
+    stateless_cancel_fn: StatelessCancelFn | None = None,
 ) -> tuple[int, int]:
     """Run one sweep. Returns ``(cancelled_subjobs, unstuck_parents)``.
 
@@ -119,6 +126,17 @@ async def _sweep_tick(
     returned ``unstuck_parents``.
     """
     cancelled = await db.cancel_stale_verification_subjobs(stale_hours)
+    if stateless_cancel_fn is not None:
+        stateless_ids = await db.list_stale_stateless_verification_subjobs(stale_hours)
+        for job_id in stateless_ids:
+            try:
+                if await stateless_cancel_fn(job_id, stale_hours=stale_hours):
+                    cancelled += 1
+            except Exception:
+                logger.exception(
+                    "Failed to settle stale stateless verification subjob %s",
+                    job_id,
+                )
 
     unstuck_rows = await db.unstick_reviewing_parents(grace_minutes)
 

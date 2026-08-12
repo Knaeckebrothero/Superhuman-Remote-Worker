@@ -59,6 +59,22 @@ class ThreadConfigUpdateDenied(Exception):
         super().__init__(f"Thread config update denied ({status_code}): {detail}")
 
 
+class ClaimBundleError(Exception):
+    """Non-200 from the claim-bundle endpoint (M3 pinned contract).
+
+    Carries the status code so the stateless turn executor can branch:
+    401/403 → treat as lease lost (its token-guarded release no-ops), 404 →
+    the unit vanished (drop the claim), 409 → not leased / wrong lane (drop
+    and re-poll). Network errors are NOT wrapped — they propagate as httpx
+    exceptions and the executor releases with backoff.
+    """
+
+    def __init__(self, status_code: int, detail: str = "") -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"claim-bundle {status_code}: {detail[:200]}")
+
+
 class VerdictRecordingError(Exception):
     """The verdict could not be durably recorded.
 
@@ -646,6 +662,43 @@ class OrchestratorClient:
             logger.debug(f"Failed to get thread workspace: {e}")
             return None
 
+    async def get_claim_bundle(self, unit_id: str, lease_token: int) -> dict:
+        """Fetch the resolved attach payload for a claimed run_queue unit.
+
+        M3 pinned contract (stateless_agents.md §5.6 — credentials are
+        delivered only against proof of the CURRENT lease):
+        ``GET {orchestrator}/internal/units/{unit_id}/claim-bundle?lease_token=N``,
+        authenticated exactly like every other internal call on this client
+        (``X-Internal-Key`` attached by :meth:`connect`). The 200 body carries
+        ``unit_id``/``thread_id``/``unit_kind``/``execution_lane``, the
+        ``watermarks`` pair, and the ``attach`` object — the existing
+        ``/session/attach`` body, fed to ``_attach_session`` unchanged.
+
+        Raises :class:`ClaimBundleError` on any non-200; network errors
+        propagate as httpx exceptions (the caller treats both as bundle
+        failure and releases its claim, token-guarded).
+        """
+        if not self._client:
+            await self.connect()
+        url = f"{self.orchestrator_url}/internal/units/{unit_id}/claim-bundle"
+        response = await self._client.get(
+            url,
+            params={
+                "lease_token": int(lease_token),
+                "pod_name": os.environ.get("POD_NAME")
+                or os.environ.get("HOSTNAME", ""),
+                "pod_uid": os.environ.get("POD_UID", ""),
+            },
+        )
+        if response.status_code == 200:
+            return response.json()
+        detail = ""
+        try:
+            detail = response.text or ""
+        except Exception:
+            pass
+        raise ClaimBundleError(response.status_code, detail)
+
     async def get_thread_canvas(self, thread_id: str) -> dict[str, Any] | None:
         """Fetch the delegated user's logical ``main`` Canvas state.
 
@@ -929,7 +982,13 @@ class OrchestratorClient:
             logger.error(f"Unexpected error during deregistration: {e}")
             return False
 
-    async def update_thread_status(self, thread_id: str, status: str) -> bool:
+    async def update_thread_status(
+        self,
+        thread_id: str,
+        status: str,
+        *,
+        pinned_agent_id: Optional[str] = None,
+    ) -> bool:
         """Update thread status via orchestrator REST.
 
         Args:
@@ -944,7 +1003,10 @@ class OrchestratorClient:
             return False
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/status"
         try:
-            r = await self._client.put(url, json={"status": status})
+            body = {"status": status}
+            if pinned_agent_id is not None:
+                body["agent_id"] = pinned_agent_id
+            r = await self._client.put(url, json=body)
             return r.status_code == 200
         except Exception as e:
             logger.warning(f"Thread status update failed (non-fatal): {e}")
@@ -1602,6 +1664,7 @@ class OrchestratorClient:
         self,
         job_id: str,
         result: dict[str, Any],
+        lease_token: int | None = None,
     ) -> bool:
         """Report job completion to the orchestrator.
 
@@ -1612,6 +1675,8 @@ class OrchestratorClient:
         Args:
             job_id: UUID of the completed job
             result: Final graph state (should_stop, goal_achieved, error, freeze_data)
+            lease_token: Current worker_batch fence for stateless jobs. Pinned
+                callers omit it and retain the historical payload byte shape.
 
         Returns:
             True if the orchestrator handled completion successfully.
@@ -1626,9 +1691,18 @@ class OrchestratorClient:
             "error": result.get("error"),
             "freeze_data": result.get("freeze_data"),
         }
+        if lease_token is not None:
+            payload["lease_token"] = int(lease_token)
 
         try:
-            response = await self._client.post(url, json=payload, timeout=60.0)
+            # Stateless terminal handling can include workspace/archive and
+            # verification side effects. A short client disconnect cancels the
+            # FastAPI handler, so the leased path gets a deliberately wide
+            # budget. Pinned retains its historical 60-second behavior.
+            timeout_seconds = 300.0 if lease_token is not None else 60.0
+            response = await self._client.post(
+                url, json=payload, timeout=timeout_seconds
+            )
             if response.status_code == 200:
                 resp_data = response.json()
                 actions = resp_data.get("actions", [])
@@ -1664,20 +1738,28 @@ class OrchestratorClient:
         job_id: str,
         guidance_ids: list[str] | None = None,
         reply_threads: list[str] | None = None,
+        reply_keys: list[str] | None = None,
+        feedback_keys: list[str] | None = None,
+        delegation_keys: list[str] | None = None,
+        checkpoint_id: str | None = None,
     ) -> bool:
         """Ack delivered supervisor guidance / drained queued replies.
 
         The orchestrator atomically moves the named entries from
-        ``context.pending_guidance`` (by entry id) and ``context.queued_replies``
-        (by thread id) to ``context.consumed_replies``, which stops redelivery
-        and lets the sender confirm delivery by reading job context. Best-effort:
-        a failed ack just means redelivery (at-least-once), so callers should
-        fire-and-forget.
+        ``context.pending_guidance`` (by entry id) and
+        ``context.queued_replies`` (by exact key for stateless workers, thread
+        id for legacy pinned callers) to ``context.consumed_replies``. A
+        stateless caller supplies the committed checkpoint proving the entries
+        reached durable graph state. Best-effort: failure means redelivery.
 
         Args:
             job_id: UUID of the job the guidance was delivered to
             guidance_ids: ``pending_guidance`` entry ids rendered into context
             reply_threads: thread ids whose queued replies were drained
+            reply_keys: exact queued-reply identities absorbed by a checkpoint
+            feedback_keys: exact queued-feedback generations absorbed
+            delegation_keys: exact delegation-result generations absorbed
+            checkpoint_id: durable checkpoint proving stateless delivery
 
         Returns:
             True if the orchestrator recorded the ack.
@@ -1689,6 +1771,10 @@ class OrchestratorClient:
         payload = {
             "guidance_ids": guidance_ids or [],
             "reply_threads": reply_threads or [],
+            "reply_keys": reply_keys or [],
+            "feedback_keys": feedback_keys or [],
+            "delegation_keys": delegation_keys or [],
+            "checkpoint_id": checkpoint_id,
         }
 
         try:

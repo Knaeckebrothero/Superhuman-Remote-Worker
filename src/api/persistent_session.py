@@ -47,7 +47,10 @@ from ..core.skill_resolution import (
     skill_bundle_digest,
 )
 from ..core.workspace import WorkspaceManager, WorkspaceManagerConfig
-from ..core.workspace_backend import WorkspaceUnavailableError
+from ..core.workspace_backend import (
+    WorkspaceAuthenticationError,
+    WorkspaceUnavailableError,
+)
 from ..tools import ToolContext, load_tools, apply_instruction_enforcement
 from ..tools.context import SessionRuntimeFacts
 from ..tools.description_manager import apply_description_overrides
@@ -204,6 +207,9 @@ class PersistentSession:
 
     thread_id: str
     config: AgentConfig
+    # Set only by the stateless executor. It must reach RemoteBackend before
+    # workspace/Git initialization can issue its first tmux command.
+    shell_owner_token: Optional[int] = None
 
     # Permission mode (switchable at runtime)
     permission_mode: str = "supervised"
@@ -243,6 +249,9 @@ class PersistentSession:
     # behind memory.manager.enabled; None keeps the legacy direct-store
     # paths in persistent_graph.py and persistent_app.py.
     memory_service: Optional[Any] = None
+    # Set only after every detached memory/citation writer has been terminally
+    # joined.  Queue transitions and claimant-loss ACKs depend on this proof.
+    _background_tasks_quiesced: bool = False
     # B11 double-extraction guard: set after a manager-path session_end/
     # idle_archive capture so _terminate_session doesn't re-extract.
     final_memory_extracted: bool = False
@@ -260,8 +269,6 @@ class PersistentSession:
     # Session task manager (lightweight in-session todos)
     session_task_manager: Optional[Any] = None
 
-    # File checkpoints for undo (turn_id -> list of snapshots)
-    file_checkpoints: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict)
     # Exact hashes of companion-skill files this runtime created. The persisted
     # manifest carries the same ownership proof across session-agent restarts.
     _managed_canvas_skill_files: Dict[str, str] = field(default_factory=dict)
@@ -269,6 +276,14 @@ class PersistentSession:
 
     # Nextcloud workspace sync (initialized if session has nc_session_folder)
     workspace_sync: Optional[Any] = None
+    # Stateless-only immutable requirements armed at turn start. A background
+    # generation push captures this dict rather than the mutable LeaseHandle,
+    # whose token is repointed when lite affinity claims the next turn.
+    cloud_sync_requirements: Dict[str, Any] = field(default_factory=dict)
+    # Orchestrator-attested binding generation, retained even when the current
+    # claim has no cloud target so pending rows for a removed/degraded mount
+    # cannot be hidden merely by omitting the coordinator payload.
+    cloud_sync_workspace_generation: str = ""
     # Lazy rclone cloud mounts (initialized from cloud_mount payload)
     cloud_mount_manager: Optional[Any] = None
     cloud_mount_error: Optional[str] = None
@@ -353,21 +368,69 @@ class PersistentSession:
             self.citation_verify_aux = None
             self.citation_verification_prompt = ""
 
+        _steps: Dict[str, float] = {}
+        _t = time.perf_counter()
+
+        try:
+            await self._setup_steps(
+                _steps,
+                _t,
+                llm=llm,
+                auxiliary_llm=auxiliary_llm,
+                postgres_conn=postgres_conn,
+                vector_conn=vector_conn,
+                workspace_override=workspace_override,
+                git_remote_url=git_remote_url,
+                cloud_mount_cfg=cloud_mount_cfg,
+            )
+        finally:
+            # Close the scoped metadata index opened in _setup_workspace, on
+            # every path — a failed setup must not leave a cached view behind
+            # for whatever runs next on this backend object.
+            self._end_backend_read_cache()
+
+    async def _setup_steps(
+        self,
+        _steps: Dict[str, float],
+        _t: float,
+        *,
+        llm: BaseChatModel,
+        auxiliary_llm: Optional[Any],
+        postgres_conn: Optional[Any],
+        vector_conn: Optional[Any],
+        workspace_override: Optional[Dict[str, Any]],
+        git_remote_url: Optional[str],
+        cloud_mount_cfg: Optional[Dict[str, Any]],
+    ) -> None:
+        """The ordered setup steps of :meth:`setup` (see its docstring).
+
+        Split out only so ``setup`` can wrap the whole sequence in the
+        scoped-index try/finally without indenting every step.
+        """
         # 1. Create workspace (with optional remote backend + git)
         await self._setup_workspace(
             workspace_override=workspace_override, git_remote_url=git_remote_url
         )
+        await self._seed_workspace_baseline_commit(postgres_conn)
+        _steps["workspace"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 2. Set up lazy cloud mounts before shell/tools so `/workspace/cloud`
         #    exists when the agent starts using the workspace.
         await self._setup_cloud_mount(cloud_mount_cfg)
+        _steps["cloud_mount"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 3. Set up shell manager BEFORE tools so shell tools can detect it
         self._setup_shell_manager()
+        _steps["shell"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 4. Initialize knowledge base connections BEFORE tools so knowledge
         #    tools can detect them via ToolContext.has_knowledge()
         self._setup_knowledge(vector_conn)
+        _steps["knowledge"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 4b. Resolve the owning user from the thread row so tools can forward
         #     X-MCP-User-Id on orchestrator calls (fixes the agent's read-job
@@ -386,14 +449,24 @@ class PersistentSession:
                     e,
                 )
 
+        _steps["user_id"] = time.perf_counter() - _t
+        _t = time.perf_counter()
+
         # 5. Create tool context and load tools
         self._setup_tools(postgres_conn)
+        await self._hydrate_durable_session_state()
+        _steps["tools"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 6. Bind tools to LLM
         self._bind_tools()
+        _steps["bind"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 7. Create context manager
         self._setup_context_manager()
+        _steps["context"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 8. Build system prompt (interactive mode has its own prompt files)
         self.system_prompt = get_phase_system_prompt(
@@ -403,16 +476,128 @@ class PersistentSession:
             tool_names=[t.name for t in self.tools] if self.tools else None,
             prompt_type="interactive",
         )
+        _steps["prompt"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 9. Set up memory (RecallStore) if enabled
         self._setup_memory(postgres_conn, vector_conn)
         self._refresh_runtime_facts()
+        _steps["memory"] = time.perf_counter() - _t
 
         logger.info(
             f"PersistentSession initialized: thread={self.thread_id}, "
             f"tools={len(self.tools or [])}, "
             f"mode={self.permission_mode}"
         )
+        logger.info(
+            "setup steps: %s | store: %s",
+            " ".join(f"{k}={v:.2f}s" for k, v in _steps.items() if v >= 0.01),
+            self._drain_store_stats(),
+        )
+
+    async def _seed_workspace_baseline_commit(self, postgres_conn: Any) -> None:
+        """Seed seq=0 with the Git HEAD visible before the first turn.
+
+        The row is create-once in Postgres, so every later pod observes the
+        same pre-first-turn baseline.  Stateless sandbox attach fails closed
+        when an active Git workspace cannot durably publish that baseline;
+        pinned sessions retain their historical best-effort setup behavior.
+        Git-disabled virtual/none workspaces intentionally have no baseline
+        and their undo surface remains unavailable.
+        """
+
+        git_manager = getattr(self.workspace_manager, "git_manager", None)
+        if git_manager is None or not git_manager.is_active:
+            return
+
+        try:
+            if postgres_conn is None:
+                raise RuntimeError("Postgres is unavailable for workspace baseline")
+            commit_sha = await asyncio.to_thread(git_manager.get_current_commit)
+            if not commit_sha:
+                raise RuntimeError("Git HEAD is unavailable for workspace baseline")
+            await postgres_conn.seed_workspace_baseline_commit(
+                self.thread_id,
+                commit_sha,
+            )
+            # Reconcile the current durable HEAD to the latest transcript seq
+            # on every attach.  This heals the crash window where a prior pod
+            # pushed a turn/undo commit but died before its ledger upsert.  On
+            # the first attach it simply records the same baseline beside the
+            # already accepted user row; seq=0 remains the immutable fallback.
+            await postgres_conn.record_turn_commit(self.thread_id, commit_sha)
+            logger.debug(
+                "Workspace baseline/head are durable: thread=%s commit=%s",
+                self.thread_id,
+                commit_sha,
+            )
+        except Exception:
+            if self.shell_owner_token is not None:
+                logger.error(
+                    "Stateless workspace baseline seed failed: thread=%s",
+                    self.thread_id,
+                    exc_info=True,
+                )
+                raise
+            logger.warning(
+                "Pinned workspace baseline seed skipped after failure: thread=%s",
+                self.thread_id,
+                exc_info=True,
+            )
+
+    def _unwrapped_backend(self, backend: Any = None) -> Any:
+        """The real backend behind any virtual overlay wrapper."""
+        try:
+            from ..core.backends.overlay import unwrap_backend
+
+            if backend is None:
+                backend = getattr(self.workspace_manager, "backend", None)
+            return unwrap_backend(backend) if backend is not None else None
+        except Exception:
+            return None
+
+    def _begin_backend_read_cache(self, backend: Any = None) -> None:
+        """Open the backend's scoped metadata index, if it has one.
+
+        Only the virtual (object-store) backend implements this — it is the
+        one whose metadata probes are process spawns. Every other backend
+        no-ops, and a failure here is never fatal: the index is an
+        optimization, not a correctness requirement.
+        """
+        target = self._unwrapped_backend(backend)
+        begin = getattr(target, "begin_read_cache", None)
+        if begin is None:
+            return
+        try:
+            begin()
+        except Exception:
+            logger.debug("backend read-cache priming skipped", exc_info=True)
+
+    def _end_backend_read_cache(self, backend: Any = None) -> None:
+        target = self._unwrapped_backend(backend)
+        end = getattr(target, "end_read_cache", None)
+        if end is None:
+            return
+        try:
+            end()
+        except Exception:
+            logger.debug("backend read-cache close failed", exc_info=True)
+
+    def _drain_store_stats(self) -> str:
+        """Object-store op tally for the phase that just ran, if the backend
+        keeps one (rclone-backed virtual workspaces do — every op there is a
+        process spawn, so the count IS the cost)."""
+        try:
+            from ..core.backends.overlay import unwrap_backend
+
+            backend = getattr(self.workspace_manager, "backend", None)
+            if backend is None:
+                return "n/a"
+            store = getattr(unwrap_backend(backend), "_store", None)
+            drain = getattr(store, "drain_op_stats", None)
+            return drain() if drain is not None else "n/a"
+        except Exception:
+            return "n/a"
 
     async def _setup_workspace(
         self,
@@ -436,6 +621,13 @@ class PersistentSession:
 
         effective_backend = (workspace_override or {}).get("backend") or ws_data.backend
         remote_cfg = (workspace_override or {}).get("remote") or ws_data.remote
+        workspace_generation = (workspace_override or {}).get("workspace_generation")
+        workspace_runtime_incarnation = (workspace_override or {}).get(
+            "workspace_runtime_incarnation"
+        )
+        workspace_ssh_host_key_fingerprint = (workspace_override or {}).get(
+            "workspace_ssh_host_key_fingerprint"
+        )
 
         # No-workspace tiers (virtual/none): no SSH workspace pod. Build the
         # lite backend directly, with git off (§8 — lite tiers have no git).
@@ -451,6 +643,12 @@ class PersistentSession:
             workspace_backend = create_lite_backend(lite_cfg, job_id=self.thread_id)
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, workspace_backend.connect)
+            # Setup asks the store "does this exist?" dozens of times about
+            # one small tree (scaffolding, instruction files, skill files,
+            # the legacy-tools sweep) and every ask is an rclone spawn.
+            # Answer them all from one listing; the scope closes at the end
+            # of setup() so tool work is never served from a cache.
+            self._begin_backend_read_cache(workspace_backend)
             self.workspace_manager = WorkspaceManager(
                 job_id=self.thread_id,
                 base_path=base_path,
@@ -473,6 +671,15 @@ class PersistentSession:
             raise RuntimeError(
                 "No workspace configured. Persistent sessions require "
                 "an isolated workspace (sandbox or vm) with SSH credentials."
+            )
+        if self.shell_owner_token is not None and (
+            not workspace_generation
+            or not workspace_runtime_incarnation
+            or not workspace_ssh_host_key_fingerprint
+        ):
+            raise WorkspaceUnavailableError(
+                "A stateless physical session requires an orchestrator-attested "
+                "workspace backing, runtime incarnation, and SSH host identity"
             )
 
         from ..core.backends.remote import RemoteBackend
@@ -504,7 +711,24 @@ class PersistentSession:
                         "retry_timeouts_as_booting", False
                     ),
                     sudo_action=shell_config.get("sudo_action", "freeze"),
+                    workspace_generation=(
+                        workspace_generation
+                        if self.shell_owner_token is not None
+                        else None
+                    ),
+                    runtime_incarnation=(
+                        workspace_runtime_incarnation
+                        if self.shell_owner_token is not None
+                        else None
+                    ),
+                    expected_host_key_fingerprint=(
+                        workspace_ssh_host_key_fingerprint
+                        if self.shell_owner_token is not None
+                        else None
+                    ),
                 )
+                if self.shell_owner_token is not None:
+                    workspace_backend.set_shell_owner_token(self.shell_owner_token)
                 # Only the internal attach API can attest that this exact SSH
                 # endpoint is paired to a Canvas generation and pinned host
                 # identity. Direct remote config, VMs, and legacy overrides all
@@ -520,11 +744,25 @@ class PersistentSession:
                 ).get("canvas_shared_browser_available") is True
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, workspace_backend.connect)
+                if self.shell_owner_token is not None:
+                    # Promotion is eager, not lazy on the first shell tool: as
+                    # soon as claim N+1 attaches, a stale N backend must fail
+                    # even during an LLM-only turn.
+                    await loop.run_in_executor(
+                        None,
+                        workspace_backend.claim_shell_owner,
+                    )
                 logger.info(
                     f"Remote workspace backend connected to {remote_cfg['host']}"
                 )
                 break
             except Exception as e:
+                if self.shell_owner_token is not None and isinstance(
+                    e, WorkspaceAuthenticationError
+                ):
+                    raise WorkspaceUnavailableError(
+                        f"Stateless workspace SSH identity attestation failed: {e}"
+                    ) from e
                 elapsed = time.monotonic() - start
                 if elapsed >= max_duration:
                     raise WorkspaceUnavailableError(
@@ -657,10 +895,24 @@ class PersistentSession:
     async def _setup_cloud_mount(
         self, cloud_mount_cfg: Optional[Dict[str, Any]]
     ) -> None:
-        """Start the RO rclone lower, then (protected mode) the capture overlay."""
+        """Adopt or start cloud mounts before exposing shell/tools.
+
+        Pinned sessions retain their historical degraded-mode behaviour when a
+        mount cannot be established.  A stateless claim cannot do that: the
+        prior agent may have left workspace-side rclone/overlay processes for
+        this thread, and using the workspace before the new claimant has
+        adopted or healed them would expose stale credentials or a dead FUSE
+        mount.  ``RcloneMountManager.start_all`` therefore includes the first
+        real directory probe and this method propagates failures for stateless
+        claims so :meth:`setup` stops before shell/tool construction.
+        """
         if not cloud_mount_cfg:
             return
         if not self.workspace_manager:
+            if self.shell_owner_token is not None:
+                raise WorkspaceUnavailableError(
+                    "stateless cloud mount requires an attached workspace"
+                )
             return
         try:
             from src.services.cloud_mount import RcloneMountManager
@@ -680,6 +932,8 @@ class PersistentSession:
             self.cloud_mount_error = str(e)
             self.cloud_mount_manager = None
             logger.warning("Failed to start cloud mount manager: %s", e)
+            if self.shell_owner_token is not None:
+                raise
             return
 
         if cloud_mount_cfg.get("protected") and cloud_mount_cfg.get("overlay"):
@@ -705,7 +959,13 @@ class PersistentSession:
                 )
                 # runs the mount script on the workspace pod over SSH
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self.overlay_mount_manager.mount)
+                await loop.run_in_executor(
+                    None,
+                    self.overlay_mount_manager.mount,
+                    lambda: self.cloud_mount_manager.restart_mount(
+                        self._protected_mount_id
+                    ),
+                )
                 logger.info(
                     "Capture overlay mounted for protected session %s", self.thread_id
                 )
@@ -720,24 +980,42 @@ class PersistentSession:
                 self.overlay_mount_manager = None
                 self._protected_mount_id = None
                 # Fail-safe: a protected session whose overlay failed to mount
-                # must NOT keep writing to the raw RO lower thinking it's
-                # protected. Tear down the rclone mount too so the session
-                # ends up with NO cloud access rather than a half-protected
-                # (unprotected) one (deviation from the brief's snippet,
-                # which left the lower mounted on overlay failure).
-                logger.warning(
-                    "Failed to mount capture overlay: %s — tearing down RO lower "
-                    "to avoid a half-protected session",
-                    e,
-                )
+                # must NOT keep running against the raw RO lower. Pinned keeps
+                # its historical degraded-mode teardown. Stateless fails the
+                # whole attach closed and locally detaches from an adopted
+                # resident lower without destroying it for the successor.
+                if self.shell_owner_token is not None:
+                    logger.warning(
+                        "Failed to mount capture overlay: %s — retiring this "
+                        "claim's local lower controller; resident lower is "
+                        "left for successor convergence",
+                        e,
+                    )
+                else:
+                    logger.warning(
+                        "Failed to mount capture overlay: %s — tearing down RO "
+                        "lower to avoid a half-protected session",
+                        e,
+                    )
                 try:
-                    await self.cloud_mount_manager.aclose()
+                    if self.shell_owner_token is not None:
+                        # The lower may be a healthy resident adopted from the
+                        # predecessor. Attach failure owns neither terminal
+                        # thread lifecycle nor permission to destroy that
+                        # durable workspace resource. Retire only this claim's
+                        # local refresh/client authority; the next claimant
+                        # converges the overlay.
+                        await self.cloud_mount_manager.detach_for_handoff()
+                    else:
+                        await self.cloud_mount_manager.aclose()
                 except Exception as close_err:
                     logger.warning(
                         "Error tearing down RO lower after overlay failure: %s",
                         close_err,
                     )
                 self.cloud_mount_manager = None
+                if self.shell_owner_token is not None:
+                    raise
 
     async def _cloud_overlay_monitor_loop(self) -> None:
         """ENOTCONN watchdog for the protected overlay (design §11.6 #3).
@@ -767,11 +1045,23 @@ class PersistentSession:
                     "cloud overlay unhealthy (ENOTCONN) — healing thread=%s",
                     self.thread_id,
                 )
+                # Capture the exact claim-local controller before entering a
+                # worker thread. Cleanup deliberately clears the session
+                # attributes, but cancelling ``to_thread`` cannot stop an
+                # already-running heal. The captured manager's retired
+                # claim-resource admission is what prevents its later remote
+                # steps from mutating a successor.
+                cloud_mount_manager = self.cloud_mount_manager
+                protected_mount_id = self._protected_mount_id
+                if cloud_mount_manager is None or protected_mount_id is None:
+                    logger.error(
+                        "cloud overlay heal lacks its exact lower mount: thread=%s",
+                        self.thread_id,
+                    )
+                    continue
                 await asyncio.to_thread(
                     overlay.heal,
-                    lambda: self.cloud_mount_manager.restart_mount(
-                        self._protected_mount_id
-                    ),
+                    lambda: cloud_mount_manager.restart_mount(protected_mount_id),
                 )
             except asyncio.CancelledError:
                 raise
@@ -1275,7 +1565,10 @@ class PersistentSession:
         # Initialize session task manager
         from ..managers.session_tasks import SessionTaskManager
 
-        self.session_task_manager = SessionTaskManager()
+        self.session_task_manager = SessionTaskManager(
+            thread_id=self.thread_id,
+            postgres=postgres_conn,
+        )
 
         self.tool_context = ToolContext(
             workspace_manager=self.workspace_manager,
@@ -1300,12 +1593,41 @@ class PersistentSession:
         if self.project_ids:
             self.tool_context.project_ids = self.project_ids
 
-        # Wire file checkpoint callback for undo support
-        self.tool_context._snapshot_callback = lambda path: self.snapshot_file(
-            path, self.turn_count
-        )
+        if postgres_conn is not None:
+
+            async def _persist_cloud_anchor(
+                workspace_path: str, anchor: Dict[str, Any]
+            ) -> None:
+                await postgres_conn.upsert_thread_cloud_anchor(
+                    self.thread_id,
+                    workspace_path,
+                    anchor,
+                )
+
+            self.tool_context.cloud_anchor_persist_callback = _persist_cloud_anchor
 
         self._load_tools_for_backend()
+
+    async def _hydrate_durable_session_state(self) -> None:
+        """Restore migration-0133 state before this claimant serves tools.
+
+        The in-process objects are only claim-local views.  Failing setup is
+        safer than silently starting with an empty task list or missing cloud
+        provenance: both would make a healthy pod handoff look like data loss.
+        """
+
+        if self.session_task_manager is not None:
+            await self.session_task_manager.hydrate()
+        if self.postgres_conn is None or self.tool_context is None:
+            return
+        anchors = await self.postgres_conn.list_thread_cloud_anchors(self.thread_id)
+        for workspace_path, anchor in anchors.items():
+            self.tool_context.record_cloud_anchor(workspace_path, anchor)
+        logger.info(
+            "Restored cloud citation anchors: thread=%s anchors=%d",
+            self.thread_id,
+            len(anchors),
+        )
 
     @staticmethod
     def _runtime_backend_id(backend: Any) -> str | None:
@@ -2004,49 +2326,41 @@ class PersistentSession:
         bound_tools = apply_guardrails_to_tools(self.tools, model=self.config.llm.model)
         self.llm_with_tools = self._llm.bind_tools(bound_tools, **bind_kwargs)
 
-    # --- File checkpoints / undo ---
+    # --- Durable workspace undo ---
 
-    def snapshot_file(self, path: str, turn_id: int) -> None:
-        """Record original file content before a write/edit for undo."""
-        import time
+    async def undo_turn(
+        self,
+        turn_id: Optional[int] = None,
+        *,
+        control_request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Restore the preceding Git/turn-ledger workspace checkpoint.
 
-        if turn_id not in self.file_checkpoints:
-            self.file_checkpoints[turn_id] = []
-        # Don't snapshot same file twice in one turn
-        if any(cp["path"] == path for cp in self.file_checkpoints[turn_id]):
-            return
-        try:
-            content = self.workspace_manager.read_file(path)
-        except (FileNotFoundError, OSError):
-            content = None  # File doesn't exist yet
-        self.file_checkpoints[turn_id].append(
-            {
-                "path": path,
-                "original_content": content,
-                "timestamp": time.time(),
-            }
+        ``turn_id`` remains accepted for the pinned WebSocket contract, but the
+        durable operation is intentionally the latest completed-turn undo; the
+        old process-local per-file checkpoint map could not survive handoff and
+        has been removed. Stateless callers supply the durable control UUID so
+        a successor can recover an effect committed before journal ack.
+        """
+
+        from uuid import uuid4
+
+        from ..services.workspace_undo import apply_workspace_undo
+
+        if turn_id is not None:
+            logger.debug(
+                "Workspace undo uses the latest durable turn checkpoint; "
+                "legacy turn_id=%s is advisory",
+                turn_id,
+            )
+        request_id = control_request_id or str(uuid4())
+        result = await apply_workspace_undo(
+            thread_id=self.thread_id,
+            request_id=request_id,
+            postgres=self.postgres_conn,
+            workspace_manager=self.workspace_manager,
         )
-
-    def undo_turn(self, turn_id: Optional[int] = None) -> List[str]:
-        """Restore files from the given turn's checkpoints. Defaults to latest."""
-        if turn_id is None:
-            if not self.file_checkpoints:
-                return []
-            turn_id = max(self.file_checkpoints.keys())
-        checkpoints = self.file_checkpoints.pop(turn_id, [])
-        restored = []
-        for cp in checkpoints:
-            try:
-                if cp["original_content"] is None:
-                    self.workspace_manager.delete_file(cp["path"])
-                else:
-                    self.workspace_manager.write_file(
-                        cp["path"], cp["original_content"]
-                    )
-                restored.append(cp["path"])
-            except Exception as e:
-                logger.warning(f"Failed to restore {cp['path']}: {e}")
-        return restored
+        return result.event_params()
 
     def _build_context_config(self, config: Optional[Any] = None) -> ContextConfig:
         """Derive the ContextConfig from a config's limits (default: current).
@@ -2146,6 +2460,42 @@ class PersistentSession:
             logger.info("ShellManager initialized (backend delegation)")
         except Exception as e:
             logger.warning(f"Failed to initialize ShellManager (non-fatal): {e}")
+
+    def set_shell_owner_token(self, lease_token: Optional[int]) -> None:
+        """Fence remote-shell mutations to the current stateless claim."""
+        if not self.workspace_manager:
+            return
+        from ..core.virtual_dirs import unwrap_backend
+
+        backend = unwrap_backend(self.workspace_manager.backend)
+        setter = getattr(backend, "set_shell_owner_token", None)
+        if setter is not None:
+            setter(lease_token)
+
+    @property
+    def stateless_warm_reuse_safe(self) -> bool:
+        """Whether this Python session may span stateless queue leases.
+
+        A shell-capable backend carries lease-fenced mutable state and may
+        still be referenced by cancelled sync work.  Its owner token must
+        therefore never be repointed in place for a later claim; lite
+        backends have no such agent-local physical-shell state.
+        """
+        backend = self._unwrapped_backend()
+        return backend is not None and not bool(
+            getattr(backend, "supports_shell", False)
+        )
+
+    def retire_shell_owner(self) -> None:
+        """Close this session's local admission to its remote shell."""
+        if not self.workspace_manager:
+            return
+        from ..core.virtual_dirs import unwrap_backend
+
+        backend = unwrap_backend(self.workspace_manager.backend)
+        retire = getattr(backend, "retire_shell_owner", None)
+        if retire is not None:
+            retire()
 
     def _setup_memory(
         self,
@@ -2317,6 +2667,20 @@ class PersistentSession:
                         # The legacy persistent path bounds each store call at
                         # 5 s (_RETRIEVAL_TIMEOUT in persistent_graph.py).
                         retrieval_timeout=5.0,
+                        extra=(
+                            {
+                                "claim_persistent_extraction_interval": (
+                                    lambda turn_count,
+                                    interval: postgres_conn.claim_memory_extraction_interval(
+                                        self.thread_id,
+                                        turn_count=turn_count,
+                                        interval=interval,
+                                    )
+                                )
+                            }
+                            if postgres_conn is not None
+                            else {}
+                        ),
                     ),
                 )
             except Exception as e:
@@ -2364,8 +2728,30 @@ class PersistentSession:
         ):
             new_backend.connect()
 
-        # Disconnect old backend
-        if hasattr(old_backend, "disconnect") and hasattr(old_backend, "is_connected"):
+        # This is a genuine backend retirement, not a queue-claim detach. The
+        # deterministic tmux session belongs to the old workspace and must not
+        # leak after the live tier swap. Destroy it explicitly before the now
+        # transport-only disconnect.
+        if getattr(old_backend, "supports_shell", False):
+            try:
+                retire_shell_owner = getattr(old_backend, "retire_shell_owner", None)
+                if retire_shell_owner is not None:
+                    retire_shell_owner()
+                old_backend.shell_cleanup()
+            except Exception as e:
+                logger.warning(f"Old backend shell cleanup error: {e}")
+
+        # Permanently retire the old Python backend instance. A cancelled sync
+        # tool may still hold it in a worker thread; retirement prevents that
+        # stale object from reconnecting after the swap.
+        if hasattr(old_backend, "retire"):
+            try:
+                old_backend.retire()
+            except Exception as e:
+                logger.warning(f"Old backend retirement error: {e}")
+        elif hasattr(old_backend, "disconnect") and hasattr(
+            old_backend, "is_connected"
+        ):
             try:
                 if old_backend.is_connected():
                     old_backend.disconnect()
@@ -2387,8 +2773,108 @@ class PersistentSession:
             f"({getattr(new_backend, '_host', 'local')})"
         )
 
-    async def cleanup(self) -> None:
-        """Clean up session resources."""
+    async def quiesce_background_tasks(self) -> None:
+        """Close every session-scoped detached writer before owner release.
+
+        The persistent process can attach a different thread immediately after
+        cleanup.  CitationEngine copies its callback and MemoryManager retains
+        pre-compaction tasks, so clearing ToolContext fields alone is not a
+        boundary.  This method is idempotent and deliberately propagates an
+        unjoinable-task failure for stateless callers: the queue lease must stay
+        held until the reaper fences the claimant.
+        """
+
+        if self._background_tasks_quiesced:
+            return
+
+        if self.tool_context is not None:
+            citation_engine = getattr(self.tool_context, "citation_engine", None)
+            if citation_engine is not None:
+                close_engine = getattr(citation_engine, "aclose", None)
+                if close_engine is None:
+                    if self.shell_owner_token is not None:
+                        raise RuntimeError(
+                            "stateless citation engine lacks terminal close"
+                        )
+                else:
+                    await close_engine()
+                # aclose disarms and joins first; only now may the cached
+                # engine/source registry be released.
+                self.tool_context.close_citation_engine()
+
+        if self.memory_service is not None:
+            close_memory = getattr(self.memory_service, "close_background", None)
+            if close_memory is None:
+                if self.shell_owner_token is not None:
+                    raise RuntimeError("stateless memory manager lacks terminal close")
+            else:
+                await close_memory()
+
+        self._background_tasks_quiesced = True
+
+    async def cleanup(
+        self,
+        *,
+        preserve_shell: bool = False,
+        preserve_workspace_daemons: bool = False,
+    ) -> None:
+        """Clean up agent-local resources and disconnect the backend transport.
+
+        ``preserve_shell`` is the queue-claim/ownership handoff disposition:
+        the remote tmux session remains on the workspace for a later claimant.
+        Genuine thread end and backend retirement keep the default destructive
+        shell cleanup.
+
+        ``preserve_workspace_daemons`` is deliberately independent.  It is set
+        only for a stateless physical-claim handoff: the retiring Python owner
+        cancels its overlay monitor and rclone token refresher, closes its
+        Keycloak clients, and retires its mutation fence, while leaving the
+        workspace-side rclone/overlay processes resident for the next claim to
+        adopt or heal.  Pinned detach/drain and genuine thread end keep their
+        historical destructive unmount behaviour.
+        """
+        if preserve_workspace_daemons and self.shell_owner_token is None:
+            # Cleanup must remain best-effort and complete, so do not raise in
+            # this late teardown path.  Ignore the invalid disposition and
+            # retain pinned's destructive semantics instead of risking that a
+            # future caller accidentally strands its mounts.
+            logger.error(
+                "Ignoring workspace-daemon preservation for non-stateless "
+                "session: thread=%s",
+                self.thread_id,
+            )
+            preserve_workspace_daemons = False
+
+        backend_for_cleanup = None
+        shell_retirement_error: Exception | None = None
+        backend_retirement_error: Exception | None = None
+        resident_cleanup_error: Exception | None = None
+        local_handoff_error: Exception | None = None
+        strict_local_handoff = bool(
+            self.shell_owner_token is not None and preserve_workspace_daemons
+        )
+        strict_resident_cleanup = bool(
+            self.shell_owner_token is not None and not preserve_workspace_daemons
+        )
+        if self.workspace_manager:
+            from ..core.virtual_dirs import unwrap_backend
+
+            backend_for_cleanup = unwrap_backend(self.workspace_manager.backend)
+            retire_shell_owner = getattr(
+                backend_for_cleanup, "retire_shell_owner", None
+            )
+            if retire_shell_owner is not None:
+                # Close shell admission before any potentially slow mount,
+                # datasource, memory or Git teardown. Cancelled sync tool work
+                # may still hold this object in a thread; it must not submit
+                # another tmux command during the handoff.
+                retire_shell_owner()
+
+        # Belt for partial-attach and non-standard cleanup call sites. The
+        # ordinary app teardown invokes this before its journal closes; this
+        # idempotent call ensures no alternate path can skip the RAM barrier.
+        await self.quiesce_background_tasks()
+
         if self.tool_context is not None:
             self.tool_context.citation_verdict_callback = None
             self.tool_context.canvas_event_callback = None
@@ -2401,30 +2887,96 @@ class PersistentSession:
                 await self._cloud_overlay_monitor_task
             except asyncio.CancelledError:
                 pass
-            except Exception:
-                logger.debug("cloud overlay monitor task exit", exc_info=True)
-            self._cloud_overlay_monitor_task = None
+            except Exception as exc:
+                if strict_local_handoff:
+                    local_handoff_error = exc
+                    logger.error("Stateless overlay monitor did not stop: %s", exc)
+                else:
+                    logger.debug("cloud overlay monitor task exit", exc_info=True)
+            if local_handoff_error is None:
+                self._cloud_overlay_monitor_task = None
 
         if self.overlay_mount_manager is not None:
             try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self.overlay_mount_manager.unmount)
-            except Exception:
-                logger.debug("overlay unmount failed", exc_info=True)
-            self.overlay_mount_manager = None
+                if preserve_workspace_daemons:
+                    # Local state only.  In particular, do not run any remote
+                    # unmount script after a successor may own the workspace.
+                    self.overlay_mount_manager.detach_local()
+                else:
+                    loop = asyncio.get_running_loop()
+                    if strict_resident_cleanup:
+                        await loop.run_in_executor(
+                            None,
+                            lambda: self.overlay_mount_manager.unmount(strict=True),
+                        )
+                    else:
+                        await loop.run_in_executor(
+                            None, self.overlay_mount_manager.unmount
+                        )
+                self.overlay_mount_manager = None
+            except Exception as exc:
+                if strict_resident_cleanup:
+                    resident_cleanup_error = exc
+                    logger.error("Stateless overlay resident did not retire: %s", exc)
+                elif strict_local_handoff:
+                    local_handoff_error = exc
+                    logger.error("Stateless overlay controller did not detach: %s", exc)
+                else:
+                    logger.debug("overlay cleanup failed", exc_info=True)
+                    self.overlay_mount_manager = None
 
         if self.cloud_mount_manager:
-            try:
-                await self.cloud_mount_manager.aclose()
-            except Exception as e:
-                logger.warning(f"Cloud mount cleanup error: {e}")
-            self.cloud_mount_manager = None
+            if strict_resident_cleanup and resident_cleanup_error is not None:
+                logger.error(
+                    "Skipping rclone retirement because the dependent overlay "
+                    "is still resident"
+                )
+            else:
+                try:
+                    if preserve_workspace_daemons:
+                        await self.cloud_mount_manager.detach_for_handoff()
+                    elif strict_resident_cleanup:
+                        await self.cloud_mount_manager.aclose(strict=True)
+                    else:
+                        await self.cloud_mount_manager.aclose()
+                    self.cloud_mount_manager = None
+                except Exception as exc:
+                    if strict_resident_cleanup:
+                        resident_cleanup_error = exc
+                        logger.error(
+                            "Stateless rclone resident did not retire: %s", exc
+                        )
+                    elif strict_local_handoff:
+                        local_handoff_error = exc
+                        logger.error(
+                            "Stateless rclone controller did not detach: %s", exc
+                        )
+                    else:
+                        logger.warning(f"Cloud mount cleanup error: {exc}")
+                        self.cloud_mount_manager = None
 
-        if self.shell_manager:
+        if self.shell_manager and not preserve_shell:
             try:
                 self.shell_manager.cleanup()
             except Exception as e:
-                logger.warning(f"Shell cleanup error: {e}")
+                if self.shell_owner_token is not None:
+                    # Stateless terminal teardown is an acknowledged remote
+                    # mutation, not best-effort local cleanup. Keep the backend
+                    # retryable and surface failure after the remaining local
+                    # resources have been made inert. A successor can also
+                    # reconcile the fenced record if lifecycle teardown removes
+                    # this runtime before the retry lands.
+                    shell_retirement_error = e
+                    logger.error(
+                        "Stateless shell retirement was not acknowledged: %s", e
+                    )
+                else:
+                    logger.warning(f"Shell cleanup error: {e}")
+        elif self.shell_manager:
+            logger.info(
+                "Preserving remote shell for session handoff: thread=%s",
+                self.thread_id,
+            )
 
         # Close datasource connections
         if self.datasources or self._datasource_clients:
@@ -2443,15 +2995,75 @@ class PersistentSession:
                 logger.warning(f"Error closing knowledge graph: {e}")
             self._knowledge_graph = None
 
-        # Disconnect remote backend if connected
-        if self.workspace_manager:
-            backend = self.workspace_manager.backend
-            if hasattr(backend, "disconnect") and hasattr(backend, "is_connected"):
+        # Retire remote backend instances terminally. Merely disconnecting is a
+        # transport reset and would let cancelled sync work reconnect after the
+        # claim/session handoff.
+        if (
+            self.workspace_manager
+            and resident_cleanup_error is None
+            and local_handoff_error is None
+        ):
+            backend = backend_for_cleanup
+            if shell_retirement_error is not None:
+                retire_claim_resource_owner = getattr(
+                    backend, "retire_claim_resource_owner", None
+                )
+                if retire_claim_resource_owner is not None:
+                    try:
+                        retire_claim_resource_owner()
+                    except Exception as e:
+                        logger.warning(f"Claim-resource retirement error: {e}")
+                # Do not call retire(): it permanently prevents the same session
+                # object from reconnecting for a terminal-retirement retry.
+                # Shell admission and claim-resource admission are already
+                # closed, so a transport reset is sufficient local containment.
+                if hasattr(backend, "disconnect"):
+                    try:
+                        backend.disconnect()
+                    except Exception as e:
+                        logger.warning(f"Backend disconnect error: {e}")
+            elif hasattr(backend, "retire"):
+                try:
+                    backend.retire()
+                    logger.info("Remote workspace backend retired")
+                except Exception as e:
+                    if self.shell_owner_token is not None:
+                        backend_retirement_error = e
+                        logger.error(
+                            "Stateless backend retirement was not acknowledged: %s",
+                            e,
+                        )
+                    else:
+                        logger.warning(f"Backend retirement error: {e}")
+            elif hasattr(backend, "disconnect") and hasattr(backend, "is_connected"):
                 try:
                     if backend.is_connected():
                         backend.disconnect()
                         logger.info("Remote workspace backend disconnected")
                 except Exception as e:
-                    logger.warning(f"Backend disconnect error: {e}")
+                    if self.shell_owner_token is not None:
+                        backend_retirement_error = e
+                        logger.error(
+                            "Stateless backend disconnect was not acknowledged: %s",
+                            e,
+                        )
+                    else:
+                        logger.warning(f"Backend disconnect error: {e}")
 
         logger.info(f"PersistentSession cleaned up: thread={self.thread_id}")
+        if shell_retirement_error is not None:
+            raise WorkspaceUnavailableError(
+                "Stateless session shell retirement remains unacknowledged"
+            ) from shell_retirement_error
+        if resident_cleanup_error is not None:
+            raise WorkspaceUnavailableError(
+                "Stateless workspace residents remain active"
+            ) from resident_cleanup_error
+        if local_handoff_error is not None:
+            raise WorkspaceUnavailableError(
+                "Stateless local workspace controllers remain active"
+            ) from local_handoff_error
+        if backend_retirement_error is not None:
+            raise WorkspaceUnavailableError(
+                "Stateless session backend retirement remains unacknowledged"
+            ) from backend_retirement_error

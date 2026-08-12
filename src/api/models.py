@@ -6,7 +6,7 @@ request validation and response serialization.
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -319,6 +319,26 @@ class JobStartRequest(BaseModel):
     project_id: Optional[str] = Field(
         default=None,
         description="Project ID for connector scoping",
+    )
+    workspace_generation: Optional[str] = Field(
+        default=None,
+        description="Control-plane-attested Kubernetes backing UID",
+    )
+    workspace_runtime_incarnation: Optional[str] = Field(
+        default=None,
+        description="Control-plane-attested current workspace Pod UID",
+    )
+    workspace_ssh_host_key_fingerprint: Optional[str] = Field(
+        default=None,
+        description="Control-plane-attested SSH host-key fingerprint",
+    )
+    workspace_owner_kind: Optional[Literal["job", "session"]] = Field(
+        default=None,
+        description="Kind used by the workspace entrypoint process tag",
+    )
+    workspace_owner_id: Optional[str] = Field(
+        default=None,
+        description="Owner UUID used by the workspace entrypoint process tag",
     )
 
     model_config = ConfigDict(

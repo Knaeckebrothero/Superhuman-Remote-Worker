@@ -119,7 +119,7 @@ class _FakeShellBackend:
     def shell_ensure_tab(self, name):
         self.tabs.append(name)
 
-    def shell_send(self, name, text, enter=True, working_dir=None):
+    def shell_send(self, name, text, enter=True, working_dir=None, allow_busy=False):
         self.sends.append((text, name, working_dir))
         return f"sent {text} to {name}"
 

@@ -658,6 +658,7 @@ def session_create_env(monkeypatch):
         get_user_settings=AsyncMock(return_value={}),
         create_thread=AsyncMock(return_value=SESSION_THREAD_ID),
         acquire=MagicMock(return_value=acquire_cm),
+        merge_thread_workspace_context=AsyncMock(return_value=True),
         list_thread_mounts=AsyncMock(return_value=[]),
         replace_thread_mounts=AsyncMock(),
     )
@@ -698,6 +699,7 @@ def session_create_env(monkeypatch):
     )
     monkeypatch.setattr(main, "docker_provisioner", SimpleNamespace(is_available=False))
     monkeypatch.setattr(main, "agent_provisioner", SimpleNamespace(is_available=False))
+    monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", False)
     monkeypatch.setattr(
         main, "_authorize_thread_datasource_ids", AsyncMock(return_value=[])
     )
@@ -720,6 +722,210 @@ def _persisted_thread_override(conn) -> dict:
 
 
 class TestSessionCreateBoundary:
+    @pytest.mark.asyncio
+    async def test_enabled_pool_auto_admits_sandbox_without_dedicated_agent(
+        self, session_create_env, monkeypatch
+    ):
+        import asyncio
+
+        main, db, conn, _ = session_create_env
+        workspace_create = AsyncMock(return_value=True)
+        schedule_workspace = MagicMock()
+        monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", True)
+        monkeypatch.setattr(
+            main, "_schedule_stateless_workspace_ensure", schedule_workspace
+        )
+        monkeypatch.setattr(
+            main,
+            "container_provisioner",
+            SimpleNamespace(
+                is_available=True,
+                in_cluster=True,
+                create_workspace=workspace_create,
+            ),
+        )
+        monkeypatch.setattr(
+            main,
+            "agent_provisioner",
+            SimpleNamespace(is_available=True, in_cluster=True),
+        )
+        pinned_provision = AsyncMock()
+
+        with patch(
+            "services.provision_or_assign.provision_or_assign", pinned_provision
+        ):
+            result = await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="stateless sandbox",
+                    config_override={"workspace": {"backend": "sandbox"}},
+                ),
+                MagicMock(),
+            )
+            await asyncio.sleep(0)
+
+        assert result == {"thread_id": SESSION_THREAD_ID, "status": "created"}
+        assert db.create_thread.await_args.kwargs["execution_lane"] == "stateless"
+        initial = db.create_thread.await_args.kwargs["initial_metadata"]
+        assert initial["config_override"]["officer"] == {
+            "enabled": False,
+            "conference": False,
+        }
+        creation = initial["workspace_container"]["_stateless_runtime_creation"]
+        assert creation["mode"] == "create"
+        assert creation["attempted"] is False
+        assert creation["replaces_uid"] is None
+        assert str(uuid.UUID(creation["generation"])) == creation["generation"]
+        assert initial["workspace_container"]["status"] == "pending"
+        assert initial["workspace_container"]["provisioner"] == "k8s"
+        conn.execute.assert_not_awaited()
+        db.merge_thread_workspace_context.assert_not_awaited()
+        schedule_workspace.assert_called_once_with(SESSION_THREAD_ID)
+        workspace_create.assert_not_awaited()
+        pinned_provision.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stateless_sandbox_insert_failure_never_schedules_workspace(
+        self, session_create_env, monkeypatch
+    ):
+        from fastapi import HTTPException
+
+        main, db, _, _ = session_create_env
+        schedule_workspace = MagicMock()
+        db.create_thread.side_effect = RuntimeError("insert failed")
+        monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", True)
+        monkeypatch.setattr(
+            main, "_schedule_stateless_workspace_ensure", schedule_workspace
+        )
+        monkeypatch.setattr(
+            main,
+            "container_provisioner",
+            SimpleNamespace(
+                is_available=True,
+                in_cluster=True,
+                create_workspace=AsyncMock(return_value=True),
+            ),
+        )
+
+        with pytest.raises(HTTPException, match="insert failed") as exc:
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="stateless sandbox",
+                    config_override={"workspace": {"backend": "sandbox"}},
+                ),
+                MagicMock(),
+            )
+
+        assert exc.value.status_code == 500
+        schedule_workspace.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disabled_pool_preserves_pinned_sandbox_agent_path(
+        self, session_create_env, monkeypatch
+    ):
+        import asyncio
+
+        main, db, _, _ = session_create_env
+        monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", False)
+        monkeypatch.setattr(
+            main,
+            "container_provisioner",
+            SimpleNamespace(
+                is_available=True,
+                in_cluster=True,
+                create_workspace=AsyncMock(return_value=True),
+            ),
+        )
+        monkeypatch.setattr(
+            main,
+            "agent_provisioner",
+            SimpleNamespace(is_available=True, in_cluster=True),
+        )
+        pinned_provision = AsyncMock()
+
+        with patch(
+            "services.provision_or_assign.provision_or_assign", pinned_provision
+        ):
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="pinned sandbox",
+                    config_override={"workspace": {"backend": "sandbox"}},
+                ),
+                MagicMock(),
+            )
+            await asyncio.sleep(0)
+
+        assert db.create_thread.await_args.kwargs["execution_lane"] == "pinned"
+        pinned_provision.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("class_source", ["account", "expert"])
+    async def test_resolved_pinned_only_class_is_materialized_before_admission(
+        self, session_create_env, monkeypatch, class_source
+    ):
+        import asyncio
+
+        main, db, conn, _ = session_create_env
+        monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", True)
+        monkeypatch.setattr(
+            main,
+            "container_provisioner",
+            SimpleNamespace(
+                is_available=True,
+                in_cluster=True,
+                create_workspace=AsyncMock(return_value=True),
+            ),
+        )
+        monkeypatch.setattr(
+            main,
+            "agent_provisioner",
+            SimpleNamespace(is_available=True, in_cluster=True),
+        )
+        if class_source == "account":
+            monkeypatch.setattr(
+                main,
+                "_resolve_session_account_defaults",
+                AsyncMock(return_value={"officer": {"enabled": True}}),
+            )
+        else:
+            expert_id = str(uuid.uuid4())
+            monkeypatch.setattr(
+                main, "_is_experts_db_enabled", MagicMock(return_value=True)
+            )
+            monkeypatch.setattr(
+                main, "_user_experts_enabled", AsyncMock(return_value=True)
+            )
+            monkeypatch.setattr(
+                main,
+                "resolve_root_expert",
+                AsyncMock(
+                    return_value=SimpleNamespace(
+                        expert={
+                            "id": expert_id,
+                            "expert_type": "session",
+                            "config": {"officer": {"enabled": True}},
+                            "prompts": {},
+                        },
+                        source="application",
+                        project_override=None,
+                    )
+                ),
+            )
+
+        pinned_provision = AsyncMock()
+        with patch(
+            "services.provision_or_assign.provision_or_assign", pinned_provision
+        ):
+            await main.create_thread(
+                main.ThreadCreateRequest(title=f"{class_source} officer"),
+                MagicMock(),
+            )
+            await asyncio.sleep(0)
+
+        assert db.create_thread.await_args.kwargs["execution_lane"] == "pinned"
+        persisted = _persisted_thread_override(conn)
+        assert persisted["officer"] == {"enabled": True, "conference": False}
+        pinned_provision.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_explicit_default_request_materializes_policy_selection(
         self, session_create_env
@@ -963,6 +1169,7 @@ class TestPrepareBoundary:
                         "user_id": "u1",
                         "agent_id": None,
                         "config_name": "session_base",
+                        "execution_lane": "pinned",
                     }
                 )
             ),

@@ -260,6 +260,129 @@ async def test_agent_registration_persists_full_provenance_beside_legacy_short_s
 
 
 @pytest.mark.asyncio
+async def test_agent_registration_expected_id_updates_only_that_hostname_row():
+    with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+        database = PostgresDB()
+    expected_id = UUID("44444444-4444-4444-4444-444444444444")
+    connection = AsyncMock()
+    connection.fetchrow = AsyncMock(return_value={"id": expected_id})
+    connection.execute = AsyncMock(side_effect=["UPDATE 0", "UPDATE 1"])
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    database.acquire = acquire
+
+    result = await database.register_agent(
+        config_name="session_base",
+        pod_ip="10.0.0.5",
+        hostname="agent-winner-host",
+        agent_mode="persistent",
+        thread_id=str(_THREAD_ID),
+        expected_agent_id=str(expected_id),
+    )
+
+    select_sql, *select_parameters = connection.fetchrow.await_args.args
+    assert "WHERE id = $1 AND hostname = $2" in select_sql
+    assert select_parameters == [expected_id, "agent-winner-host"]
+    assert connection.execute.await_count == 2
+    update_sql = connection.execute.await_args_list[1].args[0]
+    assert "WHERE id = $5" in update_sql
+    assert connection.execute.await_args_list[1].args[5] == expected_id
+    assert result["agent_id"] == str(expected_id)
+
+
+@pytest.mark.asyncio
+async def test_agent_registration_missing_expected_row_has_no_side_effects():
+    with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+        database = PostgresDB()
+    connection = AsyncMock()
+    connection.fetchrow = AsyncMock(return_value=None)
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    database.acquire = acquire
+
+    with pytest.raises(
+        RuntimeError,
+        match="expected agent no longer matches registration hostname",
+    ):
+        await database.register_agent(
+            config_name="session_base",
+            pod_ip="10.0.0.5",
+            hostname="agent-winner-host",
+            agent_mode="persistent",
+            thread_id=str(_THREAD_ID),
+            expected_agent_id="44444444-4444-4444-4444-444444444444",
+        )
+
+    connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_registration_lost_exact_update_fails_closed():
+    with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+        database = PostgresDB()
+    expected_id = UUID("44444444-4444-4444-4444-444444444444")
+    connection = AsyncMock()
+    connection.fetchrow = AsyncMock(return_value={"id": expected_id})
+    connection.execute = AsyncMock(side_effect=["UPDATE 0", "UPDATE 0"])
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    database.acquire = acquire
+
+    with pytest.raises(
+        RuntimeError,
+        match="expected agent disappeared during exact registration update",
+    ):
+        await database.register_agent(
+            config_name="session_base",
+            pod_ip="10.0.0.5",
+            hostname="agent-winner-host",
+            agent_mode="persistent",
+            thread_id=str(_THREAD_ID),
+            expected_agent_id=str(expected_id),
+        )
+
+
+@pytest.mark.asyncio
+async def test_agent_registration_insert_only_never_reuses_hostname_row():
+    with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+        database = PostgresDB()
+    inserted_id = UUID("55555555-5555-5555-5555-555555555555")
+    connection = AsyncMock()
+    connection.fetchrow = AsyncMock(return_value={"id": inserted_id})
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    database.acquire = acquire
+
+    result = await database.register_agent(
+        config_name="session_base",
+        pod_ip="10.0.0.5",
+        hostname="non-unique-hostname",
+        agent_mode="persistent",
+        thread_id=str(_THREAD_ID),
+        insert_only=True,
+    )
+
+    assert connection.fetchrow.await_count == 1
+    sql = connection.fetchrow.await_args.args[0]
+    assert "INSERT INTO agents" in sql
+    assert "SELECT id FROM agents" not in sql
+    connection.execute.assert_not_awaited()
+    assert result["agent_id"] == str(inserted_id)
+
+
+@pytest.mark.asyncio
 async def test_service_reports_all_components_and_mixed_agent_orchestrator_builds():
     async def grants(_db: Any, **_kwargs: Any) -> dict[str, Any]:
         return {

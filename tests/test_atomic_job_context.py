@@ -81,9 +81,21 @@ async def db(pg_dsn):
                 id uuid PRIMARY KEY,
                 context jsonb,
                 status text,
+                execution_lane text NOT NULL DEFAULT 'pinned',
                 freeze_data jsonb,
                 assigned_agent_id text,
                 updated_at timestamptz DEFAULT now()
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE checkpoints (
+                thread_id text NOT NULL,
+                checkpoint_ns text NOT NULL DEFAULT '',
+                checkpoint_id text NOT NULL,
+                metadata jsonb NOT NULL DEFAULT '{}',
+                PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
             )
             """
         )
@@ -577,6 +589,155 @@ class TestConsumeJobGuidance:
         ctx = await _read_ctx(db, jid)
         assert [r["thread_id"] for r in ctx["queued_replies"]] == ["other"]
         assert [r["thread_id"] for r in ctx["consumed_replies"]] == ["officer"]
+
+    @pytest.mark.asyncio
+    async def test_stateless_exact_reply_key_preserves_newer_same_thread(self, db):
+        from src.shared.job_steering import queued_reply_key
+
+        jid = str(uuid4())
+        first = {
+            "id": str(uuid4()),
+            "thread_id": "officer",
+            "message": "first",
+            "timestamp": "2026-08-10T01:00:00+00:00",
+        }
+        newer = {
+            "id": str(uuid4()),
+            "thread_id": "officer",
+            "message": "newer",
+            "timestamp": "2026-08-10T01:01:00+00:00",
+        }
+        await _insert_job(db, jid, {"queued_replies": [first, newer]})
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET execution_lane = 'stateless' WHERE id = $1",
+                uuid.UUID(jid),
+            )
+            await conn.execute(
+                "INSERT INTO checkpoints "
+                "(thread_id, checkpoint_ns, checkpoint_id, metadata) "
+                "VALUES ($1, '', 'cp-7', '{\"step\": 7}'::jsonb)",
+                jid,
+            )
+
+        moved = await db.consume_job_guidance(
+            jid,
+            reply_keys=[queued_reply_key(first)],
+            checkpoint_id="cp-7",
+        )
+
+        assert moved == 1
+        ctx = await _read_ctx(db, jid)
+        assert ctx["queued_replies"] == [newer]
+        assert ctx["consumed_replies"][0]["id"] == first["id"]
+        assert ctx["consumed_replies"][0]["consumed_checkpoint_id"] == "cp-7"
+        assert ctx["consumed_replies"][0]["consumed_checkpoint_step"] == 7
+
+    @pytest.mark.asyncio
+    async def test_stateless_missing_checkpoint_proof_preserves_inbox(self, db):
+        jid = str(uuid4())
+        await _insert_job(db, jid, {"pending_guidance": [{"id": "g1"}]})
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET execution_lane = 'stateless' WHERE id = $1",
+                uuid.UUID(jid),
+            )
+
+        with pytest.raises(ValueError, match="checkpoint"):
+            await db.consume_job_guidance(jid, guidance_ids=["g1"])
+
+        assert (await _read_ctx(db, jid))["pending_guidance"] == [{"id": "g1"}]
+
+    @pytest.mark.asyncio
+    async def test_stateless_unknown_checkpoint_preserves_inbox(self, db):
+        jid = str(uuid4())
+        await _insert_job(db, jid, {"pending_guidance": [{"id": "g1"}]})
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET execution_lane = 'stateless' WHERE id = $1",
+                uuid.UUID(jid),
+            )
+
+        with pytest.raises(ValueError, match="does not exist"):
+            await db.consume_job_guidance(
+                jid,
+                guidance_ids=["g1"],
+                checkpoint_id="missing",
+            )
+
+        assert (await _read_ctx(db, jid))["pending_guidance"] == [{"id": "g1"}]
+
+    @pytest.mark.asyncio
+    async def test_stateless_one_shot_ack_clears_only_exact_generation(self, db):
+        from src.shared.job_steering import context_delivery_key
+
+        jid = str(uuid4())
+        context = {
+            "queued_feedback": "try again",
+            "queued_feedback_reason": "review",
+            "queued_feedback_delivery_id": "feedback-new",
+            "delegation_results": [{"job_id": "child-1", "status": "completed"}],
+            "delegation_results_delivery_id": "delegation-new",
+            "keep": "me",
+        }
+        await _insert_job(db, jid, context)
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET execution_lane = 'stateless' WHERE id = $1",
+                uuid.UUID(jid),
+            )
+            await conn.execute(
+                "INSERT INTO checkpoints "
+                "(thread_id, checkpoint_ns, checkpoint_id, metadata) "
+                "VALUES ($1, '', 'cp-8', '{\"step\": 8}'::jsonb)",
+                jid,
+            )
+
+        stale_feedback_key = context_delivery_key(
+            "feedback",
+            "try again",
+            delivery_id="feedback-old",
+            companion="review",
+        )
+        assert (
+            await db.consume_job_guidance(
+                jid,
+                feedback_keys=[stale_feedback_key],
+                checkpoint_id="cp-8",
+            )
+            == 0
+        )
+        assert (await _read_ctx(db, jid))["queued_feedback_delivery_id"] == (
+            "feedback-new"
+        )
+
+        feedback_key = context_delivery_key(
+            "feedback",
+            context["queued_feedback"],
+            delivery_id=context["queued_feedback_delivery_id"],
+            companion=context["queued_feedback_reason"],
+        )
+        delegation_key = context_delivery_key(
+            "delegation",
+            context["delegation_results"],
+            delivery_id=context["delegation_results_delivery_id"],
+        )
+        assert (
+            await db.consume_job_guidance(
+                jid,
+                feedback_keys=[feedback_key],
+                delegation_keys=[delegation_key],
+                checkpoint_id="cp-8",
+            )
+            == 2
+        )
+        ctx = await _read_ctx(db, jid)
+        assert "queued_feedback" not in ctx
+        assert "queued_feedback_reason" not in ctx
+        assert "queued_feedback_delivery_id" not in ctx
+        assert "delegation_results" not in ctx
+        assert "delegation_results_delivery_id" not in ctx
+        assert ctx["keep"] == "me"
 
     @pytest.mark.asyncio
     async def test_idempotent_reack_is_noop(self, db):
