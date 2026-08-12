@@ -101,37 +101,37 @@ data:
                 userData: |
                   #cloud-config
                   write_files:
-                    - path: /etc/default/management-daemon
-                      permissions: '0644'
-                      content: |
-                        NATS_URL=${NATS_URL}
-                        JOB_ID=${JOB_ID}
-                        ORCHESTRATOR_ID=${ORCHESTRATOR_ID}
-                    - path: /run/agent/job-config.json
-                      permissions: '0644'
-                      content: |
-                        {
-                          "job_id": "${JOB_ID}",
-                          "agent_config": "${AGENT_CONFIG}",
-                          "vm_image": "${VM_IMAGE}",
-                          "cpu_cores": ${CPU_CORES},
-                          "memory": "${MEMORY}",
-                          "description": "${DESCRIPTION}",
-                          "nats_url": "${NATS_URL}",
-                          "orchestrator_id": "${ORCHESTRATOR_ID}"
-                        }
-                    - path: /etc/default/sudo-gated
-                      permissions: '0644'
-                      content: |
-                        NATS_URL=${NATS_URL}
-                        JOB_ID=${JOB_ID}
-                        ORCHESTRATOR_ID=${ORCHESTRATOR_ID}
-                        VM_ID=agent-vm-${JOB_ID}
-                    - path: /etc/ssh/authorized_keys/agent-host
-                      permissions: '0600'
-                      owner: agent-host:agent-host
-                      content: |
-                        {{ $sshPubKey }}
+                  - path: /etc/default/management-daemon
+                    permissions: '0644'
+                    content: |
+                      NATS_URL=${NATS_URL}
+                      JOB_ID=${JOB_ID}
+                      ORCHESTRATOR_ID=${ORCHESTRATOR_ID}
+                  - path: /run/agent/job-config.json
+                    permissions: '0644'
+                    content: |
+                      {
+                        "job_id": "${JOB_ID}",
+                        "agent_config": "${AGENT_CONFIG}",
+                        "vm_image": "${VM_IMAGE}",
+                        "cpu_cores": ${CPU_CORES},
+                        "memory": "${MEMORY}",
+                        "description": "${DESCRIPTION}",
+                        "nats_url": "${NATS_URL}",
+                        "orchestrator_id": "${ORCHESTRATOR_ID}"
+                      }
+                  - path: /etc/default/sudo-gated
+                    permissions: '0644'
+                    content: |
+                      NATS_URL=${NATS_URL}
+                      JOB_ID=${JOB_ID}
+                      ORCHESTRATOR_ID=${ORCHESTRATOR_ID}
+                      VM_ID=agent-vm-${JOB_ID}
+                  - path: /etc/ssh/authorized_keys/agent-host
+                    permissions: '0600'
+                    owner: agent-host:agent-host
+                    content: |
+                      {{ $sshPubKey }}
                   runcmd:
                     - mkdir -p /run/agent
                     - chmod 755 /run/agent

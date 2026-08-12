@@ -61,6 +61,8 @@ spec:
               value: {{ .Values.vmController.vmStorageClass | quote }}
             - name: VM_DISK_SIZE
               value: {{ .Values.vmController.vmDiskSize | quote }}
+            - name: ORCHESTRATOR_ID
+              value: {{ include "srw.orchestratorId" . | quote }}
             {{- if .Values.vmController.lifecycleAuthSecretName }}
             - name: VM_LIFECYCLE_HMAC_SECRET
               valueFrom:
