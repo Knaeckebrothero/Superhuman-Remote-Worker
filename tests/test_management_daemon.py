@@ -105,6 +105,23 @@ def _make_daemon(**config_overrides) -> ManagementDaemon:
     return ManagementDaemon(_make_config(**config_overrides))
 
 
+@pytest.fixture(autouse=True)
+def _fast_poll_intervals(monkeypatch):
+    """Exercise polling transitions without waiting on production intervals.
+
+    The constants copied above retain the production values for TestConstants.
+    Loop tests care about state transitions and shutdown behavior, not whether
+    the real heartbeat takes 30 seconds, so keep their clocks deterministic.
+    """
+    for name in (
+        "HEARTBEAT_INTERVAL",
+        "AGENT_POLL_INTERVAL",
+        "NATS_RETRY_INTERVAL",
+        "IP_RECHECK_INTERVAL",
+    ):
+        monkeypatch.setattr(daemon_mod, name, 0.001)
+
+
 @pytest.fixture
 def daemon():
     """Provide a fresh ManagementDaemon instance for each test."""

@@ -13,6 +13,7 @@ aux-degraded heartbeat flag lights up), and only raise when there is no
 fallback or the fallback also fails.
 """
 
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -32,6 +33,16 @@ from src.services.auxiliary import (
     CurateKnowledgeTask,
     CurationResult,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_backoff(monkeypatch):
+    """Keep retry semantics under test without real one-second backoffs."""
+    from src.services import auxiliary
+
+    fast_policy = replace(auxiliary._AUX_RETRY, base_delay=0.0, max_delay=0.0)
+    monkeypatch.setattr(auxiliary, "_AUX_RETRY", fast_policy)
+    monkeypatch.setattr(auxiliary, "_AUX_FALLBACK_RETRY", fast_policy)
 
 
 # ---------------------------------------------------------------------------

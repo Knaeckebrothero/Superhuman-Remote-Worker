@@ -404,8 +404,11 @@ jobs:
           helm dependency build helm/
       - name: Install dependencies
         run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt -r orchestrator/mcp/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+      # Keep tests from the same file on one worker so file-local fixture/order
+      # assumptions remain intact. The runner caps worker count and also scales
+      # down automatically on smaller GitHub-hosted runners.
       - name: Run tests
-        run: pytest tests/ -x -q --tb=short
+        run: ./scripts/pytest-fast.sh
 
   # ---------------------------------------------------------------------------
   # Cockpit unit + production-browser conformance tests — always run on main
