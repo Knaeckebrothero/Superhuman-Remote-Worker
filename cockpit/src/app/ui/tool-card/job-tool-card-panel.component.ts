@@ -17,6 +17,8 @@ import {JobWatchService} from '../../core/services/job-watch.service';
 import {ApiService} from '../../core/services/api.service';
 import {
     asRecord,
+    canResumeJobStatus,
+    jobStatusLabelKey,
     isRunningJobStatus,
     isTerminalJobStatus,
     jobStatusTone,
@@ -64,7 +66,14 @@ import {
     @if (job()) {
       <div class="jc">
         <div class="jc__row">
-          <app-badge [tone]="tone()" size="xs">{{ statusLabel() }}</app-badge>
+          <!-- The status in the product's words ("Pending Review"), not the
+               database enum. jobs.status.* already existed and is what the Jobs
+               page shows; this card was printing the raw value for the same row.
+               Unknown statuses fall back to the raw value rather than to a bare
+               i18n key. -->
+          <app-badge [tone]="tone()" size="xs">
+            {{ statusKey() ? (statusKey()! | transloco) : rawStatus() }}
+          </app-badge>
           <span class="jc__id" [title]="entity().id">{{ shortId() }}</span>
           @if (running()) {
             <app-icon size="xs" class="jc__spin">progress_activity</app-icon>
@@ -75,26 +84,62 @@ import {
           <p class="jc__summary">{{ s }}</p>
         }
 
-        <div class="jc__actions">
-          @if (canApprove()) {
-            <button type="button" class="jc__btn jc__btn--primary"
-                    [disabled]="busy()" (click)="approve()">
-              {{ 'toolCard.job.approve' | transloco }}
-            </button>
-          }
-          @if (canOpenDiff()) {
-            <button type="button" class="jc__btn" [disabled]="busy()"
-                    (click)="diffRequested.emit(entity().id)">
-              {{ 'toolCard.job.openDiff' | transloco }}
-            </button>
-          }
-          @if (canCancel()) {
-            <button type="button" class="jc__btn jc__btn--danger"
-                    [disabled]="busy()" (click)="cancel()">
-              {{ 'toolCard.job.cancel' | transloco }}
-            </button>
-          }
-        </div>
+        <!-- Composing replaces the action row rather than sitting under it, so
+             the only "cancel" on screen means "cancel writing" — next to a
+             "Cancel job" button it would be a one-click accident. -->
+        @if (composing()) {
+          <div class="jc__compose">
+            <textarea class="jc__input" rows="3" [value]="feedback()"
+                      [disabled]="busy()"
+                      [placeholder]="'toolCard.job.feedbackPlaceholder' | transloco"
+                      (input)="feedback.set($any($event.target).value)"
+                      (keydown.control.enter)="resumeWithFeedback()"
+                      (keydown.meta.enter)="resumeWithFeedback()"></textarea>
+            <div class="jc__actions">
+              <!-- canResume() again, not just at open time: a poll can land
+                   mid-typing and take the job somewhere unresumable (the agent
+                   approves it). Same rule as every other button here — gated on
+                   the status *now*. The draft stays on screen rather than being
+                   yanked; only the dead action is unclickable. -->
+              <button type="button" class="jc__btn jc__btn--primary"
+                      [disabled]="busy() || !feedback().trim() || !canResume()"
+                      (click)="resumeWithFeedback()">
+                {{ 'toolCard.job.feedbackSubmit' | transloco }}
+              </button>
+              <button type="button" class="jc__btn" [disabled]="busy()"
+                      (click)="composing.set(false)">
+                {{ 'toolCard.job.feedbackDismiss' | transloco }}
+              </button>
+            </div>
+          </div>
+        } @else {
+          <div class="jc__actions">
+            @if (canApprove()) {
+              <button type="button" class="jc__btn jc__btn--primary"
+                      [disabled]="busy()" (click)="approve()">
+                {{ 'toolCard.job.approve' | transloco }}
+              </button>
+            }
+            @if (canResume()) {
+              <button type="button" class="jc__btn" [disabled]="busy()"
+                      (click)="composing.set(true)">
+                {{ 'toolCard.job.resumeWithFeedback' | transloco }}
+              </button>
+            }
+            @if (canOpenDiff()) {
+              <button type="button" class="jc__btn" [disabled]="busy()"
+                      (click)="diffRequested.emit(entity().id)">
+                {{ 'toolCard.job.openDiff' | transloco }}
+              </button>
+            }
+            @if (canCancel()) {
+              <button type="button" class="jc__btn jc__btn--danger"
+                      [disabled]="busy()" (click)="cancel()">
+                {{ 'toolCard.job.cancel' | transloco }}
+              </button>
+            }
+          </div>
+        }
       </div>
     }
   `,
@@ -110,15 +155,41 @@ import {
       white-space: pre-wrap; overflow-wrap: anywhere;
     }
     .jc__actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .jc__compose { display: flex; flex-direction: column; gap: 6px; }
+    .jc__input {
+      width: 100%; box-sizing: border-box; resize: vertical;
+      padding: 6px 8px; font: inherit; font-size: 12px; line-height: 1.45;
+      border-radius: var(--radius-control); color: inherit;
+      border: 1px solid var(--border-color);
+      background: var(--surface-0);
+    }
+    .jc__input:focus { outline: 1px solid var(--accent-color); outline-offset: -1px; }
+    .jc__input:disabled { opacity: 0.5; }
     .jc__btn {
-      padding: 3px 10px; font-size: 11.5px; border-radius: 5px; cursor: pointer;
-      border: 1px solid var(--border-color, rgba(127,127,127,0.3));
+      padding: 4px 10px; min-height: 24px; font-size: 11.5px;
+      border-radius: var(--radius-control); cursor: pointer;
+      border: 1px solid var(--border-color);
       background: transparent; color: inherit;
     }
-    .jc__btn:hover:not(:disabled) { background: rgba(127,127,127,0.12); }
+    .jc__btn:hover:not(:disabled) { background: var(--hover); }
     .jc__btn:disabled { opacity: 0.5; cursor: default; }
-    .jc__btn--primary { border-color: var(--accent-color); color: var(--accent-color); }
-    .jc__btn--danger { border-color: var(--danger-color, #e5534b); color: var(--danger-color, #e5534b); }
+    /* Primary is FILLED and destructive is TINTED, rather than both being
+       outlines in different hues. Two reasons: it gives the row an actual
+       hierarchy (the recommended action reads as the recommended action), and
+       --danger === --accent-color in the Roman themes, so hue alone cannot tell
+       Approve from Cancel job. Weight can. Mirrors the shared button component's
+       'primary' and 'warning' variants. */
+    .jc__btn--primary {
+      background: var(--accent-color); color: var(--on-accent);
+      border-color: var(--accent-color);
+    }
+    .jc__btn--danger {
+      background: var(--danger-tint); color: var(--danger); border-color: transparent;
+    }
+    /* Filled/tinted buttons keep their own background on hover — the generic
+       .jc__btn:hover above would repaint them with the neutral --hover. */
+    .jc__btn--primary:hover:not(:disabled) { background: var(--accent-color); filter: brightness(1.08); }
+    .jc__btn--danger:hover:not(:disabled) { background: var(--danger-tint); filter: brightness(1.08); }
   `,
 })
 export class JobToolCardPanelComponent {
@@ -130,6 +201,11 @@ export class JobToolCardPanelComponent {
     private readonly api = inject(ApiService);
 
     protected readonly busy = signal(false);
+    /** Whether the feedback composer is open. Collapsed by default — the card
+     *  sits inline in a transcript and a permanently open textarea would make
+     *  every historical job call three lines taller. */
+    protected readonly composing = signal(false);
+    protected readonly feedback = signal('');
 
     constructor() {
         // Subscribe on first render and whenever the card is pointed at a
@@ -146,7 +222,20 @@ export class JobToolCardPanelComponent {
 
     protected readonly shortId = computed(() => this.entity().id.slice(0, 8));
     protected readonly tone = computed(() => jobStatusTone(this.job()?.status ?? ''));
-    protected readonly statusLabel = computed(() => this.job()?.status ?? '');
+
+    /**
+     * The status in the product's own words — "Pending Review", not
+     * `pending_review`.
+     *
+     * `jobs.status.*` already exists in both locales and is what the Jobs page
+     * shows; this card was rendering the raw database enum, underscore and all,
+     * for the same row. Falls back to the raw value when a status has no
+     * translation — `waiting_for_reply` is in the DB CHECK constraint but not in
+     * the locale files, so that gap is real and shows up as `waiting_for_reply`
+     * rather than as a bare i18n key.
+     */
+    protected readonly statusKey = computed(() => jobStatusLabelKey(this.job()?.status));
+    protected readonly rawStatus = computed(() => this.job()?.status ?? '');
     protected readonly running = computed(() => isRunningJobStatus(this.job()?.status));
 
     /**
@@ -182,6 +271,7 @@ export class JobToolCardPanelComponent {
         () => this.job()?.status === 'pending_review',
     );
     protected readonly canCancel = computed(() => !isTerminalJobStatus(this.job()?.status));
+    protected readonly canResume = computed(() => canResumeJobStatus(this.job()?.status));
     protected readonly canOpenDiff = computed(() => {
         const s = this.job()?.diff_status;
         return s === 'pending' || this.job()?.status === 'pending_review';
@@ -196,6 +286,29 @@ export class JobToolCardPanelComponent {
     }
 
     /**
+     * Hand the job back with guidance — the third review outcome.
+     *
+     * Approve and Cancel are "ship it" and "kill it"; the common answer to a
+     * job that stopped for review is neither, it is "close, but do X". Without
+     * this the user has to leave the transcript for the Jobs page, which is the
+     * trip this card exists to remove (docs/features/unified_tool_cards.md).
+     *
+     * The draft survives a failed send. `run()` reports the API's result rather
+     * than swallowing it, so a resume rejected by the resume PEP (403 on a
+     * grant denial, 409 on an unresolvable stored config — main.py:13597) leaves
+     * the composer open with the text still in it. Clearing on failure would
+     * discard what the user wrote and show only a toast.
+     */
+    async resumeWithFeedback(): Promise<void> {
+        const text = this.feedback().trim();
+        if (!text || this.busy() || !this.canResume()) return;
+        const result = await this.run(this.api.resumeJob(this.entity().id, text));
+        if (result === null) return;
+        this.feedback.set('');
+        this.composing.set(false);
+    }
+
+    /**
      * Run one action, then force a refresh so the card settles on the job's real
      * state rather than an optimistic guess.
      *
@@ -207,12 +320,18 @@ export class JobToolCardPanelComponent {
      * dead-button-resurrected-by-history failure the permission path hit cannot
      * arise. The refresh below closes the remaining window — if the agent
      * approved the job a second before the user did, the card corrects itself.
+     *
+     * Returns the call's result (null on failure, since `ApiService` maps errors
+     * to null) so a caller that owns user-entered state can decide whether to
+     * clear it — see {@link resumeWithFeedback}. Buttons that own nothing ignore
+     * it, as before.
      */
-    private async run(call: Observable<unknown>): Promise<void> {
+    private async run(call: Observable<unknown>): Promise<unknown> {
         this.busy.set(true);
         try {
-            await firstValueFrom(call).catch(() => null);
+            const result = await firstValueFrom(call).catch(() => null);
             await this.watcher.refresh(this.entity().id);
+            return result;
         } finally {
             this.busy.set(false);
         }

@@ -326,6 +326,10 @@ export class AppToolCardComponent implements OnDestroy {
                 return 'progress_activity';
             case 'denied':
                 return 'block';
+            case 'expired':
+                // Not 'block' — that reads as a refusal. The gate simply went
+                // unanswered and the call never ran.
+                return 'do_not_disturb_on';
             case 'error':
                 return 'error';
             default:

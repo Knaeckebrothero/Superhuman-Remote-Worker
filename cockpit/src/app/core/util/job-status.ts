@@ -43,6 +43,31 @@ export function isRunningJobStatus(status: string | null | undefined): boolean {
 }
 
 /**
+ * Statuses from which a human can hand the job back with guidance.
+ *
+ * The rule is "stopped, and will not restart itself": the job is waiting on a
+ * person, so replying to it is meaningful.
+ *
+ * Narrower than the server, deliberately. `POST /api/jobs/{id}/resume` accepts
+ * every status except `completed` (main.py:13658), but two of those would be
+ * wrong to offer in a transcript card:
+ *
+ * - **`paused`** is dispatchable-and-unassigned — the dispatcher re-picks it on
+ *   its own, and the card is already showing a spinner for it
+ *   ({@link isRunningJobStatus}). A "continue" button under a spinner reads as
+ *   broken.
+ * - **`processing`/`created`/`waiting`/`reviewing`** are live; the job has not
+ *   asked for anything.
+ *
+ * So: `pending_review` (the frozen-for-review case this exists for), plus
+ * `failed` and `cancelled` (retry with guidance) — the same set the Jobs list
+ * offers plain Resume on, minus `paused` and `created`.
+ */
+export function canResumeJobStatus(status: string | null | undefined): boolean {
+    return status === 'pending_review' || status === 'failed' || status === 'cancelled';
+}
+
+/**
  * Coerce a job's JSONB-backed field into an object.
  *
  * `GET /api/jobs/{id}` returns `context` and `freeze_data` as raw JSON
@@ -69,6 +94,30 @@ export function asRecord(value: unknown): Record<string, unknown> | null {
         }
     }
     return null;
+}
+
+/**
+ * Job statuses that have a `jobs.status.*` label in the locale files.
+ *
+ * Mirrors the `valid_status` CHECK constraint on `jobs`
+ * (`0001_initial.sql:557`) — keep the two in step, and add the locale entry in
+ * BOTH `en.json` and `de-DE.json` when the server gains a status, or the badge
+ * silently degrades to the raw enum.
+ *
+ * Exists so the label can be resolved by the `transloco` pipe (which handles
+ * catalogue loading and language switches) while still falling back to the raw
+ * value for an unknown status. Resolving it with `TranslocoService.translate()`
+ * inside a `computed()` looks simpler and is wrong: the call emits a transloco
+ * event, and emitting during template evaluation trips NG0600.
+ */
+const LABELLED_JOB_STATUSES: ReadonlySet<string> = new Set([
+    'created', 'processing', 'completed', 'failed', 'cancelled',
+    'pending_review', 'paused', 'reviewing', 'waiting', 'waiting_for_reply',
+]);
+
+/** i18n key for a job status, or null when it has no label to fall back from. */
+export function jobStatusLabelKey(status: string | null | undefined): string | null {
+    return status && LABELLED_JOB_STATUSES.has(status) ? `jobs.status.${status}` : null;
 }
 
 /** Badge tone for a job status. Single source of truth for all three surfaces. */

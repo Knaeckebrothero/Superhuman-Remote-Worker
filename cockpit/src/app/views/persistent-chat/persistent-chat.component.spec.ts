@@ -6,19 +6,27 @@ import {
     clearDraft,
     cloudBadgeVisible,
     composeDenyPrefill,
+    countTurnsAfter,
+    describeAttachmentRejection,
     draftKey,
     extractClipboardFiles,
+    filterRewindCandidates,
     formatPermissionArgs,
+    permissionApproveKey,
+    permissionTitleKey,
+    formatRewindStamp,
     HEADER_FOLD_HYSTERESIS_PX,
     HEADER_LEFT_RESERVE_PX,
     isMicMode,
     isNearBottom,
+    isRewindCommand,
     isStartupBannerVisible,
     loadDraft,
     NEAR_BOTTOM_PX,
     pinTarget,
     pickCodeServerUrlToOpen,
     pickCurrentStartupStep,
+    pickRewindCandidates,
     pickRunningCommandCard,
     pickWorkspaceOfferCard,
     PersistentChatComponent,
@@ -29,8 +37,11 @@ import {
     shouldPin,
     shouldSendOnEnter,
     textSizeToCss,
+    uploadStageAnnounceKey,
+    uploadStageFor,
+    uploadStageKey,
 } from './persistent-chat.component';
-import {AssistantTurn, MIN_FOLD_RUN} from '../../core/models/turn.model';
+import {AssistantTurn, MIN_FOLD_RUN, Turn, UserTurn} from '../../core/models/turn.model';
 
 /**
  * Build a minimal DataTransferItem stand-in. The real DataTransferItemList
@@ -140,6 +151,126 @@ describe('canSendMessage', () => {
 
     it('never sends while composing is blocked, regardless of content', () => {
         expect(canSendMessage(false, 'hello', 1)).toBe(false);
+    });
+});
+
+describe('uploadStageKey', () => {
+    it('reports per-file progress while files remain', () => {
+        expect(uploadStageKey({done: 1, total: 3, allDone: false})).toBe('chat.upload.stage');
+    });
+
+    it('switches to sending once every file has landed', () => {
+        expect(uploadStageKey({done: 3, total: 3, allDone: true})).toBe('chat.upload.sending');
+    });
+
+    it('reports nothing for an item with no files', () => {
+        expect(uploadStageKey(null)).toBeNull();
+    });
+
+    it('takes the percentage variant once the fraction is known', () => {
+        expect(uploadStageKey({done: 1, total: 3, allDone: false, percent: 34})).toBe(
+            'chat.upload.stagePercent',
+        );
+    });
+
+    it('falls back to the plain line when the fraction is unknowable', () => {
+        // A file uploading with no computable body length. "Uploading 1 of 3 —
+        // 0%" would be a lie about bytes that are moving.
+        expect(uploadStageKey({done: 1, total: 3, allDone: false, percent: null})).toBe(
+            'chat.upload.stage',
+        );
+    });
+
+    it('still says Sending once the bytes are in, percentage or not', () => {
+        // The label changes; the indicator does not. It sits where the upload
+        // left it and never fills — the accepted send removes the bubble.
+        expect(uploadStageKey({done: 3, total: 3, allDone: true, percent: 90})).toBe(
+            'chat.upload.sending',
+        );
+    });
+});
+
+describe('uploadStageAnnounceKey', () => {
+    it('strips the percentage for the polite live region', () => {
+        // The visible label updates ~4×/s; a live region re-reading
+        // "34%… 36%… 39%" is unusable. The announced string changes only when
+        // a file lands or the phase flips.
+        expect(uploadStageAnnounceKey('chat.upload.stagePercent')).toBe('chat.upload.stage');
+    });
+
+    it('leaves every other line alone', () => {
+        expect(uploadStageAnnounceKey('chat.upload.sending')).toBe('chat.upload.sending');
+        expect(uploadStageAnnounceKey('chat.upload.waitingOn')).toBe('chat.upload.waitingOn');
+    });
+});
+
+describe('uploadStageFor', () => {
+    // Fix round 1: _flushOutbox only ever processes outbox()[0], so a
+    // non-head item's own files sit at 'queued' the whole time it waits —
+    // showing them would read "Uploading 0 of n…" for work that hasn't
+    // started. The honest line names what's actually blocking it: the head's
+    // in-flight file.
+
+    it('names the head\'s blocking file for a non-head item that has its own attachments', () => {
+        // The item's own summary (2 files, neither started) must be ignored
+        // entirely — it is not waiting on itself.
+        const ownSummary = {done: 0, total: 2, allDone: false};
+        expect(uploadStageFor(false, ownSummary, 'big.mp4')).toEqual({
+            key: 'chat.upload.waitingOn',
+            params: {name: 'big.mp4'},
+        });
+    });
+
+    it('names the head\'s blocking file for a non-head item with no attachments of its own', () => {
+        // The commonest case: a plain text message queued behind a big
+        // upload. No own summary at all, but still not swallowed silently.
+        expect(uploadStageFor(false, null, 'big.mp4')).toEqual({
+            key: 'chat.upload.waitingOn',
+            params: {name: 'big.mp4'},
+        });
+    });
+
+    it('falls back to no stage line when the head itself has no files to name', () => {
+        // A plain text send at the head of the queue — nothing honest to
+        // report, so the bubble falls back to its plain queued treatment
+        // rather than inventing a filename.
+        expect(uploadStageFor(false, null, null)).toBeNull();
+    });
+
+    it('leaves the head\'s own upload-progress label unchanged', () => {
+        // Regression guard for the new isHead branch: even with a
+        // (nonsensical, since the head can't be blocked on itself)
+        // headBlockingFileName argument present, the head's own summary
+        // alone must drive the label — exactly uploadStageKey's behaviour.
+        const ownSummary = {done: 1, total: 3, allDone: false};
+        expect(uploadStageFor(true, ownSummary, 'ignored.pdf')).toEqual({
+            key: 'chat.upload.stage',
+            params: {done: 1, total: 3},
+        });
+    });
+
+    it('interpolates the percentage into the head\'s label when it is known', () => {
+        expect(uploadStageFor(true, {done: 1, total: 3, allDone: false, percent: 34}, null)).toEqual({
+            key: 'chat.upload.stagePercent',
+            params: {done: 1, total: 3, percent: 34},
+        });
+    });
+
+    it('omits the percent param entirely when the fraction is unknowable', () => {
+        // Not `percent: 0` — a param that is present but meaningless is how a
+        // future template starts rendering "0%" for a file that is moving.
+        expect(uploadStageFor(true, {done: 1, total: 3, allDone: false, percent: null}, null)).toEqual({
+            key: 'chat.upload.stage',
+            params: {done: 1, total: 3},
+        });
+    });
+
+    it('never puts a percentage on a non-head item — one indicator per send', () => {
+        // The bytes belong to the head. A percentage here would be a second
+        // reading of the same upload on a different bubble.
+        expect(
+            uploadStageFor(false, {done: 0, total: 2, allDone: false, percent: 12}, 'big.mp4'),
+        ).toEqual({key: 'chat.upload.waitingOn', params: {name: 'big.mp4'}});
     });
 });
 
@@ -260,6 +391,36 @@ describe('pickRunningCommandCard', () => {
  * carries every entry, not just the first, is proven independently in
  * persistent-chat.service.spec.ts.
  */
+/**
+ * The approval card is shared by batch turns and ordinary single-gate turns.
+ * With one pending call, "Approve all" / "run 1 tool(s)" reads as though
+ * something is hidden behind the button — so the copy switches to the
+ * singular form. Pure key-pickers so they stay testable: the component is
+ * never mounted in a spec (viewChild.required + afterNextRender throw NG0951
+ * under this runner).
+ */
+describe('permissionTitleKey', () => {
+    it('uses the singular title for exactly one pending call', () => {
+        expect(permissionTitleKey(1)).toBe('chat.permission.singleTitle');
+    });
+
+    it('uses the counted batch title for more than one', () => {
+        expect(permissionTitleKey(2)).toBe('chat.permission.batchTitle');
+        expect(permissionTitleKey(4)).toBe('chat.permission.batchTitle');
+    });
+});
+
+describe('permissionApproveKey', () => {
+    it('says "Approve" for exactly one pending call, not "Approve all"', () => {
+        expect(permissionApproveKey(1)).toBe('chat.permission.approve');
+    });
+
+    it('says "Approve all" once there is a batch to approve', () => {
+        expect(permissionApproveKey(2)).toBe('chat.permission.approveAll');
+        expect(permissionApproveKey(4)).toBe('chat.permission.approveAll');
+    });
+});
+
 describe('formatPermissionArgs', () => {
     it('renders a single string arg as "key: value"', () => {
         expect(formatPermissionArgs({file_path: 'src/app.ts'})).toBe('file_path: src/app.ts');
@@ -412,6 +573,42 @@ describe('extractClipboardFiles', () => {
         const blob = new File(['x'], '', {type: ''});
         const out = extractClipboardFiles(itemList([clipItem('file', blob)]), NOW);
         expect(out[0].name).toBe(`pasted-${NOW}-0.bin`);
+    });
+});
+
+describe('describeAttachmentRejection', () => {
+    // The wiring (calling this from onFilesSelected/onPaste/onDrop/the camera
+    // path and pushing the result into chat.attachmentError) is exercised by
+    // Playwright on the dev cluster; here we cover the pure decision of which
+    // key + params to show.
+
+    it('returns null when nothing was rejected', () => {
+        expect(describeAttachmentRejection([])).toBeNull();
+    });
+
+    it('reports an oversize file with its name interpolated', () => {
+        expect(describeAttachmentRejection([{name: 'huge.pdf', reason: 'size'}])).toEqual({
+            key: 'chat.upload.tooLarge',
+            params: {name: 'huge.pdf'},
+        });
+    });
+
+    it('reports a count rejection with no filename (generic cap message)', () => {
+        expect(describeAttachmentRejection([{name: 'f20.txt', reason: 'count'}])).toEqual({
+            key: 'chat.upload.tooManyFiles',
+        });
+    });
+
+    it('prefers the size reason when a selection trips both at once', () => {
+        const rejected = [
+            {name: 'a.txt', reason: 'count' as const},
+            {name: 'huge.pdf', reason: 'size' as const},
+            {name: 'b.txt', reason: 'count' as const},
+        ];
+        expect(describeAttachmentRejection(rejected)).toEqual({
+            key: 'chat.upload.tooLarge',
+            params: {name: 'huge.pdf'},
+        });
     });
 });
 
@@ -743,5 +940,124 @@ describe('composeDenyPrefill', () => {
 
     it('never clobbers what the user already typed', () => {
         expect(composeDenyPrefill('half a thought', starter)).toBe('half a thought');
+    });
+});
+
+describe('isRewindCommand', () => {
+    it('matches the bare command, any casing', () => {
+        expect(isRewindCommand('/rewind')).toBe(true);
+        expect(isRewindCommand('/REWIND')).toBe(true);
+    });
+
+    it('ignores trailing arguments — the picker decides the target', () => {
+        expect(isRewindCommand('/rewind to the banana one')).toBe(true);
+    });
+
+    it('never matches other commands, prefixed text, or plain chat', () => {
+        expect(isRewindCommand('/rewindx')).toBe(false);
+        expect(isRewindCommand('/undo')).toBe(false);
+        expect(isRewindCommand('rewind')).toBe(false);
+        expect(isRewindCommand('please /rewind')).toBe(false);
+        expect(isRewindCommand('')).toBe(false);
+    });
+});
+
+describe('pickRewindCandidates', () => {
+    const user = (id: string, historical = true): UserTurn =>
+        ({kind: 'user', id, content: `msg ${id}`, timestamp: 0, historical});
+    const assistant = (id: string): Turn =>
+        ({kind: 'assistant', id, events: [], status: 'complete', startedAt: 0, historical: true} as Turn);
+
+    it('lists only historical user turns, newest first', () => {
+        const turns: Turn[] = [user('u1'), assistant('a1'), user('u2'), assistant('a2')];
+        expect(pickRewindCandidates(turns, new Set()).map((t) => t.id)).toEqual(['u2', 'u1']);
+    });
+
+    it('excludes optimistic bubbles the server has not persisted yet', () => {
+        const turns: Turn[] = [user('u1'), user('u2', false)];
+        expect(pickRewindCandidates(turns, new Set()).map((t) => t.id)).toEqual(['u1']);
+    });
+
+    it('excludes turns still queued in the send outbox', () => {
+        const turns: Turn[] = [user('u1'), user('u2')];
+        expect(pickRewindCandidates(turns, new Set(['u2'])).map((t) => t.id)).toEqual(['u1']);
+    });
+
+    it('returns empty for an empty transcript', () => {
+        expect(pickRewindCandidates([], new Set())).toEqual([]);
+    });
+});
+
+describe('filterRewindCandidates', () => {
+    const turn = (id: string, content: string): UserTurn =>
+        ({kind: 'user', id, content, timestamp: 0, historical: true});
+    const all = [turn('u1', 'Fix the login bug'), turn('u2', 'write STORY.txt'), turn('u3', 'deploy it')];
+
+    it('keeps everything on an empty or whitespace query', () => {
+        expect(filterRewindCandidates(all, '')).toEqual(all);
+        expect(filterRewindCandidates(all, '   ')).toEqual(all);
+    });
+
+    it('matches substrings case-insensitively', () => {
+        expect(filterRewindCandidates(all, 'story').map((t) => t.id)).toEqual(['u2']);
+        expect(filterRewindCandidates(all, 'THE LOGIN').map((t) => t.id)).toEqual(['u1']);
+    });
+
+    it('returns empty when nothing matches', () => {
+        expect(filterRewindCandidates(all, 'zebra')).toEqual([]);
+    });
+});
+
+describe('formatRewindStamp', () => {
+    const at = (y: number, mo: number, d: number, h: number, mi: number) =>
+        new Date(y, mo, d, h, mi).getTime();
+
+    it('stays time-only for a same-day message', () => {
+        expect(formatRewindStamp(at(2026, 7, 8, 19, 8), at(2026, 7, 8, 22, 0), 'en', 'Yesterday')).toBe('19:08');
+    });
+
+    it('labels yesterday with the localized word', () => {
+        expect(formatRewindStamp(at(2026, 7, 7, 19, 8), at(2026, 7, 8, 22, 0), 'en', 'Yesterday')).toBe('Yesterday 19:08');
+    });
+
+    it('handles yesterday across a month boundary', () => {
+        expect(formatRewindStamp(at(2026, 6, 31, 9, 0), at(2026, 7, 1, 12, 0), 'en', 'Yesterday')).toBe('Yesterday 09:00');
+    });
+
+    it('handles yesterday across a year boundary', () => {
+        expect(formatRewindStamp(at(2025, 11, 31, 10, 0), at(2026, 0, 1, 9, 0), 'en', 'Yesterday')).toBe('Yesterday 10:00');
+    });
+
+    it('shows a short date without the year within the same year', () => {
+        const s = formatRewindStamp(at(2026, 0, 15, 9, 30), at(2026, 7, 8, 12, 0), 'en', 'Yesterday');
+        expect(s).toContain('Jan');
+        expect(s).toContain('09:30');
+        expect(s).not.toContain('2026');
+    });
+
+    it('adds the year once it differs', () => {
+        const s = formatRewindStamp(at(2025, 10, 3, 14, 5), at(2026, 7, 8, 12, 0), 'en', 'Yesterday');
+        expect(s).toContain('2025');
+        expect(s).toContain('14:05');
+    });
+});
+
+describe('countTurnsAfter', () => {
+    const user = (id: string): Turn => ({kind: 'user', id, content: '', timestamp: 0, historical: true});
+    const assistant = (id: string): Turn =>
+        ({kind: 'assistant', id, events: [], status: 'complete', startedAt: 0} as Turn);
+    const system = (id: string): Turn => ({kind: 'system', id} as unknown as Turn);
+
+    it('counts user and assistant turns after the target, skipping system lines', () => {
+        const turns = [user('u1'), assistant('a1'), system('s1'), user('u2'), assistant('a2')];
+        expect(countTurnsAfter(turns, 'u1')).toBe(3);
+    });
+
+    it('returns 0 when the target is the last turn', () => {
+        expect(countTurnsAfter([user('u1'), user('u2')], 'u2')).toBe(0);
+    });
+
+    it('returns -1 when the target is not in the loaded window', () => {
+        expect(countTurnsAfter([user('u1')], 'nope')).toBe(-1);
     });
 });

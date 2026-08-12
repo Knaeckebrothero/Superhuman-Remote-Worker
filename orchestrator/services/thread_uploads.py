@@ -30,6 +30,12 @@ same note (see ``_read_zip_extraction_note`` in
 The agent learns about new uploads when the cockpit appends an
 ``Attached files: …`` hint to the next user message — see
 ``persistent-chat.service.ts``.
+
+Uploads can also be removed again (``delete_file_from_thread_workspace``,
+behind ``DELETE .../uploads/{path:path}``), because the cockpit uploads
+*eagerly* — on attach, before the user commits to sending. Removing an
+attachment chip therefore has to be able to remove bytes that already
+landed. That path's whole security burden sits in ``_safe_upload_relpath``.
 """
 
 from __future__ import annotations
@@ -172,6 +178,56 @@ def _sanitize_filename(filename: str) -> str:
         p = PurePosixPath(filename)
         filename = f"{p.stem[:190]}{p.suffix}"
     return filename or "unnamed"
+
+
+def _safe_upload_relpath(relpath: str) -> str | None:
+    """Confine a caller-supplied path to ``uploads/``, or return None.
+
+    The validator behind ``DELETE .../uploads/{path:path}``, and the only
+    thing standing between that route and an arbitrary-file-deletion
+    primitive — SFTP will ``remove`` any path the ``agent-host`` user can
+    write, and the object store will delete any key under the prefix, so
+    the check can never be delegated to the remote.
+
+    ``relpath`` is relative to ``uploads/`` itself — ``"report.pdf"``, or
+    ``"bundle/sub/a.txt"`` for a zip-extracted member — i.e. exactly
+    ``UploadedFile.name``, NOT the workspace-relative ``UploadedFile.path``
+    (which carries its own ``uploads/`` prefix and would resolve to
+    ``uploads/uploads/...``).
+
+    Posture is ``_safe_zip_member_path``'s, not ``_sanitize_filename``'s:
+
+    - ``_sanitize_filename`` is unusable here. It flattens to
+      ``PurePosixPath(name).name``, which destroys the ``bundle/sub/a.txt``
+      shape an extracted member legitimately has — and, worse, a *sanitized*
+      traversal is a delete silently redirected at some other file rather
+      than a refusal.
+    - ``posixpath.normpath`` runs BEFORE the prefix check, so
+      ``uploads/../../.ssh/authorized_keys`` is resolved and then rejected
+      instead of passing a naive "starts with uploads/" test.
+    - Confinement is to the uploads *subdirectory*, not to the thread
+      prefix, which is shared: Canvas writes thread state at
+      ``threads/<id>/<path>`` (``services/canvas_files.py:1034``) and tool
+      files live alongside it.
+
+    Rejects: empty, NUL, absolute (leading ``/``), any backslash, a Windows
+    drive letter, anything normalizing to ``uploads/`` itself (``"."``,
+    ``"bundle/.."`` — removing one attachment never means removing the
+    directory), and anything normalizing outside it.
+
+    Returns:
+        The **normalized** path relative to ``uploads/`` — the string the
+        transports must act on — or None when the input is refused.
+    """
+    if not relpath or "\x00" in relpath or relpath.startswith("/"):
+        return None
+    if "\\" in relpath or re.match(r"^[A-Za-z]:", relpath):
+        return None
+
+    joined = posixpath.normpath(posixpath.join(UPLOADS_SUBDIR, relpath))
+    if joined == UPLOADS_SUBDIR or not joined.startswith(UPLOADS_SUBDIR + "/"):
+        return None
+    return joined[len(UPLOADS_SUBDIR) + 1 :]
 
 
 def _name_candidates(name: str) -> Iterator[str]:
@@ -1060,6 +1116,170 @@ async def _write_attested_sftp_files(
     return results
 
 
+def _async_sftp_entry_mode(attrs: Any) -> int:
+    """Return AsyncSSH SFTP permissions, failing closed when omitted."""
+
+    mode = getattr(attrs, "permissions", None)
+    if mode is None:
+        # Compatibility for narrow test doubles and alternate SFTP clients.
+        mode = getattr(attrs, "st_mode", None)
+    if mode is None:
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Workspace did not report the file type; refusing to delete",
+        )
+    return int(mode)
+
+
+async def _resolve_attested_delete_target(
+    sftp: Any, uploads_dir: str, relpath: str
+) -> str | None:
+    """Resolve one delete target while refusing symlinked parent components."""
+
+    try:
+        base = await sftp.lstat(uploads_dir)
+    except Exception as exc:
+        if _is_sftp_missing(exc):
+            return None
+        raise
+    base_mode = _async_sftp_entry_mode(base)
+    if stat_module.S_ISLNK(base_mode) or not stat_module.S_ISDIR(base_mode):
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Workspace uploads directory is not a directory",
+        )
+
+    parts = relpath.split("/")
+    cursor = uploads_dir
+    for index, part in enumerate(parts):
+        cursor = posixpath.join(cursor, part)
+        try:
+            attrs = await sftp.lstat(cursor)
+        except Exception as exc:
+            if _is_sftp_missing(exc):
+                return None
+            raise
+        mode = _async_sftp_entry_mode(attrs)
+        if index < len(parts) - 1:
+            if stat_module.S_ISLNK(mode):
+                raise ThreadUploadError(
+                    status_code=409,
+                    detail="Upload path traverses a symbolic link",
+                )
+            if not stat_module.S_ISDIR(mode):
+                return None
+    return cursor
+
+
+async def _delete_attested_sftp_tree(sftp: Any, path: str, *, depth: int = 0) -> None:
+    """AsyncSSH counterpart of ``_sftp_delete_tree`` without following links."""
+
+    if depth > MAX_DELETE_TREE_DEPTH:
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Upload path is nested too deeply to delete",
+        )
+    try:
+        attrs = await sftp.lstat(path)
+    except Exception as exc:
+        if _is_sftp_missing(exc):
+            return
+        raise
+    if stat_module.S_ISDIR(_async_sftp_entry_mode(attrs)):
+        for name in await sftp.listdir(path):
+            if not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
+                raise ThreadUploadError(
+                    status_code=409,
+                    detail="Workspace returned an invalid directory entry",
+                )
+            await _delete_attested_sftp_tree(
+                sftp,
+                posixpath.join(path, name),
+                depth=depth + 1,
+            )
+        await sftp.rmdir(path)
+        return
+    await sftp.remove(path)
+
+
+async def delete_file_from_attested_stateless_workspace(
+    thread: dict[str, Any],
+    relpath: str,
+    *,
+    destination: _SshTarget | _VirtualTarget,
+    expected_workspace_generation: str,
+    expected_runtime_incarnation: str,
+    expected_host_key_fingerprint: str,
+    authority_probe: RuntimeAuthorityProbe,
+) -> str | None:
+    """Delete one upload only from the exact-live, pinned sandbox runtime."""
+
+    safe_relpath = _safe_upload_relpath(relpath)
+    if safe_relpath is None:
+        raise ThreadUploadError(status_code=400, detail="Invalid upload path")
+    authority = _resolve_stateless_upload_authority(
+        thread,
+        destination=destination,
+        expected_workspace_generation=expected_workspace_generation,
+        expected_runtime_incarnation=expected_runtime_incarnation,
+        expected_host_key_fingerprint=expected_host_key_fingerprint,
+    )
+
+    async def _delete() -> str | None:
+        await _require_exact_live_runtime(authority_probe)
+        async with asyncio.timeout(45):
+            async with _ATTESTED_SFTP_POOL.checkout(
+                thread_id=authority.transport_pool_thread_id,
+                generation=authority.workspace_generation,
+                host=authority.target.host,
+                port=authority.target.port,
+                fingerprint=authority.host_key_fingerprint,
+                key_path=authority.target.key_path,
+            ) as sftp:
+                await _require_exact_live_runtime(authority_probe)
+                uploads_dir = posixpath.join(
+                    authority.target.workspace_path, UPLOADS_SUBDIR
+                )
+                remote_path = await _resolve_attested_delete_target(
+                    sftp, uploads_dir, safe_relpath
+                )
+                if remote_path is None:
+                    return None
+                # Component walking can await repeatedly. Re-probe immediately
+                # before the first irreversible unlink/rmdir.
+                await _require_exact_live_runtime(authority_probe)
+                await _delete_attested_sftp_tree(sftp, remote_path)
+                await _require_exact_live_runtime(authority_probe)
+                return safe_relpath
+
+    try:
+        return await _joined_async_call(_delete())
+    except asyncio.CancelledError:
+        raise
+    except ThreadUploadError:
+        raise
+    except TimeoutError as exc:
+        raise ThreadUploadError(
+            status_code=503,
+            detail="Stateless workspace upload delete timed out",
+        ) from exc
+    except CanvasSSHError as exc:
+        raise ThreadUploadError(
+            status_code=exc.status_code,
+            detail="Stateless workspace pinned SSH connection failed",
+        ) from exc
+    except Exception as exc:
+        logger.warning(
+            "Pinned SFTP delete failed for stateless thread %s: %s",
+            authority.thread_id,
+            exc,
+        )
+        raise ThreadUploadError(
+            status_code=502,
+            detail="Could not delete from the attested stateless workspace",
+        ) from exc
+
+
 def _virtual_write_files(
     target: _VirtualTarget,
     payloads: list[tuple[str, bytes, str]],
@@ -1157,10 +1377,266 @@ def _virtual_purge_prefix(
             store.close()
 
 
+# =============================================================================
+# Deletion
+#
+# Eager upload (the cockpit starts the transfer when a file is attached, not
+# when the message is sent) makes "remove this attachment" a request that can
+# arrive *after* the bytes have already landed. Without a delete, cancelling
+# is a lie and attach/remove cycles pile up `_1`/`_2` copies in a directory
+# the agent can list and read. See docs/features/session_attachment_send_flow.md
+# §9.1.
+# =============================================================================
+
+# A zip extracted into uploads/<stem>/… can nest arbitrarily, but not
+# unboundedly: this caps the recursive SFTP walk so a pathological tree
+# refuses cleanly instead of blowing the Python stack inside a request.
+MAX_DELETE_TREE_DEPTH = 64
+
+
+def _entry_mode(attrs: Any) -> int:
+    """Return an SFTP entry's mode, refusing when the server did not report one.
+
+    ``SSH_FILEXFER_ATTR_PERMISSIONS`` is **optional** in the SFTP protocol, so
+    ``SFTPAttributes.st_mode`` is legitimately ``None`` against a server that
+    omits it. The original ``attrs.st_mode or 0`` turned that into ``0``, and
+    ``S_ISLNK(0)`` is False — so every symlink check below passed silently and
+    the whole confinement guard failed **open**. Demonstrated, not inferred:
+    a fixture whose ``lstat`` returns ``st_mode=None`` let
+    ``uploads/escape/authorized_keys`` resolve and delete the key file.
+
+    A guard may only fail closed. An entry whose type we cannot read is one we
+    refuse to walk through, recurse into, or unlink.
+
+    Raises:
+        ThreadUploadError: 409 when the mode is unknown.
+    """
+    mode = getattr(attrs, "st_mode", None)
+    if mode is None:
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Workspace did not report the file type; refusing to delete",
+        )
+    return int(mode)
+
+
+def _sftp_resolve_delete_target(
+    sftp: Any, uploads_dir: str, relpath: str
+) -> str | None:
+    """Walk ``relpath`` component by component, refusing symlinked parents.
+
+    ``lstat`` declines to follow only the *final* component of a path — every
+    component above it is resolved by the SFTP server before we ever see an
+    answer. So a leaf-only guard is not a guard at all: with
+    ``uploads/escape -> ~/.ssh`` planted by the agent, ``escape/authorized_keys``
+    lstat's as a perfectly ordinary regular file and gets removed. Checking
+    every component (plus ``uploads/`` itself, which the agent could replace
+    with a link to ``$HOME``) is what actually confines the delete.
+
+    The leaf may legitimately be a symlink; ``_sftp_delete_tree`` unlinks it
+    as a link rather than following it.
+
+    Returns:
+        The absolute remote path of the leaf, or None when any component is
+        missing — an absent file is a 404, not an error.
+
+    Raises:
+        ThreadUploadError: 409 when a component above the leaf, or
+            ``uploads/`` itself, is a symlink.
+    """
+    try:
+        base = sftp.lstat(uploads_dir)
+    except OSError:
+        return None  # nothing has ever been uploaded here
+    if stat_module.S_ISLNK(_entry_mode(base)):
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Workspace uploads directory is not a directory",
+        )
+
+    parts = relpath.split("/")
+    cursor = uploads_dir
+    for index, part in enumerate(parts):
+        cursor = posixpath.join(cursor, part)
+        try:
+            attrs = sftp.lstat(cursor)
+        except OSError:
+            return None
+        # Read the mode for EVERY component, including the leaf: an entry whose
+        # type the server declines to report is refused outright rather than
+        # defaulted to "not a symlink" (see _entry_mode).
+        mode = _entry_mode(attrs)
+        if index < len(parts) - 1 and stat_module.S_ISLNK(mode):
+            raise ThreadUploadError(
+                status_code=409,
+                detail="Upload path traverses a symbolic link",
+            )
+    return cursor
+
+
+def _sftp_delete_tree(sftp: Any, path: str, *, depth: int = 0) -> None:
+    """Remove ``path``, recursing first when it is a real directory.
+
+    SFTP has no ``rm -rf``, so a zip-extracted ``uploads/<stem>/`` has to be
+    walked explicitly and ``rmdir``'d bottom-up.
+
+    ``lstat`` — never ``stat`` — decides what ``path`` is, so a symlink takes
+    the ``remove`` branch (unlinking the link itself, exactly like ``rm``)
+    instead of the directory branch. Following one would turn this into a
+    recursive delete of whatever it points at. ``listdir_attr`` returns the
+    server's readdir attributes, which are ``lstat``-equivalent, so a
+    symlinked *child* inside the tree gets the same treatment.
+    """
+    if depth > MAX_DELETE_TREE_DEPTH:
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Upload path is nested too deeply to delete",
+        )
+    try:
+        attrs = sftp.lstat(path)
+    except OSError:
+        return  # vanished under us (concurrent delete) — the desired state
+    if stat_module.S_ISDIR(_entry_mode(attrs)):
+        for entry in sftp.listdir_attr(path):
+            _sftp_delete_tree(
+                sftp, posixpath.join(path, entry.filename), depth=depth + 1
+            )
+        sftp.rmdir(path)
+        return
+    sftp.remove(path)
+
+
+def _sftp_delete_file(target: _SshTarget, relpath: str) -> bool:
+    """Synchronous helper that opens one SFTP session and deletes one entry.
+
+    ``relpath`` must already have passed ``_safe_upload_relpath``. Connects
+    exactly as ``_sftp_write_files`` does, including its 15s
+    connect/banner/auth timeouts, so an unreachable workspace produces the
+    same honest 502 rather than a hung request.
+
+    Returns:
+        True when something was removed, False when there was nothing there.
+    """
+    if paramiko is None:  # pragma: no cover - import guard
+        raise ThreadUploadError(
+            status_code=503, detail="paramiko is not installed on the orchestrator"
+        )
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=target.host,
+            port=target.port,
+            username=target.username,
+            key_filename=target.key_path,
+            timeout=15,
+            banner_timeout=15,
+            auth_timeout=15,
+            allow_agent=False,
+            look_for_keys=False,
+        )
+    except Exception as e:
+        logger.warning(
+            "SSH connect failed for %s@%s:%d (%s)",
+            target.username,
+            target.host,
+            target.port,
+            e,
+        )
+        raise ThreadUploadError(
+            status_code=502,
+            detail=f"Could not reach workspace ({target.host}:{target.port})",
+        ) from e
+
+    try:
+        sftp = client.open_sftp()
+        try:
+            uploads_dir = posixpath.join(target.workspace_path, UPLOADS_SUBDIR)
+            remote_path = _sftp_resolve_delete_target(sftp, uploads_dir, relpath)
+            if remote_path is None:
+                return False
+            _sftp_delete_tree(sftp, remote_path)
+            logger.info("Deleted %s from %s", remote_path, target.host)
+            return True
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+
+
+def _virtual_delete_file(
+    target: _VirtualTarget,
+    relpath: str,
+    *,
+    store: Any | None = None,
+) -> bool:
+    """Synchronous helper that deletes one upload from the thread's store.
+
+    ``relpath`` must already have passed ``_safe_upload_relpath``.
+
+    A flat key space has no directories, so an extracted zip is just a set of
+    keys sharing a prefix: removing the stem means listing ``<key>/`` and
+    deleting each key individually. The listing is only reached when the
+    exact key missed, so an ordinary flat upload still costs a single rclone
+    subprocess. The trailing separator matters — a bare ``startswith`` would
+    sweep ``bundle_1.txt`` away with ``bundle``.
+
+    Args:
+        store: Injected object store, for tests. Built from ``target.spec``
+            and closed here when not supplied.
+
+    Returns:
+        True when at least one key was removed, False when nothing matched.
+    """
+    owned = store is None
+    if store is None:
+        from src.core.backends.rclone import RcloneObjectStore
+
+        store = RcloneObjectStore(
+            remote_type=str(target.spec["type"]),
+            config=target.spec.get("config") or {},
+            root=str(target.spec.get("root") or ""),
+        )
+    key = f"{target.prefix}{UPLOADS_SUBDIR}/{relpath}"
+    try:
+        if store.delete(key):
+            logger.info("Deleted %s", key)
+            return True
+
+        removed = 0
+        for info in store.list(f"{key}/"):
+            if store.delete(info.key):
+                removed += 1
+        if removed:
+            logger.info("Deleted %d keys under %s/", removed, key)
+        return removed > 0
+    finally:
+        if owned:
+            store.close()
+
+
 async def _joined_blocking_call(func, /, *args, **kwargs):
     """Do not release lifecycle ownership while a blocking effect still runs."""
 
     task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        with suppress(Exception):
+            task.result()
+        raise asyncio.CancelledError
+    return task.result()
+
+
+async def _joined_async_call(awaitable):
+    """Finish a started async effect before propagating caller cancellation."""
+
+    task = asyncio.create_task(awaitable)
     cancelled = False
     while not task.done():
         try:
@@ -1369,3 +1845,71 @@ async def upload_files_to_thread_workspace(
             detail="Stateless sandbox uploads require exact runtime attestation",
         )
     return await asyncio.to_thread(_sftp_write_files, destination, payloads)
+
+
+async def delete_file_from_thread_workspace(
+    thread: dict[str, Any],
+    relpath: str,
+    *,
+    destination: _SshTarget | _VirtualTarget | None = None,
+) -> str | None:
+    """Remove one upload from the thread workspace's ``uploads/`` directory.
+
+    ``relpath`` is relative to ``uploads/`` (``UploadedFile.name``, not the
+    ``uploads/``-prefixed ``UploadedFile.path``). It may name a single file
+    or the ``<stem>`` directory a zip was extracted into, in which case the
+    whole subtree goes.
+
+    The path is validated *before* the destination is resolved and before any
+    connection is opened — the remote is never asked to police it.
+
+    Args:
+        thread: Thread row (must contain ``metadata`` JSONB column).
+        relpath: Path under ``uploads/`` to remove.
+        destination: Pre-resolved destination from
+            ``resolve_thread_upload_destination``. Resolved here when omitted.
+
+    Raises:
+        ThreadUploadError: 400 for a path that escapes ``uploads/``, plus the
+            same destination taxonomy the upload path uses (409 for a tier
+            with no workspace or one that isn't ready, 502 for an unreachable
+            one, 503 for missing config/capacity).
+
+    Returns:
+        The **normalized** path that was removed, relative to ``uploads/``
+        (``bundle/sub/../a.txt`` in, ``bundle/a.txt`` out) — so the route can
+        report what it actually deleted instead of echoing the caller's raw
+        string back. None when there was nothing to remove, which the API
+        layer turns into a 404.
+    """
+    safe_relpath = _safe_upload_relpath(relpath)
+    if safe_relpath is None:
+        raise ThreadUploadError(
+            status_code=400,
+            detail="Invalid upload path",
+        )
+
+    if destination is None:
+        destination = resolve_thread_upload_destination(thread)
+
+    if isinstance(destination, _VirtualTarget):
+        # Each delete spawns another rclone subprocess — one per key when a
+        # zip stem fans out — so it shares the writer's concurrency ceiling
+        # rather than opening an unbounded second source of children.
+        async with _virtual_upload_slot():
+            if thread.get("execution_lane") == "stateless":
+                removed = await _joined_blocking_call(
+                    _virtual_delete_file, destination, safe_relpath
+                )
+            else:
+                removed = await asyncio.to_thread(
+                    _virtual_delete_file, destination, safe_relpath
+                )
+    else:
+        if thread.get("execution_lane") == "stateless":
+            raise ThreadUploadError(
+                status_code=409,
+                detail="Stateless sandbox deletes require exact runtime attestation",
+            )
+        removed = await asyncio.to_thread(_sftp_delete_file, destination, safe_relpath)
+    return safe_relpath if removed else None

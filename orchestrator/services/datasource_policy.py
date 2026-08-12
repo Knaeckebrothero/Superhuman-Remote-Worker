@@ -10,6 +10,7 @@ and only then use the ordinary explicit datasource resolver to deliver secrets.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Iterable
 from uuid import UUID
 
@@ -119,7 +120,17 @@ async def _validate_effective_owner(
     return True
 
 
-async def authorize_datasource_selection(
+@dataclass(frozen=True)
+class ItemVerdict:
+    """One connector's availability decision, for callers that must report
+    rather than deny. ``reason`` is None exactly when ``denied`` is False."""
+
+    datasource_id: str
+    denied: bool
+    reason: str | None = None
+
+
+async def classify_datasource_selection(
     db,
     actor: dict[str, Any] | None,
     effective_work_owner_id: str | None,
@@ -129,15 +140,19 @@ async def authorize_datasource_selection(
     allow_admin_explicit_override: bool = False,
     trusted_system_inheritance: bool = False,
     legacy_job_id: str | None = None,
-) -> tuple[list[str], dict[str, int]]:
-    """Authorize a complete selection and return its exact policy snapshot.
+) -> tuple[list[ItemVerdict], dict[str, int]]:
+    """Per-item availability verdicts plus the policy snapshot of allowed rows.
 
-    The return order follows the first occurrence in ``datasource_ids``.
-    Missing, malformed, unauthorized and out-of-scope IDs all raise the same
-    non-enumerating exception. ``trusted_system_inheritance`` is narrowly for
-    internal reuse of an already materialized selection: it bypasses user
-    execution access, but never scope or workspace-tier checks and never scans
-    for ambient defaults.
+    The reporting half of :func:`authorize_datasource_selection`, which is now a
+    thin wrapper over this. Malformed uuids and a vanished owner row still raise
+    here because both were checked BEFORE the per-item loop pre-refactor, so
+    raising early is faithful. An unreadable ``policy_revision`` is reported as
+    a ``corrupt_revision`` verdict instead, preserving list order; the wrapper
+    turns it into the same generic denial the original raised. Corruption is not
+    drift — it is not an acknowledgeable reason.
+
+    ``workspace_tier`` is returned as a verdict rather than raised so the caller
+    controls precedence; see the wrapper.
     """
     normalized_ids = _normalized_ids(datasource_ids)
     normalized_projects = _normalized_ids(target_project_ids)
@@ -167,17 +182,20 @@ async def authorize_datasource_selection(
             legacy_job_id=normalized_legacy_job_id,
         )
     by_id = {str(row["id"]): row for row in rows}
-    if len(by_id) != len(normalized_ids):
-        raise DatasourceUnavailableError()
 
     actor_is_admin = bool(actor and actor.get("is_admin"))
     admin_override = allow_admin_explicit_override and actor_is_admin
 
+    verdicts: list[ItemVerdict] = []
     revisions: dict[str, int] = {}
     for datasource_id in normalized_ids:
-        row = by_id[datasource_id]
+        row = by_id.get(datasource_id)
+        if row is None:
+            verdicts.append(ItemVerdict(datasource_id, True, "deleted"))
+            continue
         if not _scope_matches(row, target_set):
-            raise DatasourceUnavailableError()
+            verdicts.append(ItemVerdict(datasource_id, True, "out_of_scope"))
+            continue
 
         linked_to_every_target = bool(target_set) and target_set.issubset(
             _row_project_ids(row)
@@ -202,20 +220,69 @@ async def authorize_datasource_selection(
             or admin_override
         )
         if not execution_authorized:
-            raise DatasourceUnavailableError()
+            verdicts.append(ItemVerdict(datasource_id, True, "revoked"))
+            continue
         if _is_lite_repository(row, workspace_backend):
-            raise DatasourceWorkspaceTierError(
-                "Repository connectors require a workspace with filesystem support"
-            )
+            verdicts.append(ItemVerdict(datasource_id, True, "workspace_tier"))
+            continue
         try:
             policy_revision = int(row["policy_revision"])
             if policy_revision < 1:
                 raise ValueError
-        except (KeyError, TypeError, ValueError) as exc:
-            raise DatasourceUnavailableError() from exc
+        except (KeyError, TypeError, ValueError):
+            verdicts.append(ItemVerdict(datasource_id, True, "corrupt_revision"))
+            continue
         revisions[datasource_id] = policy_revision
+        verdicts.append(ItemVerdict(datasource_id, False, None))
+    return verdicts, revisions
 
-    return normalized_ids, revisions
+
+async def authorize_datasource_selection(
+    db,
+    actor: dict[str, Any] | None,
+    effective_work_owner_id: str | None,
+    datasource_ids: list[str] | None,
+    target_project_ids: list[str] | None,
+    workspace_backend: str | None,
+    allow_admin_explicit_override: bool = False,
+    trusted_system_inheritance: bool = False,
+    legacy_job_id: str | None = None,
+) -> tuple[list[str], dict[str, int]]:
+    """Authorize a complete selection and return its exact policy snapshot.
+
+    The return order follows the first occurrence in ``datasource_ids``.
+    Missing, malformed, unauthorized and out-of-scope IDs all raise the same
+    non-enumerating exception. ``trusted_system_inheritance`` is narrowly for
+    internal reuse of an already materialized selection: it bypasses user
+    execution access, but never scope or workspace-tier checks and never scans
+    for ambient defaults.
+    """
+    verdicts, revisions = await classify_datasource_selection(
+        db,
+        actor,
+        effective_work_owner_id,
+        datasource_ids,
+        target_project_ids,
+        workspace_backend,
+        allow_admin_explicit_override=allow_admin_explicit_override,
+        trusted_system_inheritance=trusted_system_inheritance,
+        legacy_job_id=legacy_job_id,
+    )
+    # Missing rows were rejected by a len() check that ran BEFORE the per-item
+    # loop, so "deleted" is position-independent and outranks everything else.
+    if any(v.reason == "deleted" for v in verdicts):
+        raise DatasourceUnavailableError()
+    # Every other failure raised from inside that loop, so it is strictly
+    # first-in-list-order: the first denied item decides which error surfaces.
+    for verdict in verdicts:
+        if not verdict.denied:
+            continue
+        if verdict.reason == "workspace_tier":
+            raise DatasourceWorkspaceTierError(
+                "Repository connectors require a workspace with filesystem support"
+            )
+        raise DatasourceUnavailableError()
+    return [v.datasource_id for v in verdicts], revisions
 
 
 async def authorize_datasource_ids(
@@ -318,8 +385,10 @@ __all__ = [
     "DatasourceUnavailableError",
     "DatasourceWorkspaceTierError",
     "GENERIC_UNAVAILABLE_DETAIL",
+    "ItemVerdict",
     "authorize_datasource_ids",
     "authorize_datasource_selection",
+    "classify_datasource_selection",
     "default_datasource_ids",
     "default_datasource_selection",
 ]

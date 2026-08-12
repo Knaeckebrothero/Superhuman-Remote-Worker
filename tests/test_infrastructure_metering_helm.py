@@ -11,6 +11,28 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_orchestrator_images_bake_slice3_metering_package_atomically():
+    import_check = (
+        'RUN python -c "import services.infrastructure_metering.compute_activation"'
+    )
+    for relative_path in (
+        "docker/Dockerfile.orchestrator",
+        "docker/Dockerfile.orchestrator.dev",
+    ):
+        dockerfile = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert import_check in dockerfile
+
+    tiltfile = (ROOT / "Tiltfile").read_text(encoding="utf-8")
+    orchestrator_build = tiltfile.split("docker_build(\n    'srw-orchestrator'", 1)[
+        1
+    ].split(
+        "# -----------------------------------------------------------------------------",
+        1,
+    )[0]
+    fallback_paths = orchestrator_build.split("fall_back_on([", 1)[1].split("]),", 1)[0]
+    assert "'orchestrator/services/infrastructure_metering/'" in fallback_paths
+
+
 def _render_remote_vmi_ingress(*extra: str) -> list[dict]:
     chart = ROOT / "helm"
     values = chart / "ci/test-values.yaml"
@@ -81,6 +103,154 @@ def _render_remote_storage_server(*extra: str) -> list[dict]:
         text=True,
     ).stdout
     return [item for item in yaml.safe_load_all(rendered) if item]
+
+
+def _render_metering_external_secrets(*extra: str) -> list[dict]:
+    chart = ROOT / "helm"
+    values = chart / "ci/test-values.yaml"
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "metering-vault",
+            str(chart),
+            "-f",
+            str(values),
+            "--set",
+            "infrastructureMetering.externalSecrets.enabled=true",
+            "--set-string",
+            (
+                "infrastructureMetering.externalSecrets.vaultPath="
+                "homelab/superhuman-remote-worker/srw-secrets"
+            ),
+            "--set-string",
+            (
+                "infrastructureMetering.vmIngestionSecretName="
+                "srw-infra-metering-vmi-ingestion"
+            ),
+            "--set-string",
+            (
+                "infrastructureMetering.vmStorageIngestionSecretName="
+                "srw-infra-metering-vm-storage-ingestion"
+            ),
+            "--set-string",
+            (
+                "infrastructureMetering.volumeIdentitySecretName="
+                "srw-infra-metering-volume-identity"
+            ),
+            "--set-string",
+            ("infrastructureMetering.vmLifecycleAuthSecretName=srw-vm-lifecycle-auth"),
+            *extra,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return [item for item in yaml.safe_load_all(rendered) if item]
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_metering_credentials_select_short_properties_from_srw_secret_bundle():
+    objects = _render_metering_external_secrets()
+    names = {
+        "srw-infra-metering-vmi-ingestion": (
+            "INFRASTRUCTURE_METERING_VMI_INGESTION_KEY",
+            "METERING_VMI_INGESTION_KEY",
+        ),
+        "srw-infra-metering-vm-storage-ingestion": (
+            "INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY",
+            "METERING_VM_STORAGE_INGESTION_KEY",
+        ),
+        "srw-infra-metering-volume-identity": (
+            "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY",
+            "METERING_VOLUME_IDENTITY_KEY",
+        ),
+        "srw-vm-lifecycle-auth": (
+            "VM_LIFECYCLE_HMAC_SECRET",
+            "METERING_VM_LIFECYCLE_HMAC_SECRET",
+        ),
+    }
+
+    external_secrets = {
+        item["metadata"]["name"]: item
+        for item in objects
+        if item["kind"] == "ExternalSecret" and item["metadata"]["name"] in names
+    }
+    assert set(external_secrets) == set(names)
+    for name, (runtime_key, vault_property) in names.items():
+        external_secret = external_secrets[name]
+        assert external_secret["spec"]["target"]["name"] == name
+        assert external_secret["spec"]["data"] == [
+            {
+                "secretKey": runtime_key,
+                "remoteRef": {
+                    "key": "homelab/superhuman-remote-worker/srw-secrets",
+                    "property": vault_property,
+                },
+            }
+        ]
+
+
+def test_development_metering_vault_sources_project_collector_credentials_only():
+    expected_path = "homelab/superhuman-remote-worker/srw-secrets"
+    expected_properties = {
+        "vmiIngestionProperty": "METERING_VMI_INGESTION_KEY",
+        "vmStorageIngestionProperty": "METERING_VM_STORAGE_INGESTION_KEY",
+        "volumeIdentityProperty": "METERING_VOLUME_IDENTITY_KEY",
+        "vmLifecycleAuthProperty": "METERING_VM_LIFECYCLE_HMAC_SECRET",
+    }
+
+    main_values = yaml.safe_load(
+        (ROOT / "deployment/values-experimental.yaml").read_text(encoding="utf-8")
+    )
+    vm_fleet = yaml.safe_load(
+        (ROOT / "deployment-vms/srw-vm-controller/fleet.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    chart_defaults = yaml.safe_load(
+        (ROOT / "helm/values.yaml").read_text(encoding="utf-8")
+    )
+    vm_chart_defaults = yaml.safe_load(
+        (ROOT / "helm-vm-cluster/values.yaml").read_text(encoding="utf-8")
+    )
+
+    main_sync = main_values["infrastructureMetering"]["externalSecrets"]
+    vm_sync = vm_fleet["helm"]["values"]["infrastructureMetering"]["externalSecrets"]
+    assert main_sync == {"enabled": True, "vaultPath": expected_path}
+    assert vm_sync == {"enabled": True, "vaultPath": expected_path}
+    assert main_values["externalSecrets"]["vaultPath"] == expected_path
+
+    expected_main_targets = {
+        "vmIngestionSecretName": "srw-infra-metering-vmi-ingestion",
+        "vmStorageIngestionSecretName": "srw-infra-metering-vm-storage-ingestion",
+        "volumeIdentitySecretName": "srw-infra-metering-volume-identity",
+        "volumeIdentityKeyVersion": "storage-v1",
+    }
+    expected_vm_targets = {
+        "ingestionSecretName": "srw-infra-metering-vmi-ingestion",
+        "storageIngestionSecretName": "srw-infra-metering-vm-storage-ingestion",
+        "volumeIdentitySecretName": "srw-infra-metering-volume-identity",
+        "volumeIdentityKeyVersion": "storage-v1",
+    }
+    assert {
+        key: main_values["infrastructureMetering"][key] for key in expected_main_targets
+    } == expected_main_targets
+    vm_metering = vm_fleet["helm"]["values"]["infrastructureMetering"]
+    assert {key: vm_metering[key] for key in expected_vm_targets} == expected_vm_targets
+    assert "vmLifecycleAuthSecretName" not in main_values["infrastructureMetering"]
+    assert (
+        not vm_fleet["helm"]["values"]
+        .get("vmController", {})
+        .get("lifecycleAuthSecretName")
+    )
+
+    for defaults in (chart_defaults, vm_chart_defaults):
+        sync_defaults = defaults["infrastructureMetering"]["externalSecrets"]
+        assert sync_defaults["enabled"] is False
+        assert {
+            key: sync_defaults[key] for key in expected_properties
+        } == expected_properties
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")

@@ -84,7 +84,7 @@ function createComponent() {
     });
 
     const component = runInInjectionContext(injector, () => new SessionsPageComponent());
-    return {component, mockHttp, mockRouter, mockChat};
+    return {component, mockHttp, mockRouter, mockChat, mockToast};
 }
 
 function makeThread(overrides: Partial<any> = {}) {
@@ -109,6 +109,7 @@ describe('SessionsPageComponent', () => {
     let mockHttp: any;
     let mockRouter: any;
     let mockChat: any;
+    let mockToast: any;
 
     beforeEach(() => {
         const created = createComponent();
@@ -116,6 +117,7 @@ describe('SessionsPageComponent', () => {
         mockHttp = created.mockHttp;
         mockRouter = created.mockRouter;
         mockChat = created.mockChat;
+        mockToast = created.mockToast;
     });
 
     afterEach(() => {
@@ -358,6 +360,45 @@ describe('SessionsPageComponent', () => {
             );
             expect(resumeCall).toBeTruthy();
             expect(mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 'thread-end']);
+        });
+
+        // Fix round 1, Finding 3: this page has no drift dialog of its own —
+        // the chat page does (config-drift-dialog.component.ts). A 428 here
+        // used to fall into the generic catch and show the same toast a 500
+        // gets, dead-ending the user exactly like the feature exists to stop.
+        it('hands off to the chat page on a config-drift 428, with an info toast and no danger toast', async () => {
+            mockHttp.post.mockReturnValue(throwError(() => ({
+                status: 428,
+                error: {
+                    detail: {
+                        code: 'config_drift',
+                        drift: [{id: 'connector:abc', kind: 'connector',
+                                 reason: 'deleted', label: 'KurortEngine'}],
+                    },
+                },
+            })));
+            const thread = makeThread({id: 'thread-drift', status: 'ended'});
+
+            await component.resumeSession(thread);
+
+            expect(mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 'thread-drift']);
+            expect(mockToast.danger).not.toHaveBeenCalled();
+            // Task 14, item A: the first click used to look like it did
+            // nothing (428 precedes the status flip, so the chat page renders
+            // its generic ended-card). An info toast — not danger, this isn't
+            // an error — says the setup needs attention before navigating.
+            expect(mockToast.info).toHaveBeenCalledWith('sessions.configDrift.attentionNeeded');
+        });
+
+        it('still shows the danger toast, no info toast, and does not navigate on a non-drift resume failure', async () => {
+            mockHttp.post.mockReturnValue(throwError(() => ({status: 500})));
+            const thread = makeThread({id: 'thread-500', status: 'ended'});
+
+            await component.resumeSession(thread);
+
+            expect(mockToast.danger).toHaveBeenCalled();
+            expect(mockToast.info).not.toHaveBeenCalled();
+            expect(mockRouter.navigate).not.toHaveBeenCalled();
         });
     });
 

@@ -1,5 +1,6 @@
 """Unit tests for IDE session restore routing and container clone behavior."""
 
+import logging
 from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
@@ -333,3 +334,122 @@ async def test_snapshot_restore_runs_git_repair_fetch(service_factory):
     svc._repair_git_after_snapshot.assert_awaited_once_with(
         "job-0012", ANY, "10.0.0.10", 30022
     )
+
+
+# =============================================================================
+# Test: _extract_snapshot_to_vm honest return (C1a)
+# =============================================================================
+#
+# _extract_snapshot_to_vm used to return None on every path (no-service,
+# download failure, rc != 0, AND a clean extract), which made a failed
+# restore indistinguishable from a successful one. Mirrors the fix already
+# applied to workspace_suspension.py's _extract_snapshot.
+
+
+@pytest.mark.asyncio
+async def test_extract_snapshot_to_vm_returns_false_on_download_failure(
+    service_factory,
+):
+    """A failed S3 download must not be reported as a successful extract."""
+    svc = service_factory
+    svc._snapshot_service.download_snapshot = AsyncMock(return_value=False)
+
+    ok = await svc._extract_snapshot_to_vm("job-0013", "10.0.0.10", 30022)
+
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_extract_snapshot_to_vm_returns_false_on_extract_rc_nonzero(
+    service_factory,
+):
+    """A tar/ssh failure (rc != 0) must not be reported as a successful extract."""
+    svc = service_factory
+    svc._snapshot_service.download_snapshot = AsyncMock(return_value=True)
+
+    with (
+        patch(
+            "orchestrator.services.ide_session.stream_extract_snapshot",
+            AsyncMock(return_value=(2, b"boom")),
+        ),
+        patch(
+            "orchestrator.services.ide_session.resolve_ssh_key_path", return_value="k"
+        ),
+    ):
+        ok = await svc._extract_snapshot_to_vm("job-0014", "10.0.0.10", 30022)
+
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_extract_snapshot_to_vm_returns_true_on_clean_extract(
+    service_factory,
+):
+    """A clean download + unpack is the only path that reports success."""
+    svc = service_factory
+    svc._snapshot_service.download_snapshot = AsyncMock(return_value=True)
+
+    with (
+        patch(
+            "orchestrator.services.ide_session.stream_extract_snapshot",
+            AsyncMock(return_value=(0, b"")),
+        ),
+        patch(
+            "orchestrator.services.ide_session.resolve_ssh_key_path", return_value="k"
+        ),
+    ):
+        ok = await svc._extract_snapshot_to_vm("job-0015", "10.0.0.10", 30022)
+
+    assert ok is True
+
+
+# =============================================================================
+# Test: restore_snapshot_for_resume gates on the extract result (C1a)
+# =============================================================================
+#
+# restore_snapshot_for_resume used to ignore _extract_snapshot_to_vm's return
+# value entirely, unconditionally logging "Snapshot restored" and returning
+# True — so a resume whose extract failed still reported success and the
+# agent resumed on an empty/half-populated tree.
+
+
+@pytest.mark.asyncio
+async def test_restore_snapshot_for_resume_returns_false_when_extract_fails(
+    service_factory, caplog
+):
+    """A failed extract must fail the resume, not silently report success."""
+    svc = service_factory
+    svc._snapshot_service.is_available = True
+    svc._db.get_job = AsyncMock(
+        return_value={
+            "id": "job-0016",
+            "context": {"snapshot": {"status": "available"}},
+        }
+    )
+    svc._extract_snapshot_to_vm = AsyncMock(return_value=False)
+
+    with caplog.at_level(logging.INFO, logger="orchestrator.services.ide_session"):
+        result = await svc.restore_snapshot_for_resume("job-0016", "10.0.0.10", 30022)
+
+    assert result is False
+    assert "Snapshot restored for job resume" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_restore_snapshot_for_resume_returns_true_when_extract_succeeds(
+    service_factory,
+):
+    """Happy path: a clean extract still reports the resume as restored."""
+    svc = service_factory
+    svc._snapshot_service.is_available = True
+    svc._db.get_job = AsyncMock(
+        return_value={
+            "id": "job-0017",
+            "context": {"snapshot": {"status": "available"}},
+        }
+    )
+    svc._extract_snapshot_to_vm = AsyncMock(return_value=True)
+
+    result = await svc.restore_snapshot_for_resume("job-0017", "10.0.0.10", 30022)
+
+    assert result is True

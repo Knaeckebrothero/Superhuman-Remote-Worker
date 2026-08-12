@@ -9,7 +9,8 @@
       "running": "running",
       "ok": "completed",
       "error": "error",
-      "denied": "denied"
+      "denied": "denied",
+      "expired": "not run"
     },
     "diff": {
       "replace": "diff",
@@ -83,7 +84,18 @@
       "approve": "Approve",
       "openDiff": "Open diff",
       "cancel": "Cancel job",
+      "resumeWithFeedback": "Continue with feedback",
+      "feedbackPlaceholder": "What should it do differently?",
+      "feedbackSubmit": "Send & continue",
+      "feedbackDismiss": "Dismiss",
       "diffTitle": "Job {{id}} — changes"
+    },
+    "jobBatch": {
+      "title": "{{count}} jobs dispatched",
+      "finished": "{{done}}/{{total}} finished",
+      "failed": "{{count}} failed",
+      "review": "{{count}} awaiting review",
+      "notCreated": "Job was not created"
     },
     "view": {
       "rendered": "Rendered",
@@ -545,6 +557,29 @@
       "createSession": "Create Session",
       "protectedCloud": "Protected cloud — agent writes are staged for your review",
       "protectedCloudHint": "The agent gets read-only cloud access; its changes wait for your approval in the review panel."
+    },
+    "configDrift": {
+      "title": "Some of this session's setup is gone",
+      "intro": "Parts of this session's configuration aren't available anymore:",
+      "attentionNeeded": "This session's setup needs attention. Opening it now…",
+      "resumeAnyway": "Resume without them",
+      "startNew": "Start a new session",
+      "connector": {
+        "deleted": "Deleted connector — {{label}}",
+        "revoked": "Revoked connector — {{label}}",
+        "out_of_scope": "Revoked connector — {{label}}"
+      },
+      "project": {
+        "deleted": "Deleted project — {{label}}",
+        "revoked": "Revoked project — {{label}}",
+        "out_of_scope": "Revoked project — {{label}}"
+      },
+      "grant": {
+        "deleted": "Missing grant — {{label}}",
+        "revoked": "Missing grant — {{label}}",
+        "out_of_scope": "Missing grant — {{label}}"
+      },
+      "countSuffix": " (×{{count}})"
     }
   },
   "jobs": {
@@ -593,6 +628,7 @@
       "paused": "Paused",
       "failed": "Failed",
       "cancelled": "Cancelled",
+      "waiting_for_reply": "Waiting for reply",
       "waiting_approval": "Waiting · approval"
     },
     "action": {
@@ -1378,12 +1414,24 @@
     "rewind": {
       "button": "Rewind to here",
       "title": "Rewind session",
-      "body": "Go back to before this message? Messages after this point are hidden from the conversation (kept in the audit trail). Files return to their state at that point.",
       "caveat": "Commands with external effects (network calls, deployments) can't be undone.",
       "both": "Restore conversation and files",
+      "bothDesc": "Hide later messages and revert files to this point",
       "conversation": "Restore conversation only",
+      "conversationDesc": "Files keep their current state",
       "code": "Restore files only",
-      "summarize": "Summarize up to here"
+      "codeDesc": "The conversation stays intact",
+      "summarize": "Summarize up to here",
+      "summarizeDesc": "Compact everything up to this point into a summary",
+      "pickerTitle": "Rewind to…",
+      "pickerHint": "Pick a message to rewind to:",
+      "pickerEmpty": "No previous messages to rewind to yet.",
+      "pickerFilter": "Type to filter messages…",
+      "pickerNoMatches": "No messages match.",
+      "yesterday": "Yesterday",
+      "hidesOne": "hides 1 later message",
+      "hidesMany": "hides {{count}} later messages",
+      "refillHint": "Your message returns to the composer so you can edit and resend it."
     },
     "diff": {
       "replace": "Diff",
@@ -1395,20 +1443,19 @@
     "settingsPane": {
       "title": "Session settings",
       "close": "Close settings",
-      "workspace": "Workspace",
-      "tier": {
-        "virtual": "Lite (no workspace pod)",
-        "sandbox": "Sandbox container",
-        "vm": "Virtual machine",
-        "none": "None",
-        "remote": "Remote container",
-        "docker": "Container"
-      },
-      "upgrading": "Provisioning {{tier}}…",
-      "upgradeSandbox": "Upgrade to sandbox",
-      "upgradeVm": "Upgrade to VM",
-      "workspaceHint": "Upgrades carry your files over and cannot be reversed within the session.",
-      "fixedNote": "Expert and projects are set at session creation and shown in the session list."
+      "fixedNote": "Expert and projects are set at session creation and shown in the session list.",
+      "upgradeConfirm": {
+        "sandbox": {
+          "title": "Upgrade to a container?",
+          "body": "Starts a workspace container and copies your files into it. Adds shell, git and browser tools. Takes about a minute."
+        },
+        "vm": {
+          "title": "Upgrade to a VM?",
+          "body": "Provisions a dedicated virtual machine with root and sudo, and copies your files onto it. A cold start takes 6–25 minutes."
+        },
+        "irreversible": "This can't be undone — the session can't move back down a tier.",
+        "confirm": "Upgrade"
+      }
     },
     "settings": {
       "mode": "Mode",
@@ -1515,6 +1562,7 @@
     "permission": {
       "title": "Permission required",
       "approve": "Approve",
+      "singleTitle": "The agent wants to run a tool",
       "batchTitle": "The agent wants to run {{count}} tool(s)",
       "approveAll": "Approve all",
       "autoAccept": "Auto-accept",
@@ -1557,6 +1605,20 @@
       "defaultMobile": "Type a message...",
       "resuming": "Resuming session…",
       "endedSendResumes": "Type a message — sending resumes the session"
+    },
+    "upload": {
+      "stage": "Uploading {{done}} of {{total}}…",
+      "stagePercent": "Uploading {{done}} of {{total}} — {{percent}}%",
+      "progressLabel": "Send progress",
+      "sending": "Sending…",
+      "waitingOn": "Waiting for {{name}}…",
+      "failed": "{{name}} could not be uploaded",
+      "removeAndSend": "Remove file and send",
+      "slashCommandWithAttachments": "Remove the attached files before running a command.",
+      "duplicateFile": "{{name}} is already attached",
+      "tooLarge": "{{name}} is larger than the 100 MB limit",
+      "tooManyFiles": "You can attach at most 20 files at once",
+      "noWorkspace": "This session has no workspace, so files cannot be attached."
     },
     "composer": {
       "attach": "Attach",
@@ -1629,6 +1691,7 @@
       "compact": "Compress conversation history to free up context",
       "done": "End session — extract memories and archive",
       "undo": "Undo file changes from the last turn",
+      "rewind": "Rewind to an earlier message",
       "auto": "Switch to auto-accept mode (approve all except shell)",
       "supervised": "Switch to supervised mode (approve all writes)",
       "autonomous": "Switch to autonomous mode (approve nothing)",
@@ -2378,7 +2441,6 @@
       "compactOnArchive": "Compact on archive",
       "keepRecentToolResults": "Keep recent tool results",
       "keepRecentMessages": "Keep recent messages",
-      "backend": "Backend",
       "vmCpuCores": "VM CPU cores",
       "vmMemory": "VM memory",
       "maxReadWords": "Max read words",
@@ -2611,7 +2673,16 @@
       "critic": "Critic (verification)",
       "projectMemory": "Project memory",
       "imageQuality": "Image Quality",
-      "autonomyDefaultHint": "Controls when the agent pauses for human review"
+      "workspaceBackend": "Workspace",
+      "autonomyDefaultHint": "Controls when the agent pauses for human review",
+      "tierCurrent": "current",
+      "tierHint": "Upgrades carry your files over and cannot be reversed within the session.",
+      "tierUpgrading": "Provisioning {{tier}}…",
+      "tierUnreachable": {
+        "downgrade": "can't move down a tier",
+        "needsApproval": "needs approval",
+        "unsupported": "not available from this tier"
+      }
     },
     "narrationModes": {
       "auto": "Auto",

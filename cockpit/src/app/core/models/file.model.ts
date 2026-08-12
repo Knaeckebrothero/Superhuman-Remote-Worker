@@ -46,12 +46,35 @@ export interface FilePreview {
   preview?: string;
   /** Upload progress percentage (0-100) */
   uploadProgress?: number;
-  /** Current upload status */
+  /**
+   * Current upload status. Job creation drives this through its own upload
+   * (job-create.component.ts). The chat composer no longer does: a chat
+   * attachment's upload state lives on the outbox item that carries it
+   * (`PendingUpload.status`), because the file leaves the composer the instant
+   * the user sends. `remoteName`/`uploadedFiles` lived here for the same
+   * reason and were removed with it.
+   */
   uploadStatus: UploadStatus;
   /** Error message if upload failed */
   error?: string;
-  /** Server-assigned filename after upload (for the agent hint) */
-  remoteName?: string;
+}
+
+/**
+ * A file `createFilePreviews()` declined to include in the batch, and why —
+ * so the caller can tell the user instead of the file silently vanishing
+ * (the bug this type exists to close: see file-handling.service.ts).
+ */
+export interface RejectedFile {
+  /** Original filename, for display in the rejection message. */
+  name: string;
+  /** 'size': over the per-file byte cap. 'count': over the per-batch file cap. */
+  reason: 'size' | 'count';
+}
+
+/** Result of `createFilePreviews()`: what was accepted, and what wasn't. */
+export interface FilePreviewResult {
+  previews: FilePreview[];
+  rejected: RejectedFile[];
 }
 
 /**
@@ -105,3 +128,15 @@ export interface ThreadUploadResponse {
   thread_id: string;
   files: ThreadUploadedFile[];
 }
+
+/**
+ * What `ApiService.uploadOneToThread` emits: zero or more `progress` events
+ * while the bytes move, then exactly one `done` carrying the server's entries.
+ *
+ * `total` is `null` whenever the browser cannot compute the request body
+ * length — `HttpUploadProgressEvent.total` is optional, so a consumer that
+ * divides by it unguarded renders NaN/Infinity. Indeterminate is a real state.
+ */
+export type ThreadUploadEvent =
+  | {kind: 'progress'; loaded: number; total: number | null}
+  | {kind: 'done'; files: ThreadUploadedFile[]};

@@ -67,10 +67,10 @@ configure_logging(
     disable_uvicorn_access=True,
 )
 
-from dataclasses import replace  # noqa: E402
+from dataclasses import dataclass, replace  # noqa: E402
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
-from collections.abc import Coroutine, Mapping  # noqa: E402
+from collections.abc import Callable, Coroutine, Mapping  # noqa: E402
 from typing import Any, Literal, NamedTuple, Optional  # noqa: E402
 from uuid import UUID, uuid4  # noqa: E402
 
@@ -232,6 +232,15 @@ from services.dispatch_guards import (  # noqa: E402
     resume_lane_applies,
     vm_provisioning_decision,
 )
+from services.config_drift import (  # noqa: E402
+    DriftItem,
+    acknowledged_drift_ids,
+    acknowledged_grant_keys,
+    blocking_denials,
+    collect_config_drift,
+    strip_acknowledged,
+)
+from services.datasource_policy import classify_datasource_selection  # noqa: E402
 from services.audit_usage import materialize_llm_usage_from_audit  # noqa: E402
 from services.cloud_pricing import (  # noqa: E402
     CloudCostEstimator,
@@ -2537,6 +2546,39 @@ async def _account_defaults_layer(
     return await _resolve_default_models(user_id)
 
 
+async def _acknowledged_grant_strip(
+    metadata: dict[str, Any],
+    *,
+    user_id: str | None,
+    project_id: str | None,
+) -> Callable[[dict], dict] | None:
+    """Build ``resolve_config``'s ``grant_strip`` hook from a thread's
+    acknowledged grant drift, or ``None`` when there is nothing to strip (no
+    acknowledgment, or ``_resolve_runner_grants`` says admin bypass).
+
+    Shared by :func:`_resolve_session_config` (the delivered blob) and
+    :func:`_merged_session_tool_policy` (the tool-groups report), so the two
+    can never disagree about which acknowledged grants are currently still
+    violated — before this helper existed, the report used a bare
+    ``resolve_config`` call with no strip at all, so an acknowledged
+    ``catalog_authoring`` violation (say) still read "on" in the settings
+    view after the delivered blob had already dropped it. See
+    docs/done/session_config_drift_resume.md §3.3.
+    """
+    ack_grant_keys = acknowledged_grant_keys(metadata)
+    if not ack_grant_keys:
+        return None
+    grants_for_strip = await _resolve_runner_grants(
+        runner_user_id=user_id,
+        project_ids=[project_id] if project_id else [],
+    )
+    if grants_for_strip is None:
+        return None
+    return lambda fragment: _strip_acknowledged_grants(
+        fragment, grants_for_strip, ack_grant_keys
+    )
+
+
 async def _resolve_session_config(
     thread: dict[str, Any],
     metadata: dict[str, Any],
@@ -2597,6 +2639,16 @@ async def _resolve_session_config(
         request_override = await _seed_registry_model_overrides(
             request_override, user_id=user_id
         )
+        # Grants resolved BEFORE resolve_config (not after) so the strip can run
+        # as its grant_strip hook, on the SAME `data` the delivered blob is built
+        # from — not just on the detached capture the PDP evaluates. Stripping
+        # only the capture leaves the delivered blob carrying the very
+        # capability the grant revoked (round-1 finding). None when there is
+        # nothing acknowledged, or when _resolve_runner_grants says admin.
+        # Shared with the tool-groups report — see _acknowledged_grant_strip.
+        _grant_strip = await _acknowledged_grant_strip(
+            metadata, user_id=user_id, project_id=project_id
+        )
         resolved = resolve_config(
             base_config_name=base,
             base_defaults=base_defaults,
@@ -2606,6 +2658,7 @@ async def _resolve_session_config(
             expert_type="session",
             capture=_cap,
             skills=_skills_payload,
+            grant_strip=_grant_strip,
         )
         # Bound skills are delivered deterministically (instructions channel);
         # strip them from the model-invoked catalog so they aren't double-offered.
@@ -2625,6 +2678,9 @@ async def _resolve_session_config(
         # interactive.permission_mode and any persistent_agent keys baked into
         # config_override — must fit the runner's grants. GrantDenied escapes the
         # generic except below (fail closed: never deliver the unvetted override).
+        # _cap["merged_fragment"] already reflects the grant_strip hook above
+        # (same `data` the delivered blob was built from); this re-check stays
+        # authoritative — it re-runs evaluate() on whatever that hook returned.
         await _enforce_dispatch_grants(
             _cap["merged_fragment"],
             runner_user_id=user_id,
@@ -2649,9 +2705,13 @@ async def _resolve_session_config(
         if status is not None:
             status["state"] = "ok"
         return delivered
-    except GrantDenied:
+    except GrantDenied as gd:
         if status is not None:
             status["state"] = "denied"
+            # The drift collector reads these rather than re-merging the config
+            # itself — one merge implementation, so the dialog can never promise
+            # something different from what attach enforces.
+            status["grant_violations"] = list(gd.violations)
         raise
     except Exception:
         logger.exception(
@@ -2720,6 +2780,19 @@ def _merged_session_tool_groups(
       one only by ``workspace.*`` and datasource categories
       (``graph``/``sql``/``mongodb``/``webdav``/``email``/``mcp``) — disjoint
       from these four groups.
+    - ``grant_strip`` — the acknowledged-grant-downgrade hook
+      ``_resolve_session_config`` passes to ``resolve_config`` — is skipped
+      HERE too, and it does NOT belong on the "safe to skip" side of this
+      ledger the way the entries above do: an acknowledged grant violation
+      CAN delete a closed group's only enabling key (``catalog_authoring`` is
+      both a closed session tool group and a key ``strip_to_grants`` drops).
+      This function has no caller today that carries a thread/metadata to
+      build the hook from, so it is left unthreaded rather than faked.
+      :func:`_merged_session_tool_policy` — whose two HTTP callers DO have a
+      thread — accepts and forwards ``grant_strip`` instead; see
+      ``_acknowledged_grant_strip``. If this function grows a caller that
+      needs a drift-aware answer, thread it through the same way rather than
+      silently reporting the pre-strip merge.
 
     Kept, because each CAN set ``tools.*``: the base config name, the expert
     row, the project-expert link override, and the request override (which is
@@ -2741,11 +2814,17 @@ def _merged_session_tool_policy(
     project_overrides: dict[str, Any] | None,
     request_override: dict[str, Any] | None,
     expert_type: str = "session",
+    grant_strip: Callable[[dict], dict] | None = None,
 ) -> tuple[dict[str, list[str]], dict[str, str]]:
     """``(merged tools mapping, category -> deciding layer)``.
 
     SYNCHRONOUS — see :func:`_merged_session_tool_groups`, whose skip ledger
-    this shares because it runs the same resolve.
+    this shares because it runs the same resolve, with ONE exception:
+    ``grant_strip`` is NOT skipped here. A caller that holds a thread and its
+    metadata (the two tool-groups HTTP endpoints) can build the identical
+    hook ``_resolve_session_config`` passes to ``resolve_config`` — see
+    ``_acknowledged_grant_strip`` — so an acknowledged grant's downgrade
+    shows up in the reported policy instead of only in the delivered blob.
 
     This is a *prediction* and is only ever served as one. It cannot see the
     agent's runtime injection layer or its backend capability gate, so it is
@@ -2769,6 +2848,7 @@ def _merged_session_tool_policy(
         request_override=request_override,
         expert_type=expert_type,
         capture=capture,
+        grant_strip=grant_strip,
     )
     merged_fragment = capture.get("merged_fragment") or {}
     merged = merged_fragment.get("tools")
@@ -4792,8 +4872,14 @@ async def _assemble_session_attach_payload(
     # that same result. The generic denial deliberately avoids an enumeration
     # oracle; datasource credentials never reach this log path.
     try:
-        current_project_ids = await _thread_project_ids(thread_id)
-        project_ids = await _revalidate_thread_project_ids(_thread, current_project_ids)
+        # Acknowledged-but-still-unavailable project drift is narrowed out
+        # INSIDE _revalidate_thread_project_ids now (only while it stays
+        # denied), so an already-acknowledged revoked/deleted project does
+        # not spuriously 403 here — while a RECOVERED acknowledged project
+        # returns automatically (spec §3.2).
+        project_ids = await _revalidate_thread_project_ids(
+            _thread, await _thread_project_ids(thread_id)
+        )
         resolved_datasources = await _resolve_authorized_thread_datasources(
             _thread,
             _meta.get("datasource_ids"),
@@ -6754,6 +6840,40 @@ async def _enforce_dispatch_grants(
     violations = evaluate(merged, grants)
     if violations:
         raise GrantDenied(violations)
+
+
+def _strip_acknowledged_grants(
+    fragment: dict[str, Any], grants: dict[str, Any], acknowledged: set[str]
+) -> dict[str, Any]:
+    """Drop acknowledged grant violations from a merged config fragment.
+
+    A violation the user did NOT acknowledge is left in place, so
+    ``_enforce_dispatch_grants`` still denies on all of it — acknowledging one
+    grant must never smuggle a different one through.
+
+    ``strip_to_grants`` is advisory by contract; the authoritative re-check is
+    the ``_enforce_dispatch_grants`` call that runs on the resulting capture.
+
+    Sync and pure (no grant resolution here) so it can run as
+    ``resolve_config``'s ``grant_strip`` hook, applied to the fully-merged
+    ``data`` before the delivered blob is built from it — not just to the
+    detached ``capture["merged_fragment"]`` copy the PDP evaluates. Stripping
+    only the capture leaves the delivered blob carrying the very capability
+    the grant revoked (round-1 finding: acknowledging ``shell_tools`` stopped
+    the denial but the agent still hydrated ``tools.shell=True``).
+    """
+    from src.core.capability_grants import evaluate, strip_to_grants
+
+    violations = evaluate(fragment, grants)
+    if not violations:
+        return fragment
+    flagged = {v.split(":", 1)[0] for v in violations}
+    if not flagged <= acknowledged:
+        # Something drifted that was never acknowledged. Leave the fragment
+        # untouched and let the dispatch PEP fail closed on all of it.
+        return fragment
+    stripped, _dropped = strip_to_grants(fragment, grants)
+    return stripped
 
 
 async def _enforce_session_create_grants(
@@ -11498,6 +11618,12 @@ async def _resolve_internal_job_creation_scope(
             column_project = thread.get("project_id")
             if column_project and str(column_project) not in thread_projects:
                 thread_projects.insert(0, str(column_project))
+            # Acknowledged-but-still-unavailable project drift is narrowed
+            # out INSIDE _revalidate_thread_project_ids now, same as the
+            # warm-attach and cold-workspace call sites, so an
+            # already-acknowledged revoked/deleted project does not
+            # spuriously 403 an internal job scoped off this thread — while a
+            # RECOVERED acknowledged project returns automatically.
             thread_projects = await _revalidate_thread_project_ids(
                 thread, thread_projects
             )
@@ -22844,6 +22970,7 @@ async def delete_datasource(request: Request, datasource_id: str) -> dict[str, s
                 authority_project_scope_id=(
                     str(scope_project_id) if scope_project_id else None
                 ),
+                deleted_by=str(user["id"]),
             )
         else:
             success = await postgres_db.delete_datasource(
@@ -22851,6 +22978,7 @@ async def delete_datasource(request: Request, datasource_id: str) -> dict[str, s
                 authority_project_scope_id=(
                     str(scope_project_id) if scope_project_id else None
                 ),
+                deleted_by=str(user["id"]),
             )
         if not success:
             raise HTTPException(
@@ -26625,9 +26753,12 @@ async def _thread_project_ids(thread_id: str) -> list[str]:
     """Derive the project-attachment list for a thread from ``thread_mounts``.
 
     Replaces the legacy ``threads.metadata.project_ids`` JSONB read. Phase 1
-    of cloud_collaboration_model.md §9. Only ``mount_kind='project'`` rows
-    contribute — ``project_default`` and ``repo`` rows are different shapes
-    on the agent side.
+    of cloud_collaboration_model.md §9. Both ``mount_kind='project'`` and
+    ``project_default`` rows contribute — see ``_project_ids_from_mounts``,
+    which is what actually filters; ``repo`` rows are the shape excluded here.
+    (This line used to claim ``project_default`` was excluded too. It never
+    was, and reading it that way sends you looking for a bug that isn't there
+    — see docs/issues/session_contacts_never_register_on_default_project.md.)
 
     **Lazy backfill (transitional):** threads that predate the migration
     have ``metadata.project_ids`` set but no ``thread_mounts`` rows. Newer
@@ -27238,6 +27369,11 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         canvas_shared_browser_available,
     ) = _agent_canvas_workspace_capabilities(metadata, ws, vm)
     # Phase 1: project attachment + cloud mounts now live on thread_mounts.
+    # Acknowledged-but-still-unavailable project drift is narrowed out
+    # INSIDE _revalidate_thread_project_ids now, same as the warm-attach
+    # call site — otherwise a cold-started session dies here on exactly the
+    # drift the owner already acknowledged at resume — while a RECOVERED
+    # acknowledged project returns automatically (spec §3.2).
     project_ids = await _revalidate_thread_project_ids(
         thread, await _thread_project_ids(thread_id)
     )
@@ -29447,6 +29583,69 @@ async def _authorize_thread_datasource_ids(
     return selected
 
 
+async def _strip_still_denied_ack(
+    thread: dict[str, Any],
+    selected: list[str],
+    *,
+    actor: dict[str, Any] | None,
+    effective_work_owner_id: str | None,
+    project_ids: list[str],
+    trusted_system_inheritance: bool = False,
+) -> list[str]:
+    """Drop acknowledged connector ids that are CURRENTLY still unavailable.
+
+    Spec §3.2: "If the connector is recreated or the grant re-issued, the
+    item returns automatically on the next attach — no repair step." Dropping
+    an id purely because its namespaced key is IN the ack map (as this used
+    to do) breaks that promise forever, since nothing ever prunes the map.
+
+    ``strip_acknowledged`` itself stays a pure, unconditional set-difference
+    (see tests/test_attach_honors_drift_ack.py). The "only while it's still
+    denied" condition lives here, at the call site, mirroring
+    ``_strip_acknowledged_grants``'s re-evaluate-before-strip discipline:
+    classify current status first, then narrow. A recreated/re-scoped
+    connector keeps a clean verdict and is left in ``selected``, so it
+    authorizes normally and is used again automatically; a still-denied
+    acknowledged id is dropped exactly as before. Anything denied and NEVER
+    acknowledged is also left in place, so the authorize call downstream
+    still fails the whole selection closed on it — fail-closed is unchanged.
+
+    A malformed stored id or a vanished/unapproved owner makes
+    ``classify_datasource_selection`` raise ``DatasourceUnavailableError``
+    directly — those checks run BEFORE its per-item loop, so no verdict list
+    is ever returned. Translate that the same way the sibling authorizer
+    (:func:`_authorize_thread_datasource_selection`) does, so this call
+    site's behavior is unchanged from before the ack feature existed: a 403,
+    never an unhandled exception reaching the ASGI layer as a 500.
+    """
+    ack = acknowledged_drift_ids(thread.get("metadata"))
+    if not ack:
+        return selected
+    from services.datasource_policy import DatasourceUnavailableError
+
+    try:
+        verdicts, _revisions = await classify_datasource_selection(
+            postgres_db,
+            actor,
+            effective_work_owner_id,
+            selected,
+            project_ids,
+            None,
+            trusted_system_inheritance=trusted_system_inheritance,
+        )
+    except DatasourceUnavailableError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="One or more selected connectors are unavailable",
+        ) from exc
+    still_denied_ack = {
+        f"connector:{v.datasource_id}"
+        for v in verdicts
+        if v.denied and f"connector:{v.datasource_id}" in ack
+    }
+    return strip_acknowledged(selected, still_denied_ack, prefix="connector")
+
+
 async def _revalidate_thread_datasource_selection(
     thread: dict[str, Any],
     datasource_ids: list[str] | None,
@@ -29466,6 +29665,9 @@ async def _revalidate_thread_datasource_selection(
     naturally omitted by ``resolve_datasources_for_thread``. A non-system thread
     whose owner row vanished fails closed with the same generic detail used at
     create time, avoiding a datasource-enumeration oracle.
+
+    Acknowledged ids are narrowed out only while still denied — see
+    :func:`_strip_still_denied_ack`.
     """
     selected = list(dict.fromkeys(str(value) for value in datasource_ids or []))
     if not selected:
@@ -29479,6 +29681,16 @@ async def _revalidate_thread_datasource_selection(
 
     owner_id = thread.get("user_id")
     if not owner_id:
+        selected = await _strip_still_denied_ack(
+            thread,
+            selected,
+            actor=None,
+            effective_work_owner_id=None,
+            project_ids=project_ids,
+            trusted_system_inheritance=True,
+        )
+        if not selected:
+            return [], {}
         return await _authorize_thread_datasource_selection(
             None,
             selected,
@@ -29494,6 +29706,16 @@ async def _revalidate_thread_datasource_selection(
             detail="One or more selected connectors are unavailable",
         )
 
+    selected = await _strip_still_denied_ack(
+        thread,
+        selected,
+        actor=owner,
+        effective_work_owner_id=str(owner_id),
+        project_ids=project_ids,
+    )
+    if not selected:
+        return [], {}
+
     # workspace_backend=None intentionally skips the create-time lite/repository
     # compatibility rule. Revalidation is only an access check and must not
     # retroactively change existing non-KB datasource behavior.
@@ -29504,16 +29726,6 @@ async def _revalidate_thread_datasource_selection(
         target_project_ids=project_ids,
         effective_work_owner_id=str(owner_id),
     )
-
-
-async def _revalidate_thread_datasource_ids(
-    thread: dict[str, Any], datasource_ids: list[str] | None
-) -> list[str]:
-    """Compatibility wrapper for delivery paths that need IDs only."""
-    selected, _revisions = await _revalidate_thread_datasource_selection(
-        thread, datasource_ids
-    )
-    return selected
 
 
 async def _resolve_authorized_thread_datasources(
@@ -29545,6 +29757,13 @@ async def _revalidate_thread_project_ids(
     revoked membership must take effect on the next attach/resume. Userless
     internal/system threads retain their existing trusted behavior, and admins
     retain the platform's normal all-project visibility.
+
+    Acknowledged ids are dropped only while they remain unavailable (spec
+    §3.2: a restored membership returns automatically, no repair step).
+    Classify current status first, narrow out only the acknowledged ids that
+    are STILL denied, and let :func:`_authorize_thread_project_ids` fail the
+    whole selection closed on anything denied that was never acknowledged —
+    mirrors the connector counterpart, :func:`_strip_still_denied_ack`.
     """
     owner_id = thread.get("user_id")
     if not owner_id:
@@ -29556,7 +29775,51 @@ async def _revalidate_thread_project_ids(
             status_code=403,
             detail="One or more attached projects are unavailable",
         )
-    return await _authorize_thread_project_ids(owner, project_ids)
+
+    selected = list(dict.fromkeys(str(value) for value in project_ids or []))
+    ack = acknowledged_drift_ids(thread.get("metadata"))
+    if ack and selected:
+        verdicts = await _classify_thread_project_ids(owner, selected)
+        still_denied_ack = {
+            f"project:{v.project_id}"
+            for v in verdicts
+            if v.denied and f"project:{v.project_id}" in ack
+        }
+        selected = strip_acknowledged(selected, still_denied_ack, prefix="project")
+
+    return await _authorize_thread_project_ids(owner, selected)
+
+
+@dataclass(frozen=True)
+class ProjectVerdict:
+    """One project attachment's availability decision."""
+
+    project_id: str
+    denied: bool
+    reason: str | None = None
+
+
+async def _classify_thread_project_ids(
+    user: dict[str, Any], project_ids: list[str] | None
+) -> list[ProjectVerdict]:
+    """Per-item project verdicts. Reporting half of
+    :func:`_authorize_thread_project_ids`, which wraps this."""
+    selected = list(dict.fromkeys(str(value) for value in project_ids or []))
+    verdicts: list[ProjectVerdict] = []
+    for project_id in selected:
+        project = await postgres_db.get_project(project_id)
+        if not project:
+            verdicts.append(ProjectVerdict(project_id, True, "deleted"))
+            continue
+        if user.get("is_admin"):
+            verdicts.append(ProjectVerdict(project_id, False, None))
+            continue
+        role = await postgres_db.get_user_role_in_project(project_id, str(user["id"]))
+        if not role:
+            verdicts.append(ProjectVerdict(project_id, True, "revoked"))
+            continue
+        verdicts.append(ProjectVerdict(project_id, False, None))
+    return verdicts
 
 
 async def _authorize_thread_project_ids(
@@ -29566,20 +29829,12 @@ async def _authorize_thread_project_ids(
     selected = list(dict.fromkeys(str(value) for value in project_ids or []))
     if not selected:
         return []
-
-    for project_id in selected:
-        project = await postgres_db.get_project(project_id)
-        allowed = bool(project) and bool(user.get("is_admin"))
-        if project and not allowed:
-            role = await postgres_db.get_user_role_in_project(
-                project_id, str(user["id"])
-            )
-            allowed = bool(role)
-        if not allowed:
-            raise HTTPException(
-                status_code=403,
-                detail="One or more attached projects are unavailable",
-            )
+    verdicts = await _classify_thread_project_ids(user, selected)
+    if any(v.denied for v in verdicts):
+        raise HTTPException(
+            status_code=403,
+            detail="One or more attached projects are unavailable",
+        )
     return selected
 
 
@@ -31402,12 +31657,22 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
                     project_overrides = link.get("config_override") or None
                     if isinstance(project_overrides, str):
                         project_overrides = json.loads(project_overrides)
+            # Owner-correct, same as _session_tool_grants below: an admin
+            # viewing another user's thread must see THAT owner's
+            # acknowledged grants, not their own (see _acknowledged_grant_strip
+            # and the resume-time owner-vs-caller fix it mirrors).
+            grant_strip = await _acknowledged_grant_strip(
+                metadata,
+                user_id=str(thread["user_id"]) if thread.get("user_id") else None,
+                project_id=project_id,
+            )
             configured, provenance = await asyncio.to_thread(
                 _merged_session_tool_policy,
                 base_config_name=base,
                 expert_row=expert_row,
                 project_overrides=project_overrides,
                 request_override=request_override,
+                grant_strip=grant_strip,
             )
         except Exception:
             logger.exception("Tool-group resolve failed for thread %s", thread_id)
@@ -31519,6 +31784,11 @@ async def preview_tool_groups(
                 _legacy_session_tool_policy, base, body.config_override or None
             )
         else:
+            # No grant_strip here: this is a not-yet-created session, so
+            # there is no thread and no metadata.config_drift_ack to have
+            # acknowledged anything against — unlike the thread endpoint
+            # above, omitting it is not a gap to close, it is the correct
+            # answer for a config that cannot yet have drifted.
             configured, provenance = await asyncio.to_thread(
                 _merged_session_tool_policy,
                 base_config_name=base,
@@ -32891,16 +33161,127 @@ async def _await_late_cloud_setup(thread_id: str) -> None:
         )
 
 
+class ThreadResumeRequest(BaseModel):
+    """Optional body for POST /resume. ``acknowledge`` carries the drift item
+    ids the user accepted losing."""
+
+    acknowledge: list[str] | None = None
+
+
+async def _thread_config_drift(
+    thread: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    owner: dict[str, Any] | None,
+) -> list[DriftItem]:
+    """Everything in this thread's stored config that is no longer usable.
+
+    Runs the same classifiers the enforcers wrap, so the dialog can never
+    promise something different from what attach will do.
+
+    ``owner`` MUST be the thread's own owner row (looked up from
+    ``thread["user_id"]``), never the caller. ``require_thread_owner`` lets
+    admins act on threads they do not own, and admins pass every classify_*
+    check — passing the caller through would silently report no drift for
+    someone else's drifted thread, resume it anyway with no ack recorded,
+    and leave the real owner permanently stuck (attach enforces against the
+    true owner and refuses, and the cockpit only offers Resume while status
+    is ``ended``). ``None`` means a userless internal/system thread: trusted
+    exactly like :func:`_revalidate_thread_project_ids` /
+    :func:`_revalidate_thread_datasource_selection` treat one, since there is
+    no per-user membership or grant that could have drifted.
+    """
+    thread_id = str(thread["id"])
+    if owner is None:
+        return []
+    project_ids = await _thread_project_ids(thread_id)
+    project_verdicts = await _classify_thread_project_ids(owner, project_ids)
+    allowed_project_ids = [v.project_id for v in project_verdicts if not v.denied]
+
+    datasource_verdicts, _revisions = await classify_datasource_selection(
+        postgres_db,
+        owner,
+        str(owner["id"]),
+        metadata.get("datasource_ids"),
+        allowed_project_ids,
+        None,
+        allow_admin_explicit_override=True,
+    )
+
+    # workspace_tier / corrupt_revision cannot be acknowledged away (no user
+    # action makes either safe), so collect_config_drift below never turns
+    # either into a DriftItem — but both still deny at attach. Resuming past
+    # them would return 200 and hang at attach, the exact failure shape this
+    # feature exists to remove. Refuse here, before any grant probing or
+    # status mutation, and without naming which item (same non-enumeration
+    # reasoning as the generic denial raised elsewhere on this path).
+    if blocking_denials(datasource_verdicts, project_verdicts):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "This session's configuration cannot be verified and cannot "
+                "be resumed. Its connector or project data is invalid rather "
+                "than merely unavailable."
+            ),
+        )
+
+    # Grants are enforced inside the session resolve; run it purely to harvest
+    # the violations it would raise at attach.
+    status: dict[str, Any] = {}
+    try:
+        await _resolve_session_config(thread, metadata, status=status)
+    except GrantDenied:
+        # Expected: this is exactly the signal we came here to harvest.
+        pass
+    except Exception as exc:
+        # We could not determine whether grants drifted. Reporting "no drift"
+        # would let the session resume on an unknown state; fail closed with
+        # the same generic denial the endpoint used before this feature.
+        logger.exception(
+            "Thread %s: grant probe failed during drift collection; "
+            "refusing to resume on an unknown state",
+            thread_id,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Session configuration could not be verified",
+        ) from exc
+    grant_violations = status.get("grant_violations") or []
+
+    deleted_ids = [
+        v.datasource_id
+        for v in datasource_verdicts
+        if v.denied and v.reason == "deleted"
+    ]
+    tombstones = await postgres_db.get_datasource_tombstones(deleted_ids)
+
+    return await collect_config_drift(
+        postgres_db,
+        thread,
+        owner=owner,
+        project_ids=project_verdicts,
+        datasource_ids=datasource_verdicts,
+        grant_violations=grant_violations,
+        tombstones=tombstones,
+    )
+
+
 @app.post("/api/persistent/threads/{thread_id}/resume")
 async def resume_thread(
     thread_id: str,
     request: Request,
+    body: ThreadResumeRequest | None = None,
 ) -> dict[str, Any]:
     """Resume an ended thread (auth: owner only).
 
     Resets thread status to 'created' and clears the stale agent_id so that
     a new agent can pick it up. The frontend navigates to the chat page after
     calling this, where the orchestrator will provision or wait for an agent.
+
+    Drifted config (deleted/revoked connectors or projects, withdrawn grants)
+    is reported as 428 rather than silently denied; the caller re-POSTs with
+    ``acknowledge`` naming the drift ids it accepts losing. See
+    docs/done/session_config_drift_resume.md.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     from src.shared.run_queue import LANE_PINNED, LANE_STATELESS
@@ -32928,12 +33309,61 @@ async def resume_thread(
             metadata = json.loads(metadata)
         except (json.JSONDecodeError, TypeError):
             metadata = {}
-    # Validate before mutating the thread back to ``created``. A user should get
-    # one generic denial (rather than a half-resumed session that later fails to
-    # bind), and missing/private datasource/project UUIDs remain
-    # indistinguishable.
-    await _revalidate_thread_project_ids(thread, await _thread_project_ids(thread_id))
-    await _revalidate_thread_datasource_ids(thread, metadata.get("datasource_ids"))
+    # Drift must be computed as the THREAD OWNER, never the caller (`user`):
+    # require_thread_owner lets admins through for threads they do not own,
+    # and admins pass every classify_* check — see _thread_config_drift's
+    # docstring for the failure this produced. Same owner lookup and
+    # fail-closed-on-missing-row as _revalidate_thread_project_ids.
+    owner_id = thread.get("user_id")
+    if owner_id:
+        owner = await postgres_db.get_user(str(owner_id))
+        if owner is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Session configuration could not be verified",
+            )
+    else:
+        owner = None
+    # Validation stays ahead of mutation: a thread that cannot resume must not
+    # be left half-resumed. Compute drift and raise 428 BEFORE touching the
+    # thread's status, same discipline the old revalidate-and-raise calls had.
+    drift = await _thread_config_drift(thread, metadata, owner=owner)
+    # The ack is durable (spec §3.2): a PRIOR resume already persisted it to
+    # metadata.config_drift_ack (below), so it must count here too, not just
+    # whatever this particular request body happens to carry — otherwise an
+    # item the user already accepted losing is re-reported as outstanding on
+    # every subsequent resume. Union, never replace: a genuinely NEW drift
+    # id is in neither set, so it still blocks.
+    stored_ack = acknowledged_drift_ids(thread.get("metadata"))
+    acknowledged = (set(body.acknowledge or []) if body else set()) | stored_ack
+    outstanding = {item.id for item in drift} - acknowledged
+    if outstanding:
+        # Subset, not equality: an item that RECOVERED between prompt and
+        # confirm must not force a pointless re-prompt, while an item that
+        # newly drifted is never silently acknowledged.
+        raise HTTPException(
+            status_code=428,
+            detail={
+                "code": "config_drift",
+                "detail": (
+                    "Parts of this session's configuration are no longer available"
+                ),
+                "drift": [
+                    {
+                        "id": item.id,
+                        "kind": item.kind,
+                        "reason": item.reason,
+                        "label": item.label,
+                    }
+                    for item in drift
+                ],
+            },
+        )
+
+    if drift:
+        await postgres_db.record_thread_config_drift_ack(
+            thread_id, {item.id: item.reason for item in drift}
+        )
 
     if execution_lane == LANE_STATELESS:
         try:
@@ -36444,6 +36874,67 @@ async def upload_files_to_thread(
             for r in results
         ],
     }
+
+
+@app.delete("/api/persistent/threads/{thread_id}/uploads/{path:path}")
+async def delete_thread_upload(
+    thread_id: str,
+    path: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Remove one file from a persistent thread workspace's ``uploads/`` dir.
+
+    Exists so the cockpit's *eager* upload can be cancelled honestly. The
+    composer starts transferring the moment a file is attached, before the
+    user commits to sending, so removing an attachment chip can arrive after
+    the bytes have already landed. Without this, cancelling is a lie and
+    attach → remove → re-attach cycles accumulate ``_1``/``_2`` copies in a
+    directory the agent can list and read
+    (``docs/features/session_attachment_send_flow.md`` §9.1).
+
+    ``path`` is relative to ``uploads/`` — i.e. the ``name`` field the upload
+    response returned (``report.pdf``, or ``bundle/sub/a.txt`` for a
+    zip-extracted member), **not** its ``uploads/``-prefixed ``path`` field,
+    which would resolve to ``uploads/uploads/…``. Naming a zip's ``<stem>``
+    directory removes that whole subtree.
+
+    Validation is ``_safe_upload_relpath``, which rejects rather than
+    sanitizes and is never delegated to the remote: SFTP would remove any
+    path the ``agent-host`` user can write, and the thread's object-store
+    prefix is shared with Canvas state and tool files.
+
+    Returns:
+        ``{"thread_id": "...", "path": "uploads/<path>", "deleted": true}``,
+        where ``<path>`` is the **normalized** path that was actually removed
+        — ``bundle/sub/../a.txt`` in, ``uploads/bundle/a.txt`` out. Echoing
+        the raw input would report a file that was never touched.
+        400 for a path that escapes ``uploads/``, 404 when there is no such
+        upload, and the usual destination taxonomy (409 no/unready workspace,
+        502 unreachable, 503 misconfigured or at capacity) otherwise.
+    """
+    from services.thread_uploads import (
+        ThreadUploadError,
+        delete_file_from_thread_workspace,
+    )
+
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+
+    try:
+        removed = await delete_file_from_thread_workspace(thread, path)
+    except ThreadUploadError as e:
+        logger.warning(
+            "Thread upload delete refused for %s (%r): %d %s",
+            thread_id,
+            path,
+            e.status_code,
+            e.detail,
+        )
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+    if removed is None:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    return {"thread_id": thread_id, "path": f"uploads/{removed}", "deleted": True}
 
 
 # Map a TTS synthesis failure code → HTTP status. Deliberately NEVER 401/403
@@ -44350,6 +44841,7 @@ async def _delete_kb_datasource_with_index(
     datasource_id: str,
     *,
     authority_project_scope_id: str | None = None,
+    deleted_by: str | None = None,
 ) -> bool:
     """Order datasource deletion after every writer of its disposable index.
 
@@ -44358,6 +44850,10 @@ async def _delete_kb_datasource_with_index(
     vector cleanup and app-row deletion supplies the required ordering. A
     stale sweeper that captured the row earlier subsequently fails its
     under-lock liveness check and cannot recreate notes or a watermark.
+
+    ``deleted_by`` is passed straight through to the app-row delete's
+    tombstone write (Task 12 item C) — this is the KB half of the same
+    endpoint the non-kb branch already attributes, not a separate decision.
     """
     from src.services.knowledge_store import KnowledgeStore
 
@@ -44371,6 +44867,7 @@ async def _delete_kb_datasource_with_index(
         return await postgres_db.delete_datasource(
             datasource_id,
             authority_project_scope_id=authority_project_scope_id,
+            deleted_by=deleted_by,
         )
 
 

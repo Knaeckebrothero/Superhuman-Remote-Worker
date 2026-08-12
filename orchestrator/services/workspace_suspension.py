@@ -19,7 +19,11 @@ from uuid import UUID
 
 from services import resolve_ssh_key_path
 from services.container_provisioner import WORKSPACE_RUNTIME_INCARNATION_KEY
-from services.ssh_helpers import EXTRACT_HOME_REMOTE_CMD, stream_extract_snapshot
+from services.ssh_helpers import (
+    EXTRACT_HOME_REMOTE_CMD,
+    EXTRACT_REMOTE_CMD,
+    stream_extract_snapshot,
+)
 from services.vm_provisioner import vm_persistent_rootdisk_enabled
 from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from services.workspace_lifecycle import WorkspaceOwner
@@ -145,6 +149,24 @@ def _strict_session_restore_authority(
         ssh_host=ssh_host,
         ssh_port=ssh_port_raw,
         workspace_status=workspace_status,
+    )
+
+
+def _reclaim_on_idle_enabled() -> bool:
+    """Opt-in gate for dropping a session's hot-cache PVC on idle-suspend.
+
+    Default OFF: today's retain-on-idle behavior (snapshot + delete pod, keep
+    the PVC) is unchanged unless an operator turns this on. When enabled, the
+    PVC is dropped only after ``verify_snapshot`` confirms the S3 archive is
+    restorable — see the call site in ``suspend_thread_workspace``.
+    Truthy-token parsing mirrors ``canvas_snapshots.snapshots_enabled()``.
+    See docs/features/workspace_durability_tiering.md §D3.
+    """
+    return os.environ.get("WORKSPACE_RECLAIM_ON_IDLE", "false").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
     )
 
 
@@ -531,8 +553,15 @@ class WorkspaceSuspensionService:
 
         try:
             ssh_host = None
+            # Pod vs VM decides the extract scope below: a pod extract runs as
+            # the unprivileged agent-host user and must NOT try to overwrite the
+            # image-provided, root-owned /usr/local (scoped_home), while a VM
+            # extract (root, the snapshot IS the disk) restores the whole tree.
+            restoring_vm = bool(
+                vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available
+            )
 
-            if vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
+            if restoring_vm:
                 # VM: create a fresh VM
                 ok = await self._vm_provisioner.create_vm(job_id)
                 if not ok:
@@ -586,7 +615,9 @@ class WorkspaceSuspensionService:
             # 'ready' over it hands the dispatcher a blank tree that looks
             # healthy. Fail visibly instead and let the caller decide.
             ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
-            if not await self._extract_snapshot(job_id, ssh_host, ssh_port=ssh_port):
+            if not await self._extract_snapshot(
+                job_id, ssh_host, ssh_port=ssh_port, scoped_home=not restoring_vm
+            ):
                 error_msg = "snapshot extraction failed on restore"
                 logger.error("%s (job %s)", error_msg, job_id)
                 if ws_ctx:
@@ -722,6 +753,8 @@ class WorkspaceSuspensionService:
         ssh_host: str,
         ssh_port: int = 22,
         entity_type: str = "jobs",
+        *,
+        scoped_home: Optional[bool] = None,
         expected_host_key_fingerprint: Optional[str] = None,
         remote_cmd: Optional[str] = None,
         require_pipefail: bool = False,
@@ -729,6 +762,17 @@ class WorkspaceSuspensionService:
         """Download snapshot from S3 and extract into the pod via SSH.
 
         Mirrors ide_session.py:_extract_snapshot_to_vm (lines 782-836).
+
+        ``scoped_home`` selects the extract command. A snapshot carries both
+        ``/home/agent-host`` and ``/usr/local``; for a **container/pod** target
+        the extract runs as the unprivileged ``agent-host`` user, which cannot
+        overwrite the image-provided, root-owned ``/usr/local`` files — the full
+        extract then exits rc=2 and the restore is (correctly) reported failed,
+        so pod restore-from-S3 silently never worked. Pods pass
+        ``scoped_home=True`` to extract only ``home/agent-host`` (the pod image
+        already supplies ``/usr/local``), matching the proven
+        ``ide_session`` k8s-pod path. VMs (root, the snapshot IS the disk) keep
+        the full extract. See docs/features/workspace_durability_tiering.md §C1.
 
         Returns:
             True when the snapshot was downloaded AND unpacked cleanly; False
@@ -778,6 +822,10 @@ class WorkspaceSuspensionService:
                 )
             if remote_cmd is not None:
                 extract_kwargs["remote_cmd"] = remote_cmd
+            elif scoped_home is not None:
+                extract_kwargs["remote_cmd"] = (
+                    EXTRACT_HOME_REMOTE_CMD if scoped_home else EXTRACT_REMOTE_CMD
+                )
             rc, stderr = await stream_extract_snapshot(
                 ssh_host,
                 ssh_port,
@@ -997,9 +1045,66 @@ class WorkspaceSuspensionService:
                     suspended_ctx["rootdisk"] = "kept"
                 await self._db.merge_thread_vm_context(thread_id, suspended_ctx)
             else:
-                await self._container_provisioner.delete_workspace(
-                    WorkspaceOwner.session(thread_id)
-                )
+                owner = WorkspaceOwner.session(thread_id)
+                await self._container_provisioner.delete_workspace(owner)
+                # Reclaim-on-idle (opt-in, fail-safe): drop the hot-cache PVC
+                # once the snapshot is confirmed restorable, so idle sessions
+                # stop pinning volumes (docs/features/
+                # workspace_durability_tiering.md §D3). If the archive can't
+                # be verified, KEEP the PVC — deleting it would risk the only
+                # copy of the live working tree. A delete failure (return
+                # False, or a raised exception from the provisioner) must
+                # not fail the suspend either: the session stays resumable
+                # off the retained volume either way.
+                #
+                # This does NOT reclaim the session's separate AGENT-pod PVC
+                # (`pvc-agent-s-<id>`, created by AgentProvisioner): the type
+                # actually wired into ``self._agent_provisioner`` (see
+                # orchestrator/main.py) exposes no PVC-delete method at all.
+                # Only the different, unwired ``PersistentProvisioner`` class
+                # has ``delete_agent_pvc``, and it manages a differently-named
+                # legacy claim (`pvc-persistent-<id>`). Follow-up, not in
+                # scope here — the workspace PVC is the primary/larger
+                # consumer.
+                if _reclaim_on_idle_enabled() and self._snapshot_service:
+                    v_ok, reason = await self._snapshot_service.verify_snapshot(
+                        thread_id, entity_type="threads"
+                    )
+                    if v_ok:
+                        try:
+                            reclaimed = (
+                                await self._container_provisioner.delete_workspace_pvc(
+                                    owner
+                                )
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Reclaim-on-idle: PVC delete raised for thread "
+                                "%s — keeping session resumable off the "
+                                "retained volume",
+                                thread_id,
+                            )
+                            reclaimed = False
+                        if reclaimed:
+                            suspended_ctx["volume_reclaimed"] = True
+                            logger.info(
+                                "Reclaim-on-idle: snapshot verified, PVC "
+                                "reclaimed for thread %s",
+                                thread_id,
+                            )
+                        else:
+                            logger.warning(
+                                "Reclaim-on-idle: PVC delete did not succeed "
+                                "for thread %s — keeping PVC",
+                                thread_id,
+                            )
+                    else:
+                        logger.warning(
+                            "Reclaim-on-idle: snapshot unverified (%s) — "
+                            "keeping PVC for thread %s",
+                            reason,
+                            thread_id,
+                        )
                 suspended_ctx.update({"pod_ip": None, "pod_name": None})
                 await self._db.merge_thread_workspace_context(thread_id, suspended_ctx)
 
@@ -1312,7 +1417,7 @@ class WorkspaceSuspensionService:
                     reattach_reason,
                 )
             else:
-                extract_kwargs: dict[str, Any] = {}
+                extract_kwargs: dict[str, Any] = {"scoped_home": not is_vm}
                 if strict_authority is not None:
                     extract_kwargs = {
                         "expected_host_key_fingerprint": (

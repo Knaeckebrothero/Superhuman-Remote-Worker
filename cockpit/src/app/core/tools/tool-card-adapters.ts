@@ -21,6 +21,7 @@ function mapEventStatus(s: ToolCallEvent['status']): ToolCardStatus {
         case 'pending':
         case 'denied':
         case 'error':
+        case 'expired':
             return s;
         default:
             return 'pending';

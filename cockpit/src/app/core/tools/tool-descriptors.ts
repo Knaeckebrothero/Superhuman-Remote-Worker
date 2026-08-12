@@ -3,6 +3,7 @@ import {
     NormalizedToolCall,
     CanvasPresentationKind,
     CanvasPresentationSummary,
+    JOB_TOOL,
     NOTIFY_USER_TOOL,
     NotifyMessageView,
     NotifyUrgency,
@@ -394,7 +395,7 @@ const UUID_RE =
  * in this repo, so pure functions are the testable surface.
  */
 export function parseJobEntity(n: NormalizedToolCall): ToolCardView['entity'] {
-    if (n.tool !== 'create_worker_job' || n.status !== 'ok') return undefined;
+    if (n.tool !== JOB_TOOL || n.status !== 'ok') return undefined;
     const result = n.result ?? '';
     if (!result) return undefined;
     try {

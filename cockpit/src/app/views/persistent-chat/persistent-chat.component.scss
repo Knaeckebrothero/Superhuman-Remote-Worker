@@ -667,6 +667,191 @@
         opacity: 1;
       }
 
+      /* ── Rewind dialogs (action sheet + /rewind target picker) ── */
+
+      .rewind-quote {
+        margin: 0 0 6px;
+        padding: 8px 12px;
+        border-left: 3px solid var(--accent-color);
+        background: var(--surface-0);
+        border-radius: var(--radius-control);
+        color: var(--text-secondary);
+        font-style: italic;
+        font-size: 13px;
+        overflow-wrap: anywhere;
+      }
+
+      .rewind-target-meta {
+        margin: 0 0 12px;
+        padding: 0 12px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .rewind-options {
+        display: flex;
+        flex-direction: column;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        overflow: hidden;
+
+        & + .rewind-options {
+          margin-top: 10px;
+        }
+      }
+
+      .rewind-option {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        width: 100%;
+        padding: 10px 12px;
+        background: none;
+        border: none;
+        text-align: left;
+        cursor: pointer;
+        transition: background 0.1s ease;
+        color: var(--text-primary);
+
+        & + .rewind-option {
+          border-top: 1px solid var(--border-color);
+        }
+
+        &:hover:not(:disabled),
+        &:focus-visible {
+          background: var(--surface-0);
+        }
+
+        &:disabled {
+          opacity: 0.5;
+          cursor: default;
+        }
+      }
+
+      .rewind-option-icon {
+        color: var(--text-secondary);
+        margin-top: 1px;
+        flex-shrink: 0;
+      }
+
+      .rewind-option-text {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+
+      .rewind-option-title {
+        font-weight: 600;
+        font-size: 13px;
+      }
+
+      .rewind-option-desc {
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .rewind-caveat {
+        margin: 10px 0 0;
+        font-size: 11.5px;
+        color: var(--text-muted);
+
+        & + .rewind-caveat {
+          margin-top: 2px;
+        }
+      }
+
+      .rewind-picker {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+
+      .rewind-picker-filter {
+        width: 100%;
+        padding: 8px 10px;
+        margin-bottom: 10px;
+        background: transparent;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        color: var(--text-primary);
+        font-size: 13px;
+        font-family: inherit;
+
+        &:focus {
+          outline: none;
+          border-color: var(--accent-color);
+        }
+
+        &::placeholder {
+          color: var(--text-muted);
+        }
+      }
+
+      .rewind-picker-hint {
+        margin: 0 0 10px;
+        font-size: 13px;
+        color: var(--text-secondary);
+      }
+
+      .rewind-picker-empty {
+        margin: 0;
+        font-size: 13px;
+        color: var(--text-muted);
+      }
+
+      .rewind-picker-list {
+        display: flex;
+        flex-direction: column;
+        max-height: min(55vh, 460px);
+        overflow-y: auto;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+      }
+
+      .rewind-picker-item {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        width: 100%;
+        padding: 8px 12px;
+        background: none;
+        border: none;
+        text-align: left;
+        cursor: pointer;
+        transition: background 0.1s ease;
+
+        & + .rewind-picker-item {
+          border-top: 1px solid var(--border-color);
+        }
+
+        &:hover,
+        &:focus-visible {
+          background: var(--surface-0);
+        }
+      }
+
+      .rewind-picker-time {
+        flex-shrink: 0;
+        min-width: 92px;
+        font-size: 11.5px;
+        color: var(--text-muted);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .rewind-picker-text {
+        flex: 1;
+        min-width: 0;
+        font-size: 13px;
+        line-height: 1.35;
+        color: var(--text-primary);
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        overflow-wrap: anywhere;
+      }
+
       .message-assistant, .message-system {
         align-self: flex-start;
       }
@@ -1838,6 +2023,66 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+      }
+
+      /* Send stage: one line naming the phase, one bar for the whole
+         commitment (bytes + POST). Never two bars, never one per file. */
+      .upload-stage {
+        margin-top: 6px;
+      }
+
+      .upload-stage-line {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      /* The percentage lives in the visible label, which updates ~4×/s; this
+         twin carries the coarse phase for the polite region. */
+      .upload-stage-announce {
+        @include m.visually-hidden;
+      }
+
+      .upload-bar {
+        margin-top: 4px;
+        height: 3px;
+        border-radius: var(--radius-pill);
+        overflow: hidden;
+        background: color-mix(in srgb, var(--text-muted) 25%, transparent);
+      }
+
+      .upload-bar-fill {
+        height: 100%;
+        background: var(--accent-color);
+
+        /* Matches the 250ms progress-write throttle, so the fill glides
+           between writes instead of stepping. */
+        transition: width 250ms linear;
+      }
+
+      /* No computable body length — claim no position rather than lie. */
+      .upload-bar.indeterminate .upload-bar-fill {
+        width: 40%;
+        animation: upload-bar-slide 1.2s ease-in-out infinite;
+      }
+
+      @keyframes upload-bar-slide {
+        from { transform: translateX(-100%); }
+        to { transform: translateX(250%); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .upload-bar-fill {
+          transition: none;
+        }
+
+        .upload-bar.indeterminate .upload-bar-fill {
+          width: 100%;
+          animation: none;
+          opacity: 0.5;
+        }
       }
 
       /* Slash command autocomplete */

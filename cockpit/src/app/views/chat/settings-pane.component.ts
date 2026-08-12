@@ -13,7 +13,7 @@ import {
 import {TranslocoPipe} from '@jsverse/transloco';
 import {forkJoin} from 'rxjs';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
-import {readConfigPath} from '../agent-settings/agent-settings.types';
+import {readConfigPath, TierReachability} from '../agent-settings/agent-settings.types';
 import {
     enabledCategoryKeys,
     toolsFragment,
@@ -27,6 +27,7 @@ import {Datasource} from '../../core/models/api.model';
 import {AppIconComponent} from '../../ui/icon';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppButtonComponent} from '../../ui/button';
+import {AppDialogComponent} from '../../ui/dialog';
 
 /** Paths tracked by the desired-state diff. Everything the live path honors
  *  except tool groups (which diff as enabled-flags) and workspace (its own
@@ -67,6 +68,7 @@ const APPLY_DEBOUNCE_MS = 400;
         AppIconComponent,
         AppIconButtonComponent,
         AppButtonComponent,
+        AppDialogComponent,
     ],
     template: `
       <div class="pane-root" #paneRoot>
@@ -97,41 +99,44 @@ const APPLY_DEBOUNCE_MS = 400;
             [initialDatasourceIds]="attachedIds()"
             [lockedDatasourceIds]="lockedDatasourceIds()"
             [liteBackend]="isLiteBackend()"
+            [liveTier]="workspaceTier()"
+            [tierReachability]="tierReachability()"
+            [upgradeInProgress]="chat.workspaceUpgradeInProgress()"
             (change)="onSettingsChange()"
             (retryDatasources)="retryDatasourceLoad()"
+            (tierChangeRequested)="onTierPicked($event)"
           />
-
-          <!-- Workspace tier: its own upgrade verb, not config.update -->
-          <div class="workspace-group">
-            <div class="group-label">{{ 'chat.settingsPane.workspace' | transloco }}</div>
-            <div class="workspace-row">
-              <span class="workspace-tier">{{ 'chat.settingsPane.tier.' + workspaceTier() | transloco }}</span>
-              @if (chat.workspaceUpgradeInProgress(); as prog) {
-                <span class="workspace-progress">
-                  <span class="progress-spinner"></span>
-                  {{ 'chat.settingsPane.upgrading' | transloco:{ tier: prog.tier } }}
-                  @if (prog.elapsed) { ({{ prog.elapsed }}s) }
-                </span>
-              } @else {
-                @if (canUpgradeToSandbox()) {
-                  <app-button variant="secondary" size="sm" (clicked)="upgrade('sandbox')">
-                    {{ 'chat.settingsPane.upgradeSandbox' | transloco }}
-                  </app-button>
-                }
-                @if (canUpgradeToVm()) {
-                  <app-button variant="secondary" size="sm" (clicked)="upgrade('vm')">
-                    {{ 'chat.settingsPane.upgradeVm' | transloco }}
-                  </app-button>
-                }
-              }
-            </div>
-            <span class="workspace-hint">{{ 'chat.settingsPane.workspaceHint' | transloco }}</span>
-          </div>
 
           <!-- Set-at-creation surfaces, shown for honesty (criterion 7) -->
           <p class="fixed-note">{{ 'chat.settingsPane.fixedNote' | transloco }}</p>
         </div>
       </div>
+
+      <!-- Tier moves are one-way and expensive (a VM is a cold image import of
+           several minutes), so unlike every other control in this pane they
+           confirm before dispatch. The agent's offer card and
+           /upgrade-workspace stay direct: both already carry explicit intent. -->
+      <app-dialog
+        [open]="pendingTier() !== null"
+        [title]="pendingTierCopy() + '.title' | transloco"
+        size="sm"
+        (closed)="pendingTier.set(null)"
+      >
+        <p class="upgrade-body">
+          {{ pendingTierCopy() + '.body' | transloco }}
+        </p>
+        <p class="upgrade-body irreversible">
+          {{ 'chat.settingsPane.upgradeConfirm.irreversible' | transloco }}
+        </p>
+        <ng-container appDialogActions>
+          <app-button variant="secondary" size="sm" (clicked)="pendingTier.set(null)">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+          <app-button variant="primary" size="sm" (clicked)="confirmUpgrade()">
+            {{ 'chat.settingsPane.upgradeConfirm.confirm' | transloco }}
+          </app-button>
+        </ng-container>
+      </app-dialog>
     `,
     styles: `
       .pane-root {
@@ -159,52 +164,23 @@ const APPLY_DEBOUNCE_MS = 400;
         padding: 12px;
         min-height: 0;
       }
-      .workspace-group { margin-top: 16px; }
-      .group-label {
-        font-size: 11px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        color: var(--text-muted);
-        margin-bottom: 12px;
-        padding-bottom: 6px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-      }
-      .workspace-row {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        flex-wrap: wrap;
-      }
-      .workspace-tier {
-        font-size: 13px;
-        color: var(--text-primary);
-        font-weight: 500;
-      }
-      .workspace-progress {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 12px;
-        color: var(--text-muted);
-      }
-      .progress-spinner {
-        width: 12px;
-        height: 12px;
-        border: 2px solid var(--border-color);
-        border-top-color: var(--accent-color);
-        border-radius: 50%;
-        animation: settings-pane-spin 0.8s linear infinite;
-      }
-      @keyframes settings-pane-spin { to { transform: rotate(360deg); } }
-      .workspace-hint, .fixed-note {
+      .fixed-note {
         display: block;
-        margin-top: 6px;
+        margin-top: 16px;
         font-size: 11px;
         line-height: 1.4;
         color: var(--text-muted);
       }
-      .fixed-note { margin-top: 16px; }
+      .upgrade-body {
+        margin: 0 0 10px;
+        font-size: 13px;
+        line-height: 1.5;
+        color: var(--text-primary);
+      }
+      .upgrade-body.irreversible {
+        margin-bottom: 0;
+        color: var(--text-muted);
+      }
     `,
 })
 export class SettingsPaneComponent {
@@ -286,15 +262,72 @@ export class SettingsPaneComponent {
     readonly isLiteBackend = computed(() =>
         ['virtual', 'none'].includes(this.workspaceTier()),
     );
-    readonly canUpgradeToSandbox = computed(() => this.workspaceTier() === 'virtual');
-    readonly canUpgradeToVm = computed(() => {
-        if (!['virtual', 'sandbox'].includes(this.workspaceTier())) return false;
+    /** Whether this session may move to a VM. Fail closed while loading; null
+     *  = admin/unrestricted. The PDP key is `vm_workspace`
+     *  (src/core/capability_grants.py) — the server-side upgrade gate enforces
+     *  the same grant either way. */
+    private readonly vmGranted = computed(() => {
         const g = this.capabilities.grants();
-        // Fail closed while loading; null = admin/unrestricted. The PDP key
-        // is `vm_workspace` (src/core/capability_grants.py) — the server-side
-        // upgrade gate enforces the same grant either way.
         return g === null ? true : g?.['vm_workspace'] === true;
     });
+
+    /**
+     * Which tiers this session can move to, and why not when it can't.
+     *
+     * The ladder is one-way and partial: `virtual → sandbox|vm`, `sandbox → vm`.
+     * Downgrade is an explicit non-goal (workspace_tier_upgrade.md §"Non-goals")
+     * and `none` has no durable anchor to seed from, so a `none` session can
+     * reach nothing at all — the row renders static text in that case.
+     *
+     * Every refusal carries a reason so it renders in the option itself rather
+     * than arriving as a rejected click.
+     */
+    readonly tierReachability = computed<Record<string, TierReachability>>(() => {
+        const vm: TierReachability = this.vmGranted() ? 'ok' : 'needsApproval';
+        const map: Record<string, TierReachability> = {};
+        switch (this.workspaceTier()) {
+            case 'virtual':
+                map['sandbox'] = 'ok';
+                map['vm'] = vm;
+                map['none'] = 'downgrade';
+                break;
+            case 'sandbox':
+                map['vm'] = vm;
+                map['virtual'] = 'downgrade';
+                map['none'] = 'downgrade';
+                break;
+            case 'vm':
+                map['sandbox'] = 'downgrade';
+                map['virtual'] = 'downgrade';
+                map['none'] = 'downgrade';
+                break;
+            // `none`, or a tier this build does not know: nothing reachable,
+            // so the row falls back to static text.
+        }
+        return map;
+    });
+
+    /** The tier awaiting confirmation; non-null opens the dialog. */
+    readonly pendingTier = signal<string | null>(null);
+    /** Copy namespace for the open dialog. Only `sandbox`/`vm` are ever
+     *  reachable, so only those two have confirmation copy. */
+    readonly pendingTierCopy = computed(() =>
+        `chat.settingsPane.upgradeConfirm.${this.pendingTier() ?? 'sandbox'}`,
+    );
+
+    /** A tier the user picked in the settings row. Re-checked here rather than
+     *  trusted: the row is a view, this is the gate. */
+    onTierPicked(tier: string): void {
+        if (this.tierReachability()[tier] !== 'ok') return;
+        if (this.chat.workspaceUpgradeInProgress()) return;
+        this.pendingTier.set(tier);
+    }
+
+    confirmUpgrade(): void {
+        const tier = this.pendingTier();
+        this.pendingTier.set(null);
+        if (tier === 'sandbox' || tier === 'vm') this.chat.upgradeWorkspace(tier);
+    }
 
     constructor() {
         // The model picker needs the catalog; the chat page never loads it
@@ -319,10 +352,6 @@ export class SettingsPaneComponent {
         this.paneRoot()?.nativeElement
             .querySelector('app-model-group')
             ?.scrollIntoView({block: 'start', behavior: 'smooth'});
-    }
-
-    upgrade(tier: 'sandbox' | 'vm'): void {
-        this.chat.upgradeWorkspace(tier);
     }
 
     onSettingsChange(): void {

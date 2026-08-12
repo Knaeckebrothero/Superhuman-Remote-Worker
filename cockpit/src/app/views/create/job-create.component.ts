@@ -177,7 +177,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
                 <div class="dropzone-content">
                   <app-icon size="inherit" class="dropzone-icon">upload_file</app-icon>
                   <span class="dropzone-text">{{ 'jobs.create.dropHint' | transloco }}</span>
-                  <span class="dropzone-hint">{{ 'jobs.create.maxHint' | transloco:{ maxFiles: fileService.getMaxFiles(), maxSizeMb: fileService.getMaxFileSizeMB() } }}</span>
+                  <span class="dropzone-hint">{{ 'jobs.create.maxHint' | transloco:{ maxFiles: fileService.getJobUploadMaxFiles(), maxSizeMb: fileService.getJobUploadMaxFileSizeMB() } }}</span>
                 </div>
               } @else {
                 <div class="file-list">
@@ -1460,14 +1460,32 @@ export class JobCreateComponent implements OnInit {
 
   private async addFiles(files: File[]): Promise<void> {
     const currentCount = this.filePreviews().length;
-    const maxFiles = this.fileService.getMaxFiles();
+    // Job creation uploads go to POST /api/uploads (local orchestrator
+    // storage), a different endpoint from the chat composer's thread
+    // uploads — it genuinely allows a much bigger batch server-side
+    // (orchestrator/uploads.py:53-54), so this uses FileHandlingService's
+    // job-upload caps rather than its (smaller) composer defaults.
+    const maxFiles = this.fileService.getJobUploadMaxFiles();
+    const maxFileSizeMB = this.fileService.getJobUploadMaxFileSizeMB();
     if (currentCount + files.length > maxFiles) {
       this.errorMessage.set(`Maximum ${maxFiles} files allowed`);
       files = files.slice(0, maxFiles - currentCount);
     }
     if (files.length === 0) return;
-    const newPreviews = await this.fileService.createFilePreviews(files);
-    this.filePreviews.update((current) => [...current, ...newPreviews]);
+    const {previews, rejected} = await this.fileService.createFilePreviews(files, {maxFileSizeMB, maxFiles});
+    this.filePreviews.update((current) => [...current, ...previews]);
+    if (rejected.length > 0) {
+      // Oversize files no longer vanish silently (previously a console.warn
+      // only). A 'count' rejection here would mean the pre-check above and
+      // this call disagree on the same maxFiles value, which shouldn't
+      // happen — but report it honestly rather than swallow it.
+      const tooLarge = rejected.filter((r) => r.reason === 'size');
+      this.errorMessage.set(
+        tooLarge.length > 0
+          ? `${tooLarge.map((r) => r.name).join(', ')} exceed${tooLarge.length === 1 ? 's' : ''} the ${maxFileSizeMB} MB limit`
+          : `Maximum ${maxFiles} files allowed`,
+      );
+    }
     this.uploadId = null;
   }
 

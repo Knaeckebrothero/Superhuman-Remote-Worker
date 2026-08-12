@@ -148,7 +148,8 @@ original design recorded for the single-fetch case (see
   `docs/done/stale_tool_names_degrade_every_worker_job_tool_load.md`. The test
   now covers every base and expert config in merged form, not just the session
   base. It also surfaced a separate defect:
-  `docs/issues/expert_prompts_instruct_a_removed_browser_tool.md`.
+  `docs/done/expert_prompts_instruct_a_removed_browser_tool.md` (also fixed,
+  2026-08-08, with a lint so the class cannot recur).
 - `docs/issues/session_tool_group_enablement_is_computed_in_two_places.md` —
   `_session_tool_group_disabled_markers` was deliberately **not** rewritten in
   terms of `session_tool_group_enablement` (it sits on the live attach path);
