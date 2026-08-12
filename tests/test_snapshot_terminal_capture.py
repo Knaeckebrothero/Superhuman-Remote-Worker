@@ -395,6 +395,7 @@ async def test_cancelled_s3_upload_joins_blocking_writer_before_return(
     def _blocked_upload(*_args, **_kwargs):
         entered.set()
         assert release.wait(timeout=5)
+        raise RuntimeError("writer failed after caller cancellation")
 
     service = SnapshotService()
     service._available = True

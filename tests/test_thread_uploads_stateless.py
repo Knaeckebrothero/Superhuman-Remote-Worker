@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import stat
 import threading
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -12,14 +11,17 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
+import asyncssh
 
 from services.canvas_ssh import CanvasSSHError
 from services.thread_uploads import (
     ThreadUploadError,
     _SshTarget,
     _VirtualTarget,
+    _joined_async_call,
     _virtual_purge_prefix,
     delete_file_from_attested_stateless_workspace,
+    delete_file_from_thread_workspace,
     purge_attested_stateless_virtual_workspace,
     resolve_thread_upload_destination,
     upload_files_to_attested_stateless_workspace,
@@ -84,6 +86,7 @@ class _AsyncSFTP:
     def __init__(self):
         self.dirs: set[str] = {""}
         self.files: dict[str, bytes] = {}
+        self.types: dict[str, int] = {}
         self.write_attempts = 0
 
     async def stat(self, path: str):
@@ -93,9 +96,15 @@ class _AsyncSFTP:
 
     async def lstat(self, path: str):
         if path in self.dirs:
-            return SimpleNamespace(permissions=stat.S_IFDIR | 0o700)
+            return SimpleNamespace(
+                type=self.types.get(path, asyncssh.FILEXFER_TYPE_DIRECTORY),
+                permissions=None,
+            )
         if path in self.files:
-            return SimpleNamespace(permissions=stat.S_IFREG | 0o600)
+            return SimpleNamespace(
+                type=self.types.get(path, asyncssh.FILEXFER_TYPE_REGULAR),
+                permissions=None,
+            )
         raise FileNotFoundError(path)
 
     async def mkdir(self, path: str) -> None:
@@ -249,6 +258,100 @@ async def test_attested_delete_reprobes_immediately_before_unlink(attested_uploa
             expected_runtime_incarnation=RUNTIME,
             expected_host_key_fingerprint=FINGERPRINT,
             authority_probe=probe,
+        )
+
+    assert error.value.status_code == 409
+    assert attested_upload.sftp.files[UPLOAD_PATH] == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_attested_delete_recurses_with_v4_file_types(attested_upload):
+    uploads_dir = "/home/agent-host/workspace/uploads"
+    tree = f"{uploads_dir}/bundle"
+    nested = f"{tree}/nested"
+    leaf = f"{nested}/notes.txt"
+    attested_upload.sftp.dirs.update({uploads_dir, tree, nested})
+    attested_upload.sftp.files[leaf] = b"hello"
+
+    removed = await delete_file_from_attested_stateless_workspace(
+        attested_upload.thread,
+        "bundle",
+        destination=attested_upload.target,
+        expected_workspace_generation=GENERATION,
+        expected_runtime_incarnation=RUNTIME,
+        expected_host_key_fingerprint=FINGERPRINT,
+        authority_probe=AsyncMock(return_value="exact_live"),
+    )
+
+    assert removed == "bundle"
+    assert leaf not in attested_upload.sftp.files
+    assert tree not in attested_upload.sftp.dirs
+    assert nested not in attested_upload.sftp.dirs
+
+
+@pytest.mark.asyncio
+async def test_attested_delete_maps_v4_missing_path_to_not_found(attested_upload):
+    attested_upload.sftp.lstat = AsyncMock(
+        side_effect=asyncssh.SFTPNoSuchPath("missing component")
+    )
+
+    removed = await delete_file_from_attested_stateless_workspace(
+        attested_upload.thread,
+        "notes.txt",
+        destination=attested_upload.target,
+        expected_workspace_generation=GENERATION,
+        expected_runtime_incarnation=RUNTIME,
+        expected_host_key_fingerprint=FINGERPRINT,
+        authority_probe=AsyncMock(return_value="exact_live"),
+    )
+
+    assert removed is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("component", ["base", "parent"])
+async def test_attested_delete_refuses_symlinked_directory_component(
+    attested_upload, component
+):
+    uploads_dir = "/home/agent-host/workspace/uploads"
+    parent = f"{uploads_dir}/bundle"
+    leaf = f"{parent}/notes.txt"
+    attested_upload.sftp.dirs.update({uploads_dir, parent})
+    attested_upload.sftp.files[leaf] = b"hello"
+    symlink_path = uploads_dir if component == "base" else parent
+    attested_upload.sftp.types[symlink_path] = asyncssh.FILEXFER_TYPE_SYMLINK
+
+    with pytest.raises(ThreadUploadError) as error:
+        await delete_file_from_attested_stateless_workspace(
+            attested_upload.thread,
+            "bundle/notes.txt",
+            destination=attested_upload.target,
+            expected_workspace_generation=GENERATION,
+            expected_runtime_incarnation=RUNTIME,
+            expected_host_key_fingerprint=FINGERPRINT,
+            authority_probe=AsyncMock(return_value="exact_live"),
+        )
+
+    assert error.value.status_code == 409
+    assert attested_upload.sftp.files[leaf] == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_attested_delete_refuses_unknown_remote_file_type(attested_upload):
+    uploads_dir = "/home/agent-host/workspace/uploads"
+    attested_upload.sftp.dirs.add(uploads_dir)
+    attested_upload.sftp.files[UPLOAD_PATH] = b"hello"
+    attested_upload.sftp.types[UPLOAD_PATH] = asyncssh.FILEXFER_TYPE_UNKNOWN
+
+    with pytest.raises(ThreadUploadError) as error:
+        await delete_file_from_attested_stateless_workspace(
+            attested_upload.thread,
+            "notes.txt",
+            destination=attested_upload.target,
+            expected_workspace_generation=GENERATION,
+            expected_runtime_incarnation=RUNTIME,
+            expected_host_key_fingerprint=FINGERPRINT,
+            authority_probe=AsyncMock(return_value="exact_live"),
         )
 
     assert error.value.status_code == 409
@@ -424,6 +527,33 @@ async def test_pinned_transport_host_key_rejection_writes_no_bytes(
 
 
 @pytest.mark.asyncio
+async def test_pinned_transport_host_key_rejection_deletes_no_bytes(
+    attested_upload, monkeypatch
+):
+    from services import thread_uploads
+
+    attested_upload.sftp.dirs.add("/home/agent-host/workspace/uploads")
+    attested_upload.sftp.files[UPLOAD_PATH] = b"hello"
+    rejecting = _RejectingPinnedPool(attested_upload.sftp)
+    monkeypatch.setattr(thread_uploads, "_ATTESTED_SFTP_POOL", rejecting)
+
+    with pytest.raises(ThreadUploadError) as error:
+        await delete_file_from_attested_stateless_workspace(
+            attested_upload.thread,
+            "notes.txt",
+            destination=attested_upload.target,
+            expected_workspace_generation=GENERATION,
+            expected_runtime_incarnation=RUNTIME,
+            expected_host_key_fingerprint=FINGERPRINT,
+            authority_probe=AsyncMock(return_value="exact_live"),
+        )
+
+    assert error.value.status_code == 503
+    assert rejecting.checkouts[0]["fingerprint"] == FINGERPRINT
+    assert attested_upload.sftp.files[UPLOAD_PATH] == b"hello"
+
+
+@pytest.mark.asyncio
 async def test_stateless_sandbox_cannot_fall_back_to_legacy_auto_add_path(
     attested_upload, monkeypatch
 ):
@@ -441,6 +571,26 @@ async def test_stateless_sandbox_cannot_fall_back_to_legacy_auto_add_path(
 
     assert error.value.status_code == 409
     legacy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stateless_sandbox_delete_cannot_fall_back_to_legacy_auto_add_path(
+    attested_upload, monkeypatch
+):
+    from services import thread_uploads
+
+    legacy = MagicMock(side_effect=AssertionError("legacy delete must not run"))
+    monkeypatch.setattr(thread_uploads, "_sftp_delete_file", legacy)
+
+    with pytest.raises(ThreadUploadError) as error:
+        await delete_file_from_thread_workspace(
+            attested_upload.thread,
+            "notes.txt",
+            destination=attested_upload.target,
+        )
+
+    assert error.value.status_code == 409
+    legacy.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -526,7 +676,7 @@ async def test_cancelled_stateless_virtual_upload_joins_blocking_writer(
         entered.set()
         assert release.wait(timeout=5)
         finished.set()
-        return []
+        raise RuntimeError("writer failed after caller cancellation")
 
     monkeypatch.setattr(thread_uploads, "_virtual_write_files", virtual_writer)
     thread = {
@@ -558,6 +708,26 @@ async def test_cancelled_stateless_virtual_upload_joins_blocking_writer(
     with pytest.raises(asyncio.CancelledError):
         await uploading
     assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_joined_async_effect_wins_over_late_inner_failure():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def effect():
+        entered.set()
+        await release.wait()
+        raise RuntimeError("SFTP failed after caller cancellation")
+
+    running = asyncio.create_task(_joined_async_call(effect()))
+    await entered.wait()
+    running.cancel()
+    await asyncio.sleep(0)
+    assert not running.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await running
 
 
 def test_virtual_prefix_purge_checks_each_delete_and_final_listing() -> None:

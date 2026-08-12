@@ -1010,8 +1010,20 @@ def _sftp_write_files(
 
 
 def _is_sftp_missing(exc: BaseException) -> bool:
-    return isinstance(exc, FileNotFoundError) or bool(
-        asyncssh is not None and isinstance(exc, asyncssh.SFTPNoSuchFile)
+    if isinstance(exc, FileNotFoundError):
+        return True
+    if asyncssh is None:
+        return False
+    return isinstance(
+        exc,
+        tuple(
+            error_type
+            for error_type in (
+                getattr(asyncssh, "SFTPNoSuchFile", None),
+                getattr(asyncssh, "SFTPNoSuchPath", None),
+            )
+            if isinstance(error_type, type)
+        ),
     )
 
 
@@ -1116,19 +1128,35 @@ async def _write_attested_sftp_files(
     return results
 
 
-def _async_sftp_entry_mode(attrs: Any) -> int:
-    """Return AsyncSSH SFTP permissions, failing closed when omitted."""
+def _async_sftp_entry_type(attrs: Any) -> int:
+    """Return an AsyncSSH file type without mistaking permissions for mode."""
 
-    mode = getattr(attrs, "permissions", None)
-    if mode is None:
-        # Compatibility for narrow test doubles and alternate SFTP clients.
-        mode = getattr(attrs, "st_mode", None)
-    if mode is None:
-        raise ThreadUploadError(
-            status_code=409,
-            detail="Workspace did not report the file type; refusing to delete",
-        )
-    return int(mode)
+    entry_type = getattr(attrs, "type", None)
+    if entry_type in {
+        asyncssh.FILEXFER_TYPE_DIRECTORY,
+        asyncssh.FILEXFER_TYPE_SYMLINK,
+        asyncssh.FILEXFER_TYPE_REGULAR,
+        asyncssh.FILEXFER_TYPE_SPECIAL,
+        asyncssh.FILEXFER_TYPE_SOCKET,
+        asyncssh.FILEXFER_TYPE_CHAR_DEVICE,
+        asyncssh.FILEXFER_TYPE_BLOCK_DEVICE,
+        asyncssh.FILEXFER_TYPE_FIFO,
+    }:
+        return int(entry_type)
+    # Compatibility for narrow test doubles and alternate SFTP clients, whose
+    # st_mode combines kind and permission bits. AsyncSSH's permissions field
+    # deliberately does not: in SFTP v4 it can contain only the low 12 bits.
+    mode = getattr(attrs, "st_mode", None)
+    if mode is not None:
+        if stat_module.S_ISDIR(mode):
+            return asyncssh.FILEXFER_TYPE_DIRECTORY
+        if stat_module.S_ISLNK(mode):
+            return asyncssh.FILEXFER_TYPE_SYMLINK
+        return asyncssh.FILEXFER_TYPE_REGULAR
+    raise ThreadUploadError(
+        status_code=409,
+        detail="Workspace did not report a known file type; refusing to delete",
+    )
 
 
 async def _resolve_attested_delete_target(
@@ -1142,8 +1170,8 @@ async def _resolve_attested_delete_target(
         if _is_sftp_missing(exc):
             return None
         raise
-    base_mode = _async_sftp_entry_mode(base)
-    if stat_module.S_ISLNK(base_mode) or not stat_module.S_ISDIR(base_mode):
+    base_type = _async_sftp_entry_type(base)
+    if base_type != asyncssh.FILEXFER_TYPE_DIRECTORY:
         raise ThreadUploadError(
             status_code=409,
             detail="Workspace uploads directory is not a directory",
@@ -1159,14 +1187,14 @@ async def _resolve_attested_delete_target(
             if _is_sftp_missing(exc):
                 return None
             raise
-        mode = _async_sftp_entry_mode(attrs)
+        entry_type = _async_sftp_entry_type(attrs)
         if index < len(parts) - 1:
-            if stat_module.S_ISLNK(mode):
+            if entry_type == asyncssh.FILEXFER_TYPE_SYMLINK:
                 raise ThreadUploadError(
                     status_code=409,
                     detail="Upload path traverses a symbolic link",
                 )
-            if not stat_module.S_ISDIR(mode):
+            if entry_type != asyncssh.FILEXFER_TYPE_DIRECTORY:
                 return None
     return cursor
 
@@ -1185,7 +1213,7 @@ async def _delete_attested_sftp_tree(sftp: Any, path: str, *, depth: int = 0) ->
         if _is_sftp_missing(exc):
             return
         raise
-    if stat_module.S_ISDIR(_async_sftp_entry_mode(attrs)):
+    if _async_sftp_entry_type(attrs) == asyncssh.FILEXFER_TYPE_DIRECTORY:
         for name in await sftp.listdir(path):
             if not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
                 raise ThreadUploadError(
@@ -1626,8 +1654,11 @@ async def _joined_blocking_call(func, /, *args, **kwargs):
             await asyncio.shield(task)
         except asyncio.CancelledError:
             cancelled = True
+        except Exception:
+            if not cancelled:
+                raise
     if cancelled:
-        with suppress(Exception):
+        with suppress(BaseException):
             task.result()
         raise asyncio.CancelledError
     return task.result()
@@ -1643,8 +1674,11 @@ async def _joined_async_call(awaitable):
             await asyncio.shield(task)
         except asyncio.CancelledError:
             cancelled = True
+        except Exception:
+            if not cancelled:
+                raise
     if cancelled:
-        with suppress(Exception):
+        with suppress(BaseException):
             task.result()
         raise asyncio.CancelledError
     return task.result()
