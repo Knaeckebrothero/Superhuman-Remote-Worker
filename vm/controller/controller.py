@@ -661,6 +661,10 @@ class VMController:
             # Headscale mesh VPN — VM joins tailnet on boot
             "${TAILSCALE_AUTH_KEY}": tailscale_auth_key,
             "${HEADSCALE_URL}": headscale_url,
+            # The Vault-backed chart branch injects this from its synced
+            # Secret. The inline-key branch contains no such placeholder, so
+            # an absent environment value is harmless there.
+            "${SSH_AUTHORIZED_KEY}": os.environ.get("SSH_AUTHORIZED_KEY", ""),
         }
 
         rendered = self.template_text

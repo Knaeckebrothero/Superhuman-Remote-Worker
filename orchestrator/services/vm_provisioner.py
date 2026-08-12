@@ -539,6 +539,14 @@ class VMProvisioner:
             "${CPU_CORES}": str(job_config.get("cpu_cores", 8)),
             "${MEMORY}": job_config.get("memory", "16Gi"),
             "${NATS_URL}": job_config.get("nats_url", ""),
+            # Direct mode has no VM controller to inject the deployment identity
+            # and mesh settings. Read the same existing environment contract the
+            # controller/agent provisioners use. An empty Tailscale key is valid:
+            # the cloud-init command is explicitly gated on a non-empty value,
+            # which is the co-located, no-mesh deployment path.
+            "${ORCHESTRATOR_ID}": os.environ.get("ORCHESTRATOR_ID", "").strip(),
+            "${HEADSCALE_URL}": os.environ.get("HEADSCALE_URL", ""),
+            "${TAILSCALE_AUTH_KEY}": os.environ.get("TAILSCALE_AUTH_KEY", ""),
             "${DESCRIPTION}": _escape_for_job_config(job_config.get("description", "")),
             # CDI DataVolume storage
             "${VM_STORAGE_CLASS}": os.environ.get("VM_STORAGE_CLASS", "local-path"),
