@@ -399,6 +399,7 @@ async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_works
     )
     user = {"id": "user-1"}
     db = MagicMock()
+    db.get_user = AsyncMock(return_value=user)
     db.resume_thread = AsyncMock(return_value=True)
     db.get_thread = AsyncMock(return_value=thread)
     db.stateless_session_workspace_ensure_lock = MagicMock(
@@ -429,7 +430,7 @@ async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_works
         patch("main.postgres_db", db),
         patch("main._thread_project_ids", AsyncMock(return_value=[])),
         patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_datasource_ids", AsyncMock(return_value=[])),
+        patch("main._thread_config_drift", AsyncMock(return_value=[])),
         patch("main.agent_provisioner", agent_provisioner),
         patch("main.persistent_provisioner", persistent_provisioner),
         patch("main._find_idle_persistent_agent", find_idle),
@@ -476,6 +477,7 @@ async def test_stateless_resume_refuses_retirement_marker_before_mutation():
         },
     )
     db = MagicMock()
+    db.get_user = AsyncMock(return_value={"id": "user-1"})
     db.resume_thread = AsyncMock(return_value=True)
     db.get_thread = AsyncMock(return_value=thread)
     db.stateless_session_workspace_ensure_lock = MagicMock(
@@ -487,7 +489,7 @@ async def test_stateless_resume_refuses_retirement_marker_before_mutation():
         patch("main.postgres_db", db),
         patch("main._thread_project_ids", AsyncMock(return_value=[])),
         patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_datasource_ids", AsyncMock(return_value=[])),
+        patch("main._thread_config_drift", AsyncMock(return_value=[])),
         pytest.raises(main.HTTPException) as exc,
     ):
         await resume_thread("thread-1", object())
@@ -502,6 +504,7 @@ async def test_resume_cas_loss_to_retirement_fails_closed():
 
     thread = _resume_thread_row(metadata={})
     db = MagicMock()
+    db.get_user = AsyncMock(return_value={"id": "user-1"})
     db.resume_thread = AsyncMock(return_value=False)
     db.list_thread_mounts = AsyncMock(return_value=[])
 
@@ -510,7 +513,7 @@ async def test_resume_cas_loss_to_retirement_fails_closed():
         patch("main.postgres_db", db),
         patch("main._thread_project_ids", AsyncMock(return_value=[])),
         patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_datasource_ids", AsyncMock(return_value=[])),
+        patch("main._thread_config_drift", AsyncMock(return_value=[])),
         pytest.raises(main.HTTPException) as exc,
     ):
         await resume_thread("thread-1", object())
@@ -530,6 +533,7 @@ async def test_resume_refetch_refuses_lane_changed_while_task_was_scheduled():
     )
     user = {"id": "user-1"}
     db = MagicMock()
+    db.get_user = AsyncMock(return_value=user)
     db.resume_thread = AsyncMock()
     db.list_thread_mounts = AsyncMock(return_value=[])
     db.get_thread = AsyncMock(
@@ -555,7 +559,7 @@ async def test_resume_refetch_refuses_lane_changed_while_task_was_scheduled():
         patch("main.postgres_db", db),
         patch("main._thread_project_ids", AsyncMock(return_value=[])),
         patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_datasource_ids", AsyncMock(return_value=[])),
+        patch("main._thread_config_drift", AsyncMock(return_value=[])),
         patch("main._is_protected_cloud_mode_enabled", return_value=False),
         patch("main.agent_provisioner", provisioner),
         patch("main.persistent_provisioner", MagicMock(is_available=False)),
@@ -588,6 +592,7 @@ async def test_resume_refetches_lane_after_failed_pool_reservation():
     pinned = {**thread, "status": "created", "agent_id": None}
     stateless = {**pinned, "execution_lane": "stateless"}
     db = MagicMock()
+    db.get_user = AsyncMock(return_value=user)
     db.resume_thread = AsyncMock()
     db.list_thread_mounts = AsyncMock(return_value=[])
     db.get_thread = AsyncMock(side_effect=[pinned, stateless])
@@ -610,7 +615,7 @@ async def test_resume_refetches_lane_after_failed_pool_reservation():
         patch("main.postgres_db", db),
         patch("main._thread_project_ids", AsyncMock(return_value=[])),
         patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_datasource_ids", AsyncMock(return_value=[])),
+        patch("main._thread_config_drift", AsyncMock(return_value=[])),
         patch("main._thread_has_knowledge_scope", AsyncMock(return_value=False)),
         patch("main._inject_thread_dispatch_credentials", AsyncMock(return_value={})),
         patch("main._is_protected_cloud_mode_enabled", return_value=False),

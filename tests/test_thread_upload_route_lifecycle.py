@@ -166,6 +166,93 @@ async def test_retirement_marker_wins_before_upload_materialization():
 
 
 @pytest.mark.asyncio
+async def test_stateless_delete_holds_lifecycle_lock_through_exact_delete():
+    from orchestrator import main
+    from services import thread_uploads
+
+    order: list[str] = []
+    thread = _thread()
+    db = _DB(thread, order)
+
+    async def _delete(*_args, **kwargs):
+        order.append("delete")
+        assert await kwargs["authority_probe"]() == "exact_live"
+        return "notes.txt"
+
+    with (
+        patch.object(
+            main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"sub": "user-a"}, thread)),
+        ),
+        patch.object(main, "postgres_db", db),
+        patch.object(thread_uploads, "resolve_ssh_key_path", return_value="/ssh/key"),
+        patch.object(
+            main.container_provisioner,
+            "workspace_pod_authority",
+            AsyncMock(return_value="exact_live"),
+        ),
+        patch.object(
+            thread_uploads,
+            "delete_file_from_attested_stateless_workspace",
+            AsyncMock(side_effect=_delete),
+        ) as deleter,
+    ):
+        result = await main.delete_thread_upload(
+            THREAD_ID,
+            "notes.txt",
+            SimpleNamespace(),
+        )
+
+    assert result == {
+        "thread_id": THREAD_ID,
+        "path": "uploads/notes.txt",
+        "deleted": True,
+    }
+    assert order == ["lock", "fresh", "delete", "unlock"]
+    assert deleter.await_args.kwargs["expected_workspace_generation"] == GENERATION
+    assert deleter.await_args.kwargs["expected_runtime_incarnation"] == RUNTIME
+    assert deleter.await_args.kwargs["expected_host_key_fingerprint"] == FINGERPRINT
+
+
+@pytest.mark.asyncio
+async def test_retirement_marker_refuses_stateless_delete_before_transport():
+    from orchestrator import main
+    from services import thread_uploads
+
+    order: list[str] = []
+    initial = _thread()
+    ended = deepcopy(initial)
+    ended["status"] = "ended"
+    ended["metadata"]["_stateless_workspace_retirement_pending"] = True
+    db = _DB(ended, order)
+
+    with (
+        patch.object(
+            main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"sub": "user-a"}, initial)),
+        ),
+        patch.object(main, "postgres_db", db),
+        patch.object(
+            thread_uploads,
+            "delete_file_from_attested_stateless_workspace",
+            AsyncMock(),
+        ) as deleter,
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await main.delete_thread_upload(
+                THREAD_ID,
+                "notes.txt",
+                SimpleNamespace(),
+            )
+
+    assert exc.value.status_code == 409
+    assert order == ["lock", "fresh", "unlock"]
+    deleter.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "marker_key",
     [
