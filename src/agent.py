@@ -1269,6 +1269,8 @@ class UniversalAgent:
                                 "is_final_phase": False,
                                 "freeze_data": None,
                                 "error": None,
+                                "client_report_id": None,
+                                "completion_report_payload": None,
                             },
                             as_node="__start__",
                         )
@@ -1465,6 +1467,8 @@ class UniversalAgent:
             # the previous round (restore_from_feedback clears process caches).
             "completion_decision": None,
             "verdict_decision": None,
+            "client_report_id": None,
+            "completion_report_payload": None,
         }
         if stateless_worker:
             feedback_update["delivered_feedback_keys"] = sorted(
@@ -1551,6 +1555,8 @@ class UniversalAgent:
             "messages": [result_message],
             "should_stop": False,
             "goal_achieved": False,
+            "client_report_id": None,
+            "completion_report_payload": None,
         }
         if stateless_worker:
             delegation_update["delivered_delegation_keys"] = sorted(
@@ -1692,6 +1698,8 @@ class UniversalAgent:
                     "goal_achieved": False,
                     "is_final_phase": False,
                     "error": None,
+                    "client_report_id": None,
+                    "completion_report_payload": None,
                 }
             )
 
@@ -2035,6 +2043,8 @@ class UniversalAgent:
                         "freeze_data": None,
                         "should_stop": False,
                         "goal_achieved": False,
+                        "client_report_id": None,
+                        "completion_report_payload": None,
                     },
                     as_node="__start__",
                 )

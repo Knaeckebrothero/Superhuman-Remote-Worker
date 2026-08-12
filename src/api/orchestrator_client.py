@@ -18,6 +18,13 @@ from src.core.runtime_provenance import component_provenance_from_environment
 
 logger = logging.getLogger(__name__)
 
+_COMPLETION_REPORT_PAYLOAD_FIELDS = (
+    "should_stop",
+    "goal_achieved",
+    "error",
+    "freeze_data",
+)
+
 
 class DuplicateThreadBinding(RuntimeError):
     """Raised when a thread-bound registration loses the provisioning race.
@@ -1665,6 +1672,8 @@ class OrchestratorClient:
         job_id: str,
         result: dict[str, Any],
         lease_token: int | None = None,
+        client_report_id: str | None = None,
+        agent_id: str | None = None,
     ) -> bool:
         """Report job completion to the orchestrator.
 
@@ -1677,6 +1686,10 @@ class OrchestratorClient:
             result: Final graph state (should_stop, goal_achieved, error, freeze_data)
             lease_token: Current worker_batch fence for stateless jobs. Pinned
                 callers omit it and retain the historical payload byte shape.
+            client_report_id: Optional idempotency identity. When omitted, a
+                checkpointed graph envelope supplies it if present.
+            agent_id: Optional pinned-lane ownership fence. Stateless callers
+                use ``lease_token`` instead.
 
         Returns:
             True if the orchestrator handled completion successfully.
@@ -1685,14 +1698,35 @@ class OrchestratorClient:
             await self.connect()
 
         url = f"{self.orchestrator_url}/api/jobs/{job_id}/complete"
-        payload = {
-            "should_stop": result.get("should_stop", False),
-            "goal_achieved": result.get("goal_achieved", False),
-            "error": result.get("error"),
-            "freeze_data": result.get("freeze_data"),
-        }
+        checkpointed_payload = result.get("completion_report_payload")
+        if isinstance(checkpointed_payload, dict) and set(checkpointed_payload) == set(
+            _COMPLETION_REPORT_PAYLOAD_FIELDS
+        ):
+            # Never re-derive a retry payload. Freeze data can embed timestamps
+            # and repository state, so the checkpointed four-field operation
+            # envelope is the only safe source after a failed HTTP attempt.
+            payload: dict[str, Any] = {
+                field: checkpointed_payload[field]
+                for field in _COMPLETION_REPORT_PAYLOAD_FIELDS
+            }
+            if client_report_id is None:
+                stored_report_id = result.get("client_report_id")
+                if stored_report_id is not None:
+                    client_report_id = str(stored_report_id)
+        else:
+            # Backwards compatibility for old checkpoints and direct callers.
+            payload = {
+                "should_stop": result.get("should_stop", False),
+                "goal_achieved": result.get("goal_achieved", False),
+                "error": result.get("error"),
+                "freeze_data": result.get("freeze_data"),
+            }
         if lease_token is not None:
             payload["lease_token"] = int(lease_token)
+        if agent_id is not None:
+            payload["agent_id"] = str(agent_id)
+        if client_report_id is not None:
+            payload["client_report_id"] = str(client_report_id)
 
         try:
             # Stateless terminal handling can include workspace/archive and
@@ -1703,11 +1737,16 @@ class OrchestratorClient:
             response = await self._client.post(
                 url, json=payload, timeout=timeout_seconds
             )
-            if response.status_code == 200:
-                resp_data = response.json()
+            if response.status_code in {200, 202}:
+                try:
+                    resp_data = response.json()
+                except ValueError:
+                    # A body is useful for logging but not part of the durable
+                    # acceptance contract; a bodyless 202 is still success.
+                    resp_data = {}
                 actions = resp_data.get("actions", [])
                 logger.info(
-                    f"Orchestrator handled completion for job {job_id}: "
+                    f"Orchestrator accepted completion for job {job_id}: "
                     f"status={resp_data.get('new_status')}, actions={actions}"
                 )
                 return True

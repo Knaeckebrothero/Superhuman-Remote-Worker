@@ -18,7 +18,12 @@ from src.core.workspace_backend import WorkspaceUnavailableError
 from src.graph import route_entry
 from src.shared.run_queue import ClaimedUnit, EnqueueResult
 from src.shared.job_steering import CheckpointSteeringAcker, context_delivery_key
-from src.shared.worker_queue import WorkerClaim, WorkerRenewal, WorkerRotation
+from src.shared.worker_queue import (
+    WorkerClaim,
+    WorkerCompletionAcceptance,
+    WorkerRenewal,
+    WorkerRotation,
+)
 
 WORKSPACE_GENERATION = "11111111-1111-4111-8111-111111111111"
 WORKSPACE_RUNTIME = "22222222-2222-4222-8222-222222222222"
@@ -321,6 +326,58 @@ async def test_terminal_reports_once_then_closes_exact_watermark(
     rotate.assert_not_awaited()
     release.assert_not_awaited()
     assert agent.cleanup_calls == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("report_result", [True, False])
+async def test_command_accept_queue_closure_is_not_misclassified_as_lease_loss(
+    worker_runtime,
+    monkeypatch,
+    report_result,
+):
+    """B4 closes the queue inside accept, before the HTTP response returns."""
+
+    claim = _claim(input_seq=31, prior="processing")
+    final = {
+        "should_stop": True,
+        "goal_achieved": True,
+        "freeze_data": None,
+        "error": None,
+    }
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch,
+        claim,
+        final,
+        report_result=report_result,
+    )
+    executor._completion_commands_enabled = True
+    renew.side_effect = [_renewal("processing"), None]
+    acceptance = WorkerCompletionAcceptance(
+        job_status="completed",
+        queue_state="done",
+        command_state="done" if report_result else "pending",
+        command_id=uuid4(),
+    )
+    accepted_lookup = AsyncMock(return_value=acceptance)
+    monkeypatch.setattr(
+        turn_executor,
+        "get_worker_completion_acceptance",
+        accepted_lookup,
+    )
+
+    await executor._serve_worker_claim(claim)
+
+    client.report_completion.assert_awaited_once()
+    accepted_lookup.assert_awaited_once_with(
+        executor._db,
+        unit_id=claim.unit_id,
+        lease_token=claim.lease_token,
+    )
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+    rotate.assert_not_awaited()
+    assert executor._lease.lost.is_set() is False
+    assert agent.cleanup_calls == ([False] if report_result else [True])
 
 
 @pytest.mark.asyncio
@@ -797,8 +854,12 @@ class TestWorkerBatchArming:
         )
         assert graph_input["delivered_feedback_keys"] == [expected_key]
         assert graph_input["should_stop"] is False
+        assert graph_input["client_report_id"] is None
+        assert graph_input["completion_report_payload"] is None
         assert route_entry(graph_input) == "init_workspace"
         assert len(graph_input["messages"]) == 1
+        assert graph_input["client_report_id"] is None
+        assert graph_input["completion_report_payload"] is None
         assert "continue from the durable request" in graph_input["messages"][0].content
         assert "reviewer resumed" in graph_input["messages"][0].content
         assert checkpoint_values["delivered_feedback_keys"] == [expected_key]
@@ -885,6 +946,13 @@ class TestWorkerBatchArming:
                         "should_stop": True,
                         "error": {"recoverable": True},
                         "freeze_data": None,
+                        "client_report_id": "11111111-1111-4111-8111-111111111111",
+                        "completion_report_payload": {
+                            "should_stop": True,
+                            "goal_achieved": False,
+                            "error": {"recoverable": True},
+                            "freeze_data": None,
+                        },
                     },
                     next=(),
                 )
@@ -907,6 +975,8 @@ class TestWorkerBatchArming:
         assert graph.aupdate_state.await_args.kwargs == {"as_node": "__start__"}
         assert updates["error"] is None
         assert updates["should_stop"] is False
+        assert updates["client_report_id"] is None
+        assert updates["completion_report_payload"] is None
         assert terminal is None
 
     @pytest.mark.asyncio
@@ -919,6 +989,13 @@ class TestWorkerBatchArming:
                         "should_stop": True,
                         "goal_achieved": True,
                         "error": None,
+                        "client_report_id": "11111111-1111-4111-8111-111111111111",
+                        "completion_report_payload": {
+                            "should_stop": True,
+                            "goal_achieved": True,
+                            "error": None,
+                            "freeze_data": None,
+                        },
                     },
                     next=(),
                 )
@@ -939,6 +1016,7 @@ class TestWorkerBatchArming:
 
         graph.aupdate_state.assert_not_awaited()
         assert terminal["goal_achieved"] is True
+        assert terminal["client_report_id"] == ("11111111-1111-4111-8111-111111111111")
 
     @pytest.mark.asyncio
     async def test_exhausted_probe_preserves_terminal_end_without_graph_update(self):

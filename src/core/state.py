@@ -11,11 +11,20 @@ systems and file-based artifacts (plan.md, notes/), while state fields
 control loop flow.
 """
 
-from typing import Any, Dict, List, Optional, Annotated
+from typing import Annotated, Any, Dict, List, Optional
 
 from typing_extensions import TypedDict
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
+
+
+class CompletionReportPayload(TypedDict):
+    """Exact operation payload persisted for one completion-report retry set."""
+
+    should_stop: bool
+    goal_achieved: bool
+    error: Optional[Dict[str, Any]]
+    freeze_data: Optional[Dict[str, Any]]
 
 
 class UniversalAgentState(TypedDict):
@@ -66,6 +75,8 @@ class UniversalAgentState(TypedDict):
         error: Error information if something went wrong
         should_stop: Flag to signal workflow termination
         consecutive_llm_errors: Count of consecutive LLM failures
+        client_report_id: Random idempotency key minted once for a genuine stop
+        completion_report_payload: Exact four-field completion operation payload
 
         # Stateless worker batch budget (missing/None means unarmed)
         worker_batch_started_at: Epoch timestamp when this claim began
@@ -135,6 +146,13 @@ class UniversalAgentState(TypedDict):
     error: Optional[Dict[str, Any]]
     should_stop: bool
     consecutive_llm_errors: int
+
+    # Completion report retry envelope. A graph node writes both immediately
+    # before END, so a successor re-reporting the durable checkpoint reuses the
+    # same random identity and exact operation payload. Genuine resume nodes
+    # clear both before any new work can produce another stop.
+    client_report_id: Optional[str]
+    completion_report_payload: Optional[CompletionReportPayload]
 
     # Stateless worker batches are armed explicitly by their claim driver.
     # Keeping these fields in the checkpoint makes the boundary decision
@@ -256,6 +274,8 @@ def create_initial_state(
         error=None,
         should_stop=False,
         consecutive_llm_errors=0,
+        client_report_id=None,
+        completion_report_payload=None,
         # Worker batch budget (default-unarmed)
         worker_batch_started_at=None,
         worker_batch_start_iteration=None,

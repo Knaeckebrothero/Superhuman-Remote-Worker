@@ -1,0 +1,441 @@
+"""Durable admission for agent job-completion reports.
+
+The short accept transaction is the ownership boundary described by
+``docs/features/stateless_agents.md`` section 5.4.5.  It deliberately performs
+no completion side effects: it validates the lane-specific fence, records the
+immutable command as its first write, advances the per-job commit-order cursor,
+and closes a stateless worker lease before committing.
+
+Every transaction that can touch both queue and job rows locks them in that
+order.  The queue row uses ``FOR UPDATE`` rather than the design's earlier
+``FOR SHARE`` wording because accept now also terminalizes that row (B4).  A
+shared lock followed by an update creates a two-reporter lock-upgrade deadlock;
+the stronger lock preserves the prescribed order and makes the upgrade
+unnecessary.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any, AsyncIterator, Mapping
+from uuid import UUID, uuid5
+
+from src.shared.run_queue import complete_unit
+
+COMPLETION_CODE_VERSION = "job-completion-v1"
+COMPLETION_DEADLINE_SECONDS = 24 * 60 * 60
+
+# Stable, application-owned namespace.  The fallback exists only for rolling
+# compatibility with old agents; it is allocated after report_seq while the
+# jobs row is locked and therefore cannot be used to identify an HTTP retry.
+_FALLBACK_REPORT_NAMESPACE = UUID("7072cfbc-d685-4d52-9942-d954f2914652")
+
+
+class CompletionCommandError(RuntimeError):
+    """Base class for accept failures with an HTTP-level retry policy."""
+
+
+class CompletionCommandNotFound(CompletionCommandError):
+    """The target job does not exist."""
+
+
+class CompletionFenceRejected(CompletionCommandError):
+    """The caller does not own the lane-specific completion fence."""
+
+
+class CompletionPayloadMismatch(CompletionCommandError):
+    """An idempotency key was reused with a different operation payload."""
+
+
+class CompletionInProgress(CompletionCommandError):
+    """An exact duplicate exists but has not reached a terminal state."""
+
+    def __init__(self, command_id: str, state: str) -> None:
+        self.command_id = command_id
+        self.state = state
+        super().__init__(f"completion command {command_id} is {state}")
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionAcceptResult:
+    """The durable result of fresh admission or an exact-key replay."""
+
+    disposition: str
+    command_id: str
+    job_id: str
+    report_seq: int
+    state: str
+    stored_payload: dict[str, Any]
+    outcome: dict[str, Any] | None
+    winning_report_seq: int | None
+    abandoned_effects: tuple[str, ...]
+    client_report_id: str
+    queue_terminalized: bool
+
+    @property
+    def replayed(self) -> bool:
+        return self.disposition != "fresh"
+
+
+def canonical_completion_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only completion-operation fields, excluding all transport fences."""
+
+    return {
+        str(key): value
+        for key, value in payload.items()
+        if key not in {"lease_token", "agent_id", "client_report_id"}
+    }
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def completion_payload_digest(job_id: str, payload: Mapping[str, Any]) -> str:
+    """Fingerprint operation identity plus the canonical completion body."""
+
+    operation = {
+        "job_id": str(UUID(str(job_id))),
+        "payload": canonical_completion_payload(payload),
+    }
+    return hashlib.sha256(_canonical_json(operation).encode("utf-8")).hexdigest()
+
+
+def fallback_client_report_id(job_id: str, report_seq: int) -> str:
+    """Synthesize the rolling-upgrade fallback required by section 5.4.5."""
+
+    identity = f"{UUID(str(job_id))}:{int(report_seq)}"
+    return str(uuid5(_FALLBACK_REPORT_NAMESPACE, identity))
+
+
+def _json_object(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        return dict(parsed) if isinstance(parsed, dict) else None
+    return dict(value) if isinstance(value, Mapping) else None
+
+
+def _str_tuple(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(str(item) for item in value)
+
+
+def _outcome_metadata(
+    outcome: dict[str, Any] | None,
+) -> tuple[int | None, tuple[str, ...]]:
+    if not outcome:
+        return None, ()
+    winning = outcome.get("winning_report_seq")
+    try:
+        winning_seq = int(winning) if winning is not None else None
+    except (TypeError, ValueError):
+        winning_seq = None
+    return winning_seq, _str_tuple(outcome.get("abandoned_effects"))
+
+
+def _result_from_row(
+    row: Any, *, disposition: str, queue_terminalized: bool
+) -> CompletionAcceptResult:
+    payload = _json_object(row["payload"]) or {}
+    outcome = _json_object(row["outcome"])
+    winning_report_seq, abandoned_effects = _outcome_metadata(outcome)
+    return CompletionAcceptResult(
+        disposition=disposition,
+        command_id=str(row["id"]),
+        job_id=str(row["job_id"]),
+        report_seq=int(row["report_seq"]),
+        state=str(row["state"]),
+        stored_payload=payload,
+        outcome=outcome,
+        winning_report_seq=winning_report_seq,
+        abandoned_effects=abandoned_effects,
+        client_report_id=str(row["client_report_id"]),
+        queue_terminalized=queue_terminalized,
+    )
+
+
+@asynccontextmanager
+async def _connection(source: Any) -> AsyncIterator[Any]:
+    acquire = getattr(source, "acquire", None)
+    if acquire is None:
+        yield source
+        return
+    async with acquire() as conn:
+        yield conn
+
+
+def _same_uuid(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return left is right
+    try:
+        return UUID(str(left)) == UUID(str(right))
+    except (TypeError, ValueError):
+        return False
+
+
+def _validate_replay_fence(
+    row: Any,
+    *,
+    lease_token: int | None,
+    agent_id: str | None,
+) -> None:
+    accepted_token = row["accepted_lease_token"]
+    accepted_agent = row["accepted_agent_id"]
+    if accepted_token is not None:
+        if (
+            agent_id is not None
+            or lease_token is None
+            or int(accepted_token) != int(lease_token)
+        ):
+            raise CompletionFenceRejected(
+                "completion retry does not match accepted lease"
+            )
+        return
+    if (
+        lease_token is not None
+        or agent_id is None
+        or not _same_uuid(accepted_agent, agent_id)
+    ):
+        raise CompletionFenceRejected("completion retry does not match accepted agent")
+
+
+def _replay_disposition(state: str) -> str:
+    return {
+        "done": "replay_done",
+        "parked": "replay_parked",
+        "superseded": "replay_superseded",
+        "force_resolved": "replay_force_resolved",
+    }[state]
+
+
+async def accept_completion_command(
+    db: Any,
+    *,
+    job_id: str,
+    payload: Mapping[str, Any],
+    lease_token: int | None,
+    agent_id: str | None,
+    client_report_id: str | None,
+    requested_by: str,
+    code_version: str = COMPLETION_CODE_VERSION,
+) -> CompletionAcceptResult:
+    """Accept one immutable completion report in a short fenced transaction."""
+
+    job_uuid = UUID(str(job_id))
+    canonical_payload = canonical_completion_payload(payload)
+    payload_json = _canonical_json(canonical_payload)
+    digest = completion_payload_digest(str(job_uuid), canonical_payload)
+    supplied_report_uuid = UUID(str(client_report_id)) if client_report_id else None
+
+    async with _connection(db) as conn:
+        async with conn.transaction():
+            # Binding global order: queue first, jobs second.  Pinned jobs have
+            # no queue row, but the lookup still precedes the jobs lock.
+            queue = await conn.fetchrow(
+                """
+                SELECT unit_id, unit_kind, state, lease_token, input_seq
+                FROM run_queue
+                WHERE unit_id = $1::uuid
+                FOR UPDATE
+                """,
+                job_uuid,
+            )
+            job = await conn.fetchrow(
+                """
+                SELECT id, status::text AS status, execution_lane,
+                       assigned_agent_id, completion_seq_hwm
+                FROM jobs
+                WHERE id = $1::uuid
+                FOR UPDATE
+                """,
+                job_uuid,
+            )
+            if job is None:
+                raise CompletionCommandNotFound(f"job '{job_uuid}' not found")
+
+            # Exact-key lookup happens before current-owner validation.  The
+            # accepted fence is immutable and remains replayable after accept
+            # closes the queue or finalization clears agent assignment.
+            if supplied_report_uuid is not None:
+                existing = await conn.fetchrow(
+                    """
+                    SELECT id, job_id, report_seq, client_report_id, payload,
+                           payload_digest, accepted_lease_token,
+                           accepted_agent_id, state, outcome
+                    FROM job_completion_commands
+                    WHERE job_id = $1::uuid AND client_report_id = $2::uuid
+                    """,
+                    job_uuid,
+                    supplied_report_uuid,
+                )
+                if existing is not None:
+                    if str(existing["payload_digest"]) != digest:
+                        raise CompletionPayloadMismatch(
+                            "client_report_id was reused with a different completion payload"
+                        )
+                    _validate_replay_fence(
+                        existing,
+                        lease_token=lease_token,
+                        agent_id=agent_id,
+                    )
+                    state = str(existing["state"])
+                    if state in {"pending", "finalizing"}:
+                        raise CompletionInProgress(str(existing["id"]), state)
+                    return _result_from_row(
+                        existing,
+                        disposition=_replay_disposition(state),
+                        queue_terminalized=existing["accepted_lease_token"] is not None,
+                    )
+
+            lane = str(job["execution_lane"] or "pinned")
+            accepted_token: int | None = None
+            accepted_agent: UUID | None = None
+            if lane == "stateless":
+                if agent_id is not None or lease_token is None:
+                    raise CompletionFenceRejected(
+                        "stateless completion requires only a lease_token fence"
+                    )
+                if (
+                    queue is None
+                    or str(queue["unit_kind"]) != "worker_batch"
+                    or str(queue["state"]) != "leased"
+                    or int(queue["lease_token"]) != int(lease_token)
+                ):
+                    raise CompletionFenceRejected(
+                        "completion report does not hold the current worker lease"
+                    )
+                accepted_token = int(lease_token)
+            else:
+                if lease_token is not None or agent_id is None:
+                    raise CompletionFenceRejected(
+                        "pinned completion requires only an agent_id fence"
+                    )
+                try:
+                    accepted_agent = UUID(str(agent_id))
+                except (TypeError, ValueError) as exc:
+                    raise CompletionFenceRejected(
+                        "pinned completion agent_id is invalid"
+                    ) from exc
+                if not _same_uuid(job["assigned_agent_id"], accepted_agent):
+                    raise CompletionFenceRejected(
+                        "completion report does not match the assigned agent"
+                    )
+
+            report_seq = int(job["completion_seq_hwm"] or 0) + 1
+            report_uuid = supplied_report_uuid or UUID(
+                fallback_client_report_id(str(job_uuid), report_seq)
+            )
+
+            # FIRST database write of the handler.  Cursor and queue writes
+            # follow only after the immutable command is present.
+            command = await conn.fetchrow(
+                """
+                INSERT INTO job_completion_commands (
+                    job_id, report_seq, client_report_id, payload,
+                    payload_digest, accepted_lease_token, accepted_agent_id,
+                    origin, requested_by, deadline_at, code_version
+                ) VALUES (
+                    $1::uuid, $2::bigint, $3::uuid, $4::jsonb,
+                    $5::text, $6::bigint, $7::uuid,
+                    'agent', $8::text,
+                    now() + make_interval(secs => $9::float8), $10::text
+                )
+                RETURNING id, job_id, report_seq, client_report_id, payload,
+                          payload_digest, accepted_lease_token,
+                          accepted_agent_id, state, outcome
+                """,
+                job_uuid,
+                report_seq,
+                report_uuid,
+                payload_json,
+                digest,
+                accepted_token,
+                accepted_agent,
+                requested_by,
+                float(COMPLETION_DEADLINE_SECONDS),
+                code_version,
+            )
+            await conn.execute(
+                """
+                UPDATE jobs
+                SET completion_seq_hwm = $2::bigint
+                WHERE id = $1::uuid
+                """,
+                job_uuid,
+                report_seq,
+            )
+
+            queue_terminalized = False
+            if accepted_token is not None:
+                queue_state = await complete_unit(
+                    conn,
+                    unit_id=job_uuid,
+                    lease_token=accepted_token,
+                    consumed_seq=queue["input_seq"],
+                )
+                if queue_state is None:
+                    raise CompletionFenceRejected(
+                        "worker lease changed before completion command commit"
+                    )
+                if queue_state != "done":
+                    raise CompletionFenceRejected(
+                        "new worker input arrived before terminal accept committed"
+                    )
+                queue_terminalized = True
+
+            return _result_from_row(
+                command,
+                disposition="fresh",
+                queue_terminalized=queue_terminalized,
+            )
+
+
+async def complete_completion_command(
+    db: Any,
+    command_id: str,
+    outcome: Mapping[str, Any],
+) -> bool:
+    """Store the exact legacy HTTP outcome for a freshly accepted command."""
+
+    outcome_json = _canonical_json(dict(outcome))
+    async with _connection(db) as conn:
+        updated = await conn.fetchval(
+            """
+            UPDATE job_completion_commands
+            SET state = 'done', outcome = $2::jsonb, finalized_at = now(),
+                finalizing_by = NULL, lease_expires_at = NULL
+            WHERE id = $1::uuid AND state IN ('pending', 'finalizing')
+            RETURNING 1
+            """,
+            UUID(str(command_id)),
+            outcome_json,
+        )
+    return updated is not None
+
+
+__all__ = [
+    "COMPLETION_CODE_VERSION",
+    "CompletionAcceptResult",
+    "CompletionCommandError",
+    "CompletionCommandNotFound",
+    "CompletionFenceRejected",
+    "CompletionInProgress",
+    "CompletionPayloadMismatch",
+    "accept_completion_command",
+    "canonical_completion_payload",
+    "complete_completion_command",
+    "completion_payload_digest",
+    "fallback_client_report_id",
+]

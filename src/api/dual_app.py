@@ -843,16 +843,23 @@ async def _process_orchestrator_job(
 
         _current_job_id = None
 
-        # Report completion
+        # Report completion before advertising an idle slot. A ready/draining
+        # heartbeat while the job is still processing lets the orphan sweep
+        # pause and redispatch finished work before /complete reaches its
+        # guard. The ordinary app follows the same ordering.
         if _orchestrator_client:
             try:
+                await _orchestrator_client.report_completion(
+                    job_id,
+                    result,
+                    agent_id=_orchestrator_client.agent_id,
+                )
                 if _orchestrator_client.agent_id:
                     await _orchestrator_client.heartbeat(
                         status=_final_idle_status(),
                         job_id=None,
                         metrics=_get_agent_metrics(),
                     )
-                await _orchestrator_client.report_completion(job_id, result)
             except Exception as e:
                 logger.error(f"Failed to report completion for job {job_id}: {e}")
 
@@ -872,7 +879,9 @@ async def _process_orchestrator_job(
         if _orchestrator_client:
             try:
                 await _orchestrator_client.report_completion(
-                    job_id, completion_error_payload(e)
+                    job_id,
+                    completion_error_payload(e),
+                    agent_id=_orchestrator_client.agent_id,
                 )
             except Exception:
                 logger.error(f"Failed to report error for job {job_id}")
@@ -1247,15 +1256,17 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
                 if _orchestrator_client:
                     try:
+                        await _orchestrator_client.report_completion(
+                            request.job_id,
+                            result,
+                            agent_id=_orchestrator_client.agent_id,
+                        )
                         if _orchestrator_client.agent_id:
                             await _orchestrator_client.heartbeat(
                                 status=_final_idle_status(),
                                 job_id=None,
                                 metrics=_get_agent_metrics(),
                             )
-                        await _orchestrator_client.report_completion(
-                            request.job_id, result
-                        )
                     except Exception as e:
                         logger.error(f"Failed to report completion: {e}")
 
@@ -1272,7 +1283,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 if _orchestrator_client:
                     try:
                         await _orchestrator_client.report_completion(
-                            request.job_id, completion_error_payload(e)
+                            request.job_id,
+                            completion_error_payload(e),
+                            agent_id=_orchestrator_client.agent_id,
                         )
                     except Exception:
                         pass

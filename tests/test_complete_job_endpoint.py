@@ -766,6 +766,8 @@ class TestOrchestratorClientReportCompletion:
         assert payload["goal_achieved"] is True
         assert payload["freeze_data"]["freeze_type"] == "job_complete"
         assert "lease_token" not in payload
+        assert "agent_id" not in payload
+        assert "client_report_id" not in payload
         assert call_kwargs["timeout"] == 60.0
 
     @pytest.mark.asyncio
@@ -783,6 +785,63 @@ class TestOrchestratorClientReportCompletion:
         call_kwargs = mock_http.post.call_args.kwargs
         assert call_kwargs["json"]["lease_token"] == 17
         assert call_kwargs["timeout"] == 300.0
+
+    @pytest.mark.asyncio
+    async def test_sends_optional_pinned_fence_and_report_identity(self, client):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"new_status": "completed", "actions": []}
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            await client.report_completion(
+                "job-123",
+                {"should_stop": True},
+                agent_id="22222222-2222-4222-8222-222222222222",
+                client_report_id="11111111-1111-4111-8111-111111111111",
+            )
+
+        payload = mock_http.post.call_args.kwargs["json"]
+        assert payload["agent_id"] == "22222222-2222-4222-8222-222222222222"
+        assert payload["client_report_id"] == ("11111111-1111-4111-8111-111111111111")
+        assert "lease_token" not in payload
+
+    @pytest.mark.asyncio
+    async def test_retry_uses_checkpointed_four_field_payload_verbatim(self, client):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"new_status": "completed", "actions": []}
+        checkpointed = {
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": None,
+            "freeze_data": {
+                "freeze_type": "job_complete",
+                "generated_at": "2026-08-12T22:00:00Z",
+            },
+        }
+        result = {
+            "client_report_id": "11111111-1111-4111-8111-111111111111",
+            "completion_report_payload": checkpointed,
+            # These live values deliberately disagree with the durable stop.
+            "should_stop": False,
+            "goal_achieved": False,
+            "error": {"message": "later mutation"},
+            "freeze_data": None,
+        }
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            await client.report_completion("job-123", result, lease_token=17)
+
+        payload = mock_http.post.call_args.kwargs["json"]
+        assert {
+            key: value
+            for key, value in payload.items()
+            if key not in {"lease_token", "client_report_id"}
+        } == checkpointed
+        assert payload["client_report_id"] == result["client_report_id"]
+        assert payload["lease_token"] == 17
 
     @pytest.mark.asyncio
     async def test_sends_error(self, client):
@@ -812,6 +871,21 @@ class TestOrchestratorClientReportCompletion:
         with patch.object(client, "_client", AsyncMock()) as mock_http:
             mock_http.post = AsyncMock(return_value=mock_response)
             success = await client.report_completion("job-123", {"should_stop": True})
+
+        assert success is True
+
+    @pytest.mark.asyncio
+    async def test_returns_true_on_async_accept(self, client):
+        """HTTP 202 is a successful durable accept for stateless finalization."""
+        mock_response = MagicMock()
+        mock_response.status_code = 202
+        mock_response.json.side_effect = ValueError("empty response body")
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            success = await client.report_completion(
+                "job-123", {"should_stop": True}, lease_token=17
+            )
 
         assert success is True
 

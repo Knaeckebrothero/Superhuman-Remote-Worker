@@ -49,7 +49,9 @@ import math
 import re
 import asyncio
 import time
+from copy import deepcopy
 from typing import Any, Callable, Dict, List, Literal, Optional
+from uuid import UUID, uuid4
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -119,7 +121,7 @@ from .core.phase import (
 )
 from .core.phase_snapshot import PhaseSnapshotManager
 from .core.response_validator import validate_response
-from .core.state import UniversalAgentState
+from .core.state import CompletionReportPayload, UniversalAgentState
 from .core.toolcall_recovery import (
     has_leaked_tool_call_markup,
     parse_leaked_tool_calls,
@@ -274,6 +276,10 @@ def _log_worker_batch_boundary(job_id: str, updates: Dict[str, Any]) -> None:
 
 
 logger = logging.getLogger(__name__)
+
+_COMPLETION_REPORT_PAYLOAD_FIELDS = frozenset(
+    {"should_stop", "goal_achieved", "error", "freeze_data"}
+)
 
 # Model families whose tool-call grammar the fallback recovery parser
 # understands. When such a model's serving layer leaks a tool call into message
@@ -3991,6 +3997,65 @@ def create_check_goal_node(
     return check_goal
 
 
+def checkpoint_completion_report(
+    state: UniversalAgentState,
+) -> Dict[str, Any]:
+    """Freeze one completion operation identity and payload before graph END.
+
+    HTTP retries must not reconstruct this payload from live state: completion
+    freezes can contain timestamps and repository state that legitimately
+    change between attempts. A valid existing envelope therefore wins
+    verbatim. Resume nodes clear the pair before new work can reach another
+    genuine stop.
+
+    ``batch_boundary`` is a Continue-as-New handoff, not a completion report,
+    so it deliberately reaches END without minting an idempotency key.
+    """
+    freeze_data = state.get("freeze_data")
+    if (
+        isinstance(freeze_data, dict)
+        and freeze_data.get("freeze_type") == FREEZE_TYPE_BATCH_BOUNDARY
+    ):
+        return _clear_completion_report_updates(state)
+
+    report_id = state.get("client_report_id")
+    payload = state.get("completion_report_payload")
+    if isinstance(report_id, str) and isinstance(payload, dict):
+        try:
+            UUID(report_id)
+        except ValueError:
+            pass
+        else:
+            if set(payload) == _COMPLETION_REPORT_PAYLOAD_FIELDS:
+                return {}
+
+    report_payload: CompletionReportPayload = {
+        "should_stop": state.get("should_stop", False),
+        "goal_achieved": state.get("goal_achieved", False),
+        "error": deepcopy(state.get("error")),
+        "freeze_data": deepcopy(freeze_data),
+    }
+    return {
+        "client_report_id": str(uuid4()),
+        "completion_report_payload": report_payload,
+    }
+
+
+def _clear_completion_report_updates(
+    state: UniversalAgentState,
+) -> Dict[str, None]:
+    """Clear a prior stop's retry envelope only when one is present."""
+    if (
+        state.get("client_report_id") is None
+        and state.get("completion_report_payload") is None
+    ):
+        return {}
+    return {
+        "client_report_id": None,
+        "completion_report_payload": None,
+    }
+
+
 # =============================================================================
 # ROUTING FUNCTIONS
 # =============================================================================
@@ -4117,7 +4182,7 @@ def create_restore_todo_state_node(
             )
 
             todo_state = todo_manager.export_state()
-            return {
+            updates: Dict[str, Any] = {
                 "is_strategic_phase": False,
                 "should_stop": False,
                 "goal_achieved": False,
@@ -4125,11 +4190,15 @@ def create_restore_todo_state_node(
                 "staged_todos": todo_state["staged_todos"],
                 "todo_next_id": todo_state["next_id"],
             }
+            updates.update(_clear_completion_report_updates(state))
+            return updates
 
         # Always clear stop flags on resume — the checkpoint may carry
         # should_stop=True from a previous freeze, which would cause
         # check_goal to immediately stop the graph.
-        return {"should_stop": False, "goal_achieved": False}
+        updates = {"should_stop": False, "goal_achieved": False}
+        updates.update(_clear_completion_report_updates(state))
+        return updates
 
     return restore_todo_state
 
@@ -4354,7 +4423,7 @@ def create_restore_from_feedback_node(
         clear_final_phase_data(job_id)
         clear_verdict_data(job_id)
 
-        return {
+        updates: Dict[str, Any] = {
             "messages": result_messages,
             "resume_feedback": None,  # Clear — consumed
             "resume_reason": None,  # Clear — consumed
@@ -4369,6 +4438,8 @@ def create_restore_from_feedback_node(
             "staged_todos": todo_state["staged_todos"],
             "todo_next_id": todo_state["next_id"],
         }
+        updates.update(_clear_completion_report_updates(state))
+        return updates
 
     return restore_from_feedback
 
@@ -5510,6 +5581,7 @@ def build_phase_alternation_graph(
     workflow.add_node("archive_phase", archive_phase)
     workflow.add_node("handle_transition", handle_transition)
     workflow.add_node("check_goal", check_goal)
+    workflow.add_node("checkpoint_completion_report", checkpoint_completion_report)
 
     logger.info("Building phase alternation graph")
 
@@ -5575,9 +5647,10 @@ def build_phase_alternation_graph(
         else "execute",
         {
             "execute": "execute",
-            "end": END,
+            "end": "checkpoint_completion_report",
         },
     )
+    workflow.add_edge("checkpoint_completion_report", END)
 
     compiled = workflow.compile(checkpointer=checkpointer)
     # Expose the memory seam on the compiled graph so the worker run loop can
