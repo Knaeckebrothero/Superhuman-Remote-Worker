@@ -72,6 +72,16 @@ def _make_callbacks(**overrides) -> PersistentLoopCallbacks:
     return PersistentLoopCallbacks(**defaults)
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_backoff(monkeypatch):
+    """Preserve retry attempts while removing production wall-clock delays.
+
+    Retry timing itself is covered in test_session_transient_llm_retry.py; this
+    module tests turn outcomes, fallback routing, and callback ordering.
+    """
+    monkeypatch.setattr("src.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+
+
 def _make_config(**overrides):
     """Minimal config mock."""
     cfg = MagicMock()
