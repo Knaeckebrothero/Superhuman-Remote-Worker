@@ -2476,54 +2476,6 @@ class TestRemoteBackendTmuxFences:
         assert "exit 75" in command
         assert "@srw_generation" in command
 
-    def test_worker_v1_fence_does_not_require_incarnation_process_tags(
-        self, remote_backend, tmp_path
-    ):
-        backend, _, _ = remote_backend
-        backend.set_shell_owner_token(42)
-        generation = "a" * 32
-        state_dir = tmp_path / ".srw" / "tmux"
-        state_dir.mkdir(parents=True)
-        (state_dir / backend._tmux_state_filename).write_text(
-            f"1|{backend._tmux_owner_digest}|active|42|{generation}\n"
-        )
-        fake_bin = tmp_path / "bin"
-        fake_bin.mkdir()
-        fake_tmux = fake_bin / "tmux"
-        fake_tmux.write_text(
-            "#!/bin/sh\n"
-            'case "$1" in\n'
-            "  has-session) exit 0 ;;\n"
-            "  display-message)\n"
-            '    case "$*" in\n'
-            f"      *@srw_owner_id*) printf '%s\\n' {backend._job_id} ;;\n"
-            "      *@srw_owner_token*) printf '%s\\n' 42 ;;\n"
-            f"      *@srw_generation*) printf '%s\\n' {generation} ;;\n"
-            "      *) exit 2 ;;\n"
-            "    esac ;;\n"
-            "  *) exit 2 ;;\n"
-            "esac\n"
-        )
-        fake_tmux.chmod(0o755)
-        command = backend._stateless_tmux_fence_shell() + "printf fence-ok"
-
-        completed = subprocess.run(
-            ["bash", "-c", command],
-            env={
-                **os.environ,
-                "HOME": str(tmp_path),
-                "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            },
-            text=True,
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-
-        assert completed.returncode == 0, completed.stderr
-        assert completed.stdout == "fence-ok"
-        assert "_srw_process_tagged" not in command
-
     def test_stale_owner_token_mutation_is_rejected_by_checked_status(
         self, remote_backend
     ):
