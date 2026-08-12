@@ -111,7 +111,7 @@ _MIGRATIONS_DIR = (
 # on (e.g. 0117's last_leased_by) cannot pass here and fail on a real cluster.
 MIGRATION_FILES = [
     _MIGRATIONS_DIR / "0005_thread_permission_requests.sql",
-    _MIGRATIONS_DIR / "0115_run_queue.sql",
+    _MIGRATIONS_DIR / "0115a_run_queue.sql",
     _MIGRATIONS_DIR / "0117_run_queue_affinity.sql",
     _MIGRATIONS_DIR / "0119_thread_control_inbox.sql",
     _MIGRATIONS_DIR / "0120_thread_control_receipt_idx.notx.sql",

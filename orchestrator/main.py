@@ -36914,13 +36914,83 @@ async def delete_thread_upload(
     """
     from services.thread_uploads import (
         ThreadUploadError,
+        delete_file_from_attested_stateless_workspace,
         delete_file_from_thread_workspace,
+        resolve_thread_upload_destination,
     )
+    from src.shared.run_queue import LANE_STATELESS
 
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     try:
-        removed = await delete_file_from_thread_workspace(thread, path)
+        if thread.get("execution_lane") != LANE_STATELESS:
+            removed = await delete_file_from_thread_workspace(thread, path)
+        else:
+            try:
+                async with postgres_db.stateless_session_workspace_ensure_lock(
+                    thread_id,
+                    wait=True,
+                ) as delete_owner:
+                    if not delete_owner:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Stateless workspace lifecycle lock unavailable",
+                        )
+                    fresh = await postgres_db.get_thread(thread_id)
+                    if fresh is None:
+                        raise HTTPException(status_code=404, detail="Thread not found")
+                    metadata = thread_metadata_object(fresh)
+                    try:
+                        stopped = bool(stateless_stop_markers(fresh.get("metadata")))
+                    except RuntimeError:
+                        stopped = True
+                    if (
+                        fresh.get("execution_lane") != LANE_STATELESS
+                        or fresh.get("status")
+                        not in {"created", "active", "awaiting_user"}
+                        or stopped
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Stateless session is not accepting upload deletes",
+                        )
+                    backend = _require_stateless_workspace(fresh)
+                    destination = resolve_thread_upload_destination(fresh)
+                    if backend == "virtual":
+                        removed = await delete_file_from_thread_workspace(
+                            fresh,
+                            path,
+                            destination=destination,
+                        )
+                    else:
+                        workspace = metadata.get("workspace_container") or {}
+                        binding = metadata.get("_workspace_binding") or {}
+                        generation = str(binding.get("generation") or "")
+                        runtime_incarnation = str(
+                            workspace.get("_runtime_incarnation") or ""
+                        )
+                        fingerprint = str(binding.get("ssh_host_key_fingerprint") or "")
+
+                        async def _probe_runtime() -> str:
+                            return await container_provisioner.workspace_pod_authority(
+                                WorkspaceOwner.session(thread_id),
+                                expected_runtime_incarnation=runtime_incarnation,
+                            )
+
+                        removed = await delete_file_from_attested_stateless_workspace(
+                            fresh,
+                            path,
+                            destination=destination,
+                            expected_workspace_generation=generation,
+                            expected_runtime_incarnation=runtime_incarnation,
+                            expected_host_key_fingerprint=fingerprint,
+                            authority_probe=_probe_runtime,
+                        )
+            except TimeoutError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless workspace lifecycle lock timed out",
+                ) from exc
     except ThreadUploadError as e:
         logger.warning(
             "Thread upload delete refused for %s (%r): %d %s",
