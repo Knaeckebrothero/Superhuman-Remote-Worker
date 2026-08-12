@@ -68,7 +68,7 @@ _MIGRATIONS_DIR = (
     / "app"
 )
 _QUEUE_MIGRATIONS = (
-    _MIGRATIONS_DIR / "0115_run_queue.sql",
+    _MIGRATIONS_DIR / "0115a_run_queue.sql",
     _MIGRATIONS_DIR / "0117_run_queue_affinity.sql",
 )
 _JOB_MIGRATIONS = (

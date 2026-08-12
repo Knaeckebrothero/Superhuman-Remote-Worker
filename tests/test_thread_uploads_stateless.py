@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import stat
 import threading
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -18,6 +19,7 @@ from services.thread_uploads import (
     _SshTarget,
     _VirtualTarget,
     _virtual_purge_prefix,
+    delete_file_from_attested_stateless_workspace,
     purge_attested_stateless_virtual_workspace,
     resolve_thread_upload_destination,
     upload_files_to_attested_stateless_workspace,
@@ -89,6 +91,13 @@ class _AsyncSFTP:
             return object()
         raise FileNotFoundError(path)
 
+    async def lstat(self, path: str):
+        if path in self.dirs:
+            return SimpleNamespace(permissions=stat.S_IFDIR | 0o700)
+        if path in self.files:
+            return SimpleNamespace(permissions=stat.S_IFREG | 0o600)
+        raise FileNotFoundError(path)
+
     async def mkdir(self, path: str) -> None:
         self.dirs.add(path)
 
@@ -113,6 +122,12 @@ class _AsyncSFTP:
         if path not in self.files:
             raise FileNotFoundError(path)
         del self.files[path]
+
+    async def rmdir(self, path: str) -> None:
+        prefix = path.rstrip("/") + "/"
+        if any(item.startswith(prefix) for item in (*self.dirs, *self.files)):
+            raise OSError("directory not empty")
+        self.dirs.remove(path)
 
 
 class _PinnedPool:
@@ -183,6 +198,61 @@ async def test_attested_upload_pins_generation_runtime_and_host_key(attested_upl
     assert checkout["fingerprint"] == FINGERPRINT
     assert checkout["host"] == "10.42.0.25"
     assert checkout["port"] == 30022
+
+
+@pytest.mark.asyncio
+async def test_attested_delete_pins_generation_runtime_and_host_key(attested_upload):
+    uploads_dir = "/home/agent-host/workspace/uploads"
+    attested_upload.sftp.dirs.update(
+        {
+            "/home",
+            "/home/agent-host",
+            "/home/agent-host/workspace",
+            uploads_dir,
+        }
+    )
+    attested_upload.sftp.files[UPLOAD_PATH] = b"hello"
+    probe = AsyncMock(return_value="exact_live")
+
+    removed = await delete_file_from_attested_stateless_workspace(
+        attested_upload.thread,
+        "notes.txt",
+        destination=attested_upload.target,
+        expected_workspace_generation=GENERATION,
+        expected_runtime_incarnation=RUNTIME,
+        expected_host_key_fingerprint=FINGERPRINT,
+        authority_probe=probe,
+    )
+
+    assert removed == "notes.txt"
+    assert UPLOAD_PATH not in attested_upload.sftp.files
+    assert probe.await_count == 4
+    checkout = attested_upload.pool.checkouts[0]
+    assert checkout["thread_id"] == f"{THREAD_ID}:{RUNTIME}"
+    assert checkout["generation"] == UUID(GENERATION)
+    assert checkout["fingerprint"] == FINGERPRINT
+
+
+@pytest.mark.asyncio
+async def test_attested_delete_reprobes_immediately_before_unlink(attested_upload):
+    uploads_dir = "/home/agent-host/workspace/uploads"
+    attested_upload.sftp.dirs.add(uploads_dir)
+    attested_upload.sftp.files[UPLOAD_PATH] = b"hello"
+    probe = AsyncMock(side_effect=["exact_live", "exact_live", "replacement"])
+
+    with pytest.raises(ThreadUploadError) as error:
+        await delete_file_from_attested_stateless_workspace(
+            attested_upload.thread,
+            "notes.txt",
+            destination=attested_upload.target,
+            expected_workspace_generation=GENERATION,
+            expected_runtime_incarnation=RUNTIME,
+            expected_host_key_fingerprint=FINGERPRINT,
+            authority_probe=probe,
+        )
+
+    assert error.value.status_code == 409
+    assert attested_upload.sftp.files[UPLOAD_PATH] == b"hello"
 
 
 @pytest.mark.asyncio

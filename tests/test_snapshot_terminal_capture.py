@@ -349,7 +349,9 @@ async def test_strict_capture_refuses_missing_or_malformed_pin_before_ssh(
 
 
 @pytest.mark.asyncio
-async def test_available_upload_snapshot_keeps_legacy_contract(tmp_path: Path) -> None:
+async def test_available_upload_snapshot_promotes_history_and_canonical(
+    tmp_path: Path,
+) -> None:
     archive = tmp_path / "env.tar.zst"
     archive.write_bytes(b"archive")
     service = SnapshotService()
@@ -365,7 +367,20 @@ async def test_available_upload_snapshot_keeps_legacy_contract(tmp_path: Path) -
 
     assert uploaded is True
     assert service._s3.upload_file.call_count == 1
-    assert service._s3.put_object.call_count == 1
+    copied_keys = [call.args[2] for call in service._s3.copy.call_args_list]
+    assert len(copied_keys) == 2
+    assert any(
+        "/history/" in key and key.endswith("/env.tar.zst") for key in copied_keys
+    )
+    assert "jobs/job-id/env.tar.zst" in copied_keys
+    manifest_keys = [
+        call.kwargs["Key"] for call in service._s3.put_object.call_args_list
+    ]
+    assert len(manifest_keys) == 2
+    assert any(
+        "/history/" in key and key.endswith("/manifest.json") for key in manifest_keys
+    )
+    assert "jobs/job-id/manifest.json" in manifest_keys
 
 
 @pytest.mark.asyncio
