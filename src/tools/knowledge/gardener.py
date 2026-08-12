@@ -25,6 +25,12 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # Standard markdown link: [text](target). Images ![...] are excluded by the
 # negative lookbehind.
 _MD_LINK_RE = re.compile(r"(?<!\!)\[[^\]]*\]\(([^)]+)\)")
+# Obsidian wikilink: [[target]], [[target|alias]], [[target#anchor]]. The
+# negative lookbehind drops ![[...]] embeds (images/transclusions), mirroring
+# the markdown rule above. This vault is an Obsidian vault — wikilinks are the
+# dominant link syntax, so a parser that only knew _MD_LINK_RE saw a small
+# fraction of the real graph.
+_WIKILINK_RE = re.compile(r"(?<!\!)\[\[([^\]]+)\]\]")
 # ATX heading anywhere in the body.
 _HEADING_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
 
@@ -120,11 +126,27 @@ def is_reserved(path: str) -> bool:
     return _basename(path) in _RESERVED
 
 
-def _internal_link_targets(body: str) -> List[str]:
-    """Resolvable-or-not internal note slugs referenced by body markdown links.
+def _wikilink_target(raw: str) -> Optional[str]:
+    """Slug for one ``[[...]]`` inner text, or None if it names nothing.
 
-    Only ``[...](something.md)`` links count; external URLs, mailto and bare
-    anchors are ignored. Returns the target slug (basename minus ``.md``).
+    Handles the three Obsidian decorations: ``|alias`` display text,
+    ``#anchor`` section refs, and folder-qualified paths. Unlike markdown
+    links, wikilinks conventionally omit the ``.md`` extension, so no suffix
+    is required — ``_basename`` still strips one when present.
+    """
+    target = raw.split("|", 1)[0].split("#", 1)[0].strip()
+    if not target or "://" in target:
+        return None
+    return _basename(target)
+
+
+def _internal_link_targets(body: str) -> List[str]:
+    """Resolvable-or-not internal note slugs referenced by body links.
+
+    Two syntaxes count: ``[...](something.md)`` markdown links and ``[[target]]``
+    Obsidian wikilinks (including ``[[target|alias]]`` and ``[[target#anchor]]``).
+    External URLs, mailto, bare anchors and ``![[embeds]]`` are ignored. Returns
+    target slugs (basename minus ``.md``), markdown links first.
     """
     targets: List[str] = []
     for raw in _MD_LINK_RE.findall(body):
@@ -135,6 +157,36 @@ def _internal_link_targets(body: str) -> List[str]:
         target = target.split("#", 1)[0]
         if target.endswith(".md"):
             targets.append(_basename(target))
+    for raw in _WIKILINK_RE.findall(body):
+        target = _wikilink_target(raw)
+        if target:
+            targets.append(target)
+    return targets
+
+
+def frontmatter_link_targets(fm: Optional[Dict[str, Any]]) -> List[str]:
+    """Note slugs declared in a note's ``related:`` frontmatter.
+
+    ``related:`` is a relationship declaration, so it is part of the link graph
+    even though it lives outside the body — and in an Obsidian vault it carries
+    a large share of the edges. Accepts a list or a bare scalar, and the same
+    ``[[...]]`` decorations as body wikilinks; bare slugs pass through.
+    """
+    if not fm:
+        return []
+    raw_related = fm.get("related")
+    if raw_related is None:
+        return []
+    items = raw_related if isinstance(raw_related, list) else [raw_related]
+    targets: List[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        inner = item.strip()
+        m = _WIKILINK_RE.search(inner)
+        target = _wikilink_target(m.group(1) if m else inner)
+        if target:
+            targets.append(target)
     return targets
 
 

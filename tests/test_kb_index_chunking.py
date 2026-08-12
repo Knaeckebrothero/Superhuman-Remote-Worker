@@ -345,6 +345,30 @@ class TestKnowledgeChunkFromRow:
 
 class TestUpsertKbNote:
     @pytest.mark.asyncio
+    async def test_populates_search_doc_for_the_sparse_arm(self):
+        # The note-level sparse index. upsert_note (the agent-write path)
+        # computes it at write time; without the same column here, every note
+        # that arrives through the reindexer — i.e. every note in a vault that
+        # was seeded by pushing files — is invisible to the note-level search
+        # the orchestrator's /knowledge/search endpoint runs.
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="seeded-note",
+            path="knowledge/features/seeded-note.md",
+            title="Seeded Note",
+            note_type="learning",
+            content="body text worth finding",
+            blob_sha="blob123",
+            embedding_version="qwen3-8b:4096:v1",
+        )
+        query, *params = mock_db.fetchval.call_args[0]
+        assert "search_doc" in query
+        assert "to_tsvector" in query
+        assert "search_doc = EXCLUDED.search_doc" in query
+
+    @pytest.mark.asyncio
     async def test_inserts_keyed_by_kb_path_returning_id(self):
         store, mock_db, _ = _make_store()
         row_id = uuid.uuid4()

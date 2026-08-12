@@ -37,7 +37,11 @@ from src.tools.knowledge.chunker import (
 # _internal_link_targets is the same body-markdown link parser the dead-link lint
 # rule uses (external URLs / anchors / images excluded, `.md` basename returned) —
 # reused here so the link table and the linter agree on what a "link" is.
-from src.tools.knowledge.gardener import _internal_link_targets, parse_note_md
+from src.tools.knowledge.gardener import (
+    _internal_link_targets,
+    frontmatter_link_targets,
+    parse_note_md,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -810,7 +814,10 @@ async def _reindex_snapshot(
                 source_note_row=note_row,
                 kb_id=kb_id,
                 source_id=fields["note_id"],
-                targets=_internal_link_targets(body),
+                # Body links (markdown + [[wikilinks]]) plus the `related:`
+                # frontmatter declaration — in an Obsidian vault the latter
+                # carries a large share of the edges.
+                targets=(_internal_link_targets(body) + frontmatter_link_targets(fm)),
             )
             # Whole-note centroid (PR4d): the mean of this note's chunk vectors,
             # written back onto the note row atomically with the stamp so

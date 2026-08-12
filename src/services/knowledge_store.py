@@ -899,7 +899,12 @@ class KnowledgeStore:
 
         The metadata half of a reindex write — the dense vectors live on
         ``knowledge_chunks`` (see :meth:`replace_note_chunks`), so this INSERT never
-        touches the ``embedding`` column. The reindexer passes ``blob_sha`` /
+        touches the ``embedding`` column. It does write ``search_doc``: that is the
+        *note-level* sparse index the orchestrator's ``/knowledge/search`` endpoint
+        queries, and it is separate from the chunk-level arm ``kb_search`` uses.
+        Without it here, a vault seeded by pushing files indexes fine and stays
+        invisible to note-level search — the agent finds it, a human browsing the
+        cockpit does not. The reindexer passes ``blob_sha`` /
         ``embedding_version`` as None and stamps them via
         :meth:`stamp_note_indexed` only after the chunk write succeeds; the row
         also carries ``project_id = kb_id`` so legacy project-scoped queries keep
@@ -934,12 +939,14 @@ class KnowledgeStore:
             """
             INSERT INTO knowledge_index
                 (kb_id, project_id, note_id, path, title, note_type, content,
+                 search_doc,
                  status, confidence, tags, keywords, retrieval_messages,
                  blob_sha, embedding_version, superseded_by, invalidated_at,
                  job_id, phase, content_hash, created_at, modified_at, indexed_at,
                  priority)
             VALUES
                 ($1, $1, $2, $3, $4, $5, $6,
+                 to_tsvector('english', $6),
                  $7, $8, $9, $10, $11,
                  $12, $13, $14, $15,
                  $16, $17, $18, $19, $20, NOW(),
@@ -951,6 +958,7 @@ class KnowledgeStore:
                 retrieval_messages = $11, blob_sha = $12, embedding_version = $13,
                 superseded_by = $14, invalidated_at = $15, job_id = $16,
                 phase = $17, content_hash = $18, modified_at = $20, indexed_at = NOW(),
+                search_doc = EXCLUDED.search_doc,
                 priority = COALESCE($21, knowledge_index.priority)
             RETURNING id
             """,
