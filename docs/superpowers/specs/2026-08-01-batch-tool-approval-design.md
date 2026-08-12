@@ -1,9 +1,9 @@
 # Batch tool-call approval — design
 
 **Date:** 2026-08-01
-**Status:** Design approved, not yet implemented.
+**Status:** **SHIPPED and live-gated (2026-08-09).** Implemented via subagent-driven development (plan `docs/superpowers/plans/2026-08-01-batch-tool-approval.md`). A whole-branch review found 4 load-bearing defects, all since fixed (`d6518b32` cockpit, `69e22f0c` backend) and verified — backend in-pod on k3d against real Postgres (7/7), UI through a real browser on k3d. Deferred findings: `docs/issues/batch_tool_approval_residuals.md`.
 **Component:** agent tool loop (`src/persistent_graph.py`) · gate transport (`src/api/persistent_app.py`) · cockpit approval card (`cockpit/src/app/core/services/persistent-chat.service.ts`, `views/persistent-chat/persistent-chat.component.ts`)
-**Follows:** `docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md` (scope A — shipped, live gate passed 2026-07-29). That fix made parallel-tool approval *correct*; this makes it *usable*. Listed there as the deferred "batch-approval UX" follow-up.
+**Follows:** `docs/done/supervised_parallel_gates_timeout_fabricates_denial.md` (scope A — shipped, live gate passed 2026-07-29). That fix made parallel-tool approval *correct*; this makes it *usable*. Listed there as the deferred "batch-approval UX" follow-up.
 
 ---
 

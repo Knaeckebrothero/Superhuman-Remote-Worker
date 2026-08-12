@@ -70,6 +70,7 @@ def resolve_config(
     expert_type: str = "session",
     capture: Optional[dict] = None,
     skills: Optional[dict] = None,
+    grant_strip: Optional[Callable[[dict], dict]] = None,
 ) -> dict:
     """Resolve the full agent config to a ``serialize_resolved_config``-shaped blob.
 
@@ -89,6 +90,12 @@ def resolve_config(
     strips ``llm.api_key``); the caller injects creds into the delivery copy and
     strips the rest before persisting. ``expert_type`` documents the call-site
     intent (the base is actually selected by ``base_config_name``).
+
+    ``grant_strip``, when given, runs on the fully-merged ``data`` before BOTH
+    ``capture`` and the returned blob are built from it — so the PDP's capture
+    and the blob the agent hydrates always agree. Applying it only to
+    ``capture`` would silence the dispatch check while still delivering the
+    stripped capability.
     """
     base_path, deployment_dir = resolve_config_path(base_config_name)
 
@@ -176,6 +183,12 @@ def resolve_config(
     # {only: []} as true (violation fabricated for an empty group). Both are
     # refused by the normaliser, and the PDP only ever sees lists.
     data = normalize_tool_policy(data)
+
+    # Applied HERE so the capture the PDP evaluates and the blob the agent
+    # hydrates are the same stripped config. Stripping only the capture would
+    # silence the check while still delivering the capability.
+    if grant_strip is not None:
+        data = grant_strip(data)
 
     if capture is not None:
         # Full merged config in fragment shape — the policy view for the dispatch

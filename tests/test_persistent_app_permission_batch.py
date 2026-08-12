@@ -5,6 +5,7 @@ docs/superpowers/specs/2026-08-01-batch-tool-approval-design.md
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -625,3 +626,459 @@ class TestClaimSelectSoftFailKeepsTheAnnouncedRow:
             await _end_the_turn()  # must not raise
 
         assert set(ledger) == {"tc_0", "tc_1", "tc_2", "tc_3"}
+
+
+# =============================================================================
+# Defect A — a sweep must not expire the row a gate is mid-claim on
+#
+# The claim block is `async with pool.acquire() as conn: await conn.fetchrow()`.
+# The context-manager EXIT is a yield point, and `_active_permission_request_id`
+# (the sweep's "don't touch this row" guard) is not published until ~60 lines
+# later, just before the wait. A fire-and-forget `mode.set` sweep that lands in
+# that window CAS-expires the very row this gate is about to wait on; the wait
+# then re-SELECTs 'expired' -> NO_ANSWER and the turn parks *immediately after*
+# the user switched to autonomous. Publishing the id later cannot fix it: the
+# row id is not known until after the awaited SELECT. The reservation must be
+# keyed on tool_call_id and taken BEFORE the SELECT.
+# =============================================================================
+
+
+def _session_with_yielding_pool(store: _FakeRowStore, on_acquire_exit: list):
+    """Like ``_session_with_store`` but the acquire() context-manager EXIT is a
+    real yield point: it awaits (and consumes) the first hook parked in
+    ``on_acquire_exit``. That is precisely where Defect A's window opens.
+
+    The hook is popped *before* it is awaited so a sweep running inside it —
+    which acquires the same pool — cannot re-enter itself.
+    """
+
+    def _acquire():
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=store)
+
+        async def _aexit(*_exc):
+            if on_acquire_exit:
+                hook = on_acquire_exit.pop(0)
+                await hook()
+            return False
+
+        ctx.__aexit__ = _aexit
+        return ctx
+
+    session = _mock_session()
+    session.workspace_sync = None
+    session.workspace_manager = None
+    session.messages = []
+    session.postgres_conn = MagicMock()
+    session.postgres_conn.acquire = _acquire
+    return session
+
+
+class TestSweepCannotExpireAGateMidClaim:
+    @pytest.mark.asyncio
+    async def test_mode_set_sweep_landing_inside_the_claim_window(self):
+        """Reproduces the window deliberately: the sweep runs at the claim
+        SELECT's context-manager exit, before the gate could possibly know its
+        row id. The claimed row must survive and the gate must still resolve
+        APPROVED — while the rows nothing is holding are still swept."""
+        store = _FakeRowStore()
+        on_exit: list = []
+        session = _session_with_yielding_pool(store, on_exit)
+        swept = {"ran": False}
+
+        async def _sweep_lands_now():
+            # Exactly what the WS handler fires from mode.set: a detached
+            # task, scoped to the new (looser) mode.
+            swept["ran"] = True
+            await asyncio.create_task(
+                pa._retire_announced_permission_rows(
+                    "mode.set autonomous", "autonomous"
+                )
+            )
+
+        async def _wait(request_id, *a, **kw):
+            # Mirrors the real waiter: it re-SELECTs the row after registering
+            # its listener, so a sweep that already expired the row is seen.
+            status = store.status.get(request_id)
+            if status != "pending":
+                return status or "expired"
+            store.status[request_id] = "approved"
+            return "approved"
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", {}),
+            patch.object(pa, "_gates_in_flight", set()),
+            patch.object(pa, "_active_permission_request_id", None),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", MagicMock()),
+            patch.object(pa, "_wait_for_permission_resolution", _wait),
+        ):
+            await pa._loop_announce_permission_batch(FOUR_CALLS)
+            assert list(store.status.values()) == ["pending"] * 4
+            # Arm the hook only now — the announce's own acquires must not
+            # trigger it.
+            on_exit.append(_sweep_lands_now)
+            outcome = await pa._loop_permission_check("web_search", {}, "tc_0")
+
+        assert swept["ran"], "the race window was never reproduced"
+        assert store.status["rid-tc_0"] == "approved", (
+            "the sweep expired the row this gate was about to wait on — the "
+            "turn parks right after the user unblocked it"
+        )
+        assert outcome is PermissionOutcome.APPROVED
+        # The sweep really did its job on everything nobody was holding.
+        assert store.status["rid-tc_1"] == "expired"
+        assert store.status["rid-tc_2"] == "expired"
+        assert store.status["rid-tc_3"] == "expired"
+
+
+class TestGateReservationIsAlwaysReleased:
+    """A tool_call_id left in ``_gates_in_flight`` is a row no sweep will ever
+    retire — the same stranded phantom card, arrived at from the other side.
+    Every exit of the gating section must release it, including the two early
+    returns that do not fall through to the end of the function."""
+
+    @pytest.mark.asyncio
+    async def test_released_on_terminal_prior_decision_return(self):
+        """Phase 5 wake path: the claim SELECT finds an approved row and
+        returns immediately, long before the wait."""
+        session, _ = _conn_with({"id": "rid-prior", "status": "approved"})
+        gates: set = set()
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_gates_in_flight", gates),
+            patch.object(pa, "_announced_permission_rows", {}),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", MagicMock()),
+        ):
+            outcome = await pa._loop_permission_check("web_search", {}, "tc_prior")
+
+        assert outcome is PermissionOutcome.APPROVED
+        assert gates == set()
+
+    @pytest.mark.asyncio
+    async def test_released_on_insert_failure_return(self):
+        """DB refused the row: a real DECLINE, returned before the wait."""
+        session, _ = _conn_with(None)
+        gates: set = set()
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_gates_in_flight", gates),
+            patch.object(pa, "_announced_permission_rows", {}),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", MagicMock()),
+            patch.object(
+                pa, "_insert_permission_request", AsyncMock(return_value=None)
+            ),
+        ):
+            outcome = await pa._loop_permission_check("web_search", {}, "tc_noinsert")
+
+        assert outcome is PermissionOutcome.DECLINED
+        assert gates == set()
+
+    @pytest.mark.asyncio
+    async def test_released_on_the_normal_answered_path(self):
+        session, _ = _conn_with({"id": "rid-announced", "status": "pending"})
+        gates: set = set()
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_gates_in_flight", gates),
+            patch.object(pa, "_announced_permission_rows", {}),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", MagicMock()),
+            patch.object(
+                pa,
+                "_wait_for_permission_resolution",
+                AsyncMock(return_value="approved"),
+            ),
+        ):
+            await pa._loop_permission_check("web_search", {}, "tc_ok")
+
+        assert gates == set()
+
+    @pytest.mark.asyncio
+    async def test_released_when_the_waiting_gate_is_cancelled(self):
+        """The loop task is cancelled mid-gate (✕-detach, drain, shutdown).
+        The reservation must not survive the cancellation."""
+        session, _ = _conn_with({"id": "rid-announced", "status": "pending"})
+        gates: set = set()
+        entered = asyncio.Event()
+
+        async def _wait(request_id, *a, **kw):
+            entered.set()
+            await asyncio.sleep(60)
+            return "approved"
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_gates_in_flight", gates),
+            patch.object(pa, "_announced_permission_rows", {}),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", MagicMock()),
+            patch.object(pa, "_wait_for_permission_resolution", _wait),
+        ):
+            task = asyncio.create_task(
+                pa._loop_permission_check("web_search", {}, "tc_cancelled")
+            )
+            await entered.wait()
+            assert gates == {"tc_cancelled"}
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert gates == set()
+
+
+# =============================================================================
+# Defect B — a sweep that cannot reach the DB must not drop the ledger
+#
+# Entries are popped off the ledger up front ("take ownership"), but the
+# `_session is None or postgres_conn is None` guard returns *after* the pop.
+# Those rows are then gone from memory and were never expired in the DB —
+# nothing will ever retire them, and they re-render as phantom approval cards
+# on every reattach. The `except` path already restores unreached entries;
+# the early return must do the same.
+# =============================================================================
+
+
+class TestSweepWithoutADbKeepsTheLedger:
+    @pytest.mark.asyncio
+    async def test_no_pool_leaves_every_entry_for_the_next_sweep(self):
+        ledger = {
+            "tc_0": ("rid-tc_0", "web_search", "tid"),
+            "tc_1": ("rid-tc_1", "web_search", "tid"),
+        }
+        session = _mock_session()
+        session.postgres_conn = None
+        bcast = MagicMock()
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", ledger),
+            patch.object(pa, "_gates_in_flight", set()),
+            patch.object(pa, "_broadcast", bcast),
+        ):
+            await pa._retire_announced_permission_rows("pool gone")
+
+        assert set(ledger) == {"tc_0", "tc_1"}, (
+            "rows dropped from the ledger without ever being expired in the DB "
+            "can never be retired by anyone"
+        )
+        bcast.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_session_leaves_every_entry_for_the_next_sweep(self):
+        ledger = {"tc_0": ("rid-tc_0", "web_search", "tid")}
+
+        with (
+            patch.object(pa, "_session", None),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", ledger),
+            patch.object(pa, "_gates_in_flight", set()),
+            patch.object(pa, "_broadcast", MagicMock()),
+        ):
+            await pa._retire_announced_permission_rows("session gone")
+
+        assert set(ledger) == {"tc_0"}
+
+
+# =============================================================================
+# Defect C — the ledger must never outlive, or reach across, a session
+#
+# C1: _terminate_session_inner clears every sibling global but not these, and
+#     it CANCELS the loop task — the graph's `except CancelledError: return`
+#     skips on_turn_complete, where the turn-end sweep lives. So a session
+#     terminated mid-batch strands its rows; the NEXT session's first announce
+#     sweeps them and broadcasts permission.resolved carrying the PREVIOUS
+#     thread's tool_call_ids to the NEW thread's clients.
+# C2: defence in depth — entries carry their thread id, and a sweep skips any
+#     entry that is not the current thread's.
+# =============================================================================
+
+
+async def _terminate(reason: str = "rest_detach"):
+    """Drive the real terminate path with everything unrelated stubbed."""
+    with (
+        patch.object(pa, "_update_thread_status", AsyncMock()),
+        patch.object(pa, "_stop_watchdogs", MagicMock()),
+        patch.object(pa, "_clear_all_canvas_awareness", MagicMock()),
+        patch.object(pa, "_loop_task", None),
+        patch.object(pa, "_event_writer", None),
+        patch.object(pa, "_max_sessions_per_process", 0),
+    ):
+        await pa._terminate_session_inner(reason)
+
+
+class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
+    @pytest.mark.asyncio
+    async def test_terminate_retires_the_rows_and_clears_the_ledger(self):
+        store = _FakeRowStore()
+        session = _session_with_store(store)
+        session.cleanup = AsyncMock()
+        session.workspace_manager = None
+        ledger: dict = {}
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid-old"),
+            patch.object(pa, "_announced_permission_rows", ledger),
+            patch.object(pa, "_gates_in_flight", {"tc_0"}),
+            patch.object(pa, "_active_permission_request_id", "rid-tc_0"),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", MagicMock()),
+        ):
+            await pa._loop_announce_permission_batch(FOUR_CALLS)
+            assert set(ledger) == {"tc_0", "tc_1", "tc_2", "tc_3"}
+
+            await _terminate()
+
+            assert ledger == {}, "the next session inherits this thread's rows"
+            assert pa._gates_in_flight == set()
+            assert pa._active_permission_request_id is None
+
+        assert set(store.status.values()) == {"expired"}, (
+            "rows left pending on an ended thread re-render as phantom cards"
+        )
+
+    @pytest.mark.asyncio
+    async def test_next_session_announce_does_not_resolve_the_old_threads_calls(
+        self,
+    ):
+        store = _FakeRowStore()
+        old_session = _session_with_store(store)
+        old_session.cleanup = AsyncMock()
+        old_session.workspace_manager = None
+        ledger: dict = {}
+        bcast = MagicMock()
+
+        with (
+            patch.object(pa, "_session", old_session),
+            patch.object(pa, "_thread_id", "tid-old"),
+            patch.object(pa, "_announced_permission_rows", ledger),
+            patch.object(pa, "_gates_in_flight", set()),
+            patch.object(pa, "_active_permission_request_id", None),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", bcast),
+        ):
+            await pa._loop_announce_permission_batch(FOUR_CALLS)
+            await _terminate()
+
+            # A brand-new session on a brand-new thread, same process — and
+            # the SAME database: a pool agent serves many threads off one
+            # Postgres, so the previous thread's rows are still reachable.
+            bcast.reset_mock()
+            new_session = _session_with_store(store)
+            with (
+                patch.object(pa, "_session", new_session),
+                patch.object(pa, "_thread_id", "tid-new"),
+            ):
+                await pa._loop_announce_permission_batch(
+                    [{"name": "web_search", "args": {}, "id": "tc_new"}]
+                )
+
+        leaked = [
+            c.args[1]["id"]
+            for c in bcast.call_args_list
+            if c.args[0] == "permission.resolved"
+        ]
+        assert leaked == [], (
+            f"the new thread's clients were told about {leaked} — tool calls "
+            "from a thread they never saw"
+        )
+
+
+class TestSweepIsThreadScoped:
+    @pytest.mark.asyncio
+    async def test_entries_from_another_thread_are_never_swept(self):
+        """Defence in depth: even if a clear is missed, a sweep may only touch
+        rows belonging to the thread it is running on."""
+        store = _FakeRowStore()
+        store.status["rid-old"] = "pending"
+        store.status["rid-mine"] = "pending"
+        session = _session_with_store(store)
+        ledger = {
+            "tc_old": ("rid-old", "web_search", "tid-old"),
+            "tc_mine": ("rid-mine", "web_search", "tid-mine"),
+        }
+        bcast = MagicMock()
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid-mine"),
+            patch.object(pa, "_announced_permission_rows", ledger),
+            patch.object(pa, "_gates_in_flight", set()),
+            patch.object(pa, "_active_permission_request_id", None),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", bcast),
+        ):
+            await pa._retire_announced_permission_rows("turn 1 ended")
+
+        assert store.status["rid-old"] == "pending"
+        assert store.status["rid-mine"] == "expired"
+        assert set(ledger) == {"tc_old"}, "the foreign entry must stay untouched"
+        resolved = [
+            c.args[1]["id"]
+            for c in bcast.call_args_list
+            if c.args[0] == "permission.resolved"
+        ]
+        assert resolved == ["tc_mine"]
+
+
+class TestGatesInFlightExclusion:
+    @pytest.mark.asyncio
+    async def test_a_reserved_tool_call_is_skipped_by_the_sweep(self):
+        store = _FakeRowStore()
+        store.status["rid-tc_0"] = "pending"
+        store.status["rid-tc_1"] = "pending"
+        session = _session_with_store(store)
+        ledger = {
+            "tc_0": ("rid-tc_0", "web_search", "tid"),
+            "tc_1": ("rid-tc_1", "web_search", "tid"),
+        }
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", ledger),
+            patch.object(pa, "_gates_in_flight", {"tc_0"}),
+            patch.object(pa, "_active_permission_request_id", None),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", MagicMock()),
+        ):
+            await pa._retire_announced_permission_rows("turn ended")
+
+        assert store.status["rid-tc_0"] == "pending"
+        assert store.status["rid-tc_1"] == "expired"
+        assert set(ledger) == {"tc_0"}
+
+    @pytest.mark.asyncio
+    async def test_active_request_id_exclusion_still_holds(self):
+        """Belt-and-braces: the older guard is kept, not replaced."""
+        store = _FakeRowStore()
+        store.status["rid-tc_0"] = "pending"
+        session = _session_with_store(store)
+        ledger = {"tc_0": ("rid-tc_0", "web_search", "tid")}
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", ledger),
+            patch.object(pa, "_gates_in_flight", set()),
+            patch.object(pa, "_active_permission_request_id", "rid-tc_0"),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", MagicMock()),
+        ):
+            await pa._retire_announced_permission_rows("turn ended")
+
+        assert store.status["rid-tc_0"] == "pending"
+        assert set(ledger) == {"tc_0"}

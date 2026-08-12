@@ -10,7 +10,7 @@ Pattern audit protocol:
    - `read_file` on 2-3 representative components to understand the HTML/CSS conventions
    - `read_file` on the global styles (styles.scss) to extract design tokens
    - Check for shared/reusable components that the new feature should leverage
-3. If the application is running, use `browse_website` to see the current UI in action.
+3. If the application is running, use `browser_navigate` then `browser_screenshot` to see the current UI in action.
    The rendered app is ground truth — code alone can miss dynamic behavior, animations, and real layout.
 4. Search the knowledge base (kb_search) for prior design decisions, failed approaches, and established patterns.
 5. Write findings to `reference/pattern_audit.md`: existing components, design tokens in use, layout patterns, interaction conventions.

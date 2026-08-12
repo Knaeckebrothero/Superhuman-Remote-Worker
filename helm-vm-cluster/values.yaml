@@ -209,6 +209,17 @@ infrastructureMetering:
   volumeIdentitySecretName: ""
   volumeIdentitySecretKey: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY
   volumeIdentityKeyVersion: ""
+  # -- Optional ESO projections from the shared SRW Vault bundle. The source
+  # properties deliberately use concise Vault names, while the generated
+  # Kubernetes Secrets retain the canonical runtime keys below. Every target
+  # remains a distinct Secret even though the Vault record is shared.
+  externalSecrets:
+    enabled: false
+    vaultPath: ""
+    vmiIngestionProperty: METERING_VMI_INGESTION_KEY
+    vmStorageIngestionProperty: METERING_VM_STORAGE_INGESTION_KEY
+    volumeIdentityProperty: METERING_VOLUME_IDENTITY_KEY
+    vmLifecycleAuthProperty: METERING_VM_LIFECYCLE_HMAC_SECRET
   # -- Bump when rotating data inside either pre-existing ingestion Secret so
   # Helm rolls the env-backed collector Pods even though Secret names stay put.
   credentialRevision: ""

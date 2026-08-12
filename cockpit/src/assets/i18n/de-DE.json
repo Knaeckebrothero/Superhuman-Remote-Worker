@@ -9,7 +9,8 @@
       "running": "läuft",
       "ok": "abgeschlossen",
       "error": "Fehler",
-      "denied": "abgelehnt"
+      "denied": "abgelehnt",
+      "expired": "nicht ausgeführt"
     },
     "diff": {
       "replace": "Diff",
@@ -83,7 +84,18 @@
       "approve": "Freigeben",
       "openDiff": "Änderungen öffnen",
       "cancel": "Job abbrechen",
+      "resumeWithFeedback": "Mit Feedback fortsetzen",
+      "feedbackPlaceholder": "Was soll anders laufen?",
+      "feedbackSubmit": "Senden & fortsetzen",
+      "feedbackDismiss": "Verwerfen",
       "diffTitle": "Job {{id}} — Änderungen"
+    },
+    "jobBatch": {
+      "title": "{{count}} Jobs gestartet",
+      "finished": "{{done}}/{{total}} beendet",
+      "failed": "{{count}} fehlgeschlagen",
+      "review": "{{count}} zur Prüfung",
+      "notCreated": "Job wurde nicht erstellt"
     },
     "view": {
       "rendered": "Gerendert",
@@ -545,6 +557,29 @@
       "createSession": "Sitzung erstellen",
       "protectedCloud": "Geschützte Cloud — Agenten-Änderungen werden zur Überprüfung bereitgestellt",
       "protectedCloudHint": "Der Agent erhält schreibgeschützten Cloud-Zugriff; seine Änderungen warten im Prüfbereich auf Ihre Freigabe."
+    },
+    "configDrift": {
+      "title": "Ein Teil der Einrichtung dieser Sitzung ist nicht mehr vorhanden",
+      "intro": "Teile der Konfiguration dieser Sitzung sind nicht mehr verfügbar:",
+      "attentionNeeded": "Die Einrichtung dieser Sitzung erfordert Aufmerksamkeit. Sie wird jetzt geöffnet …",
+      "resumeAnyway": "Trotzdem fortsetzen",
+      "startNew": "Neue Sitzung starten",
+      "connector": {
+        "deleted": "Gelöschter Konnektor — {{label}}",
+        "revoked": "Widerrufener Konnektor — {{label}}",
+        "out_of_scope": "Widerrufener Konnektor — {{label}}"
+      },
+      "project": {
+        "deleted": "Gelöschtes Projekt — {{label}}",
+        "revoked": "Widerrufenes Projekt — {{label}}",
+        "out_of_scope": "Widerrufenes Projekt — {{label}}"
+      },
+      "grant": {
+        "deleted": "Fehlende Freigabe — {{label}}",
+        "revoked": "Fehlende Freigabe — {{label}}",
+        "out_of_scope": "Fehlende Freigabe — {{label}}"
+      },
+      "countSuffix": " (×{{count}})"
     }
   },
   "jobs": {
@@ -593,6 +628,7 @@
       "paused": "Pausiert",
       "failed": "Fehlgeschlagen",
       "cancelled": "Abgebrochen",
+      "waiting_for_reply": "Wartet auf Antwort",
       "waiting_approval": "Wartet · Freigabe"
     },
     "action": {
@@ -1378,12 +1414,24 @@
     "rewind": {
       "button": "Bis hierher zurückspulen",
       "title": "Sitzung zurückspulen",
-      "body": "Zur Zeit vor dieser Nachricht zurückkehren? Nachrichten nach diesem Punkt werden aus der Unterhaltung ausgeblendet (bleiben im Audit-Protokoll erhalten). Dateien kehren zu ihrem damaligen Stand zurück.",
       "caveat": "Befehle mit externen Auswirkungen (Netzwerkaufrufe, Deployments) lassen sich nicht rückgängig machen.",
       "both": "Unterhaltung und Dateien wiederherstellen",
+      "bothDesc": "Spätere Nachrichten ausblenden und Dateien auf diesen Stand zurücksetzen",
       "conversation": "Nur Unterhaltung wiederherstellen",
+      "conversationDesc": "Dateien behalten ihren aktuellen Stand",
       "code": "Nur Dateien wiederherstellen",
-      "summarize": "Bis hierher zusammenfassen"
+      "codeDesc": "Die Unterhaltung bleibt unverändert",
+      "summarize": "Bis hierher zusammenfassen",
+      "summarizeDesc": "Alles bis zu diesem Punkt zu einer Zusammenfassung verdichten",
+      "pickerTitle": "Zurückspulen zu …",
+      "pickerHint": "Nachricht auswählen, zu der zurückgespult werden soll:",
+      "pickerEmpty": "Noch keine früheren Nachrichten zum Zurückspulen.",
+      "pickerFilter": "Tippen, um Nachrichten zu filtern …",
+      "pickerNoMatches": "Keine Nachrichten passen.",
+      "yesterday": "Gestern",
+      "hidesOne": "blendet 1 spätere Nachricht aus",
+      "hidesMany": "blendet {{count}} spätere Nachrichten aus",
+      "refillHint": "Die Nachricht kehrt zum Bearbeiten in das Eingabefeld zurück."
     },
     "diff": {
       "replace": "Diff",
@@ -1395,20 +1443,19 @@
     "settingsPane": {
       "title": "Sitzungseinstellungen",
       "close": "Einstellungen schließen",
-      "workspace": "Arbeitsbereich",
-      "tier": {
-        "virtual": "Lite (kein Workspace-Pod)",
-        "sandbox": "Sandbox-Container",
-        "vm": "Virtuelle Maschine",
-        "none": "Keiner",
-        "remote": "Remote-Container",
-        "docker": "Container"
-      },
-      "upgrading": "{{tier}} wird bereitgestellt…",
-      "upgradeSandbox": "Auf Sandbox upgraden",
-      "upgradeVm": "Auf VM upgraden",
-      "workspaceHint": "Upgrades übernehmen Ihre Dateien und können innerhalb der Sitzung nicht rückgängig gemacht werden.",
-      "fixedNote": "Experte und Projekte werden beim Erstellen der Sitzung festgelegt und in der Sitzungsliste angezeigt."
+      "fixedNote": "Experte und Projekte werden beim Erstellen der Sitzung festgelegt und in der Sitzungsliste angezeigt.",
+      "upgradeConfirm": {
+        "sandbox": {
+          "title": "Auf Container upgraden?",
+          "body": "Startet einen Workspace-Container und kopiert deine Dateien hinein. Ergänzt Shell-, Git- und Browser-Tools. Dauert etwa eine Minute."
+        },
+        "vm": {
+          "title": "Auf VM upgraden?",
+          "body": "Stellt eine dedizierte virtuelle Maschine mit root und sudo bereit und kopiert deine Dateien darauf. Ein Kaltstart dauert 6–25 Minuten."
+        },
+        "irreversible": "Das lässt sich nicht rückgängig machen — die Sitzung kann nicht auf eine niedrigere Stufe zurück.",
+        "confirm": "Upgraden"
+      }
     },
     "settings": {
       "mode": "Modus",
@@ -1515,6 +1562,7 @@
     "permission": {
       "title": "Berechtigung erforderlich",
       "approve": "Genehmigen",
+      "singleTitle": "Der Agent möchte ein Werkzeug ausführen",
       "batchTitle": "Der Agent möchte {{count}} Werkzeugaufruf(e) ausführen",
       "approveAll": "Alle genehmigen",
       "autoAccept": "Auto-akzeptieren",
@@ -1557,6 +1605,20 @@
       "defaultMobile": "Nachricht eingeben...",
       "resuming": "Sitzung wird fortgesetzt…",
       "endedSendResumes": "Nachricht schreiben — Senden setzt die Sitzung fort"
+    },
+    "upload": {
+      "stage": "{{done}} von {{total}} werden hochgeladen…",
+      "stagePercent": "{{done}} von {{total}} werden hochgeladen — {{percent}} %",
+      "progressLabel": "Sendefortschritt",
+      "sending": "Wird gesendet…",
+      "waitingOn": "Warte auf {{name}}…",
+      "failed": "{{name}} konnte nicht hochgeladen werden",
+      "removeAndSend": "Datei entfernen und senden",
+      "slashCommandWithAttachments": "Entfernen Sie die angehängten Dateien, bevor Sie einen Befehl ausführen.",
+      "duplicateFile": "{{name}} ist bereits angehängt",
+      "tooLarge": "{{name}} überschreitet das 100-MB-Limit",
+      "tooManyFiles": "Sie können höchstens 20 Dateien gleichzeitig anhängen",
+      "noWorkspace": "Diese Sitzung hat keinen Workspace, daher können keine Dateien angehängt werden."
     },
     "composer": {
       "attach": "Anhängen",
@@ -1629,6 +1691,7 @@
       "compact": "Unterhaltungsverlauf komprimieren, um Kontext freizugeben",
       "done": "Sitzung beenden — Erinnerungen extrahieren und archivieren",
       "undo": "Dateiänderungen des letzten Zugs rückgängig machen",
+      "rewind": "Zu einer früheren Nachricht zurückspulen",
       "auto": "Zu Auto-Akzeptieren wechseln (alles außer Shell genehmigen)",
       "supervised": "Zu Beaufsichtigt wechseln (alle Schreibvorgänge genehmigen)",
       "autonomous": "Zu Autonom wechseln (nichts genehmigen)",
@@ -2378,7 +2441,6 @@
       "compactOnArchive": "Beim Archivieren komprimieren",
       "keepRecentToolResults": "Letzte Tool-Ergebnisse behalten",
       "keepRecentMessages": "Letzte Nachrichten behalten",
-      "backend": "Backend",
       "vmCpuCores": "VM-CPU-Kerne",
       "vmMemory": "VM-Arbeitsspeicher",
       "maxReadWords": "Max. Lese-Wörter",
@@ -2610,8 +2672,17 @@
       "critic": "Critic (Verifikation)",
       "projectMemory": "Projektgedächtnis",
       "imageQuality": "Bildqualität",
+      "workspaceBackend": "Arbeitsbereich",
       "autonomyDefaultHint": "Legt fest, wann der Agent für eine manuelle Prüfung pausiert",
-      "narration": "Erzählmodus"
+      "narration": "Erzählmodus",
+      "tierCurrent": "aktuell",
+      "tierHint": "Beim Upgrade werden deine Dateien übernommen; innerhalb der Sitzung ist es nicht umkehrbar.",
+      "tierUpgrading": "{{tier}} wird bereitgestellt…",
+      "tierUnreachable": {
+        "downgrade": "Herunterstufen nicht möglich",
+        "needsApproval": "Freigabe erforderlich",
+        "unsupported": "von dieser Stufe aus nicht verfügbar"
+      }
     },
     "autonomy": {
       "full": {

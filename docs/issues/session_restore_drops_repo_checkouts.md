@@ -1,5 +1,46 @@
 # Session workspace restore drops project-repo checkouts and the shell grant — agent left flailing on a half-restored workspace
 
+> **CORRECTION 2026-08-08 (verified by a 5-agent codebase sweep — read before the body below).**
+> Two premises this doc was written on have since changed, and one section is now partly superseded:
+>
+> - **Sessions are no longer emptyDir on dev.** PVC-backed workspaces (Branch (a),
+>   `workspace.pvcEnabled`) shipped for jobs 2026-06-30 and were **extended to sessions
+>   2026-08-04**; `deployment/values-experimental.yaml` sets `pvcEnabled: true`. The
+>   clone-on-attach wipe that made sessions unsafe was fixed 2026-08-06
+>   (`docs/done/session_workspace_wiped_by_agent_clone_on_attach.md`). So a session's
+>   workspace pod now reattaches `pvc-ws-thread-<id>` on recycle, and
+>   `restore_thread_workspace` already skips the S3 extract on a genuine reattach.
+> - **Strand 1 is therefore MITIGATED, not cured.** The reattached PVC keeps the
+>   `repos/<slug>` checkout across a pod crash/reschedule. But the root cause is
+>   unchanged: the checkout is committed to `thread-<id>.git` as a contentless **gitlink**,
+>   so on any Gitea-fallback path (permanent node loss, the `fresh=True` PVC discard, or
+>   `pvcEnabled` off) it still restores EMPTY. **The real fix is tiny and has a precedent:**
+>   the *job* workspace path appends `repos/` to `.gitignore` and commits it
+>   (`src/core/workspace.py:800-813`, commit "Add repos/ to .gitignore") so nested clones
+>   never become gitlinks; the *session* tool `checkout_project_repository`
+>   (`src/tools/orchestrator/repositories.py`) never does this — porting those lines cures
+>   strand 1 for all recovery paths, PVC or not. Prefer this over the "restore-time re-clone"
+>   in Proposed fix 1.
+> - **The resume-OOM cited in § Restore layering is already fixed in code**
+>   (`stream_extract_snapshot` hands the tar to `ssh` stdin as an fd, no RAM buffer —
+>   `orchestrator/services/ssh_helpers.py`), and that section's lifecycle citations
+>   (`check_idle_threads`, idle sweeper gating on `status='ended'`) are now **dead code** —
+>   idle-suspend moved to the 60s `lifecycle_reconciler_loop`. The layering *reasoning*
+>   still holds, but treat those specific anchors as historical; the PVC hot-tier + the
+>   `_is_volume_reclaimable` retain-on-idle invariant it argues toward are **already
+>   implemented** (see `docs/features/workspace_pvc_branch_a_implementation.md`).
+> - **Strand 2 (shell-grant loss on re-provision) was NOT re-investigated in this sweep** —
+>   treat it as still open pending a fresh check.
+>
+> **UPDATE 2026-08-08 (durability track).** Strand 1's recommended cure — porting the job
+> path's `.gitignore repos/` to the session `checkout_project_repository` — **shipped** as
+> F1 (`_ensure_checkout_path_ignored` in `src/tools/orchestrator/repositories.py`), so new
+> sessions no longer commit the checkout as a contentless gitlink and it survives every
+> recovery path (PVC or Gitea-fallback). Preventive only: threads whose repo already holds a
+> committed gitlink still need a one-time cleanup migration. **This issue stays OPEN** for
+> **strand 2** (shell-grant persistence, un-investigated) and **strand 3** (model degeneration
+> guards, not built) — do not move to `done/` until those are closed.
+
 **Filed:** 2026-07-24, from a live investigation of persistent thread `b1758f38` ("Hotel
 Rheinland ERP Job Status", project `68137e29` Better Resavio), turn 8 on 2026-07-23
 22:36–22:54+ UTC. Full tool-call evidence is in the thread transcript

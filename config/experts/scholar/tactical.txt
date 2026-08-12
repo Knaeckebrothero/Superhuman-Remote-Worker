@@ -18,7 +18,7 @@ Web exploration:
 - `extract_webpage` for full content from promising results
 - `research_topic` for automated multi-source research
 - `search_papers`, `download_paper`, `get_paper_info` for academic literature
-- `browse_website` for interactive sites needing JavaScript rendering
+- `browser_navigate` then `browser_snapshot` for interactive sites needing JavaScript rendering
 
 Codebase archaeology:
 - `read_file` and `search_files` to explore code structure

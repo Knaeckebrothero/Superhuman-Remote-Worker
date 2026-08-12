@@ -57,6 +57,35 @@ class MutationOutcomeUnknown(RuntimeError):
         self.path = path
 
 
+class SessionConfigDriftError(Exception):
+    """Resume refused: parts of the session's stored config are unavailable.
+
+    The message carries each item's ID as well as its label, because callers
+    that render only ``str(error)`` (the MCP tool path) would otherwise have
+    no way to build the ``acknowledge`` list the message tells them to send.
+    """
+
+    def __init__(self, drift: list[dict[str, Any]]):
+        self.drift = drift
+        self.ids = [
+            str(item.get("id"))
+            for item in drift
+            if isinstance(item, dict) and item.get("id")
+        ]
+        described = (
+            ", ".join(
+                f"{item.get('label') or item.get('id') or '?'} ({item.get('id')})"
+                for item in drift
+                if isinstance(item, dict)
+            )
+            or "unknown items"
+        )
+        super().__init__(
+            f"Session config is no longer fully available: {described}. "
+            f"Resume again with acknowledge={self.ids!r} to continue without them."
+        )
+
+
 class _RequestScopeAuth(httpx.Auth):
     """Copy the current task's MCP identity onto one outgoing request.
 
@@ -2775,15 +2804,33 @@ class AsyncCockpitClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def resume_persistent_thread(self, thread_id: str) -> dict[str, Any]:
+    async def resume_persistent_thread(
+        self, thread_id: str, acknowledge: list[str] | None = None
+    ) -> dict[str, Any]:
         """Resume an ended persistent thread.
+
+        Raises ``SessionConfigDriftError`` when the session references
+        connectors, projects, or grants that are no longer available. Pass
+        their ids back as ``acknowledge`` to resume without them.
 
         Returns:
             Dict with ``status`` and ``thread_id``.
         """
+        payload: dict[str, Any] = {}
+        if acknowledge is not None:
+            payload["acknowledge"] = acknowledge
         resp = await self._mutation_request(
-            "POST", f"/api/persistent/threads/{thread_id}/resume"
+            "POST", f"/api/persistent/threads/{thread_id}/resume", json=payload
         )
+        if resp.status_code == 428:
+            try:
+                body = resp.json() if resp.content else {}
+            except ValueError:
+                body = {}
+            detail = body.get("detail") if isinstance(body, dict) else None
+            detail = detail if isinstance(detail, dict) else {}
+            items = detail.get("drift")
+            raise SessionConfigDriftError(items if isinstance(items, list) else [])
         resp.raise_for_status()
         return resp.json()
 

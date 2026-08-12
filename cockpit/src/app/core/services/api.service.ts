@@ -1,6 +1,13 @@
 import {inject, Injectable} from '@angular/core';
-import {HttpClient, HttpErrorResponse, HttpParams} from '@angular/common/http';
-import {catchError, map, Observable, of, tap, throwError, timeout} from 'rxjs';
+import {
+    HttpClient,
+    HttpErrorResponse,
+    HttpEventType,
+    HttpParams,
+    HttpResponse,
+    HttpUploadProgressEvent,
+} from '@angular/common/http';
+import {catchError, filter, map, Observable, of, tap, throwError, timeout} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
@@ -75,7 +82,12 @@ import {
     UserCapabilities,
     VoiceCapabilities,
 } from '../models/api.model';
-import {ThreadUploadResponse, UploadInfo, UploadResponse} from '../models/file.model';
+import {
+  ThreadUploadEvent,
+  ThreadUploadResponse,
+  UploadInfo,
+  UploadResponse,
+} from '../models/file.model';
 import {AuditEntry, AuditFilterCategory, AuditResponse, JobSummary,} from '../models/audit.model';
 import {LLMRequest} from '../../workbench/request.model';
 import {GraphChangeResponse} from '../../workbench/graph.model';
@@ -229,6 +241,20 @@ export interface SnapshotStorageStats {
  * `lastApplied` baseline always gets anchored.
  */
 export const SESSION_TOOL_GROUPS_TIMEOUT_MS = 8000;
+
+/**
+ * Percent-encode an `uploads/`-relative path for the delete route's
+ * `{path:path}` segment.
+ *
+ * Per SEGMENT, never wholesale: the route matches a multi-segment path, so the
+ * `/` separators of a zip-extracted member (`bundle/sub/a.txt`) must survive
+ * while everything else is escaped. An unencoded `#` truncates the URL at the
+ * fragment and an unencoded `?` at the query string, both of which would send a
+ * DELETE for a shorter path than the caller asked for.
+ */
+export function encodeUploadPath(name: string): string {
+  return name.split('/').map(encodeURIComponent).join('/');
+}
 
 /**
  * HTTP client service for the cockpit API.
@@ -1137,28 +1163,84 @@ export class ApiService {
   }
 
   /**
-   * Push files into the persistent thread's live workspace uploads/ directory.
-   * Used by the persistent-chat composer for attachment, camera capture, and
-   * voice-message uploads.
+   * Push ONE file into the persistent thread's live workspace uploads/ directory.
    *
-   * Errors are RE-THROWN (not swallowed to ``null``) so the caller can read
-   * the server-side ``detail`` field — typical messages include
-   * ``"Workspace is not ready — try again in a moment"`` (409) or
-   * ``"Could not reach workspace (host:port)"`` (502). Use
-   * ``humanizeUploadError()`` to map an arbitrary HttpErrorResponse to a
-   * user-facing string.
+   * Deliberately one request per file rather than one batched multipart POST.
+   * Three reasons, in order of severity:
+   *   1. The deployment traverses a Cloudflare Tunnel whose request-body cap is
+   *      100MB. A batched send sums every file into that ceiling; per-file keeps
+   *      each request under the backend's own 100MB per-file cap.
+   *   2. A batch fails atomically from the client's point of view, so one
+   *      oversized file failed the whole message.
+   *   3. Per-file progress and per-file cancel are not expressible otherwise.
+   *
+   * Emits `{kind: 'progress'}` as the bytes move, then exactly one
+   * `{kind: 'done', files}` — an ARRAY, because a .zip expands into one entry
+   * per extracted member (services/thread_uploads.py). Users attach 30-90MB
+   * PDFs; without the progress events the bubble can only show an opaque
+   * indeterminate label for the whole wait.
+   *
+   * `reportProgress: true` only does anything on the XHR backend — Angular's
+   * FetchBackend emits no UploadProgress events at all — which is why
+   * app.config.ts deliberately does NOT install `withFetch()`.
+   *
+   * Errors are RE-THROWN (not swallowed to `null`) so the caller can read the
+   * status and the server-side `detail` field. Use `humanizeUploadError()` to
+   * map an arbitrary HttpErrorResponse to a user-facing string.
    */
-  uploadToThread(threadId: string, files: File[]): Observable<ThreadUploadResponse> {
+  uploadOneToThread(threadId: string, file: File): Observable<ThreadUploadEvent> {
     const formData = new FormData();
-    files.forEach((file) => formData.append('files', file, file.name));
+    formData.append('files', file, file.name);
     return this.http
       .post<ThreadUploadResponse>(
         `${this.baseUrl}/persistent/threads/${threadId}/uploads`,
         formData,
+        {reportProgress: true, observe: 'events'},
       )
       .pipe(
+        // Sent / ResponseHeader / DownloadProgress carry nothing the send
+        // outbox can use, so they never reach the caller.
+        filter(
+          (e): e is HttpUploadProgressEvent | HttpResponse<ThreadUploadResponse> =>
+            e.type === HttpEventType.UploadProgress || e.type === HttpEventType.Response,
+        ),
+        map((e) =>
+          e.type === HttpEventType.UploadProgress
+            ? // `total` is optional on the DOM event and absent whenever the
+              // body length is not computable. Normalise to null here so no
+              // consumer has to remember that it might be undefined.
+              {kind: 'progress' as const, loaded: e.loaded, total: e.total ?? null}
+            : {kind: 'done' as const, files: e.body?.files ?? []},
+        ),
         catchError((error: HttpErrorResponse) => {
-          console.error(`Failed to upload files to thread ${threadId}:`, error);
+          console.error(`Failed to upload ${file.name} to thread ${threadId}:`, error);
+          return throwError(() => error);
+        }),
+      );
+  }
+
+  /**
+   * Remove one file (or one zip's extracted subtree) from a persistent
+   * thread's `uploads/` directory.
+   *
+   * `name` is the `name` field of a `ThreadUploadedFile` — the path RELATIVE to
+   * `uploads/` (`report.pdf`, `bundle/sub/a.txt`). Passing its `path` field
+   * instead resolves to `uploads/uploads/…` server-side and 404s.
+   *
+   * Exists so eager upload (docs/features/session_attachment_send_flow.md
+   * §5.4) can be cancelled honestly: removing an attachment chip can arrive
+   * after the bytes have already landed, and without this the "cancel" would
+   * be a lie that also litters a directory the agent can list.
+   */
+  deleteThreadUpload(threadId: string, name: string): Observable<void> {
+    return this.http
+      .delete<{deleted: boolean}>(
+        `${this.baseUrl}/persistent/threads/${threadId}/uploads/${encodeUploadPath(name)}`,
+      )
+      .pipe(
+        map(() => undefined),
+        catchError((error: HttpErrorResponse) => {
+          console.error(`Failed to delete upload ${name} from thread ${threadId}:`, error);
           return throwError(() => error);
         }),
       );

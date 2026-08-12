@@ -16,8 +16,11 @@ related:
 
 **Closed by the 2026-08-06 doc-truth sweep (batch #3):** Shipped `09be5dd6`+`92cc1bcf` — zip extraction at both upload transports + read_file binary/archive branch + the collision-resolution fix; test names match 1:1. Branch since pushed (mid-sweep); the dev live-gate is still owed — the first deploy should smoke a zip upload.
 
-**Status:** **IMPLEMENTED 2026-08-02 on `develop`, not pushed and not
-live-gated.** Diagnosed 2026-08-01. Both halves shipped as task 1 of
+**Status:** **DONE — pushed, and CONFIRMED WORKING ON DEV 2026-08-08** by the repo
+owner: uploading a `.zip` to a session extracts it automatically. That closes the
+motivating incident end to end, and it was the last unverified part of the
+eight-task tool-configuration series. Implemented 2026-08-02, diagnosed
+2026-08-01. Both halves shipped as task 1 of
 [[tool_configuration_defects_and_fix_roadmap]] (commits `17065d2e..3807b32b`):
 
 - **Extraction at the session upload seam**, on **both** transports (SFTP and the
@@ -44,11 +47,12 @@ work (an un-memoised `_ensure_remote_dir`, last-write-wins on normalising member
 names, a wrong memory figure in the cap comment, the cockpit attached-files hint)
 are in [[tool_configuration_deferred_findings]].
 
-**Not verified against a cluster.** Task 1 ran while the local k3d stack could
-not deliver code (Tilt apply broken, then `kubectl cp` invalidated by a pod
-restart), so this is the one part of that series with no live gate — the
-motivating incident has never been replayed end to end. Attaching a `.zip` to a
-session on dev and asking the agent to read it is the check.
+~~**Not verified against a cluster.**~~ **Verified on dev 2026-08-08.** Task 1
+originally ran while the local k3d stack could not deliver code (Tilt apply
+broken, then `kubectl cp` invalidated by a pod restart), which left it as the one
+part of that series with no live gate for six days. The owner has since confirmed
+on dev that an uploaded `.zip` is extracted automatically — the exact behaviour
+session `1930dec9` could not get, and the reason the series exists.
 
 *Original diagnosis, 2026-08-01:*
 **Severity:** medium — the user's data is in the workspace and cannot be read by
@@ -136,7 +140,11 @@ process.
 Neither needs a new tool, which keeps the agent's menu — and its context cost —
 unchanged.
 
-## Verification owed
+## Verification
+
+**The live check is done** (see Status). What follows is the unit coverage that
+shipped with the fix; it is recorded rather than owed.
+
 
 - Unit: a `.zip` uploaded to a thread lands as extracted files under `uploads/`,
   on both the SFTP and object-store transports.

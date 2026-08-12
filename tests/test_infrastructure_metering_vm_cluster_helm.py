@@ -101,6 +101,72 @@ def _env(deployment: dict) -> dict[str, dict]:
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_vm_metering_credentials_select_short_properties_from_srw_secret_bundle():
+    objects = _render(
+        "--set",
+        "externalSecrets.enabled=true",
+        "--set",
+        "infrastructureMetering.externalSecrets.enabled=true",
+        "--set-string",
+        (
+            "infrastructureMetering.externalSecrets.vaultPath="
+            "homelab/superhuman-remote-worker/srw-secrets"
+        ),
+        "--set-string",
+        ("infrastructureMetering.ingestionSecretName=srw-infra-metering-vmi-ingestion"),
+        "--set-string",
+        (
+            "infrastructureMetering.storageIngestionSecretName="
+            "srw-infra-metering-vm-storage-ingestion"
+        ),
+        "--set-string",
+        (
+            "infrastructureMetering.volumeIdentitySecretName="
+            "srw-infra-metering-volume-identity"
+        ),
+        "--set-string",
+        "vmController.lifecycleAuthSecretName=srw-vm-lifecycle-auth",
+    )
+    names = {
+        "srw-infra-metering-vmi-ingestion": (
+            "INFRASTRUCTURE_METERING_VMI_INGESTION_KEY",
+            "METERING_VMI_INGESTION_KEY",
+        ),
+        "srw-infra-metering-vm-storage-ingestion": (
+            "INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY",
+            "METERING_VM_STORAGE_INGESTION_KEY",
+        ),
+        "srw-infra-metering-volume-identity": (
+            "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY",
+            "METERING_VOLUME_IDENTITY_KEY",
+        ),
+        "srw-vm-lifecycle-auth": (
+            "VM_LIFECYCLE_HMAC_SECRET",
+            "METERING_VM_LIFECYCLE_HMAC_SECRET",
+        ),
+    }
+
+    external_secrets = {
+        item["metadata"]["name"]: item
+        for item in objects
+        if item["kind"] == "ExternalSecret" and item["metadata"]["name"] in names
+    }
+    assert set(external_secrets) == set(names)
+    for name, (runtime_key, vault_property) in names.items():
+        external_secret = external_secrets[name]
+        assert external_secret["spec"]["target"]["name"] == name
+        assert external_secret["spec"]["data"] == [
+            {
+                "secretKey": runtime_key,
+                "remoteRef": {
+                    "key": "homelab/superhuman-remote-worker/srw-secrets",
+                    "property": vault_property,
+                },
+            }
+        ]
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_vmi_collector_defaults_dark() -> None:
     objects = _render()
 

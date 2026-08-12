@@ -10539,6 +10539,32 @@ class PostgresDB:
                     )
                 return row is not None
 
+    async def record_thread_config_drift_ack(
+        self, thread_id: str, ack: dict[str, str]
+    ) -> None:
+        """Merge acknowledged drift items into metadata.config_drift_ack.
+
+        Merged, never replaced: an older acknowledgment stays valid so a
+        previously accepted loss does not re-prompt.
+        """
+        if not ack:
+            return
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE threads
+                SET metadata = jsonb_set(
+                        COALESCE(metadata, '{}'::jsonb),
+                        '{config_drift_ack}',
+                        COALESCE(metadata->'config_drift_ack', '{}'::jsonb)
+                            || $2::jsonb
+                    )
+                WHERE id = $1
+                """,
+                UUID(thread_id),
+                json.dumps(ack),
+            )
+
     async def delete_thread(self, thread_id: str) -> None:
         """Permanently delete a thread and its messages."""
         try:
@@ -12081,6 +12107,21 @@ class PostgresDB:
 
         return _datasource_row_to_dict(row) if row else None
 
+    async def get_datasource_tombstones(self, ids: list[str]) -> dict[str, str]:
+        """Names of deleted connectors, for labelling drifted session config."""
+        if not ids:
+            return {}
+        try:
+            uuids = [UUID(str(value)) for value in ids]
+        except (TypeError, ValueError):
+            return {}
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, name FROM datasource_tombstones WHERE id = ANY($1::uuid[])",
+                uuids,
+            )
+        return {str(row["id"]): row["name"] for row in rows}
+
     async def create_datasource(
         self,
         name: str,
@@ -12753,11 +12794,15 @@ class PostgresDB:
         datasource_id: str,
         *,
         authority_project_scope_id: str | None = None,
+        deleted_by: str | None = None,
     ) -> bool:
         """Delete a datasource.
 
         Args:
             datasource_id: Datasource UUID
+            deleted_by: Acting user's id, recorded on the tombstone for
+                audit (migration 0115). ``None`` for internal/system-
+                initiated deletes — never invent an actor for those.
 
         Returns:
             True if deleted, False if not found
@@ -12776,6 +12821,12 @@ class PostgresDB:
             raise DatasourceScopeAuthorizationError(
                 "Connector mutation exceeds the caller's project scope"
             ) from exc
+        try:
+            deleted_by_uuid = UUID(str(deleted_by)) if deleted_by else None
+        except (TypeError, ValueError):
+            # A malformed actor id is an audit-trail cosmetic, not grounds to
+            # block a legitimate delete — record no attribution instead.
+            deleted_by_uuid = None
 
         async with self.acquire() as conn:
             async with _transaction_if(conn, authority_scope_uuid is not None):
@@ -12806,10 +12857,63 @@ class PostgresDB:
                         raise DatasourceScopeAuthorizationError(
                             "Connector mutation exceeds the caller's project scope"
                         )
-                result = await conn.execute(
-                    "DELETE FROM datasources WHERE id = $1",
-                    uuid_val,
-                )
+
+                # A scoped delete is already inside the transaction opened
+                # above by `_transaction_if`. An unscoped delete is not, so
+                # open one here — otherwise a crash between the DELETE and
+                # the scrub below could delete the connector while leaving
+                # dangling thread references behind.
+                async with _transaction_if(conn, authority_scope_uuid is None):
+                    doomed = await conn.fetchrow(
+                        "SELECT name FROM datasources WHERE id = $1",
+                        uuid_val,
+                    )
+                    result = await conn.execute(
+                        "DELETE FROM datasources WHERE id = $1",
+                        uuid_val,
+                    )
+                    if result == "DELETE 1":
+                        # A deleted row cannot supply its own name later, so
+                        # keep one for sessions that still reference it.
+                        # deleted_by_uuid is cast explicitly: an untyped $n
+                        # used only where it can be NULL makes asyncpg's
+                        # PREPARE fail on every call in this codebase.
+                        await conn.execute(
+                            """
+                            INSERT INTO datasource_tombstones
+                                (id, name, deleted_by)
+                            VALUES ($1, $2, $3::uuid)
+                            ON CONFLICT (id) DO NOTHING
+                            """,
+                            uuid_val,
+                            (doomed or {}).get("name") or str(uuid_val),
+                            deleted_by_uuid,
+                        )
+                        # Scrub the reference so new dangling ids stop
+                        # accumulating. Sessions already carrying one are
+                        # recovered by the acknowledgment flow, not by this.
+                        await conn.execute(
+                            """
+                            UPDATE threads
+                            SET metadata = jsonb_set(
+                                    metadata,
+                                    '{datasource_ids}',
+                                    COALESCE(
+                                        (
+                                            SELECT jsonb_agg(value)
+                                            FROM jsonb_array_elements_text(
+                                                metadata->'datasource_ids'
+                                            ) AS value
+                                            WHERE value <> $1::text
+                                        ),
+                                        '[]'::jsonb
+                                    )
+                                )
+                            WHERE jsonb_typeof(metadata->'datasource_ids') = 'array'
+                              AND metadata->'datasource_ids' ? $1::text
+                            """,
+                            str(uuid_val),
+                        )
 
         return result == "DELETE 1"
 

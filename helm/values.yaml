@@ -312,6 +312,17 @@ infrastructureMetering:
   volumeIdentitySecretName: ""
   volumeIdentitySecretKey: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY
   volumeIdentityKeyVersion: ""
+  # Optional ESO projections for metering credentials stored alongside the
+  # existing application bundle. Vault-facing property names stay concise,
+  # while each value is projected into a dedicated Kubernetes Secret under
+  # the canonical runtime key expected by the collectors/controllers.
+  externalSecrets:
+    enabled: false
+    vaultPath: ""
+    vmiIngestionProperty: METERING_VMI_INGESTION_KEY
+    vmStorageIngestionProperty: METERING_VM_STORAGE_INGESTION_KEY
+    volumeIdentityProperty: METERING_VOLUME_IDENTITY_KEY
+    vmLifecycleAuthProperty: METERING_VM_LIFECYCLE_HMAC_SECRET
   # Exact, operator-owned PV pricing classifications. These rules are stored
   # immutably by the orchestrator; collector labels and StorageClass parameters
   # can never select a priced resource. Empty means quantity-only/unpriced.
@@ -1546,6 +1557,15 @@ workspace:
   # destructive recovery path). false → a wedged reattach stays in recovery until
   # the node returns or the recovery cap fails it loud, never discarding.
   freshFallback: true
+  # -- Reclaim-on-idle (Task 7). On a session's idle-suspend, once the S3
+  # snapshot is confirmed restorable (verify_snapshot), drop its workspace
+  # PVC instead of retaining it — the next touch extracts from S3 like any
+  # never-PVC-backed session. Bounds live PVCs to currently-active +
+  # recently-crashed sessions instead of every retained thread ever. Fail-
+  # safe: an unverifiable snapshot always keeps the PVC. Default off = keep
+  # today's retain-on-idle behavior. See
+  # docs/features/workspace_durability_tiering.md §D3.
+  reclaimOnIdle: false
   # -- Capacity guard for PVC-backed workspaces (Phase 3a). Renders a
   # namespaced ResourceQuota keyed on `ephemeralStorageClass` that caps BOTH the
   # total storage and the count of workspace PVCs of that class. At the cap, new

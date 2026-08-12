@@ -63,33 +63,33 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-a4d1fab
+    tag: sha-fa8da93
   agent:
-    tag: sha-a4d1fab
+    tag: sha-fa8da93
   cockpit:
-    tag: sha-38dc146
+    tag: sha-d74ee57
   mcp:
-    tag: sha-99b8700
-    digest: sha256:427e562eb524ebcf052cf044ab85b69b8eba7be5c31d6faad848b01c0b4620d1
+    tag: sha-099d96f
+    digest: sha256:f0668b53e853df85118617cfdfbc9fc2caffd2d5a49f16b2967a29df8ca0d823
   workspace:
     tag: sha-571fbc8
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-a4d1fabaf51ab6770ee63cde5da2c7a810e6f4f3"
+  releaseVersion: "0.0.0-dev.sha-fa8da931735856799b301736ce3c909df533e6c9"
   components:
     orchestrator:
-      sourceRevision: a4d1fabaf51ab6770ee63cde5da2c7a810e6f4f3
-      releaseVersion: "0.0.0-dev.sha-a4d1fabaf51ab6770ee63cde5da2c7a810e6f4f3"
+      sourceRevision: fa8da931735856799b301736ce3c909df533e6c9
+      releaseVersion: "0.0.0-dev.sha-fa8da931735856799b301736ce3c909df533e6c9"
     agent:
-      sourceRevision: a4d1fabaf51ab6770ee63cde5da2c7a810e6f4f3
-      releaseVersion: "0.0.0-dev.sha-a4d1fabaf51ab6770ee63cde5da2c7a810e6f4f3"
+      sourceRevision: fa8da931735856799b301736ce3c909df533e6c9
+      releaseVersion: "0.0.0-dev.sha-fa8da931735856799b301736ce3c909df533e6c9"
     cockpit:
-      sourceRevision: 38dc1461a90a9db29edde2fe00a00e220367669b
-      releaseVersion: "0.0.0-dev.sha-38dc1461a90a9db29edde2fe00a00e220367669b"
+      sourceRevision: d74ee5774c97268b86eebef4e3583578774c0dc9
+      releaseVersion: "0.0.0-dev.sha-d74ee5774c97268b86eebef4e3583578774c0dc9"
     mcp:
-      sourceRevision: 99b870088728abbb38aa8538addfee21585e3a46
-      releaseVersion: "0.0.0-dev.sha-99b870088728abbb38aa8538addfee21585e3a46"
+      sourceRevision: 099d96fe1f4b3049df864531c435ef2928c12f49
+      releaseVersion: "0.0.0-dev.sha-099d96fe1f4b3049df864531c435ef2928c12f49"
     workspace:
       sourceRevision: 571fbc8ca40847bb63cf57c92d86f3df15e35a7c
       releaseVersion: "0.0.0-dev.sha-571fbc8ca40847bb63cf57c92d86f3df15e35a7c"
@@ -149,6 +149,17 @@ infrastructureMetering:
   vmPvClusterWideRbacAcknowledged: false
   stableClusterId: "srw-main-dev"
   ingestionSecretName: "srw-infra-metering-ingestion"
+  vmIngestionSecretName: "srw-infra-metering-vmi-ingestion"
+  vmStorageIngestionSecretName: "srw-infra-metering-vm-storage-ingestion"
+  volumeIdentitySecretName: "srw-infra-metering-volume-identity"
+  volumeIdentityKeyVersion: "storage-v1"
+  # Metering credentials will be selected from the existing SRW Vault bundle
+  # into dedicated Kubernetes Secrets. Lifecycle authentication remains
+  # intentionally unbound for this credential-only rollout because binding it
+  # changes the active VM command protocol and must be coordinated separately.
+  externalSecrets:
+    enabled: true
+    vaultPath: "homelab/superhuman-remote-worker/srw-secrets"
   networkPolicy:
     enabled: true
     allowUnrestrictedEgress: false

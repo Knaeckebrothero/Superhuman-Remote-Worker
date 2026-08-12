@@ -17,7 +17,7 @@ from main import (
     _authorize_thread_project_ids,
     _build_datasources_payload,
     _normalize_kb_config,
-    _revalidate_thread_datasource_ids,
+    _revalidate_thread_datasource_selection,
     _revalidate_thread_project_ids,
     _thread_has_knowledge_scope,
     _thread_creation_project_ids,
@@ -30,6 +30,7 @@ from main import (
     resume_thread,
     update_datasource,
 )
+from orchestrator.services.config_drift import DriftItem
 from orchestrator.services.kb_datasources import (
     index_status_payload,
     reindex_kb_datasource,
@@ -427,11 +428,14 @@ async def test_update_validates_preserved_token_against_changed_transport():
 @pytest.mark.asyncio
 async def test_delete_uses_coordinated_kb_index_and_app_row_cleanup():
     datasource_id = "11111111-2222-3333-4444-555555555555"
+    actor_id = "99999999-8888-7777-6666-555555555555"
     db = MagicMock()
     db.list_datasource_projects = AsyncMock(return_value=[])
     db.delete_datasource = AsyncMock(return_value=True)
     cleanup = AsyncMock(return_value=True)
-    gate = AsyncMock(return_value=({}, {"id": datasource_id, "type": "kb"}))
+    gate = AsyncMock(
+        return_value=({"id": actor_id}, {"id": datasource_id, "type": "kb"})
+    )
 
     with (
         patch("main.require_datasource_owner", gate),
@@ -441,9 +445,13 @@ async def test_delete_uses_coordinated_kb_index_and_app_row_cleanup():
         result = await delete_datasource(object(), datasource_id)
 
     assert result == {"status": "deleted"}
+    # deleted_by is the SAME authenticated caller the non-kb branch already
+    # attributes tombstones to (Task 12 item C) — the kb branch must not be
+    # a silent NULL-forever exception to that.
     cleanup.assert_awaited_once_with(
         datasource_id,
         authority_project_scope_id=None,
+        deleted_by=actor_id,
     )
     db.delete_datasource.assert_not_awaited()
 
@@ -638,7 +646,7 @@ async def test_persisted_thread_datasource_is_denied_after_access_revocation():
         patch("main._thread_project_ids", AsyncMock(return_value=[])),
         pytest.raises(HTTPException) as exc,
     ):
-        await _revalidate_thread_datasource_ids(
+        await _revalidate_thread_datasource_selection(
             {"id": "thread-1", "user_id": owner_id},
             [str(datasource_id)],
         )
@@ -673,17 +681,25 @@ async def test_persisted_thread_revalidation_preserves_global_and_system_semanti
         patch("main.postgres_db", db),
         patch("main._thread_project_ids", AsyncMock(return_value=[])),
     ):
-        global_selection = await _revalidate_thread_datasource_ids(
+        (
+            global_selection,
+            global_revisions,
+        ) = await _revalidate_thread_datasource_selection(
             {"id": "thread-user", "user_id": owner_id},
             [str(datasource_id)],
         )
-        system_selection = await _revalidate_thread_datasource_ids(
+        (
+            system_selection,
+            system_revisions,
+        ) = await _revalidate_thread_datasource_selection(
             {"id": "thread-system", "user_id": None},
             [str(datasource_id), str(datasource_id)],
         )
 
     assert global_selection == [str(datasource_id)]
     assert system_selection == [str(datasource_id)]
+    assert global_revisions == {str(datasource_id): 1}
+    assert system_revisions == {str(datasource_id): 1}
     assert db.get_user.await_count == 2
     db.get_user.assert_awaited_with(str(owner_id))
 
@@ -805,6 +821,28 @@ async def test_thread_project_authorization_preserves_admin_access():
 
 @pytest.mark.asyncio
 async def test_resume_revalidates_datasources_before_mutating_thread_status():
+    """resume_thread must not flip a thread's status before its config drift
+    is resolved.
+
+    Round-1 diagnosis (this test regressed under Task 6, commit a6e073e3):
+    this pinned a synchronous 403 raised by the old
+    ``_revalidate_thread_datasource_ids`` helper — one ``resume_thread`` no
+    longer called, and which Task 13 later deleted outright once its only
+    remaining callers (direct tests) were redirected to the selection
+    function it had wrapped, ``_revalidate_thread_datasource_selection``.
+    Task 6 (docs/done/session_config_drift_resume.md) deliberately
+    replaced that dead-end 403 with an acknowledgeable 428 listing every
+    drifted item (a revoked/deleted datasource no longer permanently
+    strands the session) — an intentional, already-shipped contract
+    change, not a bug. This is a
+    genuine (ii): the old mock (`user={}`, the old helper patched) doesn't
+    match resume_thread's real current collaborator (`_thread_config_drift`),
+    which is why it crashed with a raw ``KeyError`` rather than failing its
+    assertion. Classification correctness (deleted/revoked/out_of_scope) is
+    unit tested on its own in tests/test_config_drift.py and
+    tests/test_resume_config_drift.py; this test only pins resume_thread's
+    ordering guarantee, unchanged: no status mutation before drift resolves.
+    """
     datasource_id = UUID("11111111-2222-3333-4444-555555555555")
     thread = {
         "id": "thread-1",
@@ -813,34 +851,46 @@ async def test_resume_revalidates_datasources_before_mutating_thread_status():
         "status": "ended",
         "metadata": {"datasource_ids": [str(datasource_id)]},
     }
+    user = {"id": str(thread["user_id"])}
     db = MagicMock()
     db.resume_thread = AsyncMock()
-    db.list_thread_mounts = AsyncMock(return_value=[])
-    db.get_thread = AsyncMock(return_value=thread)
-    denied = HTTPException(
-        status_code=403,
-        detail="One or more selected connectors are unavailable",
-    )
+    db.record_thread_config_drift_ack = AsyncMock()
+    # resume_thread resolves drift as the THREAD OWNER, not the caller (a
+    # caller can be an admin acting on someone else's thread) — it reads the
+    # owner row via get_user(thread["user_id"]) before calling
+    # _thread_config_drift. Here the caller already stands in as the owner
+    # (same id), so the same dict is the right stand-in for that row.
+    db.get_user = AsyncMock(return_value=user)
+    drift = [DriftItem(f"connector:{datasource_id}", "connector", "deleted", "gone")]
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=({}, thread))),
+        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
         patch("main.postgres_db", db),
-        patch(
-            "main._revalidate_thread_datasource_ids",
-            AsyncMock(side_effect=denied),
-        ),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
+        patch("main._thread_config_drift", AsyncMock(return_value=drift)),
         pytest.raises(HTTPException) as exc,
     ):
         await resume_thread("thread-1", object())
 
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 428
+    assert exc.value.detail["drift"][0]["id"] == f"connector:{datasource_id}"
     db.resume_thread.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_resume_blocks_revoked_native_project_scope_before_status_mutation():
+    """Same ordering guarantee as the datasource test above, for a revoked
+    project membership.
+
+    Round-1 diagnosis: same (ii) as above — a synchronous 403 from
+    ``_revalidate_thread_project_ids`` is now an acknowledgeable 428 (Task 6).
+    The old ``_revalidate_thread_datasource_ids`` was never on
+    resume_thread's call path either (``_thread_config_drift`` computes
+    drift directly), so a mock of it proved nothing here and was dropped
+    rather than kept as dead weight; Task 13 later deleted the function
+    itself, its last callers having been direct tests in
+    tests/test_kb_datasource_api.py, since redirected to
+    ``_revalidate_thread_datasource_selection``.
+    """
     project_id = "99999999-2222-3333-4444-555555555555"
     thread = {
         "id": "thread-1",
@@ -849,31 +899,27 @@ async def test_resume_blocks_revoked_native_project_scope_before_status_mutation
         "status": "ended",
         "metadata": {},
     }
+    user = {"id": thread["user_id"]}
     db = MagicMock()
     db.resume_thread = AsyncMock()
-    denied = HTTPException(
-        status_code=403,
-        detail="One or more attached projects are unavailable",
-    )
+    db.record_thread_config_drift_ack = AsyncMock()
+    # See the datasource test above: resume_thread now reads the owner row
+    # via get_user(thread["user_id"]) before computing drift. The caller
+    # already stands in as the owner here (same id).
+    db.get_user = AsyncMock(return_value=user)
+    drift = [DriftItem(f"project:{project_id}", "project", "revoked", "gone")]
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=({}, thread))),
+        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
         patch("main.postgres_db", db),
-        patch("main._thread_project_ids", AsyncMock(return_value=[project_id])),
-        patch(
-            "main._revalidate_thread_project_ids",
-            AsyncMock(side_effect=denied),
-        ),
-        patch(
-            "main._revalidate_thread_datasource_ids", AsyncMock(return_value=[])
-        ) as datasource_check,
+        patch("main._thread_config_drift", AsyncMock(return_value=drift)),
         pytest.raises(HTTPException) as exc,
     ):
         await resume_thread("thread-1", object())
 
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 428
+    assert exc.value.detail["drift"][0]["id"] == f"project:{project_id}"
     db.resume_thread.assert_not_awaited()
-    datasource_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio

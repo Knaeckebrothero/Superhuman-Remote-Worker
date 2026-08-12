@@ -54,3 +54,24 @@
     }
   }
 }
+
+/* Upload stage block inside a queued user bubble. Lives here, not in the
+   component sheet, to keep new bytes out of that sheet's anyComponentStyle
+   budget (docs/issues/persistent_chat_component_style_budget.md).
+ *
+ * NOTHING HERE MAY SET `display` ON `.upload-stage`. This selector is (0,5,0)
+ * and outranks the component's own `.upload-stage[_ngcontent]` (0,2,0), so a
+ * `display: flex` here silently overrode it and laid the block out as a ROW:
+ * the label and the progress bar became siblings on one line, and the bar —
+ * which has no width of its own — rendered at width 0. Measured in Chrome
+ * before the fix: barBelowLine=false, bar width 0, i.e. the bar shipped
+ * invisible. `.upload-stage` must stay a block so `.upload-bar` can span it.
+ * (The three declarations that did this were a stale copy of
+ * `.upload-stage-line`'s, from before Slice 2 added the bar underneath it.)
+ *
+ * The properties left below are inherited-only and layout-neutral. */
+.message.message-user.queued .message-body .upload-stage {
+  margin-top: 6px;
+  font-size: 0.85em;
+  color: var(--text-secondary);
+}

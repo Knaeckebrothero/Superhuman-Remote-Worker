@@ -139,6 +139,9 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 # awareness (0126), the exact-lease interrupt inbox (0127-0129), and the
 # verification-critic dedupe/concurrent unique-index rollout (0130-0132), and
 # the S2 durable persistent-session residue tables (0133).
+APP_DATASOURCE_TOMBSTONES_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0115_datasource_tombstones.sql"
+)
 APP_JOBS_EXECUTION_LANE_MIGRATION = (
     ROOT / "orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
 )
@@ -746,6 +749,7 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
         "schema_current"
         not in APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.read_text()
     )
+    assert "schema_current" not in APP_DATASOURCE_TOMBSTONES_MIGRATION.read_text()
     assert "schema_current" not in APP_THREAD_SESSION_DURABLE_STATE.read_text()
     assert "audit_schema_current" not in AUDIT_EXPANSION.read_text()
 

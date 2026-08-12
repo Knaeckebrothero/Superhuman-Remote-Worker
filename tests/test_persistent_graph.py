@@ -3371,7 +3371,7 @@ class TestToolExecutionLoop:
         # (legacy bool False == PermissionOutcome.DECLINED) says "declined";
         # only a real user decision may claim the user refused — an
         # unanswered gate must not (see
-        # docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md).
+        # docs/done/supervised_parallel_gates_timeout_fabricates_denial.md).
         tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
         assert any("declined" in m.content.lower() for m in tool_msgs)
 

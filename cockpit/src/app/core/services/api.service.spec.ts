@@ -1,6 +1,6 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {TestBed} from '@angular/core/testing';
-import {provideHttpClient} from '@angular/common/http';
+import {HttpErrorResponse, HttpEventType, provideHttpClient} from '@angular/common/http';
 import {
   HttpTestingController,
   provideHttpClientTesting,
@@ -10,6 +10,7 @@ import {firstValueFrom} from 'rxjs';
 import {ApiService, SESSION_TOOL_GROUPS_TIMEOUT_MS} from './api.service';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
+import type {ThreadUploadedFile, ThreadUploadEvent} from '../models/file.model';
 
 describe('ApiService.transcribeVoice', () => {
   let api: ApiService;
@@ -511,5 +512,140 @@ describe('ApiService.getSessionToolGroups', () => {
     await expect(pending).resolves.toBeNull();
     expect(req.cancelled).toBe(true);
     httpMock.verify();
+  });
+});
+
+describe('uploadOneToThread', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  /** The one `done` event, or undefined if the stream never produced one. */
+  function doneFiles(events: readonly ThreadUploadEvent[]): ThreadUploadedFile[] | undefined {
+    const done = events.find((e) => e.kind === 'done');
+    return done?.kind === 'done' ? done.files : undefined;
+  }
+
+  it('posts a single file as multipart and returns its server entries', () => {
+    const file = new File(['abc'], 'report.pdf', {type: 'application/pdf'});
+    const events: ThreadUploadEvent[] = [];
+
+    api.uploadOneToThread('t1', file).subscribe((e) => events.push(e));
+
+    const req = httpMock.expectOne((r) => r.url.endsWith('/persistent/threads/t1/uploads'));
+    expect(req.request.method).toBe('POST');
+    const body = req.request.body as FormData;
+    expect(body.getAll('files').length).toBe(1);
+
+    req.flush({
+      thread_id: 't1',
+      files: [{name: 'report.pdf', size: 3, mime_type: 'application/pdf', path: 'uploads/report.pdf'}],
+    });
+
+    expect(doneFiles(events)).toEqual([
+      {name: 'report.pdf', size: 3, mime_type: 'application/pdf', path: 'uploads/report.pdf'},
+    ]);
+  });
+
+  it('emits fractional progress then the final files', () => {
+    // The whole reason app.config.ts drops withFetch(): FetchBackend emits no
+    // UploadProgress events, so `reportProgress` there is a silent no-op and a
+    // 90MB PDF would sit at 0% and jump to 100%.
+    const events: unknown[] = [];
+    api.uploadOneToThread('t1', new File(['abc'], 'a.pdf')).subscribe((e) => events.push(e));
+
+    const req = httpMock.expectOne((r) => r.url.endsWith('/persistent/threads/t1/uploads'));
+    expect(req.request.reportProgress).toBe(true);
+
+    req.event({type: HttpEventType.UploadProgress, loaded: 50, total: 100});
+    // `total` absent — the gotcha. HttpUploadProgressEvent.total is optional
+    // (the body length is not always computable) and a consumer that divides
+    // by it unguarded renders NaN.
+    req.event({type: HttpEventType.UploadProgress, loaded: 100});
+    req.flush({thread_id: 't1', files: []});
+
+    expect(events).toEqual([
+      {kind: 'progress', loaded: 50, total: 100},
+      {kind: 'progress', loaded: 100, total: null},
+      {kind: 'done', files: []},
+    ]);
+  });
+
+  it('returns every extracted member when the file is an archive', () => {
+    const zip = new File(['x'], 'bundle.zip', {type: 'application/zip'});
+    const events: ThreadUploadEvent[] = [];
+
+    api.uploadOneToThread('t1', zip).subscribe((e) => events.push(e));
+
+    httpMock.expectOne((r) => r.url.endsWith('/persistent/threads/t1/uploads')).flush({
+      thread_id: 't1',
+      files: [
+        {name: 'bundle/a.txt', size: 1, mime_type: 'text/plain', path: 'uploads/bundle/a.txt'},
+        {name: 'bundle/b.txt', size: 1, mime_type: 'text/plain', path: 'uploads/bundle/b.txt'},
+      ],
+    });
+
+    expect(doneFiles(events)?.length).toBe(2);
+  });
+
+  it('rethrows the HttpErrorResponse so the caller can read status and detail', () => {
+    let err: unknown;
+    api.uploadOneToThread('t1', new File([''], 'a.pdf')).subscribe({error: (e) => (err = e)});
+
+    httpMock
+      .expectOne((r) => r.url.endsWith('/persistent/threads/t1/uploads'))
+      .flush({detail: "File 'a.pdf' exceeds 100MB"}, {status: 413, statusText: 'Payload Too Large'});
+
+    expect((err as HttpErrorResponse).status).toBe(413);
+    expect(api.humanizeUploadError(err)).toBe("File 'a.pdf' exceeds 100MB");
+  });
+
+  it('unsubscribing cancels the upload without surfacing an error', () => {
+    // Chip removal cancels by unsubscribing (§5.4). If that surfaced as an
+    // error the caller could not tell it from an outage — Angular reports both
+    // as status 0 — which is why cancellation is tracked as explicit intent.
+    let errored = false;
+    const sub = api
+      .uploadOneToThread('t1', new File(['abc'], 'a.pdf'))
+      .subscribe({error: () => (errored = true)});
+    const req = httpMock.expectOne((r) => r.url.endsWith('/persistent/threads/t1/uploads'));
+
+    sub.unsubscribe();
+
+    expect(req.cancelled).toBe(true);
+    expect(errored).toBe(false);
+  });
+
+  it('deletes by the uploads-RELATIVE name, encoding each segment', () => {
+    // The {path:path} segment is UploadedFile.name, never its `path` field:
+    // `uploads/bundle/a.txt` would resolve to uploads/uploads/… and 404.
+    // Encoding is per segment so a zip member keeps its separators while a `#`
+    // (which would otherwise truncate the URL at the fragment) does not.
+    api.deleteThreadUpload('t1', 'bundle/sub/re#port ?.txt').subscribe();
+
+    const req = httpMock.expectOne((r) =>
+      r.url.endsWith(
+        '/persistent/threads/t1/uploads/bundle/sub/re%23port%20%3F.txt',
+      ),
+    );
+    expect(req.request.method).toBe('DELETE');
+    req.flush({thread_id: 't1', path: 'uploads/bundle/sub/re#port ?.txt', deleted: true});
   });
 });

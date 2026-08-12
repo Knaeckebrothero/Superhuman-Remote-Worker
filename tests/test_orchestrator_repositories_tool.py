@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -42,10 +44,31 @@ class _CapturingClient:
         return resp
 
 
-def _workspace_manager(*, supports_shell=True, exists=False):
+def _workspace_manager(
+    *,
+    supports_shell=True,
+    exists=False,
+    gitignore_exists=False,
+    gitignore_content="",
+):
+    """Mock workspace manager for repository-tool tests.
+
+    `exists` controls the pre-clone `backend.exists(checkout_path)` guard.
+    `gitignore_exists`/`gitignore_content` independently control the
+    `.gitignore` probe inside `_ensure_checkout_path_ignored` (F1), since a
+    successful checkout calls `backend.exists()` for both paths through the
+    same mock.
+    """
     backend = MagicMock()
     backend.supports_shell = supports_shell
-    backend.exists.return_value = exists
+
+    def _exists(path):
+        if path == ".gitignore":
+            return gitignore_exists
+        return exists
+
+    backend.exists.side_effect = _exists
+    backend.read_file.return_value = gitignore_content
 
     workspace = MagicMock()
     workspace.is_initialized = True
@@ -319,7 +342,10 @@ async def test_checkout_project_repository_clones_internal_repo_without_printing
         result = await checkout.ainvoke({})
 
     assert cap.gets == [(internal_url, {})]
-    workspace.backend.exists.assert_called_once_with("repos/hotel-erp")
+    # F1's _ensure_checkout_path_ignored also probes `backend.exists(".gitignore")`
+    # after a successful clone, so `exists` is no longer called exactly once;
+    # this still confirms the pre-clone existence guard fired on the right path.
+    workspace.backend.exists.assert_any_call("repos/hotel-erp")
     mock_clone.assert_called_once_with(
         repo_url,
         Path("/workspace/repos/hotel-erp"),
@@ -376,3 +402,278 @@ async def test_checkout_project_repository_refuses_workspace_root(monkeypatch):
 
     mock_clone.assert_not_called()
     assert "Refusing to clone into workspace root" in result
+
+
+# =============================================================================
+# F1 -- gitignore the nested checkout so the per-turn `git add -A` doesn't
+# commit it as a contentless gitlink (bug b1758f38).
+# =============================================================================
+
+
+def _source_repo_cap(project_id, thread_id, *, repo_url, name="hotel-erp"):
+    internal_url = f"http://localhost:8085/api/agents/threads/{thread_id}/workspace"
+    return _CapturingClient(
+        {
+            internal_url: {
+                "repositories": [
+                    {
+                        "id": "repo-1",
+                        "project_id": project_id,
+                        "name": name,
+                        "role": "source",
+                        "repo_url": repo_url,
+                        "branch": "main",
+                        "read_only": False,
+                    }
+                ]
+            }
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkout_project_repository_creates_gitignore_when_absent(monkeypatch):
+    project_id = "project-123"
+    thread_id = "thread-1"
+    repo_url = "http://admin:secret@srw-gitea:3000/org/hotel-erp.git"
+    cap = _source_repo_cap(project_id, thread_id, repo_url=repo_url)
+    workspace = _workspace_manager()
+
+    monkeypatch.setattr(
+        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+    )
+
+    tools = create_orchestrator_tools(
+        ToolContext(
+            user_id="user-xyz",
+            _project_id=project_id,
+            _thread_id=thread_id,
+            workspace_manager=workspace,
+        )
+    )
+    checkout = _tool_by_name(tools, "checkout_project_repository")
+
+    with patch("src.managers.git_manager.GitManager.clone", return_value=MagicMock()):
+        result = await checkout.ainvoke({})
+
+    workspace.backend.write_file.assert_called_once()
+    written_path, written_content = workspace.backend.write_file.call_args.args
+    assert written_path == ".gitignore"
+    assert "/repos/hotel-erp/" in written_content
+    workspace.backend.append_file.assert_not_called()
+    assert "Repository checked out." in result
+
+
+@pytest.mark.asyncio
+async def test_checkout_project_repository_appends_gitignore_entry_when_file_exists(
+    monkeypatch,
+):
+    project_id = "project-123"
+    thread_id = "thread-1"
+    repo_url = "http://admin:secret@srw-gitea:3000/org/hotel-erp.git"
+    cap = _source_repo_cap(project_id, thread_id, repo_url=repo_url)
+    workspace = _workspace_manager(gitignore_exists=True, gitignore_content="*.log\n")
+
+    monkeypatch.setattr(
+        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+    )
+
+    tools = create_orchestrator_tools(
+        ToolContext(
+            user_id="user-xyz",
+            _project_id=project_id,
+            _thread_id=thread_id,
+            workspace_manager=workspace,
+        )
+    )
+    checkout = _tool_by_name(tools, "checkout_project_repository")
+
+    with patch("src.managers.git_manager.GitManager.clone", return_value=MagicMock()):
+        result = await checkout.ainvoke({})
+
+    workspace.backend.append_file.assert_called_once()
+    appended_path, appended_content = workspace.backend.append_file.call_args.args
+    assert appended_path == ".gitignore"
+    assert "/repos/hotel-erp/" in appended_content
+    workspace.backend.write_file.assert_not_called()
+    assert "Repository checked out." in result
+
+
+@pytest.mark.asyncio
+async def test_checkout_project_repository_gitignore_entry_is_idempotent(monkeypatch):
+    project_id = "project-123"
+    thread_id = "thread-1"
+    repo_url = "http://admin:secret@srw-gitea:3000/org/hotel-erp.git"
+    cap = _source_repo_cap(project_id, thread_id, repo_url=repo_url)
+    workspace = _workspace_manager(
+        gitignore_exists=True, gitignore_content="/repos/hotel-erp/\n"
+    )
+
+    monkeypatch.setattr(
+        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+    )
+
+    tools = create_orchestrator_tools(
+        ToolContext(
+            user_id="user-xyz",
+            _project_id=project_id,
+            _thread_id=thread_id,
+            workspace_manager=workspace,
+        )
+    )
+    checkout = _tool_by_name(tools, "checkout_project_repository")
+
+    with patch("src.managers.git_manager.GitManager.clone", return_value=MagicMock()):
+        result = await checkout.ainvoke({})
+
+    workspace.backend.write_file.assert_not_called()
+    workspace.backend.append_file.assert_not_called()
+    assert "Repository checked out." in result
+
+
+@pytest.mark.asyncio
+async def test_checkout_project_repository_gitignore_uses_custom_target_path(
+    monkeypatch,
+):
+    project_id = "project-123"
+    thread_id = "thread-1"
+    repo_url = "http://admin:secret@srw-gitea:3000/org/hotel-erp.git"
+    cap = _source_repo_cap(project_id, thread_id, repo_url=repo_url)
+    workspace = _workspace_manager()
+
+    monkeypatch.setattr(
+        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+    )
+
+    tools = create_orchestrator_tools(
+        ToolContext(
+            user_id="user-xyz",
+            _project_id=project_id,
+            _thread_id=thread_id,
+            workspace_manager=workspace,
+        )
+    )
+    checkout = _tool_by_name(tools, "checkout_project_repository")
+
+    with patch("src.managers.git_manager.GitManager.clone", return_value=MagicMock()):
+        result = await checkout.ainvoke({"target_path": "vendor/lib"})
+
+    workspace.backend.write_file.assert_called_once()
+    written_path, written_content = workspace.backend.write_file.call_args.args
+    assert written_path == ".gitignore"
+    assert "/vendor/lib/" in written_content
+    assert "repos/" not in written_content
+    assert "Repository checked out." in result
+
+
+@pytest.mark.asyncio
+async def test_checkout_project_repository_gitignore_failure_does_not_fail_checkout(
+    monkeypatch,
+):
+    project_id = "project-123"
+    thread_id = "thread-1"
+    repo_url = "http://admin:secret@srw-gitea:3000/org/hotel-erp.git"
+    cap = _source_repo_cap(project_id, thread_id, repo_url=repo_url)
+    workspace = _workspace_manager(gitignore_exists=True, gitignore_content="*.log\n")
+    workspace.backend.append_file.side_effect = OSError("disk full")
+
+    monkeypatch.setattr(
+        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+    )
+
+    tools = create_orchestrator_tools(
+        ToolContext(
+            user_id="user-xyz",
+            _project_id=project_id,
+            _thread_id=thread_id,
+            workspace_manager=workspace,
+        )
+    )
+    checkout = _tool_by_name(tools, "checkout_project_repository")
+
+    with patch("src.managers.git_manager.GitManager.clone", return_value=MagicMock()):
+        result = await checkout.ainvoke({})
+
+    assert "Repository checked out." in result
+
+
+def _run_git(args, cwd):
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _init_repo_with_nested_checkout(root: Path) -> None:
+    """git init `root` with a seed commit, plus a real nested repo at
+    root/repos/foo with its own seed commit. Mirrors a session workspace
+    immediately after checkout_project_repository clones a project repo,
+    before the per-turn auto-commit's `git add -A` runs.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    _run_git(["init"], cwd=root)
+    _run_git(["config", "user.email", "test@example.com"], cwd=root)
+    _run_git(["config", "user.name", "Test"], cwd=root)
+    (root / "README.md").write_text("root\n")
+    _run_git(["add", "README.md"], cwd=root)
+    _run_git(["commit", "-m", "seed"], cwd=root)
+
+    nested = root / "repos" / "foo"
+    nested.mkdir(parents=True)
+    _run_git(["init"], cwd=nested)
+    _run_git(["config", "user.email", "test@example.com"], cwd=nested)
+    _run_git(["config", "user.name", "Test"], cwd=nested)
+    (nested / "file.txt").write_text("hello\n")
+    _run_git(["add", "file.txt"], cwd=nested)
+    _run_git(["commit", "-m", "nested seed"], cwd=nested)
+
+
+def test_gitignoring_checkout_path_prevents_nested_repo_gitlink_commit(tmp_path):
+    """Git-level proof for bug b1758f38.
+
+    An uncured nested checkout is committed by `git add -A` as a
+    contentless gitlink (mode 160000) -- the baseline below reproduces
+    that. Once a path is tracked, gitignore has no retroactive effect on
+    it (verified empirically: writing .gitignore after the fact does not
+    remove an already-committed gitlink, and `check-ignore` reports
+    already-tracked paths as not ignored). The real fix is therefore a
+    prevention, not a cleanup: `_ensure_checkout_path_ignored` runs *before*
+    the first `git add -A` ever sees the checkout path (see the ordering
+    guarantee in checkout_project_repository). This test models that by
+    writing .gitignore before the first add -A on an independent, otherwise
+    identically-constructed repo.
+    """
+    if not shutil.which("git"):
+        pytest.skip("git is not available in this environment")
+
+    # Baseline: no .gitignore -> the nested checkout is staged and committed
+    # as a contentless gitlink.
+    baseline_root = tmp_path / "baseline"
+    _init_repo_with_nested_checkout(baseline_root)
+    _run_git(["add", "-A"], cwd=baseline_root)
+    _run_git(["commit", "-m", "baseline auto-commit"], cwd=baseline_root)
+    baseline_tree = _run_git(["ls-tree", "-r", "HEAD"], cwd=baseline_root).stdout
+    assert "160000" in baseline_tree
+    assert "repos/foo" in baseline_tree
+
+    # Fix: .gitignore is written *before* the first `add -A`, matching the
+    # tool's ordering guarantee, so the gitlink never enters the tree.
+    fixed_root = tmp_path / "fixed"
+    _init_repo_with_nested_checkout(fixed_root)
+    (fixed_root / ".gitignore").write_text("/repos/foo/\n")
+    _run_git(["add", "-A"], cwd=fixed_root)
+    _run_git(["commit", "-m", "fixed auto-commit"], cwd=fixed_root)
+    fixed_tree = _run_git(["ls-tree", "-r", "HEAD"], cwd=fixed_root).stdout
+    assert "160000" not in fixed_tree
+    assert "repos/foo" not in fixed_tree
+
+    check_ignore = subprocess.run(
+        ["git", "check-ignore", "repos/foo"],
+        cwd=fixed_root,
+        capture_output=True,
+        text=True,
+    )
+    assert check_ignore.returncode == 0

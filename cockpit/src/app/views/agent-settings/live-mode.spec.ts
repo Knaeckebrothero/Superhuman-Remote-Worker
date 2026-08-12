@@ -1,9 +1,11 @@
 import {describe, expect, it} from 'vitest';
-import {Injector, runInInjectionContext} from '@angular/core';
+import {Injector, runInInjectionContext, signal} from '@angular/core';
+import {TestBed} from '@angular/core/testing';
 import {of} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {ToolsGroupComponent} from './tools-group.component';
 import {ExecutionGroupComponent} from './execution-group.component';
+import {UserService} from '../../core/services/user.service';
 import {SESSION_TOOL_CATEGORIES} from './agent-settings.types';
 import type {SessionToolGroupsResponse} from '../../core/services/api.service';
 
@@ -30,9 +32,19 @@ function createToolsGroup(mode: string): ToolsGroupComponent {
   return component;
 }
 
+/**
+ * Built under TestBed, not a bare Injector: the component owns the workspace
+ * backend selector, whose VM-eligibility guard is an effect() and so needs a
+ * ChangeDetectionScheduler.
+ */
 function createExecutionGroup(mode: string): ExecutionGroupComponent {
-  const injector = Injector.create({
+  TestBed.configureTestingModule({
     providers: [
+      ExecutionGroupComponent,
+      {
+        provide: UserService,
+        useValue: {currentUser: signal(null)},
+      },
       {
         provide: TranslocoService,
         useValue: {
@@ -43,7 +55,7 @@ function createExecutionGroup(mode: string): ExecutionGroupComponent {
       },
     ],
   });
-  const component = runInInjectionContext(injector, () => new ExecutionGroupComponent());
+  const component = TestBed.inject(ExecutionGroupComponent);
   stubInput(component, 'mode', mode);
   return component;
 }
