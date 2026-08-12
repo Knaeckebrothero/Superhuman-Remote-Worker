@@ -8,6 +8,7 @@ Or from orchestrator directory:
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -451,6 +452,8 @@ from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
 from services.container_provisioner import (  # noqa: E402
     WORKSPACE_RUNTIME_INCARNATION_KEY,
+    WorkspaceRuntimeAttestation,
+    WorkspaceRuntimeAuthorityError,
     container_provisioner,
 )
 from services.workspace_lifecycle import (  # noqa: E402
@@ -6002,6 +6005,49 @@ def _get_container_context(job: dict) -> dict:
     return ctx.get("workspace_container", {})
 
 
+def _stateless_worker_workspace_owner(job: dict) -> WorkspaceOwner:
+    """Resolve whose Kubernetes workspace a stateless worker must attest."""
+
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    parent_id = job.get("parent_job_id")
+    if parent_id and ctx.get("inherits_parent_workspace"):
+        return WorkspaceOwner.job(str(parent_id))
+    return WorkspaceOwner.job(str(job["id"]))
+
+
+async def _attest_stateless_worker_workspace(
+    owner: WorkspaceOwner,
+) -> WorkspaceRuntimeAttestation:
+    """Return one exact worker workspace identity or a generic claim refusal."""
+
+    try:
+        return await container_provisioner.attest_workspace_runtime(owner)
+    except WorkspaceRuntimeAuthorityError as exc:
+        logger.warning(
+            "Stateless worker workspace attestation refused for %s %s: %s",
+            owner.kind,
+            owner.id,
+            exc,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Stateless worker workspace attestation failed for %s %s: %s",
+            owner.kind,
+            owner.id,
+            exc,
+            exc_info=True,
+        )
+    raise HTTPException(
+        status_code=409,
+        detail="Stateless worker workspace authority unavailable",
+    )
+
+
 def _container_ssh_key_path(container_ctx: dict) -> str:
     """Resolve the private-key path shipped to a managed sandbox worker.
 
@@ -9035,6 +9081,26 @@ class JobStartRequest(BaseModel):
     delegation_context: str | None = Field(
         default=None,
         description="Shared context from parent delegation",
+    )
+    workspace_generation: str | None = Field(
+        default=None,
+        description="Control-plane-attested Kubernetes backing UID",
+    )
+    workspace_runtime_incarnation: str | None = Field(
+        default=None,
+        description="Control-plane-attested current workspace Pod UID",
+    )
+    workspace_ssh_host_key_fingerprint: str | None = Field(
+        default=None,
+        description="Control-plane-attested SSH host-key fingerprint",
+    )
+    workspace_owner_kind: Literal["job", "session"] | None = Field(
+        default=None,
+        description="Kind used by the workspace entrypoint process tag",
+    )
+    workspace_owner_id: str | None = Field(
+        default=None,
+        description="Owner UUID used by the workspace entrypoint process tag",
     )
 
 
@@ -34950,15 +35016,87 @@ async def internal_unit_claim_bundle(
                 detail="Stateless worker workspace is not Kubernetes-ready",
             )
 
+        # Job context is only a lifecycle hint. Bind this claim to the exact
+        # live Kubernetes objects and SSH host key, using the parent owner for
+        # children that share its workspace. The attested endpoint replaces
+        # any stale copied/persisted host in this in-memory bundle only.
+        workspace_owner = _stateless_worker_workspace_owner(job)
+        initial_attestation = await _attest_stateless_worker_workspace(workspace_owner)
+        attested_job = dict(job)
+        raw_context = job.get("context") or {}
+        if isinstance(raw_context, str):
+            try:
+                raw_context = json.loads(raw_context)
+            except (json.JSONDecodeError, TypeError):
+                raw_context = {}
+        if not isinstance(raw_context, dict):
+            raw_context = {}
+        attested_context = copy.deepcopy(raw_context)
+        exact_container_ctx = copy.deepcopy(container_ctx)
+        exact_container_ctx.update(
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "host": initial_attestation.host,
+                "pod_ip": initial_attestation.pod_ip,
+                "port": initial_attestation.port,
+            }
+        )
+        attested_context["workspace_container"] = exact_container_ctx
+        attested_job["context"] = attested_context
+
+        raw_override = job.get("config_override")
+        if isinstance(raw_override, str):
+            try:
+                raw_override = json.loads(raw_override)
+            except (json.JSONDecodeError, TypeError):
+                raw_override = None
+        attested_job["config_override"] = _inject_container_workspace_config(
+            copy.deepcopy(raw_override) if isinstance(raw_override, dict) else None,
+            exact_container_ctx,
+            replace_endpoint=True,
+        )
+
         job_start = await _build_job_start_request(
-            job,
+            attested_job,
             persist_dispatch_state=False,
         )
         if job_start is None:
             raise HTTPException(status_code=409, detail="Job bundle assembly refused")
+        job_start = job_start.model_copy(
+            update={
+                "workspace_generation": (initial_attestation.workspace_generation),
+                "workspace_runtime_incarnation": (
+                    initial_attestation.runtime_incarnation
+                ),
+                "workspace_ssh_host_key_fingerprint": (
+                    initial_attestation.ssh_host_key_fingerprint
+                ),
+                "workspace_owner_kind": workspace_owner.kind,
+                "workspace_owner_id": workspace_owner.id,
+            }
+        )
 
-        # Credential assembly can take seconds. Recheck the exact lease after
-        # that slow work so a stolen zombie never receives the response body.
+        # Credential/config assembly above can take seconds. Repeat the full
+        # control-plane + host-key attestation so a Pod/PVC/Service replacement
+        # during that window never crosses the response boundary under stale
+        # workspace authority.
+        confirmed_attestation = await _attest_stateless_worker_workspace(
+            workspace_owner
+        )
+        if confirmed_attestation != initial_attestation:
+            logger.warning(
+                "Stateless worker workspace authority changed during bundle "
+                "assembly for job %s",
+                unit_id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="Stateless worker workspace authority unavailable",
+            )
+
+        # Recheck the exact lease after both slow operations so a stolen zombie
+        # never receives either credentials or workspace authority.
         async with postgres_db.acquire() as conn:
             lease_still_current = bool(
                 await conn.fetchval(
