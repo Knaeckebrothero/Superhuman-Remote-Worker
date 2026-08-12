@@ -1366,6 +1366,56 @@ class GiteaClient:
             logger.warning(f"Failed to create PR in {repo_name}: {e}")
             return None
 
+    async def list_pull_requests(
+        self,
+        repo_name: str,
+        *,
+        state: str = "all",
+        page: int = 1,
+        limit: int = 50,
+    ) -> list[dict] | None:
+        """List pull requests with the identity fields reconciliation needs.
+
+        ``state='all'`` is load-bearing for completion replay: the process may
+        die after a PR was merged or closed, so open-only listing would turn an
+        existing command-keyed PR into a false absence.  ``None`` means the
+        probe was ambiguous; callers must not interpret it as an empty page.
+        """
+        if not self._initialized:
+            return None
+
+        client = self._get_client()
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls",
+                params={"state": state, "page": page, "limit": limit},
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "Failed to list PRs in %s (status %s)",
+                    repo_name,
+                    resp.status_code,
+                )
+                return None
+            pulls: list[dict] = []
+            for raw in resp.json():
+                head = raw.get("head") if isinstance(raw, dict) else None
+                base = raw.get("base") if isinstance(raw, dict) else None
+                pulls.append(
+                    {
+                        "number": raw.get("number"),
+                        "title": raw.get("title") or "",
+                        "body": raw.get("body") or "",
+                        "state": raw.get("state") or "",
+                        "head": head.get("ref") if isinstance(head, dict) else None,
+                        "base": base.get("ref") if isinstance(base, dict) else None,
+                    }
+                )
+            return pulls
+        except Exception as exc:  # noqa: BLE001 - ambiguity must be explicit
+            logger.warning("Failed to list PRs in %s: %s", repo_name, exc)
+            return None
+
     async def merge_pr(
         self,
         repo_name: str,
@@ -1413,6 +1463,49 @@ class GiteaClient:
         except httpx.HTTPError as e:
             logger.warning(f"Failed to merge PR #{pr_index} in {repo_name}: {e}")
             return False
+
+    async def probe_pr_merged(self, repo_name: str, pr_index: int) -> bool | None:
+        """Return Gitea's exact merge state for one pull request.
+
+        Gitea's ``GET .../pulls/{index}/merge`` handler is unusual: the
+        response body can disagree with the HTTP status after the handler has
+        already written a 204.  The status code is therefore the complete
+        protocol here -- 204 means merged, 404 means not merged, and every
+        other response is ambiguous and must be retried rather than guessed.
+
+        ``None`` also covers an uninitialized client and transport failures.
+        In particular, 405 is *not* treated as already merged because Gitea
+        uses it for several unrelated refusal modes.
+        """
+        if not self._initialized:
+            return None
+
+        client = self._get_client()
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls/"
+                f"{pr_index}/merge"
+            )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Failed to probe merge state for PR #%s in %s: %s",
+                pr_index,
+                repo_name,
+                exc,
+            )
+            return None
+
+        if resp.status_code == 204:
+            return True
+        if resp.status_code == 404:
+            return False
+        logger.warning(
+            "Ambiguous merge-state response for PR #%s in %s (status %s)",
+            pr_index,
+            repo_name,
+            resp.status_code,
+        )
+        return None
 
     async def close_pr(self, repo_name: str, pr_index: int) -> bool:
         """Close a pull request WITHOUT merging it.

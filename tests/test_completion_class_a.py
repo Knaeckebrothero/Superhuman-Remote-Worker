@@ -127,6 +127,124 @@ class TestUpdateJobStatusClassA:
         assert "WHERE id = $2 AND status::text = $3::text" in sql
         assert args[1:] == ("completed", UUID(JOB_ID), "processing")
 
+    @pytest.mark.asyncio
+    async def test_completion_term_and_entry_status_are_one_atomic_cas(self):
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        db = _db_with_connection(conn)
+        command_id = "44444444-4444-4444-8444-444444444444"
+
+        assert await db.update_job_status(
+            JOB_ID,
+            status="completed",
+            expected_status="processing",
+            completion_command_id=command_id,
+            completion_finalizing_by="attempt-owner",
+        )
+
+        args = conn.execute.await_args.args
+        sql = _normalized(args[0])
+        assert "WHERE id = $2 AND status::text = $3::text" in sql
+        assert "command.id = $4::uuid" in sql
+        assert "command.job_id = jobs.id" in sql
+        assert "command.state = 'finalizing'" in sql
+        assert "command.finalizing_by = $5::text" in sql
+        assert "command.lease_expires_at > now()" in sql
+        assert "command.deadline_at > now()" in sql
+        assert args[1:] == (
+            "completed",
+            UUID(JOB_ID),
+            "processing",
+            UUID(command_id),
+            "attempt-owner",
+        )
+
+    @pytest.mark.asyncio
+    async def test_completion_term_arguments_must_be_paired(self):
+        conn = AsyncMock()
+        db = _db_with_connection(conn)
+
+        with pytest.raises(ValueError, match="must be paired"):
+            await db.update_job_status(
+                JOB_ID,
+                status="completed",
+                completion_command_id="44444444-4444-4444-8444-444444444444",
+            )
+
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_workspace_recovery_marker_shares_failed_disposition_cas(self):
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        conn.fetchval = AsyncMock(return_value="stateless")
+        db = _db_with_connection(conn)
+        command_id = "44444444-4444-4444-8444-444444444444"
+        marker = {
+            "recovery_completion_command_id": command_id,
+            "recovery_completion_outcome": {"new_status": "failed"},
+        }
+
+        assert await db.update_job_status(
+            JOB_ID,
+            status="failed",
+            workspace_context_updates=marker,
+            expected_status="processing",
+            completion_command_id=command_id,
+            completion_finalizing_by="attempt-owner",
+        )
+
+        args = conn.execute.await_args.args
+        sql = _normalized(args[0])
+        assert "status = $1" in sql
+        assert "context = jsonb_set(" in sql
+        assert "'{workspace_container}'" in sql
+        assert "|| $2::jsonb" in sql
+        assert "WHERE id = $3 AND status::text = $4::text" in sql
+        assert "command.id = $5::uuid" in sql
+        assert "command.finalizing_by = $6::text" in sql
+        assert args[1:] == (
+            "failed",
+            json.dumps(marker),
+            UUID(JOB_ID),
+            "processing",
+            UUID(command_id),
+            "attempt-owner",
+        )
+
+    @pytest.mark.asyncio
+    async def test_workspace_recovery_pause_marker_and_term_are_one_update(self):
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        db = _db_with_connection(conn)
+        command_id = "44444444-4444-4444-8444-444444444444"
+        marker = {
+            "recovery_completion_command_id": command_id,
+            "recovery_completion_outcome": {"new_status": "paused"},
+        }
+
+        assert await db.pause_job_shed_freeze(
+            JOB_ID,
+            completion_command_id=command_id,
+            completion_finalizing_by="attempt-owner",
+            workspace_context_updates=marker,
+        )
+
+        args = conn.execute.await_args.args
+        sql = _normalized(args[0])
+        assert "SET status = 'paused'" in sql
+        assert "context = jsonb_set(" in sql
+        assert "'{workspace_container}'" in sql
+        assert "|| $2::jsonb" in sql
+        assert "command.id = $3::uuid" in sql
+        assert "command.finalizing_by = $4::text" in sql
+        assert args[1:] == (
+            UUID(JOB_ID),
+            json.dumps(marker),
+            UUID(command_id),
+            "attempt-owner",
+        )
+
 
 class _EndpointDB(PostgresDB):
     """Small real-helper/fake-connection DB for driving ``complete_job``."""

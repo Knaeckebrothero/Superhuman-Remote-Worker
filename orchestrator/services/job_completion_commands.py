@@ -27,6 +27,10 @@ from src.shared.run_queue import complete_unit
 
 COMPLETION_CODE_VERSION = "job-completion-v1"
 COMPLETION_DEADLINE_SECONDS = 24 * 60 * 60
+# Keep a newly accepted row away from the background candidate scan long
+# enough for the request's exact-ID inline claim.  The inline claim ignores
+# run_after, so cancellation before that claim still leaves a bounded drain.
+COMPLETION_INLINE_GRACE_SECONDS = 2.0
 
 # Stable, application-owned namespace.  The fallback exists only for rolling
 # compatibility with old agents; it is allocated after report_seq while the
@@ -345,12 +349,13 @@ async def accept_completion_command(
                 INSERT INTO job_completion_commands (
                     job_id, report_seq, client_report_id, payload,
                     payload_digest, accepted_lease_token, accepted_agent_id,
-                    origin, requested_by, deadline_at, code_version
+                    origin, requested_by, deadline_at, code_version, run_after
                 ) VALUES (
                     $1::uuid, $2::bigint, $3::uuid, $4::jsonb,
                     $5::text, $6::bigint, $7::uuid,
                     'agent', $8::text,
-                    now() + make_interval(secs => $9::float8), $10::text
+                    now() + make_interval(secs => $9::float8), $10::text,
+                    now() + make_interval(secs => $11::float8)
                 )
                 RETURNING id, job_id, report_seq, client_report_id, payload,
                           payload_digest, accepted_lease_token,
@@ -366,6 +371,7 @@ async def accept_completion_command(
                 requested_by,
                 float(COMPLETION_DEADLINE_SECONDS),
                 code_version,
+                COMPLETION_INLINE_GRACE_SECONDS,
             )
             await conn.execute(
                 """
@@ -402,31 +408,9 @@ async def accept_completion_command(
             )
 
 
-async def complete_completion_command(
-    db: Any,
-    command_id: str,
-    outcome: Mapping[str, Any],
-) -> bool:
-    """Store the exact legacy HTTP outcome for a freshly accepted command."""
-
-    outcome_json = _canonical_json(dict(outcome))
-    async with _connection(db) as conn:
-        updated = await conn.fetchval(
-            """
-            UPDATE job_completion_commands
-            SET state = 'done', outcome = $2::jsonb, finalized_at = now(),
-                finalizing_by = NULL, lease_expires_at = NULL
-            WHERE id = $1::uuid AND state IN ('pending', 'finalizing')
-            RETURNING 1
-            """,
-            UUID(str(command_id)),
-            outcome_json,
-        )
-    return updated is not None
-
-
 __all__ = [
     "COMPLETION_CODE_VERSION",
+    "COMPLETION_INLINE_GRACE_SECONDS",
     "CompletionAcceptResult",
     "CompletionCommandError",
     "CompletionCommandNotFound",
@@ -435,7 +419,6 @@ __all__ = [
     "CompletionPayloadMismatch",
     "accept_completion_command",
     "canonical_completion_payload",
-    "complete_completion_command",
     "completion_payload_digest",
     "fallback_client_report_id",
 ]

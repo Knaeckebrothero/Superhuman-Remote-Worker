@@ -56,6 +56,32 @@ def _valid_ssh_sha256_fingerprint(value: object) -> bool:
     )
 
 
+def _terminal_generation_name(value: object) -> str:
+    """Return the fixed S3 generation name for one completion command.
+
+    Terminal workspace capture is replayed by a durable command.  A random or
+    wall-clock history name would turn every replay into another snapshot, so
+    this key accepts only a canonical UUID and is deliberately command-shaped.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError("terminal snapshot generation is invalid")
+    try:
+        parsed = uuid.UUID(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("terminal snapshot generation is invalid") from exc
+    if str(parsed) != value:
+        raise ValueError("terminal snapshot generation is invalid")
+    return f"completion-{value}"
+
+
+def _snapshot_object_missing(exc: BaseException) -> bool:
+    if not isinstance(exc, ClientError):
+        return False
+    code = str(exc.response.get("Error", {}).get("Code", ""))
+    return code in {"404", "NoSuchKey", "NotFound"}
+
+
 async def _read_stream_tail(stream: Any, *, limit: int = 64 * 1024) -> bytes:
     """Drain a subprocess pipe without unbounded buffering, retaining its tail."""
 
@@ -124,8 +150,9 @@ def _snapshot_tar_pipeline(include_dirs: list[str], *, strict_terminal: bool) ->
                 "--exclude=*/repos/*",
             ]
         )
+    stable_order = "--sort=name " if strict_terminal else ""
     pipeline = (
-        "tar --xattrs --xattrs-include='*' --acls -cf - "
+        f"tar {stable_order}--xattrs --xattrs-include='*' --acls -cf - "
         f"{' '.join(exclude_patterns)} {' '.join(shlex.quote(path) for path in include_dirs)} "
         "2>/dev/null | zstd -1 -T0"
     )
@@ -249,6 +276,7 @@ class SnapshotService:
         manifest: dict[str, Any],
         phase_number: Optional[int] = None,
         entity_type: str = "jobs",
+        terminal_generation: Optional[str] = None,
     ) -> bool:
         """Upload a snapshot tarball + manifest to S3.
 
@@ -394,7 +422,11 @@ class SnapshotService:
                 # fail-safe (verify_snapshot's deep hash catches a
                 # tar/manifest mismatch) and recoverable from the
                 # history/<ts>/ generation just written.
-                ts = self._history_generation_stamp(manifest, staging_uuid)
+                ts = (
+                    _terminal_generation_name(terminal_generation)
+                    if terminal_generation is not None
+                    else self._history_generation_stamp(manifest, staging_uuid)
+                )
                 history_prefix = f"{prefix}/history/{ts}"
                 copy_source = {"Bucket": self._bucket, "Key": staging_key}
 
@@ -433,15 +465,16 @@ class SnapshotService:
             # already-durable promote — the new snapshot (canonical + its
             # own history generation) is safe regardless of whether old
             # generations get swept this round or the next.
-            try:
-                await self._prune_history(prefix, self._keep_generations())
-            except Exception:
-                logger.exception(
-                    "History prune failed for %s %s (canonical + new "
-                    "generation are unaffected)",
-                    entity_type.rstrip("s"),
-                    job_id,
-                )
+            if terminal_generation is None:
+                try:
+                    await self._prune_history(prefix, self._keep_generations())
+                except Exception:
+                    logger.exception(
+                        "History prune failed for %s %s (canonical + new "
+                        "generation are unaffected)",
+                        entity_type.rstrip("s"),
+                        job_id,
+                    )
 
             # Update entity context
             await self._set_snapshot_context(
@@ -616,6 +649,9 @@ class SnapshotService:
         work_marker: Optional[int] = None,
         expected_host_key_fingerprint: Optional[str] = None,
         strict_terminal: bool = False,
+        terminal_generation: Optional[str] = None,
+        terminal_created_at: Optional[str] = None,
+        expected_runtime_incarnation: Optional[str] = None,
     ) -> bool:
         """Capture a VM environment snapshot via SSH tar and upload to S3.
 
@@ -636,6 +672,37 @@ class SnapshotService:
         """
         if not self._available:
             return False
+
+        if terminal_generation is not None:
+            try:
+                _terminal_generation_name(terminal_generation)
+            except ValueError as exc:
+                logger.error("Terminal snapshot refused: %s", exc)
+                return False
+            if (
+                not strict_terminal
+                or source_type != "pod"
+                or not isinstance(terminal_created_at, str)
+                or not terminal_created_at
+                or not isinstance(expected_runtime_incarnation, str)
+                or not expected_runtime_incarnation
+            ):
+                logger.error(
+                    "Command-keyed terminal snapshot refused without strict "
+                    "runtime identity for %s %s",
+                    entity_type.rstrip("s"),
+                    job_id,
+                )
+                return False
+            reconciled, _ = await self.reconcile_terminal_snapshot_generation(
+                job_id,
+                terminal_generation=terminal_generation,
+                entity_type=entity_type,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+                expected_host_key_fingerprint=expected_host_key_fingerprint,
+            )
+            if reconciled:
+                return True
 
         if strict_terminal and not _valid_ssh_sha256_fingerprint(
             expected_host_key_fingerprint
@@ -995,7 +1062,11 @@ class SnapshotService:
                 "version": 1,
                 "job_id": job_id,
                 "source_type": source_type,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": (
+                    terminal_created_at
+                    if terminal_generation is not None
+                    else datetime.now(timezone.utc).isoformat()
+                ),
                 "agent_config": agent_config,
                 "compression": "zstd",
                 "size_compressed_bytes": total_bytes,
@@ -1017,6 +1088,14 @@ class SnapshotService:
                 manifest["sha256_compressed"] = await asyncio.to_thread(
                     _sha256_file, tar_path
                 )
+            if terminal_generation is not None:
+                manifest.update(
+                    {
+                        "terminal_generation": terminal_generation,
+                        "runtime_incarnation": expected_runtime_incarnation,
+                        "ssh_host_key_fingerprint": expected_host_key_fingerprint,
+                    }
+                )
 
             # Upload to S3
             uploaded = await self.upload_snapshot(
@@ -1025,6 +1104,7 @@ class SnapshotService:
                 manifest=manifest,
                 phase_number=phase_number,
                 entity_type=entity_type,
+                terminal_generation=terminal_generation,
             )
             # Record the work-marker (turn count at capture) into the workspace
             # context so the lifecycle reaper's is_dirty can tell whether new
@@ -1195,6 +1275,134 @@ class SnapshotService:
                 return None
             logger.error("Failed to get manifest for job %s: %s", job_id, e)
             return None
+
+    async def reconcile_terminal_snapshot_generation(
+        self,
+        job_id: str,
+        *,
+        terminal_generation: str,
+        entity_type: str = "jobs",
+        expected_runtime_incarnation: str,
+        expected_host_key_fingerprint: object,
+    ) -> tuple[bool, str]:
+        """Prove one command-keyed strict snapshot and repair its canonical alias.
+
+        The history pair is the durable idempotency record.  Both objects must
+        exist, the manifest must name the exact completion command/runtime/SSH
+        key, and the archived bytes must match its digest.  A one-object crash
+        residue is reported as ``partial`` so the finalizer retries capture; a
+        complete pair is safely copied over the ordinary canonical read keys.
+        """
+
+        if not self._available:
+            return False, "unavailable"
+        try:
+            generation_name = _terminal_generation_name(terminal_generation)
+        except ValueError:
+            return False, "invalid generation"
+        if (
+            not isinstance(expected_runtime_incarnation, str)
+            or not expected_runtime_incarnation
+            or not _valid_ssh_sha256_fingerprint(expected_host_key_fingerprint)
+        ):
+            return False, "invalid runtime identity"
+
+        prefix = f"{entity_type}/{job_id}"
+        history_prefix = f"{prefix}/history/{generation_name}"
+        archive_key = f"{history_prefix}/env.tar.zst"
+        manifest_key = f"{history_prefix}/manifest.json"
+
+        archive_head: dict[str, Any] | None = None
+        manifest_bytes: bytes | None = None
+        try:
+            archive_head = await asyncio.to_thread(
+                self._s3.head_object, Bucket=self._bucket, Key=archive_key
+            )
+        except ClientError as exc:
+            if not _snapshot_object_missing(exc):
+                return False, f"probe error: {exc}"
+        except Exception as exc:
+            return False, f"probe error: {exc}"
+        try:
+            response = await asyncio.to_thread(
+                self._s3.get_object, Bucket=self._bucket, Key=manifest_key
+            )
+            manifest_bytes = await asyncio.to_thread(response["Body"].read)
+        except ClientError as exc:
+            if not _snapshot_object_missing(exc):
+                return False, f"probe error: {exc}"
+        except Exception as exc:
+            return False, f"probe error: {exc}"
+
+        if archive_head is None and manifest_bytes is None:
+            return False, "missing"
+        if archive_head is None or manifest_bytes is None:
+            return False, "partial"
+        try:
+            manifest = json.loads(manifest_bytes)
+        except (TypeError, ValueError):
+            return False, "partial: malformed manifest"
+        if not isinstance(manifest, dict):
+            return False, "partial: malformed manifest"
+
+        digest = manifest.get("sha256_compressed")
+        checksum = manifest.get("checksum_sha256")
+        size = manifest.get("size_compressed_bytes")
+        if (
+            manifest.get("strict_terminal") is not True
+            or manifest.get("terminal_generation") != terminal_generation
+            or manifest.get("runtime_incarnation") != expected_runtime_incarnation
+            or manifest.get("ssh_host_key_fingerprint") != expected_host_key_fingerprint
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+            or checksum != digest
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size <= 0
+            or archive_head.get("ContentLength") != size
+        ):
+            return False, "partial: identity or integrity metadata mismatch"
+        try:
+            observed_digest = await asyncio.to_thread(
+                self._streaming_sha256_from_s3, archive_key
+            )
+        except Exception as exc:
+            return False, f"probe error: {exc}"
+        if observed_digest != digest:
+            return False, "partial: sha256 mismatch"
+
+        # History is authoritative.  Repair a crash between history promotion
+        # and the two ordinary canonical writes before teardown is authorized.
+        try:
+            await _joined_blocking_call(
+                self._s3.copy,
+                {"Bucket": self._bucket, "Key": archive_key},
+                self._bucket,
+                f"{prefix}/env.tar.zst",
+            )
+            await _joined_blocking_call(
+                self._s3.put_object,
+                Bucket=self._bucket,
+                Key=f"{prefix}/manifest.json",
+                Body=manifest_bytes,
+                ContentType="application/json",
+            )
+        except Exception as exc:
+            return False, f"canonical repair error: {exc}"
+        await self._set_snapshot_context(
+            job_id,
+            {
+                "status": "available",
+                "source_type": "pod",
+                "created_at": manifest.get("created_at"),
+                "size_compressed_bytes": size,
+                "phase_number": None,
+                "checksum_sha256": digest,
+            },
+            entity_type=entity_type,
+        )
+        return True, "complete"
 
     async def download_snapshot(
         self,
@@ -1931,7 +2139,7 @@ class SnapshotService:
             for obj in page.get("Contents", []):
                 rest = obj["Key"][len(history_prefix) :]
                 generation = rest.split("/", 1)[0]
-                if generation:
+                if generation and not generation.startswith("completion-"):
                     generations.add(generation)
 
         if len(generations) <= keep:

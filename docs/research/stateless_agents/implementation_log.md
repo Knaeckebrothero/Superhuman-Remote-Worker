@@ -3848,3 +3848,72 @@ The post-M2 repository-wide non-fail-fast suite produced the exact baseline
 failure set again: **17,134 passed, 163 skipped, 11 failed**. This is +46 from
 the post-M1 count and contains no new failure. Repository-wide Ruff check and
 format check (1,109 files) and the whitespace gate also pass.
+
+## M3 shipped
+
+- Added a River-style completion finalizer with two independent ownership
+  fences: a logged, expiring, exact-term leader lease for the drain and a fresh
+  per-claim execution UUID for each command. Pending and expired-finalizing
+  commands are claimed in report order, live terms are never stolen, renew/
+  settle/retry/park writes all CAS the exact owner, and retries use the existing
+  `5s * attempts * (1 + U(0, 0.2))` dialect with a process-global retry bucket.
+  Election, candidate reads, renewal loss and release tolerate transient
+  database failures without leaving a silent zero-leader drain.
+- Factored the existing `/complete` body behind a zero-cost optional effect
+  runner. The closed-gate arm calls that body directly and does not import the
+  finalizer or read/write any Gate-3 relation. The durable arm accepts and
+  commits the command first, then runs the same S1--S37 order inline; lifespan
+  starts the resume drain only when the flag is enabled. Successful early
+  returns and deterministic legacy HTTP guards are stored and replayed exactly.
+- Added stable effect intent/completion records, bounded replay detail,
+  per-effect ambiguity deadlines strictly inside the command lease, group-local
+  retry scheduling and independently retryable tail groups. Pure Postgres
+  effects can share a task-bound transaction with their journal marker; child
+  tasks cannot inherit its connection. The main status disposition is fenced
+  by both its recorded entry status and the exact finalizer term, so a foreign
+  concurrent transition is not adopted as this command's write.
+- Closed the inventory's external action/marker windows with command-keyed
+  reconciliation where a database transaction cannot span the action: loop
+  WebDAV delivery records a fixed-cardinality context intent; subjob graft and
+  terminal merge use exact paginated Gitea commit/PR markers and probes;
+  verification critic creation reconciles the 0132 natural key; curation handoff
+  carries the command key. Ambiguous external responses remain pending for a
+  probe instead of being journaled as success or failure.
+- Made Kubernetes terminal cleanup replay-safe. Its intent captures exact Pod,
+  PVC and Service UIDs plus fresh SSH endpoint/host-key identity. A strict,
+  deterministic `history/completion-<command UUID>` snapshot is deeply verified
+  or repaired before UID-preconditioned deletion; a same-name replacement
+  aborts the entire old-resource teardown. This effect receives an 890-second
+  ambiguity window inside a 900-second command lease, then atomically shrinks
+  the command back to the ordinary 120-second term after completion.
+- Preserved the accept-time B4 handoff: once the immutable worker token has been
+  accepted and its queue row closed, finalization trusts the command fence and
+  never revalidates the mutable worker lease. Resume after an S17 crash uses the
+  command's own recorded disposition and continues the remaining tail rather
+  than tripping the legacy late-callback guard.
+
+The deliberately deferred boundaries are important. Status-write reordering,
+decision-(6) resume/claim/sweep routing, Class-B/Class-A atomicity, background
+stateless response timing and winner/supersession policy remain steps 4, 5 and
+the optional M5; none is activated here. VM-specific recovery and VM/Docker
+terminal teardown remain the exact legacy best-effort path because the brief
+puts anything VM out of scope; they create no durable teardown effect. The
+Kubernetes durable S24 snapshot awaits capture rather than merely journaling an
+`asyncio.create_task` schedule marker, while the flag-off path retains the
+historical detached timing. These are the only intentional coverage/timing
+differences from the generic §5.4.5 model, chosen to respect the brief's scope
+and to avoid falsely marking an external effect complete.
+
+Verification at the M3 boundary: **121 net new collected cases** beyond M2
+(the remaining four of the full-suite delta are unstaged M4 Helm cases), plus
+the independently selected affected matrix passed **930/930**. The focused
+coverage includes leader loss/takeover, dual command claims, deadline/cap
+parking, jitter and token-bucket behavior, exact-term stale-writer rejection,
+effect intent-before-action/replay, group independence, transactional rollback,
+long-lease shrink, accept-to-cancellation drain resume, S17/tail crash replay,
+large freeze payloads, command-keyed external probes and UID-safe teardown.
+Real-Postgres tests exercise command/effect concurrency and exact-term lease
+takeover. The repository-wide non-fail-fast suite produced the exact baseline
+set again: **17,259 passed, 163 skipped, 11 failed**, with no new failure.
+Repository-wide Ruff check and format check (1,116 files) and the whitespace
+gate pass. M4 operational parity/kill proof and optional M5 remain.

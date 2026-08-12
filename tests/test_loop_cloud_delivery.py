@@ -174,6 +174,170 @@ async def test_clean_diff_is_applied_and_accepted():
 
 
 @pytest.mark.asyncio
+async def test_completion_command_registers_bounded_intent_before_cloud_apply():
+    job = _job()
+    db = _db()
+    db.merge_job_context = AsyncMock()
+    order: list[str] = []
+
+    async def clean(*_args, **_kwargs):
+        order.append("divergence-check")
+        return []
+
+    async def register(*_args, **_kwargs):
+        order.append("intent")
+        return True
+
+    async def apply(*_args, **_kwargs):
+        order.append("apply")
+        return {"applied": 1, "deleted": 0, "errors": []}
+
+    db.merge_job_context.side_effect = register
+    with (
+        patch("services.job_cloud_baseline.detect_external_mods", side_effect=clean),
+        patch("services.job_cloud_baseline.apply_diff_to_cloud", side_effect=apply),
+    ):
+        outcome = await deliver_loop_diff_to_cloud(
+            job=job,
+            project=PROJECT,
+            postgres_db=db,
+            gitea_client=_gitea(),
+            main_cloud_router=MagicMock(),
+            completion_command_id="command-1",
+        )
+
+    assert outcome["delivery_status"] == "cloud-applied"
+    assert order == ["divergence-check", "intent", "apply"]
+    db.merge_job_context.assert_awaited_once_with(
+        str(job["id"]),
+        {
+            "loop_cloud_delivery": {
+                "delivery_status": "cloud-applying",
+                "completion_command_id": "command-1",
+                "baseline_commit": BASE,
+                "delivery_sha": HEAD,
+            }
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_command_reapplies_after_cloud_apply_before_db_stamp():
+    job = _job()
+    db = _db()
+    db.merge_job_context = AsyncMock()
+
+    async def persist_intent(_job_id, patch):
+        context = dict(job["context"])
+        context.update(patch)
+        job["context"] = context
+        return True
+
+    db.merge_job_context.side_effect = persist_intent
+    db.update_job_cloud_diff.side_effect = [
+        True,
+        RuntimeError("crash after WebDAV apply"),
+        True,
+        True,
+    ]
+    detect = AsyncMock(return_value=[])
+    apply = AsyncMock(return_value={"applied": 1, "deleted": 0, "errors": []})
+
+    with (
+        patch("services.job_cloud_baseline.detect_external_mods", detect),
+        patch("services.job_cloud_baseline.apply_diff_to_cloud", apply),
+    ):
+        with pytest.raises(RuntimeError, match="crash after WebDAV apply"):
+            await deliver_loop_diff_to_cloud(
+                job=job,
+                project=PROJECT,
+                postgres_db=db,
+                gitea_client=_gitea(),
+                main_cloud_router=MagicMock(),
+                completion_command_id="command-1",
+            )
+
+        outcome = await deliver_loop_diff_to_cloud(
+            job=job,
+            project=PROJECT,
+            postgres_db=db,
+            gitea_client=_gitea(),
+            main_cloud_router=MagicMock(),
+            completion_command_id="command-1",
+        )
+
+    assert outcome["delivery_status"] == "cloud-applied"
+    assert detect.await_count == 1
+    assert apply.await_count == 2
+    assert db.merge_job_context.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cloud_apply_does_not_start_when_command_intent_is_not_durable():
+    job = _job()
+    db = _db()
+    db.merge_job_context = AsyncMock(return_value=False)
+    detect = AsyncMock(return_value=[])
+    apply = AsyncMock()
+
+    with (
+        patch("services.job_cloud_baseline.detect_external_mods", detect),
+        patch("services.job_cloud_baseline.apply_diff_to_cloud", apply),
+    ):
+        with pytest.raises(RuntimeError, match="could not persist"):
+            await deliver_loop_diff_to_cloud(
+                job=job,
+                project=PROJECT,
+                postgres_db=db,
+                gitea_client=_gitea(),
+                main_cloud_router=MagicMock(),
+                completion_command_id="command-1",
+            )
+
+    detect.assert_awaited_once()
+    apply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_different_command_cannot_adopt_cloud_apply_intent():
+    job = _job(
+        context={
+            "cloud_baseline": {"entries": {"report.md": "etag-before"}},
+            "loop_cloud_delivery": {
+                "delivery_status": "cloud-applying",
+                "completion_command_id": "old-command",
+                "baseline_commit": BASE,
+                "delivery_sha": HEAD,
+            },
+        }
+    )
+    db = _db()
+    db.merge_job_context = AsyncMock()
+    diverged = [{"path": "report.md", "kind": "etag_mismatch"}]
+    detect = AsyncMock(return_value=diverged)
+    apply = AsyncMock()
+
+    with (
+        patch("services.job_cloud_baseline.detect_external_mods", detect),
+        patch("services.job_cloud_baseline.apply_diff_to_cloud", apply),
+    ):
+        outcome = await deliver_loop_diff_to_cloud(
+            job=job,
+            project=PROJECT,
+            postgres_db=db,
+            gitea_client=_gitea(),
+            main_cloud_router=MagicMock(),
+            completion_command_id="new-command",
+        )
+
+    assert outcome["delivery_status"] == "cloud-conflict"
+    assert outcome["diverged"] == diverged
+    detect.assert_awaited_once()
+    apply.assert_not_awaited()
+    db.merge_job_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_external_conflict_requires_review_and_does_not_apply():
     job = _job()
     db = _db()
