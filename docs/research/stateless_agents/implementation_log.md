@@ -3722,3 +3722,70 @@ unverified operational item
 is that guarded cleanup of `e4bb35f8-…`; the production two-Deployment/KEDA
 split, Job Bench and Gate 3 finalizer remain the previously documented future
 scope rather than integration regressions.
+
+# Session 14 — Gate 3 steps 2+3, M1 schema (2026-08-12)
+
+Branch: `develop`, direct and not pushed. The session opened at the brief commit
+`f831ca29` with only untracked `HomeLab/`. During the untouched baseline run an
+external rebase moved `develop` to the byte-equivalent brief commit `8230ac81`
+on newer `origin/develop` `4a8da032`; the reflog records the rebase at
+21:57:28+02. The three intervening differences are deployment image-tag/value
+updates. No local Gate-3 edits were lost, Tilt was down, and work continued on
+the newer base. `HomeLab/` remained untouched and untracked.
+
+## Required pre-edit baseline
+
+The literal `./scripts/pytest-fast.sh` invocation unexpectedly inherited the
+wrapper's default `-x` and stopped at the first failure. Before any edit, the
+same wrapper was therefore rerun explicitly without fail-fast as
+`./scripts/pytest-fast.sh tests/ -q --tb=short`: **17,066 passed, 163 skipped,
+11 failed**. The exact baseline failures are:
+
+1. `tests/tools/research/test_arxiv_client.py::test_installed_arxiv_package_exposes_client_results`
+2. `tests/test_database_phase1.py::TestPostgresDB::test_connect_disconnect`
+3. `tests/test_mcp_manager.py::test_connect_discover_call_close`
+4. `tests/test_mcp_manager.py::test_unreachable_server_degrades_not_raises`
+5. `tests/test_mcp_manager.py::test_remote_transport_discover_and_call[http-streamable-http-/mcp]`
+6. `tests/test_mcp_manager.py::test_remote_transport_discover_and_call[sse-sse-/sse]`
+7. `tests/test_mcp_manager.py::test_tool_error_returns_string_not_raise`
+8. `tests/test_mcp_manager.py::test_reconnect_once_revives_tool`
+9. `tests/tools/research/test_semantic_scholar_client.py::test_arxiv_health_checks_installed_client_contract`
+10. `tests/tools/research/test_semantic_scholar_client.py::test_combined_probe_is_secret_free`
+11. `tests/test_mcp_agent_wiring.py::test_full_job_path_slice`
+
+These are the expected missing-arXiv-package, localhost-Postgres and
+MCP/Python-3.14 environment failures. They are the comparison set for every
+later full-suite gate and were not chased.
+
+## M1 shipped
+
+- Added transactional migration `0140_job_completion_commands.sql`, copied
+  from §5.4.5 for `job_completion_commands` and `completion_effects`, including
+  the load-bearing agent/operator fence XOR, the full bidirectional terminal
+  shape, the six-state vocabulary, the same-file bounded-churn drain index and
+  deliberately no effect-state index or effect foreign key.
+- Added `jobs.completion_seq_hwm`, a logged named finalizer lease table whose
+  exact `(leader_id, elected_at)` pair forms its renewal term, and the single
+  decision-(6) `job_completion_sweep_exclusions` view. The view excludes only
+  live completion leases and parked operator work; an expired or NULL-lease
+  command remains available to finalizer-resume routing.
+- Regenerated `orchestrator/database/schema_current.sql` from the complete
+  migration chain and advanced the app-migration-head tripwire to 0140.
+- Added real-Postgres coverage for every documented half-written fence and
+  terminal state shape, valid terminal shapes, per-job client-report dedup,
+  drain/effect index policy, view semantics and term-shaped lease renewal.
+
+There is no deviation from §5.4.5. That section does not prescribe names or
+exact DDL for the lease table/view; `completion_finalizer_leases` is named so
+the election can remain reusable by named finalizer domains, while M3 uses one
+`job_completion` row. Schema remains completely dead: no production code reads
+or writes any new object.
+
+Verification so far: the new real-Postgres module passes **22/22**; Squawk
+v2.59.0 reports **0 findings**; a full from-zero snapshot replay applied 0140
+on PostgreSQL 15 and changed only the app artifact; the idempotence replay
+reported the artifacts current. The post-M1 non-fail-fast suite produced the
+same exact 11-failure set with **17,088 passed and 163 skipped** (the +22 are
+the new real-Postgres cases). M2 (durable accept and agent retry identity), M3
+(inline finalizer/resume drain), M4 (flag/parity/k3d kill proof) and optional
+M5 remain.

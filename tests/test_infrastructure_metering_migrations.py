@@ -138,7 +138,8 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 # owner-gated client presence (0125), and lane-independent Canvas editor
 # awareness (0126), the exact-lease interrupt inbox (0127-0129), and the
 # verification-critic dedupe/concurrent unique-index rollout (0130-0132), and
-# the S2 durable persistent-session residue tables (0133).
+# the S2 durable persistent-session residue tables (0133), and the Gate-3
+# completion command substrate (0140; 0134-0139 are reserved).
 APP_DATASOURCE_TOMBSTONES_MIGRATION = (
     ROOT / "orchestrator/database/migrations/app/0115_datasource_tombstones.sql"
 )
@@ -195,9 +196,10 @@ APP_JOBS_VERIFICATION_INDEX = (
 APP_THREAD_SESSION_DURABLE_STATE = (
     ROOT / "orchestrator/database/migrations/app/0133_thread_session_durable_state.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = (
-    ROOT / "orchestrator/database/migrations/app/0133_thread_session_durable_state.sql"
+APP_JOB_COMPLETION_COMMANDS = (
+    ROOT / "orchestrator/database/migrations/app/0140_job_completion_commands.sql"
 )
+APP_CURRENT_MIGRATION_HEAD = APP_JOB_COMPLETION_COMMANDS
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
