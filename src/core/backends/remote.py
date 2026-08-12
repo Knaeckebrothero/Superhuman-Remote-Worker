@@ -2004,7 +2004,6 @@ __SRW_PROCESS_ZERO_PY__
         return (
             self._tmux_state_shell()
             + "_srw_load_state || exit 78\n"
-            + '[ "$_srw_process_tagged" = true ] || exit 81\n'
             + workspace_state_check
             + '[ "$_srw_status" = active ] || exit 75\n'
             + f'[ "$_srw_token" = {shlex.quote(token)} ] || exit 75\n'
