@@ -626,6 +626,8 @@ python init.py --restore-backup backups/20260201_001    # Restore
 ### 7. Testing
 
 ```bash
+python -m pip install -r requirements-dev.txt  # One-time test dependencies
+./scripts/pytest-fast.sh                   # All tests, bounded parallel runner
 pytest tests/                              # All tests
 pytest tests/test_graph.py -v              # Single file
 pytest tests/ -k "todo"                    # Pattern match

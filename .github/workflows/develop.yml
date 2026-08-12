@@ -963,9 +963,9 @@ jobs:
         run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt -r orchestrator/mcp/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
       # `changes` narrowed this to the test files the diff can reach; the fallback
       # covers a dispatch, where selection is skipped on purpose, and any path
-      # where the output is unset.
+      # where the output is unset. loadfile keeps each selected file on one worker.
       - name: Run tests
-        run: pytest ${{ needs.changes.outputs.pytest-target || 'tests/' }} -x -q --tb=short
+        run: ./scripts/pytest-fast.sh ${{ needs.changes.outputs.pytest-target || 'tests/' }} -x -q --tb=short
 
   # ---------------------------------------------------------------------------
   # Cockpit unit + production-browser conformance tests (change-based)
