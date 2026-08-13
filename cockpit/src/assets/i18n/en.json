@@ -419,6 +419,7 @@
     "emptyHint": "Create a new project to get started",
     "createProject": "Create Project",
     "creating": "Creating...",
+    "createFailed": "Could not create the project. Check the details and try again.",
     "namePlaceholder": "Project name (required)",
     "descriptionPlaceholder": "Description (optional)",
     "goalPlaceholder": "Goal (optional)",
@@ -436,6 +437,13 @@
     },
     "error": {
       "noAccess": "You don't have access to that project."
+    },
+    "externalKb": {
+      "toggle": "Use an external knowledge repository",
+      "hint": "Keep this project's knowledge base in an existing private GitHub repository instead of the built-in one. Create the repository first; the access token needs read/write access to its contents.",
+      "repoUrlPlaceholder": "Repository URL, e.g. https://github.com/org/vault (required)",
+      "branchPlaceholder": "Branch (optional, defaults to main)",
+      "tokenPlaceholder": "Access token (required)"
     }
   },
   "automations": {

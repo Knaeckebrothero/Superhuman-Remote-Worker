@@ -419,6 +419,7 @@
     "emptyHint": "Erstellen Sie ein neues Projekt, um zu beginnen",
     "createProject": "Projekt erstellen",
     "creating": "Wird erstellt...",
+    "createFailed": "Projekt konnte nicht erstellt werden. Bitte Angaben prüfen und erneut versuchen.",
     "namePlaceholder": "Projektname (erforderlich)",
     "descriptionPlaceholder": "Beschreibung (optional)",
     "goalPlaceholder": "Ziel (optional)",
@@ -436,6 +437,13 @@
     },
     "error": {
       "noAccess": "Sie haben keinen Zugriff auf dieses Projekt."
+    },
+    "externalKb": {
+      "toggle": "Externes Wissens-Repository verwenden",
+      "hint": "Die Wissensdatenbank dieses Projekts in einem vorhandenen privaten GitHub-Repository ablegen statt im integrierten. Legen Sie das Repository zuerst an; das Zugriffstoken benötigt Lese- und Schreibrechte auf dessen Inhalte.",
+      "repoUrlPlaceholder": "Repository-URL, z. B. https://github.com/org/vault (erforderlich)",
+      "branchPlaceholder": "Branch (optional, Standard: main)",
+      "tokenPlaceholder": "Zugriffstoken (erforderlich)"
     }
   },
   "automations": {

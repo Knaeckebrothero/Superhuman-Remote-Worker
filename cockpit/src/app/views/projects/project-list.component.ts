@@ -1,9 +1,9 @@
-import {Component, effect, inject, OnInit, signal} from '@angular/core';
+import {Component, computed, effect, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
 import {SessionService} from '../../core/services/session.service';
-import {Project} from '../../core/models/api.model';
+import {Project, ProjectCreateRequest} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppSpinnerComponent} from '../../ui/spinner';
@@ -22,7 +22,7 @@ import {ViewportService} from '../../core/services/viewport.service';
           <h1 class="page-title">{{ 'projects.title' | transloco }}</h1>
         </div>
         <div class="header-actions">
-          <button class="btn btn-primary" (click)="showCreateForm.set(!showCreateForm())">
+          <button class="btn btn-primary" (click)="toggleCreateForm()">
             {{ (showCreateForm() ? 'projects.cancel' : 'projects.newProject') | transloco }}
           </button>
           <!-- Refresh is desktop-only: on mobile the list reloads on navigation
@@ -63,10 +63,59 @@ import {ViewportService} from '../../core/services/viewport.service';
               (input)="formGoal.set(asInputValue($event))"
             />
           </div>
+          <!-- External knowledge base (opt-in): point the project's writable
+               vault at an existing private GitHub repo instead of the internal
+               forge. Collapsed by default — the default path is unchanged and
+               sends no external_kb key at all. -->
+          <div class="form-row">
+            <label class="form-toggle">
+              <input
+                type="checkbox"
+                [checked]="useExternalKb()"
+                (change)="setUseExternalKb(asCheckedValue($event))"
+              />
+              <span>{{ 'projects.externalKb.toggle' | transloco }}</span>
+            </label>
+            @if (useExternalKb()) {
+              <p class="form-hint">{{ 'projects.externalKb.hint' | transloco }}</p>
+            }
+          </div>
+          @if (useExternalKb()) {
+            <div class="form-row">
+              <input
+                class="form-input"
+                [placeholder]="'projects.externalKb.repoUrlPlaceholder' | transloco"
+                [value]="formKbRepoUrl()"
+                (input)="formKbRepoUrl.set(asInputValue($event))"
+              />
+            </div>
+            <div class="form-row">
+              <input
+                class="form-input"
+                [placeholder]="'projects.externalKb.branchPlaceholder' | transloco"
+                [value]="formKbBranch()"
+                (input)="formKbBranch.set(asInputValue($event))"
+              />
+            </div>
+            <div class="form-row">
+              <input
+                class="form-input"
+                type="password"
+                autocomplete="off"
+                spellcheck="false"
+                [placeholder]="'projects.externalKb.tokenPlaceholder' | transloco"
+                [value]="formKbToken()"
+                (input)="formKbToken.set(asInputValue($event))"
+              />
+            </div>
+          }
+          @if (createFailed()) {
+            <div class="form-error" role="alert">{{ 'projects.createFailed' | transloco }}</div>
+          }
           <div class="form-actions">
             <button
               class="btn btn-primary"
-              [disabled]="isCreating() || !formName().trim()"
+              [disabled]="isCreating() || !canCreate()"
               (click)="createProject()"
             >
               {{ (isCreating() ? 'projects.creating' : 'projects.createProject') | transloco }}
@@ -215,6 +264,33 @@ import {ViewportService} from '../../core/services/viewport.service';
 
     .form-input:focus { border-color: var(--accent-color, var(--accent-color)); }
 
+    .form-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-secondary, var(--text-secondary));
+      cursor: pointer;
+    }
+
+    .form-toggle input { cursor: pointer; }
+
+    .form-hint {
+      margin: 6px 0 0 24px;
+      font-size: 12px;
+      color: var(--text-muted, var(--text-muted));
+      line-height: 1.4;
+    }
+
+    .form-error {
+      margin-bottom: 10px;
+      padding: 8px 12px;
+      border-radius: var(--radius-control);
+      background: var(--danger-tint);
+      color: var(--danger);
+      font-size: 12px;
+    }
+
     .form-actions { display: flex; justify-content: flex-end; }
 
     /* Loading & Empty */
@@ -320,6 +396,29 @@ export class ProjectListPageComponent implements OnInit {
   readonly formDescription = signal('');
   readonly formGoal = signal('');
 
+  /** External-KB opt-in (see docs/features/external_forge_knowledge_base.md).
+   *  Off ⇒ the create body carries no `external_kb` key at all and the backend
+   *  provisions the internal forge repo exactly as before. */
+  readonly useExternalKb = signal(false);
+  readonly formKbRepoUrl = signal('');
+  readonly formKbBranch = signal('');
+  /** The PAT. Lives only here, only while the form is open: never persisted,
+   *  never logged, never in a URL — and cleared on success, on collapsing the
+   *  section, and on closing the form. */
+  readonly formKbToken = signal('');
+
+  /** `createProject` on ApiService swallows HTTP errors into `null`, so a
+   *  failure is otherwise indistinguishable from a no-op. Surface it. */
+  readonly createFailed = signal(false);
+
+  /** A name is always required; enabling the external KB additionally requires
+   *  a repo URL and a token (branch is optional — the backend defaults it). */
+  readonly canCreate = computed(() => {
+    if (!this.formName().trim()) return false;
+    if (!this.useExternalKb()) return true;
+    return !!this.formKbRepoUrl().trim() && !!this.formKbToken().trim();
+  });
+
     constructor() {
         // Load projects reactively — waits for currentUserId on F5 refresh
         effect(() => {
@@ -349,33 +448,84 @@ export class ProjectListPageComponent implements OnInit {
     });
   }
 
+  /** Header button. Closing the form drops the PAT from memory — the secret
+   *  never outlives the form that collected it. */
+  toggleCreateForm(): void {
+    const next = !this.showCreateForm();
+    this.showCreateForm.set(next);
+    if (!next) {
+      this.createFailed.set(false);
+      this.resetExternalKbForm();
+    }
+  }
+
+  /** Collapsing the section also discards what was typed into it, so a hidden
+   *  URL/token pair can never be submitted by accident. */
+  setUseExternalKb(enabled: boolean): void {
+    this.useExternalKb.set(enabled);
+    if (!enabled) this.resetExternalKbForm();
+  }
+
+  private resetExternalKbForm(): void {
+    this.useExternalKb.set(false);
+    this.formKbRepoUrl.set('');
+    this.formKbBranch.set('');
+    this.formKbToken.set('');
+  }
+
   createProject(): void {
     const name = this.formName().trim();
     if (!name) return;
+    if (!this.canCreate()) return;
 
     const userId = this.userService.currentUserId();
     if (!userId) return;
 
-    this.isCreating.set(true);
-    this.api.createProject({
+    const body: ProjectCreateRequest = {
       name,
       description: this.formDescription().trim() || undefined,
       goal: this.formGoal().trim() || undefined,
       user_id: userId,
-    }).subscribe((result) => {
-      this.isCreating.set(false);
-      if (result) {
-        this.showCreateForm.set(false);
-        this.formName.set('');
-        this.formDescription.set('');
-        this.formGoal.set('');
-        // Refresh the server-side access token so the new `project-{id}`
-        // group claim propagates — otherwise downstream services that read
-        // groups from the JWT stay out of sync until the next natural
-        // refresh.
-        void this.session.forceRefresh();
-        this.refresh();
-      }
+    };
+    if (this.useExternalKb()) {
+      const branch = this.formKbBranch().trim();
+      body.external_kb = {
+        repo_url: this.formKbRepoUrl().trim(),
+        token: this.formKbToken().trim(),
+        // Omitted rather than nulled when blank: the API's `branch` is a
+        // non-nullable string that defaults to `main`, so an explicit null
+        // would be a 422.
+        ...(branch ? {branch} : {}),
+      };
+    }
+
+    this.createFailed.set(false);
+    this.isCreating.set(true);
+    this.api.createProject(body).subscribe({
+      next: (result) => {
+        this.isCreating.set(false);
+        if (result) {
+          this.showCreateForm.set(false);
+          this.formName.set('');
+          this.formDescription.set('');
+          this.formGoal.set('');
+          this.resetExternalKbForm();
+          // Refresh the server-side access token so the new `project-{id}`
+          // group claim propagates — otherwise downstream services that read
+          // groups from the JWT stay out of sync until the next natural
+          // refresh.
+          void this.session.forceRefresh();
+          this.refresh();
+        } else {
+          // ApiService maps HTTP failures to `null` for every caller; keep
+          // that contract and report it here instead of failing silently.
+          this.createFailed.set(true);
+        }
+      },
+      error: () => {
+        this.isCreating.set(false);
+        this.createFailed.set(true);
+      },
     });
   }
 
@@ -412,5 +562,9 @@ export class ProjectListPageComponent implements OnInit {
 
   asInputValue(event: Event): string {
     return (event.target as HTMLInputElement).value;
+  }
+
+  asCheckedValue(event: Event): boolean {
+    return (event.target as HTMLInputElement).checked;
   }
 }
