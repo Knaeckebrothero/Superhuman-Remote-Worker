@@ -910,6 +910,9 @@ class TestAgentRestInputEndpointsNoSession:
             auxiliary_llm=None,
             recall_store=None,
             knowledge_store=None,
+            # PersistentSession.thread_id is a real field; the final-memory
+            # outbox reads it at loop start (memory_thread_id=...).
+            thread_id="thread-events-phase2",
             project_id=None,
             project_ids=[],
             tool_context=None,
