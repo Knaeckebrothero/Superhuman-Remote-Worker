@@ -11100,10 +11100,16 @@ async def lifespan(app: FastAPI):
     )
     # Gate-3 completion drain uses its own observable River-style lease row;
     # it must never be wrapped in the orchestrator advisory-leader helper.
-    # Keep even the module import dark while the default-off gate is closed.
+    # Keep the finalizer/router module imports dark while the gate is closed.
     completion_finalizer_task = None
     completion_sweep_router_task = None
-    completion_monitor_task = None
+    # Queue age is a worker-availability signal, so the monitor must remain
+    # alive when fresh worker admission or Gate-3 commands are disabled.
+    # Its commands-off sampler is explicitly run_queue-only.
+    completion_monitor_task = asyncio.create_task(
+        _get_completion_monitor().run(_shutdown_event),
+        name="completion-monitor",
+    )
     if COMPLETION_COMMANDS_ENABLED:
         completion_finalizer = _get_completion_finalizer()
         completion_finalizer_task = asyncio.create_task(
@@ -11114,11 +11120,6 @@ async def lifespan(app: FastAPI):
             _get_completion_sweep_router().run(_shutdown_event),
             name="completion-sweep-router",
         )
-        if COMPLETION_STATUS_REORDER_ENABLED:
-            completion_monitor_task = asyncio.create_task(
-                _get_completion_monitor().run(_shutdown_event),
-                name="completion-monitor",
-            )
     security_events_prune_task = asyncio.create_task(
         security_events_prune_sweeper(_shutdown_event)
     )
@@ -11395,8 +11396,7 @@ async def lifespan(app: FastAPI):
         await completion_finalizer_task
     if completion_sweep_router_task is not None:
         await completion_sweep_router_task
-    if completion_monitor_task is not None:
-        await completion_monitor_task
+    await completion_monitor_task
     await security_events_prune_task
     await checkpoint_retention_task
     await headless_notify_task
@@ -21838,6 +21838,11 @@ async def _completion_monitor_operator_alert(alert: Any) -> None:
             "job_id": alert.job_id,
             "command_state": alert.command_state,
             "age_seconds": alert.age_seconds,
+            "unit_id": alert.unit_id,
+            "queue_state": alert.queue_state,
+            "runnable_at": (
+                alert.runnable_at.isoformat() if alert.runnable_at else None
+            ),
         },
     )
     _kick_officer_event_drain(postgres_db)
@@ -21867,6 +21872,7 @@ def _get_completion_monitor() -> Any:
         _completion_monitor_instance = CompletionMonitor(
             postgres_db,
             _completion_monitor_operator_alert,
+            completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
         )
     return _completion_monitor_instance
 

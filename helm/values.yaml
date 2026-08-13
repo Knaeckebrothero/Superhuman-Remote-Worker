@@ -527,7 +527,9 @@ agent:
     resources: {}
     # -- Worker-job admission on the stateless executor plane. This is
     # independent from `stateless.enabled`: the shared pool may serve session
-    # turns while every worker job continues to use the pinned lane.
+    # turns while every new worker job continues to use the pinned lane.
+    # Turning admission off does not stop these executor pods from draining
+    # worker_batch rows that were already accepted into the durable queue.
     worker:
       # -- DEFAULT OFF. A fresh install preserves the pinned worker path.
       enabled: false

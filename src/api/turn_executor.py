@@ -349,7 +349,7 @@ class StatelessTurnExecutor:
         self._warm_session_idle_ttl = warm_session_idle_ttl_seconds
         self._warm_since: Optional[float] = None
         self._worker_enabled = (
-            _enabled_env("STATELESS_WORKER_ENABLED", False)
+            _enabled_env("STATELESS_EXECUTOR", False)
             if worker_enabled is None
             else bool(worker_enabled)
         )

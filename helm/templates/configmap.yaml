@@ -356,10 +356,11 @@ data:
 
   # The generic stateless executor gate is also the session-admission gate.
   # Keeping one rendered value prevents admission without an executor pool.
-  # Worker jobs remain separately gated so enabling stateless sessions cannot
-  # silently move jobs off the pinned dispatcher. Agents inherit these keys
-  # via envFrom; the orchestrator references them explicitly from this same
-  # ConfigMap.
+  # Worker *admission* remains separately gated so enabling stateless sessions
+  # cannot silently move new jobs off the pinned dispatcher. Executor-mode
+  # pods keep claiming durable worker_batch residue after admission is closed.
+  # Agents inherit these keys via envFrom; the orchestrator references them
+  # explicitly from this same ConfigMap.
   STATELESS_SESSION_ENABLED: {{ .Values.agent.stateless.enabled | default false | quote }}
   STATELESS_WORKER_ENABLED: {{ .Values.agent.stateless.worker.enabled | default false | quote }}
   COMPLETION_COMMANDS_ENABLED: {{ .Values.orchestrator.completionCommandsEnabled | default false | quote }}
