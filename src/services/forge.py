@@ -40,6 +40,233 @@ class ForgeRepo:
     token: str = field(repr=False)
 
 
+class GitHubClient:
+    """KB-sized GitHub API client with the native Gitea client's call shape.
+
+    The KB writer commits exactly one note at a time, so GitHub's single-file
+    Contents API is sufficient. Multi-file writes are rejected explicitly:
+    implementing those atomically would require the Git Data API and is a
+    separate design decision.
+    """
+
+    def __init__(self, target: ForgeRepo) -> None:
+        if target.forge != "github":
+            raise ForgeError("GitHubClient requires a github ForgeRepo")
+        self._target = target
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._target.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+    def _repo_api(self) -> str:
+        return (
+            f"{self._target.api_base}/repos/"
+            f"{quote(self._target.owner, safe='')}/"
+            f"{quote(self._target.repo, safe='')}"
+        )
+
+    def _matches_repo(self, repo_name: str) -> bool:
+        if str(repo_name) == self._target.repo:
+            return True
+        logger.warning("GitHub KB client refused a mismatched repository name")
+        return False
+
+    @staticmethod
+    def _content_path(path: str) -> str | None:
+        candidate = str(path or "")
+        parts = candidate.split("/")
+        if (
+            not candidate
+            or candidate.startswith("/")
+            or "\\" in candidate
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            return None
+        return quote(candidate, safe="/")
+
+    async def list_tree(self, repo_name: str, ref: str) -> list[dict[str, str]] | None:
+        """Return GitHub's recursive tree normalized to path/type/sha."""
+        if not self._matches_repo(repo_name):
+            return None
+        safe_ref = quote(str(ref), safe="")
+        try:
+            async with httpx.AsyncClient(timeout=30.0, transport=_transport) as client:
+                response = await client.get(
+                    f"{self._repo_api()}/git/trees/{safe_ref}",
+                    params={"recursive": "1"},
+                    headers=self._headers(),
+                )
+        except httpx.HTTPError as exc:
+            logger.warning("GitHub KB tree request failed: %s", exc)
+            return None
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            logger.warning(
+                "GitHub KB tree request failed (HTTP %s)", response.status_code
+            )
+            return None
+        try:
+            payload = response.json()
+            if payload.get("truncated"):
+                # An incomplete tree would make the reindexer treat unseen
+                # notes as deleted. Fail honestly instead.
+                logger.warning("GitHub KB recursive tree was truncated")
+                return None
+            entries = payload.get("tree") or []
+            return [
+                {
+                    "path": str(entry["path"]),
+                    "type": str(entry["type"]),
+                    "sha": str(entry["sha"]),
+                }
+                for entry in entries
+                if isinstance(entry, dict)
+                and entry.get("path") is not None
+                and entry.get("type") is not None
+                and entry.get("sha") is not None
+            ]
+        except (TypeError, ValueError, AttributeError, KeyError):
+            logger.warning("GitHub KB tree response was malformed")
+            return None
+
+    async def change_files(
+        self,
+        repo_name: str,
+        branch: str,
+        files: list[dict],
+        message: str,
+    ) -> bool:
+        """Create or update exactly one file through GitHub's Contents API."""
+        if not self._matches_repo(repo_name):
+            return False
+        if not files:
+            return True
+        if len(files) != 1:
+            logger.warning(
+                "GitHub KB writes support exactly one file; refusing %d files",
+                len(files),
+            )
+            return False
+
+        file = files[0]
+        path = self._content_path(str(file.get("path") or ""))
+        operation = str(file.get("operation") or "create").lower()
+        content_b64 = file.get("content_b64")
+        if (
+            path is None
+            or operation not in {"create", "update"}
+            or not isinstance(content_b64, str)
+        ):
+            logger.warning("GitHub KB write payload was invalid")
+            return False
+
+        contents_url = f"{self._repo_api()}/contents/{path}"
+        sha = str(file.get("sha") or "").strip() or None
+        try:
+            async with httpx.AsyncClient(timeout=30.0, transport=_transport) as client:
+                if operation == "update" and sha is None:
+                    lookup = await client.get(
+                        contents_url,
+                        params={"ref": branch},
+                        headers=self._headers(),
+                    )
+                    if lookup.status_code != 200:
+                        logger.warning(
+                            "GitHub KB update SHA lookup failed (HTTP %s)",
+                            lookup.status_code,
+                        )
+                        return False
+                    value = lookup.json().get("sha")
+                    sha = str(value).strip() if value else None
+                    if sha is None:
+                        logger.warning("GitHub KB update SHA lookup returned no SHA")
+                        return False
+
+                payload: dict[str, str] = {
+                    "message": str(message),
+                    "content": content_b64,
+                    "branch": str(branch or "main"),
+                }
+                if operation == "update" and sha is not None:
+                    payload["sha"] = sha
+                response = await client.put(
+                    contents_url,
+                    headers=self._headers(),
+                    json=payload,
+                )
+        except (httpx.HTTPError, ValueError, AttributeError) as exc:
+            logger.warning("GitHub KB write failed: %s", exc)
+            return False
+        if response.status_code in (200, 201):
+            return True
+        logger.warning("GitHub KB write failed (HTTP %s)", response.status_code)
+        return False
+
+    async def get_branch_head_sha(self, repo_name: str, branch: str) -> str | None:
+        """Return the commit SHA at a GitHub branch head."""
+        if not self._matches_repo(repo_name):
+            return None
+        safe_branch = quote(str(branch), safe="")
+        try:
+            async with httpx.AsyncClient(timeout=30.0, transport=_transport) as client:
+                response = await client.get(
+                    f"{self._repo_api()}/branches/{safe_branch}",
+                    headers=self._headers(),
+                )
+        except httpx.HTTPError as exc:
+            logger.warning("GitHub KB branch request failed: %s", exc)
+            return None
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            logger.warning(
+                "GitHub KB branch request failed (HTTP %s)", response.status_code
+            )
+            return None
+        try:
+            value = response.json().get("commit", {}).get("sha")
+            return str(value) if value else None
+        except (TypeError, ValueError, AttributeError):
+            logger.warning("GitHub KB branch response was malformed")
+            return None
+
+    async def download_repo_archive(
+        self, repo_name: str, ref: str, dest_path: str
+    ) -> bool:
+        """Stream a GitHub tarball for ``ref`` to ``dest_path``."""
+        if not self._matches_repo(repo_name):
+            return False
+        safe_ref = quote(str(ref), safe="")
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, read=120.0),
+                transport=_transport,
+                follow_redirects=True,
+            ) as client:
+                async with client.stream(
+                    "GET",
+                    f"{self._repo_api()}/tarball/{safe_ref}",
+                    headers=self._headers(),
+                ) as response:
+                    if response.status_code != 200:
+                        logger.warning(
+                            "GitHub KB archive request failed (HTTP %s)",
+                            response.status_code,
+                        )
+                        return False
+                    with open(dest_path, "wb") as output:
+                        async for chunk in response.aiter_bytes():
+                            output.write(chunk)
+            return True
+        except (httpx.HTTPError, OSError) as exc:
+            logger.warning("GitHub KB archive request failed: %s", exc)
+            return False
+
+
 def parse_owner_repo(url: str) -> tuple[str, str]:
     """Return ``(owner, repo)`` from a repository URL."""
     path = urlparse(url.strip()).path.strip("/")

@@ -12358,6 +12358,33 @@ class PostgresDB:
 
         return _datasource_row_to_dict(row) if row else None
 
+    async def get_native_project_kb_datasource_ref(
+        self, project_id: str
+    ) -> Dict[str, Any] | None:
+        """Return the secret-free credential handle/config for a native KB.
+
+        Vault location deliberately does not live here; callers resolve that
+        from ``project_repositories``. This lookup supplies only the encrypted
+        datasource row's UUID and its non-secret forge override.
+        """
+        try:
+            project_uuid = UUID(project_id)
+        except ValueError:
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, config
+                FROM datasources
+                WHERE type = 'kb'
+                  AND config->>'native_project_id' = $1
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                str(project_uuid),
+            )
+        return _datasource_row_to_dict(row) if row else None
+
     async def get_datasource_tombstones(self, ids: list[str]) -> dict[str, str]:
         """Names of deleted connectors, for labelling drifted session config."""
         if not ids:

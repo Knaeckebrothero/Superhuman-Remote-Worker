@@ -25,8 +25,12 @@ import posixpath
 import re
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+from src.services.forge import parse_owner_repo
 
 from src.tools.knowledge.chunker import (
     embed_note_chunks,
@@ -71,6 +75,50 @@ KNOWLEDGE_PREFIX = "knowledge/"
 # kb_sweep_tick (which projects have a vault at all) — the two must agree on
 # the vocabulary or the sweep would skip projects the resolver can serve.
 _KB_REPO_ROLES: Tuple[str, ...] = ("knowledge", "jobs")
+
+
+@dataclass(frozen=True)
+class KbRepoRef:
+    """Resolved location and credential handle for one project's live vault.
+
+    ``credential_ref`` is a datasource UUID, never credential material. The
+    URL is excluded from repr because legacy managed Gitea URLs can contain
+    basic-auth userinfo; API responses already redact that separately.
+    """
+
+    forge: str
+    repo_url: str = field(repr=False)
+    owner: str
+    repo: str
+    branch: str
+    credential_ref: Optional[str] = None
+
+
+def _forge_from_repo_url(repo_url: str, override: Optional[str]) -> str:
+    configured = str(override or "").strip().lower()
+    if configured:
+        return configured
+    hostname = (urlparse(repo_url).hostname or "").lower().rstrip(".")
+    if hostname in {"github.com", "www.github.com"}:
+        return "github"
+    if hostname in {"gitlab.com", "www.gitlab.com"}:
+        return "gitlab"
+    # Existing managed and legacy project repositories are Gitea. Keeping
+    # unknown/self-hosted hosts on that default is the backwards-compatible
+    # behavior; GitHub Enterprise is selected by the native datasource's
+    # explicit forge override.
+    return "gitea"
+
+
+async def _native_kb_datasource_ref(
+    postgres_db: Any, project_id: str
+) -> Optional[dict[str, Any]]:
+    getter = getattr(postgres_db, "get_native_project_kb_datasource_ref", None)
+    if not callable(getter):
+        return None
+    row = await getter(project_id)
+    return row if isinstance(row, dict) else None
+
 
 # Bump when OKF parsing semantics change independently of the chunker. The
 # watermark pipeline stamp also includes the normalized root, while chunk rows
@@ -920,10 +968,8 @@ async def _reindex_snapshot(
     }
 
 
-async def resolve_kb_repo(
-    postgres_db: Any, project_id: str
-) -> Optional[Tuple[str, str]]:
-    """Resolve a project's KB vault location: ``(repo_name, branch)``.
+async def resolve_kb_repo(postgres_db: Any, project_id: str) -> Optional[KbRepoRef]:
+    """Resolve a project's KB vault location and secret-free auth handle.
 
     Precedence (docs/features/knowledge_base_repo_separation.md §5):
 
@@ -946,7 +992,42 @@ async def resolve_kb_repo(
         repos = await postgres_db.get_project_repositories(project_id, role=role)
         if repos:
             first = repos[0]
-            return str(first.get("name")), str(first.get("branch") or "main")
+            repo_url = str(first.get("repo_url") or "").strip()
+            repo_name = str(first.get("name") or "").strip()
+            datasource_ref = (
+                await _native_kb_datasource_ref(postgres_db, project_id)
+                if role == "knowledge"
+                else None
+            )
+            config = (datasource_ref or {}).get("config") or {}
+            override = config.get("forge") if isinstance(config, dict) else None
+            forge = (
+                _forge_from_repo_url(repo_url, override)
+                if role == "knowledge"
+                else "gitea"
+            )
+            owner = ""
+            remote_repo = repo_name
+            if repo_url:
+                try:
+                    owner, remote_repo = parse_owner_repo(repo_url)
+                except Exception:
+                    # Gitea's established client only needs the stored name.
+                    # External clients validate owner/repo when selected.
+                    if forge != "gitea":
+                        raise
+            return KbRepoRef(
+                forge=forge,
+                repo_url=repo_url,
+                owner=owner,
+                repo=remote_repo,
+                branch=str(first.get("branch") or "main"),
+                credential_ref=(
+                    str(datasource_ref["id"])
+                    if datasource_ref and datasource_ref.get("id")
+                    else None
+                ),
+            )
     return None
 
 
@@ -991,7 +1072,7 @@ async def kb_sweep_tick(
             if resolved is None:
                 # Raced with a repo detach between the enumeration and here.
                 continue
-            repo_name, branch = resolved
+            repo_name, branch = resolved.repo, resolved.branch
             result = await reindex_fn(
                 gitea_client=gitea_client,
                 store=store,

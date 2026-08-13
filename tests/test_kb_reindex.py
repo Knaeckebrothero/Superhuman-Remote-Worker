@@ -19,6 +19,7 @@ from src.tools.knowledge.chunker import CHUNKER_VERSION, note_centroid
 from src.tools.knowledge.gardener import parse_note_md
 
 from orchestrator.services.kb_reindex import (
+    KbRepoRef,
     kb_sweep_tick,
     knowledge_blob_map,
     note_fields,
@@ -1180,6 +1181,69 @@ def _repo_db(repos_by_project=None, **roles):
 
 class TestResolveKbRepo:
     @pytest.mark.asyncio
+    async def test_github_knowledge_repo_resolves_to_secret_free_descriptor(self):
+        datasource_id = uuid.uuid4()
+        db = _repo_db(
+            knowledge=[
+                {
+                    "name": "Design Vault",
+                    "repo_url": "https://github.com/acme/design-vault.git",
+                    "branch": "vault/main",
+                }
+            ]
+        )
+        db.get_native_project_kb_datasource_ref = AsyncMock(
+            return_value={
+                "id": datasource_id,
+                "config": {"root_path": "knowledge", "native_project_id": "p"},
+            }
+        )
+
+        resolved = await resolve_kb_repo(db, "p")
+
+        assert resolved == KbRepoRef(
+            forge="github",
+            repo_url="https://github.com/acme/design-vault.git",
+            owner="acme",
+            repo="design-vault",
+            branch="vault/main",
+            credential_ref=str(datasource_id),
+        )
+        assert "credential_ref" in repr(resolved)
+        assert "token" not in repr(resolved)
+
+    @pytest.mark.asyncio
+    async def test_native_datasource_forge_override_supports_github_enterprise(self):
+        datasource_id = uuid.uuid4()
+        db = _repo_db(
+            knowledge=[
+                {
+                    "name": "Design Vault",
+                    "repo_url": "https://github.corp.example/acme/design-vault",
+                    "branch": "main",
+                }
+            ]
+        )
+        db.get_native_project_kb_datasource_ref = AsyncMock(
+            return_value={
+                "id": datasource_id,
+                "config": {
+                    "root_path": "knowledge",
+                    "native_project_id": "p",
+                    "forge": "github",
+                },
+            }
+        )
+
+        resolved = await resolve_kb_repo(db, "p")
+
+        assert resolved is not None
+        assert resolved.forge == "github"
+        assert resolved.owner == "acme"
+        assert resolved.repo == "design-vault"
+        assert resolved.credential_ref == str(datasource_id)
+
+    @pytest.mark.asyncio
     async def test_first_jobs_role_repo_wins(self):
         """No project has a knowledge repo yet, so this is today's behaviour
         and it must stay bit-for-bit intact: the oldest jobs repo."""
@@ -1190,7 +1254,13 @@ class TestResolveKbRepo:
             ]
         )
         result = await resolve_kb_repo(db, "proj-id")
-        assert result == ("project-abc-jobs", "main")
+        assert result == KbRepoRef(
+            forge="gitea",
+            repo_url="",
+            owner="",
+            repo="project-abc-jobs",
+            branch="main",
+        )
         assert db.get_project_repositories.await_args_list[-1].kwargs == {
             "role": "jobs"
         }
@@ -1204,7 +1274,13 @@ class TestResolveKbRepo:
             knowledge=[{"name": "project-abc-knowledge", "branch": "main"}],
             jobs=[{"name": "project-abc-jobs", "branch": "main"}],
         )
-        assert await resolve_kb_repo(db, "p") == ("project-abc-knowledge", "main")
+        result = await resolve_kb_repo(db, "p")
+        assert result is not None
+        assert (result.forge, result.repo, result.branch) == (
+            "gitea",
+            "project-abc-knowledge",
+            "main",
+        )
         roles = [
             c.kwargs.get("role") for c in db.get_project_repositories.await_args_list
         ]
@@ -1213,12 +1289,16 @@ class TestResolveKbRepo:
     @pytest.mark.asyncio
     async def test_knowledge_repo_branch_is_honoured(self):
         db = _repo_db(knowledge=[{"name": "kb-repo", "branch": "vault"}])
-        assert await resolve_kb_repo(db, "p") == ("kb-repo", "vault")
+        result = await resolve_kb_repo(db, "p")
+        assert result is not None
+        assert (result.repo, result.branch) == ("kb-repo", "vault")
 
     @pytest.mark.asyncio
     async def test_missing_branch_defaults_to_main(self):
         db = _repo_db(jobs=[{"name": "project-abc-jobs", "branch": None}])
-        assert await resolve_kb_repo(db, "p") == ("project-abc-jobs", "main")
+        result = await resolve_kb_repo(db, "p")
+        assert result is not None
+        assert (result.repo, result.branch) == ("project-abc-jobs", "main")
 
     @pytest.mark.asyncio
     async def test_no_repos_returns_none(self):
@@ -1301,9 +1381,14 @@ class TestKbSweepTick:
             c.kwargs["kb_id"]: (c.kwargs["repo_name"], c.kwargs["branch"])
             for c in reindex_fn.await_args_list
         }
+        resolved = {}
+        for project_id in (p1, p2):
+            ref = await resolve_kb_repo(postgres_db, str(project_id))
+            assert ref is not None
+            resolved[project_id] = (ref.repo, ref.branch)
         assert swept == {
-            p1: await resolve_kb_repo(postgres_db, str(p1)),
-            p2: await resolve_kb_repo(postgres_db, str(p2)),
+            p1: resolved[p1],
+            p2: resolved[p2],
         }
         assert swept[p1] == ("project-1-knowledge", "main")
         assert swept[p2] == ("project-2-jobs", "dev")
