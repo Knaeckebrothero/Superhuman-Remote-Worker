@@ -1,8 +1,9 @@
 # CI deploy race silently reverts image tags on dev
 
-**Status:** **OPEN**, found 2026-08-13 while deploying the KB reindex fixes. Diagnosis complete,
-fix proposed below (§Fix), not implemented — a broken `deploy-experimental` breaks every dev
-deploy, so this wants a deliberate change rather than a drive-by.
+**Status:** **Race FIXED on `develop` 2026-08-13** (guard implemented per §Fix); the two secondary
+defects below (mutable tags, inconsistent commit message) remain **OPEN**. The fix cannot be
+exercised locally — it needs two overlapping runs — so it is verified by logic tests against real
+commits and the real `yq` binary (§Implementation), and wants watching on the next few deploys.
 **Severity:** Medium-high — not data loss, but it silently reverts a deploy you just verified,
 which corrupts the *verification process* rather than the data. Dev only.
 
@@ -142,6 +143,32 @@ ancestors of themselves, so a re-run is a no-op rather than an error.
 
 **Also worth fixing, separately:** make the deploy commit message report the per-component
 identities it actually wrote, so the message and the file agree.
+
+## Implementation (2026-08-13)
+
+`fetch-depth: 0` added to the `deploy-experimental` checkout, and the guard added to all five
+per-component steps (orchestrator, agent, cockpit, mcp, workspace). The two run-sha components
+(`vmController`, `agentVmBase`) are untouched — they do not carry a per-component identity.
+
+The guard **fails open**: it skips only when the recorded revision is non-empty **and** still
+exists in history **and** is not an ancestor. That last condition matters here — this branch is
+rebased frequently, so a recorded sha can vanish, and `git merge-base --is-ancestor` *errors* on
+an unknown object. Without the `git cat-file -e` check the `!` would read that error as "not an
+ancestor" and silently block every future deploy. That is a worse failure than the bug.
+
+Verified without running CI:
+
+| case | result |
+|---|---|
+| deployed older, writing newer (normal) | WRITE |
+| **deployed newer, writing older (the race)** | **SKIP** |
+| deployed == writing (re-run) | WRITE (idempotent) |
+| recorded sha rebased away / unknown | WRITE (fails open) |
+| provenance empty (first deploy) | WRITE |
+
+Also checked against the exact binary CI installs (mikefarah yq v4.53.3, not the jq-style yq):
+`-r` is accepted, `// ""` works, a missing component key yields empty rather than erroring, and
+all five provenance keys resolve. Workflow YAML re-parsed clean (21 jobs).
 
 ## Verification when the fix lands
 
