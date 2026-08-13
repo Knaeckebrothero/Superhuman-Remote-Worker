@@ -59,8 +59,10 @@ after the 2026-08-04 cutover.
 | D6 | A **HEAD-comparison guard** becomes the delivery signal for execution turns | `delivery_status` is structurally `no-changes` for this project now; something must be able to say "nothing landed" |
 | D7 | `repo/` → `repos/KurortEngine/` **rewritten in the live slice only** | The live slice is forward-looking guidance; the history slice is an archive and rewriting it would falsify the record |
 | D8 | Workspace backend **container**, not `vm` | All six recorded loops ran `vm`; `docs/issues/vm_reliability_assessment.md` puts VM infra-failures at 2.2× container, and loop `3ed022a5` died `stop_reason=failures` on three consecutive VM provisioning failures |
-| D10 | Project `68137e29` is **archived**, not deleted; the new project reuses the name | Its jobs repo is the only copy of the pre-cutover record, and `job-<id>` repos hold the undelivered developer work |
 | D9 | First cycle is a **single manual developer job**, not a loop start | The seam being replaced is exactly the one that failed silently; watch it once end to end |
+| D10 | Project `68137e29` is **archived**, not deleted; the new project reuses the name | Its jobs repo is the only copy of the pre-cutover record, and `job-<id>` repos hold the undelivered developer work |
+| D11 | History vault lives on the **internal Gitea**, not GitHub, attached as an external `kb` connector | Avoids a second GitHub repo, and exercises the self-hosted external-KB configuration `values.example.yaml` anticipates but nobody has run. Requires `orchestrator.kbGitAllowedHosts: "srw-gitea:3000"` — see §3a |
+| D12 | Live vault stays the **auto-provisioned native Gitea repo** | The native KB write path is Gitea-bound and there is no way to point a new project's KB at an external repo — see §3a |
 
 ## 3. Topology
 
@@ -70,7 +72,7 @@ Three repositories and one connector over a new project:
 |---|---|---|---|
 | Code | `github.com/<owner>/KurortEngine` (private) | `role=source`, name `KurortEngine` | clones to `repos/KurortEngine/`; branch → push → PR |
 | Live vault | Gitea `project-<id8>-knowledge`, auto-provisioned | `role=knowledge` → native project KB | `kb_write`, `search_knowledge` |
-| History vault | Gitea, new repo | external `kb` connector | `search_knowledge`, read-only |
+| History vault | internal Gitea, new repo `srw/<name>` | external `kb` connector (`connection_url: http://srw-gitea:3000/...`) | `search_knowledge`, read-only |
 | Cloud Space | auto-provisioned with the project | — | non-code deliverables only |
 
 The repo **name** is load-bearing: `_clone_auxiliary_repos` (`src/core/workspace.py:743`)
@@ -81,6 +83,57 @@ credential path, which is why D5 puts the PAT in that URL.
 A new project provisions only the knowledge repo (`orchestrator/main.py:45031`); no jobs
 repo is created. `resolve_kb_repo` (`kb_reindex.py:923`) prefers `role=knowledge` and
 falls back to `jobs`, so a fresh project has no ambiguity to resolve.
+
+## 3a. Where a knowledge base can live (measured 2026-08-13)
+
+The question "can the KB be an external repo, like the code?" was raised and the
+answer is asymmetric. Verified against the source, not assumed:
+
+**A KB can be *read* from a remote git host.** `RemoteKnowledgeGitSource`
+(`kb_git_source.py:1008`) does real git operations from the orchestrator, with a
+host allowlist, auth methods `public|token|password|ssh`, credentials passed to git
+only through a temporary askpass — never argv or env — and credential-redacted
+errors. Unit-tested in `tests/test_kb_git_source.py`.
+
+**It cannot be *written*.** Three independent reasons:
+
+| | |
+|---|---|
+| `ProjectCreate` (`main.py:9676`) has no knowledge-repo field | there is no "supply an external repo as the KB at creation" |
+| external `kb` bindings are `writable=False` unconditionally (`bindings.py:31`) | an attached external KB is read-only by construction |
+| `materialize_knowledge_note` takes a `gitea_client` and calls `change_files` (`kb_materialize.py:264`); the native sweep uses `GiteaKnowledgeGitSource` (`kb_reindex.py:520`) | the write path is Gitea-bound end to end |
+
+`src/services/forge.py` does abstract github/gitea/gitlab, but implements only
+`open_pull_request` — there is no multi-file commit behind it. So a GitHub-writable
+vault is an implementation, not a configuration. Hence D12: the live vault is the
+auto-provisioned native Gitea repo, because that is the only place `kb_write` can land.
+
+### The allowlist, and why it matters here
+
+`validate_git_remote_trust` (`kb_git_source.py:568`) requires an exact
+`(host, port)` match — or `(host, None)` when the port is the scheme default —
+before any network operation. It rejects IP literals and `localhost`. The trusted
+set is four built-in public hosts (github.com, gitlab.com, bitbucket.org,
+codeberg.org) plus whatever `KB_GIT_ALLOWED_HOSTS` adds.
+
+**On dev that variable is unset.** `helm/values.yaml:150` has
+`kbGitAllowedHosts: ""`, and the chart only emits the env var when the value is
+non-empty (`helm/templates/orchestrator/deployment.yaml:1536`); confirmed against
+the running pod. So today an external KB connector can only point at those four
+public hosts, and a Gitea-hosted history vault is silently not an option.
+
+Enabling it is one value plus a reconcile:
+
+```yaml
+orchestrator:
+  kbGitAllowedHosts: "srw-gitea:3000"
+```
+
+Verified admissible: `srw-gitea` passes `_SAFE_DNS_LABEL_RE` as a single label, the
+service listens on 3000, `http://` is an accepted scheme, and the `host:port`
+allowlist form is supported. Credentials must **not** be embedded in the URL — the
+validator raises on that — so they go in the datasource's `credentials` field,
+which also means the KB credential never enters a workspace.
 
 ## 4. Corpus split
 
@@ -142,7 +195,8 @@ tells a *new* agent where to write.
 | PAT readable inside the workspace | Fine-grained, scoped to one private repo | Accepted |
 | Agent pushes nothing and the turn looks clean | D6 | Designed, not built |
 | 476-note cold index unmeasured at this scale | Time it during the seed | Open |
-| `test_ac6` recursion fork-bombs a workspace | Fix before the loop touches the suite | **Open — see §8** |
+| `kbGitAllowedHosts` is empty, so the history connector silently cannot reach Gitea | Set it and deploy before step 6 (§3a) | Open |
+| `test_ac6` recursion fork-bombs a workspace | Sentinel guard mirrored from `test_audit_isolation.py` | **CLOSED 2026-08-13** — full suite 177/2 in ~10 s, peak 5 procs (was 139 + timeout) |
 | Curator refills the live vault with learnings | Unmitigated; the flat-root inbox convention only segregates | Open |
 
 ## 8. The suite is armed
@@ -159,7 +213,10 @@ Of the three real failures, two are self-invoking tests and one of them —
 `pytest tests/ --ignore=tests/test_a11y_guest_pwa.py --ignore=tests/test_audit_isolation.py -q`.
 That inner run still collects `test_repo_layout.py`, re-enters `test_ac6`, and spawns
 another, without limit. Observed: **139 nested pytest processes** and a 600 s timeout.
-`test_audit_isolation.py::test_ac2_full_suite_exits_zero` has the same shape. The third,
+`test_audit_isolation.py::test_ac2_full_suite_exits_zero` re-invokes the suite the same
+way but is **correctly guarded** by an environment sentinel checked at `:164` and set at
+`:197` — that guard is precisely what `test_ac6` lacks, so the fix already exists in the
+repo and only needs copying. The third,
 `test_a11y_guest_pwa.py::test_ac2`, is a genuine isolation leak — it asserts on
 `AuditLog._shared_entries`, populated by a different test, and fails standalone.
 
@@ -207,19 +264,21 @@ content is client material for Hotel Rheinland.
 ## 10. Migration sequence
 
 ```
-0.  Fix the test_ac6 / test_ac2 recursion            ← §8, before anything runs a suite
+0.  Fix the test_ac6 recursion                       ← DONE 2026-08-13
 1.  User creates github.com/<owner>/KurortEngine (private) from KurortEngine/
 2.  User mints a fine-grained PAT scoped to that repo
 3.  Archive project 68137e29 (D10); create the new project, reusing the name →
     auto-provisions project-<id8>-knowledge + kb connector
 4.  Push BetterResavio-KB/live/knowledge/ into the knowledge repo; reindex; time it
-5.  Create the history repo, push history/knowledge/, attach as external kb connector
-6.  Verify 476 notes under kb_id=project_id, 2,635 under the connector UUID, none twice
-7.  Attach KurortEngine as role=source with the PAT-bearing URL
-8.  Author the "code lives at repos/KurortEngine/" convention note into the live vault
-9.  Build the HEAD-comparison guard (D6)
-10. One manual developer job, watched end to end: clone → branch → push → PR → HEAD delta
-11. Start the loop: container backend, standard scheduling
+5.  Set orchestrator.kbGitAllowedHosts="srw-gitea:3000"; deploy   ← §3a, BEFORE step 6
+6.  Create the Gitea history repo, push history/knowledge/, attach it as an
+    external kb connector (credentials in the datasource, not the URL)
+7.  Verify 476 notes under kb_id=project_id, 2,635 under the connector UUID, none twice
+8.  Attach KurortEngine as role=source with the PAT-bearing URL
+9.  Author the "code lives at repos/KurortEngine/" convention note into the live vault
+10. Build the HEAD-comparison guard (D6)
+11. One manual developer job, watched end to end: clone → branch → push → PR → HEAD delta
+12. Start the loop: container backend, standard scheduling
 ```
 
 Steps 0–8 are additive and abandonable. Step 10 is the gate; the loop does not start
@@ -227,10 +286,13 @@ until a single job has been observed to move `KurortEngine`'s HEAD.
 
 ## 11. Acceptance criteria
 
-1. The suite runs to completion with no nested pytest process and no timeout.
+1. ~~The suite runs to completion with no nested pytest process and no timeout.~~ **MET 2026-08-13** — 177 passed / 2 failed in ~10 s, nesting bounded at 2 levels, peak 5 processes.
 2. `knowledge_index` shows 476 notes under `kb_id = project_id` and 2,635 under the
    connector UUID, with no note indexed twice.
-3. A `search_knowledge` in the new project returns hits from both vaults.
+3. A `search_knowledge` in the new project returns hits from both vaults — which
+   also proves the remote-git external-KB path works against a self-hosted Gitea
+   over plain HTTP on a non-default port, a configuration `values.example.yaml`
+   ships for customers and that has never been run.
 4. An agent can read a whole design doc, `kb_write` a new note into the live vault, and
    clone `repos/KurortEngine/`.
 5. A manual developer job moves `KurortEngine`'s `main` HEAD, and the guard's recorded
