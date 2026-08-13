@@ -9469,7 +9469,10 @@ async def _restore_session_messages() -> None:
       summary covers turns ≤ boundary_turn; the tail covers everything after.
       This avoids re-loading the full pre-checkpoint history and
       re-summarizing on every resume — the fix for the OOM observed on a
-      793-message / 395k-token thread.
+      793-message / 395k-token thread. If the tail itself has outgrown the
+      budget, the re-bound summarizes again and the merged result is persisted
+      as a fresh checkpoint (counter-gated, same as Path B) so the cost is
+      paid once, not on every subsequent resume.
 
     * **Path B — full load (back-compat):** no checkpoint, or
       ``boundary_turn`` missing (rows that predate this feature). Load the
@@ -9545,6 +9548,8 @@ async def _restore_session_messages() -> None:
             restored = _repair_tool_pairing(restored)
             restored = _sanitize_restored_history(restored)
 
+            pre_compact_len = len(restored)
+            runs_before = getattr(ctx_mgr, "compaction_runs", 0)
             if ctx_mgr and aux and restored:
                 try:
                     bounded = await ctx_mgr.ensure_within_limits(
@@ -9559,6 +9564,12 @@ async def _restore_session_messages() -> None:
                         "Re-bound during checkpoint restore failed "
                         f"(non-fatal, keeping uncompacted): {e}"
                     )
+            runs_after = getattr(ctx_mgr, "compaction_runs", 0)
+            compacted_on_restore = (
+                isinstance(runs_before, int)
+                and isinstance(runs_after, int)
+                and runs_after > runs_before
+            )
 
             if restored:
                 _session.messages.extend(restored)
@@ -9579,6 +9590,32 @@ async def _restore_session_messages() -> None:
                     f"tail of {len(db_messages)} raw rows; "
                     f"turn_count={_session.turn_count})"
                 )
+
+                # If the post-checkpoint tail outgrew the budget, the re-bound
+                # above ran a REAL summarization — persist it so the checkpoint
+                # advances and the next resume loads the merged summary plus a
+                # short tail. Without this, every subsequent resume re-runs the
+                # same blocking aux-LLM summarization and discards the result
+                # (per-claim cost on the stateless lane, where every turn is a
+                # resume). Counter-gated exactly like Path B below: when nothing
+                # compacted, the existing row stands and no duplicate banner row
+                # is written.
+                if compacted_on_restore:
+                    summary_text = extract_summary_text(restored)
+                    if summary_text:
+                        try:
+                            await _record_compaction(
+                                summary_text,
+                                pre_compact_len,
+                                len(restored),
+                                trigger="resume",
+                                ws=None,
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                f"Path-A resume checkpoint persist failed "
+                                f"(non-fatal): {e}"
+                            )
             return
 
         # ============================================================
@@ -9649,11 +9686,12 @@ async def _restore_session_messages() -> None:
             # If a real compaction happened during resume, persist a
             # checkpoint (writes a role='summary' row with boundary_turn)
             # so subsequent resumes hit Path A and the banner appears.
-            # Path A itself does NOT re-write here — the existing row
-            # already drives the banner via the cockpit's history render
-            # (avoids the live/history banner double-render). Gated on the
-            # manager's run counter, not a length delta (the heuristic
-            # false-fires on stray RemoveMessage markers).
+            # Path A applies the same counter-gated persist when ITS re-bound
+            # actually compacts (an outgrown tail); when nothing compacted,
+            # neither path writes, so the existing row keeps driving the
+            # banner without a duplicate. Gated on the manager's run counter,
+            # not a length delta (the heuristic false-fires on stray
+            # RemoveMessage markers).
             if compacted_on_resume:
                 summary_text = extract_summary_text(restored)
                 if summary_text:
