@@ -63,33 +63,33 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-e617d97
+    tag: sha-74474c5
   agent:
-    tag: sha-e617d97
+    tag: sha-ec858ed
   cockpit:
     tag: sha-96479b0
   mcp:
-    tag: sha-e617d97
-    digest: sha256:626f36650f64fe3a54509578843a86bcaa6d93a1c6b11c12824ad64e403c5641
+    tag: sha-ec858ed
+    digest: sha256:7c3622c58dce5e833fe1f421658089d59246ede70b90c84740daa1873fb4149c
   workspace:
     tag: sha-df70ab6
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e"
+  releaseVersion: "0.0.0-dev.sha-74474c570eb53a67e1a06dfa021f805b7a8472ea"
   components:
     orchestrator:
-      sourceRevision: e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e
-      releaseVersion: "0.0.0-dev.sha-e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e"
+      sourceRevision: 74474c570eb53a67e1a06dfa021f805b7a8472ea
+      releaseVersion: "0.0.0-dev.sha-74474c570eb53a67e1a06dfa021f805b7a8472ea"
     agent:
-      sourceRevision: e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e
-      releaseVersion: "0.0.0-dev.sha-e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e"
+      sourceRevision: ec858ed1e891f19f13768bf0c286bb2ab7724253
+      releaseVersion: "0.0.0-dev.sha-ec858ed1e891f19f13768bf0c286bb2ab7724253"
     cockpit:
       sourceRevision: 96479b0456e081343ce6429518e6340a0364c69b
       releaseVersion: "0.0.0-dev.sha-96479b0456e081343ce6429518e6340a0364c69b"
     mcp:
-      sourceRevision: e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e
-      releaseVersion: "0.0.0-dev.sha-e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e"
+      sourceRevision: ec858ed1e891f19f13768bf0c286bb2ab7724253
+      releaseVersion: "0.0.0-dev.sha-ec858ed1e891f19f13768bf0c286bb2ab7724253"
     workspace:
       sourceRevision: df70ab6b3d1fc02f799786d1108ed299bd2e69c7
       releaseVersion: "0.0.0-dev.sha-df70ab6b3d1fc02f799786d1108ed299bd2e69c7"

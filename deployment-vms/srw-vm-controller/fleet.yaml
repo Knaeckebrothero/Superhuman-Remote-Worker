@@ -6,7 +6,7 @@ defaultNamespace: agent-vms
 helm:
   releaseName: srw-vm
   chart: "oci://ghcr.io/knaeckebrothero/charts/srw-dev-vm-cluster"
-  version: "0.0.0-dev.sha-900b958"
+  version: "0.0.0-dev.sha-13b691d"
   takeOwnership: true
   values:
     license:
@@ -49,10 +49,10 @@ helm:
       orchestrator:
         # Independently-built component identity; CI updates this from
         # changes.outputs.orchestrator-sha, never the VM chart AppVersion.
-        tag: "sha-e617d97"
+        tag: "sha-74474c5"
         digest: ""
       vmController:
-        tag: "sha-71a68d9"
+        tag: "sha-13b691d"
     # Pre-wire the observed private ingestion route while every collector gate
     # remains dark. These values render no resources until an inventory gate is
     # explicitly enabled, but preserve api.srw.works as the TLS SNI hostname.
