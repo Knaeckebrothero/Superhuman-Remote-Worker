@@ -4408,3 +4408,35 @@ kill the pod, then verify the record/delivery hash and effect attempt stay
 unchanged while S17 and the UID-fenced S36 tail each converge once. This is the
 highest-risk ordering claim and exercises more external surface than the
 disposable no-project record used overnight.
+
+# Session 19 — Gate 3 step 4, M5 ownership invariant (2026-08-13)
+
+M5 adds one real-Postgres CI invariant and no production behavior. Its census
+starts from every job with a `pending`, `finalizing` or `parked` completion
+command—never from jobs status—and requires exactly one current actor:
+
+1. the exact accepted pinned agent or stateless worker lease;
+2. one live finalizer command term (its live effect terms fold into that same
+   actor rather than double-counting); or
+3. one pending/claimed durable sweep action for the current command attempt.
+
+The constructed matrix has ten unfinished-command jobs and covers
+`processing`, `reviewing`, `completed`, `failed`, `cancelled`, `paused` and
+waiting states. The expected ownership partition is exactly **1 agent, 6
+finalizer, 3 sweep actions**. It exercises the real M1 live/expired/parked
+router and dedup paths, the legacy expired-job rescuer exclusion, real M2
+stateless accept/B4 plus a malicious direct requeue (the command-aware worker
+claim still returns no unit and leaves queue bytes unchanged), a
+cancelled-after-accept finalizer owner, and the M3 critic-watchdog, torn-loop
+heal and lifecycle action-time routes. Exactly the three actionable jobs
+materialize exactly three action rows; no completion callback runs. Either a
+zero-owner or a double-owner row fails the test with its census projection.
+
+The commands-off twin constructs no completion subject and proves a legacy
+commandless stateless unit remains claimable through the unchanged path.
+
+Verification: the invariant file passes **2/2**; the adjacent real-Postgres
+router/control/loop matrix passed **32/32**. Ruff check/format and whitespace
+checks are clean. The M4 repository-wide run already collected these two tests
+and finished at **17,651 passed, 163 skipped, 11 exact baseline environment
+failures**. M5 changes no runtime, migration, chart or live k3d state.
