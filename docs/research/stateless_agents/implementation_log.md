@@ -4519,3 +4519,43 @@ tests passed **11/11**; the full real-Postgres resolution/monitor file passed
 **22/22**, including effective-time ordering and exclusion cases. Both Helm
 lints, Ruff check/format, `py_compile` and whitespace checks are clean. M3 adds
 no migration, configuration key, admission flip or live-fixture mutation.
+
+## M4 — soak not started: cloud-response gate failed cleanly
+
+The k3d control plane was healthy: one orchestrator and two stateless
+executors were Ready, both completion flags were enabled, running source bytes
+matched the three local milestone commits, and there were no unfinished
+completion commands. The surviving review probe `ee33e63f-…` remained pinned
+and its workspace Pod UID `f7090b7c-…` was recorded as an untouchable guard.
+
+Before starting the four acceptance rows, a disposable gate fixture
+(`90842754-…`, command `c276834b-…`) requested the exact configured cloud model
+`openrouter/openai/gpt-oss-120b`. The agent resolved that request to the
+OpenRouter provider and created the real stateless workspace/tmux runtime, but
+the first main call ended at **16:36:42Z** with a permanent provider 401
+(`User not found`). There was therefore no successful keyed cloud response and
+the brief's M4 precondition was not satisfied. No acceptance row is claimed.
+The alternative cloud model was not tried after this fail-closed gate: the
+soak plan explicitly stops on an unreachable or mismatched selected route
+rather than changing model/provider semantics after starting evidence.
+
+The failed call still exercised the already-shipped protocol without being
+counted as soak evidence. Its failure report received public HTTP **202** at
+16:36:42Z; B4 left the exact worker queue `done` at token 1; the driver entered
+the exact-command finalization-pending hold; background finalization settled
+the job and command to `failed`/`done`; S36 ran once; and the worker recorded
+`shell=retired`. A read-only harness assertion initially failed because
+`kubectl exec` used root's tmux socket rather than `agent-host`'s; its
+rollback-only jobs-row lock was released and no durable fixture state was
+changed by that observation error.
+
+Cleanup waited for S36 and workspace metering to finish, then used the public
+job DELETE and guarded exact-ID cleanup for the deliberately no-FK journal
+rows: **17 done effects**, one failed change record, and materialized workspace
+interval 248. Final checks found zero fixture job, queue, command, effect,
+change-record, interval, checkpoint, six vector-table rows, Kubernetes
+resources, or Gitea repository (`job-90842754` returned 404). The protected
+review probe retained the same Pod UID and remained `processing`. Two truthful,
+append-only usage facts remain by design: `0.036914056111111114 gib-hour` and
+`0.018457028055555557 vcpu-hour` for the disposable workspace. The temporary
+harness and its local port-forwards were removed.
