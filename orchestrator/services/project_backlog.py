@@ -271,7 +271,7 @@ async def _resolve_note_repo(project_id: str, postgres_db: Any) -> str | None:
     from .kb_reindex import resolve_kb_repo  # late import: avoid circular
 
     resolved = await resolve_kb_repo(postgres_db, str(project_id))
-    return resolved[0] if resolved else None
+    return resolved.repo if resolved else None
 
 
 async def close_backlog_ticket(

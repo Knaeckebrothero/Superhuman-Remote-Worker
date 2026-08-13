@@ -1,6 +1,7 @@
 """Forge adapter: one PR call, three forges."""
 
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from src.services.forge import (
     ForgeError,
     ForgeRepo,
+    GitHubClient,
     open_pull_request,
     parse_owner_repo,
     resolve_api_base,
@@ -203,3 +205,228 @@ def test_forge_repo_repr_never_prints_the_token():
     assert "widget" in repr(target)
     # Still readable through the attribute — only the repr is redacted.
     assert target.token == "sekrit"
+
+
+def _github_client(token: str = "sekrit") -> GitHubClient:
+    return GitHubClient(
+        ForgeRepo(
+            "github",
+            "https://api.github.com",
+            "acme",
+            "vault",
+            token,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_github_list_tree_uses_recursive_git_tree_api(monkeypatch):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(
+            200,
+            json={
+                "tree": [
+                    {"path": "knowledge/nested/note.md", "type": "blob", "sha": "a1"},
+                    {"path": "knowledge/nested", "type": "tree", "sha": "b2"},
+                ],
+                "truncated": False,
+            },
+        )
+
+    monkeypatch.setattr(
+        "src.services.forge._transport", httpx.MockTransport(handler), raising=False
+    )
+
+    tree = await _github_client().list_tree("vault", "feature/kb")
+
+    assert seen["url"] == (
+        "https://api.github.com/repos/acme/vault/git/trees/feature%2Fkb?recursive=1"
+    )
+    assert seen["headers"]["authorization"] == "Bearer sekrit"
+    assert tree == [
+        {"path": "knowledge/nested/note.md", "type": "blob", "sha": "a1"},
+        {"path": "knowledge/nested", "type": "tree", "sha": "b2"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_github_change_files_creates_one_file_with_contents_api(monkeypatch):
+    transport, seen = _capture(
+        payload={"content": {"sha": "new"}, "commit": {"sha": "commit"}}
+    )
+    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+
+    ok = await _github_client().change_files(
+        "vault",
+        "main",
+        [
+            {
+                "path": "knowledge/nested/note.md",
+                "content_b64": "Ym9keQ==",
+                "operation": "create",
+            }
+        ],
+        "kb: note",
+    )
+
+    assert ok is True
+    assert seen["url"] == (
+        "https://api.github.com/repos/acme/vault/contents/knowledge/nested/note.md"
+    )
+    assert seen["json"] == {
+        "message": "kb: note",
+        "content": "Ym9keQ==",
+        "branch": "main",
+    }
+
+
+@pytest.mark.asyncio
+async def test_github_change_files_threads_blob_sha_for_update(monkeypatch):
+    transport, seen = _capture(payload={"commit": {"sha": "commit"}})
+    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+
+    ok = await _github_client().change_files(
+        "vault",
+        "main",
+        [
+            {
+                "path": "knowledge/note.md",
+                "content_b64": "bmV3",
+                "operation": "update",
+                "sha": "old-blob",
+            }
+        ],
+        "kb: note",
+    )
+
+    assert ok is True
+    assert seen["json"]["sha"] == "old-blob"
+
+
+@pytest.mark.asyncio
+async def test_github_change_files_looks_up_missing_update_sha(monkeypatch):
+    seen: list[tuple[str, str, dict | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.read().decode()) if request.content else None
+        seen.append((request.method, str(request.url), payload))
+        if request.method == "GET":
+            return httpx.Response(200, json={"sha": "looked-up-blob"})
+        return httpx.Response(200, json={"commit": {"sha": "commit"}})
+
+    monkeypatch.setattr(
+        "src.services.forge._transport", httpx.MockTransport(handler), raising=False
+    )
+
+    ok = await _github_client().change_files(
+        "vault",
+        "feature/kb",
+        [
+            {
+                "path": "knowledge/note.md",
+                "content_b64": "bmV3",
+                "operation": "update",
+            }
+        ],
+        "kb: note",
+    )
+
+    assert ok is True
+    assert seen == [
+        (
+            "GET",
+            "https://api.github.com/repos/acme/vault/contents/knowledge/note.md?ref=feature%2Fkb",
+            None,
+        ),
+        (
+            "PUT",
+            "https://api.github.com/repos/acme/vault/contents/knowledge/note.md",
+            {
+                "message": "kb: note",
+                "content": "bmV3",
+                "branch": "feature/kb",
+                "sha": "looked-up-blob",
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_github_change_files_rejects_multi_file_commit_without_network(
+    monkeypatch,
+):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("multi-file GitHub write reached the network")
+
+    monkeypatch.setattr(
+        "src.services.forge._transport", httpx.MockTransport(handler), raising=False
+    )
+    one = {"path": "knowledge/a.md", "content_b64": "YQ=="}
+    two = {"path": "knowledge/b.md", "content_b64": "Yg=="}
+
+    assert (
+        await _github_client().change_files("vault", "main", [one, two], "not atomic")
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_github_branch_head_encodes_slashes(monkeypatch):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"commit": {"sha": "head-sha"}})
+
+    monkeypatch.setattr(
+        "src.services.forge._transport", httpx.MockTransport(handler), raising=False
+    )
+
+    head = await _github_client().get_branch_head_sha("vault", "feature/kb")
+
+    assert head == "head-sha"
+    assert seen["url"] == (
+        "https://api.github.com/repos/acme/vault/branches/feature%2Fkb"
+    )
+
+
+@pytest.mark.asyncio
+async def test_github_archive_download_writes_response_bytes(monkeypatch, tmp_path):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, content=b"tar-gz-bytes")
+
+    monkeypatch.setattr(
+        "src.services.forge._transport", httpx.MockTransport(handler), raising=False
+    )
+    destination = tmp_path / "vault.tar.gz"
+
+    ok = await _github_client().download_repo_archive(
+        "vault", "feature/kb", str(destination)
+    )
+
+    assert ok is True
+    assert Path(destination).read_bytes() == b"tar-gz-bytes"
+    assert seen["url"] == (
+        "https://api.github.com/repos/acme/vault/tarball/feature%2Fkb"
+    )
+
+
+@pytest.mark.asyncio
+async def test_github_client_failures_do_not_expose_token(monkeypatch, caplog):
+    monkeypatch.setattr(
+        "src.services.forge._transport",
+        httpx.MockTransport(
+            lambda _request: httpx.Response(403, json={"message": "denied"})
+        ),
+        raising=False,
+    )
+
+    assert await _github_client("never-log-this").list_tree("vault", "main") is None
+    assert "never-log-this" not in caplog.text

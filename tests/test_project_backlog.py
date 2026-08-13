@@ -1619,7 +1619,7 @@ class TestCloseBacklogTicketRepoResolution:
 
         resolved = await resolve_kb_repo(db, self.PROJECT_ID)
         assert resolved is not None
-        assert gitea.create_or_update_file.await_args.args[0] == resolved[0]
+        assert gitea.create_or_update_file.await_args.args[0] == resolved.repo
 
 
 # =============================================================================

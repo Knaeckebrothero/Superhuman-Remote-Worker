@@ -28,6 +28,7 @@ from services.kb_materialize import (
     note_repo_path,
     slug_error,
 )
+from services.kb_reindex import KbRepoRef
 
 PROJECT = "1a387b4d-0000-0000-0000-000000000000"
 JOB = "abcdef12-3456-7890-abcd-ef1234567890"
@@ -88,7 +89,19 @@ def _patch_resolve(value):
     )
 
 
-async def _run(gitea, *, slug=SLUG, content=BODY, job_id=JOB, resolved=(REPO, "main")):
+def _ref(branch: str | None = "main") -> KbRepoRef:
+    return KbRepoRef(
+        forge="gitea",
+        repo_url="",
+        owner="",
+        repo=REPO,
+        branch=branch,  # type: ignore[arg-type] - exercises runtime fallback
+    )
+
+
+async def _run(gitea, *, slug=SLUG, content=BODY, job_id=JOB, resolved=None):
+    if resolved is None:
+        resolved = _ref()
     db = AsyncMock()
     with _patch_resolve(resolved) as resolve:
         result = await materialize_knowledge_note(
@@ -291,7 +304,16 @@ class TestSkips:
         """A repo-less project: the equivalent of the old ``has_git()`` skip."""
         g = _make_gitea()
 
-        result, _, _ = await _run(g, resolved=None)
+        db = AsyncMock()
+        with _patch_resolve(None):
+            result = await materialize_knowledge_note(
+                postgres_db=db,
+                gitea_client=g,
+                project_id=PROJECT,
+                slug=SLUG,
+                content=BODY,
+                job_id=JOB,
+            )
 
         assert result["status"] == "skipped"
         assert result["reason"] == "no-repo"
@@ -304,7 +326,7 @@ class TestSkips:
     async def test_missing_branch_falls_back_to_main(self):
         g = _make_gitea()
 
-        result, _, _ = await _run(g, resolved=(REPO, None))
+        result, _, _ = await _run(g, resolved=_ref(None))
 
         assert result["branch"] == "main"
         g.list_tree.assert_awaited_once_with(REPO, "main")
@@ -408,7 +430,7 @@ class TestMaterializeEndpoint:
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             patch("main.postgres_db", AsyncMock()),
             patch("main.gitea_client", g),
-            _patch_resolve((REPO, "main")),
+            _patch_resolve(_ref()),
         ):
             result = await materialize_knowledge_note(fake_request, PROJECT, body)
 
@@ -429,7 +451,7 @@ class TestMaterializeEndpoint:
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             patch("main.postgres_db", AsyncMock()),
             patch("main.gitea_client", g),
-            _patch_resolve((REPO, "main")),
+            _patch_resolve(_ref()),
         ):
             result = await materialize_knowledge_note(fake_request, PROJECT, body)
 

@@ -46731,7 +46731,7 @@ async def _reindex_project_kb(
         resolved = await resolve_kb_repo(postgres_db, project_id)
         if not resolved:
             return {"status": "no-repo"}
-        repo_name, branch = resolved
+        repo_name, branch = resolved.repo, resolved.branch
     svc = await _build_kb_embedding_service()
     if svc is None:
         logger.warning(

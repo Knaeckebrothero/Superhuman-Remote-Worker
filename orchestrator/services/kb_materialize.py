@@ -225,7 +225,7 @@ async def materialize_knowledge_note(
         )
         return _result(_STATUS_SKIPPED, reason="no-repo", path=path)
 
-    repo_name, branch = resolved
+    repo_name, branch = resolved.repo, resolved.branch
     branch = branch or "main"
     body = str(content).encode("utf-8")
 
