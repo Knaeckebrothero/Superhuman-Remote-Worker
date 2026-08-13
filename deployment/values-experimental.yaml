@@ -486,6 +486,9 @@ agent:
   expertsDbEnabled: "true"
   # DB-backed Agent Skills (skills + skill_files) — ON in dev for the skills feature.
   skillsDbEnabled: "true"
+  # Project-scoped connector availability and creator auto-attach defaults.
+  # Generic REST omission remains separately gated by datasourceDefaultsOnOmission.
+  datasourceScopeAutoAttachV1Enabled: "true"
   # Protected cloud mode (RO-reader + capture overlay) — ON in dev.
   protectedCloudModeEnabled: "true"
   tailscale:
