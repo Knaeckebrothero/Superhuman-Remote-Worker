@@ -4446,17 +4446,18 @@ failures**. M5 changes no runtime, migration, chart or live k3d state.
 ## M1 — worker shell/lifecycle handoff
 
 The worker now treats durable completion acceptance as a handoff boundary, not
-as a terminal disposition. Once B4 closes the exact `worker_batch` queue lease,
-the driver retires local shell admission, drains and permanently retires the
-original RemoteBackend (including already-admitted resource/SFTP work), scrubs
+as a terminal disposition. Once the worker observes through the renewal/B4
+lookup that B4 closed the exact `worker_batch` queue lease, the driver retires
+local shell admission, drains and permanently retires the original
+RemoteBackend (including already-admitted resource/SFTP work), scrubs
 tenant-local graph, tool, datasource, checkpoint and environment state, and
 retains only an immutable exact-authority callable capable of fenced terminal
 tmux cleanup. It polls the same accepted command ID through the existing B4
-lookup channel; all timing and the absolute bound come from the command's
-PostgreSQL `run_after`, finalizer lease and `deadline_at` clocks. `done`,
+lookup channel; PostgreSQL `run_after` and finalizer-lease horizons bound its
+next poll, while `deadline_at` is the absolute local hold bound. `done`,
 `superseded` and `force_resolved` decode only their stored outcome. Only
 `completed`, `failed` or `cancelled` invokes terminal cleanup, exactly once;
-review, pause, waiting and retry outcomes preserve the remote shell. Park,
+every other decoded status preserves the remote shell. Park,
 deadline, lookup loss, executor cancellation or a driver crash also preserve
 the shell and issue no queue complete/release/requeue verb, leaving the durable
 command, lifecycle manager and UID-fenced S36 as the backstop.
@@ -4559,3 +4560,37 @@ review probe retained the same Pod UID and remained `processing`. Two truthful,
 append-only usage facts remain by design: `0.036914056111111114 gib-hour` and
 `0.018457028055555557 vcpu-hour` for the disposable workspace. The temporary
 harness and its local port-forwards were removed.
+
+## M5 — design and operations fold
+
+The step-5 behavior is now folded into the design of record in
+`docs/features/stateless_agents.md` §5.4.5 and the current operations picture
+in §9.1. The documentation records the exact B4 boundary, fresh stateless 202
+routing, pinned inline parity, command-ID-pinned worker hold, negative-set
+shell preservation rule, DB-clock bounds, admission-off/executor-on rollback
+sequence, and independent oldest-runnable queue alarm. It also removes the
+stale pre-Gate-3 schema/finalizer claims: the app head is 0144, steps 2–4 used
+0140–0144, step 5 needed no migration, and 0145 is the next app migration.
+Step 6 remains unshipped and worker admission remains default-off.
+
+The M4 outcome is qualified rather than promoted into acceptance evidence.
+The four-row cloud soak was not started because the selected model's first
+real main call failed the availability gate with provider 401. The disposable
+fixture's mutable rows and resources were exact-cleaned; its two truthful
+append-only usage measurements remain, and the protected review probe was not
+touched.
+
+Inherited verification on the final milestone bytes is green: the combined
+step-5 selection passed **516/516**. The full repository suite reported
+**17,733 passed, 163 skipped, 11 known environment-only failures and 60
+warnings**; the failures are the unchanged missing-arxiv, local-Postgres,
+MCP-manager/wiring and external health checks, with no new product failure.
+Ruff lint, Python compilation, both Helm lints, all three schema snapshot
+idempotence checks, formatting of every Python file changed by this follow-on,
+and whitespace checks passed. A broader tracked-file format census still names
+the three pre-existing unrelated files `bench/_api.py`,
+`scripts/backfill_source_embeddings.py` and `scripts/check_licenses.py`; this
+milestone does not reformat them. An independent integrated audit found no
+P0/P1 blocker and separately passed 184 focused unit tests, three exact
+real-Postgres seams and the admission-off Helm deployment proof. M5 changes
+documentation only and does not mutate schema, chart, runtime or live state.
