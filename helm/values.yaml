@@ -147,10 +147,16 @@ orchestrator:
   # OKF KB datasources. The built-in public-provider set remains enabled.
   # Wildcards, IP literals, and localhost are rejected. Example:
   # "gitea.example.com,gitea.internal:3000"
-  # In-cluster Gitea, so an external OKF KB connector can reach a repo hosted
-  # here. Without this only github.com/gitlab.com/bitbucket.org/codeberg.org are
+  # Gitea, so an external OKF KB connector can reach a repo hosted here.
+  # Without this only github.com/gitlab.com/bitbucket.org/codeberg.org are
   # trusted and the connector fails closed. Exact host:port, no wildcards.
-  kbGitAllowedHosts: "srw-gitea:3000"
+  #
+  # NOTE the public HTTPS name, not srw-gitea:3000. Token/password auth is
+  # refused over plain http (kb_git_source.validate_git_auth_configuration),
+  # and the in-cluster service exposes only port 3000 over http — so a private
+  # repo can only be reached via the TLS ingress. Keep both entries: the
+  # in-cluster name still serves a public (credential-less) repo.
+  kbGitAllowedHosts: "git.srw.works,srw-gitea:3000"
   # -- Optional OpenSSH known_hosts content for external OKF KB deploy-key
   # remotes. Non-empty content switches SSH from accept-new to strict pinning.
   kbGitSshKnownHosts: ""

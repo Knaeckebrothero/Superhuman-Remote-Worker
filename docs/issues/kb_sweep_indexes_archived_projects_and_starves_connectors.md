@@ -52,8 +52,16 @@ success, and re-processes ~3,100 notes on every cycle. It had not completed succ
 **over a month**.
 
 Downstream: a newly created external `kb` connector (`e66708b2`, the Better Resavio history
-vault, 2,635 notes) sat unindexed. It was queued behind the archived project in the same tick
-and never reached.
+vault, 2,635 notes) went **27 minutes without a single attempt** — created 11:10, first swept
+11:38, immediately after the archived project's run finally ended. Every tick in between was
+consumed by the native phase.
+
+> **Correction.** The first version of this doc implied the starvation was *why* that connector
+> had no notes. It was not. Once reached at 11:38 it was retried every tick (11:38, 11:53,
+> 12:08, 12:23) and failed each time on an unrelated defect — see
+> [`kb_connector_token_auth_over_http_fails_invisibly`](kb_connector_token_auth_over_http_fails_invisibly.md).
+> The starvation is real and independently worth fixing; it delayed the first attempt by 27
+> minutes. It was not the blocker.
 
 ## Why this is easy to miss
 
