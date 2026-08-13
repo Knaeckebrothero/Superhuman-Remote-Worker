@@ -4594,3 +4594,102 @@ milestone does not reformat them. An independent integrated audit found no
 P0/P1 blocker and separately passed 184 focused unit tests, three exact
 real-Postgres seams and the admission-off Helm deployment proof. M5 changes
 documentation only and does not mutate schema, chart, runtime or live state.
+
+# Session 21 — session-lane hardening (2026-08-13)
+
+## M0 — current-truth reconciliation
+
+This milestone changed no production code, schema, chart, or live state. It
+reconciled the session-hardening brief against the S2 and Gate-3 implementation
+before allocating new mechanisms. The checkout began at `079a45ca` on local
+`develop`, above the unpushed step-5 commits. The live stateless hand-check job
+`a61d9940-…` retained workspace Pod UID `0b30a573-…`; the pinned probe
+`ee33e63f-…` retained workspace Pod UID `f7090b7c-…`. Neither row, workspace,
+completion history, nor the three protected untracked paths was mutated.
+
+### Interrupt
+
+The implementation gap is already closed, so M2 drops as a code milestone.
+Stateless sessions use the 0127–0129 exact-turn interrupt inbox, not the older
+0119 scalar control inbox: the public owner-gated REST route admits one request
+against the exact live queue lease and turn, the executor opens and drains the
+mid-turn watcher around that turn, and linked `interrupt.ack` plus
+`turn.interrupted` journal records converge after live delivery, owner loss, or
+terminalization. Cockpit sends a stable request UUID and exact turn and treats
+HTTP 202 as admission only. Pinned sessions already expose the correlated REST
+route; the legacy control WebSocket remains an ephemeral compatibility path.
+No interrupt-related production 501 remains.
+
+A new stateless interrupt with no exact open live gate is rejected 409 before
+INSERT. That is the adopted contract: it neither retargets a successor nor
+leaves a pending row. A distinct queued-turn-cancel verb or journaled no-op
+would be a product expansion, not hardening of the live-turn interrupt. The
+remaining work is live evidence—RAM unwind, receipt latency and forced-owner
+loss—not another transport.
+
+### Permission rows
+
+The prior claim that S2 fully closed permission retirement was too broad.
+Healthy owners do retire announced rows on turn end, teardown and mode change,
+and the live waiter can expire its own row while it still holds exact queue
+authority. But `thread_permission_requests` stores no accepted lease token,
+there is no global/reaper consumer for the existing expiry index, and the
+lease-loss path intentionally leaves the row pending when its owner fence is
+gone. Such a row remains visible in snapshots indefinitely. Force-End expires
+rows, but does not write a durable linked permission receipt.
+
+M3 therefore narrows to exact old-lease retirement rather than re-arming a
+successor. The safe outcome is `expired`/no-answer: the tool never ran, and a
+successor cannot safely reconstruct the original tool call. New stateless
+admission must stamp its lease token under the existing thread→queue lock; a
+reaper may retire only rows carrying the proven stolen token, with status and
+one durable `permission.resolved` receipt committed atomically. Legacy NULL
+rows fail closed rather than guessing authority. Approval versus retirement is
+one row-CAS race with one winner.
+
+### Ended-session wake
+
+The ordinary ended-session gap is already closed. The jobs wake outbox rereads
+the target and routes suspended, detached and explicitly `ended` sessions to a
+durable `thread_messages(role='event')` write without restoring a pod; a live
+binding instead receives the same notice through `/api/input`.
+
+Hard deletion still has a distinct gap for M3. The creator FK uses
+`ON DELETE SET NULL`, while wake enqueue and claim SQL require a non-NULL
+creator. Delete-before-completion therefore silently loses the obligation, and
+delete while pending or expired-sending can leave it forever unclaimable. M3
+must atomically settle these rows as explicitly undeliverable before the FK is
+nulled, including the delivery/delete race, without changing the already-good
+ended path.
+
+### Final memory
+
+Migration 0133 already provides a lease-fenced durable extraction cursor in
+`thread_session_runtime_state.memory_extraction_turn`. It prevents a successor
+from repeating a claimed five-turn interval, but it is not a completion
+receipt: the cursor advances before the auxiliary call, writer errors are
+non-fatal, and explicit stateless handoff intentionally skips teardown capture.
+At the default interval, a healthy end can therefore omit the last 0–4 turns;
+a pod death can also lose an already-claimed extraction.
+
+No production `producer_kind='session_turn'` effect producer, drainer or
+retention worker exists. M1 remains the primary build: mint a stable turn
+execution identity and pending final-memory effect inside the same fenced
+transaction that reconciles the final transcript, execute the auxiliary work
+through an independent retryable drain, and prune terminal session effects by
+age without touching job-completion producers. A fenced loser must commit
+neither transcript reconciliation nor obligation.
+
+### Reshaped run
+
+M1 proceeds with the final-memory outbox. M2 becomes a recorded already-closed
+milestone plus focused/live evidence. M3 keeps only exact permission lease-loss
+retirement and deleted-thread wake settlement. M4 will exercise those actual
+boundaries with `MiniMax-M3` if the environment passes its real-response gate;
+otherwise it remains cleanly not-started. M5 remains the documentation fold.
+
+Read-only recon verification included **106** interrupt service/consumer/reaper
+tests, **20** Python interrupt integration selections, and **20** Cockpit
+interrupt tests. Eight interrupt real-Postgres cases skipped because the shell
+had no configured test database; this milestone does not relabel them as a new
+database run.
