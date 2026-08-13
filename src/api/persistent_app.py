@@ -2121,6 +2121,22 @@ def _apply_session_embedding_env(env_keys: Optional[Dict[str, Any]]) -> None:
             )
 
 
+def _llm_config_with_cache_key(llm_cfg: Any) -> Any:
+    """Copy ``llm_cfg`` with the per-thread OpenAI cache-routing key.
+
+    The key is stable for the thread's life, so the provider-side prefix
+    cache survives pod rotation on the stateless lane (stateless_agents.md
+    OQ5 — the ``cache_read_input_tokens > 0`` turn-2 acceptance). The loader
+    transmits it to first-party OpenAI only; every other provider/endpoint
+    ignores the field, so setting it unconditionally here is safe.
+    """
+    if not _thread_id:
+        return llm_cfg
+    import dataclasses
+
+    return dataclasses.replace(llm_cfg, prompt_cache_key=f"srw-thread-{_thread_id}")
+
+
 async def _attach_session(
     thread_id: str,
     config_override: Optional[Dict[str, Any]] = None,
@@ -2395,7 +2411,10 @@ async def _attach_session(
     llm = _agent._tactical_llm or _agent._llm
     if _hydrated:
         # The resolved llm carries the final model + injected transport.
-        llm = create_llm(effective_config.llm, effective_config.limits)
+        llm = create_llm(
+            _llm_config_with_cache_key(effective_config.llm),
+            effective_config.limits,
+        )
         logger.info(
             "Attach: built session LLM from resolved config: model=%s",
             effective_config.llm.model,
@@ -2433,7 +2452,10 @@ async def _attach_session(
             merged, deployment_dir=effective_config._deployment_dir
         )
         if config_override.get("llm"):
-            llm = create_llm(effective_config.llm, effective_config.limits)
+            llm = create_llm(
+                _llm_config_with_cache_key(effective_config.llm),
+                effective_config.limits,
+            )
             logger.info(
                 f"Config override applied: model={effective_config.llm.model}, "
                 f"temperature={effective_config.llm.temperature}"
@@ -10772,7 +10794,9 @@ async def _handle_config_update(
 
         # Rebuild chat LLM if llm settings changed
         if llm_changed:
-            new_llm = create_llm(new_config.llm, new_config.limits)
+            new_llm = create_llm(
+                _llm_config_with_cache_key(new_config.llm), new_config.limits
+            )
 
             # Slice D — model hot-swap hardening. Only when the model itself
             # changes (temperature-only llm fragments skip both rungs):

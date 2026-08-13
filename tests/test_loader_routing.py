@@ -35,6 +35,9 @@ def _make_config(**overrides):
     config.max_output_tokens = overrides.get("max_output_tokens", None)
     config.model_max_context_tokens = overrides.get("model_max_context_tokens", None)
     config.extra_body = overrides.get("extra_body", None)
+    # Real attribute, not MagicMock truthiness — the factory's cache-key arm
+    # gates on `if config.prompt_cache_key`.
+    config.prompt_cache_key = overrides.get("prompt_cache_key", None)
     return config
 
 
@@ -889,6 +892,51 @@ class TestDeclaredExtraBody:
             "enable_thinking": False
         }
         assert call_kwargs["extra_body"]["top_k"] == 40
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_prompt_cache_key_reaches_first_party_openai(self, mock_chat):
+        """The runtime per-thread cache-routing key is transmitted when the
+        target is first-party OpenAI (no dispatcher-injected base_url)."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="gpt-4o", prompt_cache_key="srw-thread-abc")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["prompt_cache_key"] == "srw-thread-abc"
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_prompt_cache_key_withheld_from_compatible_endpoints(self, mock_chat):
+        """An explicit base_url means an OpenAI-compatible endpoint (vLLM et
+        al.), which may reject unknown body fields — the key must not be
+        sent there."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="MiniMax-M3",
+            base_url="https://api.minimax.io/v1",
+            prompt_cache_key="srw-thread-abc",
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert "prompt_cache_key" not in (call_kwargs.get("extra_body") or {})
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_prompt_cache_key_defers_to_declared_extra_body(self, mock_chat):
+        """A value declared in config.extra_body wins over the runtime key
+        (the house rule: declared beats factory-computed)."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="gpt-4o",
+            prompt_cache_key="srw-thread-abc",
+            extra_body={"prompt_cache_key": "declared-wins"},
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["prompt_cache_key"] == "declared-wins"
 
     @patch("src.core.loader.ReasoningChatOpenAI")
     def test_openrouter_factory_forwards_declared_extra_body(self, mock_chat):
