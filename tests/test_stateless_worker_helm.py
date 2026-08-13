@@ -113,17 +113,36 @@ def test_completion_status_reorder_requires_completion_commands() -> None:
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_generic_pool_opens_sessions_without_opening_worker_admission() -> None:
+    documents = _render(
+        "agent.stateless.enabled=true",
+        "agent.stateless.worker.enabled=false",
+    )
     config_map = _only_kind(
-        _render(
-            "agent.stateless.enabled=true",
-            "agent.stateless.worker.enabled=false",
-            show_only="templates/configmap.yaml",
-        ),
+        [
+            document
+            for document in documents
+            if document.get("kind") == "ConfigMap"
+            and str(document.get("metadata", {}).get("name", "")).endswith(
+                "-remote-worker-config"
+            )
+        ],
         "ConfigMap",
     )
+    stateless_deployments = [
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and str(document.get("metadata", {}).get("name", "")).endswith(
+            "-agent-stateless"
+        )
+    ]
 
     assert config_map["data"]["STATELESS_SESSION_ENABLED"] == "true"
     assert config_map["data"]["STATELESS_WORKER_ENABLED"] == "false"
+    assert len(stateless_deployments) == 1
+    assert _stateless_agent_container(stateless_deployments[0])["command"][
+        -1
+    ].startswith("exec python agent.py --mode stateless")
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")

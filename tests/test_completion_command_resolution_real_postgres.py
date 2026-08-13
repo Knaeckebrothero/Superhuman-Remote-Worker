@@ -49,7 +49,7 @@ async def pg(pg_dsn, _schema_applied):
     pool = await asyncpg.create_pool(pg_dsn, min_size=1, max_size=8, timeout=10)
     async with pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE job_completion_sweep_actions, completion_effects, "
+            "TRUNCATE run_queue, job_completion_sweep_actions, completion_effects, "
             "completion_finalizer_leases, job_completion_commands, jobs CASCADE"
         )
     try:
@@ -821,3 +821,54 @@ async def test_monitor_samples_live_leader_and_oldest_including_parked(pg):
     assert sample.oldest_state == "parked"
     assert sample.oldest_age_seconds is not None
     assert sample.oldest_age_seconds >= 3_999
+
+
+@pytest.mark.asyncio
+async def test_monitor_samples_oldest_runnable_worker_by_effective_db_time(pg):
+    async with pg.acquire() as conn:
+        oldest = uuid4()
+        newer = uuid4()
+        rows = [
+            (oldest, "worker_batch", "queued", -400.0, -700.0),
+            (newer, "worker_batch", "queued", -100.0, -200.0),
+            (uuid4(), "worker_batch", "queued", 600.0, -10_000.0),
+            (uuid4(), "session_turn", "queued", -900.0, -900.0),
+            (uuid4(), "worker_batch", "parked", -900.0, -900.0),
+            (uuid4(), "worker_batch", "leased", -900.0, -900.0),
+            (uuid4(), "worker_batch", "done", -900.0, -900.0),
+        ]
+        for unit_id, kind, state, run_after_delta, queued_delta in rows:
+            await conn.execute(
+                """
+                INSERT INTO run_queue (
+                    unit_id, unit_kind, state, run_after, queued_at,
+                    leased_by, leased_until
+                ) VALUES (
+                    $1, $2, $3,
+                    clock_timestamp()+make_interval(secs => $4::float8),
+                    clock_timestamp()+make_interval(secs => $5::float8),
+                    CASE WHEN $3='leased' THEN 'other-pod' ELSE NULL END,
+                    CASE WHEN $3='leased' THEN
+                        clock_timestamp()+interval '5 minutes' ELSE NULL END
+                )
+                """,
+                unit_id,
+                kind,
+                state,
+                run_after_delta,
+                queued_delta,
+            )
+
+    sample = await CompletionMonitor(
+        pg,
+        lambda _alert: None,
+        completion_commands_enabled=False,
+    ).sample()
+
+    assert sample.oldest_worker_unit_id == str(oldest)
+    assert sample.oldest_worker_state == "queued"
+    assert sample.oldest_worker_runnable_at is not None
+    assert sample.oldest_worker_age_seconds is not None
+    # Effective runnable time is max(queued_at, run_after): about 400s, not
+    # the row's 700s queue residence.
+    assert 399 <= sample.oldest_worker_age_seconds <= 405

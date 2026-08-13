@@ -305,6 +305,48 @@ def _install(monkeypatch, claim, final_state, *, report_result=True):
 
 
 @pytest.mark.asyncio
+async def test_stateless_executor_drains_worker_residue_when_admission_is_off(
+    worker_runtime,
+    monkeypatch,
+):
+    """Admission-off stops enqueueing; executor mode keeps existing work live."""
+
+    claim = _claim(input_seq=1, prior="processing")
+    monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+    monkeypatch.setenv("STATELESS_WORKER_ENABLED", "false")
+    monkeypatch.setenv("COMPLETION_COMMANDS_ENABLED", "false")
+    pa._agent = SimpleNamespace(postgres_conn=object())
+    session_claim = AsyncMock(return_value=None)
+    worker_claim = AsyncMock(return_value=claim)
+    monkeypatch.setattr(turn_executor, "claim_unit", session_claim)
+    monkeypatch.setattr(turn_executor, "claim_worker_batch", worker_claim)
+    executor = turn_executor.StatelessTurnExecutor(
+        pod_name="rollback-worker",
+        idle_poll_seconds=0.001,
+        jitter=0,
+    )
+
+    async def serve(_claim):
+        assert _claim is claim
+        executor._stop.set()
+
+    serve_worker = AsyncMock(side_effect=serve)
+    executor._serve_worker_claim = serve_worker
+
+    await executor.run()
+
+    assert executor._worker_enabled is True
+    assert executor._completion_commands_enabled is False
+    session_claim.assert_awaited_once()
+    worker_claim.assert_awaited_once_with(
+        executor._db,
+        pod_name="rollback-worker",
+        completion_commands_enabled=False,
+    )
+    serve_worker.assert_awaited_once_with(claim)
+
+
+@pytest.mark.asyncio
 async def test_rotation_uses_complete_and_requeue_and_zero_complete_calls(
     worker_runtime, monkeypatch, caplog
 ):

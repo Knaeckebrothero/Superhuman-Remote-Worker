@@ -4490,3 +4490,32 @@ stateless acceptance leaves `run_queue=done`, a due `inline=false` finalizer
 claim runs the workflow once, command replay is terminal, and queue bytes do
 not change. Ruff check/format, `py_compile` and whitespace checks are clean.
 M2 adds no engine, task, schema, chart flag or live-fixture mutation.
+
+## M3 — queued-age alarm and rollback executor contract
+
+Worker admission and worker execution now use their actual authorities.
+`STATELESS_WORKER_ENABLED` remains the orchestrator's fresh-admission switch;
+inside a pod launched by `agent.py --mode stateless`, `STATELESS_EXECUTOR=1`
+keeps the claim loop serving existing `worker_batch` rows even after admission
+is disabled. The explicit constructor override remains for tests. Thus the
+revert sequence is operationally real: close admission first, keep the
+stateless Deployment running until durable worker rows have reached terminal,
+and only then scale or disable the executor plane.
+
+The independent 30-second completion monitor now always runs. Its queue-only
+arm remains valid and Gate-3-table-dark with completion commands disabled. It
+selects the oldest runnable `worker_batch` whose state is `queued` and
+`run_after` has passed, using one PostgreSQL clock instant and effective
+runnable time `GREATEST(queued_at,run_after)`; future backoff, leased, parked,
+done and other unit kinds are excluded. At **300 seconds**—the worker pool's
+expected KEDA/cooldown envelope, deliberately far above normal sub-second
+claim latency—it emits the fixed dedup key
+`run_queue.worker_batch.oldest_runnable`. Existing zero-finalizer and oldest-
+command alarms run whenever completion commands are on, independently of the
+status-reorder gate.
+
+Verification: monitor/worker/Helm focused tests passed **85/85**; boot/monitor
+tests passed **11/11**; the full real-Postgres resolution/monitor file passed
+**22/22**, including effective-time ordering and exclusion cases. Both Helm
+lints, Ruff check/format, `py_compile` and whitespace checks are clean. M3 adds
+no migration, configuration key, admission flip or live-fixture mutation.
