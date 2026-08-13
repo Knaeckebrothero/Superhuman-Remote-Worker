@@ -16,7 +16,7 @@ import asyncio
 import logging
 import time
 import uuid as _uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
@@ -485,7 +485,11 @@ class PersistentLoopCallbacks:
 
     # Notify client of turn lifecycle events
     on_turn_start: Callable[[int], Awaitable[None]]
-    on_turn_complete: Callable[[int, Optional[dict]], Awaitable[None]]
+    # The trailing values are the exact accepted input row and immutable
+    # memory destination captured before execution. Transports that persist an
+    # authoritative turn/outbox must use them instead of rediscovering either
+    # from mutable history after tools have appended synthetic HumanMessages.
+    on_turn_complete: Callable[..., Awaitable[None]]
 
     # Stream a thinking/reasoning chunk to the client. Accepts an optional
     # ``message_id`` kwarg correlating the frame to the AI message it belongs
@@ -790,6 +794,8 @@ async def run_persistent_loop(
     claim_memory_extraction_interval: Optional[
         Callable[[int, int], Awaitable[bool]]
     ] = None,
+    defer_memory_extraction_to_outbox: bool = False,
+    memory_thread_id: Optional[str] = None,
 ) -> None:
     """Run the persistent interactive agent loop.
 
@@ -827,6 +833,14 @@ async def run_persistent_loop(
         claim_memory_extraction_interval: Durable migration-0133 cursor claim
             for the legacy writer path. ``None`` preserves the local cursor for
             tests/installs without Postgres.
+        defer_memory_extraction_to_outbox: Skip both in-process turn-end memory
+            paths because the caller durably enqueues one authoritative
+            session-turn extraction obligation with the final transcript.
+            Stateless claims enable this; pinned sessions preserve their
+            historical interval writer.
+        memory_thread_id: Immutable thread destination used when memory is not
+            project-scoped. The exact destination is captured at turn start and
+            delivered with ``on_turn_complete`` for the durable outbox.
     """
     # Build tool lookup map
     tool_map: Dict[str, Any] = {tool.name: tool for tool in tools}
@@ -937,6 +951,17 @@ async def run_persistent_loop(
             # HumanMessage) keeps finding the turn boundary.
             user_msg.additional_kwargs[PERSIST_ROLE_KEY] = input_persist_role
         messages.append(_ensure_msg_id(user_msg))
+        # Capture the destination now, alongside the accepted input identity.
+        # Config can hot-swap between turns, while tools can append synthetic
+        # HumanMessages during this turn; neither may retarget the obligation
+        # after its work has executed.
+        memory_config = getattr(config, "memory", None)
+        if getattr(memory_config, "project_scoped", False) is True and project_ids:
+            memory_scope_kind = "project"
+            memory_scope_id = str(project_ids[0])
+        else:
+            memory_scope_kind = "thread"
+            memory_scope_id = str(memory_thread_id) if memory_thread_id else None
 
         await callbacks.on_turn_start(turn_id)
         # Reconcile the accept-time row (turn_number was a guess there) — or
@@ -945,6 +970,20 @@ async def run_persistent_loop(
         if callbacks.persist_message is not None:
             await callbacks.persist_message(user_msg)
         tool_calls_this_turn = 0
+        # Stateless terminal frames must not outrun the fenced transaction
+        # that commits the transcript and durable memory obligation. The turn
+        # executor can report errors from inside _execute_turn (notably its
+        # handled LLM timeout) or from the outer exception path. Capture both,
+        # then replay them only after on_turn_complete makes the boundary
+        # authoritative. Pinned sessions keep their historical live ordering.
+        deferred_errors: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        turn_callbacks = callbacks
+        if defer_memory_extraction_to_outbox:
+
+            async def _capture_turn_error(*args: Any, **kwargs: Any) -> None:
+                deferred_errors.append((args, dict(kwargs)))
+
+            turn_callbacks = replace(callbacks, on_error=_capture_turn_error)
 
         result = None
         try:
@@ -953,7 +992,7 @@ async def run_persistent_loop(
                 tool_map=tool_map,
                 context_manager=context_manager,
                 messages=messages,
-                callbacks=callbacks,
+                callbacks=turn_callbacks,
                 llm_timeout=llm_timeout,
                 auxiliary_llm=auxiliary_llm,
                 config=config,
@@ -963,6 +1002,7 @@ async def run_persistent_loop(
                 project_ids=project_ids,
                 tool_context=tool_context,
                 memory_service=memory_service,
+                defer_memory_capture_to_outbox=defer_memory_extraction_to_outbox,
             )
             tool_calls_this_turn = result.tool_calls_made
         except asyncio.CancelledError:
@@ -973,60 +1013,76 @@ async def run_persistent_loop(
             # turn_id lets the transport close the still-open turn in the UI
             # and persist the failure so it survives reload
             # (session_silent_failure_audit.md #2).
-            await callbacks.on_error(_user_facing_turn_error(e), turn_id=turn_id)
+            await turn_callbacks.on_error(_user_facing_turn_error(e), turn_id=turn_id)
 
-        # Memory extraction every N turns.  It is part of this claim's durable
-        # footprint: snapshot the mutable history and await the writer before
-        # publishing the full turn-settled edge.  A detached task can inherit a
-        # mutable LeaseHandle, run after it is repointed to another thread, and
-        # either mutate the wrong cursor or vanish after advancing it.
-        extraction_messages = list(messages)
-        # Manager path (memory overhaul Phase 1): one turn_end capture —
-        # the persistent_interval_extractor writer reproduces the elapsed
-        # gate, the fixed window, and the extraction call below.
-        if memory_service is not None:
-            from .services.memory import CaptureEvent
+        # Pinned sessions retain the historical interval writer. Stateless
+        # claims skip BOTH implementations: their final transcript transaction
+        # mints one durable per-turn effect, and an independent drain owns the
+        # auxiliary extraction. Running either path here as well would make the
+        # outbox non-authoritative and duplicate memory mutation.
+        if not defer_memory_extraction_to_outbox:
+            # Memory extraction every N turns. It is part of a pinned claim's
+            # durable footprint: snapshot the mutable history and await the
+            # writer before publishing the full turn-settled edge.
+            extraction_messages = list(messages)
+            # Manager path (memory overhaul Phase 1): one turn_end capture —
+            # the persistent_interval_extractor writer reproduces the elapsed
+            # gate, the fixed window, and the extraction call below.
+            if memory_service is not None:
+                from .services.memory import CaptureEvent
 
-            await memory_service.capture(
-                CaptureEvent(
-                    kind="turn_end",
-                    messages=extraction_messages,
-                    turn_count=turn_count,
+                await memory_service.capture(
+                    CaptureEvent(
+                        kind="turn_end",
+                        messages=extraction_messages,
+                        turn_count=turn_count,
+                    )
                 )
-            )
-        elif recall_store and auxiliary_llm and extraction_interval > 0:
-            if claim_memory_extraction_interval is not None:
-                extraction_due = await claim_memory_extraction_interval(
-                    turn_count,
-                    extraction_interval,
-                )
+            elif recall_store and auxiliary_llm and extraction_interval > 0:
+                if claim_memory_extraction_interval is not None:
+                    extraction_due = await claim_memory_extraction_interval(
+                        turn_count,
+                        extraction_interval,
+                    )
+                else:
+                    extraction_due = (
+                        turn_count - _last_extraction_turn
+                    ) >= extraction_interval
+                if extraction_due:
+                    _last_extraction_turn = turn_count
             else:
-                extraction_due = (
-                    turn_count - _last_extraction_turn
-                ) >= extraction_interval
-            if extraction_due:
-                _last_extraction_turn = turn_count
-        else:
-            extraction_due = False
+                extraction_due = False
 
-        if memory_service is None and extraction_due:
-            try:
-                from .services.auxiliary import extract_and_store_memories
+            if memory_service is None and extraction_due:
+                try:
+                    from .services.auxiliary import extract_and_store_memories
 
-                await extract_and_store_memories(
-                    auxiliary_llm=auxiliary_llm,
-                    recall_store=recall_store,
-                    messages=extraction_messages,
-                    memory_extraction_prompt=memory_extraction_prompt,
-                    source_turn_start=turn_count - extraction_interval,
-                    source_turn_end=turn_count,
-                )
-                logger.debug(f"Memory extraction triggered at turn {turn_count}")
-            except Exception as e:
-                logger.warning(f"Memory extraction failed (non-fatal): {e}")
+                    await extract_and_store_memories(
+                        auxiliary_llm=auxiliary_llm,
+                        recall_store=recall_store,
+                        messages=extraction_messages,
+                        memory_extraction_prompt=memory_extraction_prompt,
+                        source_turn_start=turn_count - extraction_interval,
+                        source_turn_end=turn_count,
+                    )
+                    logger.debug(f"Memory extraction triggered at turn {turn_count}")
+                except Exception as e:
+                    logger.warning(f"Memory extraction failed (non-fatal): {e}")
 
         turn_metrics = result.metrics if result else None
-        await callbacks.on_turn_complete(turn_id, turn_metrics)
+        await callbacks.on_turn_complete(
+            turn_id,
+            turn_metrics,
+            str(user_msg.id),
+            memory_scope_kind,
+            memory_scope_id,
+        )
+        for error_args, error_kwargs in deferred_errors:
+            # _execute_turn's timeout callback predates turn correlation and
+            # supplies only the message. The outer loop owns the exact id.
+            if "turn_id" not in error_kwargs and len(error_args) < 2:
+                error_kwargs["turn_id"] = turn_id
+            await callbacks.on_error(*error_args, **error_kwargs)
 
         try:
             # Auto-commit workspace changes after the transcript reconcile, then
@@ -1182,6 +1238,7 @@ async def _execute_turn(
     project_ids: Optional[List[str]] = None,
     tool_context: Optional[Any] = None,
     memory_service: Optional[Any] = None,
+    defer_memory_capture_to_outbox: bool = False,
 ) -> TurnResult:
     """Execute a single turn: LLM call -> tool calls -> repeat until done.
 
@@ -1510,7 +1567,11 @@ async def _execute_turn(
         # (docs/done/memory_extraction_before_compaction.md). Fire-and-forget
         # so compaction latency is unchanged; no phase concept in a session →
         # phase=0 (matches the turn_end capture).
-        if memory_service is not None and context_manager.should_summarize(messages):
+        if (
+            memory_service is not None
+            and not defer_memory_capture_to_outbox
+            and context_manager.should_summarize(messages)
+        ):
             from .services.memory import CaptureEvent
 
             keep_recent = context_manager.config.keep_recent_messages

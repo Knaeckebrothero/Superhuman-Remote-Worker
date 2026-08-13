@@ -4785,7 +4785,8 @@ CREATE TABLE public.completion_effects (
     complete_by timestamp with time zone,
     completed_at timestamp with time zone,
     detail jsonb DEFAULT '{}'::jsonb NOT NULL,
-    error_code text
+    error_code text,
+    claimed_by uuid
 );
 
 
@@ -4793,7 +4794,14 @@ CREATE TABLE public.completion_effects (
 -- Name: TABLE completion_effects; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.completion_effects IS 'One stable-name progress row per completion effect. Polymorphic by producer_kind and deliberately has no foreign key or state-driven partial index; retention is explicit and shared with session producers.';
+COMMENT ON TABLE public.completion_effects IS 'One stable-name progress row per completion effect. Polymorphic by producer_kind and deliberately has no foreign key or state-driven partial index. job_completion producers use the command finalizer states; session_turn producers use pending, done, or dead and are age-pruned from created_at. Retention is explicit for both kinds.';
+
+
+--
+-- Name: COLUMN completion_effects.claimed_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.completion_effects.claimed_by IS 'Independent session-effect drain claim identity. NULL means unclaimed; a session drain may complete or release only the UUID it claimed.';
 
 
 --
@@ -7799,7 +7807,8 @@ CREATE TABLE public.thread_messages (
     additional_kwargs jsonb,
     response_metadata jsonb,
     seq bigint NOT NULL,
-    rewound_at timestamp with time zone
+    rewound_at timestamp with time zone,
+    turn_execution_id uuid
 );
 
 
@@ -7850,6 +7859,13 @@ COMMENT ON COLUMN public.thread_messages.seq IS 'Monotonic per-row insertion ord
 --
 
 COMMENT ON COLUMN public.thread_messages.rewound_at IS 'Set when a session rewind supersedes this row (seq >= the rewind''s from_seq). Live conversation readers filter rewound_at IS NULL; the row itself is never deleted. See docs/features/session_rewind.md.';
+
+
+--
+-- Name: COLUMN thread_messages.turn_execution_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_messages.turn_execution_id IS 'Identity minted on the exact accepted turn-boundary message inside the stateless claim''s fenced final-transcript transaction. It is reused by an idempotent reconcile and keys session_turn completion effects; it is NULL for pinned turns and messages that are not a finalized boundary.';
 
 
 --
@@ -10369,6 +10385,13 @@ CREATE INDEX idx_canvas_view_bootstraps_expires ON public.canvas_view_bootstraps
 --
 
 CREATE INDEX idx_canvas_view_bootstraps_pending ON public.canvas_view_bootstraps USING btree (attachment_id, expires_at) WHERE (consumed_at IS NULL);
+
+
+--
+-- Name: idx_completion_effects_session_drain; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_completion_effects_session_drain ON public.completion_effects USING btree (producer_kind, state, run_after, created_at);
 
 
 --

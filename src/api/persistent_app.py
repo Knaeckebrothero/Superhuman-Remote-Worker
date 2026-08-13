@@ -780,6 +780,8 @@ def _ensure_persistent_loop_started(
                     if _session.postgres_conn is not None
                     else None
                 ),
+                defer_memory_extraction_to_outbox=_stateless_mode(),
+                memory_thread_id=_session.thread_id,
             ),
             name="persistent-loop",
         )
@@ -3140,15 +3142,18 @@ async def _terminate_session_inner(
     # cloud ping must never observe the next pool attachment.
     await _quiesce_session_side_tasks()
 
-    # B11: final memory capture for ALL terminate reasons — the ✕-button
+    # B11: final memory capture for ALL pinned terminate reasons — the ✕-button
     # detach (and drain, watchdog, shutdown, …) historically skipped
-    # extraction entirely. Manager-mode only; the flag-off path keeps
-    # today's (skipping) behaviour. The guard flag stops a re-extraction
-    # when _handle_archive/_handle_idle_archive already captured. Must run
-    # before _session.cleanup() tears down the stores; contained like the
-    # sibling teardown steps — a memory failure must never skip cleanup.
+    # extraction entirely. Stateless turns instead mint one durable per-turn
+    # obligation and must never run this full-history writer as a duplicate.
+    # Manager-mode only; the flag-off pinned path keeps today's (skipping)
+    # behaviour. The guard flag stops a re-extraction when
+    # _handle_archive/_handle_idle_archive already captured. Must run before
+    # _session.cleanup() tears down the stores; contained like the sibling
+    # teardown steps — a memory failure must never skip cleanup.
     if (
-        _session.memory_service is not None
+        not _stateless_mode()
+        and _session.memory_service is not None
         and not _session.final_memory_extracted
         and _session.messages
         and not (_session.shell_owner_token is not None and not mark_thread)
@@ -8926,13 +8931,25 @@ async def _loop_on_workspace_commit(sha: str) -> None:
         logger.warning("record_turn_commit failed (non-fatal)", exc_info=True)
 
 
-async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -> None:
+async def _loop_on_turn_complete(
+    turn_id: int,
+    metrics: Optional[dict] = None,
+    turn_input_message_id: Optional[str] = None,
+    memory_scope_kind: Optional[str] = None,
+    memory_scope_id: Optional[str] = None,
+) -> None:
     global _turn_event_open
     # This is the transcript terminal edge. Clear before any awaited cleanup so
     # a reattach during turn-end persistence never reopens an already-completed
     # assistant bubble merely because the broader loop is not parked yet.
     _turn_event_open = False
-    await _loop_on_turn_complete_body(turn_id, metrics)
+    await _loop_on_turn_complete_body(
+        turn_id,
+        metrics,
+        turn_input_message_id=turn_input_message_id,
+        memory_scope_kind=memory_scope_kind,
+        memory_scope_id=memory_scope_id,
+    )
 
 
 async def _loop_on_turn_settled(turn_id: int) -> None:
@@ -8957,7 +8974,12 @@ async def _loop_on_turn_settled(turn_id: int) -> None:
 
 
 async def _loop_on_turn_complete_body(
-    turn_id: int, metrics: Optional[dict] = None
+    turn_id: int,
+    metrics: Optional[dict] = None,
+    *,
+    turn_input_message_id: Optional[str] = None,
+    memory_scope_kind: Optional[str] = None,
+    memory_scope_id: Optional[str] = None,
 ) -> None:
     # Runs on EVERY turn exit — completed, parked on an unanswered gate,
     # interrupted, or errored (run_persistent_loop catches and still calls
@@ -8969,9 +8991,17 @@ async def _loop_on_turn_complete_body(
     # Ensure the (shared) session aux LLM logs to llm_requests — covers the
     # title call below plus the observer/extraction paths that reuse it.
     _wire_session_aux_archiver()
-    _broadcast("turn.completed", {"turn_id": turn_id, "metrics": metrics or {}})
+    authoritative_turn_boundary = _stateless_mode()
+    if not authoritative_turn_boundary:
+        # Preserve the pinned lane's historical UI ordering. Stateless moves
+        # this terminal edge below its authoritative transaction: publishing a
+        # completed frame before a fence loss would make a retry look complete.
+        _broadcast("turn.completed", {"turn_id": turn_id, "metrics": metrics or {}})
     # Save AI messages from this turn straight to the DB (bounded await). Direct
     # write via the agent's own pool — the orchestrator REST hop is bypassed.
+    # On the stateless lane this exact transaction also mints the durable memory
+    # effect, so failure must abort settlement and leave the queue generation
+    # retryable. Pinned sessions retain the historical best-effort behavior.
     if _session.postgres_conn:
         try:
             await asyncio.wait_for(
@@ -8982,11 +9012,27 @@ async def _loop_on_turn_complete_body(
                     turn_id,
                     metrics=metrics,
                     tool_decisions=dict(_session.tool_decisions),
+                    authoritative_turn_boundary=authoritative_turn_boundary,
+                    turn_input_message_id=turn_input_message_id,
+                    memory_scope_kind=memory_scope_kind,
+                    memory_scope_id=memory_scope_id,
                 ),
                 timeout=5.0,
             )
         except asyncio.TimeoutError:
+            if authoritative_turn_boundary:
+                logger.error(
+                    "Authoritative stateless turn persist timed out (5s); "
+                    "refusing turn settlement"
+                )
+                raise
             logger.warning("AI message save timed out (5s) — proceeding")
+    elif authoritative_turn_boundary:
+        raise RuntimeError(
+            "authoritative stateless turn persist requires a Postgres connection"
+        )
+    if authoritative_turn_boundary:
+        _broadcast("turn.completed", {"turn_id": turn_id, "metrics": metrics or {}})
     _session.tool_decisions.clear()
 
     # Auto-generate title after first few turns. Awaited (not fire-and-forget)
@@ -9913,8 +9959,13 @@ async def _save_turn_ai_messages(
     turn_number: int,
     metrics: dict | None = None,
     tool_decisions: Optional[Dict[str, str]] = None,
+    *,
+    authoritative_turn_boundary: bool = False,
+    turn_input_message_id: Optional[str] = None,
+    memory_scope_kind: Optional[str] = None,
+    memory_scope_id: Optional[str] = None,
 ) -> None:
-    """Fire-and-forget: save AI + tool messages from the most recent turn by direct DB write.
+    """Reconcile the most recent turn by direct DB write.
 
     ``client`` is the agent's ``PostgresDB`` (``_session.postgres_conn``) — the
     write goes straight to the pool, not through the orchestrator REST endpoint.
@@ -9925,17 +9976,45 @@ async def _save_turn_ai_messages(
     ``tool_decisions`` carries the per-call supervised approval outcome
     (``tool_call_id -> 'approved' | 'denied'``) so the decision survives
     history reload as a field on the persisted tool_calls.
+
+    Stateless callers set ``authoritative_turn_boundary``. The exact input
+    message id and turn number then ride the same fenced transaction as the
+    final rows so the DB can mint the per-turn outbox identity. Even a turn
+    with zero output must call the DB. Any missing boundary or write failure is
+    fatal; pinned callers keep the historical empty/no-error behavior.
     """
     try:
-        # Walk backwards from the end to find messages from this turn
-        # (after the last HumanMessage)
+        # Walk backwards from the end to find messages from this turn. The
+        # stateless lane stops at the exact accepted input id; pinned preserves
+        # its historical "latest HumanMessage" boundary.
         to_save = []
+        boundary_found = False
         for msg in reversed(messages):
-            if hasattr(msg, "type") and msg.type in ("human", "HumanMessageChunk"):
+            if authoritative_turn_boundary:
+                if str(getattr(msg, "id", "")) == str(turn_input_message_id):
+                    boundary_found = True
+                    break
+            elif hasattr(msg, "type") and msg.type in (
+                "human",
+                "HumanMessageChunk",
+            ):
+                boundary_found = True
                 break
             to_save.append(msg)
         to_save.reverse()
-        if not to_save:
+        if authoritative_turn_boundary and (
+            not turn_input_message_id or not boundary_found
+        ):
+            raise ValueError(
+                "authoritative stateless turn lacks an exact input message id"
+            )
+        if authoritative_turn_boundary and (
+            memory_scope_kind not in {"thread", "project"} or not memory_scope_id
+        ):
+            raise ValueError(
+                "authoritative stateless turn lacks an immutable memory destination"
+            )
+        if not to_save and not authoritative_turn_boundary:
             return
 
         # Reconcile the whole turn in ONE batched upsert (was a serial
@@ -9952,8 +10031,24 @@ async def _save_turn_ai_messages(
             )
             for msg in to_save
         ]
-        await client.save_thread_messages(thread_id, rows)
+        if authoritative_turn_boundary:
+            producer_id = await client.save_thread_messages(
+                thread_id,
+                rows,
+                turn_input_message_id=turn_input_message_id,
+                turn_number=turn_number,
+                memory_scope_kind=memory_scope_kind,
+                memory_scope_id=memory_scope_id,
+            )
+            if not producer_id:
+                raise RuntimeError(
+                    "authoritative stateless turn persist minted no memory effect"
+                )
+        else:
+            await client.save_thread_messages(thread_id, rows)
     except Exception as e:
+        if authoritative_turn_boundary:
+            raise
         logger.warning(f"Failed to save turn messages (non-fatal): {e}")
 
 
@@ -11038,7 +11133,9 @@ async def _handle_archive(ws: WebSocket) -> None:
             except Exception as e:
                 logger.debug(f"Cloud sync aclose failed (non-fatal): {e}")
 
-        # 1. Extract final memories.
+        # 1. Extract final memories on the pinned lane. Stateless turns already
+        # own durable per-turn obligations; a full-history teardown pass would
+        # duplicate writes and refresh memory TTLs a second time.
         # Manager path (memory overhaul Phase 1): the teardown_extractor
         # writer reproduces the gates, the call, and the log line below;
         # the guard flag stops _terminate_session from re-extracting (B11).
@@ -11047,14 +11144,19 @@ async def _handle_archive(ws: WebSocket) -> None:
             if _session.tool_context
             else None
         )
-        if _session.memory_service is not None:
+        if not _stateless_mode() and _session.memory_service is not None:
             from ..services.memory import CaptureEvent
 
             await _session.memory_service.capture(
                 CaptureEvent(kind="session_end", messages=_session.messages)
             )
             _session.final_memory_extracted = True
-        elif recall_store and _session.auxiliary_llm and _session.messages:
+        elif (
+            not _stateless_mode()
+            and recall_store
+            and _session.auxiliary_llm
+            and _session.messages
+        ):
             try:
                 from ..services.auxiliary import extract_and_store_memories
 
@@ -11219,7 +11321,8 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
         # the UI can flip to the resume card without waiting for a refresh.
         _broadcast("session.ended", {"thread_id": _thread_id, "reason": "idle_timeout"})
 
-        # 1. Extract memories.
+        # 1. Extract memories on the pinned lane. Stateless extraction belongs
+        # solely to the per-turn outbox, including its final turn.
         # Manager path (memory overhaul Phase 1): the teardown_extractor
         # writer reproduces the gates, the call, and the log line below.
         recall_store = (
@@ -11227,14 +11330,19 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
             if _session.tool_context
             else None
         )
-        if _session.memory_service is not None:
+        if not _stateless_mode() and _session.memory_service is not None:
             from ..services.memory import CaptureEvent
 
             await _session.memory_service.capture(
                 CaptureEvent(kind="idle_archive", messages=_session.messages)
             )
             _session.final_memory_extracted = True
-        elif recall_store and _session.auxiliary_llm and _session.messages:
+        elif (
+            not _stateless_mode()
+            and recall_store
+            and _session.auxiliary_llm
+            and _session.messages
+        ):
             try:
                 from ..services.auxiliary import extract_and_store_memories
 

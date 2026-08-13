@@ -243,6 +243,68 @@ class TestStore:
         summary_arg = call_args[0][5]  # $5 = summary (shifted by project_id)
         assert len(summary_arg) == 500
 
+    @pytest.mark.asyncio
+    async def test_retrieval_subwrite_failure_is_legacy_best_effort(
+        self, store, mock_db, mock_embedding_service
+    ):
+        memory_id = uuid.uuid4()
+        mock_db.fetchrow.return_value = None
+        mock_db.fetchval.return_value = memory_id
+        mock_db.execute.side_effect = RuntimeError("retrieval write failed")
+
+        result = await store.store(
+            content="Durable parent with a best-effort trigger.",
+            importance=0.8,
+            retrieval_messages=["When is the durable parent useful?"],
+        )
+
+        assert result == memory_id
+        mock_embedding_service.embed_batch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_retrieval_subwrite_failure_propagates_in_strict_mode(
+        self, mock_db, mock_embedding_service, job_id, config
+    ):
+        strict = RecallStore(
+            db=mock_db,
+            embedding_service=mock_embedding_service,
+            job_id=job_id,
+            config=config,
+            strict_writes=True,
+        )
+        mock_db.fetchrow.return_value = None
+        mock_db.fetchval.return_value = uuid.uuid4()
+        mock_db.execute.side_effect = RuntimeError("retrieval write failed")
+
+        with pytest.raises(RuntimeError, match="retrieval write failed"):
+            await strict.store(
+                content="Durable parent needs an atomic trigger.",
+                importance=0.8,
+                retrieval_messages=["When is the atomic trigger useful?"],
+            )
+
+    @pytest.mark.asyncio
+    async def test_retrieval_embedding_count_mismatch_propagates_in_strict_mode(
+        self, mock_db, mock_embedding_service, job_id, config
+    ):
+        strict = RecallStore(
+            db=mock_db,
+            embedding_service=mock_embedding_service,
+            job_id=job_id,
+            config=config,
+            strict_writes=True,
+        )
+        mock_db.fetchrow.return_value = None
+        mock_db.fetchval.return_value = uuid.uuid4()
+        mock_embedding_service.embed_batch.return_value = []
+
+        with pytest.raises(RuntimeError, match="embedding count"):
+            await strict.store(
+                content="The provider response must be complete.",
+                importance=0.8,
+                retrieval_messages=["When do complete embeddings matter?"],
+            )
+
 
 # =============================================================================
 # Retrieval Tests
@@ -578,6 +640,26 @@ class TestPreInsertDedupRecheck:
 
         assert result == new_id
         mock_db.fetchval.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_initial_verdict_lookup_failure_propagates_when_strict(
+        self, store, mock_db
+    ):
+        store.strict_writes = True
+        store.ingestion_verdict = _FakeVerdictService(_FakeVerdict("ADD"))
+        mock_db.fetch.side_effect = RuntimeError("initial lookup failed")
+
+        with pytest.raises(RuntimeError, match="initial lookup failed"):
+            await store.store(content="strict candidate", importance=0.8)
+
+    @pytest.mark.asyncio
+    async def test_recheck_lookup_failure_propagates_when_strict(self, store, mock_db):
+        store.strict_writes = True
+        store.ingestion_verdict = _FakeVerdictService(_FakeVerdict("ADD"))
+        mock_db.fetch.side_effect = [[], RuntimeError("recheck failed")]
+
+        with pytest.raises(RuntimeError, match="recheck failed"):
+            await store.store(content="strict candidate", importance=0.8)
 
 
 class TestFindSimilarManyAndSupersede:

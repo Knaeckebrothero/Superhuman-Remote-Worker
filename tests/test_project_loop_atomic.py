@@ -318,13 +318,15 @@ def test_oversized_member_error_is_bounded_with_audit_count():
     assert len(json.dumps(dict(mutation.replay)).encode("utf-8")) < 8192
 
 
-def test_vector_ttl_ledger_is_current_head_and_in_generated_snapshot():
+def test_vector_idempotency_ledgers_are_current_and_in_generated_snapshot():
     migrations = sorted(
         (REPO_ROOT / "orchestrator/database/migrations/vector").glob("*.sql")
     )
-    assert migrations[-1].name == "0018_project_loop_ttl_effects.sql"
+    assert migrations[-1].name == "0019_session_memory_effect_executions.sql"
     snapshot = (
         REPO_ROOT / "orchestrator/database/vector_schema_current.sql"
     ).read_text()
     assert "CREATE TABLE public.project_loop_ttl_effects" in snapshot
     assert "project_loop_ttl_effects_pkey" in snapshot
+    assert "CREATE TABLE public.session_memory_effect_executions" in snapshot
+    assert "session_memory_effect_executions_pkey" in snapshot

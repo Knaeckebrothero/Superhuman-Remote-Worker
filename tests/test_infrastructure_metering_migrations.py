@@ -213,7 +213,10 @@ APP_JOB_COMPLETION_ACCEPT_STATUS = (
 APP_JOB_COMPLETION_STATUS_REORDER = (
     ROOT / "orchestrator/database/migrations/app/0144_job_completion_status_reorder.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_JOB_COMPLETION_STATUS_REORDER
+APP_CURRENT_MIGRATION_HEAD = (
+    ROOT
+    / "orchestrator/database/migrations/app/0146_completion_effects_session_drain.notx.sql"
+)
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"

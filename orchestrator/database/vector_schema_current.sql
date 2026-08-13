@@ -779,6 +779,55 @@ CREATE TABLE public.schema_migrations (
 
 
 --
+-- Name: session_memory_effect_executions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.session_memory_effect_executions (
+    producer_id uuid NOT NULL,
+    effect_name text NOT NULL,
+    thread_id uuid NOT NULL,
+    input_message_id uuid NOT NULL,
+    turn_number integer NOT NULL,
+    boundary_seq bigint NOT NULL,
+    end_seq bigint NOT NULL,
+    memory_scope_kind text NOT NULL,
+    memory_scope_id uuid NOT NULL,
+    state text DEFAULT 'writing'::text NOT NULL,
+    extracted_count integer,
+    stored_count integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    CONSTRAINT session_memory_effect_name CHECK ((effect_name = 'final_memory_extraction'::text)),
+    CONSTRAINT session_memory_effect_scope CHECK (((memory_scope_kind = ANY (ARRAY['thread'::text, 'project'::text])) AND ((memory_scope_kind <> 'thread'::text) OR (memory_scope_id = thread_id)))),
+    CONSTRAINT session_memory_effect_seq_window CHECK (((boundary_seq > 0) AND (end_seq >= boundary_seq))),
+    CONSTRAINT session_memory_effect_state CHECK ((state = ANY (ARRAY['writing'::text, 'done'::text]))),
+    CONSTRAINT session_memory_effect_terminal_shape CHECK ((((state = 'writing'::text) AND (extracted_count IS NULL) AND (stored_count IS NULL) AND (completed_at IS NULL)) OR ((state = 'done'::text) AND (extracted_count >= 0) AND (stored_count >= 0) AND (stored_count <= extracted_count) AND (completed_at IS NOT NULL)))),
+    CONSTRAINT session_memory_effect_turn_positive CHECK ((turn_number > 0))
+);
+
+
+--
+-- Name: TABLE session_memory_effect_executions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.session_memory_effect_executions IS 'Immutable destination receipts for session_turn final-memory effects. The writing row is inserted, all memory mutations run, and the row becomes done in one vector transaction. Rows are not time-pruned: a delayed app-DB receipt replay must never become a new vector mutation.';
+
+
+--
+-- Name: COLUMN session_memory_effect_executions.producer_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.session_memory_effect_executions.producer_id IS 'turn_execution_id minted by the fenced app-DB final-persist transaction.';
+
+
+--
+-- Name: COLUMN session_memory_effect_executions.memory_scope_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.session_memory_effect_executions.memory_scope_id IS 'Immutable thread or project destination captured with the accepted turn.';
+
+
+--
 -- Name: source_annotations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1040,6 +1089,14 @@ ALTER TABLE ONLY public.project_loop_ttl_effects
 
 ALTER TABLE ONLY public.schema_migrations
     ADD CONSTRAINT schema_migrations_pkey PRIMARY KEY (filename);
+
+
+--
+-- Name: session_memory_effect_executions session_memory_effect_executions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.session_memory_effect_executions
+    ADD CONSTRAINT session_memory_effect_executions_pkey PRIMARY KEY (producer_id, effect_name);
 
 
 --

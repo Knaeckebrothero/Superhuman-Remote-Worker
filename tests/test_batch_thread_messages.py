@@ -13,6 +13,7 @@ the batch must preserve, verified on a real pg (testcontainers):
 """
 
 import asyncio
+import json
 import uuid
 
 import pytest
@@ -23,6 +24,7 @@ from src.api.lease_context import LeaseHandle, LeaseLostError, current_lease
 from src.database.postgres_db import PostgresDB, _coerce_row_id
 
 _TID = "aaaaaaaa-0000-0000-0000-000000000001"
+_PROJECT_ID = "aaaaaaaa-0000-0000-0000-000000000099"
 _CONTROL_IDS = (
     "bbbbbbbb-0000-0000-0000-000000000001",
     "bbbbbbbb-0000-0000-0000-000000000002",
@@ -40,10 +42,13 @@ async def db(pg_dsn):
     d = PostgresDB(connection_string=pg_dsn)
     await d.connect()
     async with d.acquire() as conn:
+        await conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS threads (
                 id uuid PRIMARY KEY,
+                project_id uuid,
+                metadata jsonb DEFAULT '{}'::jsonb,
                 last_activity timestamptz,
                 total_turns int DEFAULT 0,
                 status text DEFAULT 'active',
@@ -51,6 +56,16 @@ async def db(pg_dsn):
                 agent_id uuid,
                 events_epoch int NOT NULL DEFAULT 0,
                 events_seq_hwm bigint NOT NULL DEFAULT 0
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_mounts (
+                id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+                thread_id uuid NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                mount_kind text NOT NULL,
+                source_ref uuid
             )
             """
         )
@@ -73,7 +88,32 @@ async def db(pg_dsn):
                 additional_kwargs jsonb,
                 response_metadata jsonb,
                 seq bigserial,
-                created_at timestamptz DEFAULT now()
+                created_at timestamptz DEFAULT now(),
+                rewound_at timestamptz,
+                turn_execution_id uuid
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS completion_effects (
+                producer_kind text NOT NULL,
+                producer_id uuid NOT NULL,
+                scope_id uuid,
+                effect_name text NOT NULL,
+                effect_group text NOT NULL,
+                state text NOT NULL DEFAULT 'pending',
+                attempts int NOT NULL DEFAULT 0,
+                max_attempts int NOT NULL DEFAULT 5,
+                run_after timestamptz NOT NULL DEFAULT now(),
+                created_at timestamptz NOT NULL DEFAULT now(),
+                intent_at timestamptz,
+                complete_by timestamptz,
+                completed_at timestamptz,
+                detail jsonb NOT NULL DEFAULT '{}'::jsonb,
+                error_code text,
+                claimed_by uuid,
+                PRIMARY KEY (producer_kind, producer_id, effect_name)
             )
             """
         )
@@ -113,8 +153,8 @@ async def db(pg_dsn):
             """
         )
         await conn.execute(
-            "TRUNCATE thread_events, thread_control_requests, thread_messages, "
-            "run_queue RESTART IDENTITY"
+            "TRUNCATE thread_events, thread_control_requests, thread_mounts, "
+            "thread_messages, completion_effects, run_queue RESTART IDENTITY"
         )
         await conn.execute(
             "INSERT INTO threads "
@@ -122,7 +162,8 @@ async def db(pg_dsn):
             "events_epoch, events_seq_hwm) "
             "VALUES ($1, 0, 'active', 'stateless', NULL, 4, 0) "
             "ON CONFLICT (id) DO UPDATE SET total_turns = 0, "
-            "last_activity = NULL, status = 'active', execution_lane = 'stateless', "
+            "project_id = NULL, metadata = '{}'::jsonb, last_activity = NULL, "
+            "status = 'active', execution_lane = 'stateless', "
             "agent_id = NULL, events_epoch = 4, events_seq_hwm = 0",
             uuid.UUID(_TID),
         )
@@ -164,6 +205,23 @@ async def _seqs_by_id(db):
             uuid.UUID(_TID),
         )
     return {str(r["id"]): r for r in rows}
+
+
+async def _seed_turn_boundary(db, raw_id: str, turn_number: int, role="event"):
+    """Model the orchestrator's already-durable accepted input row."""
+
+    row_id = _coerce_row_id(raw_id)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO thread_messages "
+            "(id, thread_id, role, content, turn_number) "
+            "VALUES ($1::uuid, $2::uuid, $3, 'accepted input', $4)",
+            row_id,
+            _TID,
+            role,
+            turn_number,
+        )
+    return row_id
 
 
 async def _terminal_end_after_release(db, thread_locked, release_queue):
@@ -283,6 +341,396 @@ async def test_reconcile_bumps_thread_turn_count(db):
     # GREATEST(existing, max turn_number in the batch) => 7.
     assert row["total_turns"] == 7
     assert row["last_activity"] is not None
+
+
+@pytest.mark.asyncio
+async def test_stateless_reconcile_mints_one_stable_memory_effect_per_turn(db):
+    input_id = await _seed_turn_boundary(db, "effect-boundary", 8)
+    output_id = _coerce_row_id("effect-output")
+    output_rows = [_row("effect-output", "ai", "durable answer", 8)]
+    lease = LeaseHandle()
+    lease.update(_TID, 17)
+    context_token = current_lease.set(lease)
+    try:
+        first = await db.save_thread_messages(
+            _TID,
+            output_rows,
+            turn_input_message_id="effect-boundary",
+            turn_number=8,
+            memory_scope_kind="thread",
+            memory_scope_id=_TID,
+        )
+        second = await db.save_thread_messages(
+            _TID,
+            output_rows,
+            turn_input_message_id="effect-boundary",
+            turn_number=8,
+            memory_scope_kind="thread",
+            memory_scope_id=_TID,
+        )
+    finally:
+        current_lease.reset(context_token)
+
+    assert first == second
+    uuid.UUID(first)
+    async with db.acquire() as conn:
+        message_execution_id = await conn.fetchval(
+            "SELECT turn_execution_id FROM thread_messages WHERE id = $1::uuid",
+            input_id,
+        )
+        effects = await conn.fetch(
+            "SELECT producer_id, scope_id, effect_name, effect_group, state, detail "
+            "FROM completion_effects WHERE producer_kind = 'session_turn'"
+        )
+        total_turns = await conn.fetchval(
+            "SELECT total_turns FROM threads WHERE id = $1::uuid", _TID
+        )
+        seqs = await conn.fetch(
+            "SELECT id, seq FROM thread_messages WHERE id = ANY($1::uuid[])",
+            [input_id, output_id],
+        )
+
+    assert str(message_execution_id) == first
+    assert len(effects) == 1
+    effect = effects[0]
+    assert str(effect["producer_id"]) == first
+    assert str(effect["scope_id"]) == _TID
+    assert effect["effect_name"] == "final_memory_extraction"
+    assert effect["effect_group"] == "memory_extraction"
+    assert effect["state"] == "pending"
+    detail = effect["detail"]
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    seq_by_id = {str(row["id"]): int(row["seq"]) for row in seqs}
+    assert detail == {
+        "input_message_id": input_id,
+        "turn_number": 8,
+        "memory_scope_kind": "thread",
+        "memory_scope_id": _TID,
+        "boundary_seq": seq_by_id[input_id],
+        "end_seq": seq_by_id[output_id],
+    }
+    assert total_turns == 8
+
+
+@pytest.mark.asyncio
+async def test_distinct_boundaries_do_not_collapse_when_turn_number_is_reused(db):
+    await _seed_turn_boundary(db, "first-reused-turn", 8)
+    await _seed_turn_boundary(db, "second-reused-turn", 8)
+    lease = LeaseHandle()
+    lease.update(_TID, 17)
+    context_token = current_lease.set(lease)
+    try:
+        first = await db.save_thread_messages(
+            _TID,
+            [],
+            turn_input_message_id="first-reused-turn",
+            turn_number=8,
+            memory_scope_kind="thread",
+            memory_scope_id=_TID,
+        )
+        second = await db.save_thread_messages(
+            _TID,
+            [],
+            turn_input_message_id="second-reused-turn",
+            turn_number=8,
+            memory_scope_kind="thread",
+            memory_scope_id=_TID,
+        )
+    finally:
+        current_lease.reset(context_token)
+
+    assert first != second
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM completion_effects "
+                "WHERE producer_kind = 'session_turn'"
+            )
+            == 2
+        )
+
+
+@pytest.mark.asyncio
+async def test_delayed_effect_range_does_not_absorb_reused_turn_number(db):
+    first_input = await _seed_turn_boundary(db, "first-range-boundary", 8)
+    lease = LeaseHandle()
+    lease.update(_TID, 17)
+    context_token = current_lease.set(lease)
+    try:
+        first = await db.save_thread_messages(
+            _TID,
+            [_row("first-range-output", "ai", "first answer", 8)],
+            turn_input_message_id="first-range-boundary",
+            turn_number=8,
+            memory_scope_kind="thread",
+            memory_scope_id=_TID,
+        )
+        await _seed_turn_boundary(db, "second-range-boundary", 8)
+        await db.save_thread_messages(
+            _TID,
+            [_row("second-range-output", "ai", "second answer", 8)],
+            turn_input_message_id="second-range-boundary",
+            turn_number=8,
+            memory_scope_kind="thread",
+            memory_scope_id=_TID,
+        )
+    finally:
+        current_lease.reset(context_token)
+
+    async with db.acquire() as conn:
+        detail = await conn.fetchval(
+            "SELECT detail FROM completion_effects "
+            "WHERE producer_kind = 'session_turn' AND producer_id = $1::uuid",
+            first,
+        )
+        if isinstance(detail, str):
+            detail = json.loads(detail)
+        rows = await conn.fetch(
+            "SELECT id FROM thread_messages WHERE thread_id = $1::uuid "
+            "AND seq BETWEEN $2 AND $3 ORDER BY seq",
+            _TID,
+            int(detail["boundary_seq"]),
+            int(detail["end_seq"]),
+        )
+
+    assert [str(row["id"]) for row in rows] == [
+        first_input,
+        _coerce_row_id("first-range-output"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_project_destination_is_captured_only_when_attached(db):
+    input_id = await _seed_turn_boundary(db, "project-effect-boundary", 11)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET project_id = $2::uuid WHERE id = $1::uuid",
+            _TID,
+            _PROJECT_ID,
+        )
+    lease = LeaseHandle()
+    lease.update(_TID, 17)
+    context_token = current_lease.set(lease)
+    try:
+        producer_id = await db.save_thread_messages(
+            _TID,
+            [_row("project-effect-output", "ai", "project fact", 11)],
+            turn_input_message_id="project-effect-boundary",
+            turn_number=11,
+            memory_scope_kind="project",
+            memory_scope_id=_PROJECT_ID,
+        )
+    finally:
+        current_lease.reset(context_token)
+
+    async with db.acquire() as conn:
+        detail = await conn.fetchval(
+            "SELECT detail FROM completion_effects WHERE producer_id = $1::uuid",
+            producer_id,
+        )
+        if isinstance(detail, str):
+            detail = json.loads(detail)
+        execution_id = await conn.fetchval(
+            "SELECT turn_execution_id FROM thread_messages WHERE id = $1::uuid",
+            input_id,
+        )
+    assert str(execution_id) == producer_id
+    assert detail["memory_scope_kind"] == "project"
+    assert detail["memory_scope_id"] == _PROJECT_ID
+
+
+@pytest.mark.asyncio
+async def test_unattached_project_destination_rolls_back_transcript_and_effect(db):
+    input_id = await _seed_turn_boundary(db, "unattached-effect-boundary", 12)
+    output_id = _coerce_row_id("unattached-effect-output")
+    lease = LeaseHandle()
+    lease.update(_TID, 17)
+    context_token = current_lease.set(lease)
+    try:
+        with pytest.raises(ValueError, match="not attached"):
+            await db.save_thread_messages(
+                _TID,
+                [_row("unattached-effect-output", "ai", "must roll back", 12)],
+                turn_input_message_id="unattached-effect-boundary",
+                turn_number=12,
+                memory_scope_kind="project",
+                memory_scope_id=_PROJECT_ID,
+            )
+    finally:
+        current_lease.reset(context_token)
+
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT turn_execution_id IS NULL FROM thread_messages WHERE id = $1::uuid",
+            input_id,
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM thread_messages WHERE id = $1::uuid)",
+            output_id,
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM completion_effects "
+                "WHERE producer_kind = 'session_turn'"
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_effect_retry_rejects_destination_identity_drift(db):
+    await _seed_turn_boundary(db, "scope-drift-boundary", 13)
+    lease = LeaseHandle()
+    lease.update(_TID, 17)
+    context_token = current_lease.set(lease)
+    try:
+        producer_id = await db.save_thread_messages(
+            _TID,
+            [_row("scope-drift-output", "ai", "same output", 13)],
+            turn_input_message_id="scope-drift-boundary",
+            turn_number=13,
+            memory_scope_kind="thread",
+            memory_scope_id=_TID,
+        )
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE threads SET project_id = $2::uuid WHERE id = $1::uuid",
+                _TID,
+                _PROJECT_ID,
+            )
+        with pytest.raises(ValueError, match="conflicting identity"):
+            await db.save_thread_messages(
+                _TID,
+                [_row("scope-drift-output", "ai", "same output", 13)],
+                turn_input_message_id="scope-drift-boundary",
+                turn_number=13,
+                memory_scope_kind="project",
+                memory_scope_id=_PROJECT_ID,
+            )
+    finally:
+        current_lease.reset(context_token)
+
+    async with db.acquire() as conn:
+        detail = await conn.fetchval(
+            "SELECT detail FROM completion_effects WHERE producer_id = $1::uuid",
+            producer_id,
+        )
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    assert detail["memory_scope_kind"] == "thread"
+    assert detail["memory_scope_id"] == _TID
+
+
+@pytest.mark.asyncio
+async def test_rewind_cannot_tombstone_an_unfinished_effect_source(db):
+    input_id = await _seed_turn_boundary(db, "rewind-effect-boundary", 14)
+    lease = LeaseHandle()
+    lease.update(_TID, 17)
+    context_token = current_lease.set(lease)
+    try:
+        await db.save_thread_messages(
+            _TID,
+            [_row("rewind-effect-output", "ai", "retain source", 14)],
+            turn_input_message_id="rewind-effect-boundary",
+            turn_number=14,
+            memory_scope_kind="thread",
+            memory_scope_id=_TID,
+        )
+        async with db.acquire() as conn:
+            from_seq = await conn.fetchval(
+                "SELECT seq FROM thread_messages WHERE id = $1::uuid",
+                input_id,
+            )
+        with pytest.raises(RuntimeError, match="final-memory extraction"):
+            await db.apply_rewind(
+                _TID,
+                from_seq=int(from_seq),
+                mode="conversation",
+                actor="test",
+            )
+    finally:
+        current_lease.reset(context_token)
+
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT rewound_at IS NULL FROM thread_messages WHERE id = $1::uuid",
+            input_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fenced_out_reconcile_mints_neither_transcript_nor_effect(db):
+    input_id = await _seed_turn_boundary(db, "stolen-effect-boundary", 9)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE run_queue SET lease_token = 18 WHERE unit_id = $1::uuid",
+            _TID,
+        )
+
+    lease = LeaseHandle()
+    lease.update(_TID, 17)
+    context_token = current_lease.set(lease)
+    try:
+        with pytest.raises(LeaseLostError):
+            await db.save_thread_messages(
+                _TID,
+                [_row("stolen-output", "ai", "must roll back", 9)],
+                turn_input_message_id="stolen-effect-boundary",
+                turn_number=9,
+                memory_scope_kind="thread",
+                memory_scope_id=_TID,
+            )
+    finally:
+        current_lease.reset(context_token)
+
+    async with db.acquire() as conn:
+        execution_id = await conn.fetchval(
+            "SELECT turn_execution_id FROM thread_messages WHERE id = $1::uuid",
+            input_id,
+        )
+        effect_count = await conn.fetchval(
+            "SELECT count(*) FROM completion_effects "
+            "WHERE producer_kind = 'session_turn'"
+        )
+        output_count = await conn.fetchval(
+            "SELECT count(*) FROM thread_messages WHERE id = $1::uuid",
+            _coerce_row_id("stolen-output"),
+        )
+
+    assert execution_id is None
+    assert effect_count == 0
+    assert output_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pinned_reconcile_keeps_transcript_only_compatibility(db):
+    input_id = await _seed_turn_boundary(db, "pinned-effect-boundary", 10)
+    producer_id = await db.save_thread_messages(
+        _TID,
+        [_row("pinned-output", "ai", "pinned answer", 10)],
+        turn_input_message_id="pinned-effect-boundary",
+        turn_number=10,
+    )
+
+    assert producer_id is None
+    async with db.acquire() as conn:
+        execution_id = await conn.fetchval(
+            "SELECT turn_execution_id FROM thread_messages WHERE id = $1::uuid",
+            input_id,
+        )
+        effect_count = await conn.fetchval(
+            "SELECT count(*) FROM completion_effects "
+            "WHERE producer_kind = 'session_turn'"
+        )
+        output = await conn.fetchval(
+            "SELECT content FROM thread_messages WHERE id = $1::uuid",
+            _coerce_row_id("pinned-output"),
+        )
+
+    assert execution_id is None
+    assert effect_count == 0
+    assert output == "pinned answer"
 
 
 @pytest.mark.asyncio

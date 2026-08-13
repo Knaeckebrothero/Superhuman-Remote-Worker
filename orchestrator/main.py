@@ -2730,10 +2730,13 @@ async def _resolve_session_config(
     *,
     config_override: dict[str, Any] | None = None,
     status: dict[str, Any] | None = None,
+    resolve_base_when_experts_disabled: bool = False,
 ) -> dict[str, Any] | None:
     """Resolve a persistent thread's full config to a delivery blob (credential-
     injected), or ``None`` when experts are off / resolution fails (→ the agent's
-    ``config_name`` + ``config_override`` fallback).
+    ``config_name`` + ``config_override`` fallback).  The session-memory outbox
+    alone may opt into bundled-base resolution while experts are off; normal
+    attach semantics remain unchanged and dormant expert rows stay excluded.
 
     The session sibling of the job-dispatch resolve. Sessions **re-resolve on
     every (re)attach** — there is no freeze (mutable run; spec delivery table).
@@ -2742,14 +2745,20 @@ async def _resolve_session_config(
     ``config_override`` overrides ``metadata.config_override`` for the warm-pool
     path (it carries the attach-time lite-workspace backend).
     """
-    if not _is_experts_db_enabled() or not await _user_experts_enabled():
+    experts_enabled = _is_experts_db_enabled() and await _user_experts_enabled()
+    if not experts_enabled and not resolve_base_when_experts_disabled:
         if status is not None:
             status["state"] = "disabled"
         return None
     try:
         user_id = str(thread["user_id"]) if thread.get("user_id") else None
         project_id = str(thread["project_id"]) if thread.get("project_id") else None
-        expert_id = metadata.get("expert_id")
+        # The resident session-memory drain also serves deployments where the
+        # expert catalog is disabled.  Its explicit opt-in resolves only the
+        # bundled session base + account/request layers; a dormant expert id
+        # must not become active merely because an outbox worker needs fresh
+        # credentials.  Normal attach callers keep the early-return above.
+        expert_id = metadata.get("expert_id") if experts_enabled else None
         expert_row = (
             await postgres_db.get_expert_by_id(str(expert_id)) if expert_id else None
         )
@@ -9979,6 +9988,7 @@ async def lifespan(app: FastAPI):
     global _completion_finalizer_instance, _completion_sweep_router_instance
     global _completion_control_instance
     global _completion_command_resolution_instance, _completion_monitor_instance
+    global _session_memory_effect_drain_instance
     global _shutdown_event
 
     # Reordering is an execution mode of durable completion commands, never a
@@ -11098,6 +11108,13 @@ async def lifespan(app: FastAPI):
     run_queue_reaper_task = asyncio.create_task(
         run_queue_reaper_loop(postgres_db, _shutdown_event)
     )
+    # Stateless turn memory is its own transactional-outbox ownership domain.
+    # It is always resident and never hidden behind completion-command flags or
+    # advisory leadership: row leases serialize replicas and survive handover.
+    session_memory_effect_task = asyncio.create_task(
+        _get_session_memory_effect_drain().run_drain(_shutdown_event),
+        name="session-memory-effect-drain",
+    )
     # Gate-3 completion drain uses its own observable River-style lease row;
     # it must never be wrapped in the orchestrator advisory-leader helper.
     # Keep the finalizer/router module imports dark while the gate is closed.
@@ -11392,6 +11409,7 @@ async def lifespan(app: FastAPI):
     await sudo_sweeper_task
     await thread_events_prune_task
     await run_queue_reaper_task
+    await session_memory_effect_task
     if completion_finalizer_task is not None:
         await completion_finalizer_task
     if completion_sweep_router_task is not None:
@@ -11465,6 +11483,7 @@ async def lifespan(app: FastAPI):
     _completion_control_instance = None
     _completion_command_resolution_instance = None
     _completion_monitor_instance = None
+    _session_memory_effect_drain_instance = None
 
 
 app = FastAPI(
@@ -21721,6 +21740,83 @@ _completion_sweep_router_instance: Any | None = None
 _completion_control_instance: Any | None = None
 _completion_command_resolution_instance: Any | None = None
 _completion_monitor_instance: Any | None = None
+_session_memory_effect_drain_instance: Any | None = None
+
+
+async def _resolve_session_memory_effect_config(
+    thread: Mapping[str, Any],
+    memory_scope_kind: str,
+    memory_scope_id: UUID,
+) -> Mapping[str, Any]:
+    """Fresh, credentialed config for one immutable memory destination.
+
+    The outbox captures where the accepted turn's memory belongs.  A delayed
+    drain may refresh the owner's model credentials and current config, but it
+    may neither redirect that write to a later project mount nor revive a
+    disabled DB expert.  The opt-in base resolver keeps experts-off deployments
+    functional without changing normal attach behavior.
+    """
+
+    scoped_thread = dict(thread)
+    metadata = scoped_thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("session memory thread metadata is malformed") from exc
+    if not isinstance(metadata, dict):
+        raise RuntimeError("session memory thread metadata is not an object")
+
+    if memory_scope_kind == "project":
+        project_id = str(memory_scope_id)
+        if await postgres_db.get_project(project_id) is None:
+            raise RuntimeError("captured session memory project no longer exists")
+        owner_id = scoped_thread.get("user_id")
+        if not owner_id:
+            raise RuntimeError("project-scoped session memory requires an owning user")
+        owner = await postgres_db.get_user(str(owner_id))
+        if owner is None:
+            raise RuntimeError("session memory thread owner no longer exists")
+        await _authorize_thread_project_ids(owner, [project_id])
+        # Project expert layers, grant checks, and credential resolution must
+        # be evaluated against the captured destination, not today's default.
+        scoped_thread["project_id"] = memory_scope_id
+    elif memory_scope_kind != "thread":
+        raise RuntimeError("unsupported session memory scope kind")
+
+    status: dict[str, Any] = {}
+    resolved = await _resolve_session_config(
+        scoped_thread,
+        metadata,
+        status=status,
+        resolve_base_when_experts_disabled=True,
+    )
+    if resolved is None:
+        raise RuntimeError(
+            "session memory config resolution failed "
+            f"(state={status.get('state', 'unknown')})"
+        )
+    return resolved
+
+
+def _get_session_memory_effect_drain() -> Any:
+    """Build the always-on session-turn drain independently of job completion."""
+
+    global _session_memory_effect_drain_instance
+    if _session_memory_effect_drain_instance is None:
+        from services.session_memory_effects import SessionMemoryEffectDrain
+        from services.session_memory_executor import SessionMemoryEffectExecutor
+
+        executor = SessionMemoryEffectExecutor(
+            postgres_db,
+            vector_db,
+            _resolve_session_memory_effect_config,
+        )
+        _session_memory_effect_drain_instance = SessionMemoryEffectDrain(
+            postgres_db,
+            executor,
+        )
+    return _session_memory_effect_drain_instance
 
 
 def _durable_completion_http_outcome(exc: HTTPException) -> dict[str, Any]:
@@ -38096,6 +38192,19 @@ async def end_thread(
             if permanent:
                 closure = result.get("closure") or {}
                 terminal_thread = result.get("thread") or fresh_thread
+                # The final transcript is the source of a separately leased
+                # session-turn memory obligation. Retirement may remove the
+                # runtime workspace, but permanent deletion must retain the
+                # DB transcript/config until that obligation is terminal.
+                # ``delete_thread`` repeats this under its row locks.
+                if await postgres_db.has_unfinished_session_memory_effects(thread_id):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Final-memory extraction is still pending; retry "
+                            "permanent deletion after it settles"
+                        ),
+                    )
                 terminal_metadata = thread_metadata_object(terminal_thread)
                 terminal_binding = terminal_metadata.get("_workspace_binding") or {}
                 terminal_workspace = terminal_metadata.get("workspace_container") or {}

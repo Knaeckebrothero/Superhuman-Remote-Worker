@@ -329,6 +329,7 @@ class RecallStore:
         project_id: Optional[uuid.UUID] = None,
         project_ids: Optional[List[uuid.UUID]] = None,
         archiver=None,
+        strict_writes: bool = False,
     ):
         """Initialize RecallStore.
 
@@ -341,6 +342,11 @@ class RecallStore:
             project_id: Optional project UUID for project-scoped memory sharing
             project_ids: Optional list of project UUIDs for multi-project sessions
             archiver: Optional LLMArchiver for audit logging
+            strict_writes: Propagate auxiliary sub-write failures instead of
+                containing them. Intended for callers that wrap the complete
+                memory mutation in their own transaction (for example the
+                stateless-session destination ledger); defaults to the legacy
+                best-effort behavior everywhere else.
         """
         self.db = db
         self.embedding_service = embedding_service
@@ -349,6 +355,7 @@ class RecallStore:
         self.project_id = project_id
         self.project_ids = project_ids or ([project_id] if project_id else [])
         self._archiver = archiver
+        self.strict_writes = bool(strict_writes)
         self.project_scoped = (
             getattr(config, "project_scoped", False) if config else False
         )
@@ -592,6 +599,8 @@ class RecallStore:
                     f"Stored {rm_count} retrieval messages for memory {mem_id}"
                 )
             except Exception as e:
+                if self.strict_writes:
+                    raise
                 logger.warning(f"Failed to store retrieval messages for {mem_id}: {e}")
 
         logger.debug(
@@ -724,6 +733,8 @@ class RecallStore:
                 embedding, k=svc.top_k, min_similarity=svc.review_floor
             )
         except Exception as e:
+            if self.strict_writes:
+                raise
             logger.warning(
                 "Ingestion verdict: neighbour lookup failed (%s: %s); ADD",
                 type(e).__name__,
@@ -818,6 +829,8 @@ class RecallStore:
                 min_similarity=self.recheck_threshold,
             )
         except Exception as e:
+            if self.strict_writes:
+                raise
             logger.debug(
                 "Pre-insert dedup re-check failed (%s: %s); proceeding with ADD",
                 type(e).__name__,
@@ -870,6 +883,10 @@ class RecallStore:
 
         # Batch embed all messages in one API call
         embeddings = await self.embedding_service.embed_batch(messages)
+        if self.strict_writes and len(embeddings) != len(messages):
+            raise RuntimeError(
+                "retrieval-message embedding count does not match input count"
+            )
 
         stored = 0
         for msg, emb in zip(messages, embeddings):
@@ -885,6 +902,8 @@ class RecallStore:
                 )
                 stored += 1
             except Exception as e:
+                if self.strict_writes:
+                    raise
                 logger.warning(
                     f"Failed to store retrieval message for {memory_id}: {e}"
                 )
