@@ -79,6 +79,34 @@ class TestAdjudicate:
         )
         assert out.action == "ADD"
 
+    @pytest.mark.asyncio
+    async def test_aux_exception_propagates_for_strict_transaction(self):
+        aux = _FakeAux(exc=RuntimeError("aux down"))
+        svc = IngestionVerdictService(
+            aux,
+            "P",
+            IngestionConfig(enabled=True),
+            strict_writes=True,
+        )
+        with pytest.raises(RuntimeError, match="aux down"):
+            await svc.adjudicate(
+                content="c", summary=None, keywords=None, similar=[_rec()]
+            )
+
+    @pytest.mark.asyncio
+    async def test_wrong_shape_propagates_for_strict_transaction(self):
+        aux = _FakeAux(result="not a verdict")
+        svc = IngestionVerdictService(
+            aux,
+            "P",
+            IngestionConfig(enabled=True),
+            strict_writes=True,
+        )
+        with pytest.raises(RuntimeError, match="invalid shape"):
+            await svc.adjudicate(
+                content="c", summary=None, keywords=None, similar=[_rec()]
+            )
+
 
 class TestMaybeAttach:
     def test_attaches_when_enabled(self):
@@ -91,6 +119,14 @@ class TestMaybeAttach:
         assert svc is not None
         assert store.ingestion_verdict is svc
         assert svc.top_k == 8 and svc.review_floor == 0.7
+
+    def test_inherits_strict_transaction_mode(self):
+        store = SimpleNamespace(ingestion_verdict=None, strict_writes=True)
+        aux = _FakeAux()
+        cfg = SimpleNamespace(ingestion=IngestionConfig(enabled=True))
+        svc = maybe_attach_ingestion_verdict(store, aux, cfg)
+        assert svc is not None
+        assert svc.strict_writes is True
 
     def test_noop_when_disabled(self):
         store = SimpleNamespace(ingestion_verdict=None)

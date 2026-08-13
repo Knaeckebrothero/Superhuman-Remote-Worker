@@ -71,7 +71,7 @@ def _db_with(conn):
 def test_apply_rewind_sweeps_ledgers_and_returns_stats():
     conn = _FakeConn(
         fetchrow_returns=[{"id": "11111111-1111-1111-1111-111111111111"}],
-        fetchval_returns=[7, 3],  # swept count, surviving turn
+        fetchval_returns=[1, 7, 3],  # thread lock, swept count, surviving turn
     )
     db = _db_with(conn)
     out = asyncio.run(
@@ -97,7 +97,7 @@ def test_apply_rewind_sweeps_ledgers_and_returns_stats():
 def test_apply_rewind_code_mode_skips_sweep():
     conn = _FakeConn(
         fetchrow_returns=[{"id": "22222222-2222-2222-2222-222222222222"}],
-        fetchval_returns=[3],  # surviving turn only
+        fetchval_returns=[1, 3],  # thread lock, surviving turn only
     )
     db = _db_with(conn)
     out = asyncio.run(
@@ -124,7 +124,7 @@ def test_apply_rewind_clamps_existing_memory_cursor_with_transcript(
         def __init__(self):
             super().__init__(
                 fetchrow_returns=[{"id": "11111111-1111-1111-1111-111111111111"}],
-                fetchval_returns=[2, surviving_turn],
+                fetchval_returns=[1, 2, surviving_turn],
             )
             self.memory_cursor = existing_cursor
 
@@ -154,7 +154,7 @@ def test_apply_rewind_clamps_existing_memory_cursor_with_transcript(
 def test_apply_rewind_code_mode_does_not_move_memory_cursor():
     conn = _FakeConn(
         fetchrow_returns=[{"id": "22222222-2222-2222-2222-222222222222"}],
-        fetchval_returns=[5],
+        fetchval_returns=[1, 5],
     )
     db = _db_with(conn)
 
@@ -201,10 +201,16 @@ def test_apply_rewind_cursor_failure_rolls_back_transcript_sweep():
 
         async def fetchval(self, query, *_args):
             self.calls.append(query)
+            if "SELECT 1 FROM threads" in query:
+                return 1
             if "WITH swept" in query:
                 self.messages_swept = True
                 return 2
             return 5
+
+        async def fetch(self, query, *_args):
+            self.calls.append(query)
+            return []
 
         async def fetchrow(self, query, *_args):
             self.calls.append(query)
@@ -230,6 +236,22 @@ def test_apply_rewind_cursor_failure_rolls_back_transcript_sweep():
 
     assert conn.messages_swept is False
     assert conn.memory_cursor == 10
+
+
+def test_apply_rewind_refuses_unfinished_memory_source_before_sweep():
+    conn = _FakeConn(fetchval_returns=[1], fetch_returns=[[{"producer_id": "p1"}]])
+    db = _db_with(conn)
+
+    with pytest.raises(RuntimeError, match="final-memory extraction"):
+        asyncio.run(
+            db.apply_rewind(
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                from_seq=42,
+                mode="conversation",
+            )
+        )
+
+    assert not [q for _, q, _ in conn.calls if "SET rewound_at" in q]
 
 
 def test_resweep_rewind_sweeps_remaining_strays():

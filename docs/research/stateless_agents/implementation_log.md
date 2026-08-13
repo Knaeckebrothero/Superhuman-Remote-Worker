@@ -4693,3 +4693,59 @@ tests, **20** Python interrupt integration selections, and **20** Cockpit
 interrupt tests. Eight interrupt real-Postgres cases skipped because the shell
 had no configured test database; this milestone does not relabel them as a new
 database run.
+
+## M1 — fenced final-memory outbox and destination receipt
+
+Every settled stateless turn now commits its final transcript and one durable
+`session_turn/final_memory_extraction` obligation in the same
+thread→run-queue-fenced transaction. The transaction mints or reuses a
+`turn_execution_id` on the exact accepted input row, freezes the inclusive
+`boundary_seq..end_seq` transcript window, and captures one immutable thread or
+project memory destination. A fenced loser commits neither transcript
+reconciliation nor obligation; retries validate the complete immutable effect
+identity. Pinned sessions retain their transcript-only path. The stateless
+runtime also defers terminal `turn.completed`/`turn.error` publication until
+this authoritative persist succeeds, and disables the older interval,
+pre-compaction, turn-end, archive, idle-archive and teardown extractors so the
+outbox is the single stateless memory writer.
+
+An always-resident orchestrator drain, independent of job-completion flags and
+leadership, claims only the stable session producer with a fresh UUID and a
+PostgreSQL-clock lease. It renews and checks that exact owner before external
+work, retries with the shared linear `5s × attempt × jitter` schedule, retires
+exhausted/permanent failures as `dead`, and age-prunes `done` after 24 hours and
+`dead` after seven days without reading or deleting job-completion effects.
+Permanent thread deletion and rewind both serialize with the source boundary
+and refuse while a matching session-memory obligation is pending, so delayed
+work cannot lose or cross a tombstoned transcript.
+
+The destination side has its own immutable vector-DB receipt keyed by
+`(turn_execution_id, effect_name)`. The receipt, every `RecallStore` mutation,
+retrieval-message subwrite and final counts commit in one vector transaction.
+The executor rechecks the exact app-DB owner immediately before the vector
+transaction, before and after every memory store, and at the commit edge; loss
+raises inside the transaction and rolls all destination work back. An app-DB
+receipt-loss replay validates the vector receipt and performs no second vector
+mutation. This is exactly-once for durable vector mutations, not for provider
+billing: auxiliary inference happens before the destination claim and may
+repeat under contention or an app/vector response-loss boundary. Tenant model
+and embedding transports are rebuilt explicitly from fresh authorized config
+without process-global environment mutation, while the captured destination
+cannot drift to a later project mount; project scope without a thread owner
+fails closed.
+
+Schema head is now app **0146** and vector **0019**. App 0145 adds the nullable
+turn identity and exact effect claimant; 0146 adds the non-partial ordered drain
+index. Vector 0019 adds the non-pruned destination execution ledger. Fresh app
+and vector migration replays regenerated **13,518**- and **1,647**-line
+snapshots and both freshness checks passed; pinned Squawk v2.59.0 reported
+**0 issues in 3 files**. The integrated producer/boundary/drain/executor/
+RecallStore/rewind/migration selection passed **515/515** with **3 expected
+skips** and two established AsyncMock resource warnings. The dedicated real
+pgvector cases passed **2/2**, proving response-loss replay leaves one memory,
+one retrieval subwrite and one ledger row, while a strict subwrite failure
+rolls memory and ledger back together. Ruff lint, format-check, `compileall`
+and whitespace checks are clean. No live job, workspace or completion row was
+read for mutation, and the two protected probes and three protected untracked
+paths remain untouched. The next app migration is **0147** and the next vector
+migration is **0020**.

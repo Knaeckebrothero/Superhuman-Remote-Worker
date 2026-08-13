@@ -25,16 +25,25 @@ class IngestionVerdictService:
 
     Holds the cost-guard knobs (``top_k`` neighbours to consider, the
     ``review_floor`` similarity below which the store skips the LLM entirely)
-    so the store reads them from one place. ``adjudicate`` never raises — an
-    aux outage or a malformed verdict degrades to a conservative ADD (keep the
-    candidate, retire nothing), so a write is never lost to a verdict failure.
+    so the store reads them from one place. By default ``adjudicate`` never
+    raises: an aux outage or malformed verdict degrades to a conservative ADD.
+    Transactional destination-ledger callers opt into strict propagation so a
+    contained verdict failure cannot commit a misleading successful receipt.
     """
 
-    def __init__(self, auxiliary_llm: Any, prompt: str, config: Any):
+    def __init__(
+        self,
+        auxiliary_llm: Any,
+        prompt: str,
+        config: Any,
+        *,
+        strict_writes: bool = False,
+    ):
         self._aux = auxiliary_llm
         self._prompt = prompt
         self.top_k = int(getattr(config, "verdict_top_k", 5))
         self.review_floor = float(getattr(config, "review_floor", 0.6))
+        self.strict_writes = bool(strict_writes)
 
     async def adjudicate(
         self,
@@ -69,7 +78,9 @@ class IngestionVerdictService:
         )
         try:
             verdict = await self._aux.chain(task)
-        except Exception as e:  # never let a verdict failure lose a write
+        except Exception as e:
+            if self.strict_writes:
+                raise
             logger.warning(
                 "Ingestion verdict failed (non-fatal, defaulting to ADD): %s: %s",
                 type(e).__name__,
@@ -78,6 +89,8 @@ class IngestionVerdictService:
             return IngestionVerdict(action="ADD", reason="verdict-error-fallback")
 
         if not isinstance(verdict, IngestionVerdict):
+            if self.strict_writes:
+                raise RuntimeError("ingestion verdict returned an invalid shape")
             return IngestionVerdict(action="ADD", reason="verdict-shape-fallback")
         return verdict
 
@@ -109,7 +122,12 @@ def maybe_attach_ingestion_verdict(
     from src.utils.config import load_prompt
 
     prompt = load_prompt("memory_ingestion_verdict.txt")
-    service = IngestionVerdictService(auxiliary_llm, prompt, ingestion)
+    service = IngestionVerdictService(
+        auxiliary_llm,
+        prompt,
+        ingestion,
+        strict_writes=bool(getattr(recall_store, "strict_writes", False)),
+    )
     recall_store.ingestion_verdict = service
     logger.info(
         "Ingestion verdicts enabled (top_k=%d, review_floor=%.2f)",

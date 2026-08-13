@@ -99,7 +99,14 @@ class TestResolveMemoryExtractionPrompt:
 class TestLoopExtractionWiring:
     """B1 (b)+(c): the loop honors observer_interval and threads the prompt."""
 
-    async def _run_loop(self, turns: int, observer_interval: int, prompt: str):
+    async def _run_loop(
+        self,
+        turns: int,
+        observer_interval: int,
+        prompt: str,
+        *,
+        defer_memory_extraction_to_outbox: bool = False,
+    ):
         count = 0
 
         async def _input():
@@ -124,6 +131,7 @@ class TestLoopExtractionWiring:
                 recall_store=MagicMock(),
                 auxiliary_llm=MagicMock(),
                 memory_extraction_prompt=prompt,
+                defer_memory_extraction_to_outbox=(defer_memory_extraction_to_outbox),
             )
             # Let the fire-and-forget extraction task run
             await asyncio.sleep(0)
@@ -145,6 +153,279 @@ class TestLoopExtractionWiring:
     async def test_interval_zero_disables_extraction(self):
         extraction = await self._run_loop(turns=3, observer_interval=0, prompt="unused")
         extraction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_outbox_mode_skips_legacy_interval_extraction(self):
+        extraction = await self._run_loop(
+            turns=2,
+            observer_interval=1,
+            prompt="owned by outbox",
+            defer_memory_extraction_to_outbox=True,
+        )
+        extraction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_outbox_mode_skips_memory_manager_capture(self):
+        count = 0
+
+        async def _input():
+            nonlocal count
+            count += 1
+            if count == 1:
+                return "turn 1"
+            raise asyncio.CancelledError
+
+        payload = MagicMock()
+        payload.messages.return_value = []
+        payload.blocks = []
+        memory_service = MagicMock()
+        memory_service.assemble = AsyncMock(return_value=payload)
+        memory_service.capture = AsyncMock()
+        context_manager = MagicMock()
+        context_manager.should_summarize.return_value = False
+        context_manager.ensure_within_limits = AsyncMock(
+            side_effect=lambda m, *a, **kw: m
+        )
+        await run_persistent_loop(
+            llm_with_tools=_make_streaming_llm(),
+            tools=[],
+            context_manager=context_manager,
+            config=_loop_config(observer_interval=1),
+            system_prompt="sys",
+            callbacks=_make_callbacks(get_user_input=_input),
+            messages=[],
+            memory_service=memory_service,
+            defer_memory_extraction_to_outbox=True,
+        )
+
+        memory_service.capture.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_outbox_mode_skips_pre_compaction_memory_capture(self):
+        count = 0
+
+        async def _input():
+            nonlocal count
+            count += 1
+            if count == 1:
+                return "turn 1"
+            raise asyncio.CancelledError
+
+        payload = MagicMock()
+        payload.messages.return_value = []
+        payload.blocks = []
+        memory_service = MagicMock()
+        memory_service.assemble = AsyncMock(return_value=payload)
+        memory_service.capture = AsyncMock()
+        context_manager = MagicMock()
+        context_manager.should_summarize.return_value = True
+        context_manager.config.keep_recent_messages = 1
+        context_manager.ensure_within_limits = AsyncMock(
+            side_effect=lambda m, *a, **kw: m
+        )
+        await run_persistent_loop(
+            llm_with_tools=_make_streaming_llm(),
+            tools=[],
+            context_manager=context_manager,
+            config=_loop_config(observer_interval=1),
+            system_prompt="sys",
+            callbacks=_make_callbacks(get_user_input=_input),
+            messages=[],
+            memory_service=memory_service,
+            defer_memory_extraction_to_outbox=True,
+        )
+
+        memory_service.capture_nowait.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("project_scoped", "project_ids", "expected_kind", "expected_id"),
+        [
+            (True, ["project-a", "project-b"], "project", "project-a"),
+            (False, ["project-a"], "thread", "thread-a"),
+            (True, [], "thread", "thread-a"),
+        ],
+    )
+    async def test_outbox_callback_carries_exact_input_and_destination(
+        self,
+        project_scoped,
+        project_ids,
+        expected_kind,
+        expected_id,
+    ):
+        count = 0
+
+        async def _input():
+            nonlocal count
+            count += 1
+            if count == 1:
+                return {"content": "turn 1", "id": "accepted-input-a"}
+            raise asyncio.CancelledError
+
+        callbacks = _make_callbacks(get_user_input=_input)
+        config = _loop_config(observer_interval=1)
+        config.memory.project_scoped = project_scoped
+        await run_persistent_loop(
+            llm_with_tools=_make_streaming_llm(),
+            tools=[],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=config,
+            system_prompt="sys",
+            callbacks=callbacks,
+            messages=[],
+            project_ids=project_ids,
+            memory_thread_id="thread-a",
+            defer_memory_extraction_to_outbox=True,
+        )
+
+        args = callbacks.on_turn_complete.await_args.args
+        assert args[2:] == (
+            "accepted-input-a",
+            expected_kind,
+            expected_id,
+        )
+
+    @pytest.mark.asyncio
+    async def test_outbox_persist_failure_suppresses_captured_turn_error(self):
+        count = 0
+
+        async def _input():
+            nonlocal count
+            count += 1
+            if count == 1:
+                return {"content": "turn 1", "id": "accepted-input-a"}
+            raise asyncio.CancelledError
+
+        llm = MagicMock()
+
+        async def _timeout(*_args, **_kwargs):
+            raise asyncio.TimeoutError
+            yield  # pragma: no cover - keeps this an async generator
+
+        llm.astream = _timeout
+        llm.reasoning = None
+        callbacks = _make_callbacks(
+            get_user_input=_input,
+            on_turn_complete=AsyncMock(side_effect=RuntimeError("persist failed")),
+        )
+
+        with (
+            patch("src.persistent_graph._SESSION_LLM_MAX_ATTEMPTS", 1),
+            pytest.raises(RuntimeError, match="persist failed"),
+        ):
+            await run_persistent_loop(
+                llm_with_tools=llm,
+                tools=[],
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ),
+                config=_loop_config(observer_interval=1),
+                system_prompt="sys",
+                callbacks=callbacks,
+                messages=[],
+                memory_thread_id="thread-a",
+                defer_memory_extraction_to_outbox=True,
+            )
+
+        callbacks.on_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_outbox_replays_turn_error_after_authoritative_persist(self):
+        count = 0
+        order = []
+
+        async def _input():
+            nonlocal count
+            count += 1
+            if count == 1:
+                return {"content": "turn 1", "id": "accepted-input-a"}
+            raise asyncio.CancelledError
+
+        llm = MagicMock()
+
+        async def _timeout(*_args, **_kwargs):
+            raise asyncio.TimeoutError
+            yield  # pragma: no cover - keeps this an async generator
+
+        llm.astream = _timeout
+        llm.reasoning = None
+
+        async def _complete(*_args):
+            order.append("persist")
+
+        async def _error(*_args, **kwargs):
+            order.append(("error", kwargs.get("turn_id")))
+
+        callbacks = _make_callbacks(
+            get_user_input=_input,
+            on_turn_complete=_complete,
+            on_error=_error,
+        )
+        with patch("src.persistent_graph._SESSION_LLM_MAX_ATTEMPTS", 1):
+            await run_persistent_loop(
+                llm_with_tools=llm,
+                tools=[],
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ),
+                config=_loop_config(observer_interval=1),
+                system_prompt="sys",
+                callbacks=callbacks,
+                messages=[],
+                memory_thread_id="thread-a",
+                defer_memory_extraction_to_outbox=True,
+            )
+
+        assert order == ["persist", ("error", 1)]
+
+    @pytest.mark.asyncio
+    async def test_pinned_turn_error_keeps_historical_pre_complete_order(self):
+        count = 0
+        order = []
+
+        async def _input():
+            nonlocal count
+            count += 1
+            if count == 1:
+                return "turn 1"
+            raise asyncio.CancelledError
+
+        llm = MagicMock()
+
+        async def _timeout(*_args, **_kwargs):
+            raise asyncio.TimeoutError
+            yield  # pragma: no cover - keeps this an async generator
+
+        llm.astream = _timeout
+        llm.reasoning = None
+
+        async def _complete(*_args):
+            order.append("complete")
+
+        async def _error(*_args, **_kwargs):
+            order.append("error")
+
+        callbacks = _make_callbacks(
+            get_user_input=_input,
+            on_turn_complete=_complete,
+            on_error=_error,
+        )
+        with patch("src.persistent_graph._SESSION_LLM_MAX_ATTEMPTS", 1):
+            await run_persistent_loop(
+                llm_with_tools=llm,
+                tools=[],
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ),
+                config=_loop_config(observer_interval=0),
+                system_prompt="sys",
+                callbacks=callbacks,
+                messages=[],
+            )
+
+        assert order == ["error", "complete"]
 
     @pytest.mark.asyncio
     async def test_real_extraction_pipeline_receives_threaded_prompt(self):
@@ -261,3 +542,63 @@ class TestTeardownExtraction:
         extraction.assert_awaited_once()
         kwargs = extraction.call_args.kwargs
         assert kwargs["memory_extraction_prompt"] == "TEARDOWN PROMPT"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("handler", ["archive", "idle_archive"])
+    async def test_stateless_teardown_skips_manager_and_legacy_extraction(
+        self, handler, monkeypatch
+    ):
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        session = self._make_session()
+        session.memory_service = MagicMock()
+        session.memory_service.capture = AsyncMock()
+        extraction = AsyncMock()
+        ws = AsyncMock()
+        with (
+            patch("src.api.persistent_app._session", session),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("src.api.persistent_app._broadcast"),
+            patch("src.api.persistent_app._terminate_session", AsyncMock()),
+            patch("src.services.auxiliary.extract_and_store_memories", extraction),
+        ):
+            if handler == "archive":
+                await _handle_archive(ws)
+            else:
+                await _handle_idle_archive()
+
+        session.memory_service.capture.assert_not_awaited()
+        extraction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stateless_generic_terminate_skips_manager_extraction(
+        self, monkeypatch
+    ):
+        from src.api import persistent_app as pa
+
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        session = self._make_session()
+        session.memory_service = MagicMock()
+        session.memory_service.capture = AsyncMock()
+        session.final_memory_extracted = False
+        session.shell_owner_token = None
+        session.quiesce_background_tasks = AsyncMock()
+        session.cleanup = AsyncMock()
+        session.retire_shell_owner = MagicMock()
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_loop_task", None),
+            patch.object(pa, "_event_writer", None),
+            patch.object(pa, "_stop_watchdogs"),
+            patch.object(pa, "_stop_thread_interrupt_watcher", AsyncMock()),
+            patch.object(pa, "_stop_thread_control_watcher", AsyncMock()),
+            patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
+            patch.object(pa, "_quiesce_session_side_tasks", AsyncMock()),
+            patch.object(pa, "_clear_all_canvas_awareness"),
+            patch.object(pa, "_subscribers", {}),
+            patch.object(pa, "_max_sessions_per_process", 0),
+            patch.object(pa, "_terminating", False),
+        ):
+            await pa._terminate_session("test", mark_thread=False)
+
+        session.memory_service.capture.assert_not_awaited()

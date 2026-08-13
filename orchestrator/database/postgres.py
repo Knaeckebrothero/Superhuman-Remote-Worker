@@ -8798,6 +8798,395 @@ class PostgresDB:
         except (ValueError, IndexError, AttributeError):
             return 0
 
+    # --- Session-turn completion effects -----------------------------------
+
+    async def has_unfinished_session_memory_effects(self, thread_id: str) -> bool:
+        """Whether a thread still owns a source-dependent memory obligation.
+
+        This is the public lifecycle preflight. ``delete_thread`` repeats the
+        check under its thread-row transaction, so a caller cannot erase the
+        transcript/config between this convenient early check and the final
+        database delete.
+        """
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM completion_effects AS effect
+                        WHERE effect.producer_kind = 'session_turn'
+                          AND effect.effect_name = 'final_memory_extraction'
+                          AND effect.effect_group = 'memory_extraction'
+                          AND effect.scope_id = $1::uuid
+                          AND effect.state = 'pending'
+                    )
+                    """,
+                    thread_uuid,
+                )
+            )
+
+    async def claim_session_memory_effects(
+        self,
+        *,
+        claimed_by: str,
+        limit: int = 20,
+        lease_seconds: float = 120.0,
+    ) -> List[Dict[str, Any]]:
+        """Claim due final-memory effects with one exact DB-clock lease term.
+
+        ``claimed_by`` is a fresh UUID per drain pass, not a process identity.
+        Reusing a process identity would create an ABA hole: a callback from an
+        expired attempt could settle a later lease held by the same process.
+
+        The scan is intentionally limited and restricted to
+        ``producer_kind='session_turn'``.  It never reads or updates the
+        job-completion producer.  A prior attempt that consumed its last retry
+        and then lost its response is retired to ``dead`` in a separate bounded
+        CTE before new work is claimed, so an expired final lease cannot wedge
+        forever as an unclaimable pending row.
+        """
+
+        try:
+            owner_uuid = UUID(str(claimed_by))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session memory effect owner must be a UUID") from exc
+        if not 1 <= int(limit) <= 1000:
+            raise ValueError("session memory effect claim limit must be 1..1000")
+        if not math.isfinite(float(lease_seconds)) or float(lease_seconds) <= 0:
+            raise ValueError("session memory effect lease must be positive")
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    WITH exhausted AS (
+                        SELECT effect.producer_id, effect.effect_name
+                        FROM completion_effects AS effect
+                        WHERE effect.producer_kind = 'session_turn'
+                          AND effect.effect_name = 'final_memory_extraction'
+                          AND effect.effect_group = 'memory_extraction'
+                          AND effect.state = 'pending'
+                          AND effect.attempts >= effect.max_attempts
+                          AND effect.run_after <= now()
+                          AND (
+                              effect.claimed_by IS NULL
+                              OR effect.complete_by IS NULL
+                              OR effect.complete_by <= now()
+                          )
+                        ORDER BY effect.run_after, effect.created_at,
+                                 effect.producer_id, effect.effect_name
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT $1
+                    )
+                    UPDATE completion_effects AS effect
+                    SET state = 'dead',
+                        claimed_by = NULL,
+                        complete_by = NULL,
+                        completed_at = now(),
+                        error_code = COALESCE(
+                            effect.error_code, 'attempt_budget_exhausted'
+                        )
+                    FROM exhausted
+                    WHERE effect.producer_kind = 'session_turn'
+                      AND effect.producer_id = exhausted.producer_id
+                      AND effect.effect_name = exhausted.effect_name
+                    """,
+                    int(limit),
+                )
+                rows = await conn.fetch(
+                    """
+                    WITH candidates AS (
+                        SELECT effect.producer_id, effect.effect_name
+                        FROM completion_effects AS effect
+                        WHERE effect.producer_kind = 'session_turn'
+                          AND effect.effect_name = 'final_memory_extraction'
+                          AND effect.effect_group = 'memory_extraction'
+                          AND effect.state = 'pending'
+                          AND effect.attempts < effect.max_attempts
+                          AND effect.run_after <= now()
+                          AND (
+                              effect.claimed_by IS NULL
+                              OR effect.complete_by IS NULL
+                              OR effect.complete_by <= now()
+                          )
+                        ORDER BY effect.run_after, effect.created_at,
+                                 effect.producer_id, effect.effect_name
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT $1
+                    )
+                    UPDATE completion_effects AS effect
+                    SET claimed_by = $2::uuid,
+                        attempts = effect.attempts + 1,
+                        intent_at = now(),
+                        complete_by = now() + make_interval(
+                            secs => $3::double precision
+                        ),
+                        error_code = NULL
+                    FROM candidates
+                    WHERE effect.producer_kind = 'session_turn'
+                      AND effect.producer_id = candidates.producer_id
+                      AND effect.effect_name = candidates.effect_name
+                    RETURNING effect.producer_id, effect.scope_id,
+                              effect.effect_name, effect.effect_group,
+                              effect.state, effect.attempts,
+                              effect.max_attempts, effect.run_after,
+                              effect.created_at, effect.intent_at,
+                              effect.complete_by, effect.completed_at,
+                              effect.detail, effect.error_code,
+                              effect.claimed_by
+                    """,
+                    int(limit),
+                    owner_uuid,
+                    float(lease_seconds),
+                )
+        return [dict(row) for row in rows]
+
+    async def renew_session_memory_effect(
+        self,
+        *,
+        producer_id: str,
+        effect_name: str,
+        claimed_by: str,
+        lease_seconds: float,
+    ) -> bool:
+        """Renew only the live, exact session-effect claim term."""
+
+        try:
+            producer_uuid = UUID(str(producer_id))
+            owner_uuid = UUID(str(claimed_by))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session memory effect ids must be UUIDs") from exc
+        if effect_name != "final_memory_extraction":
+            raise ValueError("unsupported session memory effect name")
+        if not math.isfinite(float(lease_seconds)) or float(lease_seconds) <= 0:
+            raise ValueError("session memory effect lease must be positive")
+        async with self.acquire() as conn:
+            renewed = await conn.fetchval(
+                """
+                UPDATE completion_effects
+                SET complete_by = GREATEST(
+                    complete_by,
+                    now() + make_interval(secs => $4::double precision)
+                )
+                WHERE producer_kind = 'session_turn'
+                  AND producer_id = $1::uuid
+                  AND effect_name = $2::text
+                  AND effect_group = 'memory_extraction'
+                  AND state = 'pending'
+                  AND claimed_by = $3::uuid
+                  AND complete_by > now()
+                RETURNING 1
+                """,
+                producer_uuid,
+                effect_name,
+                owner_uuid,
+                float(lease_seconds),
+            )
+        return renewed is not None
+
+    async def finish_session_memory_effect(
+        self,
+        *,
+        producer_id: str,
+        effect_name: str,
+        claimed_by: str,
+        detail: Mapping[str, Any],
+    ) -> bool:
+        """Settle a final-memory effect under its exact live claim."""
+
+        try:
+            producer_uuid = UUID(str(producer_id))
+            owner_uuid = UUID(str(claimed_by))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session memory effect ids must be UUIDs") from exc
+        if effect_name != "final_memory_extraction":
+            raise ValueError("unsupported session memory effect name")
+        if not isinstance(detail, Mapping):
+            raise ValueError("session memory effect detail must be an object")
+        detail_json = json.dumps(
+            dict(detail),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+            allow_nan=False,
+        )
+        if len(detail_json.encode("utf-8")) > 8 * 1024:
+            raise ValueError("session memory effect detail exceeds 8 KiB")
+
+        async with self.acquire() as conn:
+            settled = await conn.fetchval(
+                """
+                UPDATE completion_effects
+                SET state = 'done',
+                    claimed_by = NULL,
+                    complete_by = NULL,
+                    completed_at = now(),
+                    detail = $4::jsonb,
+                    error_code = NULL
+                WHERE producer_kind = 'session_turn'
+                  AND producer_id = $1::uuid
+                  AND effect_name = $2::text
+                  AND effect_group = 'memory_extraction'
+                  AND state = 'pending'
+                  AND claimed_by = $3::uuid
+                  AND complete_by > now()
+                RETURNING 1
+                """,
+                producer_uuid,
+                effect_name,
+                owner_uuid,
+                detail_json,
+            )
+        return settled is not None
+
+    async def retry_session_memory_effect(
+        self,
+        *,
+        producer_id: str,
+        effect_name: str,
+        claimed_by: str,
+        error_code: str,
+        backoff_seconds: float,
+        force_dead: bool = False,
+    ) -> str | None:
+        """Release an exact claim onto backoff, or terminalize it as dead.
+
+        Returns ``pending`` or ``dead`` when this owner settled the live term;
+        ``None`` means the claim expired or was stolen and the caller has no
+        authority to write a result.
+        """
+
+        try:
+            producer_uuid = UUID(str(producer_id))
+            owner_uuid = UUID(str(claimed_by))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session memory effect ids must be UUIDs") from exc
+        normalized_error = str(error_code or "session_memory_effect_error").strip()
+        normalized_error = (normalized_error or "session_memory_effect_error")[:128]
+        if effect_name != "final_memory_extraction":
+            raise ValueError("unsupported session memory effect name")
+        if not math.isfinite(float(backoff_seconds)) or float(backoff_seconds) < 0:
+            raise ValueError("session memory effect backoff must be non-negative")
+
+        async with self.acquire() as conn:
+            state = await conn.fetchval(
+                """
+                UPDATE completion_effects AS effect
+                SET state = CASE
+                        WHEN $6::boolean
+                             OR effect.attempts >= effect.max_attempts
+                        THEN 'dead'
+                        ELSE 'pending'
+                    END,
+                    claimed_by = NULL,
+                    complete_by = NULL,
+                    run_after = CASE
+                        WHEN $6::boolean
+                             OR effect.attempts >= effect.max_attempts
+                        THEN effect.run_after
+                        ELSE now() + make_interval(
+                            secs => $5::double precision
+                        )
+                    END,
+                    completed_at = CASE
+                        WHEN $6::boolean
+                             OR effect.attempts >= effect.max_attempts
+                        THEN now()
+                        ELSE NULL
+                    END,
+                    error_code = $4::text
+                WHERE effect.producer_kind = 'session_turn'
+                  AND effect.producer_id = $1::uuid
+                  AND effect.effect_name = $2::text
+                  AND effect.effect_group = 'memory_extraction'
+                  AND effect.state = 'pending'
+                  AND effect.claimed_by = $3::uuid
+                  AND effect.complete_by > now()
+                RETURNING effect.state
+                """,
+                producer_uuid,
+                effect_name,
+                owner_uuid,
+                normalized_error,
+                float(backoff_seconds),
+                bool(force_dead),
+            )
+        return str(state) if state is not None else None
+
+    async def prune_session_memory_effects(
+        self,
+        *,
+        batch_limit: int = 1000,
+        done_retention_seconds: float = 86400.0,
+        dead_retention_seconds: float = 604800.0,
+    ) -> int:
+        """Delete one bounded age-retention batch of terminal session effects.
+
+        Retention is measured from ``created_at`` by design.  Failed rows must
+        outlive successes for diagnosis.  The producer predicate is repeated
+        on the DELETE, making it structurally impossible for this sweep to
+        prune job-completion effects or their command rows.
+        """
+
+        if not 1 <= int(batch_limit) <= 10000:
+            raise ValueError("session memory prune batch limit must be 1..10000")
+        done_seconds = float(done_retention_seconds)
+        dead_seconds = float(dead_retention_seconds)
+        if (
+            not math.isfinite(done_seconds)
+            or not math.isfinite(dead_seconds)
+            or done_seconds < 0
+            or dead_seconds <= done_seconds
+        ):
+            raise ValueError("dead retention must be longer than done retention")
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH doomed AS (
+                    SELECT effect.ctid, effect.producer_id, effect.effect_name
+                    FROM completion_effects AS effect
+                    WHERE effect.producer_kind = 'session_turn'
+                      AND effect.effect_name = 'final_memory_extraction'
+                      AND effect.effect_group = 'memory_extraction'
+                      AND (
+                          (
+                              effect.state = 'done'
+                              AND effect.created_at < now() - make_interval(
+                                  secs => $2::double precision
+                              )
+                          )
+                          OR (
+                              effect.state = 'dead'
+                              AND effect.created_at < now() - make_interval(
+                                  secs => $3::double precision
+                              )
+                          )
+                      )
+                    ORDER BY effect.created_at, effect.producer_id,
+                             effect.effect_name
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $1
+                )
+                DELETE FROM completion_effects AS effect
+                USING doomed
+                WHERE effect.ctid = doomed.ctid
+                  AND effect.producer_kind = 'session_turn'
+                RETURNING effect.producer_id
+                """,
+                int(batch_limit),
+                done_seconds,
+                dead_seconds,
+            )
+        return len(rows)
+
     async def get_officer_thread_for_project(
         self, project_id: str
     ) -> Optional[Dict[str, Any]]:
@@ -11714,6 +12103,24 @@ class PostgresDB:
                         raise RuntimeError(
                             "permanent stateless delete queue authority changed"
                         )
+                unfinished_memory = await conn.fetch(
+                    """
+                    SELECT producer_id
+                    FROM completion_effects
+                    WHERE producer_kind = 'session_turn'
+                      AND effect_name = 'final_memory_extraction'
+                      AND effect_group = 'memory_extraction'
+                      AND scope_id = $1::uuid
+                      AND state = 'pending'
+                    ORDER BY created_at, producer_id
+                    FOR UPDATE
+                    """,
+                    thread_uuid,
+                )
+                if unfinished_memory:
+                    raise RuntimeError(
+                        "permanent thread delete waits for final-memory extraction"
+                    )
                 # Rewind ledgers intentionally have no FK to threads, so the
                 # permanent lifecycle transaction must remove them explicitly.
                 await conn.execute(

@@ -648,9 +648,31 @@ class PostgresDB:
         if mode not in ("both", "conversation", "code"):
             raise ValueError(f"invalid rewind mode: {mode}")
         swept = 0
+        lease = _active_run_queue_lease_for_thread(thread_id)
         async with self.acquire() as conn:
             async with conn.transaction():
+                # Serialize the rewind with the stateless turn's final fenced
+                # transcript/effect transaction. Whichever owns the thread
+                # row first wins cleanly: a committed obligation blocks the
+                # rewind; a committed rewind makes the boundary update fail
+                # and rolls the producer back. Pinned sessions have no queue
+                # lease but retain the same thread-row serialization.
+                thread_exists = await conn.fetchval(
+                    "SELECT 1 FROM threads WHERE id = $1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if thread_exists is None:
+                    raise ValueError("session thread no longer exists")
+                if lease is not None:
+                    await _require_run_queue_fence(conn, lease)
                 if mode in ("both", "conversation"):
+                    unfinished = await conn.fetch(
+                        self._SESSION_MEMORY_REWIND_GUARD_SQL,
+                        thread_id,
+                        from_seq,
+                    )
+                    if unfinished:
+                        raise RuntimeError("rewind waits for final-memory extraction")
                     swept = await conn.fetchval(
                         """
                         WITH swept AS (
@@ -1128,6 +1150,91 @@ class PostgresDB:
         WHERE id = $1::uuid
         FOR KEY SHARE
     """
+    _SESSION_MEMORY_PARENT_LOCK_SQL = """
+        SELECT project_id, metadata, execution_lane
+        FROM threads
+        WHERE id = $1::uuid
+        FOR UPDATE
+    """
+    _SESSION_MEMORY_PROJECT_SCOPE_SQL = """
+        SELECT 1
+        FROM thread_mounts
+        WHERE thread_id = $1::uuid
+          AND source_ref = $2::uuid
+          AND mount_kind IN ('project', 'project_default')
+        FOR KEY SHARE
+    """
+    _SESSION_TURN_EXECUTION_SQL = """
+        UPDATE thread_messages
+        SET turn_execution_id = COALESCE(
+                turn_execution_id,
+                uuid_generate_v4()
+            )
+        WHERE thread_id = $1::uuid
+          AND id = $2::uuid
+          AND turn_number = $3
+          AND rewound_at IS NULL
+        RETURNING turn_execution_id, seq
+    """
+    _SESSION_TURN_END_SEQ_SQL = """
+        SELECT max(seq)
+        FROM thread_messages
+        WHERE thread_id = $1::uuid
+          AND id = ANY($2::uuid[])
+          AND rewound_at IS NULL
+    """
+    _SESSION_MEMORY_EFFECT_INSERT_SQL = """
+        WITH inserted AS (
+            INSERT INTO completion_effects
+                (producer_kind, producer_id, scope_id, effect_name,
+                 effect_group, detail)
+            VALUES
+                ('session_turn', $2::uuid, $1::uuid,
+                 'final_memory_extraction', 'memory_extraction',
+                 jsonb_build_object(
+                     'input_message_id', $3::uuid,
+                     'turn_number', $4::integer,
+                     'memory_scope_kind', $5::text,
+                     'memory_scope_id', $6::uuid,
+                     'boundary_seq', $7::bigint,
+                     'end_seq', $8::bigint
+                 ))
+            ON CONFLICT (producer_kind, producer_id, effect_name) DO NOTHING
+            RETURNING producer_id
+        )
+        SELECT producer_id FROM inserted
+        UNION ALL
+        SELECT producer_id
+        FROM completion_effects
+        WHERE producer_kind = 'session_turn'
+          AND producer_id = $2::uuid
+          AND scope_id = $1::uuid
+          AND effect_name = 'final_memory_extraction'
+          AND effect_group = 'memory_extraction'
+          AND detail = jsonb_build_object(
+              'input_message_id', $3::uuid,
+              'turn_number', $4::integer,
+              'memory_scope_kind', $5::text,
+              'memory_scope_id', $6::uuid,
+              'boundary_seq', $7::bigint,
+              'end_seq', $8::bigint
+          )
+        LIMIT 1
+    """
+    _SESSION_MEMORY_REWIND_GUARD_SQL = """
+        SELECT effect.producer_id
+        FROM completion_effects AS effect
+        JOIN thread_messages AS boundary
+          ON boundary.thread_id = effect.scope_id
+         AND boundary.turn_execution_id = effect.producer_id
+        WHERE effect.producer_kind = 'session_turn'
+          AND effect.effect_name = 'final_memory_extraction'
+          AND effect.scope_id = $1::uuid
+          AND effect.state = 'pending'
+          AND boundary.seq >= $2::bigint
+        ORDER BY boundary.seq, effect.producer_id
+        FOR UPDATE OF effect
+    """
 
     async def save_thread_message(
         self,
@@ -1229,8 +1336,15 @@ class PostgresDB:
         return {"id": str(row["id"]), "seq": row["seq"]}
 
     async def save_thread_messages(
-        self, thread_id: str, messages: List[Dict[str, Any]]
-    ) -> None:
+        self,
+        thread_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        turn_input_message_id: Optional[str] = None,
+        turn_number: Optional[int] = None,
+        memory_scope_kind: Optional[str] = None,
+        memory_scope_id: Optional[str] = None,
+    ) -> Optional[str]:
         """Batch-upsert a turn's messages: one pipelined ``executemany`` + a
         single ``threads`` bump.
 
@@ -1245,10 +1359,53 @@ class PostgresDB:
         The upsert runs inside a transaction so the whole turn reconciles
         atomically. This batches ONLY the reconcile; the incremental mid-turn
         persists still go through :meth:`save_thread_message` one at a time (the
-        crash-durability path). A no-op on an empty list.
+        crash-durability path).
+
+        A stateless turn-complete caller also supplies the exact accepted input
+        message, turn number, and immutable memory scope. After the claim fence
+        succeeds, this method validates that scope against the locked thread,
+        mints (or reuses) a ``turn_execution_id`` on the boundary row, and
+        inserts the stable final-memory obligation in the same transaction as
+        the final transcript. A stale claimant therefore commits neither, and
+        an idempotent reconcile returns the same producer identity. A later
+        project/mount edit cannot redirect the captured destination. Pinned
+        callers have no lease context and preserve the transcript-only path.
+
+        An empty message list remains a no-op except for the stateless producer
+        path: even a turn that emitted no AI/tool row must durably mint its
+        final-memory obligation.
         """
-        if not messages:
-            return
+        if not messages and not turn_input_message_id:
+            return None
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        should_mint_effect = lease is not None and bool(turn_input_message_id)
+        if not messages and not should_mint_effect:
+            # In particular, preserve the pinned lane's historical empty-batch
+            # no-op even when its caller provides turn-boundary metadata.
+            return None
+        if should_mint_effect and turn_number is None:
+            raise ValueError(
+                "turn_number is required when minting a session-turn effect"
+            )
+        if should_mint_effect:
+            if memory_scope_kind not in {"thread", "project"}:
+                raise ValueError(
+                    "memory_scope_kind must be thread or project for a "
+                    "session-turn effect"
+                )
+            try:
+                destination_id = uuid.UUID(str(memory_scope_id))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "memory_scope_id must be a UUID for a session-turn effect"
+                ) from exc
+            if memory_scope_kind == "thread" and str(destination_id) != str(
+                uuid.UUID(str(thread_id))
+            ):
+                raise ValueError("thread memory scope must equal the thread id")
+        else:
+            destination_id = None
 
         def _dj(value: Any) -> Optional[str]:
             return json.dumps(value) if value is not None else None
@@ -1256,8 +1413,8 @@ class PostgresDB:
         args: List[Tuple] = []
         max_turn = 0
         for m in messages:
-            turn_number = m.get("turn_number")
-            max_turn = max(max_turn, turn_number or 0)
+            row_turn_number = m.get("turn_number")
+            max_turn = max(max_turn, row_turn_number or 0)
             args.append(
                 (
                     _coerce_row_id(m.get("id")),
@@ -1265,7 +1422,7 @@ class PostgresDB:
                     m["role"],
                     m.get("content"),
                     _dj(m.get("tool_calls")),
-                    turn_number,
+                    row_turn_number,
                     _dj(m.get("metrics")),
                     m.get("tool_call_id"),
                     m.get("thinking"),
@@ -1278,30 +1435,117 @@ class PostgresDB:
                 )
             )
 
-        lease = _active_run_queue_lease_for_thread(thread_id)
+        turn_execution_id = None
         async with self.acquire() as conn:
             async with conn.transaction():
                 # Match public End's threads -> run_queue order before any
                 # batch FK/upsert or activity mutation. Pinned lane (no lease
                 # context) keeps today's exact transaction shape.
+                memory_parent = None
                 if lease is not None:
-                    thread_exists = await conn.fetchval(
-                        self._THREAD_MESSAGE_PARENT_LOCK_SQL,
+                    # The authoritative final reconcile captures its memory
+                    # tenancy while the thread row is locked, before the exact
+                    # queue fence. A later project/mount edit can refresh
+                    # credentials but cannot redirect an old turn's facts.
+                    memory_parent = await conn.fetchrow(
+                        self._SESSION_MEMORY_PARENT_LOCK_SQL,
                         thread_id,
                     )
-                    if thread_exists is None:
+                    if memory_parent is None:
                         raise ValueError("session thread no longer exists")
                     await _require_run_queue_fence(conn, lease)
+                if should_mint_effect:
+                    if str(memory_parent["execution_lane"] or "") != "stateless":
+                        raise ValueError(
+                            "session-turn effects require the stateless lane"
+                        )
+                    if memory_scope_kind == "project":
+                        metadata = memory_parent["metadata"] or {}
+                        if isinstance(metadata, str):
+                            try:
+                                metadata = json.loads(metadata)
+                            except (TypeError, ValueError):
+                                metadata = {}
+                        legacy_ids = (
+                            metadata.get("project_ids", [])
+                            if isinstance(metadata, dict)
+                            else []
+                        )
+                        direct_match = memory_parent["project_id"] is not None and str(
+                            memory_parent["project_id"]
+                        ) == str(destination_id)
+                        legacy_match = str(destination_id) in {
+                            str(value) for value in legacy_ids
+                        }
+                        mount_match = await conn.fetchval(
+                            self._SESSION_MEMORY_PROJECT_SCOPE_SQL,
+                            thread_id,
+                            destination_id,
+                        )
+                        if not (direct_match or legacy_match or mount_match):
+                            raise ValueError(
+                                "captured memory project is not attached to "
+                                "the exact thread"
+                            )
                 # Same upsert as save_thread_message, minus RETURNING. Each
                 # execution's ON CONFLICT is independent (executemany runs N
                 # separate commands), so distinct-id rows never collide.
-                await conn.executemany(self._THREAD_MESSAGE_UPSERT_BATCH_SQL, args)
+                if args:
+                    await conn.executemany(
+                        self._THREAD_MESSAGE_UPSERT_BATCH_SQL,
+                        args,
+                    )
                 # One activity/turn bump for the whole batch (was per-message).
+                # The stateless producer path also bumps an output-less turn.
+                activity_turn = max_turn
+                if should_mint_effect:
+                    activity_turn = max(activity_turn, turn_number or 0)
                 await conn.execute(
                     self._THREAD_ACTIVITY_BUMP_SQL,
                     thread_id,
-                    max_turn,
+                    activity_turn,
                 )
+                if should_mint_effect:
+                    input_row_id = _coerce_row_id(turn_input_message_id)
+                    boundary = await conn.fetchrow(
+                        self._SESSION_TURN_EXECUTION_SQL,
+                        thread_id,
+                        input_row_id,
+                        turn_number,
+                    )
+                    if boundary is None:
+                        raise ValueError(
+                            "exact live turn-boundary message was not found"
+                        )
+                    turn_execution_id = boundary["turn_execution_id"]
+                    boundary_seq = int(boundary["seq"])
+                    reconciled_ids = [input_row_id]
+                    reconciled_ids.extend(row[0] for row in args)
+                    end_seq = await conn.fetchval(
+                        self._SESSION_TURN_END_SEQ_SQL,
+                        thread_id,
+                        reconciled_ids,
+                    )
+                    if end_seq is None or int(end_seq) < boundary_seq:
+                        raise ValueError(
+                            "exact reconciled turn transcript has no valid end"
+                        )
+                    effect_producer_id = await conn.fetchval(
+                        self._SESSION_MEMORY_EFFECT_INSERT_SQL,
+                        thread_id,
+                        turn_execution_id,
+                        input_row_id,
+                        turn_number,
+                        memory_scope_kind,
+                        destination_id,
+                        boundary_seq,
+                        int(end_seq),
+                    )
+                    if effect_producer_id is None:
+                        raise ValueError(
+                            "existing session-turn effect has conflicting identity"
+                        )
+        return str(turn_execution_id) if turn_execution_id is not None else None
 
     # =========================================================================
     # SYNC WRAPPERS (for scripts and other sync contexts)

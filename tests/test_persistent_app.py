@@ -909,6 +909,331 @@ class TestSaveTurnAiMessages:
         # Should not raise
         await _save_turn_ai_messages(client, "tid", messages, 1)
 
+    @pytest.mark.asyncio
+    async def test_authoritative_boundary_is_in_same_batch_call(self):
+        """Stateless reconcile carries the exact accepted input identity."""
+        client = AsyncMock()
+        messages = [
+            HumanMessage(content="question", id="input-message-7"),
+            AIMessage(content="answer", id="answer-message-7"),
+        ]
+
+        await _save_turn_ai_messages(
+            client,
+            "tid",
+            messages,
+            7,
+            authoritative_turn_boundary=True,
+            turn_input_message_id="input-message-7",
+            memory_scope_kind="thread",
+            memory_scope_id="tid",
+        )
+
+        client.save_thread_messages.assert_awaited_once()
+        args = client.save_thread_messages.call_args.args
+        kwargs = client.save_thread_messages.call_args.kwargs
+        assert args[0] == "tid"
+        assert [row["id"] for row in args[1]] == ["answer-message-7"]
+        assert kwargs == {
+            "turn_input_message_id": "input-message-7",
+            "turn_number": 7,
+            "memory_scope_kind": "thread",
+            "memory_scope_id": "tid",
+        }
+
+    @pytest.mark.asyncio
+    async def test_authoritative_zero_output_still_mints_boundary(self):
+        """An interrupted/error turn with no output still reaches the producer."""
+        client = AsyncMock()
+        messages = [HumanMessage(content="question", id="input-message-8")]
+
+        await _save_turn_ai_messages(
+            client,
+            "tid",
+            messages,
+            8,
+            authoritative_turn_boundary=True,
+            turn_input_message_id="input-message-8",
+            memory_scope_kind="thread",
+            memory_scope_id="tid",
+        )
+
+        client.save_thread_messages.assert_awaited_once_with(
+            "tid",
+            [],
+            turn_input_message_id="input-message-8",
+            turn_number=8,
+            memory_scope_kind="thread",
+            memory_scope_id="tid",
+        )
+
+    @pytest.mark.asyncio
+    async def test_authoritative_failure_propagates(self):
+        client = AsyncMock()
+        client.save_thread_messages.side_effect = RuntimeError("fence lost")
+        messages = [
+            HumanMessage(content="question", id="input-message-9"),
+            AIMessage(content="answer"),
+        ]
+
+        with pytest.raises(RuntimeError, match="fence lost"):
+            await _save_turn_ai_messages(
+                client,
+                "tid",
+                messages,
+                9,
+                authoritative_turn_boundary=True,
+                turn_input_message_id="input-message-9",
+                memory_scope_kind="project",
+                memory_scope_id="project-9",
+            )
+
+    @pytest.mark.asyncio
+    async def test_authoritative_missing_effect_identity_fails_closed(self):
+        client = AsyncMock()
+        client.save_thread_messages.return_value = None
+        messages = [HumanMessage(content="question", id="input-message-9")]
+
+        with pytest.raises(RuntimeError, match="minted no memory effect"):
+            await _save_turn_ai_messages(
+                client,
+                "tid",
+                messages,
+                9,
+                authoritative_turn_boundary=True,
+                turn_input_message_id="input-message-9",
+                memory_scope_kind="thread",
+                memory_scope_id="tid",
+            )
+
+    @pytest.mark.asyncio
+    async def test_authoritative_boundary_requires_stable_input_id(self):
+        client = AsyncMock()
+
+        with pytest.raises(ValueError, match="exact input message id"):
+            await _save_turn_ai_messages(
+                client,
+                "tid",
+                [HumanMessage(content="question")],
+                10,
+                authoritative_turn_boundary=True,
+                memory_scope_kind="thread",
+                memory_scope_id="tid",
+            )
+
+        client.save_thread_messages.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_authoritative_boundary_ignores_synthetic_human_output(self):
+        """Multimodal tool output cannot replace the accepted input identity."""
+        client = AsyncMock()
+        messages = [
+            HumanMessage(content="inspect it", id="accepted-input"),
+            AIMessage(
+                content="",
+                id="tool-call-message",
+                tool_calls=[{"name": "inspect", "args": {}, "id": "call-1"}],
+            ),
+            ToolMessage(content="image", tool_call_id="call-1", id="tool-result"),
+            HumanMessage(content="synthetic image", id="synthetic-image-input"),
+            AIMessage(content="final answer", id="final-answer"),
+        ]
+
+        await _save_turn_ai_messages(
+            client,
+            "tid",
+            messages,
+            12,
+            authoritative_turn_boundary=True,
+            turn_input_message_id="accepted-input",
+            memory_scope_kind="project",
+            memory_scope_id="project-12",
+        )
+
+        args = client.save_thread_messages.call_args.args
+        kwargs = client.save_thread_messages.call_args.kwargs
+        assert [row["id"] for row in args[1]] == [
+            "tool-call-message",
+            "tool-result",
+            "synthetic-image-input",
+            "final-answer",
+        ]
+        assert kwargs["turn_input_message_id"] == "accepted-input"
+        assert kwargs["memory_scope_kind"] == "project"
+        assert kwargs["memory_scope_id"] == "project-12"
+
+    @pytest.mark.asyncio
+    async def test_pinned_keeps_historical_latest_human_boundary(self):
+        """The new callback metadata must not change pinned reconciliation."""
+        client = AsyncMock()
+        messages = [
+            HumanMessage(content="accepted", id="accepted-input"),
+            AIMessage(content="tool call", id="before-synthetic"),
+            HumanMessage(content="synthetic image", id="synthetic-input"),
+            AIMessage(content="final", id="after-synthetic"),
+        ]
+
+        await _save_turn_ai_messages(
+            client,
+            "tid",
+            messages,
+            12,
+            turn_input_message_id="accepted-input",
+            memory_scope_kind="project",
+            memory_scope_id="project-12",
+        )
+
+        _, rows = client.save_thread_messages.call_args.args
+        assert [row["id"] for row in rows] == ["after-synthetic"]
+        assert client.save_thread_messages.call_args.kwargs == {}
+
+
+class TestAuthoritativeTurnPersist:
+    @staticmethod
+    def _session() -> SimpleNamespace:
+        return SimpleNamespace(
+            postgres_conn=object(),
+            messages=[HumanMessage(content="question", id="input-message-11")],
+            tool_decisions={"call-1": "approved"},
+            workspace_sync=None,
+            overlay_mount_manager=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stateless_timeout_aborts_turn_settlement(self, monkeypatch):
+        from src.api import persistent_app as pa
+
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        session = self._session()
+        broadcast = MagicMock()
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
+            patch.object(pa, "_wire_session_aux_archiver"),
+            patch.object(pa, "_broadcast", broadcast),
+            patch.object(
+                pa,
+                "_save_turn_ai_messages",
+                AsyncMock(side_effect=asyncio.TimeoutError),
+            ) as save,
+        ):
+            with pytest.raises(asyncio.TimeoutError):
+                await pa._loop_on_turn_complete_body(11)
+
+        assert save.call_args.kwargs["authoritative_turn_boundary"] is True
+        broadcast.assert_not_called()
+        assert session.tool_decisions == {"call-1": "approved"}
+
+    @pytest.mark.asyncio
+    async def test_pinned_timeout_remains_nonfatal(self, monkeypatch):
+        from src.api import persistent_app as pa
+
+        monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
+        session = self._session()
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
+            patch.object(pa, "_wire_session_aux_archiver"),
+            patch.object(pa, "_broadcast"),
+            patch.object(
+                pa,
+                "_save_turn_ai_messages",
+                AsyncMock(side_effect=asyncio.TimeoutError),
+            ) as save,
+        ):
+            await pa._loop_on_turn_complete_body(11)
+
+        assert save.call_args.kwargs["authoritative_turn_boundary"] is False
+        assert session.tool_decisions == {}
+
+    @pytest.mark.asyncio
+    async def test_stateless_completion_frame_follows_authoritative_persist(
+        self, monkeypatch
+    ):
+        from src.api import persistent_app as pa
+
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        session = self._session()
+        order = []
+
+        async def save(*_args, **_kwargs):
+            order.append("persist")
+
+        def broadcast(kind, _payload):
+            order.append(kind)
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
+            patch.object(pa, "_wire_session_aux_archiver"),
+            patch.object(pa, "_broadcast", side_effect=broadcast),
+            patch.object(pa, "_save_turn_ai_messages", side_effect=save),
+        ):
+            await pa._loop_on_turn_complete_body(11)
+
+        assert order == ["persist", "turn.completed"]
+
+    @pytest.mark.asyncio
+    async def test_stateless_missing_postgres_fails_closed(self, monkeypatch):
+        from src.api import persistent_app as pa
+
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        session = self._session()
+        session.postgres_conn = None
+        broadcast = MagicMock()
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
+            patch.object(pa, "_wire_session_aux_archiver"),
+            patch.object(pa, "_broadcast", broadcast),
+        ):
+            with pytest.raises(RuntimeError, match="requires a Postgres connection"):
+                await pa._loop_on_turn_complete_body(11)
+
+        broadcast.assert_not_called()
+
+
+class TestPersistentLoopMemoryOutboxWiring:
+    @pytest.mark.asyncio
+    async def test_stateless_runtime_defers_turn_memory_to_outbox(self, monkeypatch):
+        from src.api import persistent_app as pa
+
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        captured = {}
+        release = asyncio.Event()
+
+        def fake_run(**kwargs):
+            captured.update(kwargs)
+
+            async def wait_for_release():
+                await release.wait()
+
+            return wait_for_release()
+
+        async def no_completion_cleanup(_task):
+            return None
+
+        session = MagicMock()
+        session.thread_id = "tid"
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_loop_task", None),
+            patch.object(pa, "_session_ready", return_value=True),
+            patch.object(pa, "run_persistent_loop", new=fake_run),
+            patch.object(pa, "_loop_completion_handler", no_completion_cleanup),
+        ):
+            assert pa._ensure_persistent_loop_started("test") is True
+            loop_task = pa._loop_task
+            assert captured["defer_memory_extraction_to_outbox"] is True
+            assert captured["memory_thread_id"] == "tid"
+            release.set()
+            await loop_task
+
 
 # ---------------------------------------------------------------------------
 # 3.4a _persist_one_message() + _loop_persist_message() — incremental (Phase 2)
