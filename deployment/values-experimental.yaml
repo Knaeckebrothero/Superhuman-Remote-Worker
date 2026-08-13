@@ -470,6 +470,14 @@ headscale:
 # VMs. Disable to skip the sidecar entirely (e.g. when VM workspaces aren't
 # in use or headscale is offline).
 agent:
+  # Stateless session lane ON for dev (chart default stays false): the
+  # executor pool serves lite+sandbox session tiers via the run_queue —
+  # the first live-traffic deployment of the lane, for the unmeasured
+  # acceptance criteria (TTFT, claim-wait, prompt-cache reuse). VM/remote
+  # tiers stay pinned/refused, and worker-job admission stays OFF: sessions
+  # are the only lane consumer on dev until Gate 3 step 4+ lands.
+  stateless:
+    enabled: true
   # Apply admin-curated DB prompt overrides to provisioned agents. ON here
   # (dev/experimental) so the admin Prompt-overrides UI takes effect; the
   # chart default (helm/values.yaml) keeps this OFF for prod.
