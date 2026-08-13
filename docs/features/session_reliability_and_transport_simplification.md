@@ -1,9 +1,11 @@
 # Session Reliability & Transport Simplification
 
-**Status**: PARTIALLY SHIPPED — Phases 1–4 live on `develop`; Phases 5–6 not
-started. Not a candidate for `docs/done/` until those land.
-**Date**: 2026-07-06 (v2 — same day, post-review); status refreshed 2026-08-05
-**Phase state** (verified against the tree, 2026-08-05):
+**Status**: PARTIALLY SHIPPED — Phases 1–4 live on `develop`; Phase 5's epoch
+prerequisite is shipped but the phase itself is not started; Phase 6 has a
+stateless-lane precursor subset, not the transport cutover. Not a candidate for
+`docs/done/` until Phases 5–6 land in full.
+**Date**: 2026-07-06 (v2 — same day, post-review); status refreshed 2026-08-14
+**Phase state** (verified against the tree, 2026-08-14):
 
 | Phase | State | Marker checked |
 |---|---|---|
@@ -11,8 +13,22 @@ started. Not a candidate for `docs/done/` until those land.
 | 2 — send-liveness kickstart | shipped | `_armSendKickstart` in `persistent-chat.service.ts` |
 | 3 — outbox | shipped, + stalled-queue follow-up (§"Stalled queue") | `outbox`, `outboxStalled`, `retryQueuedSends`, `discardQueuedSend` |
 | 4 — de-flicker generation | shipped | `_flushDeltas`, 5 call sites |
-| 5 — on-demand per-session SSE | **not started** | — |
-| 6 — retire control WebSocket | **not started** | no `threads/{thread_id}/control` endpoint; `_installControlWs` still live (5 refs) |
+| 5 — on-demand per-session SSE | **not started; former epoch blocker satisfied** | S1 made epoch stable across ordinary clean claims and fenced the journal writer; explicit system boundaries may still rotate it; `thread.activity`, `/events/head`, and the client soft-suspend state machine remain unbuilt |
+| 6 — retire control WebSocket | **not complete; precursor subset shipped** | owner-gated `/controls` carries the narrow durable scalar/undo subset and exact interrupt has its own REST path; `control_socket="websocket"`, the per-session WS, welcome-frame dependency, rollout flag, and deletion work remain |
+
+The 2026-08-14 session-lane hardening follow-on also closed reliability work
+adjacent to, but not equivalent to, Phases 5–6. Stateless final transcript
+persist now mints a fenced `completion_effects` final-memory obligation and an
+independent drain settles it against a destination receipt that makes durable
+vector mutations exactly-once (auxiliary provider inference may repeat).
+Exact-turn interrupt was reconfirmed as already complete: a new stateless
+request without the exact open live gate returns 409 before INSERT, while a
+previously admitted UUID remains replay-observable. Permission requests now bind to the accepted
+lease token and retire with one linked receipt only at a proven owner-loss
+boundary; there is no blind expiry sweep. Ordinary ended-session wake was
+already durable, while hard deletion now terminates open wakes as
+`undeliverable`. These are current session-lane guarantees, not evidence that
+the on-demand-SSE or WebSocket-retirement phases have shipped.
 
 **Provenance**: v1 drafted from a two-agent code investigation; v2 refined via a
 20-agent workflow — 4 codebase deep-dives + 4 web best-practice sweeps
@@ -53,9 +69,10 @@ architecture change (Phases 5–6): hold a per-session stream **only while a
 turn is in flight**, and retire the per-session control WebSocket in favor
 of REST + the journaled SSE.
 
-## Current State (verified mechanics, 2026-07-06 tree)
+## Current State (baseline mechanics captured 2026-07-06; hardening deltas through 2026-08-14)
 
-The working tree is clean; all references below are committed `develop`.
+The inventory below preserves the original code-location trail. The phase table
+and dated boundary notes above and in Phases 5–6 carry the current status.
 
 ### Transport inventory
 
@@ -63,7 +80,7 @@ The working tree is clean; all references below are committed `develop`.
 |---------|----------|---------|-------|
 | Per-thread SSE | `GET /api/persistent/threads/{id}/stream` | all journaled agent frames (token, thinking, permission.request/resolved, turn.*, `ready`) | Backed by the `thread_events` journal (epoch+seq); the orchestrator generator **polls Postgres** 200ms–1s and pushes rows. Cursor = `epoch:seq`, persisted in IndexedDB. |
 | Control WS | `/p/{thread_id}/ws` (per-session Traefik Ingress+Service, 60s JWT) | slash commands (`compact`, `archive`, `undo`, `upgrade-to-workspace`), `mode.set`, `narration.set`, `config.update`, approve/deny **fallback**, the `session.state` welcome frame | Requires `SessionRouterService.ensure_route()`, which only runs after `probe_ready` (`orchestrator/routers/sessions.py:400`) — the gate behind the 425/504 startup class. Reconnect caps at 8 attempts. |
-| REST | `POST …/input` (`main.py:17835`), `POST …/interrupt` (`:17891`), `POST …/approve/{approval_id}` (`:17907`), agent-side `POST /api/approve` (`persistent_app.py:2091`, resolves most-recent-pending when `approval_id` omitted) | input, interrupt, permission resolution | The orchestrator approve endpoint is already **canonical**: direct `thread_permission_requests` UPDATE + DB trigger NOTIFY → agent LISTEN. No agent-forwarding hop. WS approve is back-compat only. |
+| REST | `POST …/input` (`main.py:17835`), `POST …/interrupt` (`:17891`), `POST …/approve/{approval_id}` (`:17907`), agent-side `POST /api/approve` (`persistent_app.py:2091`, resolves most-recent-pending when `approval_id` omitted) | input, interrupt, permission resolution | The orchestrator approve endpoint is already **canonical**: direct `thread_permission_requests` UPDATE, observed by the agent's bounded row poll. The DB trigger/NOTIFY remains a compatibility hint, but M4 deliberately removed the long-held permission listener so it cannot consume the heartbeat's third pool slot. No agent-forwarding hop; WS approve is back-compat only. |
 | Global notifications SSE | `GET /api/notifications/events` | `session.lifecycle` (provisioning/booting/ready/failed, emitted from `_do_prepare`, `sessions.py:174/278/304`), notifications | Always-on, one per tab. `notification_feed` is **per-process** (replica-local) with a 100-entry drop queue — no journal, no replay. |
 
 **Correction from review (v1 got this wrong):** `ready` *is* journaled and
@@ -574,20 +591,23 @@ Playwright/perf the rest).
 **Depends on P1 (epoch handling at reopen) and P2 (wake funnel +
 kickstart plumbing).**
 
-**Blocked-by (added 2026-08-07): `docs/features/stateless_agents.md` §5.3.2
-epoch-stability.** Today `events_epoch` bumps on every runtime attach; under
-stateless per-turn claims that becomes per-turn. P5's idle-close does NOT
-neutralize it — it converts the ~2.2 s mid-stream horizon detection into an
-at-open `epoch_mismatch` that still forces the client's full cache-wipe reload
-on every reopen. Land the epoch redesign (bump only on steal/rewind, DB-side
-seq) first, or at minimum before any stateless session serves traffic, keeping
-the `/events/head` contract stable across both changes.
+**Former blocker satisfied; phase still incomplete (refreshed 2026-08-14).**
+`docs/features/stateless_agents.md` §5.3.2's S1 work now keeps
+`events_epoch` stable across ordinary clean claims, seeds monotonic sequence
+numbers from the durable HWM, and fences the journal writer. Epoch rotation is
+reserved for an explicit writer-invalidating system boundary, including steal,
+rewind, terminal interrupt/Force-End, or claim-bound permission retirement—not
+runtime attach or every turn. That
+removes the at-open cache-wipe cascade which would have made P5 unsafe. It does
+not implement P5: the `thread.activity` trigger/listener, `/events/head`, client
+`idle-closed` state, head polling, wake funnel, and live connection-count
+acceptance below are all still required.
 
 ### Server
 
 - **`thread.activity` via DB trigger** (decision settled — v1 left it
-  open, review closed it): migration
-  `orchestrator/database/migrations/app/0048_thread_activity_notify.sql`
+  open, review closed it): use the then-current app migration number (the
+  current next number is **0156**, not the historical v2 `0048` placeholder)
   — `AFTER INSERT ON thread_events FOR EACH ROW WHEN (NEW.kind =
   'turn.started')` → `pg_notify('thread_activity', {thread_id, turn_id})`.
   Trigger wins because (a) `notification_feed` is **replica-local**; an
@@ -677,6 +697,19 @@ approval renders without reopen; schema snapshot diff committed.
 timers + EventSource mocks + signal effects is where it goes — k3d ½).
 
 ## Phase 6 — Retire the per-session control WebSocket
+
+**Current boundary (refreshed 2026-08-14): precursor subset only.** Stateless
+S1/S2 needed durable lane-neutral controls before this phase, so the tree now
+has the owner-gated plural `/controls` inbox for `mode.set`, `narration.set`,
+and workspace undo, plus dedicated REST routes for exact interrupt and
+permission decisions. The applying owner writes journal receipts. That subset
+does not satisfy 6a–6e: the generic singular `/control` contract and full verb
+allowlist are absent, `session.state`/`running_tool` still depend on the WS,
+`/connection` still advertises `control_socket="websocket"` for pinned
+sessions, and neither the transport flag nor deletion rollout has happened.
+Connected-session `rewind` also remains WS-only; the detached destructive route
+rejects stateless use, so P6 must either carry it explicitly or record a
+separate safe REST contract before deleting the socket.
 
 The payoff analysis stands: with no per-session WS there is no
 per-session route to provision — `ensure_route`, per-session
