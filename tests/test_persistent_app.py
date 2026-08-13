@@ -720,6 +720,106 @@ class TestRestoreFromCheckpoint:
         )
         assert "Recap of q1-q3" in kwargs["content"]
 
+    @staticmethod
+    def _path_a_fixture(compaction_fires: bool):
+        """Shared Path-A rig: a checkpoint exists and the post-boundary tail is
+        loaded; ``compaction_fires`` controls whether the resume re-bound runs
+        a real summarization (compaction_runs counter bump)."""
+        tail = [
+            {"role": "user", "content": "q6", "tool_calls": None, "turn_number": 6},
+            {
+                "role": "assistant",
+                "content": "a6",
+                "tool_calls": None,
+                "turn_number": 6,
+            },
+        ]
+
+        mock_session = MagicMock()
+        mock_session.messages = []
+        mock_session.turn_count = 0
+        mock_session.config.context_management.max_summary_length = 10000
+        mock_session.context_manager = MagicMock()
+        mock_session.context_manager.compaction_runs = 0
+        merged = [
+            SystemMessage(content="[Summary of prior work]\nMerged recap q1-q6"),
+            AIMessage(content="a6", id="y"),
+        ]
+
+        async def _ensure(msgs, *args, **kwargs):
+            if compaction_fires:
+                mock_session.context_manager.compaction_runs += 1
+                return merged
+            return msgs
+
+        mock_session.context_manager.ensure_within_limits = AsyncMock(
+            side_effect=_ensure
+        )
+        mock_session.auxiliary_llm = MagicMock()
+        mock_agent = MagicMock()
+        mock_agent.postgres_conn = MagicMock()
+        mock_agent.postgres_conn.get_latest_compaction_checkpoint = AsyncMock(
+            return_value={
+                "summary": "old recap of q1-q5",
+                "boundary_turn": 5,
+                "boundary_seq": None,
+                "turn_number": 5,
+            }
+        )
+        mock_agent.postgres_conn.get_thread_messages_history = AsyncMock(
+            return_value=tail
+        )
+        mock_session.postgres_conn = mock_agent.postgres_conn
+        mock_session.postgres_conn.save_thread_message = AsyncMock(
+            return_value={"id": "m1", "seq": 1}
+        )
+        return mock_session, mock_agent
+
+    @pytest.mark.asyncio
+    async def test_path_a_records_checkpoint_when_rebound_compacts(self):
+        """A Path-A restore whose tail outgrew the budget re-summarizes; the
+        merged result must persist so the NEXT resume pays nothing. Without
+        the persist, every resume re-runs the same blocking aux-LLM
+        summarization and discards it (per-claim cost on the stateless
+        lane)."""
+        from src.api import persistent_app as pa
+
+        mock_session, mock_agent = self._path_a_fixture(compaction_fires=True)
+
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_agent", mock_agent),
+            patch.object(pa, "_thread_id", "thread-path-a-compact"),
+        ):
+            await pa._restore_session_messages()
+
+        writer = mock_session.postgres_conn.save_thread_message
+        writer.assert_awaited()
+        kwargs = writer.call_args.kwargs
+        assert kwargs["role"] == "summary"
+        assert kwargs["metrics"]["trigger"] == "resume"
+        assert "Merged recap q1-q6" in kwargs["content"], (
+            "the NEW merged summary must be persisted, not the stale one"
+        )
+
+    @pytest.mark.asyncio
+    async def test_path_a_skips_persist_when_no_compaction(self):
+        """A Path-A restore whose tail fits the budget must NOT rewrite the
+        checkpoint — the existing summary row keeps driving the banner, and a
+        rewrite would duplicate it on every reconnect."""
+        from src.api import persistent_app as pa
+
+        mock_session, mock_agent = self._path_a_fixture(compaction_fires=False)
+
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_agent", mock_agent),
+            patch.object(pa, "_thread_id", "thread-path-a-clean"),
+        ):
+            await pa._restore_session_messages()
+
+        mock_session.postgres_conn.save_thread_message.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # 3.4 _save_turn_ai_messages()
