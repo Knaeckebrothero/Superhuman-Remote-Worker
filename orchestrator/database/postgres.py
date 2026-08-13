@@ -8474,17 +8474,22 @@ class PostgresDB:
             )
         return [dict(row) for row in rows]
 
-    async def finish_job_wake(self, job_id: str, delivered_status: str) -> None:
+    async def finish_job_wake(self, job_id: str, delivered_status: str) -> bool:
         """Mark a claimed wake delivered, recording WHICH terminal status went
         out. The recorded status is what lets a later, different terminal state
         (approve flipping pending_review → completed) wake the session again
-        without re-delivering the one it already saw."""
+        without re-delivering the one it already saw.
+
+        Returns False when another transaction retired the claim first. Hard
+        deletion uses that CAS loss to keep an ``undeliverable`` outcome from
+        being overwritten by a sender that claimed before the delete began.
+        """
         try:
             job_uuid = UUID(job_id)
         except ValueError:
-            return
+            return False
         async with self.acquire() as conn:
-            await conn.execute(
+            row = await conn.fetchrow(
                 """
                 UPDATE jobs
                    SET wake_state = 'sent',
@@ -8492,10 +8497,12 @@ class PostgresDB:
                        wake_claimed_at = NULL
                  WHERE id = $1
                    AND wake_state = 'sending'
+                RETURNING id
                 """,
                 job_uuid,
                 delivered_status,
             )
+        return row is not None
 
     async def release_job_wake(self, job_id: str, *, max_attempts: int = 8) -> str:
         """Hand a failed send back for retry, or bury it.
@@ -8525,14 +8532,24 @@ class PostgresDB:
                 job_uuid,
                 max_attempts,
             )
-        return str(row["wake_state"]) if row else "dead"
+            if row is not None:
+                return str(row["wake_state"])
+            state = await conn.fetchval(
+                "SELECT wake_state FROM jobs WHERE id = $1",
+                job_uuid,
+            )
+        # A hard-delete settlement racing this failed delivery is expected and
+        # is not retry exhaustion. Preserve the legacy fail-closed `dead`
+        # return for every other missing/stale claim.
+        return "undeliverable" if state == "undeliverable" else "dead"
 
     async def get_job_wake_stats(self) -> Dict[str, int]:
         """Fleet-wide wake-outbox depth by state.
 
-        ``dead`` is the alert-worthy number and the whole observability story
-        for this feature: each one is a session waiting on a job it will never
-        be told about. Excludes 'none' — most jobs are not session-created and
+        ``dead`` remains alert-worthy retry exhaustion: each one is a session
+        waiting on a job it will never be told about. ``undeliverable`` is the
+        separate expected terminal outcome for wakes whose exact thread was
+        hard-deleted. Excludes 'none' — most jobs are not session-created and
         counting them would swamp the signal.
         """
         async with self.acquire() as conn:
@@ -8546,6 +8563,7 @@ class PostgresDB:
             "sending": counts.get("sending", 0),
             "sent": counts.get("sent", 0),
             "dead": counts.get("dead", 0),
+            "undeliverable": counts.get("undeliverable", 0),
         }
 
     # --- Officer wake event outbox (centurion) -------------------------------
@@ -10715,6 +10733,9 @@ class PostgresDB:
         """
         from services.container_provisioner import WORKSPACE_RUNTIME_INCARNATION_KEY
         from services.run_queue_reaper import reconcile_terminal_interrupts
+        from src.shared.session_permission_retirement import (
+            retire_stale_stateless_permissions,
+        )
         from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
         from src.shared.session_retirement import (
             active_claim_authority,
@@ -11115,6 +11136,19 @@ class PostgresDB:
                         raise RuntimeError(
                             "stateless session queue closure lost its row"
                         )
+                    permission_epoch_bumped = False
+                    if force and pending_permission:
+                        permission_retirement = (
+                            await retire_stale_stateless_permissions(
+                                conn,
+                                thread_id=thread_id,
+                                retired_lease_token=prior_token,
+                                successor_lease_token=terminal_token,
+                                reason="force_end",
+                                epoch_already_bumped=False,
+                            )
+                        )
+                        permission_epoch_bumped = permission_retirement.epoch_bumped
                     if prior_token > 0:
                         await reconcile_terminal_interrupts(
                             conn,
@@ -11125,19 +11159,7 @@ class PostgresDB:
                             attempts=int(queue["attempts_since_completion"] or 0),
                             active_turn_id=active_turn_id,
                             reason="force_end" if force else "user_end",
-                        )
-                    if force and pending_permission:
-                        # Permission cards carry no queue cursor and no durable
-                        # waiter survives terminal claim fencing. Preserve their
-                        # audit rows but expire every still-pending card; an
-                        # unconsumed human preserved for Resume may request a
-                        # fresh approval under its successor claim.
-                        await conn.execute(
-                            "UPDATE thread_permission_requests "
-                            "SET status = 'expired', decided_at = now(), "
-                            "    decided_by = 'system/force_end' "
-                            "WHERE thread_id = $1::uuid AND status = 'pending'",
-                            thread_id,
+                            epoch_already_bumped=permission_epoch_bumped,
                         )
                     closed = await conn.fetchval(
                         "UPDATE run_queue SET state = 'done', "
@@ -12121,6 +12143,26 @@ class PostgresDB:
                     raise RuntimeError(
                         "permanent thread delete waits for final-memory extraction"
                     )
+                # Thread row first, then its jobs. Wake claim/finish/release
+                # paths lock only jobs, so this order has no jobs→thread cycle.
+                # Retiring before DELETE is load-bearing: the creator FK is ON
+                # DELETE SET NULL and claim/enqueue intentionally ignore NULL
+                # creators. Without this update an owed wake silently becomes
+                # unclaimable. A sender that already claimed may finish later,
+                # but its `wake_state = 'sending'` CAS cannot overwrite this
+                # terminal outcome.
+                await conn.execute(
+                    """
+                    UPDATE jobs
+                       SET wake_state = 'undeliverable',
+                           wake_claimed_at = NULL,
+                           updated_at = CURRENT_TIMESTAMP
+                     WHERE created_by_thread_id = $1
+                       AND wake_on_complete
+                       AND wake_state IN ('none', 'pending', 'sending')
+                    """,
+                    thread_uuid,
+                )
                 # Rewind ledgers intentionally have no FK to threads, so the
                 # permanent lifecycle transaction must remove them explicitly.
                 await conn.execute(

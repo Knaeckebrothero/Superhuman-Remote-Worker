@@ -77,6 +77,20 @@ async def _schema_applied(pg_dsn):
             CREATE TABLE thread_turn_commits (thread_id uuid);
             CREATE TABLE thread_rewinds (thread_id uuid);
             CREATE TABLE thread_messages (thread_id uuid);
+            CREATE TABLE jobs (
+                id uuid PRIMARY KEY,
+                created_by_thread_id uuid REFERENCES threads(id)
+                    ON DELETE SET NULL,
+                wake_on_complete boolean NOT NULL DEFAULT false,
+                wake_state text NOT NULL DEFAULT 'none' CHECK (
+                    wake_state IN (
+                        'none', 'pending', 'sending', 'sent', 'dead',
+                        'undeliverable'
+                    )
+                ),
+                wake_claimed_at timestamptz,
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
             """
         )
         await connection.execute(SESSION_COLUMNS.read_text())
@@ -102,7 +116,7 @@ async def db(pool):
         await connection.execute(
             "TRUNCATE completion_effects, job_completion_commands, "
             "docker_workspace_leases, thread_turn_commits, thread_rewinds, "
-            "thread_messages, run_queue, threads"
+            "thread_messages, jobs, run_queue, threads"
         )
     database = PostgresDB.__new__(PostgresDB)
     database._pool = pool

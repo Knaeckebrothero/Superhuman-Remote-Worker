@@ -254,6 +254,7 @@ def _db_for_settled(thread: dict, *, permanent: bool) -> SimpleNamespace:
         stateless_session_workspace_ensure_lock=_owned_lock,
         begin_stateless_thread_workspace_retirement=AsyncMock(return_value=closure),
         merge_thread_config_override=AsyncMock(),
+        has_unfinished_session_memory_effects=AsyncMock(return_value=False),
         delete_thread=AsyncMock(),
     )
 
@@ -751,6 +752,7 @@ async def test_direct_permanent_end_does_not_require_an_uncaptured_snapshot(
         get_stateless_thread_lifecycle_authority=AsyncMock(return_value=authority),
         stateless_session_workspace_ensure_lock=_owned_lock,
         merge_thread_config_override=AsyncMock(),
+        has_unfinished_session_memory_effects=AsyncMock(return_value=False),
         delete_thread=AsyncMock(),
     )
     snapshots = SimpleNamespace(
@@ -807,6 +809,7 @@ async def test_emptydir_permanent_requires_snapshot_prefix_cleanup_after_restore
         get_stateless_thread_lifecycle_authority=AsyncMock(return_value=authority),
         stateless_session_workspace_ensure_lock=_owned_lock,
         merge_thread_config_override=AsyncMock(),
+        has_unfinished_session_memory_effects=AsyncMock(return_value=False),
         delete_thread=AsyncMock(),
     )
     reconcile = AsyncMock(
@@ -869,6 +872,7 @@ async def test_permanent_virtual_end_purges_exact_workspace_before_row_delete(
             }
         ),
         merge_thread_config_override=AsyncMock(),
+        has_unfinished_session_memory_effects=AsyncMock(return_value=False),
         delete_thread=AsyncMock(),
     )
     purge = AsyncMock(return_value=purged)

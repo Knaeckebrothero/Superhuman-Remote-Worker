@@ -65,10 +65,13 @@ from src.shared.thread_interrupts import (
     interrupt_receipt_result,
 )
 
+from src.shared.session_permission_retirement import retire_stale_stateless_permissions
+
 logger = logging.getLogger(__name__)
 
 
 STALE_INTERRUPT_RETRY_MAX_THREADS = 25
+STALE_PERMISSION_RETRY_MAX_THREADS = 25
 CLAIM_LOSS_RECONCILE_MAX_THREADS = 25
 
 
@@ -195,6 +198,94 @@ WHERE (request.outcome IS NULL
 GROUP BY request.thread_id
 ORDER BY min(request.requested_at), request.thread_id
 LIMIT $1::integer
+"""
+
+_DONE_PERMISSION_RECOVERY_PROOF = """
+EXISTS (
+    SELECT 1
+    FROM thread_interrupt_requests proof_request
+    JOIN thread_events proof_receipt
+      ON proof_receipt.thread_id = proof_request.thread_id
+     AND proof_receipt.interrupt_request_id = proof_request.id
+     AND proof_receipt.epoch = proof_request.journal_epoch
+     AND proof_receipt.seq = proof_request.journal_seq
+    WHERE proof_request.thread_id = request.thread_id
+      AND proof_request.outcome = 'applied'
+      AND proof_request.accepted_lease_token > 0
+      AND proof_request.accepted_lease_token = queue.lease_token - 1
+      AND proof_request.applied_lease_token =
+          proof_request.accepted_lease_token
+      AND proof_request.result->>'input_settlement' = 'lease_recovery'
+      AND proof_request.result->'input_settled_by_lease_token' =
+          to_jsonb(queue.lease_token)
+      AND proof_receipt.kind = 'interrupt.ack'
+      AND proof_receipt.payload @> jsonb_build_object(
+            'request_id', proof_request.id::text,
+            'client_request_id', proof_request.client_request_id::text,
+            'target_turn_id', proof_request.target_turn_id,
+            'applied', TRUE
+          )
+      AND proof_receipt.payload->>'mode' IN ('hard', 'graceful')
+)
+"""
+
+_STALE_PERMISSION_RETRY_CANDIDATES_SQL = f"""
+SELECT request.thread_id, min(request.requested_at) AS oldest_request
+FROM thread_permission_requests request
+JOIN threads thread ON thread.id = request.thread_id
+JOIN run_queue queue ON queue.unit_id = request.thread_id
+WHERE request.status = 'pending'
+  AND (request.accepted_lease_token IS NULL
+       OR (request.accepted_lease_token > 0
+           AND request.accepted_lease_token < queue.lease_token))
+  AND thread.execution_lane = 'stateless'
+  AND thread.agent_id IS NULL
+  AND queue.unit_kind = 'session_turn'
+  AND queue.lease_token > 0
+  AND (queue.state = 'parked'
+       OR (queue.state = 'done'
+           AND {_DONE_PERMISSION_RECOVERY_PROOF}))
+  AND queue.leased_by IS NULL
+  AND queue.last_leased_by IS NULL
+  AND NOT (COALESCE(thread.metadata, '{{}}'::jsonb)
+           ? '_stateless_active_claim')
+  AND NOT (COALESCE(thread.metadata, '{{}}'::jsonb)
+           ? '_stateless_claim_losses')
+  AND NOT (COALESCE(thread.metadata, '{{}}'::jsonb)
+           ? '_stateless_claim_loss_hold')
+GROUP BY request.thread_id
+ORDER BY min(request.requested_at), request.thread_id
+LIMIT $1::integer
+"""
+
+_LOCK_DONE_PERMISSION_RECOVERY_PROOF_SQL = """
+SELECT proof_request.id
+FROM thread_interrupt_requests proof_request
+JOIN thread_events proof_receipt
+  ON proof_receipt.thread_id = proof_request.thread_id
+ AND proof_receipt.interrupt_request_id = proof_request.id
+ AND proof_receipt.epoch = proof_request.journal_epoch
+ AND proof_receipt.seq = proof_request.journal_seq
+WHERE proof_request.thread_id = $1::uuid
+  AND proof_request.outcome = 'applied'
+  AND proof_request.accepted_lease_token > 0
+  AND proof_request.accepted_lease_token = $2::bigint - 1
+  AND proof_request.applied_lease_token = proof_request.accepted_lease_token
+  AND proof_request.result->>'input_settlement' = 'lease_recovery'
+  AND proof_request.result->'input_settled_by_lease_token' =
+      to_jsonb($2::bigint)
+  AND proof_receipt.kind = 'interrupt.ack'
+  AND proof_receipt.payload @> jsonb_build_object(
+        'request_id', proof_request.id::text,
+        'client_request_id', proof_request.client_request_id::text,
+        'target_turn_id', proof_request.target_turn_id,
+        'applied', TRUE
+      )
+  AND proof_receipt.payload->>'mode' IN ('hard', 'graceful')
+ORDER BY proof_request.accepted_lease_token, proof_request.requested_at,
+         proof_request.id
+LIMIT 1
+FOR SHARE OF proof_request, proof_receipt
 """
 
 _PENDING_STALE_INTERRUPT_RETRY_SQL = """
@@ -538,6 +629,7 @@ async def reconcile_terminal_interrupts(
     attempts: int,
     active_turn_id: int | None = None,
     reason: str = "force_end",
+    epoch_already_bumped: bool = False,
 ) -> InterruptReconcileResult:
     """Settle exact old-lease interrupts after public End steals ownership.
 
@@ -575,7 +667,8 @@ async def reconcile_terminal_interrupts(
     # This is also the fence for an old claimant's journal allocator.  One
     # bump covers every stale receipt and the synthetic force-End frame in the
     # enclosing transaction.
-    await bump_epoch(conn, thread_id=thread_id)
+    if not epoch_already_bumped:
+        await bump_epoch(conn, thread_id=thread_id)
     interrupts = await _reconcile_interrupt_rows(
         conn,
         thread_id=thread_id,
@@ -803,6 +896,14 @@ async def _steal_session_with_claim_loss(
         # loss provenance are one atomic owner-loss fact.  Publishing only the
         # queue bump would leave an unrecoverable claim-loss gap after a crash.
         await bump_epoch(conn, thread_id=thread_id)
+        await retire_stale_stateless_permissions(
+            conn,
+            thread_id=thread_id,
+            retired_lease_token=previous_token,
+            successor_lease_token=int(unit.lease_token),
+            reason="lease_expired",
+            epoch_already_bumped=True,
+        )
         interrupts = await _reconcile_stolen_interrupts(
             conn,
             thread_id=thread_id,
@@ -927,6 +1028,14 @@ async def _journal_steal(conn: Any, unit: StolenUnit) -> JournalStealResult:
         if queue_result is not JournalStealResult.WRITTEN:
             return queue_result
         await bump_epoch(conn, thread_id=thread_id)
+        await retire_stale_stateless_permissions(
+            conn,
+            thread_id=thread_id,
+            retired_lease_token=int(unit.previous_lease_token),
+            successor_lease_token=int(unit.lease_token),
+            reason="lease_expired",
+            epoch_already_bumped=True,
+        )
         interrupts = await _reconcile_stolen_interrupts(
             conn,
             thread_id=thread_id,
@@ -969,6 +1078,120 @@ def _queue_allows_stale_retry(queue: Any) -> bool:
     )
 
 
+def _thread_allows_parked_permission_retry(thread: Any) -> bool:
+    """Prove no credential-bearing claimant or resident writer remains."""
+
+    if (
+        thread is None
+        or str(thread["execution_lane"] or "") != "stateless"
+        or thread["agent_id"] is not None
+    ):
+        return False
+    try:
+        metadata = _metadata_object(thread["metadata"] or {})
+    except RuntimeError:
+        return False
+    return not any(
+        key in metadata
+        for key in (
+            ACTIVE_CLAIM_KEY,
+            CLAIM_LOSS_LEDGER_KEY,
+            CLAIM_LOSS_HOLD_KEY,
+        )
+    )
+
+
+async def _retry_stale_permission_thread(
+    conn: Any,
+    *,
+    thread_id: str,
+) -> int:
+    """Retire rolling-skew rows only at a proven writer-free boundary."""
+
+    async with conn.transaction():
+        thread = await conn.fetchrow(_LOCK_THREAD_SQL, thread_id)
+        if not _thread_allows_parked_permission_retry(thread):
+            return 0
+        queue = await conn.fetchrow(_LOCK_QUEUE_UNIT_SQL, thread_id)
+        if (
+            queue is None
+            or str(queue["unit_kind"]) != UNIT_KIND_SESSION_TURN
+            or str(queue["state"]) not in {"parked", "done"}
+            or queue["leased_by"] is not None
+        ):
+            return 0
+        queue_token = int(queue["lease_token"] or 0)
+        if queue_token <= 0:
+            return 0
+        if queue["last_leased_by"] is not None:
+            # Reaper steals clear this hint. A non-NULL holder on parked is a
+            # malformed/legacy state, not proof that a warm allocator is gone.
+            return 0
+        if str(queue["state"]) == "done":
+            # A plain completed queue may still have a warm allocator or may
+            # simply be old history. The only recovery-grade done state is one
+            # whose terminal interrupt row and immutable linked receipt both
+            # prove that this exact queue token performed lease-recovery input
+            # settlement. Lock that provenance through the retirement txn.
+            proof = await conn.fetchrow(
+                _LOCK_DONE_PERMISSION_RECOVERY_PROOF_SQL,
+                thread_id,
+                queue_token,
+            )
+            if proof is None:
+                return 0
+        result = await retire_stale_stateless_permissions(
+            conn,
+            thread_id=thread_id,
+            retired_lease_token=queue_token - 1,
+            successor_lease_token=queue_token,
+            reason="lease_expired",
+            epoch_already_bumped=False,
+        )
+        return result.count
+
+
+async def retry_stale_permission_requests(
+    conn: Any,
+    *,
+    max_threads: int = STALE_PERMISSION_RETRY_MAX_THREADS,
+) -> int:
+    """Bounded repair for rows skipped by an older rolling reaper.
+
+    Candidate discovery is advisory. Each thread is rechecked in the global
+    ``threads -> run_queue`` lock order. A parked row with no holder and no
+    active/claim-loss authority is a system-writer context. A done row is
+    eligible only with an exact terminal interrupt request + linked receipt
+    proving this queue token performed lease-recovery input settlement.
+    Ordinary done/queued rows can retain a warm allocator, and leased rows
+    belong to their exact successor, so none is touched without that proof.
+    """
+
+    if max_threads <= 0:
+        return 0
+    candidates = await conn.fetch(
+        _STALE_PERMISSION_RETRY_CANDIDATES_SQL,
+        int(max_threads),
+    )
+    retired = 0
+    for candidate in candidates:
+        thread_id = str(candidate["thread_id"])
+        try:
+            retired += await _retry_stale_permission_thread(
+                conn,
+                thread_id=thread_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "run_queue reaper: stale permission retry failed for thread %s "
+                "(contained)",
+                thread_id,
+            )
+    return retired
+
+
 async def _retry_stale_interrupt_thread(
     conn: Any,
     *,
@@ -1001,6 +1224,14 @@ async def _retry_stale_interrupt_thread(
         # reconstructs the whole boundary even when every ack receipt predates
         # it: epoch bump, row reconciliation, and turn.parked are one commit.
         await bump_epoch(conn, thread_id=thread_id)
+        await retire_stale_stateless_permissions(
+            conn,
+            thread_id=thread_id,
+            retired_lease_token=queue_token - 1,
+            successor_lease_token=queue_token,
+            reason="lease_expired",
+            epoch_already_bumped=True,
+        )
         interrupts = await _reconcile_interrupt_rows(
             conn,
             thread_id=thread_id,
@@ -1188,6 +1419,7 @@ async def reap_cycle(
                 unit.unit_id,
             )
     await retry_stale_interrupt_requests(conn)
+    await retry_stale_permission_requests(conn)
     await reconcile_claim_loss_holds(conn)
     return len(stolen)
 

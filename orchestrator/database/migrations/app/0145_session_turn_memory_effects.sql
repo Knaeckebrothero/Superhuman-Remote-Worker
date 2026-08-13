@@ -30,11 +30,4 @@ COMMENT ON COLUMN completion_effects.claimed_by IS
     'Independent session-effect drain claim identity. NULL means unclaimed; '
     'a session drain may complete or release only the UUID it claimed.';
 
-COMMENT ON TABLE completion_effects IS
-    'One stable-name progress row per completion effect. Polymorphic by '
-    'producer_kind and deliberately has no foreign key or state-driven '
-    'partial index. job_completion producers use the command finalizer states; '
-    'session_turn producers use pending, done, or dead and are age-pruned from '
-    'created_at. Retention is explicit for both kinds.';
-
 COMMIT;

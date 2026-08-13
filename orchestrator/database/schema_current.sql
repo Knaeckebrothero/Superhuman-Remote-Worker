@@ -3723,6 +3723,34 @@ $$;
 
 
 --
+-- Name: settle_job_wakes_before_thread_delete(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.settle_job_wakes_before_thread_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog', 'public'
+    AS $$
+BEGIN
+    UPDATE public.jobs
+    SET wake_state = 'undeliverable',
+        wake_claimed_at = NULL,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE wake_on_complete
+      AND created_by_thread_id = OLD.id
+      AND wake_state IN ('none', 'pending', 'sending');
+    RETURN OLD;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION settle_job_wakes_before_thread_delete(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.settle_job_wakes_before_thread_delete() IS 'Atomically retires open completion wakes before jobs.creator FK ON DELETE SET NULL. The trigger is the rolling-version guard for old/raw thread deletes; PostgresDB.delete_thread performs the same update explicitly.';
+
+
+--
 -- Name: transition_storage_asset_for_destruction(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -5686,7 +5714,7 @@ CREATE TABLE public.jobs (
     completion_sweep_attempt_hwm bigint DEFAULT 0 NOT NULL,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
-    CONSTRAINT jobs_wake_state_known CHECK ((wake_state = ANY (ARRAY['none'::text, 'pending'::text, 'sending'::text, 'sent'::text, 'dead'::text]))),
+    CONSTRAINT jobs_wake_state_known CHECK ((wake_state = ANY (ARRAY['none'::text, 'pending'::text, 'sending'::text, 'sent'::text, 'dead'::text, 'undeliverable'::text]))),
     CONSTRAINT valid_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'processing'::character varying, 'completed'::character varying, 'failed'::character varying, 'cancelled'::character varying, 'pending_review'::character varying, 'paused'::character varying, 'reviewing'::character varying, 'waiting'::character varying, 'waiting_for_reply'::character varying])::text[])))
 );
 
@@ -5737,7 +5765,7 @@ COMMENT ON COLUMN public.jobs.created_by_thread_id IS 'Session thread that creat
 -- Name: COLUMN jobs.wake_state; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.jobs.wake_state IS 'Wake outbox state: none|pending|sending|sent|dead. Claimed by an atomic UPDATE ... FOR UPDATE SKIP LOCKED before the (non-idempotent) send.';
+COMMENT ON COLUMN public.jobs.wake_state IS 'Wake outbox state: none|pending|sending|sent|dead|undeliverable. dead is retry exhaustion; undeliverable means the exact creating thread was hard-deleted before the wake could settle. Claimed by an atomic UPDATE ... FOR UPDATE SKIP LOCKED before the non-idempotent send.';
 
 
 --
@@ -7657,7 +7685,8 @@ CREATE TABLE public.thread_events (
     payload jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     control_request_id uuid,
-    interrupt_request_id uuid
+    interrupt_request_id uuid,
+    permission_request_id uuid
 );
 
 
@@ -7701,6 +7730,13 @@ COMMENT ON COLUMN public.thread_events.control_request_id IS 'Durable receipt li
 --
 
 COMMENT ON COLUMN public.thread_events.interrupt_request_id IS 'Durable result link for one exact-lease interrupt request. A committed receipt lets the same owner recover finalization without emitting a duplicate journal frame; it never transfers application authority to a successor lease.';
+
+
+--
+-- Name: COLUMN thread_events.permission_request_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_events.permission_request_id IS 'Durable permission.resolved receipt link for one exact-lease permission request retired after proven owner loss. The partial unique index added by 0148 permits at most one linked receipt per request.';
 
 
 --
@@ -8002,6 +8038,8 @@ CREATE TABLE public.thread_permission_requests (
     decided_at timestamp with time zone,
     decided_by text,
     expires_at timestamp with time zone DEFAULT (now() + '00:05:00'::interval) NOT NULL,
+    accepted_lease_token bigint,
+    CONSTRAINT thread_permission_accepted_lease_positive CHECK (((accepted_lease_token IS NULL) OR (accepted_lease_token > 0))),
     CONSTRAINT thread_permission_requests_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'denied'::text, 'expired'::text])))
 );
 
@@ -8025,6 +8063,13 @@ COMMENT ON COLUMN public.thread_permission_requests.tool_call_id IS 'The LangCha
 --
 
 COMMENT ON COLUMN public.thread_permission_requests.decided_by IS 'User id, MCP token id, or "system" (for timeout-driven expiry).';
+
+
+--
+-- Name: COLUMN thread_permission_requests.accepted_lease_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_permission_requests.accepted_lease_token IS 'Immutable exact stateless session_turn lease captured while admission holds the threads -> run_queue locks. NULL identifies pinned or legacy rows and is never guessed by a generic expiry sweep. For rolling compatibility, a NULL row may be expired only at a proven writer-exclusive stateless owner-loss or terminal boundary.';
 
 
 --
@@ -10009,6 +10054,14 @@ ALTER TABLE ONLY public.thread_mounts
 
 
 --
+-- Name: thread_permission_requests uq_thread_permission_request_identity; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_permission_requests
+    ADD CONSTRAINT uq_thread_permission_request_identity UNIQUE (id, thread_id);
+
+
+--
 -- Name: usage_rate_card_rates usage_rate_card_rates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -10924,6 +10977,13 @@ CREATE UNIQUE INDEX idx_thread_events_control_request ON public.thread_events US
 --
 
 CREATE UNIQUE INDEX idx_thread_events_interrupt_request ON public.thread_events USING btree (interrupt_request_id) WHERE (interrupt_request_id IS NOT NULL);
+
+
+--
+-- Name: idx_thread_events_permission_request; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_thread_events_permission_request ON public.thread_events USING btree (permission_request_id) WHERE (permission_request_id IS NOT NULL);
 
 
 --
@@ -12023,6 +12083,13 @@ CREATE TRIGGER resource_publication_plans_frozen_intent BEFORE DELETE OR UPDATE 
 --
 
 CREATE CONSTRAINT TRIGGER resource_publication_plans_manifest_complete AFTER INSERT ON public.resource_publication_plans DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_resource_publication_plan_manifest();
+
+
+--
+-- Name: threads settle_job_wakes_before_thread_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER settle_job_wakes_before_thread_delete BEFORE DELETE ON public.threads FOR EACH ROW EXECUTE FUNCTION public.settle_job_wakes_before_thread_delete();
 
 
 --
@@ -13351,6 +13418,14 @@ ALTER TABLE ONLY public.thread_events
 
 ALTER TABLE ONLY public.thread_events
     ADD CONSTRAINT thread_events_interrupt_request_thread_fkey FOREIGN KEY (interrupt_request_id, thread_id) REFERENCES public.thread_interrupt_requests(id, thread_id);
+
+
+--
+-- Name: thread_events thread_events_permission_request_thread_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_events
+    ADD CONSTRAINT thread_events_permission_request_thread_fkey FOREIGN KEY (permission_request_id, thread_id) REFERENCES public.thread_permission_requests(id, thread_id);
 
 
 --

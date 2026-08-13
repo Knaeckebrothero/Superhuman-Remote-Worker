@@ -379,6 +379,18 @@ _interrupt_watcher_lifecycle_lock: asyncio.Lock = asyncio.Lock()
 _INTERRUPT_NOTIFY_CHANNEL = "thread_interrupt_requests"
 _INTERRUPT_POLL_SECONDS = 1.0
 
+_STALE_PERMISSION_EXISTS_SQL = """
+SELECT EXISTS (
+    SELECT 1
+    FROM thread_permission_requests
+    WHERE thread_id = $1::uuid
+      AND status = 'pending'
+      AND (accepted_lease_token IS NULL
+           OR (accepted_lease_token > 0
+               AND accepted_lease_token < $2::bigint))
+)
+"""
+
 _EVENT_WRITER_QUEUE_MAXSIZE: int = int(
     os.environ.get("THREAD_EVENT_WRITER_QUEUE_MAXSIZE", "10000")
 )
@@ -6302,10 +6314,34 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
                     raise InterruptInboxBlocked(
                         "interrupt epoch recovery queue token is no longer current"
                     )
-                new_epoch = await _event_journal.bump_epoch(
+                from ..shared.session_permission_retirement import (
+                    retire_stale_stateless_permissions,
+                )
+
+                permission_retirement = await retire_stale_stateless_permissions(
                     conn,
                     thread_id=str(_thread_id),
+                    retired_lease_token=int(lease_token) - 1,
+                    successor_lease_token=int(lease_token),
+                    reason="lease_expired",
+                    epoch_already_bumped=False,
                 )
+                if permission_retirement.epoch_bumped:
+                    new_epoch = permission_retirement.receipts[0].epoch
+                    if any(
+                        receipt.epoch != int(new_epoch)
+                        for receipt in permission_retirement.receipts
+                    ):
+                        raise RuntimeError(
+                            "permission recovery receipts span journal epochs"
+                        )
+                    recovered_hwm = permission_retirement.receipts[-1].seq
+                else:
+                    new_epoch = await _event_journal.bump_epoch(
+                        conn,
+                        thread_id=str(_thread_id),
+                    )
+                    recovered_hwm = 0
     except BaseException:
         # A failed transaction exit can be commit-ambiguous. Never recreate a
         # writer in the old epoch by guessing that the bump rolled back; leave
@@ -6314,7 +6350,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
         raise
 
     _events_epoch = int(new_epoch)
-    _next_seq = 0
+    _next_seq = int(recovered_hwm)
     try:
         new_writer = _OrderedPersistentEventWriter(
             postgres_conn=_session.postgres_conn,
@@ -6329,11 +6365,12 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
         raise
     _event_writer = new_writer
     logger.info(
-        "session-interrupt recovery epoch: thread=%s token=%d old=%d new=%d",
+        "session-owner recovery epoch: thread=%s token=%d old=%d new=%d permissions=%d",
         _thread_id,
         lease_token,
         old_epoch,
         _events_epoch,
+        permission_retirement.count,
     )
     return _events_epoch
 
@@ -6394,7 +6431,15 @@ async def _reconcile_stale_thread_interrupts(
                         thread_id=_thread_id,
                         current_lease_token=int(lease_token),
                     )
-                    if not requests:
+                    stale_permissions = bool(
+                        await conn.fetchval(
+                            _STALE_PERMISSION_EXISTS_SQL,
+                            _thread_id,
+                            int(lease_token),
+                        )
+                    )
+                    no_interrupts = not requests
+                    if no_interrupts:
                         queue = await conn.fetchrow(
                             "SELECT consumed_seq FROM run_queue "
                             "WHERE unit_id = $1::uuid AND state = 'leased' "
@@ -6402,7 +6447,7 @@ async def _reconcile_stale_thread_interrupts(
                             _thread_id,
                             int(lease_token),
                         )
-                        return (
+                        result = (
                             reconciled,
                             (
                                 int(queue["consumed_seq"])
@@ -6411,14 +6456,25 @@ async def _reconcile_stale_thread_interrupts(
                                 else None
                             ),
                         )
-                    receipts = {
-                        request.id: await fetch_interrupt_receipt(
-                            conn,
-                            thread_id=_thread_id,
-                            request_id=request.id,
-                        )
-                        for request in requests
-                    }
+                    else:
+                        receipts = {
+                            request.id: await fetch_interrupt_receipt(
+                                conn,
+                                thread_id=_thread_id,
+                                request_id=request.id,
+                            )
+                            for request in requests
+                        }
+
+            if no_interrupts:
+                if stale_permissions:
+                    # The discovery transaction has released its thread/queue
+                    # locks before rotation takes a fresh connection. Holding
+                    # them while awaiting the second connection self-deadlocks.
+                    await _rotate_thread_interrupt_recovery_epoch(
+                        lease_token=int(lease_token)
+                    )
+                return result
 
             # A stale row proves the claim beat the reaper's post-steal
             # boundary. Rotate before any recovery frame or successor output.
@@ -7561,13 +7617,15 @@ async def _insert_permission_request(
                         return None
                     row_id = await conn.fetchval(
                         "INSERT INTO thread_permission_requests "
-                        "(thread_id, tool_call_id, tool_name, tool_args) "
-                        "VALUES ($1, $2, $3, $4::jsonb) "
+                        "(thread_id, tool_call_id, tool_name, tool_args, "
+                        " accepted_lease_token) "
+                        "VALUES ($1, $2, $3, $4::jsonb, $5::bigint) "
                         "RETURNING id",
                         _thread_id,
                         tool_call_id,
                         tool_name,
                         json.dumps(_safe_serialize(tool_args)),
+                        int(handle.lease_token),
                     )
                 return str(row_id) if row_id is not None else None
 

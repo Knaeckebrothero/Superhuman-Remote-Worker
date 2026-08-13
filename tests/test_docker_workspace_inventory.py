@@ -116,6 +116,12 @@ class _InventoryConnection:
             rows = [row for row in rows if row["host"] == host and row["port"] == port]
         return copy.deepcopy(rows[0]) if rows else None
 
+    async def fetch(self, query: str, *args):
+        sql = _compact(query)
+        if "FROM completion_effects" in sql:
+            return []
+        raise AssertionError(f"unexpected fetch: {sql}")
+
     async def execute(self, query: str, *args):
         sql = _compact(query)
         if "pg_advisory_xact_lock" in sql:
@@ -227,6 +233,11 @@ class _InventoryConnection:
                 return "UPDATE 0"
             self.jobs[owner_id] = json.loads(raw)
             return "UPDATE 1"
+        if sql.startswith("UPDATE jobs") and "wake_state = 'undeliverable'" in sql:
+            # This seam models only workspace ownership. No represented job is
+            # a session wake, but permanent thread deletion still issues the
+            # production atomic wake-retirement statement.
+            return "UPDATE 0"
         if sql.startswith("UPDATE threads") and "workspace_container" in sql:
             if self.fail_owner_update_once:
                 self.fail_owner_update_once = False

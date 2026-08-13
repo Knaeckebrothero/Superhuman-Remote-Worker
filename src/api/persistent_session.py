@@ -31,7 +31,6 @@ from ..core.loader import (
     get_all_tool_names,
     get_phase_system_prompt,
     get_project_root,
-    load_auxiliary_prompt,
     render_instruction_content,
     supports_parallel_tool_calls,
 )
@@ -50,6 +49,10 @@ from ..core.workspace import WorkspaceManager, WorkspaceManagerConfig
 from ..core.workspace_backend import (
     WorkspaceAuthenticationError,
     WorkspaceUnavailableError,
+)
+from ..services.memory_prompts import (
+    resolve_citation_verification_prompt,
+    resolve_memory_extraction_prompt,
 )
 from ..tools import ToolContext, load_tools, apply_instruction_enforcement
 from ..tools.context import SessionRuntimeFacts
@@ -84,54 +87,6 @@ class CloudOverlayUnavailable(Exception):
     remount/vfs-refresh failure be swallowed into the 404 branch instead of
     surfacing as a 500 (retry/alert) to the orchestrator caller.
     """
-
-
-def resolve_memory_extraction_prompt(config: AgentConfig) -> str:
-    """Load the memory-extraction prompt through the prompt matrix.
-
-    Mirrors the worker graph's resolution (graph.py): the auxiliary model
-    drives model-family resolution, falling back to the summarization phase
-    model, then the main model. ``MemoryConfig`` has no prompt attribute —
-    the prompt must be resolved here and threaded to every extraction call
-    site (docs/issues/memory_bugs.md B1).
-    """
-    aux_model = (
-        config.auxiliary.model
-        or config.llm.get_phase_config("summarization").model
-        or config.llm.model
-    )
-    try:
-        return load_auxiliary_prompt(config, "memory_extraction", model=aux_model)
-    except Exception as e:
-        logger.warning(
-            "Memory extraction prompt could not be loaded — extraction "
-            "will run without instructions: %s",
-            e,
-        )
-        return ""
-
-
-def resolve_citation_verification_prompt(config: AgentConfig) -> str:
-    """Load the citation-verification prompt through the prompt matrix.
-
-    Mirrors ``resolve_memory_extraction_prompt``. Persistent sessions verify
-    citations on the auxiliary model (the dedicated CITATION_LLM model slot is
-    a worker-dispatch concept), so resolve against the aux model family.
-    """
-    aux_model = (
-        config.auxiliary.model
-        or config.llm.get_phase_config("summarization").model
-        or config.llm.model
-    )
-    try:
-        return load_auxiliary_prompt(config, "citation_verification", model=aux_model)
-    except Exception as e:
-        logger.warning(
-            "Citation verification prompt could not be loaded — verification "
-            "will run without instructions: %s",
-            e,
-        )
-        return ""
 
 
 # Phase-specific tools that don't apply to interactive mode

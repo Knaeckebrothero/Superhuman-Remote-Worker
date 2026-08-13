@@ -97,6 +97,14 @@ excluded_rules = [
 #                in-place annotation or NOT VALID rewrite would violate the
 #                migration ledger. Future constraints retain the normal
 #                NOT VALID + later VALIDATE rule.
+#        - app/0147: the composite permission-request identity UNIQUE supports
+#                the same-file composite receipt FK. PostgreSQL cannot add a
+#                UNIQUE constraint NOT VALID, and the migration explicitly
+#                bounded/retried its ACCESS EXCLUSIVE lock on the small
+#                permission table. Tilt applied and checksummed these bytes
+#                before the pinned-linter pass, so fix-forward migrations
+#                0148/0149 add the receipt index concurrently and validate the
+#                FK/CHECK while this already-applied file remains immutable.
 excluded_paths = [
     "orchestrator/database/migrations/app/0001_initial.sql",
     "orchestrator/database/migrations/vector/0001_initial.sql",
@@ -109,5 +117,6 @@ excluded_paths = [
     "orchestrator/database/migrations/app/0123_thread_cloud_sync_baselines.sql",
     "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql",
     "orchestrator/database/migrations/app/0143_job_completion_accept_status.sql",
+    "orchestrator/database/migrations/app/0147_thread_permission_lease_receipts.sql",
     "orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]

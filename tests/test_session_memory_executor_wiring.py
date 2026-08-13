@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +22,39 @@ import main  # noqa: E402
 THREAD_ID = UUID("11111111-aaaa-4111-8111-111111111111")
 PROJECT_ID = UUID("22222222-bbbb-4222-8222-222222222222")
 USER_ID = UUID("33333333-cccc-4333-8333-333333333333")
+
+
+def test_executor_import_does_not_require_agent_only_aiosqlite() -> None:
+    """The always-on orchestrator drain must import in its production image."""
+
+    script = """
+import builtins
+original = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name == 'aiosqlite' or name.startswith('aiosqlite.'):
+        raise ModuleNotFoundError('agent-only dependency blocked')
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+import orchestrator.services.session_memory_executor
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parent.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_orchestrator_images_smoke_import_always_on_drain() -> None:
+    root = Path(__file__).parent.parent
+    import_probe = 'RUN python -c "import services.session_memory_executor"'
+    for relative in (
+        "docker/Dockerfile.orchestrator",
+        "docker/Dockerfile.orchestrator.dev",
+    ):
+        assert import_probe in (root / relative).read_text()
 
 
 def test_drain_singleton_wires_app_vector_and_fresh_resolver() -> None:

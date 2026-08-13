@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 
 from orchestrator.services import run_queue_reaper as mod
+from src.shared import session_permission_retirement as permission_retirement
 from src.shared.run_queue import StolenUnit
 from src.shared.run_queue import queries as queue_queries
 
@@ -144,6 +145,9 @@ def _conn():
     conn.transaction = lambda: _FakeTxn(conn)
     conn.stolen_interrupts = []
     conn.retry_candidates = []
+    conn.stale_permission_candidates = []
+    conn.stale_permissions = []
+    conn.done_permission_proof = None
     conn.retry_interrupts = []
     conn.claim_loss_candidates = []
     conn.thread_row = _thread()
@@ -154,6 +158,10 @@ def _conn():
             return conn.stolen_interrupts
         if sql == mod._STALE_INTERRUPT_RETRY_CANDIDATES_SQL:
             return conn.retry_candidates
+        if sql == mod._STALE_PERMISSION_RETRY_CANDIDATES_SQL:
+            return conn.stale_permission_candidates
+        if sql == permission_retirement._LOCK_STALE_PENDING_SQL:
+            return conn.stale_permissions
         if sql == mod._PENDING_STALE_INTERRUPT_RETRY_SQL:
             return conn.retry_interrupts
         if sql == mod._CLAIM_LOSS_HOLD_CANDIDATES_SQL:
@@ -165,6 +173,8 @@ def _conn():
             return conn.thread_row
         if sql == mod._LOCK_QUEUE_UNIT_SQL:
             return conn.queue_row
+        if sql == mod._LOCK_DONE_PERMISSION_RECOVERY_PROOF_SQL:
+            return conn.done_permission_proof
         raise AssertionError(f"unexpected fetchrow SQL: {sql}")
 
     def _fetchval(sql, *args):
@@ -351,9 +361,11 @@ async def test_steal_of_requeued_session_unit_journals_turn_interrupted(monkeypa
         payload={"reason": "lease_expired", "attempts": 2, "stolen_from": "pod-1"},
     )
     assert conn.txn_enters == 1, "bump + frame share ONE transaction per unit"
-    # exact-token rows + bounded interrupt retry + claimant-loss reconciliation
-    assert conn.fetch.await_count == 3
-    assert conn.fetch.await_args_list[0].args[1:] == (str(UNIT_A), 8)
+    # Exact permission/interrupt rows plus both bounded repair probes and
+    # claimant-loss reconciliation.
+    assert conn.fetch.await_count == 5
+    assert conn.fetch.await_args_list[0].args[1:] == (str(UNIT_A), 9)
+    assert conn.fetch.await_args_list[1].args[1:] == (str(UNIT_A), 8)
     conn.fetchval.assert_not_awaited()
     # grace flows through to the substrate
     assert mod.reap_expired.await_args.kwargs["grace_seconds"] == 30
@@ -978,6 +990,126 @@ async def test_queued_rows_are_deferred_to_live_successor_without_system_write(
     bump.assert_not_awaited()
     frame.assert_not_awaited()
     assert "queue.state = 'parked'" in mod._STALE_INTERRUPT_RETRY_CANDIDATES_SQL
+
+
+@pytest.mark.asyncio
+async def test_parked_permission_retry_retires_null_only_rolling_residue(
+    monkeypatch,
+):
+    conn = _conn()
+    conn.queue_row = _queue(
+        state="parked", token=9, leased_by=None, last_leased_by=None
+    )
+    conn.stale_permission_candidates = [{"thread_id": UNIT_A}]
+    retirement = MagicMock(count=1)
+    retire = AsyncMock(return_value=retirement)
+    monkeypatch.setattr(mod, "retire_stale_stateless_permissions", retire)
+
+    assert await mod.retry_stale_permission_requests(conn) == 1
+
+    retire.assert_awaited_once_with(
+        conn,
+        thread_id=str(UNIT_A),
+        retired_lease_token=8,
+        successor_lease_token=9,
+        reason="lease_expired",
+        epoch_already_bumped=False,
+    )
+    candidate_sql = mod._STALE_PERMISSION_RETRY_CANDIDATES_SQL
+    assert "accepted_lease_token IS NULL" in candidate_sql
+    assert "queue.lease_token > 0" in candidate_sql
+    assert "queue.state = 'parked'" in candidate_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["queued", "leased", "done"])
+async def test_permission_retry_never_system_writes_outside_parked_boundary(
+    monkeypatch, state
+):
+    conn = _conn()
+    conn.queue_row = _queue(
+        state=state,
+        token=9,
+        leased_by="successor" if state == "leased" else None,
+        last_leased_by=None,
+    )
+    retire = AsyncMock()
+    monkeypatch.setattr(mod, "retire_stale_stateless_permissions", retire)
+
+    assert await mod._retry_stale_permission_thread(conn, thread_id=str(UNIT_A)) == 0
+
+    retire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "thread_metadata",
+    [
+        {},  # old reaper settled directly to done
+        {"claim_loss_acknowledged": True},  # parked hold ACK restored done
+    ],
+)
+async def test_done_permission_retry_requires_exact_interrupt_recovery_proof(
+    monkeypatch, thread_metadata
+):
+    conn = _conn()
+    conn.thread_row = _thread(metadata=thread_metadata)
+    conn.queue_row = _queue(state="done", token=9, leased_by=None, last_leased_by=None)
+    conn.done_permission_proof = {"id": REQUEST_A}
+    retirement = MagicMock(count=1)
+    retire = AsyncMock(return_value=retirement)
+    monkeypatch.setattr(mod, "retire_stale_stateless_permissions", retire)
+
+    assert await mod._retry_stale_permission_thread(conn, thread_id=str(UNIT_A)) == 1
+
+    retire.assert_awaited_once_with(
+        conn,
+        thread_id=str(UNIT_A),
+        retired_lease_token=8,
+        successor_lease_token=9,
+        reason="lease_expired",
+        epoch_already_bumped=False,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"_stateless_active_claim": {"lease_token": 9}},
+        {"_stateless_claim_losses": {"8": {}}},
+        {"_stateless_claim_loss_hold": {"lease_token": 9}},
+    ],
+)
+async def test_done_permission_retry_excludes_any_claim_authority(
+    monkeypatch, metadata
+):
+    conn = _conn()
+    conn.thread_row = _thread(metadata=metadata)
+    conn.queue_row = _queue(state="done", token=9, leased_by=None, last_leased_by=None)
+    conn.done_permission_proof = {"id": REQUEST_A}
+    retire = AsyncMock()
+    monkeypatch.setattr(mod, "retire_stale_stateless_permissions", retire)
+
+    assert await mod._retry_stale_permission_thread(conn, thread_id=str(UNIT_A)) == 0
+    retire.assert_not_awaited()
+
+
+def test_done_permission_candidate_requires_exact_linked_recovery_marker():
+    candidate = mod._STALE_PERMISSION_RETRY_CANDIDATES_SQL
+    proof = mod._LOCK_DONE_PERMISSION_RECOVERY_PROOF_SQL
+
+    assert "queue.state = 'done'" in candidate
+    assert "proof_receipt.interrupt_request_id = proof_request.id" in candidate
+    assert "proof_receipt.epoch = proof_request.journal_epoch" in candidate
+    assert "proof_receipt.seq = proof_request.journal_seq" in candidate
+    assert "input_settlement' = 'lease_recovery'" in proof
+    assert "input_settled_by_lease_token" in proof
+    assert "accepted_lease_token = $2::bigint - 1" in proof
+    assert "to_jsonb($2::bigint)" in proof
+    assert ")::bigint" not in proof
+    assert "proof_receipt.kind = 'interrupt.ack'" in proof
+    assert "FOR SHARE OF proof_request, proof_receipt" in proof
 
 
 @pytest.mark.asyncio

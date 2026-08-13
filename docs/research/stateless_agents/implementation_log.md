@@ -4786,3 +4786,63 @@ independent read-only audit found no P0/P1 across public admission, executor
 watcher closure, owner-loss convergence, pinned forwarding or Cockpit retry.
 No live resource was queried or mutated; the protected stateless hand-check and
 pinned probe remain untouched.
+
+## M3 — claim-bound permission retirement and terminal wake convergence
+
+Stateless permission requests now capture the exact accepted worker lease token
+inside the existing thread→run-queue admission lock. Permission loss follows a
+retire, not re-arm, contract: at a proven writer-exclusive owner-loss,
+Force-End, successor-rotation, parked-recovery, or narrowly receipt-proven
+`done` boundary, every pending request belonging to an older claim is changed
+to `expired` and receives one linked durable `permission.resolved` frame in the
+same transaction. Approval and retirement race through the request-row lock and
+CAS, so exactly one disposition wins. Active presence still owns its normal
+timeout behavior; there is deliberately no blind `expires_at` sweeper.
+
+The rolling-upgrade paths are explicit. Legacy NULL-token requests fail closed
+until one of those proven writer boundaries. A new successor releases its
+discovery locks before rotating the journal epoch, retires both legacy and
+older-token requests, seeds the writer from the last receipt HWM, and therefore
+writes its first ordinary frame at N+1. A bounded parked repair covers an old
+binary that advanced the token without retiring permissions. The otherwise
+terminal old-reaper case is admitted only with exact proof: `run_queue` is
+unowned `done`, the request token is the immediate predecessor, and a linked
+terminal interrupt receipt records `lease_recovery` settlement by the current
+token. Ordinary `done`, queued, leased, current-token, and unrelated successor
+rows remain ineligible.
+
+Ended sessions already had the correct wake path: they receive the durable
+event without workspace restoration. Hard-deleted threads were the actual gap.
+Deletion now changes every open `wake_on_complete` row to the distinct terminal
+state `undeliverable`, clears its claim, and only then lets the creator FK become
+NULL. Finish/release CAS cannot overwrite that result. A `BEFORE DELETE`
+trigger protects old binaries and direct SQL during rolling deployment; a
+forward convergence migration closes the one-time backfill→trigger visibility
+window. `dead` remains reserved for delivery exhaustion and monitoring reports
+`undeliverable` separately.
+
+App migrations **0147–0155** carry the permission token and linked receipt,
+concurrent receipt index and validation, wake-state expansion/validation,
+forward comments, delete trigger, and post-trigger convergence. Migration 0145
+was restored byte-for-byte to its already-applied checksum after a late comment
+race; 0152 carries that comment forward. Every local 0145–0155 checksum now
+matches the live successful ledger and those files are frozen. The app snapshot
+was regenerated through **0155** (**13,593 lines**) and its from-zero replay and
+freshness check passed. Pinned Squawk v2.59.0 reported **0 issues in 8 files**;
+0147 has a path-scoped rationale because PostgreSQL cannot add a UNIQUE
+constraint `NOT VALID`, its bounded small-table lock was already applied, and
+0148/0149 provide the online index/validation follow-up.
+
+The integrated permission/interrupt/wake/End selection passed **259/259**. The
+dedicated permission real-Postgres suite passed **7/7**, covering NULL-token
+Force-End, successor recovery without self-deadlock, approval-vs-retirement,
+the exact receipt-proven `done` repair and its negative controls. The wake
+real-Postgres suite passed **24/24**, including raw old-binary deletion, late
+finish/release races, and the 0151→0154 rollout-window fixture closed by 0155.
+Ruff lint, repository format-check, `py_compile`, and whitespace checks are
+clean. The lean orchestrator image now imports the shared memory prompt module
+without the agent-only SQLite dependency, and refreshed orchestrator and
+stateless-agent pods import the new shared permission helper. The protected
+stateless hand-check and pinned probe retained their exact workspace UIDs; no
+soak fixture or protected completion row was mutated in M3. The next app
+migration is **0156**.

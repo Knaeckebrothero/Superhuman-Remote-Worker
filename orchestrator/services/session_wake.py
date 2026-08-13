@@ -261,10 +261,21 @@ async def _deliver_and_settle(db: Any, row: dict[str, Any]) -> bool:
 
     try:
         if ok:
-            await db.finish_job_wake(job_id, status)
+            settled = await db.finish_job_wake(job_id, status)
+            if settled is False:
+                logger.info(
+                    "session wake: claim for job %s was retired before settle",
+                    job_id[:8],
+                )
+                return False
             return True
         state = await db.release_job_wake(job_id, max_attempts=MAX_ATTEMPTS)
-        if state == "dead":
+        if state == "undeliverable":
+            logger.info(
+                "session wake: failed claim for job %s was retired by thread delete",
+                job_id[:8],
+            )
+        elif state == "dead":
             logger.error(
                 "session wake: job %s exhausted %d attempts — thread %s will "
                 "never learn this job finished",
@@ -282,8 +293,9 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool:
     """Deliver one claimed wake. True = delivered (or nothing left to deliver)."""
     thread_id = row.get("created_by_thread_id")
     if not thread_id:
-        # The creating thread was hard-deleted; the FK's ON DELETE SET NULL
-        # already nulled the backref. Nobody to wake — consume the claim.
+        # Forward hard deletes atomically retire the row before the FK is
+        # nulled. This branch covers a stale claimed projection (or a legacy
+        # orphan); finish_job_wake's CAS decides whether it was retired.
         return True
     thread_id = str(thread_id)
 
@@ -298,6 +310,9 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool:
         logger.exception("session wake: thread lookup failed for %s", thread_id[:8])
         return False
     if thread is None:
+        # A hard delete that began after claim retires the jobs row in the same
+        # transaction. Returning success gets us to the guarded finish CAS;
+        # it cannot overwrite the distinct undeliverable outcome.
         return True
 
     if _thread_is_officer(thread):

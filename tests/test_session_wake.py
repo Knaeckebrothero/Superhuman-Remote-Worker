@@ -112,7 +112,7 @@ def _db(*, claimed=None, thread=None, agent=None) -> SimpleNamespace:
         claim_pending_job_wakes=AsyncMock(
             return_value=list(claimed) if claimed is not None else []
         ),
-        finish_job_wake=AsyncMock(),
+        finish_job_wake=AsyncMock(return_value=True),
         release_job_wake=AsyncMock(return_value="pending"),
         mark_job_wake_pending=AsyncMock(return_value=True),
         get_thread=AsyncMock(return_value=thread),
@@ -399,6 +399,20 @@ async def test_vanished_thread_consumes_the_claim():
     db = _db(claimed=[_claim_row()], thread=None)
     assert await session_wake.drain_pending_wakes(db) == 1
     db.finish_job_wake.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_retirement_wins_the_late_finish_cas():
+    """A pre-delete claim may retain its old thread projection. Once delivery
+    resolves, the finish CAS must report that deletion already retired it and
+    the drain must not count an undeliverable wake as delivered."""
+    db = _db(claimed=[_claim_row()], thread=None)
+    db.finish_job_wake = AsyncMock(return_value=False)
+
+    assert await session_wake.drain_pending_wakes(db) == 0
+
+    db.finish_job_wake.assert_awaited_once_with(JOB_ID, "completed")
+    db.release_job_wake.assert_not_awaited()
 
 
 @pytest.mark.asyncio

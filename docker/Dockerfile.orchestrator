@@ -90,6 +90,9 @@ COPY --chown=srw:srw config/ ./config/
 # Keep the metering package and the main entrypoint image-atomic. This import
 # catches selective/stale build contexts before an image can be published.
 RUN python -c "import services.infrastructure_metering.compute_activation"
+# Fail the image build if the always-on session-memory drain accidentally
+# regains an agent-only import dependency.
+RUN python -c "import services.session_memory_executor"
 
 # Marker so get_project_root() finds /app (no .git in container)
 RUN touch /app/pyproject.toml && chown srw:srw /app/pyproject.toml

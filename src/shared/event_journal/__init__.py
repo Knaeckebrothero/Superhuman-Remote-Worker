@@ -39,9 +39,11 @@ _APPEND_SYSTEM_FRAME_SQL = """
         RETURNING events_epoch, events_seq_hwm AS seq
     )
     INSERT INTO thread_events (
-        thread_id, epoch, seq, kind, payload, interrupt_request_id
+        thread_id, epoch, seq, kind, payload, interrupt_request_id,
+        permission_request_id
     )
-    SELECT $1, allocated.events_epoch, allocated.seq, $2, $3::jsonb, $4::uuid
+    SELECT $1, allocated.events_epoch, allocated.seq, $2, $3::jsonb,
+           $4::uuid, $5::uuid
     FROM allocated
     RETURNING epoch, seq
 """
@@ -62,6 +64,7 @@ async def append_system_frame(
     kind: str,
     payload: dict[str, Any],
     interrupt_request_id: str | None = None,
+    permission_request_id: str | None = None,
 ) -> tuple[int, int] | None:
     """Append one system-class frame under the thread's CURRENT epoch.
 
@@ -70,7 +73,9 @@ async def append_system_frame(
     ``events_epoch`` in the same snapshot, then inserts the frame at that
     (epoch, seq). ``interrupt_request_id`` optionally links a post-steal
     ``interrupt.ack`` to its durable inbox row; the database's partial unique
-    index enforces one receipt per request. Other system frames leave it NULL.
+    index enforces one receipt per request. ``permission_request_id`` does the
+    same for an exact-lease ``permission.resolved`` owner-loss receipt. Other
+    system frames leave both links NULL.
     Returns the allocated ``(epoch, seq)``, or ``None`` when the thread row
     does not exist.
 
@@ -89,6 +94,7 @@ async def append_system_frame(
         kind,
         json.dumps(payload),
         interrupt_request_id,
+        permission_request_id,
     )
     if row is None:
         return None
