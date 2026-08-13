@@ -227,4 +227,5 @@ bench/runs/
 # push to a separate GitHub repo. NEVER commit client code to this public repo.
 KurortEngine/
 KurortEngine-salvage/
+KurortEngine-extracted/
 BetterResavio-KB/
