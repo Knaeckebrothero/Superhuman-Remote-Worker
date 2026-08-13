@@ -552,9 +552,7 @@ class TestWikilinkTargets:
     def test_extracts_plain_wikilink(self):
         from src.tools.knowledge.gardener import _internal_link_targets
 
-        assert _internal_link_targets("see [[other_note]] for detail") == [
-            "other_note"
-        ]
+        assert _internal_link_targets("see [[other_note]] for detail") == ["other_note"]
 
     def test_strips_alias_after_pipe(self):
         from src.tools.knowledge.gardener import _internal_link_targets
@@ -566,16 +564,12 @@ class TestWikilinkTargets:
     def test_strips_anchor(self):
         from src.tools.knowledge.gardener import _internal_link_targets
 
-        assert _internal_link_targets("see [[other_note#a section]]") == [
-            "other_note"
-        ]
+        assert _internal_link_targets("see [[other_note#a section]]") == ["other_note"]
 
     def test_reduces_path_to_basename(self):
         from src.tools.knowledge.gardener import _internal_link_targets
 
-        assert _internal_link_targets("see [[features/other_note]]") == [
-            "other_note"
-        ]
+        assert _internal_link_targets("see [[features/other_note]]") == ["other_note"]
 
     def test_ignores_embed_transclusion(self):
         from src.tools.knowledge.gardener import _internal_link_targets
@@ -601,9 +595,10 @@ class TestFrontmatterLinkTargets:
     def test_extracts_related_wikilinks(self):
         from src.tools.knowledge.gardener import frontmatter_link_targets
 
-        assert frontmatter_link_targets(
-            {"related": ["[[alpha]]", "[[bravo]]"]}
-        ) == ["alpha", "bravo"]
+        assert frontmatter_link_targets({"related": ["[[alpha]]", "[[bravo]]"]}) == [
+            "alpha",
+            "bravo",
+        ]
 
     def test_accepts_bare_slugs(self):
         from src.tools.knowledge.gardener import frontmatter_link_targets
