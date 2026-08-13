@@ -173,6 +173,9 @@ from auth import bff_router  # noqa: E402
 from routers import automations_router  # noqa: E402
 from routers import canvases_router, internal_canvases_router, wopi_router  # noqa: E402
 from services.canvas_office import warm_collabora_discovery  # noqa: E402
+from services.completion_effect_policy import (  # noqa: E402
+    COMPLETION_EFFECT_INDEX as _LEGACY_COMPLETION_EFFECT_INDEX,
+)
 from routers import project_loops_router  # noqa: E402
 from routers import product_capabilities_router  # noqa: E402
 from routers import shared_browser_router  # noqa: E402
@@ -1555,6 +1558,13 @@ STATELESS_WORKER_ENABLED = os.environ.get(
 # M4; local/tests may opt in before then without changing the legacy path.
 COMPLETION_COMMANDS_ENABLED = os.environ.get(
     "COMPLETION_COMMANDS_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+
+# Step 4 reorders only newly accepted completion commands.  The admission
+# decision is persisted on the command row so a config flip or rolling restart
+# cannot change the ordering contract of work already in flight.
+COMPLETION_STATUS_REORDER_ENABLED = os.environ.get(
+    "COMPLETION_STATUS_REORDER_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
 
 # Local-only crash-recovery proof hook. Production/chart defaults keep this at
@@ -9968,7 +9978,19 @@ async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     global _completion_finalizer_instance, _completion_sweep_router_instance
     global _completion_control_instance
+    global _completion_command_resolution_instance, _completion_monitor_instance
     global _shutdown_event
+
+    # Reordering is an execution mode of durable completion commands, never a
+    # standalone legacy-path feature. The admission bit is persisted, so this
+    # process flag changes only fresh commands. Reject the invalid combination
+    # before opening either database so a bad rollout fails loudly and
+    # side-effect free.
+    if COMPLETION_STATUS_REORDER_ENABLED and not COMPLETION_COMMANDS_ENABLED:
+        logger.error(
+            "COMPLETION_STATUS_REORDER_ENABLED requires COMPLETION_COMMANDS_ENABLED"
+        )
+        sys.exit(1)
 
     # Hard-fail if the legacy LLM_BASE_URL env var is set. The env-var-driven
     # routing for self-hosted "Local" group models was removed in chunk 6 of
@@ -11081,6 +11103,7 @@ async def lifespan(app: FastAPI):
     # Keep even the module import dark while the default-off gate is closed.
     completion_finalizer_task = None
     completion_sweep_router_task = None
+    completion_monitor_task = None
     if COMPLETION_COMMANDS_ENABLED:
         completion_finalizer = _get_completion_finalizer()
         completion_finalizer_task = asyncio.create_task(
@@ -11091,6 +11114,11 @@ async def lifespan(app: FastAPI):
             _get_completion_sweep_router().run(_shutdown_event),
             name="completion-sweep-router",
         )
+        if COMPLETION_STATUS_REORDER_ENABLED:
+            completion_monitor_task = asyncio.create_task(
+                _get_completion_monitor().run(_shutdown_event),
+                name="completion-monitor",
+            )
     security_events_prune_task = asyncio.create_task(
         security_events_prune_sweeper(_shutdown_event)
     )
@@ -11367,6 +11395,8 @@ async def lifespan(app: FastAPI):
         await completion_finalizer_task
     if completion_sweep_router_task is not None:
         await completion_sweep_router_task
+    if completion_monitor_task is not None:
+        await completion_monitor_task
     await security_events_prune_task
     await checkpoint_retention_task
     await headless_notify_task
@@ -11433,6 +11463,8 @@ async def lifespan(app: FastAPI):
     _completion_finalizer_instance = None
     _completion_sweep_router_instance = None
     _completion_control_instance = None
+    _completion_command_resolution_instance = None
+    _completion_monitor_instance = None
 
 
 app = FastAPI(
@@ -21526,6 +21558,7 @@ async def complete_job(
             postgres_db,
             job_id=job_id,
             payload=payload,
+            status_reorder_enabled=COMPLETION_STATUS_REORDER_ENABLED,
             lease_token=body.lease_token,
             agent_id=str(body.agent_id) if body.agent_id is not None else None,
             client_report_id=(
@@ -21669,6 +21702,8 @@ _DURABLE_COMPLETION_HTTP_ERROR = "_completion_http_error"
 _completion_finalizer_instance: Any | None = None
 _completion_sweep_router_instance: Any | None = None
 _completion_control_instance: Any | None = None
+_completion_command_resolution_instance: Any | None = None
+_completion_monitor_instance: Any | None = None
 
 
 def _durable_completion_http_outcome(exc: HTTPException) -> dict[str, Any]:
@@ -21731,6 +21766,11 @@ def _get_completion_finalizer() -> Any:
         _completion_finalizer_instance = CompletionFinalizer(
             postgres_db,
             workflow=_run_persisted_completion_workflow,
+            preclaim=(
+                _get_completion_command_resolution().preclaim_command
+                if COMPLETION_STATUS_REORDER_ENABLED
+                else None
+            ),
         )
     return _completion_finalizer_instance
 
@@ -21748,6 +21788,72 @@ async def _completion_sweep_operator_alert(message: str) -> None:
     _kick_officer_event_drain(postgres_db)
 
 
+async def _completion_resolution_operator_alert(incident: Any) -> None:
+    """Publish a force/safety incident with its service-provided stable key."""
+
+    await notify_all_officers(
+        postgres_db,
+        source="completion_resolution",
+        dedup_key=str(incident.dedup_key),
+        payload={
+            "kind": str(incident.kind)[:128],
+            "command_id": str(incident.command_id),
+            "job_id": str(incident.job_id),
+            "actor": str(incident.actor)[:128],
+            "reason": str(incident.reason)[:1000],
+            "terminal_status": incident.terminal_status,
+        },
+    )
+    _kick_officer_event_drain(postgres_db)
+
+
+async def _completion_monitor_operator_alert(alert: Any) -> None:
+    """Publish fixed-cardinality completion liveness/age alarms."""
+
+    await notify_all_officers(
+        postgres_db,
+        source="completion_monitor",
+        dedup_key=str(alert.dedup_key),
+        payload={
+            "kind": str(alert.kind),
+            "summary": str(alert.message)[:1000],
+            "command_id": alert.command_id,
+            "job_id": alert.job_id,
+            "command_state": alert.command_state,
+            "age_seconds": alert.age_seconds,
+        },
+    )
+    _kick_officer_event_drain(postgres_db)
+
+
+def _get_completion_command_resolution() -> Any:
+    """Lazily build the non-executing safety/operator command service."""
+
+    global _completion_command_resolution_instance
+    if _completion_command_resolution_instance is None:
+        from services.completion_command_resolution import CompletionCommandResolution
+
+        _completion_command_resolution_instance = CompletionCommandResolution(
+            postgres_db,
+            alert=_completion_resolution_operator_alert,
+        )
+    return _completion_command_resolution_instance
+
+
+def _get_completion_monitor() -> Any:
+    """Lazily build monitoring independently of the finalizer drain loop."""
+
+    global _completion_monitor_instance
+    if _completion_monitor_instance is None:
+        from services.completion_monitor import CompletionMonitor
+
+        _completion_monitor_instance = CompletionMonitor(
+            postgres_db,
+            _completion_monitor_operator_alert,
+        )
+    return _completion_monitor_instance
+
+
 def _get_completion_sweep_router() -> Any:
     """Lazily build the class-1 router only while commands are enabled."""
 
@@ -21759,6 +21865,11 @@ def _get_completion_sweep_router() -> Any:
             postgres_db,
             _get_completion_finalizer(),
             alert=_completion_sweep_operator_alert,
+            safety_net=(
+                _get_completion_command_resolution()
+                if COMPLETION_STATUS_REORDER_ENABLED
+                else None
+            ),
         )
     return _completion_sweep_router_instance
 
@@ -21881,53 +21992,6 @@ def _active_completion_control_claim(
     from services.completion_control import completion_control_claim_active
 
     return completion_control_claim_active(job.get("context"))
-
-
-_LEGACY_COMPLETION_EFFECT_PLAN: tuple[tuple[str, str], ...] = (
-    ("late_callback_guard", "entry"),  # S1
-    ("clear_stale_failure", "entry"),  # S2
-    ("persist_reported_freeze", "entry"),  # S3
-    ("drop_queued_replies", "entry"),  # S4
-    ("infra_transient_give_up", "recovery"),  # S5
-    ("infra_transient_pause", "recovery"),  # S6
-    ("pod_workspace_recovery", "recovery"),  # S7
-    ("vm_workspace_recovery", "recovery"),  # S8
-    ("reset_recovery_strikes", "recovery"),  # S9
-    ("memory_kb_retry_pause", "recovery"),  # S11
-    ("llm_outage_retry_pause", "recovery"),  # S12
-    ("llm_give_up_operator_alert", "llm_give_up_alert"),  # S13
-    ("deliverable_contract_gate", "delivery_gate"),  # S14
-    ("loop_project_cloud_delivery", "delivery"),  # S15
-    ("mode_a_diff_capture", "delivery"),  # S16
-    ("main_status_write", "job_disposition"),  # S17
-    ("clear_assigned_agent_on_pause", "job_disposition"),  # S18
-    ("stash_and_clear_freeze", "job_disposition"),  # S19
-    ("drain_stall_counter_alert", "drain_stall_alert"),  # S20
-    ("drain_stall_operator_alert", "drain_stall_notification"),  # S20 notification
-    ("completed_at", "job_disposition"),  # S21
-    ("sudo_approval_request", "sudo_request"),  # S22
-    ("auto_deny_resume", "auto_deny_resume"),  # S23
-    ("freeze_workspace_snapshot", "workspace_snapshot"),  # S24
-    ("freeze_notification", "freeze_notification"),  # S25
-    ("subjob_output_graft", "subjob_graft"),  # S26
-    ("critic_verdict", "critic_verdict"),  # S27
-    ("critic_verdict_followup", "critic_verdict_followup"),  # S27 external tail
-    ("scholar_parent_unblock", "scholar_unblock"),  # S28
-    ("delegation_parent_unblock", "delegation_unblock"),  # S29
-    ("verification_critic_spawn", "verification"),  # S30
-    ("verification_critic_handoff", "verification_handoff"),  # S30 external tail
-    ("curation_final_pass", "curation"),  # S31
-    ("project_loop_advance", "project_loop"),  # S32
-    ("project_loop_advance_handoff", "project_loop_handoff"),  # S32 external tail
-    ("terminal_merge_change_record", "terminal_delivery"),  # S33
-    ("session_wake_enqueue", "session_wake_enqueue"),  # S34
-    ("dispatch_trigger", "dispatch"),  # S35
-    ("workspace_archive_teardown", "workspace_teardown"),  # S36
-    ("session_wake_drain_kick", "session_wake_kick"),  # S37
-)
-_LEGACY_COMPLETION_EFFECT_INDEX = frozenset(_LEGACY_COMPLETION_EFFECT_PLAN)
-if len(_LEGACY_COMPLETION_EFFECT_INDEX) != len(_LEGACY_COMPLETION_EFFECT_PLAN):
-    raise RuntimeError("completion effect stable names must be unique")
 
 
 async def _run_completion_effect(
@@ -23530,6 +23594,32 @@ async def _complete_job_legacy(
                 "actions": actions,
             }
 
+        # A reordered command owns one durable jobs-row control marker before
+        # any product delivery starts.  Cancel/pause/resume/admission paths
+        # already honor this reserved marker, so the check survives the gap
+        # between a jobs-row preflight and external WebDAV/Gitea I/O.  A retry
+        # adopts the command-id marker; a stale process still loses on its
+        # ephemeral command term.  Once S17 is already journaled, skip this
+        # pre-status phase entirely and resume only its durable tail.
+        from services.completion_effect_policy import completion_status_order
+
+        pre_s15_status_order = completion_status_order(
+            getattr(_effect_runner, "command", None),
+            new_status,
+        )
+        main_status_already_completed = False
+        delivery_control_claim_id: str | None = None
+        if pre_s15_status_order.reordered:
+            main_status_already_completed = await _effect_runner.has_completed(
+                "main_status_write"
+            )
+            if not main_status_already_completed:
+                delivery_control_claim_id = (
+                    await _effect_runner.acquire_delivery_control(
+                        completion_entry_status
+                    )
+                )
+
         # 1a. Project-cloud delivery. Every project job receives a cloud
         # baseline in its isolated repo. Ordinary jobs retain the human
         # accept/reject workflow. Loop jobs auto-apply only a completely
@@ -23542,6 +23632,10 @@ async def _complete_job_legacy(
         if _completion_loop_id and new_status == "completed":
 
             async def _deliver_loop_project_cloud() -> dict[str, Any]:
+                if delivery_control_claim_id is not None:
+                    await _effect_runner.assert_delivery_control(
+                        completion_entry_status
+                    )
                 try:
                     from services.job_cloud_baseline import deliver_loop_diff_to_cloud
 
@@ -23695,6 +23789,149 @@ async def _complete_job_legacy(
                 new_status = "pending_review"
                 actions.append("mode A diff captured -> pending_review")
 
+        # Step 4 is selected only by the immutable value captured on this
+        # command at admission. A process-global flag must never reinterpret a
+        # stranded command after a rollback/redeploy, and non-terminal paths
+        # retain their historical order even when that captured bit is true.
+        status_order = completion_status_order(
+            getattr(_effect_runner, "command", None),
+            new_status,
+        )
+        pre_status_critic_verdict: dict[str, Any] | None = None
+        pre_status_subjob_actions: list[str] = []
+        pre_status_terminal_actions: list[str] = []
+
+        async def _run_subjob_output_graft_effect() -> list[str]:
+            if not job.get("parent_job_id"):
+                return []
+
+            async def _graft_subjob_output() -> dict[str, Any]:
+                if delivery_control_claim_id is not None:
+                    await _effect_runner.assert_delivery_control(
+                        completion_entry_status
+                    )
+                graft = await _maybe_graft_completed_subjob(
+                    job,
+                    completion_command_id=getattr(_effect_runner, "command_id", None),
+                )
+                return {"graft_result": graft}
+
+            graft_effect = await _run_completion_effect(
+                _effect_runner,
+                "subjob_output_graft",
+                "subjob_graft",
+                _graft_subjob_output,
+                retry_on_error=True,
+                error_output=lambda exc: {
+                    "graft_result": {
+                        "status": "error",
+                        "reason": str(exc),
+                    }
+                },
+            )
+            graft_result = graft_effect["graft_result"]
+            if graft_result and graft_result.get("status") == "grafted":
+                return [f"subjob output grafted to {graft_result['output_path']}"]
+            return []
+
+        async def _run_terminal_delivery_effect() -> list[str]:
+            # S33 preserves its historical applicability. ``cancelled`` is in
+            # the reordered terminal set but has no merge/change-record work.
+            if new_status not in ("completed", "failed"):
+                return []
+
+            async def _apply_terminal_merge_and_record() -> dict[str, Any]:
+                if delivery_control_claim_id is not None:
+                    await _effect_runner.assert_delivery_control(
+                        completion_entry_status
+                    )
+                try:
+                    from services.completion import apply_terminal_job_side_effects
+
+                    durable_merge_kwargs: dict[str, Any] = {}
+                    if _effect_runner is not None:
+                        durable_merge_kwargs = {
+                            "completion_command_id": _effect_runner.command_id,
+                            "load_merge_intent": lambda: _effect_runner.capture_intent(
+                                "terminal_merge_change_record"
+                            ),
+                            "store_merge_intent": lambda detail: (
+                                _effect_runner.capture_intent(
+                                    "terminal_merge_change_record", detail
+                                )
+                            ),
+                        }
+                    side_effects = await apply_terminal_job_side_effects(
+                        job,
+                        new_status,
+                        gitea=gitea_client,
+                        db=postgres_db,
+                        vector_db=vector_db,
+                        error=error_message,
+                        **durable_merge_kwargs,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"Job {job_id}: terminal side effects failed (non-fatal)",
+                        exc_info=True,
+                    )
+                    return {"actions": [], "error": str(exc)}
+                return {"actions": list(side_effects["actions"])}
+
+            terminal_effects = await _run_completion_effect(
+                _effect_runner,
+                "terminal_merge_change_record",
+                "terminal_delivery",
+                _apply_terminal_merge_and_record,
+                retry_if=lambda output: bool(output.get("error")),
+            )
+            return list(terminal_effects["actions"])
+
+        if status_order.reordered and not main_status_already_completed:
+            # S27's DB-only core is Class B. It must observe the disposition
+            # this command is about to publish, not the still-processing jobs
+            # row. Its external follow-up remains in the post-status tail.
+            if "critic_verdict" in status_order.pre_status_class_b_effects:
+                logical_terminal_job = {**job, "status": new_status}
+
+                async def _materialize_pre_status_critic_verdict() -> dict[str, Any]:
+                    return await _materialize_critic_verdict_transactional(
+                        logical_terminal_job
+                    )
+
+                pre_status_critic_verdict = await _run_completion_effect(
+                    _effect_runner,
+                    "critic_verdict",
+                    "critic_verdict",
+                    _materialize_pre_status_critic_verdict,
+                    transactional=True,
+                    supersede_if=lambda output: (
+                        output.get("applicable") is True
+                        and output.get("world_cas_won") is False
+                    ),
+                )
+
+            if "subjob_output_graft" in status_order.pre_status_delivery_effects:
+                pre_status_subjob_actions = await _run_subjob_output_graft_effect()
+            if (
+                "terminal_merge_change_record"
+                in status_order.pre_status_delivery_effects
+            ):
+                pre_status_terminal_actions = await _run_terminal_delivery_effect()
+
+            # Run every independent delivery first, then withhold S17 if any
+            # group scheduled a retry. CompletionFinalizer owns release/park;
+            # returning here is what prevents a pending delivery from becoming
+            # user-visible terminal state.
+            for gated_group in status_order.gated_groups:
+                if await _effect_runner.has_pending_group(gated_group):
+                    return {
+                        "status": "handled",
+                        "job_id": job_id,
+                        "new_status": job["status"],
+                        "actions": actions,
+                    }
+
         if new_status:
             kwargs: dict[str, Any] = {"status": new_status}
             had_assigned_agent = False
@@ -23742,6 +23979,8 @@ async def _complete_job_legacy(
             if _effect_runner is not None:
                 kwargs["completion_command_id"] = _effect_runner.command_id
                 kwargs["completion_finalizing_by"] = _effect_runner.owner
+                if delivery_control_claim_id is not None:
+                    kwargs["completion_control_claim_id"] = delivery_control_claim_id
 
             async def _write_main_status() -> dict[str, Any]:
                 disposition_updated = await postgres_db.update_job_status(
@@ -24128,34 +24367,16 @@ async def _complete_job_legacy(
         if _effect_runner is not None:
             await _effect_runner.assert_disposition_authority()
 
-        # 2. Subjob output graft (uniform for all subjob types; critic skipped inside)
-        if job.get("parent_job_id"):
-
-            async def _graft_subjob_output() -> dict[str, Any]:
-                graft = await _maybe_graft_completed_subjob(
-                    job,
-                    completion_command_id=getattr(_effect_runner, "command_id", None),
-                )
-                return {"graft_result": graft}
-
-            graft_effect = await _run_completion_effect(
-                _effect_runner,
-                "subjob_output_graft",
-                "subjob_graft",
-                _graft_subjob_output,
-                retry_on_error=True,
-                error_output=lambda exc: {
-                    "graft_result": {
-                        "status": "error",
-                        "reason": str(exc),
-                    }
-                },
-            )
-            graft_result = graft_effect["graft_result"]
-            if graft_result and graft_result.get("status") == "grafted":
-                actions.append(
-                    f"subjob output grafted to {graft_result['output_path']}"
-                )
+        # 2. Subjob output graft (uniform for all subjob types; critic skipped
+        # inside). Reordered terminal commands already ran this delivery before
+        # S17; every other command reaches the historical tail call here.
+        if main_status_already_completed or (
+            "subjob_output_graft" not in status_order.pre_status_delivery_effects
+        ):
+            pre_status_subjob_actions = await _run_subjob_output_graft_effect()
+        # Effects move, response presentation does not: emit S26's stored
+        # action at its historical tail location after S17.
+        actions.extend(pre_status_subjob_actions)
 
         # 3. Handle critic verdict (if this is a critic job). The flag-off arm
         # remains the historical callback-direct path. Durable S27 publishes
@@ -24184,21 +24405,24 @@ async def _complete_job_legacy(
             )
             actions.extend(critic_verdict["actions"])
         else:
+            if pre_status_critic_verdict is not None:
+                critic_verdict = pre_status_critic_verdict
+            else:
 
-            async def _materialize_critic_verdict() -> dict[str, Any]:
-                return await _materialize_critic_verdict_transactional(job)
+                async def _materialize_critic_verdict() -> dict[str, Any]:
+                    return await _materialize_critic_verdict_transactional(job)
 
-            critic_verdict = await _run_completion_effect(
-                _effect_runner,
-                "critic_verdict",
-                "critic_verdict",
-                _materialize_critic_verdict,
-                transactional=True,
-                supersede_if=lambda output: (
-                    output.get("applicable") is True
-                    and output.get("world_cas_won") is False
-                ),
-            )
+                critic_verdict = await _run_completion_effect(
+                    _effect_runner,
+                    "critic_verdict",
+                    "critic_verdict",
+                    _materialize_critic_verdict,
+                    transactional=True,
+                    supersede_if=lambda output: (
+                        output.get("applicable") is True
+                        and output.get("world_cas_won") is False
+                    ),
+                )
             # A command that crossed S27 before M3 replays its legacy output;
             # its side effects already ran and must not be synthesized again.
             if "world_cas_won" not in critic_verdict:
@@ -24480,50 +24704,13 @@ async def _complete_job_legacy(
         # A narrow legacy merge path remains for in-flight jobs that were
         # already attached to a shared project repo before this migration.
         # Best-effort: a failure here never blocks completion handling.
-        if new_status in ("completed", "failed"):
-
-            async def _apply_terminal_merge_and_record() -> dict[str, Any]:
-                try:
-                    from services.completion import apply_terminal_job_side_effects
-
-                    durable_merge_kwargs: dict[str, Any] = {}
-                    if _effect_runner is not None:
-                        durable_merge_kwargs = {
-                            "completion_command_id": _effect_runner.command_id,
-                            "load_merge_intent": lambda: _effect_runner.capture_intent(
-                                "terminal_merge_change_record"
-                            ),
-                            "store_merge_intent": lambda detail: (
-                                _effect_runner.capture_intent(
-                                    "terminal_merge_change_record", detail
-                                )
-                            ),
-                        }
-                    side_effects = await apply_terminal_job_side_effects(
-                        job,
-                        new_status,
-                        gitea=gitea_client,
-                        db=postgres_db,
-                        vector_db=vector_db,
-                        error=error_message,
-                        **durable_merge_kwargs,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        f"Job {job_id}: terminal side effects failed (non-fatal)",
-                        exc_info=True,
-                    )
-                    return {"actions": [], "error": str(exc)}
-                return {"actions": list(side_effects["actions"])}
-
-            terminal_effects = await _run_completion_effect(
-                _effect_runner,
-                "terminal_merge_change_record",
-                "terminal_delivery",
-                _apply_terminal_merge_and_record,
-                retry_if=lambda output: bool(output.get("error")),
-            )
-            actions.extend(terminal_effects["actions"])
+        if main_status_already_completed or (
+            "terminal_merge_change_record"
+            not in status_order.pre_status_delivery_effects
+        ):
+            pre_status_terminal_actions = await _run_terminal_delivery_effect()
+        # As above, S33's user-visible action retains the pre-step-4 ordering.
+        actions.extend(pre_status_terminal_actions)
 
         # 5e. Wake the session that created this job, if any. Must sit BEFORE
         # the workspace archive below: that call tears the workspace down, and
@@ -40216,6 +40403,109 @@ async def admin_run_queue_unpark(unit_id: str, request: Request) -> dict[str, An
         raise HTTPException(status_code=404, detail="Unit is not parked")
     logger.info("run_queue unpark: unit=%s", unit_id)
     return {"unit_id": unit_id, "state": "queued"}
+
+
+class CompletionCommandForceResolveRequest(BaseModel):
+    """Explicit incident disposition for an unfinished completion command."""
+
+    expected_state: Literal["pending", "finalizing", "parked"]
+    terminal_status: Literal["completed", "failed", "cancelled"]
+    reason: str = Field(min_length=1, max_length=2048)
+
+
+def _completion_operator_result(result: Any) -> dict[str, Any]:
+    """Serialize the bounded dataclass returned by the resolution service."""
+
+    from dataclasses import fields, is_dataclass
+
+    if not is_dataclass(result):
+        raise RuntimeError("completion operator service returned an invalid result")
+    return {field.name: getattr(result, field.name) for field in fields(result)}
+
+
+@app.post("/api/admin/completion-commands/{command_id}/unpark")
+async def admin_completion_command_unpark(
+    command_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Rearm one exact parked completion command and its pending effects."""
+
+    admin = await _require_admin(request)
+    if not COMPLETION_COMMANDS_ENABLED:
+        raise HTTPException(status_code=404, detail="Completion commands are disabled")
+    from services.completion_command_resolution import (
+        CompletionResolutionConflict,
+        CompletionResolutionNotFound,
+    )
+
+    try:
+        command_uuid = UUID(str(command_id))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=404, detail="Completion command not found"
+        ) from None
+    try:
+        result = await _get_completion_command_resolution().unpark(
+            command_uuid,
+            actor=str(admin["id"]),
+        )
+    except CompletionResolutionNotFound as exc:
+        raise HTTPException(
+            status_code=404, detail="Completion command not found"
+        ) from exc
+    except CompletionResolutionConflict as exc:
+        raise HTTPException(status_code=409, detail=exc.reason) from exc
+    return _completion_operator_result(result)
+
+
+@app.post("/api/admin/completion-commands/{command_id}/force-resolve")
+async def admin_completion_command_force_resolve(
+    command_id: str,
+    body: CompletionCommandForceResolveRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Abandon a quiescent tail and write an operator-selected terminal state."""
+
+    admin = await _require_admin(request)
+    if not COMPLETION_COMMANDS_ENABLED:
+        raise HTTPException(status_code=404, detail="Completion commands are disabled")
+    from services.completion_command_resolution import (
+        CompletionResolutionConflict,
+        CompletionResolutionNotFound,
+    )
+
+    try:
+        command_uuid = UUID(str(command_id))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=404, detail="Completion command not found"
+        ) from None
+    try:
+        result = await _get_completion_command_resolution().force_resolve(
+            command_uuid,
+            expected_state=body.expected_state,
+            terminal_status=body.terminal_status,
+            actor=str(admin["id"]),
+            reason=body.reason,
+        )
+    except CompletionResolutionNotFound as exc:
+        raise HTTPException(
+            status_code=404, detail="Completion command not found"
+        ) from exc
+    except CompletionResolutionConflict as exc:
+        raise HTTPException(status_code=409, detail=exc.reason) from exc
+
+    # The durable jobs/command/effect transaction is authoritative. Checkpoint
+    # pruning is the same non-fatal hygiene used by ordinary terminal writes.
+    try:
+        await postgres_db.delete_checkpoint_thread(result.job_id)
+    except Exception:
+        logger.warning(
+            "completion force-resolve checkpoint prune failed for job %s",
+            result.job_id,
+            exc_info=True,
+        )
+    return _completion_operator_result(result)
 
 
 class ThreadApproveRequest(BaseModel):

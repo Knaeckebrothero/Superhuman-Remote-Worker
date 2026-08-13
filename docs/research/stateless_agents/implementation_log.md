@@ -4266,3 +4266,145 @@ use the future operator unpark verb, and confirm exactly one critic without a
 fixture-ledger correction. That is the one live row whose handcrafted setup
 omitted an immutable admission field; the fail-closed response was correct,
 but it makes the production-shaped retry the most valuable hand check.
+
+# Session 18 — Gate 3 step 4, M4 delivery-before-status and recovery nets (2026-08-13)
+
+## M4 shipped — terminal status follows the durable product deliveries
+
+- Migration 0144 adds the immutable per-command
+  `status_reorder_enabled` discriminator, defaulting every old row to false.
+  Fresh reordered commands are `job-completion-v2`; legacy commands remain
+  `job-completion-v1`. A new executor drains both pairs, while an old/v1-only
+  executor refuses v2 and a malformed version/capability pair parks loudly.
+  This makes rolling deploys and flag changes incapable of silently changing
+  the execution order of an admitted command.
+- The exact product-delivery set is encoded in one effect-policy module and
+  documented in §5.4.5: S15 `loop_project_cloud_delivery`, S26
+  `subjob_output_graft`, and S33 `terminal_merge_change_record`. Their groups
+  `delivery`, `subjob_graft`, and `terminal_delivery` gate only the canonical
+  terminal set `completed|failed|cancelled`. S16 retains its shipped
+  `delivery` group for replay compatibility but is not classified as a product
+  delivery. S27's transactional verdict core is Class B before status; its
+  external follow-up remains after status. M3's atomic S32 remains Class C.
+- A reordered terminal command owns a strict jobs-row
+  `completion_delivery` marker before S15. S15/S26/S33 recheck the exact live
+  command term and that marker immediately before their callback. Cancel,
+  pause, resume, admission, dispatch and lifecycle ownership already serialize
+  on this marker, closing the check-to-external-I/O gap. S17 validates the
+  accepted entry status, exact finalizer term and marker, then consumes the
+  marker in its status transaction. Delivery retry/park retains it for exact
+  adoption; force resolution may clear only that command's full marker shape.
+- A crash after all delivery gates but before S17 replays the stored delivery
+  output, writes S17 once and resumes the historical tail. It does not
+  reacquire/run pre-status delivery after a completed S17. Pending delivery
+  groups are sticky within the runner, so the finalizer releases to the
+  effect's `run_after` instead of spinning or consuming command attempts.
+  Response action ordering remains at the old presentation sites even though
+  the corresponding delivery executed earlier.
+- The status-reorder gate is independently default-off and hard-requires
+  completion commands at both Helm render and process startup, before any DB
+  connection. Admission stores the current gate; execution never consults the
+  current global value. The ops note records the safe revert sequence: disable
+  new reordered admissions, drain persisted-true unfinished rows, then roll
+  back the image; never disable the command executor first.
+
+## Day-one safety, operator recovery and alarms
+
+- The independent safety net runs before each finalizer claim and from router
+  maintenance. It never invokes a workflow callback. Only old-mode rows on an
+  already terminal job, or sufficiently stale rows with no effect beyond S1,
+  qualify. Live command/effect/action/control owners and active S36
+  authorization are absolute holds; persisted reordered post-S17 tails are
+  deliberately ineligible. Existing pending effects become `superseded` with
+  their intent retained and an explicit `executed=false`, `callbacks=false`
+  result.
+- Admin `unpark` rearms the command and all pending-effect attempt/deadline
+  budgets. Admin `force-resolve` requires the expected state, an explicit
+  canonical terminal status and a bounded incident reason; it records the
+  complete stable unstarted-effect plan, abandons materialized pending effects,
+  writes the requested Class-A job state and marks the command
+  `force_resolved`. Both reject active S36 and live executors. Pinned authority
+  is not guessed from a stale FK: it requires a live jobs lease plus an exact
+  working/draining agent whose `current_job_id` matches. Stateless authority
+  uses the exact live queue lease. Operator locking remains queue → jobs →
+  command. The routes stay service-dark when completion commands are off, but
+  remain available with only the reorder gate off so persisted rows can drain.
+- A separate 30-second monitor task reports a missing live finalizer leader
+  after startup grace and the DB-clock age of the oldest unfinished command,
+  including parked rows. Fixed dedup keys prevent an increasing age value from
+  filing repeated incidents. Monitoring is not coupled to the finalizer drain;
+  router maintenance contains only the safety pass.
+
+## Preserved rollback residue
+
+Opening the local reorder flag consumed the three explicitly preserved rows
+without manual repair:
+
+| Command | Result |
+|---|---|
+| `c6735d9d-…` / job `1a97a6b5-…` | Safety-superseded at **13:24:57.059316Z**. Its pending S36 moved to `superseded` with intent retained, `executed=false`, `callbacks=false`; 15 historical effects remained done. |
+| `b9ab9aa6-…` / job `d119a6fc-…` | Safety-superseded at **13:24:57.155629Z** with the same non-executing S36 treatment; its pre-existing M1 `alert_only` action remained done. |
+| `a010c9f0-…` / the same job | The first safety pass could not skip its still-unfinished predecessor. Once the predecessor settled, the ordinary `resume_finalizer` route claimed it and entry authority superseded it at **13:24:57.200581Z** because the pre-0143 row had no accepted-status/S1 proof and a safety-superseded predecessor is deliberately not adoptable. It has zero effect rows, hence zero callbacks. |
+
+Both jobs remain completed. The final residue is **7 done + 3 superseded
+commands; 112 done + 2 superseded effects; 0 unfinished commands, pending
+effects, action claims or control markers**, with one live finalizer leader.
+
+## M4 k3d row-9 crash proof
+
+The disposable v2 command was `2936200e-…` on job `ab368922-…`. A pod-local
+one-off harness used the production finalizer/workflow but intercepted only the
+S17 DB call. Before the cut, the job was still `processing`, the strict
+`completion_delivery` marker named the command, S33 was `done` on attempt 1,
+and the sole immutable change record had committed at
+**13:37:35.722666Z**; `main_status_write` did not exist. The actual sole
+orchestrator pod was then deleted, killing both the app and harness process.
+
+The replacement pod was Ready with both flags true by **13:38:41Z**. It waited
+for the killed command term rather than fabricating expiry, reclaimed the
+command on attempt 2, and finalized at **13:39:46.620873Z**. S33 remained
+attempt 1 with its original completion timestamp and the record count remained
+exactly one. S17 ran once at **13:39:46.393365Z**; S36 ran once at
+**13:39:46.599490Z** with `teardown_disposition=completed`. All 19 effects
+were done with maximum effect attempt 1, the job was `completed`, the delivery
+marker was absent, and no Pod/PVC/Service, workspace/resource interval,
+run-queue row, action, message or notification existed for the fixture.
+Guarded cleanup then deleted exactly its 19 effects, one change record, one job
+and one offline fixture agent, restoring the residue counts above.
+
+An earlier disposable harness attempt intentionally used over-short local
+lease values and was rejected before S1 with `completion command lease must
+outlive its effect timeout`; the ordinary background finalizer subsequently
+completed it, and its exact fixture rows were guarded and removed. It is not
+counted as row-9 evidence.
+
+## Verification and stretch decision
+
+The M4 affected matrices passed **306/306**, with independent audit runs of
+155 core/admission/Helm, 74 schema/admission/finalizer real-Postgres, 26
+resolution pure/real-Postgres, and 22 final-wiring/admin cases also green. The
+repository-wide non-fail-fast suite first exposed two contract artifacts: the
+migration-head assertion still named 0143 and the endpoint-auth inventory
+lacked the two new admin routes. After updating both, the suite produced
+**17,651 passed, 163 skipped, 11 failed**, exactly the baseline environment-only
+list, with 60 warnings. That integrated run also collected the already-frozen,
+still-unstaged two-test M5 invariant file; M4's own focused and real-Postgres
+counts above are independent of it. Repository-wide Ruff check/format over 1,144 files,
+Python compilation, whitespace checks, both Helm lints, Squawk v2.59.0 on 0144
+(zero findings), and full app/vector/audit schema replay and idempotence pass.
+
+M6 was deliberately not started. Read-only reconnaissance found that the
+existing worker cleanup treats a fresh stateless 202 while the reordered job is
+still `processing` as permission to destroy its tmux shell. A background
+command may instead resolve to review, pause, waiting or retry, so the stretch
+needs a worker-handoff fix plus a real human-stop/shell-preservation soak. M6
+is therefore deferred rather than shipping a completed-only happy-path branch.
+
+### Morning hand-check
+
+Repeat row 9 with a naturally admitted, real-workspace job whose S33 performs
+an actual command-keyed project delivery: hold S17 after the delivery record,
+kill the pod, then verify the record/delivery hash and effect attempt stay
+unchanged while S17 and the UID-fenced S36 tail each converge once. This is the
+highest-risk ordering claim and exercises more external surface than the
+disposable no-project record used overnight.

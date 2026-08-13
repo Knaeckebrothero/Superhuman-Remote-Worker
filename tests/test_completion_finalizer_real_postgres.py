@@ -856,6 +856,83 @@ async def test_cancel_after_accept_supersedes_before_workflow_or_effects(pg):
 
 
 @pytest.mark.asyncio
+async def test_cancel_after_entry_resolution_fences_pre_s17_delivery(pg):
+    accepted, job_id, _ = await _accepted_pinned(pg)
+    delivery_calls = 0
+
+    async def workflow(runner):
+        async with pg.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET status='cancelled' WHERE id=$1",
+                job_id,
+            )
+        await runner.assert_entry_authority()
+
+        async def must_not_deliver():
+            nonlocal delivery_calls
+            delivery_calls += 1
+            return {"delivered": True}
+
+        await runner.run(
+            name="subjob_output_graft",
+            group="subjob_graft",
+            callback=must_not_deliver,
+        )
+        raise AssertionError("entry-authority loss did not stop delivery")
+
+    result = await CompletionFinalizer(pg, workflow=workflow).finalize_command(
+        accepted.command_id
+    )
+
+    assert result.disposition == "superseded"
+    assert delivery_calls == 0
+    async with pg.acquire() as conn:
+        command = await conn.fetchrow(
+            "SELECT state, outcome FROM job_completion_commands WHERE id=$1",
+            UUID(accepted.command_id),
+        )
+        effect_count = await conn.fetchval(
+            "SELECT count(*) FROM completion_effects "
+            "WHERE producer_kind='job_completion' AND producer_id=$1",
+            UUID(accepted.command_id),
+        )
+    assert command["state"] == "superseded"
+    assert json.loads(command["outcome"])["observed_status"] == "cancelled"
+    assert effect_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pending_group_query_is_fenced_to_exact_live_command(pg):
+    accepted, _, _ = await _accepted_pinned(pg)
+    runner = await _claimed_runner(_pool_db(pg), accepted.command_id)
+    runner.command["resolved_entry_status"] = "processing"
+    async with pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO completion_effects "
+            "(producer_kind, producer_id, scope_id, effect_name, effect_group, "
+            " state, attempts, run_after, intent_at, complete_by, detail) "
+            "SELECT 'job_completion', id, job_id, 'graft', 'subjob_graft', "
+            "       'pending', 1, now()+interval '5 seconds', now(), NULL, '{}' "
+            "FROM job_completion_commands WHERE id=$1",
+            UUID(accepted.command_id),
+        )
+
+    assert await runner.has_pending_group("subjob_graft")
+    assert not await runner.has_pending_group("terminal_delivery")
+
+    async with pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE job_completion_commands SET lease_expires_at=now()-interval '1 second' "
+            "WHERE id=$1",
+            UUID(accepted.command_id),
+        )
+    # Once this workflow pass observed the durable block, it remains the
+    # finalizer release signal even if the exact command term expires before
+    # workflow return.
+    assert await runner.has_pending_group("subjob_graft")
+
+
+@pytest.mark.asyncio
 async def test_typed_s17_race_supersedes_exact_term_and_abandons_pending_effect(pg):
     accepted, job_id, _ = await _accepted_pinned(pg)
 

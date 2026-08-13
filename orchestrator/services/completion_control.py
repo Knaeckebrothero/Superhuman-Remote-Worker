@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 COMPLETION_FINALIZING_DETAIL = "completion finalizing"
 COMPLETION_CONTROL_CLAIM_KEY = "_completion_control_claim"
 COMPLETION_CONTROL_CLAIM_VERSION = 1
+COMPLETION_DELIVERY_CONTROL_SOURCE = "completion_delivery"
 # Every claimed external section is time-bounded below 30 minutes. Keep a
 # generous lease margin for scheduler stalls while retaining bounded automatic
 # recovery after an orchestrator crash.
@@ -106,6 +107,36 @@ def completion_control_claim_owned_active(
     except (OverflowError, TypeError, ValueError):
         return False
     return math.isfinite(expiry) and expiry > float(now_epoch)
+
+
+def completion_delivery_control_claim_owned_active(
+    context: Any,
+    command_id: str,
+    *,
+    now_epoch: float,
+) -> bool:
+    """Require the fixed command-owned marker used by completion delivery.
+
+    ``claim_id`` is the stable crash-adoptable owner.  The separate fence
+    fields make this reserved marker distinguishable from a human-control
+    claim that happens to reuse an identifier, and let operator resolution
+    retain or clear only this command's exact delivery barrier.
+    """
+
+    canonical_command_id = str(command_id)
+    if not completion_control_claim_owned_active(
+        context,
+        canonical_command_id,
+        now_epoch=now_epoch,
+    ):
+        return False
+    marker = _json_object(context).get(COMPLETION_CONTROL_CLAIM_KEY)
+    return bool(
+        isinstance(marker, dict)
+        and marker.get("source") == COMPLETION_DELIVERY_CONTROL_SOURCE
+        and marker.get("fence_kind") == "completion_command"
+        and marker.get("fence_value") == canonical_command_id
+    )
 
 
 @dataclass(frozen=True, slots=True)

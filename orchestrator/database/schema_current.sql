@@ -5454,6 +5454,7 @@ CREATE TABLE public.job_completion_commands (
     finalized_at timestamp with time zone,
     error_code text,
     accepted_job_status text,
+    status_reorder_enabled boolean DEFAULT false NOT NULL,
     CONSTRAINT job_completion_accepted_status_nonempty CHECK (((accepted_job_status IS NULL) OR (btrim(accepted_job_status) <> ''::text))),
     CONSTRAINT job_completion_fence_exactly_one CHECK ((((origin = 'operator'::text) AND (accepted_lease_token IS NULL) AND (accepted_agent_id IS NULL)) OR ((origin <> 'operator'::text) AND (((accepted_lease_token IS NOT NULL) AND (accepted_agent_id IS NULL)) OR ((accepted_lease_token IS NULL) AND (accepted_agent_id IS NOT NULL)))))),
     CONSTRAINT job_completion_state_value CHECK ((state = ANY (ARRAY['pending'::text, 'finalizing'::text, 'done'::text, 'parked'::text, 'superseded'::text, 'force_resolved'::text]))),
@@ -5473,6 +5474,13 @@ COMMENT ON TABLE public.job_completion_commands IS 'Durable, commit-ordered comp
 --
 
 COMMENT ON COLUMN public.job_completion_commands.accepted_job_status IS 'jobs.status observed while admission held the jobs row lock. Nullable only for legacy commands: a completed late_callback_guard S1 journal row is the sole accepted backfill proof; an unproven NULL fails closed to whole-command supersession rather than guessing from current job state.';
+
+
+--
+-- Name: COLUMN job_completion_commands.status_reorder_enabled; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.job_completion_commands.status_reorder_enabled IS 'Status-reorder policy captured at fresh admission. False preserves the legacy status-first order; exact retries and resumed finalization use this stored decision rather than the process-global rollout flag.';
 
 
 --

@@ -157,6 +157,7 @@ class CompletionSweepRouter:
         db: Any,
         finalizer: Any,
         alert: AlertCallback | None = None,
+        safety_net: Any | None = None,
         claimant_id: str | None = None,
         action_lease_seconds: float = 120,
         poll_seconds: float = 1,
@@ -170,6 +171,7 @@ class CompletionSweepRouter:
         self.db = db
         self.finalizer = finalizer
         self.alert = alert
+        self.safety_net = safety_net
         self.claimant_id = (
             str(claimant_id).strip()
             if claimant_id is not None
@@ -619,6 +621,22 @@ class CompletionSweepRouter:
         )
         return CompletionSweepBatchResult(count=len(results), results=results)
 
+    async def maintenance_once(self) -> None:
+        """Run non-executing reconciliation before independent alarm sampling.
+
+        A safety-net database failure must not stop routed finalizer recovery.
+        Liveness monitoring owns its independent 30-second task and is not
+        coupled to this router's one-second recovery cadence.
+        """
+
+        if self.safety_net is not None:
+            try:
+                await self.safety_net.reconcile_batch(limit=50)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("completion safety-net tick failed")
+
     async def run(self, shutdown_event: asyncio.Event) -> None:
         """Poll until shutdown; action leases make overlapping runners safe."""
 
@@ -629,6 +647,7 @@ class CompletionSweepRouter:
         )
         while not shutdown_event.is_set():
             try:
+                await self.maintenance_once()
                 await self.route_once()
             except asyncio.CancelledError:
                 raise

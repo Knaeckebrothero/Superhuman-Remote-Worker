@@ -14,6 +14,8 @@
 #   unscoped               — no gate detected; CI snapshot test will fail
 
 GET    /api/actions/pending                                                             gated:require_approved_user
+POST   /api/admin/completion-commands/{command_id}/force-resolve                        admin:_require_admin
+POST   /api/admin/completion-commands/{command_id}/unpark                               admin:_require_admin
 GET    /api/admin/config/bundled/{family}/{kind}/{name}                                 admin:_require_admin
 GET    /api/admin/config/catalog                                                        admin:_require_admin
 GET    /api/admin/config/overrides                                                      admin:_require_admin

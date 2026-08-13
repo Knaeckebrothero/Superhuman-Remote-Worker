@@ -140,6 +140,21 @@ def _completion_control_owned_active_sql(
     )
 
 
+def _completion_delivery_control_owned_active_sql(
+    context_expression: str,
+    claim_parameter: str,
+) -> str:
+    """Exact active command-owned delivery barrier consumed by S17."""
+
+    marker = f"({context_expression})->'_completion_control_claim'"
+    return (
+        f"({_completion_control_owned_active_sql(context_expression, claim_parameter)}) "
+        f"AND {marker}->>'source' = 'completion_delivery' "
+        f"AND {marker}->>'fence_kind' = 'completion_command' "
+        f"AND {marker}->>'fence_value' = {claim_parameter}::text"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _TaskTransactionScope:
     """One connection reusable only by the task that opened its transaction.
@@ -2638,6 +2653,7 @@ class PostgresDB:
         expected_status: str | None = None,
         completion_command_id: str | None = None,
         completion_finalizing_by: str | None = None,
+        completion_control_claim_id: str | None = None,
     ) -> bool:
         """Update job status fields.
 
@@ -2663,6 +2679,9 @@ class PostgresDB:
                 ``completion_finalizing_by`` in the same UPDATE statement.
             completion_finalizing_by: Unique command-attempt owner. Must be
                 supplied together with ``completion_command_id``.
+            completion_control_claim_id: Exact live delivery-control marker to
+                require and remove in this same disposition UPDATE. This is
+                valid only with the matching durable completion command term.
 
         Returns:
             True if updated, False if not found
@@ -2756,6 +2775,14 @@ class PostgresDB:
                 f"|| ${workspace_context_param}::jsonb, true)"
             )
 
+        if completion_control_claim_id is not None:
+            if completion_command_id is None or completion_finalizing_by is None:
+                raise ValueError(
+                    "completion control claim requires a paired completion command term"
+                )
+            context_base = context_expression or "COALESCE(context, '{}'::jsonb)"
+            context_expression = f"({context_base}) - '_completion_control_claim'"
+
         if context_expression is not None:
             updates.append(f"context = {context_expression}")
 
@@ -2791,8 +2818,20 @@ class PostgresDB:
                 f"AND command.finalizing_by = ${owner_param}::text "
                 "AND command.lease_expires_at > now() "
                 "AND command.deadline_at > now())"
-                f" AND NOT ({_completion_control_active_sql('context')})"
             )
+            if completion_control_claim_id is not None:
+                param_count += 1
+                values.append(str(UUID(completion_control_claim_id)))
+                claim_param = param_count
+                query += (
+                    " AND ("
+                    + _completion_delivery_control_owned_active_sql(
+                        "context", f"${claim_param}"
+                    )
+                    + ")"
+                )
+            else:
+                query += f" AND NOT ({_completion_control_active_sql('context')})"
 
         terminal_lane: str | None = None
         async with self.acquire() as conn:

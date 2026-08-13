@@ -134,6 +134,7 @@ async def _accept(
     lease_token: int | None = None,
     agent_id: UUID | None = None,
     client_report_id: UUID | None = None,
+    status_reorder_enabled: bool = False,
 ) -> CompletionAcceptResult:
     return await accept_completion_command(
         source,
@@ -145,6 +146,7 @@ async def _accept(
             str(client_report_id) if client_report_id is not None else None
         ),
         requested_by="real-postgres-test",
+        status_reorder_enabled=status_reorder_enabled,
     )
 
 
@@ -166,13 +168,14 @@ async def test_pinned_accept_requires_the_exact_assigned_agent(pg):
         job_id=accepted_job_id,
         agent_id=assigned_agent_id,
         client_report_id=report_id,
+        status_reorder_enabled=True,
     )
     assert isinstance(accepted, CompletionAcceptResult)
 
     async with pg.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT report_seq, client_report_id, accepted_lease_token, "
-            "accepted_agent_id, accepted_job_status "
+            "accepted_agent_id, accepted_job_status, status_reorder_enabled "
             "FROM job_completion_commands WHERE job_id = $1",
             accepted_job_id,
         )
@@ -182,6 +185,7 @@ async def test_pinned_accept_requires_the_exact_assigned_agent(pg):
         "accepted_lease_token": None,
         "accepted_agent_id": assigned_agent_id,
         "accepted_job_status": "processing",
+        "status_reorder_enabled": True,
     }
 
     with pytest.raises(CompletionFenceRejected):
@@ -255,7 +259,7 @@ async def test_stateless_accept_fences_stale_token_without_any_mutation_then_clo
     async with pg.acquire() as conn:
         command = await conn.fetchrow(
             "SELECT report_seq, client_report_id, accepted_lease_token, "
-            "accepted_agent_id, accepted_job_status "
+            "accepted_agent_id, accepted_job_status, status_reorder_enabled "
             "FROM job_completion_commands WHERE job_id = $1",
             job_id,
         )
@@ -271,6 +275,7 @@ async def test_stateless_accept_fences_stale_token_without_any_mutation_then_clo
         "accepted_lease_token": lease_token,
         "accepted_agent_id": None,
         "accepted_job_status": "processing",
+        "status_reorder_enabled": False,
     }
     assert dict(queue) == {
         "state": "done",

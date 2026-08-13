@@ -18,6 +18,8 @@ from uuid import UUID
 import pytest
 
 from orchestrator.services.job_completion_commands import (
+    COMPLETION_CODE_VERSION,
+    COMPLETION_STATUS_REORDER_CODE_VERSION,
     CompletionControlInProgress,
     CompletionFenceRejected,
     CompletionInProgress,
@@ -57,6 +59,7 @@ def _existing_command(
     error_code: str | None = None,
     accepted_lease_token: int | None = 41,
     accepted_agent_id: UUID | None = None,
+    status_reorder_enabled: bool = False,
 ) -> dict[str, Any]:
     stored_payload = payload or _payload()
     return {
@@ -69,6 +72,7 @@ def _existing_command(
         "accepted_lease_token": accepted_lease_token,
         "accepted_agent_id": accepted_agent_id,
         "accepted_job_status": "processing",
+        "status_reorder_enabled": status_reorder_enabled,
         "state": state,
         "outcome": outcome,
         "error_code": error_code,
@@ -196,6 +200,7 @@ class _RecordingConnection:
             "accepted_lease_token": args[5],
             "accepted_agent_id": args[6],
             "accepted_job_status": args[7],
+            "status_reorder_enabled": args[12],
             "state": "pending",
             "outcome": None,
         }
@@ -495,6 +500,7 @@ async def test_terminal_retry_matrix_replays_stored_disposition(
     assert tuple(result.abandoned_effects or ()) == abandoned
     assert result.queue_terminalized is True
     assert result.accepted_job_status == "processing"
+    assert result.status_reorder_enabled is False
     assert _mutating_calls(conn) == []
 
 
@@ -583,6 +589,80 @@ async def test_stateless_admission_locks_queue_before_job_and_inserts_first() ->
     assert result.accepted_job_status == "processing"
     insert = _mutating_calls(conn)[0]
     assert insert.args[7] == "processing"
+
+
+@pytest.mark.asyncio
+async def test_status_reorder_policy_is_persisted_once_and_exactly_replayed() -> None:
+    fresh_conn = _RecordingConnection(lane="stateless", queue_lease_token=41)
+
+    fresh = await accept_completion_command(
+        _RecordingDB(fresh_conn),
+        job_id=str(JOB_ID),
+        payload=_payload(),
+        lease_token=41,
+        agent_id=None,
+        client_report_id=str(CLIENT_REPORT_ID),
+        requested_by="agent:test",
+        status_reorder_enabled=True,
+    )
+
+    assert fresh.status_reorder_enabled is True
+    assert _mutating_calls(fresh_conn)[0].args[10] == (
+        COMPLETION_STATUS_REORDER_CODE_VERSION
+    )
+    assert _mutating_calls(fresh_conn)[0].args[12] is True
+
+    replay_conn = _RecordingConnection(
+        existing=_existing_command(
+            state="done",
+            outcome={"status": "handled"},
+            status_reorder_enabled=True,
+        )
+    )
+    replay = await accept_completion_command(
+        _RecordingDB(replay_conn),
+        job_id=str(JOB_ID),
+        payload=_payload(),
+        lease_token=41,
+        agent_id=None,
+        client_report_id=str(CLIENT_REPORT_ID),
+        requested_by="agent:test",
+        status_reorder_enabled=False,
+    )
+
+    assert replay.disposition == "replay_done"
+    assert replay.status_reorder_enabled is True
+    assert _mutating_calls(replay_conn) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_reorder_enabled", "code_version"),
+    [
+        (True, COMPLETION_CODE_VERSION),
+        (False, COMPLETION_STATUS_REORDER_CODE_VERSION),
+    ],
+)
+async def test_explicit_code_version_cannot_disagree_with_persisted_capability(
+    status_reorder_enabled: bool,
+    code_version: str,
+) -> None:
+    conn = _RecordingConnection(lane="stateless", queue_lease_token=41)
+
+    with pytest.raises(ValueError, match="does not match"):
+        await accept_completion_command(
+            _RecordingDB(conn),
+            job_id=str(JOB_ID),
+            payload=_payload(),
+            lease_token=41,
+            agent_id=None,
+            client_report_id=str(CLIENT_REPORT_ID),
+            requested_by="agent:test",
+            code_version=code_version,
+            status_reorder_enabled=status_reorder_enabled,
+        )
+
+    assert conn.calls == []
 
 
 @pytest.mark.asyncio
