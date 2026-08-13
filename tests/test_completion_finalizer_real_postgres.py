@@ -92,6 +92,46 @@ async def _accepted_pinned(pg, *, report_id: UUID | None = None):
     return accepted, job_id, agent_id
 
 
+async def _accepted_stateless(pg):
+    lease_token = 71
+    async with pg.acquire() as conn:
+        job_id = await conn.fetchval(
+            "INSERT INTO jobs (description, status, execution_lane) "
+            "VALUES ('stateless finalizer test', 'processing', 'stateless') "
+            "RETURNING id"
+        )
+        await conn.execute(
+            """
+            INSERT INTO run_queue (
+                unit_id, unit_kind, state, attempts_since_completion,
+                lease_token, leased_by, last_leased_by, leased_until,
+                input_seq, consumed_seq
+            ) VALUES (
+                $1, 'worker_batch', 'leased', 1,
+                $2, 'stateless-finalizer-pod', 'stateless-finalizer-pod',
+                now() + interval '5 minutes', 4, 3
+            )
+            """,
+            job_id,
+            lease_token,
+        )
+    accepted = await accept_completion_command(
+        pg,
+        job_id=str(job_id),
+        payload={
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": None,
+            "freeze_data": None,
+        },
+        lease_token=str(lease_token),
+        agent_id=None,
+        client_report_id=str(uuid4()),
+        requested_by="real-pg-stateless-finalizer-test",
+    )
+    return accepted, job_id
+
+
 def _pool_db(pg) -> PostgresDB:
     database = PostgresDB.__new__(PostgresDB)
     database._pool = pg
@@ -156,6 +196,77 @@ async def test_two_claimers_execute_one_effect_and_replay_one_outcome(pg):
     assert replay.disposition == "terminal"
     assert replay.outcome == outcome
     assert effect_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_due_stateless_command_is_finalized_once_by_background_claim(pg):
+    accepted, job_id = await _accepted_stateless(pg)
+    assert accepted.queue_terminalized is True
+
+    async with pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE job_completion_commands "
+            "SET run_after=clock_timestamp()-interval '1 second' WHERE id=$1",
+            UUID(accepted.command_id),
+        )
+        queue_before = await conn.fetchrow(
+            "SELECT state, leased_by, consumed_seq, input_seq "
+            "FROM run_queue WHERE unit_id=$1",
+            job_id,
+        )
+    assert dict(queue_before) == {
+        "state": "done",
+        "leased_by": None,
+        "consumed_seq": 4,
+        "input_seq": 4,
+    }
+
+    workflow_calls = 0
+    outcome = {
+        "status": "handled",
+        "job_id": str(job_id),
+        "new_status": "completed",
+        "actions": ["background finalizer proof"],
+    }
+
+    async def workflow(_runner):
+        nonlocal workflow_calls
+        workflow_calls += 1
+        return outcome
+
+    finalizer = CompletionFinalizer(
+        pg,
+        workflow=workflow,
+        leader_id="stateless-background-proof",
+    )
+    finalized = await finalizer.finalize_command(accepted.command_id, inline=False)
+    replay = await finalizer.finalize_command(accepted.command_id, inline=False)
+
+    assert finalized.disposition == "done"
+    assert finalized.state == "done"
+    assert finalized.outcome == outcome
+    assert replay.disposition == "terminal"
+    assert replay.state == "done"
+    assert replay.outcome == outcome
+    assert workflow_calls == 1
+
+    async with pg.acquire() as conn:
+        command = await conn.fetchrow(
+            "SELECT state, attempts, outcome, finalizing_by, lease_expires_at "
+            "FROM job_completion_commands WHERE id=$1",
+            UUID(accepted.command_id),
+        )
+        queue_after = await conn.fetchrow(
+            "SELECT state, leased_by, consumed_seq, input_seq "
+            "FROM run_queue WHERE unit_id=$1",
+            job_id,
+        )
+    assert command["state"] == "done"
+    assert command["attempts"] == 1
+    assert json.loads(command["outcome"]) == outcome
+    assert command["finalizing_by"] is None
+    assert command["lease_expires_at"] is None
+    assert dict(queue_after) == dict(queue_before)
 
 
 @pytest.mark.asyncio

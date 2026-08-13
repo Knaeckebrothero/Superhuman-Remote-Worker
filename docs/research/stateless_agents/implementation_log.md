@@ -4469,3 +4469,24 @@ real-Postgres B4 proof passed **1/1**: it checks the exact command outcome,
 command-ID pin and DB-clock deadline/lease/run-after bounds after the worker
 queue is durably closed. M1 changes no schema, chart, endpoint routing or live
 fixture state.
+
+## M2 — fresh stateless 202 and the existing background drain
+
+The completion endpoint now branches only on the durable acceptance result:
+`disposition=fresh` plus `queue_terminalized=true` returns HTTP 202 with
+`accepted_pending`, the exact command ID and its pending state. B4 already
+closed that worker generation in the same queue→jobs transaction, so the
+singleton completion drain owns the persisted workflow after the existing
+two-second inline grace; the request never constructs or invokes an inline
+finalizer. Current worker admission is deliberately not consulted. A fresh
+pinned command (`queue_terminalized=false`) retains its byte-for-byte inline
+response and call ordering, while pending/finalizing, done, parked,
+superseded, force-resolved and divergent replays keep the established retry
+matrix ahead of the new branch.
+
+Verification: the endpoint/finalizer/legacy selection passed **153/153**; its
+wrapper subset passed **65/65**. A real-Postgres row passed **1/1**, proving
+stateless acceptance leaves `run_queue=done`, a due `inline=false` finalizer
+claim runs the workflow once, command replay is terminal, and queue bytes do
+not change. Ruff check/format, `py_compile` and whitespace checks are clean.
+M2 adds no engine, task, schema, chart flag or live-fixture mutation.
