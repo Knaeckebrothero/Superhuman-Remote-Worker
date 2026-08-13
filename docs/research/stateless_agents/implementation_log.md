@@ -4932,3 +4932,65 @@ history. The protected stateless hand-check workspace UID `0b30a573-…` and
 pinned probe workspace UID `f7090b7c-…` remained Running and unchanged. The
 pinned probe was independently reassigned by background production recovery
 during the soak; no soak action touched its workspace or completion rows.
+
+## M5 — current-truth documentation fold (2026-08-14)
+
+This milestone is documentation-only. It updates
+`docs/features/stateless_agents.md` and
+`docs/features/session_reliability_and_transport_simplification.md`, then
+records this handoff here. It changes no production code, test, migration,
+schema snapshot, chart, configuration or live state; no soak fixture or
+protected row/resource was read for mutation.
+
+The fold separates historical design from current implementation. M2 is
+recorded as the already-built 0127–0129 exact-turn interrupt path, including
+the adopted 409-before-INSERT contract for a new request without an exact live
+gate. M1's `session_turn/final_memory_extraction` producer, independent drain
+and vector destination receipt replace the stale “final 0–4 turns remain
+lossy” status without overclaiming a fully generic session outbox. M3 is the
+claim-bound retire contract: exact accepted tokens, proven writer-exclusive
+boundaries, one linked receipt, and no blind TTL sweep. Ordinary ended-session
+wake remains the already-good path; hard deletion now resolves open wakes as
+the distinct terminal `undeliverable` outcome. The frozen schema heads are app
+**0155** and vector **0019**; the next migration numbers are **0156** and
+**0020**.
+
+The session-reliability phase table now treats P5's epoch blocker as satisfied,
+not P5 itself as shipped: stable ordinary clean claims and fenced monotonic
+journal writes are live, while `thread.activity`, `/events/head`, client
+idle-close/head polling and the connection-count acceptance remain. P6 is
+likewise only a precursor subset: durable scalar/undo controls plus dedicated
+interrupt/permission REST do not replace the per-session control WebSocket,
+its `session.state` welcome contract, remaining verbs (including connected
+`rewind`), rollout flag or deletion work.
+
+M4's MiniMax-pinned **session** evidence remains distinct from the Gate 3
+step-5 **worker** soak that never started after its provider-availability gate.
+The session run live-proved correlated interrupt, fixed and live-proved the
+three-connection permission-pool starvation P1, exercised exact old-lease
+permission retirement without tool execution, and observed normal final-memory
+effects complete once with vector receipts. It did **not** prove the requested
+executor-after-final-persist crash row. Abrupt Pod disappearance also left the
+known claimant-quiescence cleanup debt: fail-closed public lifecycle behavior
+was correct, but a general durable process-zero receipt remains a follow-up.
+
+**Remaining gates and follow-ups.** The morning hand-check should use a fast,
+naturally admitted `none`-workspace MiniMax turn, observe its exact final-memory
+effect pending after authoritative transcript persist, remove the serving
+executor, and prove recovery commits one vector receipt/mutation while the app
+effect reaches `done` once. Separately, design a production claimant-
+quiescence receipt for an abruptly absent Pod rather than generalizing the
+disposable fixture's audited operator acknowledgement. P5 and full P6 remain
+their own feature gates, and worker admission/Job Bench remain default-off.
+
+Documentation verification: `git diff --check` passed, and the targeted
+negative search across the two feature docs found none of the stale
+current-state claims (P5 still blocked by epoch, S2 fully closed lease-loss
+permission retirement, final-memory tail still needs an outbox, or app head
+0144/next 0145). M5 adds no executable test claim beyond the M0–M4 evidence
+above. On the final inherited M4 bytes, the repository-wide suite reported
+**17,865 passed, 163 skipped, 11 established environment-only failures and 58
+warnings in 129.23 seconds**. Its initial pass exposed two stale test fakes;
+the root-directed test-only M4 amendment passed the exact nodes **2/2** and
+their full file **27/27**, after which the suite returned to the exact baseline.
+That executable correction belongs to M4; M5 itself remains documentation-only.

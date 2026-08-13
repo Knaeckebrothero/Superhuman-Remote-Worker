@@ -1,12 +1,12 @@
 # Stateless Agents — Turn Execution as a Deployment
 
-**Status:** v3.5 — **GATE 3 STEP 5 IMPLEMENTATION BUILT LOCALLY; CLOUD SOAK NOT STARTED (2026-08-13).** The session spine, its performance work, the S1 session lane, the S2 handoff substrate, the S3 worker driver and Gate 3 steps 1–5 are now on local `develop` milestone commits. Nothing from this follow-on has been pushed; step 6 (opening worker admission) remains unshipped and default-off. **Where things stand is §9.1 Implementation status**, written against the code rather than intent.
+**Status:** v3.6 — **GATE 3 STEP 5 IMPLEMENTATION BUILT; ITS WORKER CLOUD SOAK WAS NOT STARTED. SESSION HARDENING M0–M4 IS BUILT AND PARTIALLY LIVE-PROVEN (2026-08-14).** The session spine, its performance work, the S1 session lane, the S2 handoff substrate, the S3 worker driver, Gate 3 steps 1–5, and the session final-memory/permission/wake hardening stack are on `develop` milestone commits. This run did not push; its M3–M5 hardening tail remains local/unpushed. Step 6 (opening worker admission) remains unshipped and default-off. **Where things stand is §9.1 Implementation status**, written against the code rather than intent.
 
-In one paragraph: the shared queue/lease substrate is built, k3d-verified and genuinely kind-agnostic; **the session lane is functionally complete** — turns queue and run on any pod, survive a mid-generation kill, never double-answer, reconnect with no socket, and take durable control verbs, all without the cockpit ever learning a lane exists; **the worker driver is built behind an independent default-off admission gate** — exact Kubernetes workspaces can enqueue, rotate without calling the completion handler, resume on another pod with checkpoint/Todo/tmux state intact, and fence a stale completion report. VM jobs remain pinned. Gate 3 now durably accepts and finalizes pinned and stateless-worker reports, orders product delivery before terminal status, and returns HTTP 202 for a freshly accepted stateless-worker report so the existing background drain can finish it. The worker holds its exact tmux lifecycle until that command's stored outcome or a fail-closed handoff boundary: terminal outcomes retire it; human-facing/retry outcomes preserve it for reattachment. Admission-off leaves the stateless executor running to drain durable residue, with independent oldest-runnable-queue monitoring. Step 6 still has not opened worker admission, and the step-5 cloud soak was left not-started after the selected provider's first keyed call failed its availability gate (§9.1). Turn latency went 99.6 s → 5.4 s cold / 3.0 s warm (§5.3.3, §5.3.4). Build history, measurements and failures: `docs/research/stateless_agents/implementation_log.md`; the completion-path evidence base is `docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
+In one paragraph: the shared queue/lease substrate is built, k3d-verified and genuinely kind-agnostic; **the session lane is functionally complete** — turns queue and run on any pod, survive a mid-generation kill, never double-answer, reconnect with no socket, and take durable control verbs, all without the cockpit ever learning a lane exists; **the worker driver is built behind an independent default-off admission gate** — exact Kubernetes workspaces can enqueue, rotate without calling the completion handler, resume on another pod with checkpoint/Todo/tmux state intact, and fence a stale completion report. VM jobs remain pinned. Gate 3 now durably accepts and finalizes pinned and stateless-worker reports, orders product delivery before terminal status, and returns HTTP 202 for a freshly accepted stateless-worker report so the existing background drain can finish it. The worker holds its exact tmux lifecycle until that command's stored outcome or a fail-closed handoff boundary: terminal outcomes retire it; human-facing/retry outcomes preserve it for reattachment. Admission-off leaves the stateless executor running to drain durable residue, with independent oldest-runnable-queue monitoring. The later session-hardening run durably covered final-memory obligations and claim-bound permission/wake convergence, and live-proved exact interrupt plus permission owner-loss on `MiniMax-M3`; its executor-after-persist crash row remains unproven. Step 6 still has not opened worker admission, and the **separate Gate 3 step-5 worker cloud soak** was left not-started after that run's selected provider failed its availability gate (§9.1). Turn latency went 99.6 s → 5.4 s cold / 3.0 s warm (§5.3.3, §5.3.4). Build history, measurements and failures: `docs/research/stateless_agents/implementation_log.md`; the completion-path evidence base is `docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
 
 v1 2026-08-06 (initial proposal); v2 2026-08-07 after an 8-agent research fan-out; **v3 same night after a 6-lens adversarial panel** (10 critical + 28 major findings folded in). Raw research and critic reports: `docs/research/stateless_agents/`. Related implementation docs carrying pieces of this work: `no_workspace_agent_mode.md` §5.1 (op count is the cost — the virtual backend's scoped metadata index) and `cloud_collaboration_model.md` §4 (one `Depth: infinity` PROPFIND per turn boundary).
 **Origin:** user proposal — an LLM turn is conversation JSON in, bigger conversation JSON out; so agents can be a Deployment, not pinned pods.
-**Related:** `docs/go_rewrite.md` (names this flip; two sketches inverted by evidence — §5.1, §5.2), `docs/features/job_execution_lease.md` (shipped substrate), `docs/features/session_reliability_and_transport_simplification.md` (P5/P6 converge here; **P5 is blocked-by §5.3.2 — record it there**), `docs/features/worker_runtime_strategy.md` (no-new-runtime decision — this is a driver/deployment change), `docs/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md` (D3).
+**Related:** `docs/go_rewrite.md` (names this flip; two sketches inverted by evidence — §5.1, §5.2), `docs/features/job_execution_lease.md` (shipped substrate), `docs/features/session_reliability_and_transport_simplification.md` (P5/P6 converge here; **§5.3.2's P5 blocker is satisfied, but P5 and P6 remain incomplete**), `docs/features/worker_runtime_strategy.md` (no-new-runtime decision — this is a driver/deployment change), `docs/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md` (D3).
 
 ## 1. The idea
 
@@ -28,7 +28,7 @@ A turn is a pure function: `(thread state, input, config) → (new messages, eve
 
 **Operations.** Scaling becomes replicas/HPA on queue depth. The agent-lifecycle control plane gets deleted **per lane, on lane retirement** — not at flag-flip (§7's delete-when column). The honest steady state during the soak is *dual control planes*, priced in §9.
 
-**Reliability — a bug-class graveyard.** Structural pod-pinning bugs dissolve rather than get fixed: the stale-agent-detector class, drain-strips-workspace, the exit-137 wedge, idle-reap wipes, the fresh-vs-resume seeding asymmetry (one lane: every claim loads everything), and the dead-pod `awaiting_user` trap observed live during the S1 build — a pinned thread whose pod died mid-life is unreachable by both `/input` ("agent unreachable") and `/resume` (409 for any status but 'ended') until something flips its status; a queue-lane thread cannot enter it (no pod to die — the next input just enqueues). Two live replica-unsafe spots get fixed as a side effect: the per-turn input lock dict (`main.py:30385` — "Single-instance orchestrator" is stale; dev runs 2 replicas) and `_threads_suspending`; the bench-sweeper double-submission race is the in-repo proof of unclaimed work under 2 replicas. And the design *forces* fixing a hole that already exists: `thread_messages` writes are unfenced today — the zombie-writer window is live in current session persistence (§5.2).
+**Reliability — a bug-class graveyard.** Structural pod-pinning bugs dissolve rather than get fixed: the stale-agent-detector class, drain-strips-workspace, the exit-137 wedge, idle-reap wipes, the fresh-vs-resume seeding asymmetry (one lane: every claim loads everything), and the dead-pod `awaiting_user` trap observed live during the S1 build — a pinned thread whose pod died mid-life is unreachable by both `/input` ("agent unreachable") and `/resume` (409 for any status but 'ended') until something flips its status; a queue-lane thread cannot enter it (no pod to die — the next input just enqueues). Two replica-unsafe spots were fixed as part of the build: the per-turn input lock dict (`main.py:30385` — "Single-instance orchestrator" was stale; dev runs 2 replicas) and `_threads_suspending`; the bench-sweeper double-submission race was the in-repo proof of unclaimed work under 2 replicas. The design also forced closure of the pre-S1 zombie-writer hole: final `thread_messages` reconciliation and queue completion now share the exact lease fence (§5.2).
 
 **UX.** Session creation stops meaning "provision a pod, watch a spinner": create-to-*accepted* becomes sub-second; create-to-first-token is budgeted honestly in §5.5 (provider TTFT dominates — "sub-second TTFT" was v2 overclaim).
 
@@ -102,7 +102,7 @@ The lease is **recorded state** (pgmq/SQS visibility-timeout model), never a hel
 **Two counters, deliberately** (v2 tried to unify them and contradicted itself):
 
 - **`lease_token`** — bumped **unconditionally on every claim and every steal**. Not client-visible, so per-turn bumps are free. This is the Kleppmann fencing token every persist checks. Same-pod re-claims get a *new* token — which is what invalidates stragglers from the previous claim (post-release background work may therefore touch **only unfenced stores**: vector DB, audit store, object storage, workspace — never `thread_messages`/`thread_events`/checkpoints/job rows; anything fenced must complete before release).
-- **`threads.events_epoch`** — the **client-visible writer-generation**, bumped **only by the reaper's steal, by rewind, and by nothing else**. A clean handoff (release → claim by a different pod) does **not** bump: with seq DB-allocated and monotonic (§5.3.2), a clean cross-pod handoff is *invisible to the client* — which matters because cross-pod re-claims are routine exactly at the utilization this design is sold on; "bump on writer change" (v2) would have partially re-imported the per-turn cascade under load. The reaper is the only steal-bumper; the post-steal claim must not re-bump. `leased_by` stays diagnostics-only.
+- **`threads.events_epoch`** — the **client-visible writer-generation**, stable across ordinary clean claims and bumped only at an explicit system boundary that invalidates or replaces a writer, including reaper steal, rewind, terminal interrupt/Force-End, or the claim-bound permission-retirement rotation added in M3. A clean handoff (release → claim by a different pod) does **not** bump: with seq DB-allocated and monotonic (§5.3.2), a clean cross-pod handoff is *invisible to the client* — which matters because cross-pod re-claims are routine exactly at the utilization this design is sold on; "bump on writer change" (v2) would have partially re-imported the per-turn cascade under load. An already-rotated path must not re-bump. `leased_by` stays diagnostics-only.
 
 **Claim** (single statement; also CASes the `jobs` row for `worker_batch` in the same transaction — §5.4.4):
 
@@ -139,12 +139,18 @@ RETURNING r.unit_id, r.lease_token, r.input_seq, r.consumed_seq;
 
 #### 5.3.2 Epoch, seq, and the system-writer class
 
-The v2 finding stands and got sharper: `events_epoch` bumps **unconditionally on every runtime attach** today, and per-turn attach would fire the client cascade — ~2.0–2.2 s dead-epoch polling, then `gone_beyond_horizon` → **IndexedDB thread-cache wipe → full transcript refetch** → SSE reopen — *every turn*. Required, before any stateless session serves traffic (and **before P5**, whose idle-close otherwise converts the delay into an at-open full reload per turn — record the dependency in the session-reliability doc):
+The v2 finding was the decisive pre-S1 blocker: `events_epoch` then bumped on
+every runtime attach, so per-turn attach would have caused ~2.0–2.2 s of
+dead-epoch polling followed by `gone_beyond_horizon` → **IndexedDB thread-cache
+wipe → full transcript refetch** → SSE reopen on every turn. **S1 shipped the
+five-part contract below before stateless traffic opened.** The epoch blocker
+for session-reliability P5 is therefore satisfied; P5's on-demand-SSE work is
+still a separate, incomplete phase.
 
-1. **Epoch bumps only on reaper steal and rewind** (§5.2). Clean cross-pod handoffs don't bump *and stay client-invisible* because:
-2. **Seq allocation moves DB-side** — monotonic *across* claims within an epoch. The in-process `_next_seq` global (reset per attach) is what forces epoch-per-attach today. **Implemented (S1) as DB-*seeded*, not per-event-allocated**: attach seeds from `GREATEST(threads.events_seq_hwm, MAX(seq))` — `events_seq_hwm` (migration 0116) is maintained in the writer's flush statement and survives retention pruning of the rows themselves (a bare MAX(seq) seed would drop below cached client cursors after the pruner runs); gap-free, zero per-event cost, sync stamping preserved. Block allocation on the threads row (the alternative above) was not needed at S1 concurrency.
-3. **The journal writer is fenced**: the batch INSERT carries `WHERE threads.events_epoch = $claimed AND run_queue.lease_token = $token` (CTE); zero rows = lost lease, terminal-fail loudly. Today a stale writer inserts into a dead epoch forever.
-4. **A system-writer class exists for non-stream kinds.** The fence rule cannot mean "only the lease holder may ever write the journal": the reaper (`turn.interrupted`, `turn.parked`), outbox workers (`title.updated` — a journal frame today), and P6's orchestrator-journaled control acks all write client-visible frames without holding a turn lease. Designated non-stream kinds may be appended by the orchestrator/outbox under the *current* epoch (epoch-read-and-stamp in the same transaction); token/stream kinds stay lease-fenced.
+1. **Epoch stays stable across ordinary clean claims** (§5.2). It rotates only at an explicit writer-invalidating system boundary, including reaper steal, rewind, terminal interrupt/Force-End, or claim-bound permission retirement. Clean cross-pod handoffs don't bump *and stay client-invisible* because:
+2. **Seq allocation moves DB-side** — monotonic *across* claims within an epoch. The former in-process `_next_seq` reset was what forced epoch-per-attach. **Implemented (S1) as DB-*seeded*, not per-event-allocated**: attach seeds from `GREATEST(threads.events_seq_hwm, MAX(seq))` — `events_seq_hwm` (migration 0116) is maintained in the writer's flush statement and survives retention pruning of the rows themselves (a bare MAX(seq) seed would drop below cached client cursors after the pruner runs); gap-free, zero per-event cost, sync stamping preserved. Block allocation on the threads row (the alternative above) was not needed at S1 concurrency.
+3. **The journal writer is fenced**: the batch INSERT carries `WHERE threads.events_epoch = $claimed AND run_queue.lease_token = $token` (CTE); zero rows = lost lease, terminal-fail loudly. This shipped in S1, so a stale writer can no longer keep inserting into a dead epoch.
+4. **A system-writer class exists for non-stream kinds.** The fence rule cannot mean "only the lease holder may ever write the journal": the reaper (`turn.interrupted`, `turn.parked`), claim-bound permission retirement, and outbox workers (`title.updated`) may write client-visible frames without holding a live turn lease. Designated non-stream kinds append under a transactionally selected current/new epoch; token/stream kinds stay lease-fenced. Durable scalar-control acknowledgements are different: the exact applying owner writes their journal receipt so it cannot collide with that owner's allocator.
 5. **Rewind = a fenced lease steal**, specified: one advisory-locked transaction bumps `events_epoch`, resets the run_queue lease (`state='queued'`, token+1), and initializes the seq allocator *above* the `rewind.done` row it writes — the shipped rewind assumes a detached thread and writes `(new_epoch, seq=1)`; without allocator init, the next writer's `seq=1` collides with the UNIQUE index and presents as a phantom lost-lease. A mid-turn rewind must not wait ~90 s for the reaper.
 
 #### 5.3.3 Per-turn load — decompose attach, don't speed it up
@@ -196,16 +202,55 @@ The "release the lease when idle, keep only the warm cache" rule stands as writt
 - **Cloud-push ordering fence is mandatory** (not "either/or"): a per-mount sync-generation counter the next claim's pull must observe; with queued-only dedup, one running + one pending push serialize through it. Without it S2 reintroduces the concurrent-walk corruption class.
 - **Two daemons cannot be queued work** — they keep *workspace-side* mounts alive: the rclone bearer-token refresh loop (pushes fresh Keycloak tokens over SSH on a TTL schedule) and the protected-overlay ENOTCONN heal loop. They need a resident home: workspace-side refresher, orchestrator cron, or refresh-on-claim + accepted idle rot. S2's hardest inventory item.
 
+**Final-memory outbox built (2026-08-14).** Each settled stateless turn now
+mints one `producer_kind='session_turn'` / `final_memory_extraction` effect in
+the same fenced transaction as its final transcript. The immutable
+`turn_execution_id`, transcript boundary and destination survive executor loss;
+an independent always-on orchestrator drain owns retry/pruning, and a vector-DB
+execution receipt commits atomically with every durable memory mutation. A
+fenced loser mints nothing. This closes the final 0–4-turn tail-loss gap, but is
+not a claim that every background item listed above has moved to the outbox.
+
 #### 5.3.6 Session semantics that must survive the model change
 
-- **Mid-turn settings**: today `mode.set` applies to the *next tool call inside the running turn* (the gate re-reads it per call) and sweeps pending approval cards. "Write override, next turn resolves fresh" (v2) silently regressed the exact moment users reach for the control. Fix: persist mode/narration to the thread row (they're memory-only today — a live revert-on-resume bug) *and* the executor re-reads them at each gate decision (one indexed read per tool call, or piggybacked on the 20 s renewal). Any residual latency (≤ renewal interval) is named and accepted.
-- **Permission gates**: rows already DB+NOTIFY. Decision (was OQ): **release the lease at the gate** — N pending approvals must not pin N pods. The spec that makes it acceptable: approval enqueues the continuation; gate resumes prefer `last_pod` strongly (avoid the cascade — though with §5.3.2 a clean cross-pod resume no longer bumps the epoch anyway); the approval card's row id stays stable across release/resume (no duplicate cards; approved card shows a resuming state); p95 approval-to-visible-resume < 3 s is an S2 acceptance criterion. Lease expiry runs the permission-row retire path (no sweeper exists today — pod death mid-gate strands live cards).
-- **Steal UX contract** (was undefined): the reaper writes `turn.interrupted` so the client renders a state instead of ≤ ~105 s of dead air indistinguishable from a long tool call; the partially-streamed answer **visibly vanishes and regenerates** (dead-epoch deltas are never replayed) — named as accepted behavior; and because sessions gain an *automatic re-run* lane they never had (today a crashed turn just dies and the user resends), S1 constrains retry for side-effectful tools: re-run at most up to the first tool call unless the call is covered by dedup (MCP writes like `create_job` are the sharp case).
+- **Mid-turn settings**: built as durable first-class thread scalars plus the
+  owner-fenced 0119–0121 control inbox. `mode.set` and `narration.set` persist,
+  the exact owner applies them in commit order and writes the journal receipt,
+  and the permission gate reconciles the durable scalar before deciding the
+  next tool call (including expiry of an incompatible pending card). Resume
+  therefore cannot revert to a process-local value, and “next turn only” is not
+  the contract.
+- **Permission gates**: rows are DB-backed. The original release-at-gate target
+  is not the implemented active-wait shape: while a healthy stateless turn is
+  waiting, its independent heartbeat continues renewing the exact lease. New
+  requests capture that accepted lease token under the thread→queue lock. At a
+  proven writer-exclusive loss/rotation/Force-End boundary, pending rows from
+  the old token retire as `expired` with one linked `permission.resolved`
+  receipt; they are never re-armed on a successor that cannot reconstruct the
+  tool call. Approval and retirement share one row-CAS race. There is
+  deliberately **no blind `expires_at` sweeper**; legacy NULL-token rows move
+  only at a proven boundary. M4 removed the long-lived permission LISTEN so
+  control+interrupt listeners cannot starve the heartbeat in the supported
+  three-connection agent pool.
+- **Steal UX contract** (was undefined): the reaper writes `turn.interrupted` so the client renders a state instead of ≤ ~105 s of dead air indistinguishable from a long tool call; the partially-streamed answer **visibly vanishes and regenerates** (dead-epoch deltas are never replayed). S1 added an automatic re-run lane where the pre-S1 pinned behavior simply lost the turn and required user resend, so retry remains constrained for side-effectful tools: re-run at most up to the first tool call unless the call is covered by dedup (MCP writes like `create_job` are the sharp case).
 - **Media fidelity**: `_serialize_message_row` flattens list content (images dropped) and restore excludes `thinking`. Per-turn reload makes this the steady state, and **byte-stable re-rendering (§5.6) is impossible for affected turns until fixed**. Either structured-content storage lands with S1, or the degraded option ships *with a visible UI notice* on media past their turn — silent degradation is not an option.
-- **Presence**: `_subscribers` is a load-bearing oracle (permission expiry, `awaiting_user` flip) — re-home to an orchestrator-side attached-clients signal.
-- **Hard interrupt**: route to `leased_by` or NOTIFY into the executor; graceful interrupt = polled DB flag.
+- **Presence**: re-homed in migration 0125 as a bounded database-clock
+  attached-client TTL renewed by the owner-gated SSE stream. Stateless natural
+  pause and permission expiry consult that durable oracle; pinned
+  WebSocket/subscriber behavior remains unchanged.
+- **Hard interrupt**: built as the 0127–0129 exact-turn request/receipt path.
+  Owner-gated REST admits only against the exact open turn and live lease; the
+  executor watcher signals that turn and writes the linked `interrupt.ack`,
+  with reaper/terminal recovery settling admitted owner-loss cases. A new
+  no-live-gate request returns 409 before INSERT; it is not retargeted and does
+  not leave a dangling row. Pinned sessions have correlated REST parity; the
+  uncorrelated control-WS verb remains compatibility-only.
 - **Metrics**: the heartbeat's aux-health/RSS payload moves to the lease heartbeat / release report, or admin badges go dark.
-- Small state promotions (all verified memory-only today): SessionTaskManager todos → DB/workspace; memory-extraction interval cursor → persisted (else extraction fires *every* turn); file-undo RAM snapshots → the existing git turn→sha ledger; read-before-write stamps → thread metadata or per-turn re-arm (OQ §10.4).
+- Small state promotions: SessionTaskManager todos, the interval extraction
+  cursor and citation anchors are persisted; sandbox undo uses the durable
+  control/Git turn→SHA ledger. Read-before-write stamps remain deliberately
+  claim-local, forcing a fresh read after handoff (OQ §10.4 remains only for a
+  stronger persisted-stamp design).
 
 #### 5.3.7 Capacity UX
 
@@ -1420,17 +1465,19 @@ S8 VM-recovery wedge and the S19 dispatcher-invisible window are fixed properly 
 the command's atomicity; each also has a cheap sweeper backstop if they bite
 before then.
 
-##### The finalizer is shared with the session lane (decided 2026-08-09)
+##### The completion-effects substrate is shared with the session lane (built 2026-08-14)
 
-S2 stopped before building a generic background-work outbox for sessions,
-correctly: making it safe requires enqueueing the effect inside the final
-message-persist transaction *and* having `complete_unit` block or reconcile on
-it, which is a completion-protocol change. Today the session lane keeps that work
-correct by **holding the lease** instead — `_await_cloud_push` blocks
-`complete_unit` until the push reaches a terminal outcome, because "a live task
-after `complete_unit` has no durable ownership and can race the next claimant".
-An outbox replaces holding with releasing, and that is the same problem Gate 3 is
-already solving.
+S2 correctly stopped before building a generic background-work outbox for
+sessions: making it safe required enqueueing the effect inside the authoritative
+final message-persist transaction. Gate 3 then supplied the polymorphic
+`completion_effects` table, and session-hardening M1 built its first session
+producer. Every settled stateless turn now commits a stable
+`turn_execution_id`, immutable transcript boundary/destination and one
+`final_memory_extraction` obligation inside the fenced persist transaction. An
+always-on orchestrator drain settles it independently, with vector-side
+destination receipts making durable mutations exactly-once. A fenced loser
+mints no effect. This replaces the old final-memory lease-hold/teardown gap; it
+does not claim that every session background item is now outboxed.
 
 **Ruling: one substrate, both lanes.** A session turn's background work is
 another effect-group producer, not a second mechanism. Two consequences to build
@@ -1446,19 +1493,18 @@ in from the start rather than retrofit:
   `lease_token`, which is one arm of the `lease_token` XOR `agent_id` pair the
   command row already carries.
 
-Sequencing: this lands **after** step 1 below, so the three items S2 has blocked
-behind it (exact `llm_requests` archival, turn-end memory capture, post-callback
-Git turn→SHA ordering) wait on the substrate rather than on all of Gate 3.
+Current producer status: turn-end/final-memory capture is built. Exact
+`llm_requests` archival and post-callback Git turn→SHA ordering remain candidate
+producers on the same substrate rather than blockers to its existence.
 
 **Migration numbering:** S1 used 0115–0121 (with `0115a_run_queue.sql` renamed
 during the 2026-08-12 develop merge — develop had independently taken 0115;
 the rename is byte-identical so recorded checksums stay valid); S2 used
 **0122–0129** plus **0133** at close-out; Gate 3 step 1 used **0130–0132**;
-**0134–0139 remain free**; Gate 3 steps 2–4 used **0140–0144**, step 5 needed
-no migration, and the next app migration starts at **0145**. The remaining
-0145–0149 allocation is deliberate
-— S2 was allocated eight numbers, used all eight, and stopped partly because it
-had none left, which was an allocation error rather than a design constraint.
+**0134–0139 remain free**; Gate 3 steps 2–4 used **0140–0144**, and step 5
+needed no migration. Session hardening then used app **0145–0155** and vector
+**0019** for the final-memory/permission/wake work. The current heads are app
+**0155** and vector **0019**; the next migrations are **0156** and **0020**.
 Range allocation itself remains necessary: the earlier dev-cluster wedge came
 from two tracks numbering independently against one shared database.
 
@@ -1570,10 +1616,18 @@ One generic image; two Deployments (interactive: warm floor ≥ 2 sized per §2'
    correctness lock/marker must move outside the workload user's writable
    authority (or that cooperative-only threat boundary must be accepted).
 3. **Message fidelity** (§5.3.6) — also a prerequisite of the byte-determinism requirement.
-4. **Epoch/seq/fence redesign** (§5.3.2) before any stateless session traffic and **before P5** (dependency recorded in the session-reliability doc; if P5 lands first, the epoch change must still precede stateless traffic with `/events/head` kept stable).
+4. ~~**Epoch/seq/fence redesign** (§5.3.2) before any stateless session traffic
+   and before P5.~~ **Satisfied by S1.** P5 must preserve the shipped stable-
+   across-clean-claims contract and still build its own `/events/head`, activity
+   wake and idle-close machinery.
 5. **Path-A resume-compaction persistence** (§5.3.3) — else per-claim aux-LLM re-summarization.
 6. **Freeze-type registry consolidation** into `src/shared/` (§5.4.1) — else version-skew phantom-completes loop jobs.
-7. **Control-verb transport for S1 sessions**: `mode.set`, `narration.set`, `compact`, `archive`, `undo`, `rewind`, `config.update`, `upgrade-to-workspace` are **control-WS-only today** (verified) and a stateless thread has no pod to socket to. S1 ships the P6 §6a subset as orchestrator REST + journaled acks — this is S1 scope, not P6's someday.
+7. **Control-verb transport for S1 sessions**: the required precursor subset is
+   shipped as owner-gated durable REST + journaled receipts for `mode.set`,
+   `narration.set` and workspace undo, with dedicated REST for exact interrupt
+   and permission decisions. This is not full P6: `compact`, `archive`,
+   `rewind`, `config.update`, `upgrade-to-workspace`, the welcome-frame substitute,
+   transport flag and WebSocket deletion remain in that phase.
 
 ## 7. Deletion ledger — now with delete-when
 
@@ -1606,13 +1660,14 @@ Format: component → replaced-by → **delete-when**.
 The migration's steady state is **dual control planes** for the whole soak — an operational cost owned here, not a footnote: every dispatch/sweep/provisioning predicate becomes class-aware at S1/S3 flag-flip, and stays so until lane retirements.
 
 - **S0 — this doc.** Align on design + acceptance.
-- **S1 — lite/virtual sessions.** Build: run_queue + claim/heartbeat/reaper/completion protocol + fence (incl. object-store PUT fencing or the documented corruption window); epoch/seq/system-writer redesign; turn-request rows + watermarks; **cockpit workstream** (`/connection`+`/prepare` compat answering ready immediately for stateless threads, composer ungating, provisioning-card bypass) + **control-verb REST subset** (§6.7); persistence promotions (mode/narration, task manager, interval cursor, Path-A summary persist; media-fidelity decision *with UI notice if degraded*); scrub-on-claim; permission-row retire on lease expiry; queued-turn UX + `fair_key`; lite agent-local-state inventory (§6.1); journal-writer coalescing tick; metering lease-interval ingestion (shadow). Acceptance: create-to-*accepted* < 1 s; TTFT p50 < 2 s / p95 < 4 s **including provider TTFT**, and p95 claim-wait bounded at 2× pod-count concurrency; cache_read > 0 on second same-turn call and on a <5-min cross-pod follow-up; pod deleted mid-turn → takeover ≤ ~105 s, `turn.interrupted` rendered, no duplicate answer (watermark), no interleaved histories (fence assert); **zombie's late persist rejected at the fence**; poison unit parks within max_attempts with a user-visible terminal frame + operator unpark; queued input drains FIFO across a steal; zero in-process claim state; epoch bumps ≤1 per steal and 0 per clean handoff; after tenant A → tenant B on one pod, no A-residue (env/singletons/clients).
+- **S1 — lite/virtual sessions.** Build: run_queue + claim/heartbeat/reaper/completion protocol + fence (incl. object-store PUT fencing or the documented corruption window); epoch/seq/system-writer redesign; turn-request rows + watermarks; **cockpit workstream** (`/connection`+`/prepare` compat answering ready immediately for stateless threads, composer ungating, provisioning-card bypass) + **control-verb REST subset** (§6.7); persistence promotions (mode/narration, task manager, interval cursor, Path-A summary persist; media-fidelity decision *with UI notice if degraded*); scrub-on-claim; claim-bound permission-row retirement at proven lease loss; queued-turn UX + `fair_key`; lite agent-local-state inventory (§6.1); journal-writer coalescing tick; metering lease-interval ingestion (shadow). Acceptance: create-to-*accepted* < 1 s; TTFT p50 < 2 s / p95 < 4 s **including provider TTFT**, and p95 claim-wait bounded at 2× pod-count concurrency; cache_read > 0 on second same-turn call and on a <5-min cross-pod follow-up; pod deleted mid-turn → takeover ≤ ~105 s, `turn.interrupted` rendered, no duplicate answer (watermark), no interleaved histories (fence assert); **zombie's late persist rejected at the fence**; poison unit parks within max_attempts with a user-visible terminal frame + operator unpark; queued input drains FIFO across a steal; zero in-process claim state; epoch bumps ≤1 per steal and 0 per clean handoff; after tenant A → tenant B on one pod, no A-residue (env/singletons/clients).
 - **S2 — workspace sessions.** SSH affinity + tmux reattach; §6.1's
   process-local state and backend-path bypasses are externalized or explicitly
   retired (the corrected inventory requires no agent PVC); cloud-push
   sync-generation fence; outbox re-homing (incl. llm_requests archive);
   resident daemons re-homed; hard-interrupt routing; presence re-home;
-  gate-release flow. Acceptance: push(N)→pull(N+1) ordering holds across a
+  permission-wait/heartbeat flow (the active claim stays live; it is not
+  released at the gate). Acceptance: push(N)→pull(N+1) ordering holds across a
   forced pod handoff; tmux state survives handoff; mid-idle rclone token expiry
   heals on next claim; p95 approval-to-visible-resume < 3 s; canvas presence has
   no inter-turn flicker (or the flicker is named and accepted).
@@ -1620,15 +1675,18 @@ The migration's steady state is **dual control planes** for the whole soak — a
 - **S4 — optional, bill-driven**: in-process multiplexing; compile-once; workspace pause tier (§10.7); JetStream hatch.
 - **Rollback**: per-class flag at every stage; pinned plane intact until lane retirement decisions (§10.9).
 
-### 9.1 Implementation status (2026-08-13)
+### 9.1 Implementation status (2026-08-14)
 
-Written against local `develop`, not against intent. The step-5 milestone
-commits are deliberately unpushed. The short version: **the shared substrate is
+Written against local `develop`, not against intent. This run did not push and
+its M3–M5 hardening tail remains local. The short version: **the shared substrate is
 genuinely kind-agnostic; the session lane accepts exact virtual/none and
 Kubernetes sandbox workspaces; the default-off worker driver is built end to
 end; and Gate 3 steps 1–5 now provide durable completion, delivery-before-
 terminal ordering, stateless background finalization, outcome-gated shell
-handoff and independent queue-age monitoring.** S2 sandbox admission passed its
+handoff and independent queue-age monitoring. Session hardening now also makes
+the final-memory obligation durable, retires stale claim-bound permission rows
+with linked receipts, and distinguishes deleted-thread wakes as
+`undeliverable`.** S2 sandbox admission passed its
 fail-closed lifecycle and two-pod acceptance gates on 2026-08-11. Worker
 rotation still obeys the 2026-08-10 §5.4.5 scope correction: it releases only
 through `run_queue` and never calls `/complete`. The production two-Deployment/
@@ -1703,12 +1761,41 @@ preserves it and hands authority to lifecycle/S36. On rollback, first close
 worker admission, then keep the stateless executor Deployment up until worker
 rows and completion commands drain. Do not equate admission-off with
 executor-off. The independent oldest-runnable worker alarm remains active
-outside the finalizer loop. The four-row cloud soak remains not-started: the
+outside the finalizer loop. The **Gate 3 step-5 worker** four-row cloud soak
+remains not-started: the
 disposable preflight resolved the selected OpenRouter route, but its first main
 model call returned provider 401, so zero acceptance rows were begun or
 claimed in the four acceptance scenarios. Mutable fixture state and resources
 were exact-cleaned; only the documented append-only usage facts remain. The
 protected review probe was untouched.
+
+**Session-lane hardening status (2026-08-14).** M0 recon found exact-turn
+interrupt already closed by S2: stateless admission is exact-live-gate only and
+a new no-live request returns 409 before INSERT. M1 builds the final-memory
+producer/drainer described in §5.3.5 on the existing polymorphic effect table,
+with destination receipts in vector migration 0019. M3 binds permission rows
+to accepted lease tokens and retires only at a proven writer-exclusive
+boundary—never by blind TTL—while preserving the already-good ended-session
+wake path and settling hard-delete races as `undeliverable`. App migrations
+0145–0155 and vector 0019 are frozen; current heads are app **0155** and vector
+**0019**, so the next numbers are **0156** and **0020**.
+
+M4 used a separate, MiniMax-pinned **session** soak; it must not be conflated
+with the unavailable Gate 3 worker soak above. Exact interrupt completed with
+one correlated receipt. The first permission fixture exposed a three-slot pool
+starvation P1: control, interrupt and permission LISTENs could consume every
+connection and starve the lease heartbeat. Permission wait now polls through
+short acquisitions instead of holding the third listener; the fixed live gate
+showed the same permission pending while the exact lease renewed, and a
+gracefully deleted owner then converged through the production reaper to one
+`expired/system/lease_expired` row and one linked receipt without running the
+tool. Normal final-memory effects drained once with vector receipts. The
+brief's executor-after-final-persist crash row was **not proven**, and abrupt
+Pod disappearance also reconfirmed a claimant-quiescence cleanup debt: public
+Force-End correctly fails closed until process-zero evidence is durably
+recorded. The disposable virtual fixture required a disclosed, exact-CAS
+operator acknowledgement after Kubernetes/CRI/containerd/process/cgroup
+absence proof; a general production receipt path remains follow-up work.
 
 #### Is it shared between sessions and workers? The substrate and local pool are; the production split is not built.
 
@@ -1779,11 +1866,15 @@ survived a hard reload and a second tab, was denied over REST, was
 journal-acknowledged, and the tool never executed.
 
 **Still open after S1/S2**: Path-A resume-compaction persistence; durable
-queued-turn UX; control verbs beyond the two scalars; metering lease-interval
+queued-turn UX; controls beyond the scalar/undo subset (`compact`, `archive`,
+connected `rewind`, `config.update`, `upgrade-to-workspace`); metering lease-interval
 ingestion; the journal coalescing tick; and server-side conditional object-store
-PUT fencing. S2 closed permission retirement, ended-session wake, durable
-task/undo state, extraction cursor and citation-anchor items from the original
-§6.1 inventory.
+PUT fencing. S2 closed the healthy-owner permission/presence path and ordinary
+ended-session wake, plus durable task/undo state, extraction cursor and
+citation-anchor items from the original §6.1 inventory. Later M3 closed the
+actual lease-loss permission gap with claim-bound retirement and linked
+receipts, and closed the distinct hard-delete wake gap as `undeliverable`; it
+did not add a blind TTL sweeper.
 
 **Acceptance — met**: create-to-accepted <1 s; takeover ≤105 s with no duplicate
 answer; the fence assert; FIFO drain across a steal; epoch bump bounds; zero
@@ -1940,17 +2031,14 @@ database and replay fences, not a live executor's RAM unwind, LISTEN latency or
 a forced-pod interrupt handoff. No live pinned executor existed, so pinned
 interrupt behavior remains unit/integration-tested rather than live-smoked.
 
-The generic §3.5 outbox is deliberately **not** built. Its design requires
-effect enqueue in the same transaction as the turn's final message persist,
-but that persist is currently non-fatal and may time out while `complete_unit`
-still advances the input watermark. Making the enqueue authoritative therefore
-changes the normal completion protocol. No safe generic payload carrier exists
-in 0122–0129, and migrations 0130+ belong to Gate 3. Per the stop rule, this
-pass did not repurpose the officer wake outbox or add a competing live-epoch
-journal writer. Exact LLM audit, turn-end memory and post-callback Git ordering
-remain blocked on that boundary; Canvas revision snapshots, a pending-citation
-sweeper and orchestrator-derived notifications are separable future slices,
-but were not started after the stop condition triggered.
+At S2 close, the generic §3.5 outbox was deliberately **not** built because
+effect enqueue was not yet part of the authoritative final-persist
+transaction. Gate 3 later supplied the polymorphic `completion_effects`
+substrate, and session-hardening M1 built the first production session
+producer: exact final-memory extraction. It does not make the entire generic
+outbox inventory complete. Exact LLM audit and post-callback Git ordering,
+Canvas revision snapshots, a pending-citation sweeper and
+orchestrator-derived notifications remain separate future slices.
 
 **Final S2 verification and live acceptance.** Repository-wide pytest completed
 in **843.10 s** with **16,681 passed / 156 skipped / 11 established environment
@@ -1992,10 +2080,12 @@ command `exec`s Python as PID 1 (`5e60a644`); eviction provenance is created
 before Pod deletion (`77d6909a`); and JSON-held deadlines cross asyncpg through
 explicit text-to-timestamp casts (`e17418bd`).
 
-**Residuals.** Public End's exact final-memory tail still needs a durable
-same-transaction effect/outbox; the five-turn interval can omit the final
-**0–4 turns** after a crash. The generic outbox, durable Canvas mutation
-invalidations, full two-editor Monaco/auth-expiry UX, and server-side
+**Residuals.** The exact final-memory tail is now covered by a durable
+same-transaction effect/outbox plus destination receipt. The M4
+executor-after-persist crash row is still unproven live, but the former final
+**0–4-turn** design gap is closed. The remaining generic outbox producers,
+durable Canvas mutation invalidations, full two-editor Monaco/auth-expiry UX,
+and server-side
 conditional object-store writes remain open. Passing the displayed tool-call
 `id` rather than the UUID `approval_id` still returns 500 (P2 validation debt).
 A pinned parity run exposed pre-existing pinned snapshot/agent-retention debt;
@@ -2068,11 +2158,14 @@ thread empty before atomically removing the queue/job anchor. The stale-
 verification critic sweep uses the same stateless hard-close and strict-prune
 path, so a parent cannot unblock while critic cleanup is merely pending.
 
-**Schema and remaining work.** The S3 driver required **no migration**. The
-current app-schema head is **0144**: Gate 3 steps 2–4 used 0140–0144, step 5
-needed no migration, and the next app migration starts at 0145. The durable
-command table, polymorphic effect table, completion high-water mark and
-finalizer are built through Gate 3 step 5. Still unbuilt are §5.8's production
+**Schema and remaining work.** The S3 driver required **no migration**. Gate 3
+steps 2–4 used app 0140–0144 and step 5 needed no schema. Session hardening
+subsequently used app **0145–0155** and vector **0019**. The current heads are
+app **0155** and vector **0019**; the next migrations are **0156** and
+**0020**. The durable command table, polymorphic effect table, completion
+high-water mark and finalizer are built through Gate 3 step 5, and the first
+session producer (`final_memory_extraction`) now uses that substrate. Still
+unbuilt are §5.8's production
 two-Deployment/KEDA split, per-claim job-log
 capture, the §10.2 job-journal decision and the Job Bench performance/rollout
 gate. The current single-pool proof cannot guarantee interactive capacity
@@ -2094,9 +2187,16 @@ consumer.
 
 ## 10. Open questions
 
-1. **Interrupt-grade steering** — is `enqueue` enough, or do sessions/officers eventually need the Platform's `interrupt` policy (with partial-tool-call cleanup)?
+1. **Queued-turn cancellation / partial-tool cleanup** — exact live-turn
+   interrupt is built and a no-live gate returns 409 before INSERT. Decide
+   separately whether users need a durable verb that cancels queued input, and
+   whether interrupted partial tool calls require tool-specific compensation.
 2. **Job journal** — extend `thread_events`' contract to job runs in S3, or accept poll-based job UX and defer?
-3. ~~Permission-gate parking~~ — **decided release-at-gate**, spec in §5.3.6; remaining question is only the approval-to-resume latency target's final number.
+3. ~~Permission-gate parking~~ — **superseded by the built active-wait
+   contract**: the exact claim remains leased and independently heartbeating
+   through the permission gate; claim loss retires, never re-arms, the old
+   request. Only capacity and approval-latency tuning remain, not ownership
+   semantics.
 4. **Read-before-write gates** — persist stamps vs per-turn re-arm (token tax vs behavior change)?
 5. **Media-fidelity scope** — structured-content storage in S1, or degraded-with-UI-notice first?
 6. ~~**Interactive saturation policy / shared worker capacity**~~ — **S3 ruling: do not ship one pool yet.** Gate 3 stopped worker admission before a load result existed, and the proposed pod-local reserve is not a pool-wide availability guarantee during rollout or pod loss. Re-open only with coordinator-visible executor capacity, capability-aware claims, and a passing p95 session claim-wait benchmark; otherwise retain two Deployments.
