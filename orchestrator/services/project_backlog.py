@@ -20,9 +20,13 @@ work because of it — it only sorts what the agent is shown.
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 from typing import Any
+
+from .kb_forge import kb_client_for_repo
+from .kb_git_source import GiteaKnowledgeGitSource
 
 logger = logging.getLogger(__name__)
 
@@ -242,8 +246,8 @@ def _rewrite_status(markdown: str, new_status: str) -> tuple[str, str]:
     return "---" + head + sep + tail, _REWRITTEN
 
 
-async def _resolve_note_repo(project_id: str, postgres_db: Any) -> str | None:
-    """The repo whose ``knowledge/`` vault holds this project's notes.
+async def _resolve_note_repo(project_id: str, postgres_db: Any) -> Any | None:
+    """The descriptor for the repo holding this project's notes.
 
     Routed through ``kb_reindex.resolve_kb_repo`` — the one resolver the KB
     sweep and the note write path also use — rather than re-deriving the
@@ -270,8 +274,82 @@ async def _resolve_note_repo(project_id: str, postgres_db: Any) -> str | None:
 
     from .kb_reindex import resolve_kb_repo  # late import: avoid circular
 
-    resolved = await resolve_kb_repo(postgres_db, str(project_id))
-    return resolved.repo if resolved else None
+    return await resolve_kb_repo(postgres_db, str(project_id))
+
+
+async def _read_note_file(
+    repo_client: Any, repo_ref: Any, file_path: str
+) -> tuple[str | None, str | None]:
+    """Return note text and its blob SHA without adding a GitHub file GET."""
+    if repo_ref.forge == "gitea":
+        return await repo_client.get_file_content(repo_ref.repo, file_path), None
+
+    source = GiteaKnowledgeGitSource(
+        repo_client,
+        repo_ref.repo,
+        branch=repo_ref.branch,
+        label=repo_ref.repo,
+    )
+    head = await source.get_head()
+    if not head:
+        return None, None
+    async with source.snapshot(head) as snapshot:
+        current = await snapshot.get_file(file_path)
+    if current is None:
+        return None, None
+    tree = await repo_client.list_tree(repo_ref.repo, head)
+    if tree is None:
+        return current, None
+    blob_sha = next(
+        (
+            str(entry.get("sha"))
+            for entry in tree
+            if entry.get("type") == "blob" and entry.get("path") == file_path
+        ),
+        None,
+    )
+    return current, blob_sha
+
+
+async def _write_note_file(
+    repo_client: Any,
+    repo_ref: Any,
+    file_path: str,
+    content: str,
+    message: str,
+    blob_sha: str | None,
+) -> bool:
+    """Write one backlog note while preserving Gitea's established call."""
+    if repo_ref.forge == "gitea":
+        return bool(
+            await repo_client.create_or_update_file(
+                repo_ref.repo,
+                file_path,
+                content,
+                message,
+            )
+        )
+    if not blob_sha:
+        # The GitHub contents API requires this for an update. Refuse rather
+        # than add a second, hidden location/content lookup rule.
+        return False
+    return bool(
+        await repo_client.change_files(
+            repo_ref.repo,
+            repo_ref.branch,
+            [
+                {
+                    "path": file_path,
+                    "content_b64": base64.b64encode(content.encode("utf-8")).decode(
+                        "ascii"
+                    ),
+                    "operation": "update",
+                    "sha": blob_sha,
+                }
+            ],
+            message=message,
+        )
+    )
 
 
 async def close_backlog_ticket(
@@ -305,17 +383,20 @@ async def close_backlog_ticket(
     durable_ok = False
     repo_name: str | None = None
     try:
-        repo_name = await _resolve_note_repo(project_id, postgres_db)
-        if repo_name is None:
+        repo_ref = await _resolve_note_repo(project_id, postgres_db)
+        if repo_ref is None:
             logger.info(
                 "backlog: project %s has no KB repo — %s → %s is an index-only close",
                 project_id,
                 note_id,
                 new_status,
             )
-        current = (
-            await gitea.get_file_content(repo_name, file_path) if repo_name else None
-        )
+            current, blob_sha = None, None
+            repo_client = None
+        else:
+            repo_name = repo_ref.repo
+            repo_client = await kb_client_for_repo(postgres_db, gitea, repo_ref)
+            current, blob_sha = await _read_note_file(repo_client, repo_ref, file_path)
         if current:
             updated, outcome = _rewrite_status(current, new_status)
             if outcome == _ALREADY_SET:
@@ -339,11 +420,13 @@ async def close_backlog_ticket(
                 )
             else:  # _REWRITTEN — the only outcome whose text differs
                 durable_ok = bool(
-                    await gitea.create_or_update_file(
-                        repo_name,
+                    await _write_note_file(
+                        repo_client,
+                        repo_ref,
                         file_path,
                         updated,
                         f"backlog: {note_id} → {new_status}",
+                        blob_sha,
                     )
                 )
         elif repo_name is not None:

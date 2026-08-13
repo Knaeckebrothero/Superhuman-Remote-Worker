@@ -10,7 +10,7 @@ field mapping), then the orchestration with AsyncMock deps.
 
 import asyncio
 import uuid
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -472,6 +472,93 @@ class TestReindexKbIncremental:
         wm_kwargs = store.upsert_watermark.await_args[1]
         assert wm_kwargs["indexed_commit"] == "headsha"
         assert wm_kwargs["pipeline_version"] == endpoint_pipeline
+
+    @pytest.mark.asyncio
+    async def test_github_tree_and_tarball_populate_nested_path_and_links(
+        self, monkeypatch
+    ):
+        """The external-forge source reaches the unchanged indexing pipeline."""
+        import io
+        import tarfile
+
+        import httpx
+
+        from src.services.forge import ForgeRepo, GitHubClient
+
+        note = (
+            "---\nid: note\ntype: learning\nstatus: active\n---\n"
+            "# Nested Note\n\nExternal vault insight; see [[related-note]].\n"
+        ).encode()
+        archive_buffer = io.BytesIO()
+        with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+            member = tarfile.TarInfo("acme-vault-head/knowledge/nested/note.md")
+            member.size = len(note)
+            archive.addfile(member, io.BytesIO(note))
+        archive_bytes = archive_buffer.getvalue()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/branches/main"):
+                return httpx.Response(200, json={"commit": {"sha": "head-sha"}})
+            if path.endswith("/git/trees/head-sha"):
+                assert request.url.params.get("recursive") == "1"
+                return httpx.Response(
+                    200,
+                    json={
+                        "tree": [
+                            {
+                                "path": "knowledge/nested/note.md",
+                                "type": "blob",
+                                "sha": "blob-sha",
+                            }
+                        ],
+                        "truncated": False,
+                    },
+                )
+            if path.endswith("/tarball/head-sha"):
+                return httpx.Response(200, content=archive_bytes)
+            raise AssertionError(f"unexpected GitHub request: {request.method} {path}")
+
+        monkeypatch.setattr(
+            "src.services.forge._transport",
+            httpx.MockTransport(handler),
+            raising=False,
+        )
+        client = GitHubClient(
+            ForgeRepo(
+                "github",
+                "https://api.github.com",
+                "acme",
+                "vault",
+                "test-pat",
+            )
+        )
+        _unused, store, svc = _make_deps(indexed={})
+        kb_id = uuid.uuid4()
+
+        result = await reindex_kb(
+            gitea_client=client,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb_id,
+            repo_name="vault",
+            branch="main",
+        )
+
+        assert result["status"] == "completed"
+        assert result["upserted"] == 1
+        note_kwargs = store.upsert_kb_note.await_args.kwargs
+        assert note_kwargs["kb_id"] == kb_id
+        assert note_kwargs["path"] == "knowledge/nested/note.md"
+        assert note_kwargs["note_id"] == "note"  # basename, never nested path
+        assert "External vault insight" in note_kwargs["content"]
+        assert store.replace_note_links.await_args.kwargs["targets"] == ["related-note"]
+        # KnowledgeStore.upsert_kb_note derives note-level search_doc from this
+        # content in SQL; the chunk write likewise derives its sparse document.
+        assert store.replace_note_chunks.await_count == 1
+        wm_kwargs = store.upsert_watermark.await_args[1]
+        assert wm_kwargs["indexed_commit"] == "head-sha"
+        assert wm_kwargs["pipeline_version"] == CURRENT_VERSION
 
     @pytest.mark.asyncio
     async def test_forwards_parsed_priority_to_upsert_kb_note(self):
@@ -1352,6 +1439,48 @@ class TestKbSweepTick:
         assert "project_repositories" in query
         assert "jobs" in str(postgres_db.fetch.call_args[0])
         assert "knowledge" in str(postgres_db.fetch.call_args[0])
+
+    @pytest.mark.asyncio
+    async def test_github_project_uses_selected_client_for_reindex(self):
+        project_id = uuid.uuid4()
+        datasource_id = uuid.uuid4()
+        postgres_db = self._db(
+            {
+                project_id: {
+                    "knowledge": [
+                        {
+                            "name": "Design Vault",
+                            "repo_url": "https://github.com/acme/design-vault.git",
+                            "branch": "main",
+                        }
+                    ]
+                }
+            }
+        )
+        postgres_db.get_native_project_kb_datasource_ref = AsyncMock(
+            return_value={"id": datasource_id, "config": {"root_path": "knowledge"}}
+        )
+        gitea = MagicMock()
+        github = MagicMock()
+        reindex_fn = AsyncMock(return_value={"status": "completed"})
+
+        with patch(
+            "orchestrator.services.kb_reindex.kb_client_for_repo",
+            AsyncMock(return_value=github),
+        ) as select:
+            await kb_sweep_tick(
+                postgres_db=postgres_db,
+                store=MagicMock(),
+                gitea_client=gitea,
+                embedding_service=MagicMock(),
+                reindex_fn=reindex_fn,
+            )
+
+        ref = await resolve_kb_repo(postgres_db, str(project_id))
+        assert ref is not None
+        select.assert_awaited_once_with(postgres_db, gitea, ref)
+        assert reindex_fn.await_args.kwargs["gitea_client"] is github
+        assert reindex_fn.await_args.kwargs["repo_name"] == "design-vault"
 
     @pytest.mark.asyncio
     async def test_sweep_picks_the_repo_the_resolver_picks(self):

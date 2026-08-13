@@ -848,7 +848,15 @@ class _GiteaSnapshot:
     async def get_file(self, path: str) -> str | None:
         if self._archive_members is not None:
             return await asyncio.to_thread(self._read_from_archive, path)
-        return await self._client.get_file_content(self._repo_name, path, ref=self._ref)
+        reader = getattr(self._client, "get_file_content", None)
+        if callable(reader):
+            return await reader(self._repo_name, path, ref=self._ref)
+        # GitHub's approved KB API surface uses tree + tarball and deliberately
+        # does not add one Contents-API GET per changed note. Download lazily
+        # for a small incremental run; large runs already call prefetch().
+        if await self.prefetch():
+            return await asyncio.to_thread(self._read_from_archive, path)
+        return None
 
     def _read_from_archive(self, path: str) -> str | None:
         member = (self._archive_members or {}).get(path)

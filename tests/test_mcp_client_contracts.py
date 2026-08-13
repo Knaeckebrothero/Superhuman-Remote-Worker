@@ -17,6 +17,40 @@ from src.shared.orch_surface.formatters import (
 
 
 @pytest.mark.asyncio
+async def test_project_client_forwards_external_kb_only_when_supplied() -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(201, json={"id": "project-1"})
+
+    client = AsyncCockpitClient(
+        "http://orchestrator.test", transport=httpx.MockTransport(handler)
+    )
+    external = {
+        "repo_url": "https://github.com/acme/vault.git",
+        "branch": "main",
+        "token": "test-pat",
+    }
+    try:
+        await client.create_project("External", "user-1", external_kb=external)
+        await client.create_project("Default", "user-1")
+        await client.attach_project_knowledge_repository("project-2", external)
+    finally:
+        await client.close()
+
+    assert captured[0] == (
+        "/api/projects",
+        {"name": "External", "user_id": "user-1", "external_kb": external},
+    )
+    assert "external_kb" not in captured[1][1]
+    assert captured[2] == (
+        "/api/projects/project-2/knowledge/repository",
+        external,
+    )
+
+
+@pytest.mark.asyncio
 async def test_async_job_clients_preserve_explicit_empty_connector_selection() -> None:
     captured: list[tuple[str, dict[str, Any]]] = []
 

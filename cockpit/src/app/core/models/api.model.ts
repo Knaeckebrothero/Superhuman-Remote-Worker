@@ -1244,7 +1244,17 @@ export interface ProjectCreateRequest {
   goal?: string;
   default_config_name?: string;
   default_config_override?: Record<string, unknown>;
+  external_kb?: ExternalKnowledgeBaseRequest;
   user_id: string;
+}
+
+/** Existing private GitHub repository used as the writable project KB. */
+export interface ExternalKnowledgeBaseRequest {
+  repo_url: string;
+  branch?: string;
+  token: string;
+  /** Required for GitHub Enterprise; github.com is inferred. */
+  forge?: 'github';
 }
 
 /**

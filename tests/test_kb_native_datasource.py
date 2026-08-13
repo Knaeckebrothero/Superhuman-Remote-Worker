@@ -23,9 +23,12 @@ from fastapi import HTTPException
 
 from main import (
     DatasourceUpdate,
+    ExternalKnowledgeBase,
     ProjectCreate,
     _normalize_kb_config,
+    _provision_external_project_knowledge_repo,
     _provision_project_knowledge_repo,
+    attach_project_knowledge_repository,
     create_project,
     reindex_datasource_knowledge,
     update_datasource,
@@ -96,7 +99,10 @@ class TestProjectCreationProvisioning:
             return_value={"id": PROJECT_ID, "name": "Better Resavio"}
         )
         db.add_project_member = AsyncMock()
-        db.add_project_repository = AsyncMock()
+        db.add_project_repository = AsyncMock(
+            side_effect=lambda **kwargs: {"id": uuid.uuid4(), **kwargs}
+        )
+        db.get_native_project_kb_datasource_ref = AsyncMock(return_value=None)
         db.get_user = AsyncMock(return_value={"email": "owner@example.test"})
         db.create_datasource = AsyncMock(
             return_value={"id": DATASOURCE_ID, "name": "Better Resavio Knowledge"}
@@ -112,9 +118,10 @@ class TestProjectCreationProvisioning:
             **kwargs,
         )
         gitea.grant_user_repo_access = AsyncMock()
+        gitea.delete_repo = AsyncMock()
         return gitea
 
-    async def _create(self, db, gitea):
+    async def _create(self, db, gitea, *, external_kb=None):
         with (
             patch(
                 "main.require_approved_user",
@@ -128,7 +135,12 @@ class TestProjectCreationProvisioning:
             ),
         ):
             return await create_project(
-                ProjectCreate(name="Better Resavio", user_id=OWNER_ID), object()
+                ProjectCreate(
+                    name="Better Resavio",
+                    user_id=OWNER_ID,
+                    external_kb=external_kb,
+                ),
+                object(),
             )
 
     @pytest.mark.asyncio
@@ -241,6 +253,157 @@ class TestProjectCreationProvisioning:
 
 
 # =============================================================================
+# External GitHub live vault — docs/features/external_forge_knowledge_base.md
+# =============================================================================
+
+
+class TestExternalProjectKnowledgeProvisioning(TestProjectCreationProvisioning):
+    EXTERNAL = ExternalKnowledgeBase(
+        repo_url="https://github.com/acme/design-vault.git",
+        branch="vault/main",
+        token="github-pat-never-return",
+    )
+
+    @pytest.mark.asyncio
+    async def test_create_uses_external_repo_without_creating_gitea_repo(self):
+        db, gitea = self._db(), self._gitea()
+
+        project = await self._create(db, gitea, external_kb=self.EXTERNAL)
+
+        assert project["id"] == PROJECT_ID
+        gitea.create_repo.assert_not_awaited()
+        db.add_project_repository.assert_awaited_once()
+        repo_kwargs = db.add_project_repository.await_args.kwargs
+        assert repo_kwargs["name"] == "design-vault"
+        assert repo_kwargs["repo_url"] == self.EXTERNAL.repo_url
+        assert repo_kwargs["role"] == "knowledge"
+        assert repo_kwargs["branch"] == "vault/main"
+        assert repo_kwargs["is_managed"] is False
+        assert "credentials" not in repo_kwargs
+
+    @pytest.mark.asyncio
+    async def test_pat_is_written_only_to_native_datasource_credentials(self):
+        db, gitea = self._db(), self._gitea()
+
+        project = await self._create(db, gitea, external_kb=self.EXTERNAL)
+
+        kwargs = db.create_datasource.await_args.kwargs
+        assert kwargs["connection_url"] is None
+        assert kwargs["credentials"] == {
+            "auth_method": "token",
+            "token": "github-pat-never-return",
+        }
+        assert kwargs["config"] == {
+            "root_path": "knowledge",
+            NATIVE_PROJECT_CONFIG_KEY: PROJECT_ID,
+        }
+        assert "github-pat-never-return" not in repr(project)
+        assert "github-pat-never-return" not in repr(
+            db.add_project_repository.await_args.kwargs
+        )
+
+    @pytest.mark.asyncio
+    async def test_github_enterprise_persists_explicit_forge_override(
+        self, monkeypatch
+    ):
+        db, gitea = self._db(), self._gitea()
+        monkeypatch.setenv("KB_GIT_ALLOWED_HOSTS", "github.corp.example")
+        external = ExternalKnowledgeBase(
+            repo_url="https://github.corp.example/acme/design-vault.git",
+            branch="main",
+            forge="github",
+            token="enterprise-pat",
+        )
+
+        await self._create(db, gitea, external_kb=external)
+
+        assert db.create_datasource.await_args.kwargs["config"]["forge"] == "github"
+
+    @pytest.mark.asyncio
+    async def test_external_helper_compensates_repo_row_if_datasource_write_fails(self):
+        db = self._db()
+        db.create_datasource.side_effect = RuntimeError("db failure")
+        db.remove_project_repository = AsyncMock()
+
+        with patch("main.postgres_db", db), pytest.raises(RuntimeError):
+            await _provision_external_project_knowledge_repo(
+                {"id": PROJECT_ID, "name": "Better Resavio"},
+                OWNER_ID,
+                self.EXTERNAL,
+            )
+
+        db.remove_project_repository.assert_awaited_once()
+        assert db.remove_project_repository.await_args.args[0]
+
+
+class TestAttachExternalProjectKnowledgeRepo(TestProjectCreationProvisioning):
+    EXTERNAL = ExternalKnowledgeBase(
+        repo_url="https://github.com/acme/design-vault.git",
+        branch="main",
+        token="attach-pat-never-return",
+    )
+
+    @pytest.mark.asyncio
+    async def test_repo_less_existing_project_can_attach_external_vault(self):
+        db, gitea = self._db(), self._gitea()
+        db.get_project_repositories = AsyncMock(return_value=[])
+        request = object()
+
+        with (
+            patch(
+                "main.require_project_owner",
+                AsyncMock(
+                    return_value=(
+                        {"id": OWNER_ID, "is_admin": False},
+                        {"id": PROJECT_ID, "name": "Better Resavio"},
+                    )
+                ),
+            ),
+            patch("main.postgres_db", db),
+            patch("main.gitea_client", gitea),
+        ):
+            result = await attach_project_knowledge_repository(
+                request, PROJECT_ID, self.EXTERNAL
+            )
+
+        assert result["status"] == "attached"
+        assert "credentials" not in result["repository"]
+        assert "credentials" not in result["datasource"]
+        assert "attach-pat-never-return" not in repr(result)
+        gitea.create_repo.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_existing_knowledge_repo_is_not_silently_replaced(self):
+        db, gitea = self._db(), self._gitea()
+        db.get_project_repositories = AsyncMock(
+            return_value=[{"id": uuid.uuid4(), "role": "knowledge"}]
+        )
+
+        with (
+            patch(
+                "main.require_project_owner",
+                AsyncMock(
+                    return_value=(
+                        {"id": OWNER_ID, "is_admin": False},
+                        {"id": PROJECT_ID, "name": "Better Resavio"},
+                    )
+                ),
+            ),
+            patch("main.postgres_db", db),
+            patch("main.gitea_client", gitea),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await attach_project_knowledge_repository(
+                object(), PROJECT_ID, self.EXTERNAL
+            )
+
+        assert exc.value.status_code == 409
+        db.add_project_repository.assert_not_awaited()
+        db.create_datasource.assert_not_awaited()
+        gitea.delete_repo.assert_not_awaited()
+
+
+# =============================================================================
 # The external sweep — criterion 5
 # =============================================================================
 
@@ -345,6 +508,14 @@ class TestMarkerDurability:
             _normalize_kb_config({NATIVE_PROJECT_CONFIG_KEY: PROJECT_ID})
         assert exc.value.status_code == 400
         assert NATIVE_PROJECT_CONFIG_KEY in str(exc.value.detail)
+
+    def test_forge_override_survives_native_config_round_trip(self):
+        stored = {
+            "root_path": "knowledge",
+            NATIVE_PROJECT_CONFIG_KEY: PROJECT_ID,
+            "forge": "github",
+        }
+        assert _normalize_kb_config(stored, stored=True) == stored
 
     @pytest.mark.asyncio
     async def test_editing_the_root_path_does_not_strip_the_marker(self):

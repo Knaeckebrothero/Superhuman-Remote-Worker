@@ -863,6 +863,33 @@ async def test_gitea_snapshot_prefetch_serves_reads_from_archive(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_archive_only_client_lazily_prefetches_for_single_file_read(tmp_path):
+    """GitHub's approved read surface is tree + tarball, without contents GET."""
+    import shutil
+
+    archive_src = _make_archive(tmp_path)
+
+    class ArchiveOnlyClient:
+        def __init__(self):
+            self.downloads = 0
+
+        async def download_repo_archive(self, repo_name, ref, dest_path):
+            assert (repo_name, ref) == ("jobs-project", HEAD_SHA)
+            self.downloads += 1
+            shutil.copy(archive_src, dest_path)
+            return True
+
+    client = ArchiveOnlyClient()
+    source = GiteaKnowledgeGitSource(client, "jobs-project")
+
+    async with source.snapshot(HEAD_SHA) as snapshot:
+        assert await snapshot.get_file("knowledge/a.md") == "# A\n"
+        assert await snapshot.get_file("knowledge/b.md") == "# B\n"
+
+    assert client.downloads == 1
+
+
+@pytest.mark.asyncio
 async def test_gitea_snapshot_prefetch_failure_falls_back_to_rest():
     """A failed archive download degrades to the per-file path, never raises."""
     client = AsyncMock()

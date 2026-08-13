@@ -63,6 +63,7 @@ import {
     ProjectLoop,
     ProjectLoopStartRequest,
     ProjectCreateRequest,
+    ExternalKnowledgeBaseRequest,
     ProjectDatasource,
     ProjectMember,
     ProjectMemberAddRequest,
@@ -2199,6 +2200,18 @@ export class ApiService {
     return this.http.post<Project>(`${this.baseUrl}/projects`, body).pipe(
       catchError(() => of(null)),
     );
+  }
+
+  attachProjectKnowledgeRepository(
+    projectId: string,
+    body: ExternalKnowledgeBaseRequest,
+  ): Observable<Record<string, unknown> | null> {
+    return this.http
+      .post<Record<string, unknown>>(
+        `${this.baseUrl}/projects/${projectId}/knowledge/repository`,
+        body,
+      )
+      .pipe(catchError(() => of(null)));
   }
 
   updateProject(id: string, body: ProjectUpdateRequest): Observable<{ status: string } | null> {

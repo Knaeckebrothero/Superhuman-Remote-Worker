@@ -1962,6 +1962,7 @@ class AsyncCockpitClient:
         goal: str | None = None,
         default_config_name: str | None = None,
         default_config_override: dict[str, Any] | None = None,
+        external_kb: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create a new project.
 
@@ -1972,6 +1973,7 @@ class AsyncCockpitClient:
             goal: Project goal statement
             default_config_name: Default agent config for new jobs
             default_config_override: Default config overrides for new jobs
+            external_kb: Existing private GitHub repo + branch + PAT for the live KB
 
         Returns:
             Created project record with ID
@@ -1985,7 +1987,21 @@ class AsyncCockpitClient:
             body["default_config_name"] = default_config_name
         if default_config_override is not None:
             body["default_config_override"] = default_config_override
+        if external_kb is not None:
+            body["external_kb"] = external_kb
         resp = await self._mutation_request("POST", "/api/projects", json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def attach_project_knowledge_repository(
+        self, project_id: str, external_kb: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Attach an existing private GitHub live vault to a project."""
+        resp = await self._mutation_request(
+            "POST",
+            f"/api/projects/{project_id}/knowledge/repository",
+            json=external_kb,
+        )
         resp.raise_for_status()
         return resp.json()
 
