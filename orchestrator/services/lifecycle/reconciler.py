@@ -16,7 +16,9 @@ drift-detection fires N concurrent drains the moment a new image lands.
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Any, AsyncIterator
 
 from .types import (
     Instance,
@@ -155,7 +157,11 @@ class InstanceLifecycleReconciler:
                 if not healthy:
                     stats["unhealthy"] += 1
                     try:
-                        await manager.delete(inst, grace_s=0)
+                        async with self._lifecycle_action(
+                            manager, inst, source="unhealthy_delete"
+                        ) as permit:
+                            if permit.local:
+                                await manager.delete(inst, grace_s=0)
                     except Exception:
                         logger.exception(
                             "Unhealthy-delete failed for kind=%s id=%s",
@@ -262,39 +268,84 @@ class InstanceLifecycleReconciler:
         can never be snapshotted (gone/unreachable pod) is force-deleted after
         a bounded number of attempts rather than retried forever.
         """
-        if not await manager.is_reapable(inst):
-            return
-        if not await manager.is_dirty(inst):
-            await manager.delete(inst, grace_s=0)
-            stats["reaped"] += 1
-            return
-        if await manager.is_reachable(inst):
-            ref = await manager.snapshot(inst)
-            if ref:
+        async with self._lifecycle_action(manager, inst, source="reap") as permit:
+            if not permit.local:
+                return
+            if not await manager.is_reapable(inst):
+                permit.complete()
+                return
+            if not await manager.is_dirty(inst):
                 await manager.delete(inst, grace_s=0)
-                stats["reaped"] += 1
+                if permit.local:
+                    stats["reaped"] += 1
+                return
+            if await manager.is_reachable(inst):
+                ref = await manager.snapshot(inst)
+                if not permit.local:
+                    return
+                if ref:
+                    await manager.delete(inst, grace_s=0)
+                    if permit.local:
+                        stats["reaped"] += 1
+                else:
+                    await manager.record_attempt(inst)
+                    if permit.local:
+                        stats["reap_attempts"] += 1
+                return
+            if await manager.attempts_exhausted(inst):
+                await manager.give_up(inst, grace_s=0)
+                if not permit.local:
+                    return
+                stats["reap_forced"] += 1
+                # Data-loss signal: a dirty instance we could never snapshot.
+                # Logged (not a Prometheus counter — codebase has none) so
+                # log-based alerting can fire on it. Applies to any reapable kind
+                # (workspace, vm); kind-specific detail stays out of the message.
+                logger.warning(
+                    "Lifecycle reaper force-deleted dirty unreachable instance "
+                    "kind=%s id=%s bound=%s — state not captured "
+                    "(snapshot attempts exhausted)",
+                    manager.kind,
+                    inst.id,
+                    inst.bound_to,
+                )
             else:
                 await manager.record_attempt(inst)
-                stats["reap_attempts"] += 1
+                if permit.local:
+                    stats["reap_attempts"] += 1
+
+    @staticmethod
+    @asynccontextmanager
+    async def _lifecycle_action(
+        manager: InstanceLifecycleManager,
+        inst: Instance,
+        *,
+        source: str,
+    ) -> AsyncIterator[Any]:
+        """Use a manager's optional cross-domain ownership section.
+
+        Agents and default-off workspace/VM managers have no hook and retain
+        the exact historical call sequence.  Completion-aware managers keep a
+        single jobs-row claim across snapshot -> delete, closing the former
+        read-before-I/O window rather than merely checking twice.
+        """
+
+        action = getattr(manager, "lifecycle_action", None)
+        if action is None or not bool(
+            getattr(manager, "completion_lifecycle_ownership_enabled", False)
+        ):
+
+            class _LegacyPermit:
+                local = True
+
+                @staticmethod
+                def complete() -> None:
+                    return None
+
+            yield _LegacyPermit()
             return
-        if await manager.attempts_exhausted(inst):
-            await manager.give_up(inst, grace_s=0)
-            stats["reap_forced"] += 1
-            # Data-loss signal: a dirty instance we could never snapshot.
-            # Logged (not a Prometheus counter — codebase has none) so
-            # log-based alerting can fire on it. Applies to any reapable kind
-            # (workspace, vm); kind-specific detail stays out of the message.
-            logger.warning(
-                "Lifecycle reaper force-deleted dirty unreachable instance "
-                "kind=%s id=%s bound=%s — state not captured "
-                "(snapshot attempts exhausted)",
-                manager.kind,
-                inst.id,
-                inst.bound_to,
-            )
-        else:
-            await manager.record_attempt(inst)
-            stats["reap_attempts"] += 1
+        async with action(inst, source=source) as permit:
+            yield permit
 
     @staticmethod
     def is_stateful(manager: InstanceLifecycleManager) -> bool:

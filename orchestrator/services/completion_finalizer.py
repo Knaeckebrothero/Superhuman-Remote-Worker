@@ -52,6 +52,7 @@ Workflow = Callable[["CompletionEffectRunner"], Awaitable[Mapping[str, Any]]]
 EffectCallback = Callable[[], Awaitable[Any]]
 EffectErrorOutput = Callable[[BaseException], Any]
 EffectRetryPredicate = Callable[[Any], bool]
+EffectSupersedePredicate = Callable[[Any], bool]
 AlertCallback = Callable[[str], Any]
 
 
@@ -224,11 +225,14 @@ _DIAGNOSTIC_OUTPUT_PATHS: dict[str, tuple[tuple[str, ...], ...]] = {
     "freeze_notification": (("error",),),
     "subjob_output_graft": (("graft_result", "reason"),),
     "critic_verdict": (("actions",), ("error",)),
+    "critic_verdict_followup": (("actions",), ("error",)),
     "scholar_parent_unblock": (("actions",), ("error",)),
     "delegation_parent_unblock": (("actions",), ("error",)),
     "verification_critic_spawn": (("actions",), ("error",)),
+    "verification_critic_handoff": (("actions",), ("error",)),
     "curation_final_pass": (("error",),),
     "project_loop_advance": (("actions",), ("error",)),
+    "project_loop_advance_handoff": (("actions",), ("error",)),
     "terminal_merge_change_record": (("actions",), ("error",)),
     "session_wake_enqueue": (("error",),),
     "workspace_archive_teardown": (("actions",), ("error",)),
@@ -470,6 +474,15 @@ class CompletionEffectRunner:
     async def completed_detail(self, name: str) -> Any:
         row = await self._effect_row(name)
         if row is None or str(row["state"]) != "done":
+            return None
+        detail = _json_object(row["detail"]) or {}
+        return detail.get("output")
+
+    async def terminal_detail(self, name: str) -> Any:
+        """Return replay output for ``done|superseded``, never authority proof."""
+
+        row = await self._effect_row(name)
+        if row is None or str(row["state"]) not in {"done", "superseded"}:
             return None
         detail = _json_object(row["detail"]) or {}
         return detail.get("output")
@@ -834,7 +847,7 @@ class CompletionEffectRunner:
                     raise CompletionEffectVersionError(
                         f"effect {name!r} changed group across a resumable command"
                     )
-                if str(row["state"]) == "done":
+                if str(row["state"]) in {"done", "superseded"}:
                     detail = _json_object(row["detail"]) or {}
                     return True, detail.get("output"), None, False
                 if inserted is not None:
@@ -934,7 +947,11 @@ class CompletionEffectRunner:
                 _error_code(exc),
             )
 
-    async def _complete(self, name: str, output: Any) -> None:
+    async def _settle(self, name: str, output: Any, *, state: str) -> None:
+        """Settle one exact-term effect to a replayable terminal state."""
+
+        if state not in {"done", "superseded"}:
+            raise ValueError(f"invalid completion effect terminal state {state!r}")
         prior_row = await self._effect_row(name)
         if prior_row is None:
             raise CompletionLeaseLost(
@@ -951,7 +968,7 @@ class CompletionEffectRunner:
                 """
                 WITH completed_effect AS (
                     UPDATE completion_effects AS effect
-                    SET state = 'done', completed_at = now(),
+                    SET state = $6::text, completed_at = now(),
                         complete_by = NULL, detail = $4::jsonb,
                         error_code = NULL
                     WHERE effect.producer_kind = 'job_completion'
@@ -987,11 +1004,18 @@ class CompletionEffectRunner:
                 name,
                 detail_json,
                 self._command_lease_seconds,
+                state,
             )
         if updated is None:
             raise CompletionLeaseLost(
                 f"completion effect {name!r} finished after its fenced deadline"
             )
+
+    async def _complete(self, name: str, output: Any) -> None:
+        await self._settle(name, output, state="done")
+
+    async def _supersede_effect(self, name: str, output: Any) -> None:
+        await self._settle(name, output, state="superseded")
 
     async def _pending_dependency(self, group: str) -> _GroupBlock | None:
         """Return one durable prerequisite block under this exact command term."""
@@ -1167,6 +1191,7 @@ class CompletionEffectRunner:
         retry_on_error: bool = False,
         error_output: EffectErrorOutput | None = None,
         retry_if: EffectRetryPredicate | None = None,
+        supersede_if: EffectSupersedePredicate | None = None,
         depends_on_groups: Sequence[str] = (),
         effect_timeout_seconds: float | None = None,
         command_lease_seconds: float | None = None,
@@ -1285,6 +1310,9 @@ class CompletionEffectRunner:
             )
             self._blocked_groups[group] = block
             return output
+        if supersede_if is not None and supersede_if(output):
+            await self._supersede_effect(name, output)
+            return output
         await self._complete(name, output)
         return output
 
@@ -1297,6 +1325,7 @@ class CompletionEffectRunner:
         retry_on_error: bool = False,
         error_output: EffectErrorOutput | None = None,
         retry_if: EffectRetryPredicate | None = None,
+        supersede_if: EffectSupersedePredicate | None = None,
         depends_on_groups: Sequence[str] = (),
         effect_timeout_seconds: float | None = None,
         command_lease_seconds: float | None = None,
@@ -1324,6 +1353,7 @@ class CompletionEffectRunner:
                 name=name,
                 group=group,
                 callback=callback,
+                supersede_if=supersede_if,
                 depends_on_groups=depends_on_groups,
                 effect_timeout_seconds=effect_timeout_seconds,
                 command_lease_seconds=command_lease_seconds,
@@ -1334,6 +1364,7 @@ class CompletionEffectRunner:
                 name=name,
                 group=group,
                 callback=callback,
+                supersede_if=supersede_if,
                 depends_on_groups=depends_on_groups,
                 effect_timeout_seconds=effect_timeout_seconds,
                 command_lease_seconds=command_lease_seconds,
@@ -1547,7 +1578,7 @@ class CompletionFinalizer:
             FROM completion_effects
             WHERE producer_kind = 'job_completion'
               AND producer_id = $1::uuid
-              AND state <> 'done'
+              AND state NOT IN ('done', 'superseded')
             ORDER BY effect_name
             """,
             UUID(command_id),
@@ -1894,7 +1925,7 @@ class CompletionFinalizer:
                       SELECT 1 FROM completion_effects AS effect
                       WHERE effect.producer_kind = 'job_completion'
                         AND effect.producer_id = job_completion_commands.id
-                        AND effect.state <> 'done'
+                        AND effect.state NOT IN ('done', 'superseded')
                   )
                 RETURNING *
                 """,

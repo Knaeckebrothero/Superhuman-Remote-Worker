@@ -87,6 +87,7 @@ _TERMINAL = ("completed", "failed", "cancelled")
 
 # advance_fn(job, result, actions) -> Awaitable — wired to _advance_project_loop.
 AdvanceFn = Callable[[dict[str, Any], dict[str, Any], list[str]], Awaitable[None]]
+ReconcileHandoffFn = Callable[[], Awaitable[int]]
 
 
 async def project_loop_sweeper_loop(
@@ -94,12 +95,22 @@ async def project_loop_sweeper_loop(
     shutdown_event: asyncio.Event,
     *,
     advance_fn: AdvanceFn,
+    completion_commands_enabled: bool = False,
+    reconcile_handoff_fn: ReconcileHandoffFn | None = None,
 ) -> None:
     """Recover wedged project loops until ``shutdown_event`` is set."""
     logger.info("Project loop sweeper started (tick=%ds)", TICK_SECONDS)
     while not shutdown_event.is_set():
         try:
-            recovered = await _sweep_tick(db, advance_fn)
+            if completion_commands_enabled:
+                recovered = await _sweep_tick(
+                    db,
+                    advance_fn,
+                    completion_commands_enabled=True,
+                    reconcile_handoff_fn=reconcile_handoff_fn,
+                )
+            else:
+                recovered = await _sweep_tick(db, advance_fn)
             if recovered:
                 logger.info(
                     "Project loop sweeper recovered %d wedged loop(s)", recovered
@@ -116,19 +127,42 @@ async def project_loop_sweeper_loop(
     logger.info("Project loop sweeper stopped")
 
 
-async def _sweep_tick(db: Any, advance_fn: AdvanceFn) -> int:
+async def _sweep_tick(
+    db: Any,
+    advance_fn: AdvanceFn,
+    *,
+    completion_commands_enabled: bool = False,
+    reconcile_handoff_fn: ReconcileHandoffFn | None = None,
+) -> int:
     """Recover any running loop whose in-flight turn stalled.
 
     Returns the number of loops recovered this tick.
     """
     recovered = 0
+    if completion_commands_enabled and reconcile_handoff_fn is not None:
+        try:
+            recovered += int(await reconcile_handoff_fn())
+        except Exception:
+            logger.exception(
+                "project loop: persisted atomic handoff reconciliation failed; "
+                "will retry next tick"
+            )
     for loop in await db.list_running_project_loops():
         # The in-flight turn is barrier-tracked in current_stage_jobs (width 1
         # included). The backstop only steps in once every member is terminal
         # (a missed barrier hook); the atomic claim makes the re-run idempotent.
         stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
         if stage_ids:
-            recovered += await _sweep_stage(db, loop, stage_ids, advance_fn)
+            if completion_commands_enabled:
+                recovered += await _sweep_stage(
+                    db,
+                    loop,
+                    stage_ids,
+                    advance_fn,
+                    completion_commands_enabled=True,
+                )
+            else:
+                recovered += await _sweep_stage(db, loop, stage_ids, advance_fn)
             continue
 
         if (loop.get("scheduling") or "standard") == "officer":
@@ -153,6 +187,16 @@ async def _sweep_tick(db: Any, advance_fn: AdvanceFn) -> int:
             # newer turn's membership — that would fire the barrier under the
             # NEW running job and double-spawn (the exact incident class this
             # branch exists to kill).
+            if completion_commands_enabled and await _member_finalization_live(
+                db, [str(cur)]
+            ):
+                logger.debug(
+                    "project loop %s: legacy pointer member %s has a live "
+                    "completion finalizer; deferring adoption",
+                    str(loop.get("id"))[:8],
+                    str(cur)[:8],
+                )
+                continue
             if await db.adopt_project_loop_pointer_turn(str(loop["id"]), str(cur)):
                 logger.warning(
                     "project loop %s: adopting legacy width-1 pointer %s into "
@@ -172,7 +216,14 @@ async def _sweep_tick(db: Any, advance_fn: AdvanceFn) -> int:
         # before the first spawn. The heal restores membership; it returns a
         # job only when the restored turn is already fully terminal, meaning
         # the rotate itself was lost — re-run it now.
-        job = await _heal_wedged_loop(db, loop)
+        if completion_commands_enabled:
+            job = await _heal_wedged_loop(
+                db,
+                loop,
+                completion_commands_enabled=True,
+            )
+        else:
+            job = await _heal_wedged_loop(db, loop)
         if not job:
             continue
         logger.warning(
@@ -191,7 +242,12 @@ async def _sweep_tick(db: Any, advance_fn: AdvanceFn) -> int:
 
 
 async def _sweep_stage(
-    db: Any, loop: dict[str, Any], stage_ids: list[str], advance_fn: AdvanceFn
+    db: Any,
+    loop: dict[str, Any],
+    stage_ids: list[str],
+    advance_fn: AdvanceFn,
+    *,
+    completion_commands_enabled: bool = False,
 ) -> int:
     """Backstop for a loop with a turn in flight (any width).
 
@@ -217,6 +273,14 @@ async def _sweep_stage(
 
     Returns 1 if a recovery advance ran, else 0.
     """
+    if completion_commands_enabled and await _member_finalization_live(db, stage_ids):
+        logger.debug(
+            "project loop %s: in-flight turn has a live completion finalizer; "
+            "sweeper stands down",
+            str(loop.get("id"))[:8],
+        )
+        return 0
+
     statuses = await db.get_loop_stage_member_statuses(stage_ids)
     survivors = [mid for mid in stage_ids if mid in statuses]
     if any(statuses[mid] not in _TERMINAL for mid in survivors):
@@ -334,7 +398,28 @@ def _wedge_age_seconds(loop: dict[str, Any]) -> float | None:
     return (datetime.now(timezone.utc) - updated_at).total_seconds()
 
 
-async def _heal_wedged_loop(db: Any, loop: dict[str, Any]) -> dict[str, Any] | None:
+async def _member_finalization_live(db: Any, member_ids: list[str]) -> bool:
+    """Whether the shared completion route says a member is finalizing live.
+
+    Callers invoke this helper only with ``COMPLETION_COMMANDS_ENABLED`` on.
+    Keeping the flag at the caller is intentional: the default-off sweeper
+    retains its historical DB call graph and never touches command relations.
+    The database helper consumes the authoritative routed-sweep view rather
+    than reproducing lease/deadline predicates here.
+    """
+
+    return bool(
+        member_ids
+        and await db.project_loop_members_have_live_completion_command(member_ids)
+    )
+
+
+async def _heal_wedged_loop(
+    db: Any,
+    loop: dict[str, Any],
+    *,
+    completion_commands_enabled: bool = False,
+) -> dict[str, Any] | None:
     """Restore membership for a running loop with both pointer columns empty.
 
     That state is either the transient window of a live advance (young — see
@@ -368,6 +453,19 @@ async def _heal_wedged_loop(db: Any, loop: dict[str, Any]) -> dict[str, Any] | N
         return None
 
     members = await db.get_newest_loop_stage(loop_id)
+    member_ids = [str(member["id"]) for member in members]
+    if completion_commands_enabled and await _member_finalization_live(db, member_ids):
+        # This is the exact dup-iter-14 collision: a live finalizer owns the
+        # old turn while its Class-C advance is between observation and commit.
+        # An expired/parked command is deliberately NOT hidden here: the
+        # synthesizer may fire, after which S32's exact world CAS either owns
+        # the successor materialization or supersedes on the changed world.
+        logger.debug(
+            "project loop %s: cleared pointers belong to a live completion "
+            "finalizer; deferring the 600s heal",
+            loop_id[:8],
+        )
+        return None
     ctx = members[0].get("context") if members else None
     if isinstance(ctx, str):
         try:
@@ -386,7 +484,6 @@ async def _heal_wedged_loop(db: Any, loop: dict[str, Any]) -> dict[str, Any] | N
         return None
 
     seq_index, total_jobs_run, remaining = derived
-    member_ids = [str(m["id"]) for m in members]
     if not await db.heal_project_loop_stage(
         loop_id,
         member_ids,

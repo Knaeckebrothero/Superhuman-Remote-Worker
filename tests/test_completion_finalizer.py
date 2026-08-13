@@ -537,7 +537,8 @@ class _StatefulConnection:
                 for (producer_id, effect_name), effect in sorted(
                     self.effects.items(), key=lambda item: item[0][1]
                 )
-                if producer_id == command_id and effect["state"] != "done"
+                if producer_id == command_id
+                and effect["state"] not in {"done", "superseded"}
             ]
         raise AssertionError(f"unexpected fetch query: {sql}")
 
@@ -554,7 +555,7 @@ class _StatefulConnection:
             )
 
         if normalized.startswith("with completed_effect as"):
-            command_id, owner, name, detail_json, base_lease_seconds = args
+            command_id, owner, name, detail_json, base_lease_seconds, state = args
             command_id = UUID(str(command_id))
             effect = self.effects[(command_id, name)]
             if (
@@ -565,7 +566,7 @@ class _StatefulConnection:
             ):
                 return None
             effect.update(
-                state="done",
+                state=state,
                 completed_at=self.now,
                 complete_by=None,
                 detail=json.loads(detail_json),
@@ -751,6 +752,57 @@ async def test_effect_intent_precedes_callback_and_completed_detail_replays() ->
         name="workspace_archive", group="teardown", callback=must_not_run
     ) == {"pod_uid": "uid-a"}
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_superseded_effect_replays_but_is_not_done_authority() -> None:
+    conn = _StatefulConnection(_finalizing())
+    runner = CompletionEffectRunner(
+        conn,
+        command=conn.commands[COMMAND_ID],
+        owner="owner-a",
+        effect_lease_seconds=30,
+    )
+
+    async def lose_world_state_cas() -> dict[str, Any]:
+        return {"won": False, "status": "pending_review"}
+
+    output = await runner.run(
+        name="world_state_cas",
+        group="synthesizer",
+        callback=lose_world_state_cas,
+        supersede_if=lambda value: value["won"] is False,
+    )
+
+    assert output == {"won": False, "status": "pending_review"}
+    assert conn.effects[(COMMAND_ID, "world_state_cas")]["state"] == "superseded"
+    assert await runner.has_started("world_state_cas")
+    assert not await runner.has_completed("world_state_cas")
+    assert await runner.completed_detail("world_state_cas") is None
+    assert await runner.terminal_detail("world_state_cas") == {
+        "won": False,
+        "status": "pending_review",
+    }
+
+    conn.commands[COMMAND_ID].update(
+        finalizing_by="owner-b", lease_expires_at=NOW + timedelta(minutes=2)
+    )
+    successor = CompletionEffectRunner(
+        conn,
+        command=conn.commands[COMMAND_ID],
+        owner="owner-b",
+        effect_lease_seconds=30,
+    )
+
+    async def must_not_run() -> None:
+        raise AssertionError("superseded effect callback was replayed")
+
+    assert await successor.run(
+        name="world_state_cas",
+        group="synthesizer",
+        callback=must_not_run,
+        supersede_if=lambda value: value["won"] is False,
+    ) == {"won": False, "status": "pending_review"}
 
 
 @pytest.mark.asyncio

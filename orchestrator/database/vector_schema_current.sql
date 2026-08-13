@@ -743,6 +743,27 @@ CREATE TABLE public.memory_retrieval_messages (
 
 
 --
+-- Name: project_loop_ttl_effects; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project_loop_ttl_effects (
+    loop_id uuid NOT NULL,
+    total_jobs_run integer NOT NULL,
+    completed_member_id uuid NOT NULL,
+    project_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT project_loop_ttl_effects_total_jobs_run_check CHECK ((total_jobs_run >= 0))
+);
+
+
+--
+-- Name: TABLE project_loop_ttl_effects; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.project_loop_ttl_effects IS 'Immutable project-loop turn identities whose knowledge_index cycle TTL decrement committed. A key collision with different project/member identity is corruption and callers fail closed.';
+
+
+--
 -- Name: schema_migrations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1003,6 +1024,14 @@ ALTER TABLE ONLY public.memories
 
 ALTER TABLE ONLY public.memory_retrieval_messages
     ADD CONSTRAINT memory_retrieval_messages_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: project_loop_ttl_effects project_loop_ttl_effects_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_loop_ttl_effects
+    ADD CONSTRAINT project_loop_ttl_effects_pkey PRIMARY KEY (loop_id, total_jobs_run);
 
 
 --

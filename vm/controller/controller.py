@@ -328,6 +328,20 @@ def _admitted_vm_uid(value: object, *, expected_name: str) -> str | None:
     return uid
 
 
+def _safe_uid(value: object) -> str | None:
+    """Validate one opaque Kubernetes UID without interpreting its format."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 256
+        or any(character.isspace() for character in value)
+    ):
+        return None
+    return value
+
+
 def _admitted_pvc_uid(
     value: object,
     *,
@@ -939,6 +953,8 @@ class VMController:
         job_id: str,
         purge_disk: bool = True,
         provision_generation: str | None = None,
+        expected_vm_uid: str | None = None,
+        expected_rootdisk_pvc_uid: str | None = None,
     ) -> dict:
         """Delete a KubeVirt VirtualMachine for a job.
 
@@ -951,6 +967,8 @@ class VMController:
                 job_id,
                 purge_disk=purge_disk,
                 provision_generation=provision_generation,
+                expected_vm_uid=expected_vm_uid,
+                expected_rootdisk_pvc_uid=expected_rootdisk_pvc_uid,
             )
 
     async def _do_delete_serialized(
@@ -958,6 +976,8 @@ class VMController:
         job_id: str,
         purge_disk: bool = True,
         provision_generation: str | None = None,
+        expected_vm_uid: str | None = None,
+        expected_rootdisk_pvc_uid: str | None = None,
     ) -> dict:
         """Delete while holding the reusable entity-name lifecycle lock.
 
@@ -1020,6 +1040,37 @@ class VMController:
                     raise RuntimeError(
                         "refusing to delete a VM without its admitted immutable UID"
                     )
+                if expected_vm_uid is not None and admitted_vm_uid != expected_vm_uid:
+                    raise RuntimeError("refusing to delete a superseded VM UID")
+
+        rootdisk = _rootdisk_name(job_id)
+        captured_rootdisk_absent = False
+        if expected_rootdisk_pvc_uid is not None:
+            rootdisk_known, observed_rootdisk_uid = await self._rootdisk_pvc_probe(
+                rootdisk,
+                owner_id=job_id,
+                owner_kind=None,
+                wait=False,
+            )
+            if not rootdisk_known:
+                raise RuntimeError(
+                    "captured rootdisk PVC identity is temporarily unknown"
+                )
+            if observed_rootdisk_uid is None:
+                # Response-loss replay: only the conjunction of absent VM,
+                # absent PVC, and absent DataVolume is exact completion.
+                captured_rootdisk_absent = bool(
+                    vm_already_absent and await self._get_dv(rootdisk) is None
+                )
+                if not captured_rootdisk_absent:
+                    raise RuntimeError(
+                        "captured rootdisk PVC is absent but teardown is incomplete"
+                    )
+            if observed_rootdisk_uid != expected_rootdisk_pvc_uid:
+                if not captured_rootdisk_absent:
+                    raise RuntimeError(
+                        "refusing to delete a superseded rootdisk PVC UID"
+                    )
 
         try:
             if vm_already_absent:
@@ -1048,13 +1099,24 @@ class VMController:
             else:
                 raise
 
-        rootdisk = _rootdisk_name(job_id)
         if purge_disk:
             # Non-fatal: a disk we failed to delete is a leak the GC backstop
             # catches, whereas raising here would strand the VM delete itself.
             try:
-                await self._delete_dv(rootdisk)
+                if (
+                    expected_rootdisk_pvc_uid is not None
+                    and not captured_rootdisk_absent
+                ):
+                    await self._delete_captured_rootdisk(
+                        rootdisk,
+                        owner_id=job_id,
+                        expected_pvc_uid=expected_rootdisk_pvc_uid,
+                    )
+                elif not captured_rootdisk_absent:
+                    await self._delete_dv(rootdisk)
             except Exception as e:
+                if expected_rootdisk_pvc_uid is not None:
+                    raise
                 log.warning("rootdisk purge failed for %s: %s", rootdisk, e)
             if self.headscale.is_available:
                 await self.headscale.delete_node(job_id)
@@ -1083,7 +1145,7 @@ class VMController:
             result["generation_evidence"] = "request-echo-vm-absent"
         return result
 
-    async def _do_list(self) -> dict:
+    async def _do_list(self, *, include_teardown_identity: bool = False) -> dict:
         """Enumerate the agent VMs this controller manages.
 
         Inventory source for the orchestrator's VM orphan sweep
@@ -1107,26 +1169,70 @@ class VMController:
             name = meta.get("name", "")
             if not name.startswith("agent-vm-") or name.startswith("agent-vm-golden-"):
                 continue
-            out.append(
-                {
-                    "vm_name": name,
-                    "entity_id": name[len("agent-vm-") :],
-                    "created_at": meta.get("creationTimestamp"),
-                    "phase": item.get("status", {}).get("printableStatus", "Unknown"),
-                }
-            )
+            entity_id = name[len("agent-vm-") :]
+            inventory = {
+                "vm_name": name,
+                "entity_id": entity_id,
+                "created_at": meta.get("creationTimestamp"),
+                "phase": item.get("status", {}).get("printableStatus", "Unknown"),
+            }
+            if include_teardown_identity:
+                generation = _admitted_provision_generation(item)
+                vm_uid = _admitted_vm_uid(item, expected_name=name)
+                rootdisk_uid = await self._rootdisk_pvc_uid(
+                    _rootdisk_name(entity_id),
+                    owner_id=entity_id,
+                    owner_kind=None,
+                    wait=False,
+                )
+                if generation is not None:
+                    inventory["provision_generation"] = generation
+                if vm_uid is not None:
+                    inventory["vm_uid"] = vm_uid
+                if rootdisk_uid is not None:
+                    inventory["rootdisk_pvc_uid"] = rootdisk_uid
+            out.append(inventory)
         return {"vms": out}
 
-    async def _do_status(self, job_id: str) -> dict:
+    async def _do_status(
+        self,
+        job_id: str,
+        provision_generation: str | None = None,
+        *,
+        exact_absence: bool = False,
+    ) -> dict:
         """Query KubeVirt for a VM's current status."""
+        from kubernetes.client.exceptions import ApiException
+
         vm_name = f"agent-vm-{job_id}"
-        vm = self.k8s_client.get_namespaced_custom_object(
-            group=KUBEVIRT_GROUP,
-            version=KUBEVIRT_VERSION,
-            namespace=VM_NAMESPACE,
-            plural=KUBEVIRT_PLURAL,
-            name=vm_name,
-        )
+        try:
+            vm = self.k8s_client.get_namespaced_custom_object(
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_PLURAL,
+                name=vm_name,
+            )
+        except ApiException as exc:
+            if exc.status != 404 or not exact_absence:
+                raise
+            rootdisk_known, rootdisk_uid = await self._rootdisk_pvc_probe(
+                _rootdisk_name(job_id),
+                owner_id=job_id,
+                owner_kind=None,
+                wait=False,
+            )
+            return {
+                "job_id": job_id,
+                "status": "not_found",
+                "provision_generation": _provision_generation(provision_generation),
+                "rootdisk_identity_known": rootdisk_known,
+                **(
+                    {"rootdisk_pvc_uid": rootdisk_uid}
+                    if rootdisk_uid is not None
+                    else {}
+                ),
+            }
         status = vm.get("status", {})
         metadata = vm.get("metadata", {})
         labels = metadata.get("labels", {}) if isinstance(metadata, Mapping) else {}
@@ -1153,12 +1259,23 @@ class VMController:
             result["provision_generation"] = generation
         if entity_type in _OWNER_KINDS:
             result["entity_type"] = entity_type
-        rootdisk_pvc_uid = await self._rootdisk_pvc_uid(
-            _rootdisk_name(job_id),
-            owner_id=job_id,
-            owner_kind=None,
-            wait=False,
-        )
+        if exact_absence:
+            rootdisk_known, rootdisk_pvc_uid = await self._rootdisk_pvc_probe(
+                _rootdisk_name(job_id),
+                owner_id=job_id,
+                owner_kind=None,
+                wait=False,
+            )
+            result["rootdisk_identity_known"] = rootdisk_known
+        else:
+            # Preserve the ordinary status response/call shape.  Only the
+            # explicit teardown probe may publish an authenticated absence bit.
+            rootdisk_pvc_uid = await self._rootdisk_pvc_uid(
+                _rootdisk_name(job_id),
+                owner_id=job_id,
+                owner_kind=None,
+                wait=False,
+            )
         if rootdisk_pvc_uid is not None:
             result["rootdisk_pvc_uid"] = rootdisk_pvc_uid
         return result
@@ -1188,6 +1305,24 @@ class VMController:
         authenticated identity.
         """
 
+        _known, uid = await self._rootdisk_pvc_probe(
+            name,
+            owner_id=owner_id,
+            owner_kind=owner_kind,
+            wait=wait,
+        )
+        return uid
+
+    async def _rootdisk_pvc_probe(
+        self,
+        name: str,
+        *,
+        owner_id: str,
+        owner_kind: str | None,
+        wait: bool,
+    ) -> tuple[bool, str | None]:
+        """Return ``(known, uid)`` to distinguish 404 from API ambiguity."""
+
         from kubernetes.client.exceptions import ApiException
 
         if self.core_api is None:
@@ -1195,8 +1330,9 @@ class VMController:
                 "rootdisk PVC identity unavailable for %s: CoreV1Api is not initialized",
                 name,
             )
-            return None
+            return False, None
         attempts = max(1, VM_ROOTDISK_PVC_UID_ATTEMPTS if wait else 1)
+        exact_absence = False
         for attempt in range(attempts):
             try:
                 pvc = await asyncio.to_thread(
@@ -1209,10 +1345,11 @@ class VMController:
                     log.warning(
                         "rootdisk PVC identity read failed for %s: %s", name, exc
                     )
-                    return None
+                    return False, None
+                exact_absence = True
             except Exception as exc:
                 log.warning("rootdisk PVC identity read failed for %s: %s", name, exc)
-                return None
+                return False, None
             else:
                 uid = _admitted_pvc_uid(
                     pvc,
@@ -1221,15 +1358,18 @@ class VMController:
                     expected_owner_kind=owner_kind,
                 )
                 if uid is not None:
-                    return uid
+                    return True, uid
+                return False, None
             if attempt + 1 < attempts and VM_ROOTDISK_PVC_UID_RETRY_SECONDS > 0:
                 await asyncio.sleep(VM_ROOTDISK_PVC_UID_RETRY_SECONDS)
+        if exact_absence:
+            return True, None
         log.warning(
             "rootdisk PVC %s was not admitted with the expected immutable identity; "
             "storage attribution will remain unknown",
             name,
         )
-        return None
+        return False, None
 
     async def _get_dv(self, name: str) -> dict | None:
         """GET a CDI DataVolume by name; None on 404."""
@@ -1249,7 +1389,67 @@ class VMController:
                 return None
             raise
 
-    async def _delete_dv(self, name: str) -> None:
+    async def _delete_captured_rootdisk(
+        self,
+        name: str,
+        *,
+        owner_id: str,
+        expected_pvc_uid: str,
+    ) -> None:
+        """Purge only the rootdisk whose immutable PVC UID was captured."""
+
+        if self.core_api is None:
+            raise RuntimeError("CoreV1Api is unavailable for captured rootdisk delete")
+        known, observed_uid = await self._rootdisk_pvc_probe(
+            name,
+            owner_id=owner_id,
+            owner_kind=None,
+            wait=False,
+        )
+        if not known:
+            raise RuntimeError("captured rootdisk PVC identity is unknown")
+        if observed_uid != expected_pvc_uid:
+            raise RuntimeError("refusing to delete a superseded rootdisk PVC UID")
+
+        # Bind the reusable DataVolume name to the exact object observed beside
+        # the captured PVC, then use Kubernetes UID preconditions on both
+        # deletes.  The explicit PVC delete makes the captured storage fence
+        # authoritative even if CDI cascade cleanup is delayed.
+        dv = await self._get_dv(name)
+        dv_uid = None
+        if dv is not None:
+            metadata = dv.get("metadata") if isinstance(dv, Mapping) else None
+            labels = metadata.get("labels") if isinstance(metadata, Mapping) else None
+            if (
+                not isinstance(metadata, Mapping)
+                or not isinstance(labels, Mapping)
+                or labels.get("srw.io/owner-id") != owner_id
+                or labels.get("srw.io/owner-kind") not in _OWNER_KINDS
+            ):
+                raise RuntimeError("rootdisk DataVolume ownership is not exact")
+            dv_uid = _safe_uid(metadata.get("uid"))
+            if dv_uid is None:
+                raise RuntimeError("rootdisk DataVolume UID is unavailable")
+            await self._delete_dv(name, expected_uid=dv_uid)
+
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            await asyncio.to_thread(
+                self.core_api.delete_namespaced_persistent_volume_claim,
+                name=name,
+                namespace=VM_NAMESPACE,
+                body={
+                    "apiVersion": "v1",
+                    "kind": "DeleteOptions",
+                    "preconditions": {"uid": expected_pvc_uid},
+                },
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
+
+    async def _delete_dv(self, name: str, *, expected_uid: str | None = None) -> None:
         """DELETE a CDI DataVolume (its PVC cascades); 404 is success."""
         from kubernetes.client.exceptions import ApiException
 
@@ -1261,6 +1461,17 @@ class VMController:
                 namespace=VM_NAMESPACE,
                 plural=CDI_PLURAL,
                 name=name,
+                **(
+                    {
+                        "body": {
+                            "apiVersion": "v1",
+                            "kind": "DeleteOptions",
+                            "preconditions": {"uid": expected_uid},
+                        }
+                    }
+                    if expected_uid is not None
+                    else {}
+                ),
             )
         except ApiException as e:
             if e.status != 404:
@@ -1747,11 +1958,17 @@ class VMController:
             request_generation = _provision_generation(data.get("provision_generation"))
             # Absent field → purge, so an un-upgraded orchestrator keeps exact
             # current semantics.
-            result = await self._do_delete(
-                data["job_id"],
-                purge_disk=data.get("purge_disk", True) is not False,
-                provision_generation=data.get("provision_generation"),
-            )
+            delete_kwargs = {
+                "purge_disk": data.get("purge_disk", True) is not False,
+                "provision_generation": data.get("provision_generation"),
+            }
+            if data.get("expected_vm_uid") is not None:
+                delete_kwargs["expected_vm_uid"] = data["expected_vm_uid"]
+            if data.get("expected_rootdisk_pvc_uid") is not None:
+                delete_kwargs["expected_rootdisk_pvc_uid"] = data[
+                    "expected_rootdisk_pvc_uid"
+                ]
+            result = await self._do_delete(data["job_id"], **delete_kwargs)
             await self._publish_status(
                 result["job_id"],
                 result,
@@ -1792,7 +2009,11 @@ class VMController:
             request_id = _lifecycle_request_id(data)
             data = unsigned_payload(data)
             request_generation = _provision_generation(data.get("provision_generation"))
-            response = await self._do_status(data["job_id"])
+            response = await self._do_status(
+                data["job_id"],
+                provision_generation=request_generation,
+                exact_absence=data.get("exact_absence") is True,
+            )
             response = sign_payload(
                 response,
                 direction="response",
@@ -1850,8 +2071,13 @@ class VMController:
             ) or not await self._verify_lifecycle_request(data, "list", mutating=False):
                 raise PermissionError("invalid VM lifecycle list authentication")
             request_id = _lifecycle_request_id(data)
+            unsigned = unsigned_payload(data)
             response = sign_payload(
-                await self._do_list(),
+                await self._do_list(
+                    include_teardown_identity=(
+                        unsigned.get("include_teardown_identity") is True
+                    )
+                ),
                 direction="response",
                 operation="list",
                 secret=LIFECYCLE_HMAC_SECRET,
@@ -1948,6 +2174,20 @@ class VMController:
                 "job_id": job_id,
                 "purge_disk": purge_disk,
                 "provision_generation": request.query.get("provision_generation"),
+                **(
+                    {"expected_vm_uid": request.query.get("expected_vm_uid")}
+                    if request.query.get("expected_vm_uid") is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "expected_rootdisk_pvc_uid": request.query.get(
+                            "expected_rootdisk_pvc_uid"
+                        )
+                    }
+                    if request.query.get("expected_rootdisk_pvc_uid") is not None
+                    else {}
+                ),
             },
             operation="delete",
         )
@@ -1959,11 +2199,17 @@ class VMController:
         request_payload = unsigned_payload(request_payload)
 
         try:
-            result = await self._do_delete(
-                job_id,
-                purge_disk=purge_disk,
-                provision_generation=request_payload.get("provision_generation"),
-            )
+            delete_kwargs = {
+                "purge_disk": purge_disk,
+                "provision_generation": request_payload.get("provision_generation"),
+            }
+            if request_payload.get("expected_vm_uid") is not None:
+                delete_kwargs["expected_vm_uid"] = request_payload["expected_vm_uid"]
+            if request_payload.get("expected_rootdisk_pvc_uid") is not None:
+                delete_kwargs["expected_rootdisk_pvc_uid"] = request_payload[
+                    "expected_rootdisk_pvc_uid"
+                ]
+            result = await self._do_delete(job_id, **delete_kwargs)
             return web.json_response(
                 sign_payload(
                     result,
@@ -2003,11 +2249,15 @@ class VMController:
         job_id = request.match_info.get("job_id")
         if not job_id:
             return web.json_response({"error": "job_id required"}, status=400)
+        exact_absence = (
+            str(request.query.get("exact_absence", "false")).lower() == "true"
+        )
         request_payload = _authenticated_http_payload(
             request,
             {
                 "job_id": job_id,
                 "provision_generation": request.query.get("provision_generation"),
+                **({"exact_absence": True} if exact_absence else {}),
             },
             operation="status",
         )
@@ -2018,7 +2268,11 @@ class VMController:
         request_id = _lifecycle_request_id(request_payload)
 
         try:
-            result = await self._do_status(job_id)
+            result = await self._do_status(
+                job_id,
+                provision_generation=request_payload.get("provision_generation"),
+                exact_absence=request_payload.get("exact_absence") is True,
+            )
             return web.json_response(
                 sign_payload(
                     result,
@@ -2076,14 +2330,24 @@ class VMController:
         """GET /vms — enumerate managed agent VMs (orphan-sweep inventory)."""
         from aiohttp import web
 
-        request_payload = _authenticated_http_payload(request, {}, operation="list")
+        include_teardown_identity = (
+            str(request.query.get("include_teardown_identity", "false")).lower()
+            == "true"
+        )
+        request_payload = _authenticated_http_payload(
+            request,
+            ({"include_teardown_identity": True} if include_teardown_identity else {}),
+            operation="list",
+        )
         if not await self._verify_lifecycle_request(
             request_payload, "list", mutating=False
         ):
             return web.json_response({"error": "authentication failed"}, status=401)
         request_id = _lifecycle_request_id(request_payload)
         try:
-            result = await self._do_list()
+            result = await self._do_list(
+                include_teardown_identity=include_teardown_identity
+            )
             return web.json_response(
                 sign_payload(
                     result,

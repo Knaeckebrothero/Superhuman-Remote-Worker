@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,17 @@ _LOOP_JOB_GITIGNORE = "\n".join(
 )
 
 
-async def _ensure_loop_job_gitignore(gitea_client: Any, repo_name: str) -> bool:
+async def _permit(authority_check: Callable[[], Awaitable[None]] | None) -> None:
+    if authority_check is not None:
+        await authority_check()
+
+
+async def _ensure_loop_job_gitignore(
+    gitea_client: Any,
+    repo_name: str,
+    *,
+    authority_check: Callable[[], Awaitable[None]] | None = None,
+) -> bool:
     """Seed the scratch-floor ``.gitignore`` on an isolated loop repo (idempotent).
 
     Runs before the loop job works on its isolated repo's ``main`` so commits
@@ -74,24 +85,26 @@ async def _ensure_loop_job_gitignore(gitea_client: Any, repo_name: str) -> bool:
     carries the floor, do nothing. A loop treats ``False`` as a provisioning
     failure because the seed commit also establishes a readable ``main`` HEAD.
     """
+    await _permit(authority_check)
     try:
         existing = await gitea_client.get_file_bytes(
             repo_name, ".gitignore", ref="main"
         )
+        await _permit(authority_check)
         if existing is not None and b"todos.yaml" in existing:
             return True  # floor already present
         if existing is None:
             content_b64 = base64.b64encode(_LOOP_JOB_GITIGNORE.encode("utf-8")).decode(
                 "ascii"
             )
-            return bool(
-                await gitea_client.change_files(
-                    repo_name,
-                    "main",
-                    [{"path": ".gitignore", "content_b64": content_b64}],
-                    message="Add loop scratch .gitignore floor",
-                )
+            changed = await gitea_client.change_files(
+                repo_name,
+                "main",
+                [{"path": ".gitignore", "content_b64": content_b64}],
+                message="Add loop scratch .gitignore floor",
             )
+            await _permit(authority_check)
+            return bool(changed)
         else:
             # .gitignore exists without the floor (rare — seeding runs before the
             # workspace ever touches main). change_files is create-only, so leave
@@ -103,6 +116,11 @@ async def _ensure_loop_job_gitignore(gitea_client: Any, repo_name: str) -> bool:
             )
             return False
     except Exception as e:
+        if authority_check is not None:
+            from services.project_loop_atomic import ProjectLoopHandoffAuthorityLost
+
+            if isinstance(e, ProjectLoopHandoffAuthorityLost):
+                raise
         logger.warning("Failed to seed loop .gitignore floor for %s: %s", repo_name, e)
         return False
 
@@ -114,6 +132,7 @@ async def provision_job_repo(
     postgres_db: Any,
     main_cloud_router: Any,
     loop_floor: bool = False,
+    authority_check: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Provision a job's Gitea repo/branch, grant creator access, seed baseline.
 
@@ -130,6 +149,7 @@ async def provision_job_repo(
     the user when they have never logged into Gitea directly (the old
     email-only call silently no-ops for such users).
     """
+    await _permit(authority_check)
     if not gitea_client.is_initialized:
         if loop_floor:
             raise RuntimeError(
@@ -150,12 +170,15 @@ async def provision_job_repo(
 
     if parent_job_id:
         # Subjob: branch on parent's repo
+        await _permit(authority_check)
         parent = await postgres_db.get_job(parent_job_id)
+        await _permit(authority_check)
         if parent:
             # Resolve parent's repo name (parent may be root or itself a subjob)
             parent_repo_name = parent.get("repo_name")
             if not parent_repo_name and parent.get("parent_job_id"):
                 root = await postgres_db.get_job(str(parent["parent_job_id"]))
+                await _permit(authority_check)
                 if root:
                     parent_repo_name = root.get("repo_name")
             if not parent_repo_name:
@@ -164,6 +187,7 @@ async def provision_job_repo(
                     repos = await postgres_db.get_project_repositories(
                         str(parent["project_id"]), role="jobs"
                     )
+                    await _permit(authority_check)
                     if repos:
                         parent_repo_name = repos[0]["name"]
                 if not parent_repo_name:
@@ -175,6 +199,7 @@ async def provision_job_repo(
             branch_ok = await gitea_client.create_branch(
                 parent_repo_name, branch_name, from_branch=from_branch
             )
+            await _permit(authority_check)
             if not branch_ok:
                 logger.error(
                     f"Failed to create branch '{branch_name}' from '{from_branch}' "
@@ -188,13 +213,16 @@ async def provision_job_repo(
                     ),
                 },
             )
+            await _permit(authority_check)
             async with postgres_db.acquire() as conn:
+                await _permit(authority_check)
                 await conn.execute(
                     "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
                     branch_name,
                     parent_repo_name,
                     job_row["id"],
                 )
+            await _permit(authority_check)
             job_row["branch_name"] = branch_name
             job_row["repo_name"] = parent_repo_name
     else:
@@ -203,10 +231,19 @@ async def provision_job_repo(
         # job's workspace lineage. Existing jobs keep their stored legacy repo;
         # only newly-created roots pass through this branch.
         repo_name = f"job-{short_id}"
+        await _permit(authority_check)
         git_remote_url = await gitea_client.create_repo(repo_name)
+        await _permit(authority_check)
         if git_remote_url:
+            gitignore_kwargs = (
+                {"authority_check": authority_check}
+                if authority_check is not None
+                else {}
+            )
             if loop_floor and not await _ensure_loop_job_gitignore(
-                gitea_client, repo_name
+                gitea_client,
+                repo_name,
+                **gitignore_kwargs,
             ):
                 raise RuntimeError(
                     f"could not initialize isolated loop repository {repo_name}"
@@ -217,12 +254,15 @@ async def provision_job_repo(
                     "git_remote_url": git_remote_url,
                 },
             )
+            await _permit(authority_check)
             async with postgres_db.acquire() as conn:
+                await _permit(authority_check)
                 await conn.execute(
                     "UPDATE jobs SET repo_name = $1 WHERE id = $2",
                     repo_name,
                     job_row["id"],
                 )
+            await _permit(authority_check)
             job_row["repo_name"] = repo_name
         elif loop_floor:
             raise RuntimeError(f"could not create isolated loop repository {repo_name}")
@@ -234,7 +274,9 @@ async def provision_job_repo(
     # instead of creating a duplicate.
     if job_row.get("repo_name") and user_id:
         try:
+            await _permit(authority_check)
             creator = await postgres_db.get_user(user_id)
+            await _permit(authority_check)
             if creator and creator.get("email"):
                 email_local = creator["email"].split("@")[0]
                 await gitea_client.grant_user_repo_access(
@@ -244,7 +286,15 @@ async def provision_job_repo(
                     full_name=creator.get("display_name"),
                     sub=creator.get("keycloak_sub"),
                 )
+                await _permit(authority_check)
         except Exception as e:
+            if authority_check is not None:
+                from services.project_loop_atomic import (
+                    ProjectLoopHandoffAuthorityLost,
+                )
+
+                if isinstance(e, ProjectLoopHandoffAuthorityLost):
+                    raise
             logger.warning(f"Failed to grant Gitea access for job {job_id_str}: {e}")
 
     # Mode A baseline seed (job_cloud_export.md §3.1). Fire-and-forget —
@@ -259,13 +309,25 @@ async def provision_job_repo(
     # loose jobs and projects without a cloud_folder handle skip this path.
     if project_id and job_row.get("repo_name"):
         try:
+            await _permit(authority_check)
             project_row = await postgres_db.get_project(project_id)
-        except Exception:
+            await _permit(authority_check)
+        except Exception as exc:
+            if authority_check is not None:
+                from services.project_loop_atomic import (
+                    ProjectLoopHandoffAuthorityLost,
+                )
+
+                if isinstance(exc, ProjectLoopHandoffAuthorityLost):
+                    raise
             project_row = None
         if project_row and project_row.get("main_cloud_folder_handle"):
             if loop_floor:
                 from services.job_cloud_baseline import seed_project_folder_baseline
 
+                baseline_kwargs: dict[str, Any] = {}
+                if authority_check is not None:
+                    baseline_kwargs["authority_check"] = authority_check
                 await seed_project_folder_baseline(
                     job_id=job_id_str,
                     project=project_row,
@@ -275,8 +337,11 @@ async def provision_job_repo(
                     gitea_client=gitea_client,
                     main_cloud_router=main_cloud_router,
                     require_complete=True,
+                    **baseline_kwargs,
                 )
+                await _permit(authority_check)
                 refreshed = await postgres_db.get_job(job_id_str)
+                await _permit(authority_check)
                 if not refreshed or not refreshed.get("cloud_diff_baseline_commit"):
                     raise RuntimeError(
                         "project cloud baseline could not be seeded completely"

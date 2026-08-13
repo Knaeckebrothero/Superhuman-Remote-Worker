@@ -56,6 +56,7 @@ class _RecordingRunner:
         self.callback_counts: Counter[str] = Counter()
         self.retry_if_names: set[str] = set()
         self.transactional_names: set[str] = set()
+        self.superseded_names: set[str] = set()
 
     async def run(
         self,
@@ -66,6 +67,7 @@ class _RecordingRunner:
         retry_on_error: bool = False,
         error_output=None,
         retry_if=None,
+        supersede_if=None,
         depends_on_groups=(),
         effect_timeout_seconds=None,
         command_lease_seconds=None,
@@ -97,6 +99,11 @@ class _RecordingRunner:
         if retry_if is not None and retry_if(detail):
             self.pending[name] = copy.deepcopy(detail)
             return copy.deepcopy(detail)
+        if supersede_if is not None and supersede_if(detail):
+            self.pending.pop(name, None)
+            self.superseded_names.add(name)
+            self.details[name] = copy.deepcopy(detail)
+            return copy.deepcopy(detail)
         self.pending.pop(name, None)
         self.details[name] = copy.deepcopy(detail)
         return copy.deepcopy(detail)
@@ -109,9 +116,15 @@ class _RecordingRunner:
         return name in self.started
 
     async def has_completed(self, name: str) -> bool:
-        return name in self.details
+        return name in self.details and name not in self.superseded_names
 
     async def completed_detail(self, name: str):
+        if name in self.superseded_names:
+            return None
+        detail = self.details.get(name)
+        return copy.deepcopy(detail)
+
+    async def terminal_detail(self, name: str):
         detail = self.details.get(name)
         return copy.deepcopy(detail)
 
@@ -169,6 +182,11 @@ class _RouteDB:
         database = self
 
         class _Connection:
+            async def fetchrow(self, _sql: str, *_args):
+                row = copy.deepcopy(database.job)
+                row["db_now_epoch"] = datetime.now(timezone.utc).timestamp()
+                return row
+
             async def execute(self, _sql: str, *_args):
                 database.execute_count += 1
                 return "UPDATE 1"
@@ -593,6 +611,36 @@ async def test_effect_runner_reconstructs_normal_result_without_repeating_effect
     wake.assert_awaited_once_with(database, JOB_ID, "completed")
     dispatch.assert_called_once_with()
     wake_drain.assert_called_once_with(database)
+
+
+@pytest.mark.asyncio
+async def test_pre_m3_terminal_loop_effect_never_synthesizes_new_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shipped S32 output already includes every legacy consequence."""
+
+    database = _RouteDB(_route_job())
+    runner = _RecordingRunner()
+    runner.details["project_loop_advance"] = {
+        "actions": ["legacy project loop consequence"]
+    }
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=AsyncMock(return_value={"actions": []}),
+        workspace_cleanup=AsyncMock(return_value=[]),
+    )
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    assert "legacy project loop consequence" in result["actions"]
+    assert "project_loop_advance_handoff" not in runner.started
 
 
 @pytest.mark.asyncio
@@ -1535,6 +1583,375 @@ async def test_active_s36_marker_status_drift_parks_without_clearing_effect(
 
 
 @pytest.mark.asyncio
+async def test_flagged_vm_teardown_captures_replays_and_archives_exact_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+
+    job = _route_job()
+    job["context"] = {
+        "vm": {
+            "status": "ready",
+            "provision_generation": "00000000-0000-4000-8000-000000000001",
+            "vm_uid": "vm-uid-a",
+            "rootdisk_pvc_uid": "root-uid-a",
+            "ssh_host": "100.64.0.8",
+            "ssh_port": 22,
+        }
+    }
+    database = _RouteDB(job)
+    runner = _RecordingRunner()
+    identity = VMTeardownIdentity(
+        "00000000-0000-4000-8000-000000000001",
+        "vm-uid-a",
+        "root-uid-a",
+    )
+    capture = AsyncMock(return_value=identity)
+    release = AsyncMock(return_value=VMTeardownResult("completed", True))
+    legacy_cleanup = AsyncMock(return_value=["legacy cleanup"])
+    monkeypatch.setattr(main, "postgres_db", database)
+    monkeypatch.setattr(main.vm_provisioner, "capture_vm_teardown_identity", capture)
+    monkeypatch.setattr(main.vm_provisioner, "release_vm_captured", release)
+    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", legacy_cleanup)
+
+    first = await main._run_completion_workspace_teardown(JOB_ID, runner)
+    replay = await main._run_completion_workspace_teardown(JOB_ID, runner)
+
+    assert (
+        first
+        == replay
+        == {
+            "actions": ["vm released"],
+            "teardown_disposition": "completed",
+        }
+    )
+    assert runner.intents["workspace_archive_teardown"] == {
+        "kind": "vm",
+        "provision_generation": identity.provision_generation,
+        "vm_uid": "vm-uid-a",
+        "rootdisk_pvc_uid": "root-uid-a",
+        "ssh_host": "100.64.0.8",
+        "ssh_port": 22,
+    }
+    capture.assert_awaited_once_with(JOB_ID)
+    release.assert_awaited_once_with(
+        JOB_ID,
+        identity,
+        ssh_host="100.64.0.8",
+        ssh_port=22,
+    )
+    legacy_cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_vm_identity_mismatch_supersedes_only_s36_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+
+    generation = "00000000-0000-4000-8000-000000000001"
+    job = _route_job()
+    job["context"] = {"vm": {"status": "ready"}}
+    database = _RouteDB(job)
+    runner = _RecordingRunner()
+    runner.intents["workspace_archive_teardown"] = {
+        "kind": "vm",
+        "provision_generation": generation,
+        "vm_uid": "old-vm-uid",
+        "rootdisk_pvc_uid": "old-root-uid",
+        "ssh_host": "100.64.0.8",
+        "ssh_port": 22,
+    }
+    release = AsyncMock(return_value=VMTeardownResult("identity_superseded", False))
+    monkeypatch.setattr(main, "postgres_db", database)
+    monkeypatch.setattr(main.vm_provisioner, "release_vm_captured", release)
+    monkeypatch.setattr(
+        main.vm_provisioner,
+        "capture_vm_teardown_identity",
+        AsyncMock(side_effect=AssertionError("must replay captured intent")),
+    )
+
+    output = await main._run_completion_workspace_teardown(JOB_ID, runner)
+
+    assert output["teardown_disposition"] == "identity_superseded"
+    assert runner.superseded_names == {"workspace_archive_teardown"}
+    release.assert_awaited_once_with(
+        JOB_ID,
+        VMTeardownIdentity(generation, "old-vm-uid", "old-root-uid"),
+        ssh_host="100.64.0.8",
+        ssh_port=22,
+    )
+
+
+@pytest.mark.asyncio
+async def test_docker_vm_s36_keeps_durable_legacy_cleanup_without_identity_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _route_job()
+    job["context"] = {
+        "vm": {
+            "status": "ready",
+            "provisioner": "docker",
+            "ssh_host": "127.0.0.1",
+            "ssh_port": 2222,
+        }
+    }
+    runner = _RecordingRunner()
+    legacy_cleanup = AsyncMock(return_value=["docker vm released"])
+    monkeypatch.setattr(main, "postgres_db", _RouteDB(job))
+    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", legacy_cleanup)
+    monkeypatch.setattr(
+        main.vm_provisioner,
+        "capture_vm_teardown_identity",
+        AsyncMock(side_effect=AssertionError("Docker has no KubeVirt identity")),
+    )
+
+    first = await main._run_completion_workspace_teardown(JOB_ID, runner)
+    replay = await main._run_completion_workspace_teardown(JOB_ID, runner)
+
+    assert (
+        first
+        == replay
+        == {
+            "actions": ["docker vm released"],
+            "teardown_disposition": "completed",
+        }
+    )
+    assert "workspace_archive_teardown" not in runner.intents
+    assert runner.callback_counts["workspace_archive_teardown"] == 1
+    legacy_cleanup.assert_awaited_once_with(JOB_ID)
+
+
+@pytest.mark.asyncio
+async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+
+    generation = "00000000-0000-4000-8000-000000000001"
+    host_key = "SHA256:" + ("A" * 43)
+    workspace_identity = main.WorkspaceTeardownIdentity(
+        pod_uid="pod-uid-a",
+        pvc_uid="pvc-uid-a",
+        service_uid="service-uid-a",
+        pod_ip="10.0.0.8",
+        ssh_host_key_fingerprint=host_key,
+    )
+    vm_identity = VMTeardownIdentity(generation, "vm-uid-a", "root-uid-a")
+    job = _route_job()
+    job["context"] = {
+        "workspace_container": {"status": "ready", "provisioner": "k8s"},
+        "vm": {
+            "status": "ready",
+            "provisioner": "kubevirt",
+            "ssh_host": "100.64.0.8",
+            "ssh_port": 22,
+        },
+    }
+    runner = _RecordingRunner()
+    release_order: list[str] = []
+
+    async def release_vm(*_args, **_kwargs):
+        release_order.append("vm")
+        return VMTeardownResult("completed", True)
+
+    async def release_kubernetes(*_args, **_kwargs):
+        release_order.append("kubernetes")
+        return True
+
+    monkeypatch.setattr(main, "postgres_db", _RouteDB(job))
+    monkeypatch.setattr(
+        main.container_provisioner,
+        "capture_terminal_workspace_identity",
+        AsyncMock(return_value=workspace_identity),
+    )
+    monkeypatch.setattr(
+        main.vm_provisioner,
+        "capture_vm_teardown_identity",
+        AsyncMock(return_value=vm_identity),
+    )
+    release_vm_mock = AsyncMock(side_effect=release_vm)
+    release_kubernetes_mock = AsyncMock(side_effect=release_kubernetes)
+    monkeypatch.setattr(main.vm_provisioner, "release_vm_captured", release_vm_mock)
+    monkeypatch.setattr(
+        main.container_provisioner,
+        "release_workspace",
+        release_kubernetes_mock,
+    )
+    legacy_cleanup = AsyncMock(side_effect=AssertionError("must stay UID fenced"))
+    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", legacy_cleanup)
+
+    first = await main._run_completion_workspace_teardown(JOB_ID, runner)
+    replay = await main._run_completion_workspace_teardown(JOB_ID, runner)
+
+    assert (
+        first
+        == replay
+        == {
+            "actions": ["vm released", "k8s workspace released"],
+            "teardown_disposition": "completed",
+        }
+    )
+    intent = runner.intents["workspace_archive_teardown"]
+    assert intent["kind"] == "vm_and_kubernetes"
+    assert intent["vm"] == {
+        "provision_generation": generation,
+        "vm_uid": "vm-uid-a",
+        "rootdisk_pvc_uid": "root-uid-a",
+        "ssh_host": "100.64.0.8",
+        "ssh_port": 22,
+    }
+    assert intent["kubernetes"] == {
+        "pod_uid": "pod-uid-a",
+        "pvc_uid": "pvc-uid-a",
+        "service_uid": "service-uid-a",
+        "pod_ip": "10.0.0.8",
+        "ssh_host_key_fingerprint": host_key,
+        "ssh_port": 30022,
+        "snapshot_generation": COMMAND_ID,
+        "snapshot_created_at": intent["kubernetes"]["snapshot_created_at"],
+    }
+    assert release_order == ["vm", "kubernetes"]
+    assert runner.callback_counts["workspace_archive_teardown"] == 1
+    legacy_cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["vm", "kubernetes"])
+async def test_hybrid_s36_replacement_supersedes_and_preserves_other_names(
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    from services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+
+    generation = "00000000-0000-4000-8000-000000000001"
+    host_key = "SHA256:" + ("A" * 43)
+    workspace_identity = main.WorkspaceTeardownIdentity(
+        pod_uid="old-pod-uid",
+        pvc_uid="old-pvc-uid",
+        service_uid="old-service-uid",
+        pod_ip="10.0.0.8",
+        ssh_host_key_fingerprint=host_key,
+    )
+    job = _route_job()
+    job["context"] = {
+        "workspace_container": {"status": "ready", "provisioner": "k8s"},
+        "vm": {
+            "status": "ready",
+            "provisioner": "kubevirt",
+            "ssh_host": "100.64.0.8",
+            "ssh_port": 22,
+        },
+    }
+    runner = _RecordingRunner()
+    monkeypatch.setattr(main, "postgres_db", _RouteDB(job))
+    monkeypatch.setattr(
+        main.container_provisioner,
+        "capture_terminal_workspace_identity",
+        AsyncMock(return_value=workspace_identity),
+    )
+    monkeypatch.setattr(
+        main.vm_provisioner,
+        "capture_vm_teardown_identity",
+        AsyncMock(
+            return_value=VMTeardownIdentity(generation, "old-vm-uid", "old-root-uid")
+        ),
+    )
+    release_vm = AsyncMock(
+        return_value=VMTeardownResult(
+            "identity_superseded" if replacement == "vm" else "completed",
+            False if replacement == "vm" else True,
+        )
+    )
+    release_kubernetes = AsyncMock(return_value=replacement == "vm")
+    classify_kubernetes = AsyncMock(return_value="identity_superseded")
+    monkeypatch.setattr(main.vm_provisioner, "release_vm_captured", release_vm)
+    monkeypatch.setattr(
+        main.container_provisioner,
+        "release_workspace",
+        release_kubernetes,
+    )
+    monkeypatch.setattr(
+        main.container_provisioner,
+        "classify_workspace_teardown_identity",
+        classify_kubernetes,
+    )
+    legacy_cleanup = AsyncMock(side_effect=AssertionError("must preserve successors"))
+    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", legacy_cleanup)
+
+    output = await main._run_completion_workspace_teardown(JOB_ID, runner)
+
+    assert output["teardown_disposition"] == "identity_superseded"
+    assert runner.superseded_names == {"workspace_archive_teardown"}
+    legacy_cleanup.assert_not_awaited()
+    release_kubernetes.assert_awaited_once()
+    if replacement == "vm":
+        classify_kubernetes.assert_not_awaited()
+        assert output["actions"] == ["k8s workspace released"]
+    else:
+        classify_kubernetes.assert_awaited_once_with(
+            main.WorkspaceOwner.job(JOB_ID), workspace_identity
+        )
+        assert output["actions"] == ["vm released"]
+
+
+@pytest.mark.asyncio
+async def test_hybrid_s36_retry_precedes_replacement_supersede(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.vm_provisioner import VMTeardownResult
+
+    generation = "00000000-0000-4000-8000-000000000001"
+    host_key = "SHA256:" + ("A" * 43)
+    runner = _RecordingRunner()
+    runner.intents["workspace_archive_teardown"] = {
+        "kind": "vm_and_kubernetes",
+        "vm": {
+            "provision_generation": generation,
+            "vm_uid": "old-vm-uid",
+            "rootdisk_pvc_uid": "old-root-uid",
+            "ssh_host": "100.64.0.8",
+            "ssh_port": 22,
+        },
+        "kubernetes": {
+            "pod_uid": "old-pod-uid",
+            "pvc_uid": "old-pvc-uid",
+            "service_uid": "old-service-uid",
+            "pod_ip": "10.0.0.8",
+            "ssh_host_key_fingerprint": host_key,
+            "ssh_port": 30022,
+            "snapshot_generation": COMMAND_ID,
+            "snapshot_created_at": "2026-08-13T01:02:03+00:00",
+        },
+    }
+    monkeypatch.setattr(main, "postgres_db", _RouteDB(_route_job()))
+    monkeypatch.setattr(
+        main.vm_provisioner,
+        "release_vm_captured",
+        AsyncMock(return_value=VMTeardownResult("identity_superseded", False)),
+    )
+    release_kubernetes = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        main.container_provisioner,
+        "release_workspace",
+        release_kubernetes,
+    )
+    monkeypatch.setattr(
+        main.container_provisioner,
+        "classify_workspace_teardown_identity",
+        AsyncMock(return_value="unknown"),
+    )
+
+    output = await main._run_completion_workspace_teardown(JOB_ID, runner)
+
+    assert output["teardown_disposition"] == "retry_pending"
+    assert "captured Kubernetes teardown remains unknown" in output["error"]
+    assert "workspace_archive_teardown" in runner.pending
+    assert not runner.superseded_names
+    release_kubernetes.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_flagged_kubernetes_teardown_captures_and_uses_exact_uids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1717,15 +2134,12 @@ async def test_kubernetes_teardown_resume_reuses_intent_after_pod_disappears(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("use_runner", [False, True])
-async def test_kubernetes_uid_teardown_stays_off_for_default_off_and_vm_lanes(
+async def test_kubernetes_uid_teardown_stays_off_for_default_off(
     monkeypatch: pytest.MonkeyPatch,
-    use_runner: bool,
 ) -> None:
     job = _route_job()
     job["context"] = {
         "workspace_container": {"status": "ready", "provisioner": "k8s"},
-        **({"vm": {"status": "ready"}} if use_runner else {}),
     }
     database = _RouteDB(job)
     terminal_effects = AsyncMock(return_value={"actions": ["terminal durable"]})
@@ -1754,7 +2168,7 @@ async def test_kubernetes_uid_teardown_stays_off_for_default_off_and_vm_lanes(
         JOB_ID,
         _body(),
         _authorized=True,
-        _effect_runner=_RecordingRunner() if use_runner else None,
+        _effect_runner=None,
     )
 
     assert result["actions"][-1] == "legacy cleanup"

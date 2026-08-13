@@ -118,6 +118,35 @@ async def _status(db, job_id):
     return row["status"]
 
 
+async def _insert_completion_command(db, job_id, *, route_case):
+    state = "parked" if route_case == "parked" else "finalizing"
+    lease_interval = (
+        "interval '5 minutes'" if route_case == "live" else "interval '-1 minute'"
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            f"""
+            INSERT INTO job_completion_commands (
+                job_id, report_seq, client_report_id, payload, payload_digest,
+                accepted_job_status, origin, requested_by, state, attempts,
+                lease_expires_at, deadline_at, finalizing_by, code_version,
+                error_code
+            ) VALUES (
+                $1, 1, $2, '{{}}'::jsonb, 'watchdog-route', 'reviewing',
+                'operator', 'watchdog-test', $3, 1,
+                CASE WHEN $3 = 'finalizing' THEN now() + {lease_interval} END,
+                now() + interval '1 hour',
+                CASE WHEN $3 = 'finalizing' THEN 'watchdog-finalizer' END,
+                'gate3-v1',
+                CASE WHEN $3 = 'parked' THEN 'operator_hold' END
+            )
+            """,
+            job_id,
+            uuid4(),
+            state,
+        )
+
+
 def _round(round_num, critic_job_id, verdict):
     """Minimal round record — only the fields the watchdog's SQL reads."""
     return {"round": round_num, "critic_job_id": str(critic_job_id), "verdict": verdict}
@@ -697,3 +726,92 @@ async def test_wallclock_ignores_dead_critic_parents(db):
 
     assert await db.unstick_reviewing_parents_wallclock(WALLCLOCK_MINUTES) == []
     assert await _status(db, target) == "reviewing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wallclock", [False, True])
+@pytest.mark.parametrize(
+    ("route_case", "expected_status"),
+    [
+        ("live", "reviewing"),
+        ("expired", "pending_review"),
+        ("parked", "pending_review"),
+    ],
+)
+async def test_watchdogs_defer_only_to_live_finalizer_lease(
+    db, wallclock, route_case, expected_status
+):
+    target = uuid4()
+    await _insert_job(
+        db,
+        job_id=target,
+        status="reviewing",
+        updated_minutes_ago=120,
+        context={},
+    )
+    if wallclock:
+        critic = uuid4()
+        await _insert_job(
+            db,
+            job_id=critic,
+            status="processing",
+            parent_job_id=target,
+            context={"verification_target": str(target)},
+            created_minutes_ago=120,
+        )
+    await _insert_completion_command(db, target, route_case=route_case)
+
+    if wallclock:
+        await db.unstick_reviewing_parents_wallclock(
+            WALLCLOCK_MINUTES, completion_commands_enabled=True
+        )
+    else:
+        await db.unstick_reviewing_parents(
+            GRACE_MINUTES, completion_commands_enabled=True
+        )
+
+    assert await _status(db, target) == expected_status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wallclock", [False, True])
+@pytest.mark.parametrize(
+    ("route_case", "expected_status"),
+    [
+        ("live", "reviewing"),
+        ("expired", "pending_review"),
+        ("parked", "pending_review"),
+    ],
+)
+async def test_watchdogs_defer_to_live_critic_finalizer_lease_only(
+    db, wallclock, route_case, expected_status
+):
+    target = uuid4()
+    critic = uuid4()
+    await _insert_job(
+        db,
+        job_id=target,
+        status="reviewing",
+        updated_minutes_ago=120,
+        context={},
+    )
+    await _insert_job(
+        db,
+        job_id=critic,
+        status="processing" if wallclock else "failed",
+        parent_job_id=target,
+        context={"verification_target": str(target)},
+        created_minutes_ago=120,
+    )
+    await _insert_completion_command(db, critic, route_case=route_case)
+
+    if wallclock:
+        await db.unstick_reviewing_parents_wallclock(
+            WALLCLOCK_MINUTES, completion_commands_enabled=True
+        )
+    else:
+        await db.unstick_reviewing_parents(
+            GRACE_MINUTES, completion_commands_enabled=True
+        )
+
+    assert await _status(db, target) == expected_status

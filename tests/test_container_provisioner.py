@@ -4687,6 +4687,55 @@ class TestWorkspaceNamedResourceAuthority:
         p._delete_service.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_s36_classifier_proves_pod_replacement_is_superseded(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
+
+        p = self._provisioner()
+        p.workspace_pod_authority = AsyncMock(return_value="replacement")
+
+        disposition = await p.classify_workspace_teardown_identity(
+            self.OWNER,
+            WorkspaceTeardownIdentity(
+                pod_uid=self.POD_UID,
+                pvc_uid=self.RESOURCE_UID,
+                service_uid=self.RESOURCE_UID,
+            ),
+        )
+
+        assert disposition == "identity_superseded"
+        p._core_api.read_namespaced_persistent_volume_claim.assert_not_called()
+        p._core_api.read_namespaced_service.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_s36_classifier_proves_pvc_replacement_is_superseded(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
+
+        p = self._provisioner()
+        p.workspace_pod_authority = AsyncMock(return_value="exact_absent")
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = (
+            TestStrictStatelessWorkspaceCreation._claim(
+                p,
+                uid="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            )
+        )
+
+        disposition = await p.classify_workspace_teardown_identity(
+            self.OWNER,
+            WorkspaceTeardownIdentity(
+                pod_uid=self.POD_UID,
+                pvc_uid=self.RESOURCE_UID,
+                service_uid=self.RESOURCE_UID,
+            ),
+        )
+
+        assert disposition == "identity_superseded"
+        p._core_api.read_namespaced_service.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_s36_release_aborts_all_deletes_when_replacement_appears_at_handoff(
         self,
     ):

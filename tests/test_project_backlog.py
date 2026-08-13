@@ -975,6 +975,45 @@ def _repo_db(**roles):
 
 class TestCloseBacklogTicket:
     @pytest.mark.asyncio
+    async def test_handoff_lease_loss_after_file_mirror_skips_vector_follow_on(self):
+        """A stale handoff owner may finish its in-flight Gitea write, but it
+        must not start the independent vector consequence afterwards.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+        from services.project_loop_atomic import ProjectLoopHandoffAuthorityLost
+
+        vector_db = MagicMock()
+        gitea = MagicMock()
+        gitea.get_file_content = AsyncMock(
+            return_value="---\nid: feature-x\ntype: feature\nstatus: active\n---\n# T\n"
+        )
+        gitea.create_or_update_file = AsyncMock(return_value=True)
+        permits = 0
+
+        async def authority_check():
+            nonlocal permits
+            permits += 1
+            # before resolve, after resolve, after read, before write, after write
+            if permits == 5:
+                raise ProjectLoopHandoffAuthorityLost("test lease loss")
+
+        with pytest.raises(ProjectLoopHandoffAuthorityLost, match="test lease loss"):
+            await close_backlog_ticket(
+                vector_db,
+                gitea,
+                "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+                "feature-x",
+                "resolved",
+                postgres_db=_repo_db(),
+                authority_check=authority_check,
+            )
+
+        gitea.create_or_update_file.assert_awaited_once()
+        vector_db.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_writes_file_and_index(self):
         """Index-only would be reverted by the next kb_reindex pass, which
         re-ingests status from the markdown frontmatter."""

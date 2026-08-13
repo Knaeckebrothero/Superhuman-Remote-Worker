@@ -2178,6 +2178,244 @@ class TestPurgeDiskIntent:
             entity_type="thread",
         )
 
+
+class TestCapturedVmTeardown:
+    @staticmethod
+    def _identity():
+        from orchestrator.services.vm_provisioner import VMTeardownIdentity
+
+        return VMTeardownIdentity(
+            provision_generation=PROVISION_GENERATION,
+            vm_uid="captured-vm-uid",
+            rootdisk_pvc_uid="captured-root-uid",
+        )
+
+    @staticmethod
+    def _probe(disposition: str, *, vm_uid=None, root_uid=None, known=True):
+        from orchestrator.services.vm_provisioner import (
+            VMTeardownIdentity,
+            _VMTeardownProbe,
+        )
+
+        return _VMTeardownProbe(
+            disposition,
+            VMTeardownIdentity(PROVISION_GENERATION, vm_uid, root_uid),
+            rootdisk_identity_known=known,
+        )
+
+    @pytest.mark.asyncio
+    async def test_capture_probes_authenticated_late_rootdisk_uid(
+        self, provisioner_with_k8s, mock_db
+    ):
+        mock_db.get_job.return_value = {
+            "context": {
+                "vm": {
+                    "provision_generation": PROVISION_GENERATION,
+                    "identity_provision_generation": PROVISION_GENERATION,
+                    "identity_authenticated": True,
+                    "vm_uid": "captured-vm-uid",
+                }
+            }
+        }
+        provisioner_with_k8s._probe_vm_teardown_identity = AsyncMock(
+            return_value=self._probe(
+                "present",
+                vm_uid="captured-vm-uid",
+                root_uid="late-root-uid",
+                known=True,
+            )
+        )
+
+        identity = await provisioner_with_k8s.capture_vm_teardown_identity("job-1")
+
+        assert identity.vm_uid == "captured-vm-uid"
+        assert identity.rootdisk_pvc_uid == "late-root-uid"
+
+    @pytest.mark.asyncio
+    async def test_delete_acceptance_waits_for_exact_vm_and_rootdisk_absence(
+        self, provisioner_with_k8s
+    ):
+        present = self._probe(
+            "present",
+            vm_uid="captured-vm-uid",
+            root_uid="captured-root-uid",
+        )
+        provisioner_with_k8s._probe_vm_teardown_identity = AsyncMock(
+            side_effect=[present, present]
+        )
+        provisioner_with_k8s._delete_vm_with_identity = AsyncMock(return_value=True)
+
+        outcome = await provisioner_with_k8s.delete_vm_captured(
+            "job-1", self._identity()
+        )
+
+        assert outcome.disposition == "retry_pending"
+        assert outcome.deleted is False
+
+    @pytest.mark.asyncio
+    async def test_response_loss_converges_with_stale_db_context_after_exact_absence(
+        self, provisioner_with_k8s
+    ):
+        absent = self._probe("absent", vm_uid=None, root_uid=None, known=True)
+        provisioner_with_k8s._probe_vm_teardown_identity = AsyncMock(
+            return_value=absent
+        )
+        provisioner_with_k8s._delete_vm_with_identity = AsyncMock()
+
+        outcome = await provisioner_with_k8s.delete_vm_captured(
+            "job-1", self._identity()
+        )
+
+        assert outcome.disposition == "completed"
+        assert outcome.deleted is True
+        provisioner_with_k8s._delete_vm_with_identity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("vm_uid", "root_uid"),
+        [
+            ("replacement-vm-uid", "captured-root-uid"),
+            ("captured-vm-uid", "replacement-root-uid"),
+        ],
+    )
+    async def test_proven_replacement_identity_supersedes_without_delete(
+        self, provisioner_with_k8s, vm_uid, root_uid
+    ):
+        provisioner_with_k8s._probe_vm_teardown_identity = AsyncMock(
+            return_value=self._probe(
+                "present", vm_uid=vm_uid, root_uid=root_uid, known=True
+            )
+        )
+        provisioner_with_k8s._delete_vm_with_identity = AsyncMock()
+
+        outcome = await provisioner_with_k8s.delete_vm_captured(
+            "job-1", self._identity()
+        )
+
+        assert outcome.disposition == "identity_superseded"
+        provisioner_with_k8s._delete_vm_with_identity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_transport_false_with_unchanged_identity_retries(
+        self, provisioner_with_k8s
+    ):
+        present = self._probe(
+            "present",
+            vm_uid="captured-vm-uid",
+            root_uid="captured-root-uid",
+        )
+        provisioner_with_k8s._probe_vm_teardown_identity = AsyncMock(
+            side_effect=[present, present]
+        )
+        provisioner_with_k8s._delete_vm_with_identity = AsyncMock(return_value=False)
+
+        outcome = await provisioner_with_k8s.delete_vm_captured(
+            "job-1", self._identity()
+        )
+
+        assert outcome.disposition == "retry_pending"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("root_known", [False, True])
+    async def test_active_vm_without_captured_rootdisk_uid_never_purges(
+        self, provisioner_with_k8s, root_known
+    ):
+        identity = self._identity()
+        identity = type(identity)(identity.provision_generation, identity.vm_uid, None)
+        provisioner_with_k8s._probe_vm_teardown_identity = AsyncMock(
+            return_value=self._probe(
+                "present",
+                vm_uid="captured-vm-uid",
+                root_uid=None,
+                known=root_known,
+            )
+        )
+        provisioner_with_k8s._delete_vm_with_identity = AsyncMock()
+
+        outcome = await provisioner_with_k8s.delete_vm_captured("job-1", identity)
+
+        assert outcome.disposition == "identity_unknown"
+        provisioner_with_k8s._delete_vm_with_identity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_orphan_purge_requires_captured_rootdisk_uid(
+        self, provisioner_with_k8s
+    ):
+        identity = self._identity()
+        identity = type(identity)(identity.provision_generation, identity.vm_uid, None)
+        provisioner_with_k8s._delete_vm_with_identity = AsyncMock()
+
+        outcome = await provisioner_with_k8s.delete_orphan_vm_captured(
+            "job-1", identity, purge_disk=True
+        )
+
+        assert outcome.disposition == "identity_unknown"
+        provisioner_with_k8s._delete_vm_with_identity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_orphan_delete_acceptance_waits_for_exact_absence(
+        self, provisioner_with_k8s
+    ):
+        present = self._probe(
+            "present",
+            vm_uid="captured-vm-uid",
+            root_uid="captured-root-uid",
+        )
+        provisioner_with_k8s._probe_vm_teardown_identity = AsyncMock(
+            side_effect=[present, present]
+        )
+        provisioner_with_k8s._delete_vm_with_identity = AsyncMock(return_value=True)
+
+        outcome = await provisioner_with_k8s.delete_orphan_vm_captured(
+            "job-1", self._identity(), purge_disk=True
+        )
+
+        assert (outcome.disposition, outcome.deleted) == ("retry_pending", False)
+
+    @pytest.mark.asyncio
+    async def test_orphan_response_loss_converges_on_exact_absence(
+        self, provisioner_with_k8s
+    ):
+        present = self._probe(
+            "present",
+            vm_uid="captured-vm-uid",
+            root_uid="captured-root-uid",
+        )
+        absent = self._probe("absent", vm_uid=None, root_uid=None, known=True)
+        provisioner_with_k8s._probe_vm_teardown_identity = AsyncMock(
+            side_effect=[present, absent]
+        )
+        provisioner_with_k8s._delete_vm_with_identity = AsyncMock(return_value=False)
+
+        outcome = await provisioner_with_k8s.delete_orphan_vm_captured(
+            "job-1", self._identity(), purge_disk=True
+        )
+
+        assert (outcome.disposition, outcome.deleted) == ("completed", True)
+
+    @pytest.mark.asyncio
+    async def test_orphan_replacement_supersedes_without_delete(
+        self, provisioner_with_k8s
+    ):
+        provisioner_with_k8s._probe_vm_teardown_identity = AsyncMock(
+            return_value=self._probe(
+                "present",
+                vm_uid="replacement-vm-uid",
+                root_uid="captured-root-uid",
+            )
+        )
+        provisioner_with_k8s._delete_vm_with_identity = AsyncMock()
+
+        outcome = await provisioner_with_k8s.delete_orphan_vm_captured(
+            "job-1", self._identity(), purge_disk=True
+        )
+
+        assert (outcome.disposition, outcome.deleted) == (
+            "identity_superseded",
+            False,
+        )
+        provisioner_with_k8s._delete_vm_with_identity.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_http_delete_sends_purge_disk_query_param(
         self, provisioner_with_nats

@@ -23,7 +23,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Any, List, Dict, Tuple
+from typing import Optional, Any, List, Dict, Tuple, Mapping
 from uuid import UUID, uuid4
 
 try:
@@ -8032,6 +8032,23 @@ class PostgresDB:
         if completion_commands_enabled:
             query = query.replace(
                 "        RETURNING p.id, p.user_id, p.config_name",
+                "           AND NOT EXISTS (\n"
+                "                 SELECT 1\n"
+                "                 FROM job_completion_sweep_exclusions "
+                "AS completion_route\n"
+                "                 WHERE completion_route.route = 'stand_down'\n"
+                "                   AND (\n"
+                "                       completion_route.job_id = p.id\n"
+                "                       OR EXISTS (\n"
+                "                           SELECT 1 FROM jobs AS critic_owner\n"
+                "                           WHERE critic_owner.id = "
+                "completion_route.job_id\n"
+                "                             AND critic_owner.parent_job_id = p.id\n"
+                "                             AND critic_owner.context"
+                "->>'verification_target' = p.id::text\n"
+                "                       )\n"
+                "                   )\n"
+                "               )\n"
                 f"           AND NOT ({_completion_control_active_sql('p.context')})\n"
                 "        RETURNING p.id, p.user_id, p.config_name",
             )
@@ -8112,6 +8129,23 @@ class PostgresDB:
         if completion_commands_enabled:
             query = query.replace(
                 "        RETURNING p.id, p.user_id, p.config_name",
+                "           AND NOT EXISTS (\n"
+                "                 SELECT 1\n"
+                "                 FROM job_completion_sweep_exclusions "
+                "AS completion_route\n"
+                "                 WHERE completion_route.route = 'stand_down'\n"
+                "                   AND (\n"
+                "                       completion_route.job_id = p.id\n"
+                "                       OR EXISTS (\n"
+                "                           SELECT 1 FROM jobs AS critic_owner\n"
+                "                           WHERE critic_owner.id = "
+                "completion_route.job_id\n"
+                "                             AND critic_owner.parent_job_id = p.id\n"
+                "                             AND critic_owner.context"
+                "->>'verification_target' = p.id::text\n"
+                "                       )\n"
+                "                   )\n"
+                "               )\n"
                 f"           AND NOT ({_completion_control_active_sql('p.context')})\n"
                 "        RETURNING p.id, p.user_id, p.config_name",
             )
@@ -21232,6 +21266,351 @@ class PostgresDB:
                 "ORDER BY updated_at ASC"
             )
         return [self._project_loop_row_to_dict(r) for r in rows]
+
+    async def project_loop_members_have_live_completion_command(
+        self, job_ids: List[str]
+    ) -> bool:
+        """Return whether a loop member is owned by a live finalizer lease.
+
+        The routed-sweep view is the single source of truth for command lease,
+        deadline, retry-cap, parked, and report-order classification.  Loop
+        healing consumes only its ``stand_down`` row for an actually
+        ``finalizing`` command: expired and parked work must remain visible to
+        their completion-command recovery route rather than become a permanent
+        loop-sweeper exclusion.
+
+        This helper is called only behind ``COMPLETION_COMMANDS_ENABLED`` so a
+        default-off process keeps the legacy project-loop query graph exactly.
+        """
+
+        if not job_ids:
+            return False
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM job_completion_sweep_exclusions AS route
+                        WHERE route.job_id = ANY($1::uuid[])
+                          AND route.command_state = 'finalizing'
+                          AND route.route = 'stand_down'
+                    )
+                    """,
+                    [UUID(job_id) for job_id in job_ids],
+                )
+            )
+
+    async def log_project_loop_message_once(
+        self,
+        *,
+        message_id: str,
+        job_id: str,
+        user_id: str,
+        thread_id: str,
+        subject: str,
+        message: str,
+    ) -> bool:
+        """Insert one immutable loop notification, validating any replay.
+
+        Returns ``True`` only for the inserting caller. A response-lost retry
+        sees the deterministic primary key, validates the complete immutable
+        payload/owner, and returns ``False`` so SSE is not broadcast twice.
+        """
+
+        args = (
+            UUID(message_id),
+            UUID(job_id),
+            UUID(user_id),
+            thread_id,
+            subject,
+            message,
+        )
+        async with self.transaction_scope():
+            async with self.acquire() as conn:
+                inserted = await conn.fetchval(
+                    """
+                    INSERT INTO message_log (
+                        id, job_id, user_id, thread_id, direction,
+                        subject, message, mode, status
+                    ) VALUES (
+                        $1::uuid, $2::uuid, $3::uuid, $4::text, 'outbound',
+                        $5::text, $6::text, 'async', 'sent'
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                    RETURNING TRUE
+                    """,
+                    *args,
+                )
+            if inserted:
+                return True
+            # Separate statement is deliberate: if ON CONFLICT waited for a
+            # concurrent inserter, READ COMMITTED takes a fresh snapshot here
+            # and can see the row whose conflict it observed.
+            async with self.acquire() as conn:
+                matches = await conn.fetchval(
+                    """
+                    SELECT job_id = $2::uuid
+                       AND user_id = $3::uuid
+                       AND thread_id = $4::text
+                       AND direction = 'outbound'
+                       AND subject = $5::text
+                       AND message = $6::text
+                       AND mode = 'async'
+                       AND status = 'sent'
+                    FROM message_log
+                    WHERE id = $1::uuid
+                    """,
+                    *args,
+                )
+        if not matches:
+            raise RuntimeError(
+                "project-loop notification replay identity matched a different payload"
+            )
+        return False
+
+    async def list_pending_project_loop_handoffs(
+        self, *, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Jobs carrying an atomically persisted but claimable loop handoff.
+
+        ``claimed`` rows remain invisible until their DB-clock lease expires.
+        This makes overlapping leader terms single-owner without turning a
+        crashed handoff into a permanent Kubernetes-finalizer-style wedge.
+        """
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM jobs
+                WHERE (
+                    context->'_project_loop_advance_handoff'->>'state' = 'pending'
+                    OR (
+                        context->'_project_loop_advance_handoff'->>'state' = 'claimed'
+                        AND COALESCE(
+                            (context->'_project_loop_advance_handoff'
+                                ->>'claim_expires_epoch')::float8,
+                            0
+                        ) <= extract(epoch FROM now())
+                    )
+                )
+                ORDER BY updated_at ASC, id ASC
+                LIMIT $1::int
+                """,
+                max(1, min(int(limit), 500)),
+            )
+        return [dict(row) for row in rows]
+
+    async def claim_project_loop_handoff(
+        self,
+        job_id: str,
+        *,
+        expected_output: Mapping[str, Any],
+        claimant_id: str,
+        lease_seconds: float,
+    ) -> bool:
+        """Lease one exact pending/expired project-loop external tail."""
+
+        if float(lease_seconds) <= 0:
+            raise ValueError("project-loop handoff lease must be positive")
+        output_json = json.dumps(dict(expected_output), default=str)
+        async with self.acquire() as conn:
+            claimed = await conn.fetchval(
+                """
+                UPDATE jobs
+                SET context = jsonb_set(
+                        context,
+                        '{_project_loop_advance_handoff}',
+                        (context->'_project_loop_advance_handoff')
+                            || jsonb_build_object(
+                                'state', 'claimed',
+                                'claimed_by', $3::text,
+                                'claim_expires_epoch', to_jsonb(
+                                    extract(epoch FROM now()) + $4::float8
+                                )
+                            ),
+                        true
+                    ),
+                    updated_at = now()
+                WHERE id = $1::uuid
+                  AND context->'_project_loop_advance_handoff'->'output' = $2::jsonb
+                  AND (
+                      context->'_project_loop_advance_handoff'->>'state' = 'pending'
+                      OR (
+                          context->'_project_loop_advance_handoff'->>'state' = 'claimed'
+                          AND COALESCE(
+                              (context->'_project_loop_advance_handoff'
+                                  ->>'claim_expires_epoch')::float8,
+                              0
+                          ) <= extract(epoch FROM now())
+                      )
+                  )
+                RETURNING TRUE
+                """,
+                UUID(job_id),
+                output_json,
+                claimant_id,
+                float(lease_seconds),
+            )
+        return bool(claimed)
+
+    async def renew_project_loop_handoff(
+        self,
+        job_id: str,
+        *,
+        expected_output: Mapping[str, Any],
+        claimant_id: str,
+        lease_seconds: float,
+    ) -> bool:
+        """Renew one still-exact handoff claim by its owner."""
+
+        if float(lease_seconds) <= 0:
+            raise ValueError("project-loop handoff lease must be positive")
+        output_json = json.dumps(dict(expected_output), default=str)
+        async with self.acquire() as conn:
+            renewed = await conn.fetchval(
+                """
+                UPDATE jobs
+                SET context = jsonb_set(
+                        context,
+                        '{_project_loop_advance_handoff,claim_expires_epoch}',
+                        to_jsonb(extract(epoch FROM now()) + $4::float8),
+                        false
+                    ),
+                    updated_at = now()
+                WHERE id = $1::uuid
+                  AND context->'_project_loop_advance_handoff'->'output' = $2::jsonb
+                  AND context->'_project_loop_advance_handoff'->>'state' = 'claimed'
+                  AND context->'_project_loop_advance_handoff'->>'claimed_by' = $3::text
+                  AND COALESCE(
+                      (context->'_project_loop_advance_handoff'
+                          ->>'claim_expires_epoch')::float8,
+                      0
+                  ) > extract(epoch FROM now())
+                RETURNING TRUE
+                """,
+                UUID(job_id),
+                output_json,
+                claimant_id,
+                float(lease_seconds),
+            )
+        return bool(renewed)
+
+    async def finish_project_loop_handoff(
+        self,
+        job_id: str,
+        *,
+        expected_output: Mapping[str, Any],
+        result: Mapping[str, Any],
+        claimant_id: str,
+    ) -> Dict[str, Any]:
+        """Mark one exact persisted loop handoff done, or replay its result.
+
+        The predecessor job is the durable recovery index even when advancement
+        stops a loop or leaves an officer loop with empty stage pointers. Exact
+        output comparison prevents a reused job marker from acknowledging a
+        different turn. The renewable claim serializes overlapping leaders;
+        deterministic consequence identities cover the residual response-loss
+        retry after an external commit. This CAS chooses the stored result.
+        """
+
+        output_json = json.dumps(dict(expected_output), default=str)
+        result_json = json.dumps(dict(result), default=str)
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                SET context = jsonb_set(
+                        context,
+                        '{_project_loop_advance_handoff}',
+                        ((context->'_project_loop_advance_handoff')
+                            - 'claimed_by'::text - 'claim_expires_epoch'::text)
+                            || jsonb_build_object(
+                                'state', 'done',
+                                'result', $3::jsonb,
+                                'completed_at', to_jsonb(now()::text)
+                            ),
+                        true
+                    ),
+                    updated_at = now()
+                WHERE id = $1::uuid
+                  AND context->'_project_loop_advance_handoff'->>'state' = 'claimed'
+                  AND context->'_project_loop_advance_handoff'->'output' = $2::jsonb
+                  AND context->'_project_loop_advance_handoff'->>'claimed_by' = $4::text
+                  AND COALESCE(
+                      (context->'_project_loop_advance_handoff'
+                          ->>'claim_expires_epoch')::float8,
+                      0
+                  ) > extract(epoch FROM now())
+                RETURNING context->'_project_loop_advance_handoff' AS handoff
+                """,
+                UUID(job_id),
+                output_json,
+                result_json,
+                claimant_id,
+            )
+            if row is None:
+                existing = await conn.fetchval(
+                    """
+                    SELECT context->'_project_loop_advance_handoff'
+                    FROM jobs WHERE id = $1::uuid
+                    """,
+                    UUID(job_id),
+                )
+                if isinstance(existing, str):
+                    existing = json.loads(existing)
+                if (
+                    not isinstance(existing, Mapping)
+                    or existing.get("output") != dict(expected_output)
+                    or existing.get("state") != "done"
+                    or not isinstance(existing.get("result"), Mapping)
+                ):
+                    raise RuntimeError(
+                        "project-loop handoff marker changed before completion CAS"
+                    )
+                return dict(existing["result"])
+        handoff = row["handoff"]
+        if isinstance(handoff, str):
+            handoff = json.loads(handoff)
+        return dict(handoff["result"])
+
+    async def lock_project_loop_for_advance(
+        self, loop_id: str
+    ) -> Dict[str, Any] | None:
+        """Lock and return one loop row for atomic Class-C advancement.
+
+        Must be called inside :meth:`transaction_scope`; the task-bound acquire
+        makes this row lock cover successor job materialization, pointer and
+        campaign write-back, and the durable effect marker that encloses it.
+        """
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM project_loops WHERE id = $1::uuid FOR UPDATE",
+                UUID(loop_id),
+            )
+        return self._project_loop_row_to_dict(row)
+
+    async def lock_loop_stage_member_statuses(
+        self, job_ids: List[str]
+    ) -> Dict[str, str]:
+        """Lock surviving stage members and return their exact statuses.
+
+        Missing rows remain omitted.  The atomic advance service projects them
+        as the explicit ``missing`` sentinel, matching the historical barrier's
+        ghost-member semantics without inventing a lockable row.
+        """
+
+        if not job_ids:
+            return {}
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, status FROM jobs "
+                "WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+                [UUID(job_id) for job_id in job_ids],
+            )
+        return {str(row["id"]): str(row["status"]) for row in rows}
 
     async def claim_project_loop_stage_barrier(
         self, loop_id: str, member_job_id: str
