@@ -15,12 +15,17 @@ docs/done/supervised_parallel_gates_timeout_fabricates_denial.md:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import src.api.persistent_app as pa
 from src.persistent_graph import PermissionOutcome
+from src.shared.run_queue import heartbeat_unit
 from src.shared.thread_presence import PermissionExpiryResult
 
 
@@ -287,8 +292,40 @@ class TestStatelessDurablePresenceWait:
         )
 
     @pytest.mark.asyncio
+    async def test_fast_status_polls_do_not_move_presence_expiry_boundary(self):
+        conn = _conn_returning(["pending"] * 20)
+        session = _session_with_conn(conn)
+        expiry = AsyncMock(
+            return_value=PermissionExpiryResult(
+                status="expired", owner_live=True, live_for_seconds=None
+            )
+        )
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "00000000-0000-0000-0000-000000000001"),
+            patch.object(pa, "_stateless_mode", return_value=True),
+            patch.object(pa, "_current_stateless_lease_token", return_value=9),
+            patch.object(pa, "expire_permission_if_untethered", expiry),
+            patch.object(pa, "_hard_interrupt_event", None),
+            patch.object(pa, "_PERMISSION_POLL_SECONDS", 0.005),
+        ):
+            waiter = asyncio.create_task(
+                pa._wait_for_permission_resolution("req-boundary", timeout=0.05)
+            )
+            await asyncio.sleep(0.025)
+
+            assert conn.fetchval.await_count >= 3
+            expiry.assert_not_awaited()
+            assert waiter.done() is False
+            assert await waiter == "expired"
+
+        expiry.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_live_client_rechecks_at_presence_expiry(self):
-        conn = _conn_returning(["pending"])
+        # One status read opens each bounded presence slice; the durable
+        # oracle itself supplies the terminal result at the second boundary.
+        conn = _conn_returning(["pending", "pending"])
         session = _session_with_conn(conn)
         expiry = AsyncMock(
             side_effect=[
@@ -330,6 +367,242 @@ class TestStatelessDurablePresenceWait:
         assert not any(
             "expired" in str(call).lower() for call in conn.execute.await_args_list
         )
+
+    @pytest.mark.asyncio
+    async def test_interrupt_does_not_cancel_ambiguous_expiry_mutation(self):
+        """Once the exact-owner CAS starts, its durable outcome is authoritative."""
+
+        conn = _conn_returning(["pending"])
+        session = _session_with_conn(conn)
+        hard_interrupt = asyncio.Event()
+        expiry_started = asyncio.Event()
+        allow_expiry = asyncio.Event()
+
+        async def _expire(*_args, **_kwargs):
+            expiry_started.set()
+            await allow_expiry.wait()
+            return PermissionExpiryResult(
+                status="expired", owner_live=True, live_for_seconds=None
+            )
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "00000000-0000-0000-0000-000000000001"),
+            patch.object(pa, "_stateless_mode", return_value=True),
+            patch.object(pa, "_current_stateless_lease_token", return_value=9),
+            patch.object(pa, "expire_permission_if_untethered", _expire),
+            patch.object(pa, "_hard_interrupt_event", hard_interrupt),
+        ):
+            waiter = asyncio.create_task(
+                pa._wait_for_permission_resolution("req-cas", timeout=0.01)
+            )
+            await asyncio.wait_for(expiry_started.wait(), timeout=0.5)
+            hard_interrupt.set()
+            await asyncio.sleep(0)
+
+            assert waiter.done() is False
+            allow_expiry.set()
+            assert await waiter == "expired"
+
+
+class _ThreeConnectionPool:
+    """Small asyncpg-like pool used to reproduce the stateless listener budget."""
+
+    class _Connection:
+        def __init__(self, pool):
+            self._pool = pool
+
+        async def add_listener(self, _channel, _callback):
+            self._pool.listener_count += 1
+            if self._pool.listener_count == 2:
+                self._pool.listeners_ready.set()
+
+        async def remove_listener(self, _channel, _callback):
+            self._pool.listener_count -= 1
+
+        async def fetchval(self, sql, *_args):
+            if "thread_permission_requests" in sql:
+                self._pool.permission_reads += 1
+                self._pool.permission_read.set()
+                return "pending"
+            self._pool.heartbeat_reads += 1
+            return datetime.now(timezone.utc)
+
+        async def execute(self, _sql, *_args):
+            return "UPDATE 0"
+
+    class _Acquire:
+        def __init__(self, pool):
+            self._pool = pool
+
+        async def __aenter__(self):
+            await self._pool._slots.acquire()
+            self._pool.in_use += 1
+            self._pool.peak_in_use = max(self._pool.peak_in_use, self._pool.in_use)
+            return _ThreeConnectionPool._Connection(self._pool)
+
+        async def __aexit__(self, _exc_type, _exc, _tb):
+            self._pool.in_use -= 1
+            self._pool._slots.release()
+
+    def __init__(self):
+        self._slots = asyncio.Semaphore(3)
+        self.in_use = 0
+        self.peak_in_use = 0
+        self.listener_count = 0
+        self.permission_reads = 0
+        self.heartbeat_reads = 0
+        self.listeners_ready = asyncio.Event()
+        self.permission_read = asyncio.Event()
+
+    def acquire(self):
+        return self._Acquire(self)
+
+    async def fetchval(self, sql, *args):
+        async with self.acquire() as conn:
+            return await conn.fetchval(sql, *args)
+
+
+class TestStatelessPermissionPoolBudget:
+    @pytest.mark.asyncio
+    async def test_pending_gate_leaves_max_three_pool_slot_for_lease_heartbeat(self):
+        """Control + interrupt listeners must not make permission starve renewal.
+
+        This is the production max=3 shape: two long-lived watcher LISTEN
+        connections, one pending supervised gate, and the independent exact
+        lease heartbeat. The gate may use the third connection briefly, but it
+        must return it while waiting for the human decision.
+        """
+
+        pool = _ThreeConnectionPool()
+        thread_id = "00000000-0000-0000-0000-000000000001"
+        control_stop = asyncio.Event()
+        interrupt_stop = asyncio.Event()
+        control_task = None
+        interrupt_task = None
+        permission_task = None
+
+        with (
+            patch.object(pa, "_session", SimpleNamespace(postgres_conn=pool)),
+            patch.object(pa, "_thread_id", thread_id),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_hard_interrupt_event", None),
+            patch.object(pa, "_stateless_mode", return_value=True),
+            patch.object(pa, "_current_stateless_lease_token", return_value=7),
+            patch.object(pa, "_PERMISSION_POLL_SECONDS", 0.05),
+            patch.object(pa, "_drain_thread_controls", AsyncMock(return_value=0)),
+            patch.object(pa, "_drain_thread_interrupts", AsyncMock(return_value=0)),
+        ):
+            try:
+                control_task = asyncio.create_task(
+                    pa._control_watcher_loop(
+                        postgres_conn=pool,
+                        thread_id=thread_id,
+                        stop=control_stop,
+                        lease_token=7,
+                        agent_id=None,
+                    )
+                )
+                interrupt_task = asyncio.create_task(
+                    pa._interrupt_watcher_loop(
+                        postgres_conn=pool,
+                        thread_id=thread_id,
+                        stop=interrupt_stop,
+                        lease_token=7,
+                        target_turn_id=1,
+                    )
+                )
+                await asyncio.wait_for(pool.listeners_ready.wait(), timeout=0.5)
+
+                permission_task = asyncio.create_task(
+                    pa._wait_for_permission_resolution("permission-1", timeout=30)
+                )
+                await asyncio.wait_for(pool.permission_read.wait(), timeout=0.5)
+
+                renewed = await asyncio.wait_for(
+                    heartbeat_unit(pool, unit_id=thread_id, lease_token=7),
+                    timeout=0.5,
+                )
+
+                assert renewed is not None
+                assert pool.heartbeat_reads == 1
+                assert pool.listener_count == 2
+                assert pool.peak_in_use == 3
+                assert permission_task.done() is False
+            finally:
+                if permission_task is not None:
+                    permission_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await permission_task
+                control_stop.set()
+                interrupt_stop.set()
+                if control_task is not None and interrupt_task is not None:
+                    await asyncio.gather(control_task, interrupt_task)
+
+    @pytest.mark.asyncio
+    async def test_hard_interrupt_cancels_permission_acquire_on_saturated_pool(self):
+        """Stop remains prompt even if a transient third borrower fills the pool."""
+
+        pool = _ThreeConnectionPool()
+        thread_id = "00000000-0000-0000-0000-000000000001"
+        hard_interrupt = asyncio.Event()
+        control_stop = asyncio.Event()
+        interrupt_stop = asyncio.Event()
+        control_task = None
+        interrupt_task = None
+        permission_task = None
+
+        with (
+            patch.object(pa, "_session", SimpleNamespace(postgres_conn=pool)),
+            patch.object(pa, "_thread_id", thread_id),
+            patch.object(pa, "_hard_interrupt_event", hard_interrupt),
+            patch.object(pa, "_drain_thread_controls", AsyncMock(return_value=0)),
+            patch.object(pa, "_drain_thread_interrupts", AsyncMock(return_value=0)),
+        ):
+            try:
+                control_task = asyncio.create_task(
+                    pa._control_watcher_loop(
+                        postgres_conn=pool,
+                        thread_id=thread_id,
+                        stop=control_stop,
+                        lease_token=7,
+                        agent_id=None,
+                    )
+                )
+                interrupt_task = asyncio.create_task(
+                    pa._interrupt_watcher_loop(
+                        postgres_conn=pool,
+                        thread_id=thread_id,
+                        stop=interrupt_stop,
+                        lease_token=7,
+                        target_turn_id=1,
+                    )
+                )
+                await asyncio.wait_for(pool.listeners_ready.wait(), timeout=0.5)
+
+                async with pool.acquire():
+                    permission_task = asyncio.create_task(
+                        pa._wait_for_permission_resolution(
+                            "permission-blocked", timeout=30
+                        )
+                    )
+                    await asyncio.sleep(0)
+                    hard_interrupt.set()
+                    assert (
+                        await asyncio.wait_for(permission_task, timeout=0.5)
+                        == "interrupted"
+                    )
+
+                assert pool.permission_reads == 0
+            finally:
+                if permission_task is not None and not permission_task.done():
+                    permission_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await permission_task
+                control_stop.set()
+                interrupt_stop.set()
+                if control_task is not None and interrupt_task is not None:
+                    await asyncio.gather(control_task, interrupt_task)
 
 
 # =============================================================================
