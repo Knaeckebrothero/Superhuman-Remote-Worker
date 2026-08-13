@@ -52,6 +52,12 @@ class _FakeConn:
 
     async def fetchrow(self, query, *args):
         self.calls.append(("fetchrow", query, args))
+        if "SELECT project_id, metadata, execution_lane" in query:
+            return {
+                "project_id": None,
+                "metadata": {},
+                "execution_lane": "stateless",
+            }
         if "INSERT INTO thread_messages" in query:
             return {"id": args[0], "seq": 1}
         if "INSERT INTO thread_session_tasks" in query:
@@ -301,14 +307,28 @@ async def test_fk_insert_uses_threads_then_queue_then_write_lock_order(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "operation,write_kind",
+    "operation,parent_lock_kind,parent_lock_mode,write_kind",
     [
-        pytest.param(_save_message, "fetchrow", id="incremental"),
-        pytest.param(_save_messages, "executemany", id="reconcile-batch"),
+        pytest.param(
+            _save_message,
+            "fetchval",
+            "FOR KEY SHARE",
+            "fetchrow",
+            id="incremental",
+        ),
+        pytest.param(
+            _save_messages,
+            "fetchrow",
+            "FOR UPDATE",
+            "executemany",
+            id="reconcile-batch",
+        ),
     ],
 )
 async def test_message_write_uses_threads_then_queue_then_mutations(
     operation: Operation,
+    parent_lock_kind: str,
+    parent_lock_mode: str,
     write_kind: str,
 ):
     conn = _FakeConn()
@@ -332,13 +352,13 @@ async def test_message_write_uses_threads_then_queue_then_mutations(
         await operation(db, THREAD_ID)
 
     assert [kind for kind, _query, _args in conn.calls] == [
-        "fetchval",
+        parent_lock_kind,
         "fence",
         write_kind,
         "execute",
     ]
     assert "FROM threads" in conn.calls[0][1]
-    assert "FOR KEY SHARE" in conn.calls[0][1]
+    assert parent_lock_mode in conn.calls[0][1]
     assert "INSERT INTO thread_messages" in conn.calls[2][1]
     assert "UPDATE threads" in conn.calls[3][1]
 

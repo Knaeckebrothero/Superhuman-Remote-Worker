@@ -7547,20 +7547,26 @@ async def _loop_on_tool_result(
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: DB-backed permission gates (LISTEN/NOTIFY on thread_permission_requests)
+# Phase 3: DB-backed permission gates (thread_permission_requests)
 # ---------------------------------------------------------------------------
 #
-# The agent INSERTs a pending row when permission_check fires, then waits for
-# UPDATE → trigger → NOTIFY. Approval can arrive from any path (WS-attached
-# cockpit, REST POST from MCP/cockpit, future email magic-link) — all converge
-# on the same UPDATE statement. The agent never blocks on an in-memory queue
-# anymore; the queue path is still in place for non-permission user input.
+# The agent INSERTs a pending row when permission_check fires, then checks that
+# row until an UPDATE resolves it. Approval can arrive from any path
+# (WS-attached cockpit, REST POST from MCP/cockpit, future email magic-link) —
+# all converge on the same UPDATE statement. The agent never blocks on an
+# in-memory queue anymore; the queue path is still in place for non-permission
+# user input.
 #
-# Channel: thread_permission_updates (global). Payload carries the request id;
-# the listener filters by it to match its own pending wait.
+# Poll on short-lived pool acquisitions rather than pinning a LISTEN connection
+# for the whole human wait. A stateless turn already owns long-lived control and
+# interrupt listeners; with the supported three-connection agent pool, a third
+# listener would starve the independent lease heartbeat and let a live turn be
+# stolen. Polling is the correctness path for the other inboxes too; one second
+# keeps approval latency bounded while always returning the connection between
+# checks.
 
 _PERMISSION_TIMEOUT_S: float = 300.0
-_PERMISSION_NOTIFY_CHANNEL: str = "thread_permission_updates"
+_PERMISSION_POLL_SECONDS: float = 1.0
 
 
 async def _insert_permission_request(
@@ -8026,10 +8032,11 @@ async def _wait_for_permission_resolution(
     status string ('approved'/'denied'/'expired'/'interrupted'). On any
     failure, returns 'denied' as the conservative default.
 
-    Uses asyncpg's connection-scoped add_listener on the global NOTIFY
-    channel; filters by row id. After registering the listener, re-SELECTs
-    the row's status to close the race window between INSERT and listen
-    setup.
+    Re-SELECTs on short-lived pool acquisitions and sleeps without owning a
+    connection between checks. This is deliberately polling-only: a stateless
+    turn's control and interrupt watchers already pin two LISTEN connections,
+    so holding a third throughout a human wait would starve the exact-lease
+    heartbeat on the supported three-connection agent pool.
 
     ``timeout`` is a *polling slice*, not a deadline, while a client is
     attached: a user who is simply slow to click must not have the gate
@@ -8042,155 +8049,210 @@ async def _wait_for_permission_resolution(
     if _session is None or _session.postgres_conn is None:
         return "denied"
 
-    resolved = asyncio.Event()
+    postgres_conn = _session.postgres_conn
+    base_timeout = max(0.0, float(timeout))
+    wait_timeout = base_timeout
+    terminal_statuses = ("approved", "denied", "expired")
 
-    def _on_notify(_conn, _pid, _channel, payload):
+    async def _read_status() -> Any:
+        async with postgres_conn.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT status FROM thread_permission_requests WHERE id = $1",
+                request_id,
+            )
+
+    async def _read_status_interruptibly() -> Any:
+        """Race only the read-only pool operation against a hard interrupt."""
+
+        read_task = asyncio.create_task(_read_status())
+        interrupt_task = (
+            asyncio.create_task(_hard_interrupt_event.wait())
+            if _hard_interrupt_event is not None
+            else None
+        )
+        if interrupt_task is None:
+            return await read_task
         try:
-            data = json.loads(payload)
-        except Exception:
-            return
-        if str(data.get("id")) == request_id:
-            resolved.set()
+            done, _pending = await asyncio.wait(
+                {read_task, interrupt_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if read_task in done:
+                return read_task.result()
+            raise InterruptedError
+        finally:
+            for task in (read_task, interrupt_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(read_task, interrupt_task, return_exceptions=True)
 
     try:
-        async with _session.postgres_conn.acquire() as conn:
-            await conn.add_listener(_PERMISSION_NOTIFY_CHANNEL, _on_notify)
-            try:
-                # Race-safe: an UPDATE between INSERT and add_listener
-                # would have fired NOTIFY into the void; check the row's
-                # current status before settling in to wait.
-                current = await conn.fetchval(
-                    "SELECT status FROM thread_permission_requests WHERE id = $1",
+        while True:
+            # Race-safe initial/current read. The connection is returned before
+            # any human-scale wait so lease renewal always has a pool slot.
+            current = await _read_status_interruptibly()
+            if current in terminal_statuses:
+                return str(current)
+
+            if _hard_interrupt_event is not None and _hard_interrupt_event.is_set():
+                # Stop pressed. Leave the row pending — the user made no
+                # decision, so nothing may be recorded as one.
+                logger.info(
+                    "Permission wait interrupted (req=%s) — leaving pending",
                     request_id,
                 )
-                if current in ("approved", "denied", "expired"):
-                    return str(current)
+                return "interrupted"
 
-                wait_timeout = float(timeout)
-                while True:
-                    waits = [asyncio.ensure_future(resolved.wait())]
-                    if _hard_interrupt_event is not None:
-                        waits.append(
-                            asyncio.ensure_future(_hard_interrupt_event.wait())
-                        )
+            # Preserve `timeout` as the presence/expiry slice, not a total
+            # deadline. Status polls within the slice only reduce answer
+            # latency; they do not move the expiry boundary.
+            deadline = asyncio.get_running_loop().time() + wait_timeout
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                poll_seconds = min(_PERMISSION_POLL_SECONDS, remaining)
+                if _hard_interrupt_event is None:
+                    await asyncio.sleep(poll_seconds)
+                else:
                     try:
-                        await asyncio.wait(
-                            waits,
-                            timeout=wait_timeout,
-                            return_when=asyncio.FIRST_COMPLETED,
+                        await asyncio.wait_for(
+                            _hard_interrupt_event.wait(),
+                            timeout=poll_seconds,
                         )
-                    finally:
-                        for w in waits:
-                            w.cancel()
-
-                    if _hard_interrupt_event is not None and (
-                        _hard_interrupt_event.is_set()
-                    ):
-                        # Stop pressed. Leave the row pending — the user made
-                        # no decision, so nothing may be recorded as one.
+                    except asyncio.TimeoutError:
+                        pass
+                    if _hard_interrupt_event.is_set():
                         logger.info(
                             "Permission wait interrupted (req=%s) — leaving pending",
                             request_id,
                         )
                         return "interrupted"
 
-                    if resolved.is_set():
-                        break
+                # Reaching the slice boundary must run the same durable
+                # presence/expiry decision as before. Do not insert one final
+                # status poll ahead of it; the CAS/CTE below already resolves
+                # decision races at that boundary.
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                current = await _read_status_interruptibly()
+                if current in terminal_statuses:
+                    return str(current)
 
-                    if _stateless_mode():
-                        lease_token = _current_stateless_lease_token()
-                        if lease_token is None:
-                            # Lease loss is not a user decision. Leave the row
-                            # pending for the successor/retirement path.
-                            logger.info(
-                                "Permission wait lost stateless owner "
-                                "(req=%s) — leaving pending",
-                                request_id,
-                            )
-                            return "interrupted"
-                        try:
-                            expiry = await expire_permission_if_untethered(
-                                conn,
-                                thread_id=str(_thread_id),
-                                request_id=request_id,
-                                lease_token=lease_token,
-                            )
-                        except Exception as exc:
-                            # Unknown presence must retain the card. A broken
-                            # connection may recover; retry on a short bounded
-                            # slice rather than fabricating a denial/expiry.
-                            logger.warning(
-                                "Permission presence check failed (req=%s): %s",
-                                request_id,
-                                exc,
-                            )
-                            wait_timeout = min(float(timeout), 5.0)
-                            continue
+            if _stateless_mode():
+                lease_token = _current_stateless_lease_token()
+                if lease_token is None:
+                    # Lease loss is not a user decision. Leave the row pending
+                    # for the successor/retirement path.
+                    logger.info(
+                        "Permission wait lost stateless owner "
+                        "(req=%s) — leaving pending",
+                        request_id,
+                    )
+                    return "interrupted"
 
-                        if expiry.status in ("approved", "denied", "expired"):
-                            return str(expiry.status)
-                        if not expiry.owner_live:
-                            logger.info(
-                                "Permission owner fence rejected (req=%s) "
-                                "— leaving pending",
-                                request_id,
-                            )
-                            return "interrupted"
-                        if expiry.live_for_seconds is not None:
-                            # A tab closed just before this timeout should be
-                            # reconsidered at its short presence deadline, not
-                            # after another full five-minute permission slice.
-                            wait_timeout = min(
-                                float(timeout),
-                                max(0.1, expiry.live_for_seconds + 0.05),
-                            )
-                            continue
+                if _hard_interrupt_event is not None and _hard_interrupt_event.is_set():
+                    logger.info(
+                        "Permission wait interrupted (req=%s) — leaving pending",
+                        request_id,
+                    )
+                    return "interrupted"
 
-                        # A concurrent resolver may have won after the CTE's
-                        # statement snapshot. Re-read before looping.
-                        status_now = await conn.fetchval(
-                            "SELECT status FROM thread_permission_requests "
-                            "WHERE id = $1",
-                            request_id,
+                try:
+                    async with postgres_conn.acquire() as conn:
+                        expiry = await expire_permission_if_untethered(
+                            conn,
+                            thread_id=str(_thread_id),
+                            request_id=request_id,
+                            lease_token=lease_token,
                         )
-                        if status_now in ("approved", "denied", "expired"):
-                            return str(status_now)
-                        wait_timeout = float(timeout)
-                        continue
+                        if (
+                            expiry.status not in terminal_statuses
+                            and expiry.owner_live
+                            and expiry.live_for_seconds is None
+                        ):
+                            # A concurrent resolver may have won after the
+                            # CTE's statement snapshot. Re-read before looping.
+                            status_now = await conn.fetchval(
+                                "SELECT status FROM thread_permission_requests "
+                                "WHERE id = $1",
+                                request_id,
+                            )
+                        else:
+                            status_now = None
+                except Exception as exc:
+                    # Unknown presence must retain the card. A broken
+                    # connection may recover; retry on a short bounded slice
+                    # rather than fabricating a denial/expiry.
+                    logger.warning(
+                        "Permission presence check failed (req=%s): %s",
+                        request_id,
+                        exc,
+                    )
+                    wait_timeout = min(base_timeout, 5.0)
+                    continue
 
-                    if not _subscribers:
-                        # Untethered: nobody can answer. CAS-style expire —
-                        # only if nobody beat us to it.
-                        await conn.execute(
-                            "UPDATE thread_permission_requests "
-                            "SET status = 'expired', decided_at = now(), "
-                            "    decided_by = 'system' "
-                            "WHERE id = $1 AND status = 'pending'",
-                            request_id,
-                        )
-                        break
+                if expiry.status in terminal_statuses:
+                    return str(expiry.status)
+                if not expiry.owner_live:
+                    logger.info(
+                        "Permission owner fence rejected (req=%s) — leaving pending",
+                        request_id,
+                    )
+                    return "interrupted"
+                if expiry.live_for_seconds is not None:
+                    # A tab closed just before this timeout should be
+                    # reconsidered at its short presence deadline, not after
+                    # another full five-minute permission slice.
+                    wait_timeout = min(
+                        base_timeout,
+                        max(0.1, expiry.live_for_seconds + 0.05),
+                    )
+                    continue
 
-                    # Tethered: a client is watching, so keep the question
-                    # open. Re-read in case a resolution raced the NOTIFY
-                    # (a decision from another path fires NOTIFY once; if we
-                    # were between waits it would otherwise be missed).
-                    status_now = await conn.fetchval(
+                if status_now in terminal_statuses:
+                    return str(status_now)
+                wait_timeout = base_timeout
+                continue
+
+            if not _subscribers:
+                # Untethered: nobody can answer. CAS-style expire — only if
+                # nobody beat us to it. This acquisition is released as soon
+                # as the boundary update and read complete.
+
+                if _hard_interrupt_event is not None and _hard_interrupt_event.is_set():
+                    logger.info(
+                        "Permission wait interrupted (req=%s) — leaving pending",
+                        request_id,
+                    )
+                    return "interrupted"
+                async with postgres_conn.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE thread_permission_requests "
+                        "SET status = 'expired', decided_at = now(), "
+                        "    decided_by = 'system' "
+                        "WHERE id = $1 AND status = 'pending'",
+                        request_id,
+                    )
+                    final = await conn.fetchval(
                         "SELECT status FROM thread_permission_requests WHERE id = $1",
                         request_id,
                     )
-                    if status_now in ("approved", "denied", "expired"):
-                        return str(status_now)
-
-                final = await conn.fetchval(
-                    "SELECT status FROM thread_permission_requests WHERE id = $1",
-                    request_id,
-                )
                 return str(final) if final is not None else "denied"
-            finally:
-                try:
-                    await conn.remove_listener(_PERMISSION_NOTIFY_CHANNEL, _on_notify)
-                except Exception:
-                    pass
+
+            # Tethered: a client is watching, so keep the question open.
+            # Re-read at the slice boundary in case the decision committed
+            # after the last within-slice poll.
+            status_now = await _read_status_interruptibly()
+            if status_now in terminal_statuses:
+                return str(status_now)
+            wait_timeout = base_timeout
+    except InterruptedError:
+        logger.info(
+            "Permission wait interrupted (req=%s) — leaving pending",
+            request_id,
+        )
+        return "interrupted"
     except Exception as e:
         logger.warning("Permission resolution wait failed (id=%s): %s", request_id, e)
         return "denied"
@@ -8244,7 +8306,7 @@ async def _loop_permission_check(
     tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
 ) -> PermissionOutcome:
     """Resolve a supervised gate. INSERTs a pending row and waits for the DB
-    to flip via LISTEN/NOTIFY.
+    status to flip via short-acquisition polling.
 
     Returns a THREE-state outcome, because a gate is a question to the user:
 
@@ -8365,7 +8427,7 @@ async def _loop_permission_check(
                     claimed_request_id = remembered[0]
 
         # Supervised mode (or shell under auto_accept): ask user via the
-        # durable permission table, then wait on LISTEN/NOTIFY.
+        # durable permission table, then wait via short-acquisition polling.
         if claimed_request_id is not None:
             request_id = claimed_request_id
         else:

@@ -1,10 +1,9 @@
 """Tests for Phase 3 of headless persistent sessions: DB-backed permission
-gates with LISTEN/NOTIFY. The real round-trip (INSERT → UPDATE → trigger →
-NOTIFY → wake) needs a live Postgres and lives in integration tests; here
-we cover the data-flow and contract surface with mocks.
+gates. The real INSERT → UPDATE → polling round-trip needs a live Postgres
+and lives in integration tests; here we cover the data-flow and contract
+surface with mocks.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -304,7 +303,7 @@ class TestResolvePendingPermission:
 
 
 # ---------------------------------------------------------------------------
-# Section 4 — _wait_for_permission_resolution: race-safe SELECT-first
+# Section 4 — _wait_for_permission_resolution: short-acquisition polling
 # ---------------------------------------------------------------------------
 
 
@@ -323,8 +322,7 @@ class TestWaitForPermissionResolution:
 
     @pytest.mark.asyncio
     async def test_returns_immediately_if_already_approved(self):
-        """SELECT-first guard: if the UPDATE happened between INSERT and
-        add_listener, the pre-wait status check picks it up without waiting."""
+        """The first short acquisition observes a decision without waiting."""
         import src.api.persistent_app as mod
 
         postgres = _make_postgres_conn(
@@ -333,9 +331,8 @@ class TestWaitForPermissionResolution:
         _install_session(postgres_conn=postgres)
         result = await mod._wait_for_permission_resolution("rid-1", timeout=1.0)
         assert result == "approved"
-        # add_listener registered then immediately removed.
-        postgres._fake_conn.add_listener.assert_awaited_once()
-        postgres._fake_conn.remove_listener.assert_awaited_once()
+        postgres._fake_conn.add_listener.assert_not_awaited()
+        postgres._fake_conn.remove_listener.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_returns_denied_when_already_denied(self):
@@ -372,54 +369,26 @@ class TestWaitForPermissionResolution:
         import src.api.persistent_app as mod
 
         postgres = _make_postgres_conn()
-        postgres._fake_conn.add_listener.side_effect = RuntimeError("listener fail")
+        postgres._fake_conn.fetchval.side_effect = RuntimeError("status read failed")
         _install_session(postgres_conn=postgres)
         result = await mod._wait_for_permission_resolution("rid-4", timeout=0.1)
         assert result == "denied"
 
     @pytest.mark.asyncio
-    async def test_notify_callback_wakes_the_wait(self):
-        """When the NOTIFY callback fires for our id, the wait returns
-        the final status from the post-wake SELECT."""
+    async def test_short_poll_observes_resolution(self, monkeypatch):
+        """A decision committed during the slice is observed on a fresh poll."""
         import src.api.persistent_app as mod
 
-        target_id = "rid-5"
-
-        captured_callbacks = []
-
-        async def _capture_listener(channel, callback):
-            captured_callbacks.append(callback)
-
         postgres = _make_postgres_conn(
-            # Pre-wait SELECT: pending. Post-wake SELECT: approved.
+            # First short acquisition: pending. Next acquisition: approved.
             select_status_sequence=["pending", "approved"],
         )
-        postgres._fake_conn.add_listener.side_effect = _capture_listener
         _install_session(postgres_conn=postgres)
+        monkeypatch.setattr(mod, "_PERMISSION_POLL_SECONDS", 0.01)
 
-        async def _trigger_notify():
-            # Wait for the listener to register, then fire a NOTIFY
-            # carrying our id.
-            for _ in range(50):
-                if captured_callbacks:
-                    break
-                await asyncio.sleep(0.01)
-            assert captured_callbacks, "listener never registered"
-            import json as _json
-
-            captured_callbacks[0](
-                MagicMock(),
-                12345,
-                "thread_permission_updates",
-                _json.dumps({"id": target_id, "status": "approved"}),
-            )
-
-        trigger_task = asyncio.create_task(_trigger_notify())
-        try:
-            result = await mod._wait_for_permission_resolution(target_id, timeout=2.0)
-        finally:
-            await trigger_task
+        result = await mod._wait_for_permission_resolution("rid-5", timeout=2.0)
         assert result == "approved"
+        postgres._fake_conn.add_listener.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

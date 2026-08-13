@@ -4846,3 +4846,89 @@ stateless-agent pods import the new shared permission helper. The protected
 stateless hand-check and pinned probe retained their exact workspace UIDs; no
 soak fixture or protected completion row was mutated in M3. The next app
 migration is **0156**.
+
+## M4 — MiniMax session soak, permission heartbeat repair and bounded deviations
+
+The live gate used only disposable stateless sessions with virtual or `none`
+workspaces and explicit `MiniMax-M3` main and auxiliary configuration. The
+first exact-marker response completed through the MiniMax chat endpoint with
+HTTP 200 in **1.866 s**; later gate calls also succeeded. Resolved runtime
+configuration and attach logs named `MiniMax-M3`. The audit archive rendered
+the anomalous concatenated label `MiniMax-M3MiniMax-M3`, which is recorded here
+rather than normalized away.
+
+Correlated interrupt passed end to end. Fixture `f94bc279-…`, turn 2, input
+sequence 2806 and lease token 2 admitted request `20f21334-…`; the owner applied
+a hard interrupt, consumed the exact input, wrote exactly one linked
+`interrupt.ack`, and emitted none of the forbidden completion marker. Replaying
+the same client UUID returned the stored applied result with `duplicate=true`.
+
+The first supervised `write_file` gate uncovered a production P1 before any
+test fault was injected. With the supported three-connection agent pool, the
+control watcher and interrupt watcher each held one LISTEN connection while
+the permission waiter held the third. The independent lease heartbeat could
+not acquire a connection, so a healthy permission wait self-expired its claim.
+The repair removes only the long-lived permission LISTEN and polls the durable
+row every second through short acquisitions; control and interrupt LISTEN stay
+unchanged and the pool is not enlarged. The existing 300-second
+presence/expiry boundary and exact-token CTE remain authoritative. Hard stop
+may cancel only a read-only status acquisition; stateless and pinned expiry
+mutations always run to a determinate CAS result.
+
+The fixed image was verified byte-for-byte in both stateless pods. A genuine
+pending request then remained on token 2 while `lease_until` advanced from
+`21:48:06.338` to `21:48:26.440` and `21:48:46.448` across roughly 50 seconds,
+proving that the heartbeat now progresses with both watcher listeners and the
+permission gate active. The focused permission/control/interrupt/executor
+selection passed **227/227**; an independent adversarial review found no
+remaining P0/P1. A root rerun of the highest-risk five-file selection passed
+**175/175**. Ruff lint, format-check and whitespace checks are clean.
+
+The forced owner-loss row then exercised M3 itself. Detector-caught permission
+`19937584-…` was 0.2 seconds old on lease token 4, owned by the sole queue lease
+on Pod UID `66774d71-…`, with no tool event and both protected workspace UIDs
+unchanged. A one-second graceful Kubernetes Pod deletion (no force flag and no
+database edit) stopped further renewals. At `22:11:33.344Z` the production
+reaper advanced token 4→5 and atomically changed the request to
+`expired/system/lease_expired`, wrote exactly one linked
+`permission.resolved` at epoch 1/sequence 1, and never ran the tool. The
+ordinary final-memory rows produced during the soak each reached `done` on
+attempt 1 with a matching vector execution receipt; one fixture stored one
+memory, while zero-extraction turns correctly stored none.
+
+That fault also reproduced the known claimant-quiescence cleanup debt in its
+strict form. The dead Pod object disappeared before either claimant or
+controller observed a terminal object, leaving the exact token/Pod/UID ledger
+`quiesced=false`; public Force-End correctly refused to convert a Kubernetes
+404 into process-zero proof and returned 503. There is no ordinary public verb
+that can settle this state. For this disposable **virtual** fixture only, an
+independent audit approved the exceptional operator procedure: two unchanged
+ended/unleased projections more than 30 seconds apart; one Ready node with
+unchanged boot ID; zero exact UID hits across Kubernetes, all CRI sandboxes and
+containers, containerd containers/tasks, process command lines/cgroups and
+cgroup directories; no shell/resident retirement requirement; no pending
+permission/interrupt/control work; and no unfinished memory effect. The
+existing exact-CAS `acknowledge_session_claim_quiesced` helper returned true for
+token 4/terminal token 6 with `quiesced_by=operator_containerd_absent`; public
+soft End then returned 200 and public permanent Delete returned 200. No JSON
+field was patched directly. The general durable process-quiescence receipt for
+an abruptly vanished Pod remains a lifecycle follow-up, not a weakened fence.
+
+The brief's executor-after-final-persist crash row was **not proven**. A
+separate vector-ledger table lock safely left the app transcript/effect path
+unblocked, but virtual cloud setup exceeded the bounded lock window before the
+effect existed; the transaction was rolled back before its deadline and no Pod
+was touched. A final `none`-workspace attempt was stopped before input after a
+filtered harness response. No result is relabeled as a crash proof. The best
+morning follow-up remains a naturally admitted, fast `none`-workspace turn
+whose exact effect is observed pending before the serving executor is removed.
+
+All disposable thread IDs were ended/deleted through public APIs. Every
+fixture thread, run-queue row, transcript/event/card/interrupt row, app effect,
+vector execution receipt, memory and retrieval child was zero after guarded
+exact-ID cleanup; global unfinished session effects and vector ledger locks
+were also zero. Append-only audit and usage history remains as truthful
+history. The protected stateless hand-check workspace UID `0b30a573-…` and
+pinned probe workspace UID `f7090b7c-…` remained Running and unchanged. The
+pinned probe was independently reassigned by background production recovery
+during the soak; no soak action touched its workspace or completion rows.
