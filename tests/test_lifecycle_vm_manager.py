@@ -21,6 +21,7 @@ from orchestrator.services.lifecycle import (
     VMInstanceManager,
     expected_vm_shas,
 )
+from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
 
 
 # =============================================================================
@@ -37,11 +38,26 @@ def _make_manager(
     shared_child_exists: bool = False,
     completion_commands_enabled: bool = False,
     completion_control_active: bool = False,
+    completion_command_exists: bool = False,
 ):
     provisioner = MagicMock()
     provisioner.is_available = is_available
     provisioner.delete_vm = AsyncMock(return_value=True)
     provisioner.delete_thread_vm = AsyncMock(return_value=True)
+    provisioner.capture_vm_teardown_identity = AsyncMock(
+        return_value=VMTeardownIdentity(
+            provision_generation="00000000-0000-4000-8000-000000000001",
+            vm_uid="vm-uid-1",
+            rootdisk_pvc_uid="rootdisk-uid-1",
+        )
+    )
+    provisioner.revalidate_vm_teardown_identity = AsyncMock(return_value="matched")
+    provisioner.delete_vm_captured = AsyncMock(
+        return_value=VMTeardownResult("completed", True)
+    )
+    provisioner.delete_orphan_vm_captured = AsyncMock(
+        return_value=VMTeardownResult("completed", True)
+    )
 
     suspension = MagicMock()
     suspension.is_enabled = suspension_enabled
@@ -67,18 +83,56 @@ def _make_manager(
         return shared_child_exists
 
     conn.fetchval = AsyncMock(side_effect=_fetchval)
+
+    async def _fetchrow(sql, *args):
+        identity = str(args[0]) if args else ""
+        if "job_completion_sweep_exclusions" in sql:
+            return (
+                {
+                    "command_id": "44444444-4444-4444-8444-444444444444",
+                    "route": "stand_down",
+                }
+                if completion_command_exists
+                else None
+            )
+        if "FROM jobs" in sql and "FOR UPDATE" in sql:
+            row = next(
+                (r for r in (job_rows or []) if str(r.get("id")) == identity),
+                None,
+            )
+            if row is None:
+                return None
+            return {
+                "status": row.get("status"),
+                "execution_lane": row.get("execution_lane") or "pinned",
+                "context": row.get("context") or {},
+                "control_active": completion_control_active,
+            }
+        if "UPDATE jobs" in sql and "RETURNING" in sql:
+            return {"id": identity, "context": {}}
+        return None
+
+    conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+    tx = AsyncMock()
+    tx.__aenter__ = AsyncMock(return_value=None)
+    tx.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx)
     ctx = AsyncMock()
     ctx.__aenter__ = AsyncMock(return_value=conn)
     ctx.__aexit__ = AsyncMock(return_value=False)
     db.acquire.return_value = ctx
 
+    router = MagicMock()
+    router.enqueue_job = AsyncMock()
     mgr = VMInstanceManager(
         vm_provisioner=provisioner,
         suspension_service=suspension,
         snapshot_service=snapshot,
         db=db,
         completion_commands_enabled=completion_commands_enabled,
+        completion_router=router if completion_commands_enabled else None,
     )
+    mgr._test_completion_router = router
     return mgr, provisioner, suspension, snapshot, db
 
 
@@ -165,8 +219,8 @@ class TestListInstances:
         conn = db.acquire.return_value.__aenter__.return_value
         [sql] = [
             str(call.args[0])
-            for call in conn.fetchval.await_args_list
-            if "_completion_control_claim" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
+            if "FROM jobs" in str(call.args[0]) and "FOR UPDATE" in str(call.args[0])
         ]
         assert "jsonb_typeof" in sql
         assert "clock_timestamp()" in sql
@@ -928,6 +982,14 @@ class TestCompletionControlLifecycleOwnership:
     @pytest.mark.asyncio
     async def test_action_time_recheck_blocks_snapshot_delete_and_give_up(self):
         mgr, provisioner, _, snapshot, db = _make_manager(
+            job_rows=[
+                {
+                    "id": "job-1",
+                    "status": "paused",
+                    "execution_lane": "pinned",
+                    "context": {},
+                }
+            ],
             completion_commands_enabled=True,
             completion_control_active=True,
         )
@@ -938,6 +1000,7 @@ class TestCompletionControlLifecycleOwnership:
             metadata={
                 "scope": "job",
                 "job_status": "paused",
+                "execution_lane": "pinned",
                 "ssh_host": "10.0.0.7",
             },
         )
@@ -952,28 +1015,81 @@ class TestCompletionControlLifecycleOwnership:
         conn = db.acquire.return_value.__aenter__.return_value
         marker_queries = [
             call
-            for call in conn.fetchval.await_args_list
-            if "_completion_control_claim" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
+            if "FROM jobs" in str(call.args[0]) and "FOR UPDATE" in str(call.args[0])
         ]
         assert len(marker_queries) == 3
 
     @pytest.mark.asyncio
     async def test_lookup_error_fails_closed_before_delete(self):
         mgr, provisioner, _, _, db = _make_manager(
+            job_rows=[
+                {
+                    "id": "job-1",
+                    "status": "completed",
+                    "execution_lane": "pinned",
+                    "context": {},
+                }
+            ],
             completion_commands_enabled=True,
         )
         conn = db.acquire.return_value.__aenter__.return_value
-        conn.fetchval.side_effect = RuntimeError("db clock unavailable")
+        base_fetchrow = conn.fetchrow.side_effect
+
+        async def _fetchrow(sql, *args):
+            if "FROM jobs" in sql and "FOR UPDATE" in sql:
+                raise RuntimeError("db clock unavailable")
+            return await base_fetchrow(sql, *args)
+
+        conn.fetchrow.side_effect = _fetchrow
         inst = Instance(
             kind="vm",
             id="vm-job-1",
             bound_to="job-1",
-            metadata={"scope": "job"},
+            metadata={
+                "scope": "job",
+                "job_status": "completed",
+                "execution_lane": "pinned",
+            },
         )
 
         await mgr.delete(inst, grace_s=0)
 
         provisioner.delete_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_replacement_after_claim_blocks_vm_snapshot_and_context_write(self):
+        job = {
+            "id": "job-1",
+            "status": "completed",
+            "execution_lane": "pinned",
+            "context": {},
+        }
+        mgr, provisioner, _, snapshot, db = _make_manager(
+            job_rows=[job], completion_commands_enabled=True
+        )
+        provisioner.revalidate_vm_teardown_identity.return_value = "superseded"
+        inst = Instance(
+            kind="vm",
+            id="agent-vm-job-1",
+            bound_to="job-1",
+            metadata={
+                "scope": "job",
+                "job_status": "completed",
+                "execution_lane": "pinned",
+                "ssh_host": "10.0.0.7",
+                "ssh_port": 22,
+                "provision_generation": ("00000000-0000-4000-8000-000000000001"),
+                "vm_uid": "vm-uid-1",
+                "rootdisk_pvc_uid": "rootdisk-uid-1",
+            },
+        )
+
+        assert await mgr.snapshot(inst) is None
+
+        snapshot.capture_vm_snapshot.assert_not_awaited()
+        provisioner.delete_vm_captured.assert_not_awaited()
+        db.merge_vm_context.assert_not_awaited()
 
 
 # =============================================================================

@@ -71,9 +71,9 @@ configure_logging(
 from dataclasses import dataclass, replace  # noqa: E402
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
-from collections.abc import Callable, Coroutine, Mapping  # noqa: E402
+from collections.abc import Awaitable, Callable, Coroutine, Mapping  # noqa: E402
 from typing import Any, Literal, NamedTuple, Optional  # noqa: E402
-from uuid import UUID, uuid4  # noqa: E402
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5  # noqa: E402
 
 import asyncpg  # noqa: E402
 import yaml  # noqa: E402
@@ -11164,7 +11164,17 @@ async def lifespan(app: FastAPI):
     # current job went terminal without the completion hook advancing it.
     project_loop_sweeper_task = asyncio.create_task(
         project_loop_sweeper_loop(
-            postgres_db, _shutdown_event, advance_fn=_advance_project_loop
+            postgres_db,
+            _shutdown_event,
+            advance_fn=_advance_project_loop,
+            **(
+                {
+                    "completion_commands_enabled": True,
+                    "reconcile_handoff_fn": (_reconcile_atomic_project_loop_handoff),
+                }
+                if COMPLETION_COMMANDS_ENABLED
+                else {}
+            ),
         )
     )
     # Reap orphaned verification (critic) subjobs that would otherwise linger as
@@ -11293,6 +11303,9 @@ async def lifespan(app: FastAPI):
             snapshot_service=snapshot_service,
             db=postgres_db,
             completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+            completion_router=(
+                _get_completion_sweep_router() if COMPLETION_COMMANDS_ENABLED else None
+            ),
         )
     )
     lifecycle_reconciler.register(
@@ -11302,6 +11315,9 @@ async def lifespan(app: FastAPI):
             snapshot_service=snapshot_service,
             db=postgres_db,
             completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+            completion_router=(
+                _get_completion_sweep_router() if COMPLETION_COMMANDS_ENABLED else None
+            ),
         )
     )
     # Startup reconciliation: rebuild the in-memory view from K8s
@@ -17768,6 +17784,357 @@ def _resolve_critic_outcome(
     )
 
 
+class _CriticWorldCASMiss(RuntimeError):
+    """Roll back a synthesizer's tentative domain writes before superseding it."""
+
+    def __init__(self, observed_status: str) -> None:
+        self.observed_status = observed_status
+        super().__init__(f"critic target world CAS lost ({observed_status})")
+
+
+_CRITIC_DIAGNOSTIC_LIMIT_BYTES = 1024
+
+
+def _bounded_critic_text(
+    value: Any, *, limit_bytes: int = _CRITIC_DIAGNOSTIC_LIMIT_BYTES
+) -> str:
+    """Bound critic diagnostics before DB, log, notification, or replay use."""
+
+    text = str(value or "")
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit_bytes:
+        return text
+    suffix = "…"
+    budget = max(0, limit_bytes - len(suffix.encode("utf-8")))
+    return encoded[:budget].decode("utf-8", errors="ignore") + suffix
+
+
+def _critic_verdict_transition(
+    critic_job: dict[str, Any], target_job: dict[str, Any]
+) -> dict[str, Any]:
+    """Build the bounded DB-only S27 transition from one locked target row."""
+
+    from services.completion import get_autonomy_level, is_curation_enabled
+    from services.project_loops import job_loop_id
+    from services.verification_ledger import escalation_status, fold_open_findings
+
+    critic_job_id = str(critic_job["id"])
+    target_job_id = str(target_job["id"])
+    rounds = _verification_rounds(target_job)
+    outcome, reason = _resolve_critic_outcome(
+        critic_job_id, str(critic_job.get("status") or ""), rounds
+    )
+    reason = _bounded_critic_text(reason)
+    transition: dict[str, Any] = {
+        "outcome": outcome,
+        "reason": reason,
+        "target_job_id": target_job_id,
+        "critic_job_id": critic_job_id,
+        "is_loop_job": bool(job_loop_id(target_job)),
+        "curation_enabled": bool(is_curation_enabled(target_job)),
+    }
+    if outcome == "approved":
+        transition["new_status"] = (
+            "completed"
+            if get_autonomy_level(target_job) == "full"
+            else "pending_review"
+        )
+    elif outcome == "returned":
+        open_findings = fold_open_findings(rounds)
+        feedback_lines = ["## Open findings", ""]
+        for finding in sorted(open_findings, key=lambda value: value.get("id", "")):
+            feedback_lines.append(
+                f"- **{finding['id']}** "
+                f"[{finding.get('severity', 'unknown')}]: "
+                f"{finding.get('claim', '')}"
+            )
+        transition.update(
+            new_status="paused",
+            feedback="\n".join(feedback_lines),
+            feedback_reason=(
+                "The critic reviewed the completed work and returned it with "
+                "open findings; address them."
+            ),
+            open_finding_count=len(open_findings),
+        )
+    else:
+        transition["new_status"] = escalation_status(
+            is_loop_job=transition["is_loop_job"]
+        )
+    return transition
+
+
+async def _materialize_critic_verdict_transactional(
+    critic_job: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply S27 under ``status='reviewing'`` or report a lost world CAS.
+
+    The caller runs this inside ``CompletionEffectRunner.run_transactional``.
+    A stateless return takes the queue lock before the jobs lock and composes
+    its wake watermark with the status/context transition.  The inner
+    savepoint is deliberately rolled back on a world miss so the enclosing
+    effect can commit only its ``superseded`` marker.
+    """
+
+    if not _is_verification_critic(critic_job):
+        return {"applicable": False, "world_cas_won": True, "actions": []}
+    critic_status = str(critic_job.get("status") or "")
+    if critic_status not in _CRITIC_ACTIONABLE_STATUSES:
+        return {"applicable": False, "world_cas_won": True, "actions": []}
+
+    critic_context = critic_job.get("context") or {}
+    if isinstance(critic_context, str):
+        try:
+            critic_context = json.loads(critic_context)
+        except (TypeError, ValueError):
+            critic_context = {}
+    target_job_id = str((critic_context or {}).get("verification_target") or "")
+    try:
+        target_uuid = UUID(target_job_id)
+    except (TypeError, ValueError):
+        return {
+            "applicable": True,
+            "world_cas_won": False,
+            "observed_status": "missing",
+            "target_job_id": target_job_id,
+            "actions": [],
+        }
+
+    from services.completion_control import completion_control_claim_active
+
+    async with postgres_db.acquire() as conn:
+        hint = await conn.fetchrow(
+            "SELECT jobs.*, "
+            "extract(epoch FROM clock_timestamp())::float8 AS db_now_epoch "
+            "FROM jobs WHERE id=$1::uuid",
+            target_uuid,
+        )
+        if hint is None:
+            return {
+                "applicable": True,
+                "world_cas_won": False,
+                "observed_status": "missing",
+                "target_job_id": target_job_id,
+                "actions": [],
+            }
+        hinted_job = dict(hint)
+        hinted_transition = _critic_verdict_transition(critic_job, hinted_job)
+        hinted_lane = str(hinted_job.get("execution_lane") or "pinned")
+        queue_first = (
+            hinted_lane == "stateless" and hinted_transition["outcome"] == "returned"
+        )
+
+        try:
+            async with conn.transaction():
+                if queue_first:
+                    from orchestrator.database.postgres import (
+                        _stateless_resume_context,
+                    )
+                    from src.shared.run_queue import unpark_unit
+                    from src.shared.worker_queue import (
+                        enqueue_worker_batch_wake,
+                        reset_worker_batch_attempts,
+                    )
+
+                    admitted = await enqueue_worker_batch_wake(
+                        conn,
+                        job_id=target_uuid,
+                        fair_key=(
+                            str(hinted_job["user_id"])
+                            if hinted_job.get("user_id")
+                            else None
+                        ),
+                        priority=int(hinted_job.get("priority") or 0),
+                    )
+
+                locked = await conn.fetchrow(
+                    "SELECT jobs.*, "
+                    "extract(epoch FROM clock_timestamp())::float8 AS db_now_epoch "
+                    "FROM jobs WHERE id=$1::uuid FOR UPDATE",
+                    target_uuid,
+                )
+                if locked is None:
+                    raise _CriticWorldCASMiss("missing")
+                target_job = dict(locked)
+                observed_status = str(target_job.get("status") or "")
+                if observed_status != "reviewing":
+                    raise _CriticWorldCASMiss(observed_status)
+                if completion_control_claim_active(
+                    target_job.get("context"),
+                    now_epoch=float(target_job["db_now_epoch"]),
+                ):
+                    raise _CriticWorldCASMiss("reviewing:control_claimed")
+
+                transition = _critic_verdict_transition(critic_job, target_job)
+                lane = str(target_job.get("execution_lane") or "pinned")
+                if queue_first != (
+                    lane == "stateless" and transition["outcome"] == "returned"
+                ):
+                    raise RuntimeError(
+                        "critic verdict transition changed across queue-first admission"
+                    )
+
+                if transition["outcome"] == "returned":
+                    resume_values = {
+                        "queued_feedback": transition["feedback"],
+                        "queued_feedback_reason": transition["feedback_reason"],
+                    }
+                    resume_context = (
+                        _stateless_resume_context(resume_values)
+                        if queue_first
+                        else resume_values
+                    )
+                    if queue_first:
+                        if (
+                            await reset_worker_batch_attempts(conn, job_id=target_uuid)
+                            is None
+                        ):
+                            raise RuntimeError(
+                                "critic return lost the worker queue row"
+                            )
+                        if admitted.state == "parked" and not await unpark_unit(
+                            conn, unit_id=target_uuid
+                        ):
+                            raise RuntimeError(
+                                "critic return could not unpark worker queue"
+                            )
+                    result = await conn.execute(
+                        "UPDATE jobs SET "
+                        "context=(COALESCE(context, '{}'::jsonb) "
+                        "- 'completion_decision') || $2::jsonb || "
+                        "CASE WHEN freeze_data IS NULL THEN '{}'::jsonb "
+                        "ELSE jsonb_build_object('last_freeze_data', freeze_data) END, "
+                        "status='paused', assigned_agent_id=NULL, freeze_data=NULL, "
+                        "updated_at=CURRENT_TIMESTAMP "
+                        "WHERE id=$1::uuid AND status='reviewing' "
+                        "AND execution_lane=$3::text",
+                        target_uuid,
+                        json.dumps(resume_context),
+                        lane,
+                    )
+                else:
+                    new_status = str(transition["new_status"])
+                    result = await conn.execute(
+                        "UPDATE jobs SET status=$2::text, "
+                        "completed_at=CASE WHEN $2::text='completed' "
+                        "THEN COALESCE(completed_at, CURRENT_TIMESTAMP) "
+                        "ELSE completed_at END, "
+                        "error_message=CASE WHEN $3::text='' THEN error_message "
+                        "ELSE $3::text END, updated_at=CURRENT_TIMESTAMP "
+                        "WHERE id=$1::uuid AND status='reviewing'",
+                        target_uuid,
+                        new_status,
+                        str(transition.get("reason") or ""),
+                    )
+                if result != "UPDATE 1":
+                    raise _CriticWorldCASMiss(observed_status)
+        except _CriticWorldCASMiss as miss:
+            return {
+                "applicable": True,
+                "world_cas_won": False,
+                "observed_status": miss.observed_status,
+                "target_job_id": target_job_id,
+                "critic_job_id": str(critic_job["id"]),
+                "actions": [],
+            }
+
+    persisted_transition = {
+        key: transition[key]
+        for key in (
+            "outcome",
+            "target_job_id",
+            "critic_job_id",
+            "new_status",
+            "open_finding_count",
+        )
+        if key in transition
+    }
+    return {
+        "applicable": True,
+        "world_cas_won": True,
+        **persisted_transition,
+        "actions": [],
+    }
+
+
+async def _run_critic_verdict_followups(
+    plan: Mapping[str, Any], *, completion_command_id: str
+) -> dict[str, Any]:
+    """Run only the external/idempotent consequences of the winning S27 CAS."""
+
+    if not plan.get("applicable") or not plan.get("world_cas_won"):
+        return {"actions": []}
+    target_job_id = str(plan["target_job_id"])
+    critic_job_id = str(plan["critic_job_id"])
+    outcome = str(plan["outcome"])
+    new_status = str(plan["new_status"])
+    actions: list[str] = []
+    target_job = await postgres_db.get_job(target_job_id)
+
+    if outcome == "approved":
+        logger.info("Critic %s approved target %s", critic_job_id, target_job_id)
+        await maybe_wake_session(postgres_db, target_job_id, new_status)
+        _kick_session_wake_drain(postgres_db)
+        actions.append(f"target {target_job_id} set to '{new_status}' (approved)")
+        from services.completion import is_curation_enabled
+
+        if target_job and is_curation_enabled(target_job):
+            await _trigger_curation_final_pass(
+                target_job_id,
+                completion_command_id=completion_command_id,
+            )
+            actions.append(f"curation final pass triggered for {target_job_id}")
+    elif outcome == "returned":
+        logger.info(
+            "Critic %s returned target %s (%s open finding(s))",
+            critic_job_id,
+            target_job_id,
+            int(plan.get("open_finding_count") or 0),
+        )
+        _trigger_dispatch()
+        actions.append(
+            f"target {target_job_id} resumed with feedback from critic {critic_job_id}"
+        )
+    else:
+        from services.project_loops import job_loop_id
+
+        reason = _bounded_critic_text((target_job or {}).get("error_message") or "")
+        logger.warning(
+            "Verification escalated target %s to %s: %s",
+            target_job_id,
+            new_status,
+            reason,
+        )
+        try:
+            await maybe_wake_session(postgres_db, target_job_id, new_status)
+            _kick_session_wake_drain(postgres_db)
+        except Exception:
+            logger.exception(
+                "Session wake for escalated target %s failed (non-fatal)",
+                target_job_id,
+            )
+        user_id = (target_job or {}).get("user_id")
+        if target_job and not job_loop_id(target_job) and user_id:
+            try:
+                await notification_service.notify_review_returned_to_manual(
+                    user_id=str(user_id),
+                    job_id=target_job_id,
+                    config_name=str(target_job.get("config_name") or ""),
+                    reason=reason,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to notify owner of escalated target %s (non-fatal)",
+                    target_job_id,
+                )
+        actions.append(
+            _bounded_critic_text(
+                f"target {target_job_id} escalated to '{new_status}': {reason}"
+            )
+        )
+    return {"actions": actions}
+
+
 async def _handle_critic_verdict_on_complete(
     job: dict[str, Any],
     actions: list[str],
@@ -18380,6 +18747,424 @@ async def _trigger_verification_on_complete(
         logger.info(f"Verification job {critic_job_id} created for job {job_id}")
 
 
+async def _materialize_verification_critic_transactional(
+    job: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    expected_round: int,
+) -> dict[str, Any]:
+    """Materialize S30 under the locked ``reviewing`` parent world state.
+
+    This callback is DB-only and is invoked through ``run_transactional``.
+    The jobs-row lock orders the critic INSERT against the reviewing watchdog
+    and human decisions; the exact natural round is re-derived under that lock.
+    Gitea branch setup and dispatch belong to the separate handoff effect.
+    """
+
+    from services.completion import (
+        _parse_freeze_data,
+        format_verification_instructions,
+        get_verification_config,
+        is_job_completion_freeze,
+        is_verification_enabled,
+    )
+    from services.completion_control import completion_control_claim_active
+    from services.project_loops import job_loop_id
+    from services.verification_ledger import (
+        escalation_status,
+        fold_open_findings,
+        render_prior_findings,
+    )
+
+    job_id = str(job["id"])
+    if (
+        result.get("error")
+        or not result.get("should_stop", False)
+        or job.get("parent_job_id") is not None
+        or _is_lite_config_override(job.get("config_override"))
+        or (
+            not is_job_completion_freeze(job)
+            and str(job.get("status") or "") != "reviewing"
+        )
+    ):
+        return {
+            "applicable": False,
+            "world_cas_won": True,
+            "action": "noop",
+            "actions": [],
+        }
+
+    try:
+        job_uuid = UUID(job_id)
+    except (TypeError, ValueError):
+        return {
+            "applicable": True,
+            "world_cas_won": False,
+            "observed_status": "missing",
+            "target_job_id": job_id,
+            "actions": [],
+        }
+
+    async with postgres_db.acquire() as conn:
+        parent_row = await conn.fetchrow(
+            "SELECT jobs.*, "
+            "extract(epoch FROM clock_timestamp())::float8 AS db_now_epoch "
+            "FROM jobs WHERE id=$1::uuid FOR UPDATE",
+            job_uuid,
+        )
+        if parent_row is None:
+            return {
+                "applicable": True,
+                "world_cas_won": False,
+                "observed_status": "missing",
+                "target_job_id": job_id,
+                "actions": [],
+            }
+        parent = dict(parent_row)
+        if not is_verification_enabled(parent):
+            return {
+                "applicable": False,
+                "world_cas_won": True,
+                "action": "noop",
+                "actions": [],
+            }
+        observed_status = str(parent.get("status") or "")
+        if observed_status != "reviewing" or completion_control_claim_active(
+            parent.get("context"), now_epoch=float(parent["db_now_epoch"])
+        ):
+            return {
+                "applicable": True,
+                "world_cas_won": False,
+                "observed_status": (
+                    observed_status
+                    if observed_status != "reviewing"
+                    else "reviewing:control_claimed"
+                ),
+                "target_job_id": job_id,
+                "actions": [],
+            }
+
+        rounds = _verification_rounds(parent)
+        natural_round = len(rounds)
+        if natural_round != int(expected_round):
+            return {
+                "applicable": True,
+                "world_cas_won": False,
+                "observed_status": f"reviewing:round-{natural_round}",
+                "target_job_id": job_id,
+                "expected_round": int(expected_round),
+                "actions": [],
+            }
+
+        verification_config = get_verification_config(parent)
+        max_rounds = int(verification_config.get("max_rounds", 3))
+        freeze_data = _parse_freeze_data(job) or _parse_freeze_data(parent) or {}
+        content_tree = freeze_data.get("content_tree")
+
+        escalation_reason = ""
+        escalation_code = ""
+        if freeze_data.get("delivery_failed"):
+            escalation_reason = (
+                freeze_data.get("delivery_error")
+                or "The job-ending git push failed; deliverables were not delivered."
+            )
+            escalation_reason = f"Verification skipped — {escalation_reason}"
+            escalation_code = "delivery_failed"
+        else:
+            gate_action, gate_reason = _verification_gate_decision(
+                rounds, content_tree, max_rounds
+            )
+            if gate_action == "escalate":
+                escalation_reason = gate_reason
+                escalation_code = "verification_gate"
+
+        async def _publish_escalation(reason: str, action_code: str) -> dict[str, Any]:
+            reason = _bounded_critic_text(reason)
+            is_loop_job = bool(job_loop_id(parent))
+            status = escalation_status(is_loop_job=is_loop_job)
+            updated = await conn.execute(
+                "UPDATE jobs SET status=$2::text, error_message=$3::text, "
+                "completed_at=CASE WHEN $2::text='completed' "
+                "THEN COALESCE(completed_at, CURRENT_TIMESTAMP) "
+                "ELSE completed_at END, updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=$1::uuid AND status='reviewing'",
+                job_uuid,
+                status,
+                reason,
+            )
+            if updated != "UPDATE 1":
+                return {
+                    "applicable": True,
+                    "world_cas_won": False,
+                    "observed_status": observed_status,
+                    "target_job_id": job_id,
+                    "actions": [],
+                }
+            return {
+                "applicable": True,
+                "world_cas_won": True,
+                "action": "escalate",
+                "target_job_id": job_id,
+                "new_status": status,
+                "action_code": action_code,
+                "actions": [],
+            }
+
+        if escalation_reason:
+            return await _publish_escalation(escalation_reason, escalation_code)
+
+        existing_critic = await postgres_db.get_verification_critic_for_round(
+            job_id, natural_round
+        )
+        critic_config = str(verification_config.get("critic_config", "critic"))
+        if existing_critic is not None:
+            return {
+                "applicable": True,
+                "world_cas_won": True,
+                "action": "handoff",
+                "target_job_id": job_id,
+                "critic_job_id": str(existing_critic["id"]),
+                "verification_round": natural_round,
+                "reconciled": True,
+                "actions": [],
+            }
+
+        if await postgres_db.has_live_verification_critic(job_id):
+            return {
+                "applicable": True,
+                "world_cas_won": True,
+                "action": "noop",
+                "target_job_id": job_id,
+                "verification_round": natural_round,
+                "actions": [],
+            }
+
+        config_name = str(parent.get("config_name") or "unknown")
+        instructions = format_verification_instructions(
+            job_id=job_id,
+            description=str(parent.get("description") or ""),
+            freeze_data=freeze_data,
+            config_name=config_name,
+            prior_findings=render_prior_findings(
+                fold_open_findings(rounds), natural_round
+            ),
+        )
+        if not instructions:
+            raise RuntimeError(
+                f"failed to format verification instructions for job {job_id}"
+            )
+        verification_description = (
+            f"Verify deliverables of job {job_id} ({config_name}). "
+            "Review output against original requirements and either approve "
+            "or return with feedback."
+        )
+        critic_context: dict[str, Any] = {
+            "verification_target": job_id,
+            "instructions": instructions,
+            "original_description": str(parent.get("description") or ""),
+            "original_config": config_name,
+            "deliverables": freeze_data.get("deliverables", []),
+            "summary": freeze_data.get("summary", ""),
+            "confidence": freeze_data.get("confidence", 0),
+            "verification_round": natural_round,
+            "max_verification_rounds": max_rounds,
+        }
+        parent_context = parent.get("context") or {}
+        if isinstance(parent_context, str):
+            try:
+                parent_context = json.loads(parent_context)
+            except (TypeError, ValueError):
+                parent_context = {}
+        if parent_context.get("vm"):
+            critic_context["vm"] = parent_context["vm"]
+            critic_context["inherits_parent_workspace"] = True
+        elif parent_context.get("workspace_container"):
+            critic_context["workspace_container"] = parent_context[
+                "workspace_container"
+            ]
+            critic_context["inherits_parent_workspace"] = True
+
+        parent_override = parent.get("config_override")
+        if isinstance(parent_override, str):
+            try:
+                parent_override = json.loads(parent_override)
+            except (TypeError, ValueError):
+                parent_override = None
+        parent_llm = (
+            parent_override.get("llm")
+            if isinstance(parent_override, dict)
+            and isinstance(parent_override.get("llm"), dict)
+            else None
+        )
+        critic_override = _critic_config_override(parent_llm)
+        project_id = str(parent["project_id"]) if parent.get("project_id") else None
+
+        try:
+            (
+                critic_datasource_ids,
+                critic_datasource_revisions,
+            ) = await _revalidate_job_datasource_selection(parent)
+        except HTTPException as exc:
+            if exc.status_code != 403:
+                raise
+            reason = (
+                "Verification could not start because the target's connector "
+                "selection is no longer authorized."
+            )
+            return await _publish_escalation(reason, "connector_access_changed")
+
+        critic_owner_id = str(parent["user_id"]) if parent.get("user_id") else None
+        critic_actor = (
+            await postgres_db.get_user(critic_owner_id) if critic_owner_id else None
+        )
+        critic_datasource_provenance = await _datasource_selection_provenance(
+            datasource_ids=critic_datasource_ids,
+            policy_revisions=critic_datasource_revisions,
+            origin="inherited",
+            effective_work_owner_id=critic_owner_id,
+            actor=critic_actor,
+            project_ids=[project_id] if project_id else [],
+            creation_path="critic_lifecycle",
+        )
+
+        critic_was_reconciled = False
+        try:
+            # An explicit savepoint keeps a handled 0132 loser from aborting
+            # the surrounding effect/materialization transaction, including
+            # ownerless targets for which create_job otherwise needs no nested
+            # policy transaction of its own.
+            async with conn.transaction():
+                critic_job = await postgres_db.create_job(
+                    description=verification_description,
+                    config_name=critic_config,
+                    config_override=critic_override,
+                    context=critic_context,
+                    parent_job_id=job_id,
+                    project_id=project_id,
+                    priority=10,
+                    user_id=critic_owner_id,
+                    runner_kind="lifecycle",
+                    datasource_ids=critic_datasource_ids,
+                    datasource_selection_provenance=critic_datasource_provenance,
+                    datasource_policy_revisions=critic_datasource_revisions,
+                    authority_user_id=critic_owner_id,
+                    authority_project_ids=(
+                        [project_id] if critic_owner_id and project_id else []
+                    ),
+                )
+        except asyncpg.UniqueViolationError as exc:
+            if getattr(exc, "constraint_name", None) != "jobs_verification_uniq":
+                raise
+            critic_job = await postgres_db.get_verification_critic_for_round(
+                job_id, natural_round
+            )
+            if critic_job is None:
+                raise RuntimeError(
+                    f"verification critic index winner for {job_id} round "
+                    f"{natural_round} could not be resolved"
+                ) from exc
+            critic_was_reconciled = True
+        except DatasourcePolicyConflictError:
+            reason = (
+                "Verification could not start because the target's connector "
+                "policy changed concurrently."
+            )
+            return await _publish_escalation(reason, "connector_policy_changed")
+
+    return {
+        "applicable": True,
+        "world_cas_won": True,
+        "action": "handoff",
+        "target_job_id": job_id,
+        "critic_job_id": str(critic_job["id"]),
+        "verification_round": natural_round,
+        "reconciled": critic_was_reconciled,
+        "actions": [],
+    }
+
+
+async def _run_verification_critic_handoff(
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Run S30's external handoff only after DB materialization won."""
+
+    if not plan.get("applicable") or not plan.get("world_cas_won"):
+        return {"actions": []}
+    action = str(plan.get("action") or "noop")
+    target_job_id = str(plan.get("target_job_id") or "")
+    if action == "noop":
+        return {"actions": []}
+    if action == "handoff":
+        critic_job_id = str(plan["critic_job_id"])
+        target_job = await postgres_db.get_job(target_job_id)
+        critic_job = await postgres_db.get_job(critic_job_id)
+        if target_job is None or critic_job is None:
+            raise RuntimeError("verification critic handoff lost a materialized job")
+        await _setup_verification_critic_workspace(
+            target_job,
+            critic_job,
+            str(critic_job.get("config_name") or "critic"),
+            durable_reconcile=True,
+        )
+        _trigger_dispatch()
+        reconciled = bool(plan.get("reconciled"))
+        verb = "reconciled" if reconciled else "created"
+        logger.info(
+            "Verification job %s %s for job %s",
+            critic_job_id,
+            verb,
+            target_job_id,
+        )
+        return {"actions": [f"critic job {critic_job_id} {verb}"]}
+
+    if action != "escalate":
+        raise RuntimeError(f"unknown verification materialization action {action!r}")
+    target_job = await postgres_db.get_job(target_job_id)
+    if target_job is None:
+        raise RuntimeError("verification escalation handoff lost its target job")
+    status = str(target_job.get("status") or plan["new_status"])
+    reason = _bounded_critic_text(target_job.get("error_message") or "")
+    logger.warning(
+        "Verification escalated target %s to %s: %s",
+        target_job_id,
+        status,
+        reason,
+    )
+    try:
+        await maybe_wake_session(postgres_db, target_job_id, status)
+        _kick_session_wake_drain(postgres_db)
+    except Exception:
+        logger.exception(
+            "Session wake for escalated target %s failed (non-fatal)", target_job_id
+        )
+    from services.project_loops import job_loop_id
+
+    user_id = target_job.get("user_id")
+    if not job_loop_id(target_job) and user_id:
+        try:
+            await notification_service.notify_review_returned_to_manual(
+                user_id=str(user_id),
+                job_id=target_job_id,
+                config_name=str(target_job.get("config_name") or ""),
+                reason=reason,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to notify owner of escalated target %s (non-fatal)",
+                target_job_id,
+            )
+    action_code = str(plan.get("action_code") or "")
+    if action_code == "connector_access_changed":
+        action_text = f"target {target_job_id} escalated: connector access changed"
+    elif action_code == "connector_policy_changed":
+        action_text = f"target {target_job_id} escalated: connector policy changed"
+    else:
+        action_text = _bounded_critic_text(
+            f"target {target_job_id} escalated: {reason}"
+        )
+    return {"actions": [action_text]}
+
+
 def _loop_deadline_passed(run_until: Any) -> bool:
     """True if the project loop's run_until deadline has passed (tz-aware)."""
     if run_until is None:
@@ -18581,6 +19366,9 @@ async def _notify_loop_event(
     event_type: str,
     subject: str,
     message: str,
+    dedup_turn_identity: str | None = None,
+    note_id: str | None = None,
+    authority_check: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Surface a loop event to the loop's owner — notification bell + SSE.
 
@@ -18593,24 +19381,61 @@ async def _notify_loop_event(
     owner_id = loop.get("owner_id")
     if not owner_id:
         return
-    try:
-        await postgres_db.log_message(
+    thread_id = f"loop-{str(loop.get('id', ''))[:6]}"
+    if dedup_turn_identity is not None:
+        from services.project_loop_atomic import bounded_replay_text
+
+        event_type = bounded_replay_text(event_type, limit_bytes=96)
+        subject = bounded_replay_text(subject, limit_bytes=256)
+        message = bounded_replay_text(message, limit_bytes=1024)
+        if authority_check is not None:
+            await authority_check()
+        # Durable-command handoffs replay after response loss. Persist one
+        # deterministic bell row first; its helper validates owner + immutable
+        # payload on conflict. SSE is emitted only by the inserting caller.
+        notification_id = uuid5(
+            NAMESPACE_URL,
+            ":".join(
+                (
+                    "srw-project-loop-notification-v1",
+                    str(loop.get("id")),
+                    str(dedup_turn_identity),
+                    str(job_id),
+                    str(event_type),
+                    str(note_id or "-"),
+                )
+            ),
+        )
+        inserted = await postgres_db.log_project_loop_message_once(
+            message_id=str(notification_id),
             job_id=str(job_id),
-            # message_log.thread_id is the conversation key (email-threading
-            # for job messages). Loop events aren't email threads; group them
-            # per loop — "loop-" + 6 hex chars.
-            thread_id=f"loop-{str(loop.get('id', ''))[:6]}",
-            direction="outbound",
+            user_id=str(owner_id),
+            thread_id=thread_id,
             subject=subject,
             message=message,
-            status="sent",
-            user_id=str(owner_id),
-            mode="async",
         )
-    except Exception:
-        logger.warning(
-            "loop notify: message_log write failed (non-fatal)", exc_info=True
-        )
+        if not inserted:
+            return
+        if authority_check is not None:
+            await authority_check()
+    else:
+        # Default-off/legacy callers retain the historical best-effort path and
+        # exact DB call shape.
+        try:
+            await postgres_db.log_message(
+                job_id=str(job_id),
+                thread_id=thread_id,
+                direction="outbound",
+                subject=subject,
+                message=message,
+                status="sent",
+                user_id=str(owner_id),
+                mode="async",
+            )
+        except Exception:
+            logger.warning(
+                "loop notify: message_log write failed (non-fatal)", exc_info=True
+            )
     try:
         from services.notification_feed import notification_feed
 
@@ -18632,7 +19457,12 @@ async def _notify_loop_event(
 
 
 async def _notify_loop_user_questions(
-    loop: dict[str, Any], job: dict[str, Any]
+    loop: dict[str, Any],
+    job: dict[str, Any],
+    *,
+    dedup_turn_identity: str | None = None,
+    durable: bool = False,
+    authority_check: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Surface ``user-question``-tagged KB notes a completed loop job filed.
 
@@ -18646,6 +19476,8 @@ async def _notify_loop_user_questions(
     project_id = loop.get("project_id")
     if not project_id or vector_db is None:
         return
+    if authority_check is not None:
+        await authority_check()
     try:
         async with vector_db.acquire() as conn:
             rows = await conn.fetch(
@@ -18657,12 +19489,16 @@ async def _notify_loop_user_questions(
                 str(project_id),
             )
     except Exception:
+        if durable:
+            raise
         logger.debug(
             "loop notify: user-question scan unavailable (non-fatal)",
             exc_info=True,
         )
         return
     for r in rows:
+        if authority_check is not None:
+            await authority_check()
         await _notify_loop_event(
             loop,
             job_id=str(job["id"]),
@@ -18674,6 +19510,9 @@ async def _notify_loop_user_questions(
                 "answer via the KB or the loop's steering fields when "
                 "convenient."
             ),
+            dedup_turn_identity=dedup_turn_identity,
+            note_id=str(r["note_id"]),
+            authority_check=authority_check,
         )
 
 
@@ -18727,6 +19566,8 @@ async def _record_loop_job_outcome(
     actions: list[str],
     failed: bool,
     last_error: str | None,
+    durable: bool = False,
+    authority_check: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[str, str | None]:
     """Persist a loop member's delivery outcome and refresh its knowledge.
 
@@ -18782,10 +19623,19 @@ async def _record_loop_job_outcome(
                     exc_info=True,
                 )
 
-        asyncio.create_task(_kb_reindex_after_job(str(loop["project_id"])))
+        if durable:
+            if authority_check is not None:
+                await authority_check()
+            await _reindex_project_kb(str(loop["project_id"]))
+            if authority_check is not None:
+                await authority_check()
+        else:
+            asyncio.create_task(_kb_reindex_after_job(str(loop["project_id"])))
 
     try:
-        await write_loop_retro(
+        if durable and authority_check is not None:
+            await authority_check()
+        recorded = await write_loop_retro(
             postgres_db,
             job,
             ctx=ctx or {},
@@ -18796,7 +19646,20 @@ async def _record_loop_job_outcome(
             merge_notes=delivery_notes,
             vector_db=vector_db,
         )
+        if durable and authority_check is not None:
+            await authority_check()
+        if durable and not recorded:
+            # ``ON CONFLICT (job_id) DO NOTHING`` is a successful replay; the
+            # writer also returns False after a swallowed dependency error, so
+            # distinguish them with the authoritative record table.
+            existing = await postgres_db.get_job_change_record(str(job["id"]))
+            if existing is None:
+                raise RuntimeError(
+                    f"project loop {loop_id}: durable job record was not persisted"
+                )
     except Exception:
+        if durable:
+            raise
         logger.exception(
             "project loop %s: structured record write failed (non-fatal)", loop_id
         )
@@ -19376,6 +20239,732 @@ async def _rotate_loop_to_next_stage(
         )
 
 
+async def _prepare_atomic_loop_spawn_blocks(
+    loop: Mapping[str, Any],
+) -> tuple[str | None, str | None]:
+    """Prepare vector/DB kickoff reads before the short S32 transaction."""
+
+    from services.project_backlog import fetch_backlog, render_backlog_block
+    from services.project_loops import render_loop_job_history
+
+    project_id = loop.get("project_id")
+    backlog_block: str | None = None
+    history_block: str | None = None
+    if project_id and vector_db is not None:
+        campaign = loop.get("campaign") or {}
+        in_progress_id = campaign.get("initiative_note_id")
+        try:
+            rows, counts = await fetch_backlog(
+                vector_db,
+                str(project_id),
+                exclude_note_id=in_progress_id,
+            )
+            in_progress = (
+                {
+                    "note_id": in_progress_id,
+                    "title": campaign.get("title") or "",
+                }
+                if in_progress_id
+                else None
+            )
+            backlog_block = render_backlog_block(
+                rows,
+                counts,
+                in_progress=in_progress,
+            )
+        except Exception:
+            logger.warning(
+                "loop %s: atomic-advance backlog preflight failed; spawning "
+                "without the block",
+                str(loop.get("id"))[:8],
+                exc_info=True,
+            )
+    if project_id:
+        try:
+            history_rows = await postgres_db.list_project_job_change_records(
+                str(project_id), limit=20
+            )
+            history_block = render_loop_job_history(history_rows)
+        except Exception:
+            logger.warning(
+                "loop %s: atomic-advance history preflight failed; spawning "
+                "without the block",
+                str(loop.get("id"))[:8],
+                exc_info=True,
+            )
+    return backlog_block, history_block
+
+
+async def _prepare_atomic_project_loop_advance(
+    job: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    completion_command_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Build S32's exact world expectation and pure mutation plan.
+
+    No external work occurs after this returns until the DB transaction has
+    committed. Vector/history reads needed to render successor kickoffs are
+    materialized here and become inert transaction inputs.
+    """
+
+    from services.project_loop_atomic import (
+        LoopAdvanceExpectation,
+        bounded_replay_diagnostic,
+        plan_loop_advance,
+    )
+
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    if not isinstance(ctx, Mapping) or not ctx.get("loop_id"):
+        return None
+    loop_id = str(ctx["loop_id"])
+    loop = await postgres_db.get_project_loop(loop_id)
+    if not loop or loop.get("status") != "running":
+        return None
+    stage_ids = [str(value) for value in (loop.get("current_stage_jobs") or [])]
+    if str(job["id"]) not in stage_ids:
+        return None
+
+    statuses = await postgres_db.get_loop_stage_member_statuses(stage_ids)
+    expectation = LoopAdvanceExpectation.from_rows(loop, statuses)
+    failed = bool(result.get("error")) or job.get("status") == "failed"
+    raw_error = result.get("error")
+    if isinstance(raw_error, Mapping):
+        raw_error = raw_error.get("message") or str(dict(raw_error))
+    member_error = (str(raw_error) if raw_error else "job failed") if failed else None
+    replay_error, replay_error_truncation = bounded_replay_diagnostic(member_error)
+
+    all_survivors_terminal = all(
+        status in ("completed", "failed", "cancelled") for status in statuses.values()
+    )
+    if not all_survivors_terminal:
+        return {
+            "kind": "member_only",
+            "loop": loop,
+            "job_context": dict(ctx),
+            "output": {
+                "applicable": True,
+                "won": True,
+                "reason": "turn_incomplete",
+                "loop_id": loop_id,
+                "completed_member_id": str(job["id"]),
+                "spawned_job_ids": [],
+                "spawned_roles": [],
+                "replay": {
+                    "record_member": {
+                        "failed": failed,
+                        "last_error": replay_error,
+                        **(
+                            {"last_error_truncation": replay_error_truncation}
+                            if replay_error_truncation is not None
+                            else {}
+                        ),
+                    },
+                    "notify_user_questions": True,
+                    "notifications": [],
+                    "close_ticket": None,
+                    "kb_ttl_decrement": False,
+                    "officer": None,
+                    "action": {"kind": "turn_incomplete"},
+                },
+            },
+        }
+
+    park_until = await _loop_cooldown_park_until(
+        job,
+        result,
+        stage_ids=stage_ids,
+        statuses=statuses,
+    )
+    mutation = plan_loop_advance(
+        loop,
+        completed_job=job,
+        completed_context=ctx,
+        member_states=statuses,
+        failed=failed,
+        member_error=member_error,
+        deadline_passed=_loop_deadline_passed(loop.get("run_until")),
+        park_until=park_until,
+    )
+    successor_identity = {
+        **dict(mutation.extra_context),
+        "_loop_advance_origin_job_id": str(job["id"]),
+    }
+    if completion_command_id is not None:
+        successor_identity["_loop_advance_completion_command_id"] = str(
+            completion_command_id
+        )
+    mutation = replace(mutation, extra_context=successor_identity)
+    backlog_block: str | None = None
+    history_block: str | None = None
+    if mutation.stage is not None:
+        backlog_block, history_block = await _prepare_atomic_loop_spawn_blocks(loop)
+    return {
+        "kind": "mutation",
+        "loop": loop,
+        "job_context": dict(ctx),
+        "expectation": expectation,
+        "mutation": mutation,
+        "backlog_block": backlog_block,
+        "history_block": history_block,
+    }
+
+
+async def _materialize_prepared_project_loop_advance(
+    prepared: Mapping[str, Any] | None,
+    job: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Run only S32's app-DB work; safe inside ``run_transactional``."""
+
+    if prepared is None:
+        return {
+            "applicable": False,
+            "won": True,
+            "reason": "not_a_running_loop_member",
+            "loop_id": None,
+            "completed_member_id": str(job["id"]),
+            "spawned_job_ids": [],
+            "spawned_roles": [],
+            "replay": {},
+        }
+    if prepared.get("kind") == "member_only":
+        return dict(prepared["output"])
+
+    from services.project_loop_atomic import materialize_loop_advance_atomic
+
+    output = await materialize_loop_advance_atomic(
+        postgres_db,
+        loop_id=str(prepared["loop"]["id"]),
+        member_job_id=str(job["id"]),
+        expected=prepared["expectation"],
+        mutation=prepared["mutation"],
+        backlog_block=prepared.get("backlog_block"),
+        history_block=prepared.get("history_block"),
+    )
+    return {"applicable": True, **output}
+
+
+async def _decrement_project_loop_kb_ttl_once(
+    *,
+    loop_id: str,
+    project_id: str,
+    completed_member_id: str,
+    total_jobs_run: int,
+) -> bool:
+    """Apply one cycle decrement under an immutable vector-DB turn identity.
+
+    Both the ledger INSERT and ``knowledge_index`` UPDATE commit in one vector
+    transaction. A response-lost handoff retry therefore either observes the
+    exact ledger identity and skips, or finds no ledger and applies both. A key
+    collision with different project/member identity fails closed.
+    """
+
+    if vector_db is None:
+        return False
+    async with vector_db.acquire() as conn:
+        async with conn.transaction():
+            inserted = await conn.fetchrow(
+                """
+                INSERT INTO project_loop_ttl_effects (
+                    loop_id, total_jobs_run, completed_member_id, project_id
+                ) VALUES ($1::uuid, $2::int, $3::uuid, $4::uuid)
+                ON CONFLICT (loop_id, total_jobs_run) DO NOTHING
+                RETURNING completed_member_id, project_id
+                """,
+                str(loop_id),
+                int(total_jobs_run),
+                str(completed_member_id),
+                str(project_id),
+            )
+            if inserted is not None:
+                await conn.execute(
+                    """
+                    UPDATE knowledge_index
+                    SET remaining_cycles = remaining_cycles - 1
+                    WHERE project_id = $1::uuid
+                      AND remaining_cycles IS NOT NULL
+                      AND status = 'active'
+                    """,
+                    str(project_id),
+                )
+                return True
+
+            # Separate statement takes a fresh READ COMMITTED snapshot after a
+            # concurrent ON CONFLICT waiter and validates immutable identity.
+            existing = await conn.fetchrow(
+                """
+                SELECT completed_member_id, project_id
+                FROM project_loop_ttl_effects
+                WHERE loop_id = $1::uuid AND total_jobs_run = $2::int
+                """,
+                str(loop_id),
+                int(total_jobs_run),
+            )
+            if (
+                existing is None
+                or str(existing["completed_member_id"]) != str(completed_member_id)
+                or str(existing["project_id"]) != str(project_id)
+            ):
+                raise RuntimeError(
+                    "project-loop KB TTL replay identity matched a different turn"
+                )
+            return False
+
+
+async def _handoff_atomic_project_loop_advance(
+    job: dict[str, Any],
+    atomic_output: Mapping[str, Any],
+    *,
+    authority_check: Callable[[], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    """Replay S32's external tail from committed successor IDs only."""
+
+    if authority_check is not None:
+        await authority_check()
+    loop_id = atomic_output.get("loop_id")
+    if (
+        not atomic_output.get("applicable")
+        or not atomic_output.get("won")
+        or not loop_id
+    ):
+        return {"actions": []}
+    loop = await postgres_db.get_project_loop(str(loop_id))
+    if authority_check is not None:
+        await authority_check()
+    if not loop:
+        raise RuntimeError(f"project loop {loop_id} disappeared before S32 handoff")
+    replay = atomic_output.get("replay") or {}
+    if not isinstance(replay, Mapping):
+        raise RuntimeError("project-loop advance replay payload is not an object")
+    handoff_actions: list[str] = []
+    from services.project_loop_atomic import bounded_replay_text
+
+    turn_identity = (
+        f"{atomic_output.get('completed_member_id')}:"
+        f"{int(atomic_output.get('total_jobs_run') or 0)}"
+    )
+
+    record = replay.get("record_member") or {}
+    job_context = job.get("context") or {}
+    if isinstance(job_context, str):
+        try:
+            job_context = json.loads(job_context)
+        except (json.JSONDecodeError, TypeError):
+            job_context = {}
+    await _record_loop_job_outcome(
+        job,
+        ctx=(dict(job_context) if isinstance(job_context, Mapping) else {}),
+        loop=loop,
+        loop_id=str(loop_id),
+        actions=handoff_actions,
+        failed=bool(record.get("failed")),
+        last_error=(str(record["last_error"]) if record.get("last_error") else None),
+        durable=True,
+        authority_check=authority_check,
+    )
+    if authority_check is not None:
+        await authority_check()
+    if replay.get("notify_user_questions"):
+        await _notify_loop_user_questions(
+            loop,
+            job,
+            dedup_turn_identity=turn_identity,
+            durable=True,
+            authority_check=authority_check,
+        )
+        if authority_check is not None:
+            await authority_check()
+
+    from services.job_provisioning import provision_job_repo
+
+    spawned_ids = [str(value) for value in atomic_output.get("spawned_job_ids") or []]
+    for spawned_id in spawned_ids:
+        if authority_check is not None:
+            await authority_check()
+        spawned = await postgres_db.get_job(spawned_id)
+        if authority_check is not None:
+            await authority_check()
+        if not spawned:
+            raise RuntimeError(
+                f"atomic loop successor {spawned_id} disappeared before provisioning"
+            )
+        await provision_job_repo(
+            job_row=spawned,
+            gitea_client=gitea_client,
+            postgres_db=postgres_db,
+            main_cloud_router=main_cloud_router,
+            loop_floor=True,
+            authority_check=authority_check,
+        )
+        if authority_check is not None:
+            await authority_check()
+
+    if replay.get("kb_ttl_decrement") and loop.get("project_id"):
+        if authority_check is not None:
+            await authority_check()
+        await _decrement_project_loop_kb_ttl_once(
+            loop_id=str(loop_id),
+            project_id=str(loop["project_id"]),
+            completed_member_id=str(atomic_output["completed_member_id"]),
+            total_jobs_run=int(atomic_output.get("total_jobs_run") or 0),
+        )
+        if authority_check is not None:
+            await authority_check()
+
+    close_ticket = replay.get("close_ticket")
+    if isinstance(close_ticket, Mapping) and vector_db is not None:
+        from services.project_backlog import close_backlog_ticket
+
+        if authority_check is not None:
+            await authority_check()
+        if not await close_backlog_ticket(
+            vector_db,
+            gitea_client,
+            str(loop.get("project_id")),
+            str(close_ticket["note_id"]),
+            str(close_ticket["status"]),
+            postgres_db=postgres_db,
+            authority_check=authority_check,
+        ):
+            raise RuntimeError(
+                "project loop "
+                f"{loop_id}: could not durably mirror ticket "
+                f"{close_ticket['note_id']} -> {close_ticket['status']}"
+            )
+        if authority_check is not None:
+            await authority_check()
+
+    for notification_index, notification in enumerate(
+        replay.get("notifications") or []
+    ):
+        if not isinstance(notification, Mapping):
+            continue
+        await _notify_loop_event(
+            loop,
+            job_id=str(job["id"]),
+            event_type=str(notification["event_type"]),
+            subject=str(notification["subject"]),
+            message=str(notification["message"]),
+            dedup_turn_identity=turn_identity,
+            note_id=f"planned:{notification_index}",
+            authority_check=authority_check,
+        )
+        if authority_check is not None:
+            await authority_check()
+
+    officer = replay.get("officer")
+    if isinstance(officer, Mapping):
+        project_id = str(loop.get("project_id") or "")
+        if authority_check is not None:
+            await authority_check()
+        officer_thread = await postgres_db.get_officer_thread_for_project(project_id)
+        if authority_check is not None:
+            await authority_check()
+        if officer_thread:
+            await postgres_db.enqueue_session_wake_event(
+                str(officer_thread["id"]),
+                source="loop",
+                dedup_key=str(officer["dedup_key"]),
+                project_id=project_id,
+                payload={
+                    "loop_id": str(loop_id),
+                    "turn_all_failed": bool(officer.get("turn_all_failed")),
+                    "consecutive_failures": int(
+                        officer.get("consecutive_failures") or 0
+                    ),
+                    "summary": (
+                        "loop turn concluded — scheduling='officer': the next "
+                        "dispatch is yours (nothing was auto-created)"
+                    ),
+                },
+            )
+            if authority_check is not None:
+                await authority_check()
+        if authority_check is not None:
+            await authority_check()
+        _kick_officer_event_drain(postgres_db)
+
+    for pre_action in replay.get("pre_actions") or []:
+        if not isinstance(pre_action, Mapping):
+            continue
+        pre_kind = pre_action.get("kind")
+        if pre_kind == "cooldown_park":
+            handoff_actions.append(
+                f"project loop {str(loop_id)[:8]}: model cooldown — next member "
+                f"parked until {pre_action.get('park_until')}"
+            )
+        elif pre_kind == "campaign_aborted":
+            handoff_actions.append(
+                f"project loop {str(loop_id)[:8]}: campaign "
+                f"'{pre_action.get('label')}' ABORTED after "
+                f"{pre_action.get('member_failures')} consecutive member failures — "
+                "returning to the critic checkpoint"
+            )
+        elif pre_kind == "campaign_complete":
+            handoff_actions.append(
+                f"project loop {str(loop_id)[:8]}: campaign "
+                f"'{pre_action.get('label')}' complete "
+                f"({pre_action.get('stage_count')} stages) — awaiting critic review"
+            )
+        elif pre_kind == "campaign_review_skipped":
+            handoff_actions.append(
+                f"project loop {str(loop_id)[:8]}: campaign "
+                f"'{pre_action.get('label')}' still awaits disposition — checkpoint "
+                "critic filed no plan; dispose-only filing is allowed"
+            )
+        elif pre_kind == "campaign_disposed":
+            handoff_actions.append(
+                f"project loop {str(loop_id)[:8]}: campaign "
+                f"'{pre_action.get('label')}' disposed ({pre_action.get('outcome')})"
+            )
+        elif pre_kind == "campaign_dispose_only":
+            handoff_actions.append(
+                f"project loop {str(loop_id)[:8]}: no successor campaign opened — "
+                "returning to rotation"
+            )
+        elif pre_kind == "plan_rejected":
+            handoff_actions.append(
+                f"project loop {str(loop_id)[:8]}: filed plan rejected at apply "
+                f"time ({pre_action.get('error')}) — falling back to rotation"
+            )
+
+    action = replay.get("action") or {}
+    action_kind = action.get("kind") if isinstance(action, Mapping) else None
+    if action_kind == "stop":
+        handoff_actions.append(
+            f"project loop {str(loop_id)[:8]} stopped ({action.get('reason')})"
+        )
+    elif action_kind == "officer":
+        handoff_actions.append(
+            f"project loop {str(loop_id)[:8]} turn concluded — "
+            "officer-scheduled, no auto-advance"
+        )
+    elif action_kind == "campaign_member" and spawned_ids:
+        handoff_actions.append(
+            f"project loop {str(loop_id)[:8]} → campaign "
+            f"'{action.get('label')}' stage {int(action.get('stage_index') or 0) + 1}/"
+            f"{action.get('stage_count')} ({action.get('role')} job "
+            f"{spawned_ids[0][:8]})"
+        )
+    elif action_kind == "rotation" and spawned_ids:
+        stage = action.get("stage")
+        if len(spawned_ids) == 1:
+            handoff_actions.append(
+                f"project loop {str(loop_id)[:8]} → {stage} job {spawned_ids[0][:8]}"
+            )
+        else:
+            from services.project_loops import normalize_stage
+
+            handoff_actions.append(
+                f"project loop {str(loop_id)[:8]} → parallel stage "
+                f"[{'+'.join(normalize_stage(stage))}] ({len(spawned_ids)} jobs)"
+            )
+
+    if spawned_ids:
+        if authority_check is not None:
+            await authority_check()
+        _trigger_dispatch()
+    return {
+        "actions": [
+            bounded_replay_text(action_text, limit_bytes=768)
+            for action_text in handoff_actions
+        ]
+    }
+
+
+def _project_loop_handoff_marker(job: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    context = job.get("context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    marker = (
+        context.get("_project_loop_advance_handoff")
+        if isinstance(context, Mapping)
+        else None
+    )
+    return marker if isinstance(marker, Mapping) else None
+
+
+_PROJECT_LOOP_HANDOFF_LEASE_SECONDS = 120.0
+_PROJECT_LOOP_HANDOFF_HEARTBEAT_SECONDS = 30.0
+
+
+async def _execute_persisted_project_loop_handoff(
+    job: dict[str, Any],
+    atomic_output: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Run/replay the full external tail and settle its predecessor marker."""
+
+    job_id = str(job["id"])
+    current = await postgres_db.get_job(job_id)
+    marker = _project_loop_handoff_marker(current or job)
+    expected_output = dict(atomic_output)
+    if marker is not None:
+        if marker.get("output") != expected_output:
+            raise RuntimeError(
+                "project-loop handoff output differs from persisted marker"
+            )
+        if marker.get("state") == "done" and isinstance(marker.get("result"), Mapping):
+            return dict(marker["result"])
+        if marker.get("state") not in {"pending", "claimed"}:
+            raise RuntimeError("project-loop handoff marker has an unknown state")
+
+    if marker is None:
+        # Member-only S32 results make no loop-world mutation and therefore
+        # carry no sweeper marker; their command-owned handoff effect is enough.
+        return await _handoff_atomic_project_loop_advance(job, expected_output)
+
+    claimant_id = f"project-loop-handoff:{uuid4()}"
+    claimed = await postgres_db.claim_project_loop_handoff(
+        job_id,
+        expected_output=expected_output,
+        claimant_id=claimant_id,
+        lease_seconds=_PROJECT_LOOP_HANDOFF_LEASE_SECONDS,
+    )
+    if not claimed:
+        # A contender can finish between our initial read and claim attempt.
+        refreshed = await postgres_db.get_job(job_id)
+        refreshed_marker = _project_loop_handoff_marker(refreshed or {})
+        if (
+            refreshed_marker is not None
+            and refreshed_marker.get("output") == expected_output
+            and refreshed_marker.get("state") == "done"
+            and isinstance(refreshed_marker.get("result"), Mapping)
+        ):
+            return dict(refreshed_marker["result"])
+        raise RuntimeError("project-loop handoff is owned by another live claimant")
+
+    stopped = asyncio.Event()
+    lost = asyncio.Event()
+
+    async def _assert_authority() -> None:
+        """Refresh the exact claim before starting another consequence."""
+
+        from services.project_loop_atomic import ProjectLoopHandoffAuthorityLost
+
+        if lost.is_set():
+            raise ProjectLoopHandoffAuthorityLost("project-loop handoff lease was lost")
+        try:
+            renewed = await postgres_db.renew_project_loop_handoff(
+                job_id,
+                expected_output=expected_output,
+                claimant_id=claimant_id,
+                lease_seconds=_PROJECT_LOOP_HANDOFF_LEASE_SECONDS,
+            )
+        except Exception as exc:
+            lost.set()
+            raise ProjectLoopHandoffAuthorityLost(
+                "project-loop handoff lease refresh failed"
+            ) from exc
+        if not renewed:
+            lost.set()
+            raise ProjectLoopHandoffAuthorityLost("project-loop handoff lease was lost")
+
+    async def _heartbeat() -> None:
+        while not stopped.is_set():
+            try:
+                await asyncio.wait_for(
+                    stopped.wait(),
+                    timeout=_PROJECT_LOOP_HANDOFF_HEARTBEAT_SECONDS,
+                )
+                return
+            except TimeoutError:
+                pass
+            try:
+                renewed = await postgres_db.renew_project_loop_handoff(
+                    job_id,
+                    expected_output=expected_output,
+                    claimant_id=claimant_id,
+                    lease_seconds=_PROJECT_LOOP_HANDOFF_LEASE_SECONDS,
+                )
+            except Exception:
+                logger.exception(
+                    "project-loop handoff heartbeat failed for predecessor %s",
+                    job_id,
+                )
+                renewed = False
+            if not renewed:
+                lost.set()
+                return
+
+    heartbeat = asyncio.create_task(_heartbeat())
+    try:
+        result = await _handoff_atomic_project_loop_advance(
+            job,
+            expected_output,
+            authority_check=_assert_authority,
+        )
+        await _assert_authority()
+        return await postgres_db.finish_project_loop_handoff(
+            job_id,
+            expected_output=expected_output,
+            result=result,
+            claimant_id=claimant_id,
+        )
+    finally:
+        stopped.set()
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+
+
+def _project_loop_handoff_error_output(exc: BaseException) -> dict[str, Any]:
+    """Bound retry diagnostics before the effect runner persists them."""
+
+    from services.project_loop_atomic import bounded_replay_text
+
+    return {
+        "actions": [],
+        "error": bounded_replay_text(exc, limit_bytes=1024),
+    }
+
+
+async def _reconcile_atomic_project_loop_handoff(
+    *,
+    limit: int = 50,
+) -> int:
+    """Reconcile full pending handoffs, including empty/terminal loop worlds.
+
+    The bounded descriptor is written onto the completed predecessor in the
+    SAME app-DB transaction as successor rows and loop pointers. It therefore
+    survives crashes before provisioning and remains discoverable after
+    provisioning changes successor baselines to ``ready``, after an officer
+    turn clears pointers, or after a stop makes the loop non-running.
+
+    Command-owned descriptors route to their exact finalizer first. Only a
+    genuinely command-less (or already-terminal legacy) descriptor executes
+    here, through the same idempotent full-tail function used by S32.
+    """
+
+    reconciled = 0
+    for origin in await postgres_db.list_pending_project_loop_handoffs(limit=limit):
+        marker = _project_loop_handoff_marker(origin)
+        if marker is None or not isinstance(marker.get("output"), Mapping):
+            raise RuntimeError("pending project-loop handoff descriptor is malformed")
+        command_id = marker.get("command_id")
+        if command_id:
+            routed = await _get_completion_sweep_router().route_job(
+                str(origin["id"]), source="project_loop_handoff"
+            )
+            if not routed.legacy:
+                # live => stand down; expired => finalizer resumed; parked =>
+                # alert-only. In all three cases this synthesizer must not run a
+                # parallel copy of the command-owned tail.
+                continue
+        await _execute_persisted_project_loop_handoff(
+            origin,
+            dict(marker["output"]),
+        )
+        reconciled += 1
+    return reconciled
+
+
 async def _advance_project_loop(
     job: dict[str, Any],
     result: dict[str, Any],
@@ -19400,6 +20989,26 @@ async def _advance_project_loop(
             ctx = {}
     loop_id = (ctx or {}).get("loop_id")
     if not loop_id:
+        return
+
+    # The durable command path moves the barrier claim into S32's Class-C
+    # transaction with successor materialization. Direct callers here are
+    # safety nets, not the finalizer. A live finalizer lease owns the turn, so
+    # that one route stands down. Expired/parked routes are durably nudged but
+    # do NOT suppress this class-2 synthesizer: it may win the exact-world CAS,
+    # in which case the resumed S32 marks itself superseded; if S32 wins first,
+    # our freshly planned transaction loses benignly. The default-off path
+    # below remains the historical helper/call graph byte-for-byte.
+    if COMPLETION_COMMANDS_ENABLED:
+        routed = await _get_completion_sweep_router().enqueue_job(
+            str(job["id"]), source="project_loop_advance"
+        )
+        if routed.route == "stand_down":
+            return
+        prepared = await _prepare_atomic_project_loop_advance(job, result)
+        output = await _materialize_prepared_project_loop_advance(prepared, job)
+        handoff = await _execute_persisted_project_loop_handoff(job, output)
+        actions.extend(handoff["actions"])
         return
 
     loop = await postgres_db.get_project_loop(str(loop_id))
@@ -20302,11 +21911,14 @@ _LEGACY_COMPLETION_EFFECT_PLAN: tuple[tuple[str, str], ...] = (
     ("freeze_notification", "freeze_notification"),  # S25
     ("subjob_output_graft", "subjob_graft"),  # S26
     ("critic_verdict", "critic_verdict"),  # S27
+    ("critic_verdict_followup", "critic_verdict_followup"),  # S27 external tail
     ("scholar_parent_unblock", "scholar_unblock"),  # S28
     ("delegation_parent_unblock", "delegation_unblock"),  # S29
     ("verification_critic_spawn", "verification"),  # S30
+    ("verification_critic_handoff", "verification_handoff"),  # S30 external tail
     ("curation_final_pass", "curation"),  # S31
     ("project_loop_advance", "project_loop"),  # S32
+    ("project_loop_advance_handoff", "project_loop_handoff"),  # S32 external tail
     ("terminal_merge_change_record", "terminal_delivery"),  # S33
     ("session_wake_enqueue", "session_wake_enqueue"),  # S34
     ("dispatch_trigger", "dispatch"),  # S35
@@ -20327,6 +21939,7 @@ async def _run_completion_effect(
     retry_on_error: bool = False,
     error_output: Callable[[BaseException], Any] | None = None,
     retry_if: Callable[[Any], bool] | None = None,
+    supersede_if: Callable[[Any], bool] | None = None,
     depends_on_groups: tuple[str, ...] = (),
     transactional: bool = False,
     effect_timeout_seconds: float | None = None,
@@ -20357,6 +21970,7 @@ async def _run_completion_effect(
         retry_on_error=retry_on_error,
         error_output=error_output,
         retry_if=retry_if,
+        supersede_if=supersede_if,
         depends_on_groups=depends_on_groups,
         effect_timeout_seconds=effect_timeout_seconds,
         command_lease_seconds=command_lease_seconds,
@@ -20374,12 +21988,135 @@ async def _run_completion_workspace_teardown(
     any backend is touched. A higher report that acquired the same lock first
     makes this S36 a durable handoff with no external calls.
 
-    Every command-backed backend uses this same journal and authorization. The
-    Kubernetes arm alone retains the stricter UID/snapshot identity protocol;
-    VM, Docker, and the default-off route keep their historical cleanup call.
+    Every command-backed backend uses this same journal and authorization.
+    Kubernetes and authenticated KubeVirt resources retain immutable teardown
+    identities (including both resources after a workspace-to-VM upgrade).
+    Docker and the default-off route keep their historical cleanup call.
     """
 
     async def _archive_and_teardown_workspace() -> dict[str, Any]:
+        async def _release_captured_vm(intent: Mapping[str, Any]) -> Any:
+            from services.vm_provisioner import VMTeardownIdentity
+
+            generation = intent.get("provision_generation")
+            vm_uid = intent.get("vm_uid")
+            rootdisk_uid = intent.get("rootdisk_pvc_uid")
+            ssh_host = intent.get("ssh_host")
+            ssh_port = intent.get("ssh_port")
+            if not isinstance(generation, str) or str(UUID(generation)) != generation:
+                raise RuntimeError(
+                    "VM teardown intent has invalid provision generation"
+                )
+            for label, value in (
+                ("VM UID", vm_uid),
+                ("rootdisk PVC UID", rootdisk_uid),
+            ):
+                if value is not None and (
+                    not isinstance(value, str)
+                    or not value
+                    or value != value.strip()
+                    or len(value) > 256
+                    or any(character.isspace() for character in value)
+                ):
+                    raise RuntimeError(f"VM teardown intent has invalid {label}")
+            if ssh_host is not None and (
+                not isinstance(ssh_host, str) or not ssh_host or len(ssh_host) > 512
+            ):
+                raise RuntimeError("VM teardown intent has invalid SSH host")
+            if ssh_port is not None and (
+                isinstance(ssh_port, bool)
+                or not isinstance(ssh_port, int)
+                or not 1 <= ssh_port <= 65535
+            ):
+                raise RuntimeError("VM teardown intent has invalid SSH port")
+            return await vm_provisioner.release_vm_captured(
+                job_id,
+                VMTeardownIdentity(
+                    provision_generation=generation,
+                    vm_uid=vm_uid,
+                    rootdisk_pvc_uid=rootdisk_uid,
+                ),
+                ssh_host=ssh_host,
+                ssh_port=ssh_port,
+            )
+
+        async def _capture_kubernetes_teardown_detail() -> dict[str, Any]:
+            captured = await container_provisioner.capture_terminal_workspace_identity(
+                WorkspaceOwner.job(job_id)
+            )
+            return {
+                "pod_uid": captured.pod_uid,
+                "pvc_uid": captured.pvc_uid,
+                "service_uid": captured.service_uid,
+                "pod_ip": captured.pod_ip,
+                "ssh_host_key_fingerprint": captured.ssh_host_key_fingerprint,
+                "ssh_port": captured.ssh_port,
+                "snapshot_generation": effect_runner.command_id,
+                "snapshot_created_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        async def _release_captured_kubernetes(
+            intent: Mapping[str, Any],
+        ) -> str:
+            pod_uid = intent.get("pod_uid")
+            pvc_uid = intent.get("pvc_uid")
+            service_uid = intent.get("service_uid")
+            pod_ip = intent.get("pod_ip")
+            host_key = intent.get("ssh_host_key_fingerprint")
+            ssh_port = intent.get("ssh_port")
+            snapshot_generation = intent.get("snapshot_generation")
+            snapshot_created_at = intent.get("snapshot_created_at")
+            if not isinstance(pod_uid, str) or not pod_uid:
+                raise RuntimeError("workspace teardown intent has invalid Pod UID")
+            if pvc_uid is not None and (not isinstance(pvc_uid, str) or not pvc_uid):
+                raise RuntimeError("workspace teardown intent has invalid PVC UID")
+            if service_uid is not None and (
+                not isinstance(service_uid, str) or not service_uid
+            ):
+                raise RuntimeError("workspace teardown intent has invalid Service UID")
+            if not isinstance(pod_ip, str) or not pod_ip:
+                raise RuntimeError("workspace teardown intent has invalid Pod IP")
+            if not isinstance(host_key, str) or not host_key:
+                raise RuntimeError("workspace teardown intent has invalid SSH host key")
+            if isinstance(ssh_port, bool) or not isinstance(ssh_port, int):
+                raise RuntimeError("workspace teardown intent has invalid SSH port")
+            if (
+                snapshot_generation != effect_runner.command_id
+                or not isinstance(snapshot_created_at, str)
+                or not snapshot_created_at
+            ):
+                raise RuntimeError(
+                    "workspace teardown intent has invalid snapshot identity"
+                )
+            teardown_identity = WorkspaceTeardownIdentity(
+                pod_uid=pod_uid,
+                pvc_uid=pvc_uid,
+                service_uid=service_uid,
+                pod_ip=pod_ip,
+                ssh_host_key_fingerprint=host_key,
+                ssh_port=ssh_port,
+            )
+            released = await container_provisioner.release_workspace(
+                WorkspaceOwner.job(job_id),
+                teardown_identity=teardown_identity,
+                require_snapshot=True,
+                expected_runtime_incarnation=pod_uid,
+                expected_host_key_fingerprint=host_key,
+                strict_terminal_snapshot=True,
+                terminal_snapshot_generation=snapshot_generation,
+                terminal_snapshot_created_at=snapshot_created_at,
+                strict=True,
+                exact_absence_timeout_seconds=(
+                    _COMPLETION_S36_EXACT_ABSENCE_TIMEOUT_SECONDS
+                ),
+            )
+            if released:
+                return "completed"
+            return await container_provisioner.classify_workspace_teardown_identity(
+                WorkspaceOwner.job(job_id),
+                teardown_identity,
+            )
+
         try:
             if effect_runner is not None:
                 authorization = await effect_runner.authorize_workspace_teardown()
@@ -20413,17 +22150,29 @@ async def _run_completion_workspace_teardown(
                     }
 
             use_uid_fenced_kubernetes_teardown = False
+            use_identity_fenced_vm_teardown = False
             teardown_intent: dict[str, Any] | None = None
             if effect_runner is not None:
                 teardown_intent = await effect_runner.capture_intent(
                     "workspace_archive_teardown"
                 )
+                intent_kind = (
+                    teardown_intent.get("kind")
+                    if isinstance(teardown_intent, Mapping)
+                    else None
+                )
                 use_uid_fenced_kubernetes_teardown = bool(
-                    teardown_intent is not None
-                    and teardown_intent.get("kind") == "kubernetes"
+                    intent_kind in {"kubernetes", "vm_and_kubernetes"}
+                )
+                use_identity_fenced_vm_teardown = bool(
+                    intent_kind in {"vm", "vm_and_kubernetes"}
                 )
                 teardown_job = await postgres_db.get_job(job_id)
-                if not use_uid_fenced_kubernetes_teardown and teardown_job is not None:
+                if (
+                    not use_uid_fenced_kubernetes_teardown
+                    and not use_identity_fenced_vm_teardown
+                    and teardown_job is not None
+                ):
                     workspace_context = _get_container_context(teardown_job)
                     vm_context = _get_vm_context(teardown_job)
                     workspace_is_active = bool(workspace_context) and (
@@ -20433,109 +22182,126 @@ async def _run_completion_workspace_teardown(
                     vm_is_active = bool(vm_context) and (
                         vm_context.get("status") not in ("deleted", "deleting")
                     )
+                    legacy_backend_is_active = bool(
+                        (
+                            workspace_is_active
+                            and workspace_context.get("provisioner") == "docker"
+                        )
+                        or (vm_is_active and vm_context.get("provisioner") == "docker")
+                    )
                     use_uid_fenced_kubernetes_teardown = (
                         workspace_is_active
                         and workspace_context.get("provisioner") != "docker"
-                        and not vm_is_active
+                        and not legacy_backend_is_active
                     )
+                    use_identity_fenced_vm_teardown = (
+                        vm_is_active
+                        and vm_context.get("provisioner") != "docker"
+                        and not legacy_backend_is_active
+                    )
+
+                    kubernetes_detail = None
+                    vm_detail = None
+                    if use_uid_fenced_kubernetes_teardown:
+                        kubernetes_detail = await _capture_kubernetes_teardown_detail()
+                    if use_identity_fenced_vm_teardown:
+                        captured_vm = await vm_provisioner.capture_vm_teardown_identity(
+                            job_id
+                        )
+                        vm_detail = {
+                            "provision_generation": (captured_vm.provision_generation),
+                            "vm_uid": captured_vm.vm_uid,
+                            "rootdisk_pvc_uid": captured_vm.rootdisk_pvc_uid,
+                            "ssh_host": vm_context.get("ssh_host"),
+                            "ssh_port": vm_context.get("ssh_port"),
+                        }
+                    if kubernetes_detail is not None and vm_detail is not None:
+                        intent_detail = {
+                            "kind": "vm_and_kubernetes",
+                            "vm": vm_detail,
+                            "kubernetes": kubernetes_detail,
+                        }
+                    elif vm_detail is not None:
+                        intent_detail = {"kind": "vm", **vm_detail}
+                    elif kubernetes_detail is not None:
+                        intent_detail = {"kind": "kubernetes", **kubernetes_detail}
+                    else:
+                        intent_detail = None
+                    if intent_detail is not None:
+                        teardown_intent = await effect_runner.capture_intent(
+                            "workspace_archive_teardown",
+                            intent_detail,
+                        )
+
+            cleanup_actions: list[str] = []
+            teardown_dispositions: list[str] = []
+            retry_reasons: list[str] = []
+            if use_identity_fenced_vm_teardown:
+                try:
+                    if teardown_intent is None:
+                        raise RuntimeError("VM teardown intent is missing identity")
+                    vm_intent = (
+                        teardown_intent.get("vm")
+                        if teardown_intent.get("kind") == "vm_and_kubernetes"
+                        else teardown_intent
+                    )
+                    if not isinstance(vm_intent, Mapping):
+                        raise RuntimeError("VM teardown intent is missing identity")
+                    outcome = await _release_captured_vm(vm_intent)
+                    teardown_dispositions.append(outcome.disposition)
+                    if outcome.disposition == "completed":
+                        cleanup_actions.append("vm released")
+                    elif outcome.disposition != "identity_superseded":
+                        retry_reasons.append(
+                            "captured VM teardown remains " + outcome.disposition
+                        )
+                except Exception as exc:
+                    retry_reasons.append(f"captured VM teardown failed: {exc}")
 
             if use_uid_fenced_kubernetes_teardown:
-                owner = WorkspaceOwner.job(job_id)
-                intent = teardown_intent
-                if intent is None:
-                    captured = (
-                        await container_provisioner.capture_terminal_workspace_identity(
-                            owner
+                try:
+                    if teardown_intent is None:
+                        raise RuntimeError(
+                            "workspace teardown intent is missing Kubernetes identity"
                         )
+                    kubernetes_intent = (
+                        teardown_intent.get("kubernetes")
+                        if teardown_intent.get("kind") == "vm_and_kubernetes"
+                        else teardown_intent
                     )
-                    intent = await effect_runner.capture_intent(
-                        "workspace_archive_teardown",
-                        {
-                            "kind": "kubernetes",
-                            "pod_uid": captured.pod_uid,
-                            "pvc_uid": captured.pvc_uid,
-                            "service_uid": captured.service_uid,
-                            "pod_ip": captured.pod_ip,
-                            "ssh_host_key_fingerprint": (
-                                captured.ssh_host_key_fingerprint
-                            ),
-                            "ssh_port": captured.ssh_port,
-                            "snapshot_generation": effect_runner.command_id,
-                            "snapshot_created_at": (
-                                datetime.now(timezone.utc).isoformat()
-                            ),
-                        },
+                    if not isinstance(kubernetes_intent, Mapping):
+                        raise RuntimeError(
+                            "workspace teardown intent is missing Kubernetes identity"
+                        )
+                    kubernetes_disposition = await _release_captured_kubernetes(
+                        kubernetes_intent
                     )
+                    teardown_dispositions.append(kubernetes_disposition)
+                    if kubernetes_disposition == "completed":
+                        cleanup_actions.append("k8s workspace released")
+                    elif kubernetes_disposition != "identity_superseded":
+                        retry_reasons.append(
+                            "captured Kubernetes teardown remains "
+                            + kubernetes_disposition
+                        )
+                except Exception as exc:
+                    retry_reasons.append(f"captured Kubernetes teardown failed: {exc}")
 
-                if intent is None or intent.get("kind") != "kubernetes":
-                    raise RuntimeError(
-                        "workspace teardown intent is missing Kubernetes identity"
-                    )
-                pod_uid = intent.get("pod_uid")
-                pvc_uid = intent.get("pvc_uid")
-                service_uid = intent.get("service_uid")
-                pod_ip = intent.get("pod_ip")
-                host_key = intent.get("ssh_host_key_fingerprint")
-                ssh_port = intent.get("ssh_port")
-                snapshot_generation = intent.get("snapshot_generation")
-                snapshot_created_at = intent.get("snapshot_created_at")
-                if not isinstance(pod_uid, str) or not pod_uid:
-                    raise RuntimeError("workspace teardown intent has invalid Pod UID")
-                if pvc_uid is not None and (
-                    not isinstance(pvc_uid, str) or not pvc_uid
-                ):
-                    raise RuntimeError("workspace teardown intent has invalid PVC UID")
-                if service_uid is not None and (
-                    not isinstance(service_uid, str) or not service_uid
-                ):
-                    raise RuntimeError(
-                        "workspace teardown intent has invalid Service UID"
-                    )
-                if not isinstance(pod_ip, str) or not pod_ip:
-                    raise RuntimeError("workspace teardown intent has invalid Pod IP")
-                if not isinstance(host_key, str) or not host_key:
-                    raise RuntimeError(
-                        "workspace teardown intent has invalid SSH host key"
-                    )
-                if isinstance(ssh_port, bool) or not isinstance(ssh_port, int):
-                    raise RuntimeError("workspace teardown intent has invalid SSH port")
-                if (
-                    snapshot_generation != effect_runner.command_id
-                    or not isinstance(snapshot_created_at, str)
-                    or not snapshot_created_at
-                ):
-                    raise RuntimeError(
-                        "workspace teardown intent has invalid snapshot identity"
-                    )
-                teardown_identity = WorkspaceTeardownIdentity(
-                    pod_uid=pod_uid,
-                    pvc_uid=pvc_uid,
-                    service_uid=service_uid,
-                    pod_ip=pod_ip,
-                    ssh_host_key_fingerprint=host_key,
-                    ssh_port=ssh_port,
-                )
+            # A composite must give each captured side one independent chance
+            # to converge.  Unknown beats superseded so the exact old
+            # counterpart remains recoverable; once both sides are terminal,
+            # any proven replacement terminal-supersedes only S36.
+            if retry_reasons:
+                raise RuntimeError("; ".join(retry_reasons))
+            if "identity_superseded" in teardown_dispositions:
+                return {
+                    "actions": cleanup_actions,
+                    "teardown_disposition": "identity_superseded",
+                }
 
-                released = await container_provisioner.release_workspace(
-                    owner,
-                    teardown_identity=teardown_identity,
-                    require_snapshot=True,
-                    expected_runtime_incarnation=pod_uid,
-                    expected_host_key_fingerprint=host_key,
-                    strict_terminal_snapshot=True,
-                    terminal_snapshot_generation=snapshot_generation,
-                    terminal_snapshot_created_at=snapshot_created_at,
-                    strict=True,
-                    exact_absence_timeout_seconds=(
-                        _COMPLETION_S36_EXACT_ABSENCE_TIMEOUT_SECONDS
-                    ),
-                )
-                if not released:
-                    raise RuntimeError(
-                        "UID-fenced Kubernetes workspace release was not confirmed"
-                    )
-                cleanup_actions = ["k8s workspace released"]
-            else:
+            if not (
+                use_identity_fenced_vm_teardown or use_uid_fenced_kubernetes_teardown
+            ):
                 cleanup_actions = await _archive_and_cleanup_workspace(job_id)
         except Exception as exc:
             logger.warning(
@@ -20559,6 +22325,9 @@ async def _run_completion_workspace_teardown(
         "workspace_teardown",
         _archive_and_teardown_workspace,
         retry_if=lambda output: bool(output.get("error")),
+        supersede_if=lambda output: (
+            output.get("teardown_disposition") == "identity_superseded"
+        ),
         effect_timeout_seconds=890.0,
         command_lease_seconds=900.0,
     )
@@ -22388,27 +24157,67 @@ async def _complete_job_legacy(
                     f"subjob output grafted to {graft_result['output_path']}"
                 )
 
-        # 3. Handle critic verdict (if this is a critic job)
-        async def _apply_critic_verdict() -> dict[str, Any]:
-            effect_actions: list[str] = []
-            try:
-                await _handle_critic_verdict_on_complete(job, effect_actions)
-            except Exception as exc:
-                logger.error(
-                    f"Error handling critic verdict for {job_id}: {exc}",
-                    exc_info=True,
-                )
-                return {"actions": effect_actions, "error": str(exc)}
-            return {"actions": effect_actions}
+        # 3. Handle critic verdict (if this is a critic job). The flag-off arm
+        # remains the historical callback-direct path. Durable S27 publishes
+        # the target transition and its effect marker in one transaction;
+        # only that winner may run dispatch/wake/notification follow-ups.
+        if _effect_runner is None:
 
-        critic_verdict = await _run_completion_effect(
-            _effect_runner,
-            "critic_verdict",
-            "critic_verdict",
-            _apply_critic_verdict,
-            retry_if=lambda output: bool(output.get("error")),
-        )
-        actions.extend(critic_verdict["actions"])
+            async def _apply_critic_verdict() -> dict[str, Any]:
+                effect_actions: list[str] = []
+                try:
+                    await _handle_critic_verdict_on_complete(job, effect_actions)
+                except Exception as exc:
+                    logger.error(
+                        f"Error handling critic verdict for {job_id}: {exc}",
+                        exc_info=True,
+                    )
+                    return {"actions": effect_actions, "error": str(exc)}
+                return {"actions": effect_actions}
+
+            critic_verdict = await _run_completion_effect(
+                None,
+                "critic_verdict",
+                "critic_verdict",
+                _apply_critic_verdict,
+                retry_if=lambda output: bool(output.get("error")),
+            )
+            actions.extend(critic_verdict["actions"])
+        else:
+
+            async def _materialize_critic_verdict() -> dict[str, Any]:
+                return await _materialize_critic_verdict_transactional(job)
+
+            critic_verdict = await _run_completion_effect(
+                _effect_runner,
+                "critic_verdict",
+                "critic_verdict",
+                _materialize_critic_verdict,
+                transactional=True,
+                supersede_if=lambda output: (
+                    output.get("applicable") is True
+                    and output.get("world_cas_won") is False
+                ),
+            )
+            # A command that crossed S27 before M3 replays its legacy output;
+            # its side effects already ran and must not be synthesized again.
+            if "world_cas_won" not in critic_verdict:
+                actions.extend(critic_verdict.get("actions") or [])
+            elif critic_verdict.get("world_cas_won"):
+
+                async def _critic_verdict_followup() -> dict[str, Any]:
+                    return await _run_critic_verdict_followups(
+                        critic_verdict,
+                        completion_command_id=_effect_runner.command_id,
+                    )
+
+                critic_followup = await _run_completion_effect(
+                    _effect_runner,
+                    "critic_verdict_followup",
+                    "critic_verdict_followup",
+                    _critic_verdict_followup,
+                )
+                actions.extend(critic_followup["actions"])
 
         # 3b. Handle scholar completion (unblock parent job)
         async def _unblock_scholar_parent() -> dict[str, Any]:
@@ -22460,37 +24269,76 @@ async def _complete_job_legacy(
         )
         actions.extend(delegation_unblock["actions"])
 
-        # 4. Trigger verification (if this is a main job that completed)
-        async def _spawn_verification_critic() -> dict[str, Any]:
-            effect_actions: list[str] = []
-            try:
-                durable_verification_kwargs = (
-                    {"reconcile_existing_critic": True}
-                    if _effect_runner is not None
-                    else {}
-                )
-                await _trigger_verification_on_complete(
+        # 4. Trigger verification (if this is a main job that completed).
+        # Durable S30 owns only DB materialization in its first effect; branch
+        # creation and dispatch happen after commit in a separate effect.
+        if _effect_runner is None:
+
+            async def _spawn_verification_critic() -> dict[str, Any]:
+                effect_actions: list[str] = []
+                try:
+                    await _trigger_verification_on_complete(
+                        job,
+                        result,
+                        effect_actions,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"Error triggering verification for {job_id}: {exc}",
+                        exc_info=True,
+                    )
+                    return {"actions": effect_actions, "error": str(exc)}
+                return {"actions": effect_actions}
+
+            verification_spawn = await _run_completion_effect(
+                None,
+                "verification_critic_spawn",
+                "verification",
+                _spawn_verification_critic,
+                retry_if=lambda output: bool(output.get("error")),
+            )
+            actions.extend(verification_spawn["actions"])
+        else:
+            expected_verification_round = len(_verification_rounds(job))
+
+            async def _materialize_verification_critic() -> dict[str, Any]:
+                return await _materialize_verification_critic_transactional(
                     job,
                     result,
-                    effect_actions,
-                    **durable_verification_kwargs,
+                    expected_round=expected_verification_round,
                 )
-            except Exception as exc:
-                logger.error(
-                    f"Error triggering verification for {job_id}: {exc}",
-                    exc_info=True,
-                )
-                return {"actions": effect_actions, "error": str(exc)}
-            return {"actions": effect_actions}
 
-        verification_spawn = await _run_completion_effect(
-            _effect_runner,
-            "verification_critic_spawn",
-            "verification",
-            _spawn_verification_critic,
-            retry_if=lambda output: bool(output.get("error")),
-        )
-        actions.extend(verification_spawn["actions"])
+            verification_spawn = await _run_completion_effect(
+                _effect_runner,
+                "verification_critic_spawn",
+                "verification",
+                _materialize_verification_critic,
+                transactional=True,
+                supersede_if=lambda output: (
+                    output.get("applicable") is True
+                    and output.get("world_cas_won") is False
+                ),
+            )
+            if "world_cas_won" not in verification_spawn:
+                # Pre-M3 completed effect: its embedded external handoff
+                # already ran, so replay only its stored actions.
+                actions.extend(verification_spawn.get("actions") or [])
+            elif (
+                verification_spawn.get("world_cas_won")
+                and verification_spawn.get("action") != "noop"
+            ):
+
+                async def _handoff_verification_critic() -> dict[str, Any]:
+                    return await _run_verification_critic_handoff(verification_spawn)
+
+                verification_handoff = await _run_completion_effect(
+                    _effect_runner,
+                    "verification_critic_handoff",
+                    "verification_handoff",
+                    _handoff_verification_critic,
+                    depends_on_groups=("verification",),
+                )
+                actions.extend(verification_handoff["actions"])
 
         # 5. Curation final pass (if no verification but curation enabled, and goal achieved)
         if (
@@ -22537,27 +24385,92 @@ async def _complete_job_legacy(
         # memory_unavailable bounded-retry) is re-dispatched as the SAME job, so
         # the loop must keep waiting on it rather than rotate to the next role.
         # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
-        async def _advance_completion_project_loop() -> dict[str, Any]:
-            effect_actions: list[str] = []
-            try:
-                if job.get("status") in ("completed", "failed", "cancelled"):
-                    await _advance_project_loop(job, result, effect_actions)
-            except Exception as exc:
-                logger.error(
-                    f"Error advancing project loop for {job_id}: {exc}",
-                    exc_info=True,
-                )
-                return {"actions": effect_actions, "error": str(exc)}
-            return {"actions": effect_actions}
+        if _effect_runner is None:
 
-        loop_advance = await _run_completion_effect(
-            _effect_runner,
-            "project_loop_advance",
-            "project_loop",
-            _advance_completion_project_loop,
-            retry_if=lambda output: bool(output.get("error")),
-        )
-        actions.extend(loop_advance["actions"])
+            async def _advance_completion_project_loop() -> dict[str, Any]:
+                effect_actions: list[str] = []
+                try:
+                    if job.get("status") in ("completed", "failed", "cancelled"):
+                        await _advance_project_loop(job, result, effect_actions)
+                except Exception as exc:
+                    logger.error(
+                        f"Error advancing project loop for {job_id}: {exc}",
+                        exc_info=True,
+                    )
+                    return {"actions": effect_actions, "error": str(exc)}
+                return {"actions": effect_actions}
+
+            loop_advance = await _run_completion_effect(
+                _effect_runner,
+                "project_loop_advance",
+                "project_loop",
+                _advance_completion_project_loop,
+                retry_if=lambda output: bool(output.get("error")),
+            )
+            actions.extend(loop_advance["actions"])
+        else:
+            # S32's barrier claim is part of the same DB transaction as the
+            # successor INSERTs and loop pointer/counter/campaign writeback.
+            # Preparing kickoffs may read vector/history stores, so do it
+            # before opening the transaction. A replayed terminal effect skips
+            # that planning entirely and uses its persisted output.
+            loop_advance = await _effect_runner.terminal_detail("project_loop_advance")
+            legacy_loop_replay = (
+                isinstance(loop_advance, Mapping) and "applicable" not in loop_advance
+            )
+            if loop_advance is None:
+                prepared_loop_advance = None
+                if job.get("status") in ("completed", "failed", "cancelled"):
+                    prepared_loop_advance = await _prepare_atomic_project_loop_advance(
+                        job,
+                        result,
+                        completion_command_id=_effect_runner.command_id,
+                    )
+
+                async def _materialize_completion_project_loop() -> dict[str, Any]:
+                    return await _materialize_prepared_project_loop_advance(
+                        prepared_loop_advance,
+                        job,
+                    )
+
+                loop_advance = await _run_completion_effect(
+                    _effect_runner,
+                    "project_loop_advance",
+                    "project_loop",
+                    _materialize_completion_project_loop,
+                    transactional=True,
+                    supersede_if=lambda output: (
+                        bool(output.get("applicable")) and not bool(output.get("won"))
+                    ),
+                )
+                legacy_loop_replay = False
+
+            if legacy_loop_replay:
+                # Pre-M3 S32 ran all DB and external work inside the one effect.
+                # Preserve its terminal output exactly; synthesizing a new
+                # handoff would duplicate those already-executed consequences.
+                actions.extend(loop_advance.get("actions") or [])
+            else:
+                # External provisioning, cloud baseline, KB/vector consequences,
+                # notifications, officer wake and dispatch are independently
+                # journaled. A crash after the DB commit replays S32's IDs then
+                # resumes this handoff; it never re-enters the materializer.
+                async def _handoff_completion_project_loop() -> dict[str, Any]:
+                    return await _execute_persisted_project_loop_handoff(
+                        job,
+                        loop_advance,
+                    )
+
+                loop_handoff = await _run_completion_effect(
+                    _effect_runner,
+                    "project_loop_advance_handoff",
+                    "project_loop_handoff",
+                    _handoff_completion_project_loop,
+                    retry_on_error=True,
+                    error_output=_project_loop_handoff_error_output,
+                    depends_on_groups=("project_loop",),
+                )
+                actions.extend(loop_handoff["actions"])
 
         # 5d2. Structured terminal history (project_jobs_repo_retirement.md).
         # New jobs write one database record; no history file is committed into

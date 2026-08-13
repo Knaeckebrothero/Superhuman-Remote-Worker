@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .kb_forge import kb_client_for_repo
@@ -360,6 +361,7 @@ async def close_backlog_ticket(
     new_status: str,
     *,
     postgres_db: Any = None,
+    authority_check: Callable[[], Awaitable[None]] | None = None,
 ) -> bool:
     """Mirror a ticket's closed status to the note file AND the index row.
 
@@ -382,8 +384,15 @@ async def close_backlog_ticket(
     file_path = f"knowledge/{note_id}.md"
     durable_ok = False
     repo_name: str | None = None
+
+    async def _permit() -> None:
+        if authority_check is not None:
+            await authority_check()
+
+    await _permit()
     try:
         repo_ref = await _resolve_note_repo(project_id, postgres_db)
+        await _permit()
         if repo_ref is None:
             logger.info(
                 "backlog: project %s has no KB repo — %s → %s is an index-only close",
@@ -397,6 +406,7 @@ async def close_backlog_ticket(
             repo_name = repo_ref.repo
             repo_client = await kb_client_for_repo(postgres_db, gitea, repo_ref)
             current, blob_sha = await _read_note_file(repo_client, repo_ref, file_path)
+        await _permit()
         if current:
             updated, outcome = _rewrite_status(current, new_status)
             if outcome == _ALREADY_SET:
@@ -419,6 +429,7 @@ async def close_backlog_ticket(
                     new_status,
                 )
             else:  # _REWRITTEN — the only outcome whose text differs
+                await _permit()
                 durable_ok = bool(
                     await _write_note_file(
                         repo_client,
@@ -429,13 +440,19 @@ async def close_backlog_ticket(
                         blob_sha,
                     )
                 )
+                await _permit()
         elif repo_name is not None:
             logger.info(
                 "backlog: note file %s not found in %s — index-only close",
                 file_path,
                 repo_name,
             )
-    except Exception:
+    except Exception as exc:
+        if authority_check is not None:
+            from services.project_loop_atomic import ProjectLoopHandoffAuthorityLost
+
+            if isinstance(exc, ProjectLoopHandoffAuthorityLost):
+                raise
         logger.warning(
             "backlog: file mirror failed for %s (%s) — the next kb_reindex will "
             "restore the pool entry and the overseer will see it again",
@@ -445,6 +462,7 @@ async def close_backlog_ticket(
         )
 
     try:
+        await _permit()
         async with vector_db.acquire() as conn:
             result = await conn.execute(
                 """
@@ -459,6 +477,7 @@ async def close_backlog_ticket(
                 new_status,
                 list(BACKLOG_NOTE_TYPES),
             )
+            await _permit()
             if _rowcount(result) == 0:
                 # UPDATE 0: either no such note, or one that exists but isn't
                 # a ticket type (e.g. a `decision` note mistakenly filed as a
@@ -470,6 +489,7 @@ async def close_backlog_ticket(
                     project_id,
                     note_id,
                 )
+                await _permit()
                 logger.warning(
                     "backlog: index close matched 0 rows for note_id=%s "
                     "(project %s, wanted status=%s) — stored note_type is "
@@ -481,7 +501,12 @@ async def close_backlog_ticket(
                     actual_type,
                     BACKLOG_NOTE_TYPES,
                 )
-    except Exception:
+    except Exception as exc:
+        if authority_check is not None:
+            from services.project_loop_atomic import ProjectLoopHandoffAuthorityLost
+
+            if isinstance(exc, ProjectLoopHandoffAuthorityLost):
+                raise
         logger.warning(
             "backlog: index mirror failed for %s (%s)",
             note_id,

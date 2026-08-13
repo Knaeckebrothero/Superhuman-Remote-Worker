@@ -241,6 +241,25 @@ class TestUnstickReviewingParents:
 
         assert await db.unstick_reviewing_parents() == []
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("wallclock", [False, True])
+    async def test_commands_flag_defers_only_to_live_finalizer_route(self, wallclock):
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        db = _make_db(conn)
+
+        if wallclock:
+            await db.unstick_reviewing_parents_wallclock(
+                60, completion_commands_enabled=True
+            )
+        else:
+            await db.unstick_reviewing_parents(30, completion_commands_enabled=True)
+
+        sql = conn.fetch.await_args.args[0]
+        assert "job_completion_sweep_exclusions" in sql
+        assert "completion_route.route = 'stand_down'" in sql
+        assert "_completion_control_claim" in sql
+
 
 def test_unstick_no_longer_requires_all_children_failed():
     """Every round now leaves a `completed` critic behind (Task 8 froze both

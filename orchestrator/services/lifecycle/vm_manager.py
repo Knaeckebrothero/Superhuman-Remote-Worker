@@ -28,11 +28,18 @@ import os
 import socket
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
-from database.postgres import _completion_control_active_sql
+from services.completion_lifecycle import (
+    CompletionLifecycleOwnership,
+    LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS,
+    LifecycleActionPermit,
+    LifecycleRouteDecision,
+)
 from services.ssh_helpers import orchestrator_can_reach
+from services.vm_provisioner import VMTeardownIdentity
 
 from .types import Instance
 from .workspace_manager import (
@@ -165,6 +172,7 @@ class VMInstanceManager:
         db: Any,
         *,
         completion_commands_enabled: bool = False,
+        completion_router: Any | None = None,
     ):
         self._provisioner = vm_provisioner
         self._suspension = suspension_service
@@ -174,10 +182,19 @@ class VMInstanceManager:
         # completion commands disabled, no lifecycle query names or reads the
         # reserved control marker.
         self._completion_commands_enabled = completion_commands_enabled
+        self._completion_lifecycle = (
+            CompletionLifecycleOwnership(db, completion_router)
+            if completion_commands_enabled and completion_router is not None
+            else None
+        )
         # Reachability probe cache: ssh_host -> (probed_at, ok).
         self._reach_cache: dict[str, tuple[float, bool]] = {}
         self._reach_ttl_s: float = 30.0
         self._clock = time.monotonic
+
+    @property
+    def completion_lifecycle_ownership_enabled(self) -> bool:
+        return self._completion_lifecycle is not None
 
     # -------------------------------------------------------------------------
     # Protocol implementation
@@ -196,13 +213,20 @@ class VMInstanceManager:
             if inst is None:
                 continue
             if (
-                self._completion_commands_enabled
+                self._completion_lifecycle is not None
                 and inst.metadata.get("scope") == "job"
                 and inst.bound_to
             ):
-                inst.metadata[
-                    "completion_control_owned"
-                ] = await self._completion_control_owns_job(inst.bound_to)
+                decision = await self._completion_lifecycle.classify(
+                    inst.bound_to, source="lifecycle_vm_list"
+                )
+                inst.metadata["completion_lifecycle_disposition"] = decision.disposition
+                inst.metadata["completion_lifecycle_route"] = decision.route
+                inst.metadata["completion_lifecycle_command_id"] = decision.command_id
+                inst.metadata["completion_lifecycle_deferred"] = decision.deferred
+                inst.metadata["completion_control_owned"] = (
+                    decision.reason == "active_control_claim"
+                )
             # Live-child guard: only a reapable-status *job* VM can be torn down,
             # and only a job VM can have a critic subjob, so scope the query to
             # that case. Threads have no critic children.
@@ -224,7 +248,7 @@ class VMInstanceManager:
             # Suppress the reconciler's immediate unhealthy-delete shortcut;
             # terminal/loss retirement is the sole physical cleanup owner.
             return True
-        if inst.metadata.get("completion_control_owned"):
+        if inst.metadata.get("completion_lifecycle_deferred"):
             return True
         # VMs report status in their own context. ``failed`` (a provisioning
         # failure) is now filtered out in _row_to_instance (_PARKED_VM_STATUSES)
@@ -240,7 +264,7 @@ class VMInstanceManager:
     async def is_idle(self, inst: Instance) -> bool:
         if _is_stateless_instance(inst):
             return False
-        if inst.metadata.get("completion_control_owned"):
+        if inst.metadata.get("completion_lifecycle_deferred"):
             return False
         if inst.metadata.get("has_live_shared_child"):
             return False
@@ -294,7 +318,7 @@ class VMInstanceManager:
         """
         if _is_stateless_instance(inst):
             return False
-        if inst.metadata.get("completion_control_owned"):
+        if inst.metadata.get("completion_lifecycle_deferred"):
             return False
         if inst.metadata.get("has_live_shared_child"):
             return False
@@ -401,6 +425,113 @@ class VMInstanceManager:
             return True
         return (inst.metadata.get("snapshot_attempts") or 0) >= self._max_attempts()
 
+    @staticmethod
+    def _legacy_permit(inst: Instance) -> LifecycleActionPermit:
+        return LifecycleActionPermit(
+            LifecycleRouteDecision(
+                job_id=str(inst.bound_to or inst.id), disposition="legacy"
+            )
+        )
+
+    @asynccontextmanager
+    async def lifecycle_action(
+        self,
+        inst: Instance,
+        *,
+        source: str,
+    ) -> AsyncIterator[LifecycleActionPermit]:
+        """Hold one command-visible job claim across VM snapshot -> delete."""
+
+        existing = inst.metadata.get("_completion_lifecycle_permit")
+        if isinstance(existing, LifecycleActionPermit):
+            yield existing
+            return
+        job_bound = inst.metadata.get("scope") == "job" and bool(inst.bound_to)
+        if self._completion_lifecycle is None or not job_bound:
+            permit = self._legacy_permit(inst)
+            inst.metadata["_completion_lifecycle_permit"] = permit
+            try:
+                yield permit
+            finally:
+                inst.metadata.pop("_completion_lifecycle_permit", None)
+            return
+
+        async with self._completion_lifecycle.action(
+            str(inst.bound_to),
+            source=f"lifecycle_vm_{source}"[:64],
+            resource_kind="vm",
+            resource_identity=str(inst.metadata.get("vm_uid") or inst.id),
+            expected_status=str(inst.metadata.get("job_status") or "unknown"),
+            expected_lane=str(inst.metadata.get("execution_lane") or "pinned"),
+        ) as permit:
+            inst.metadata["_completion_lifecycle_permit"] = permit
+            try:
+                if permit.local and self._provisioner_available():
+                    if not await self._permit_external(permit):
+                        yield permit
+                        return
+                    try:
+                        async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                            identity = (
+                                await self._provisioner.capture_vm_teardown_identity(
+                                    str(inst.bound_to)
+                                )
+                            )
+                    except Exception:
+                        logger.exception(
+                            "VM lifecycle identity capture failed for job %s",
+                            inst.bound_to,
+                        )
+                        permit.skip("vm_identity_unknown")
+                    else:
+                        listed_generation = inst.metadata.get("provision_generation")
+                        listed_vm_uid = inst.metadata.get("vm_uid")
+                        listed_root_uid = inst.metadata.get("rootdisk_pvc_uid")
+                        if (
+                            (
+                                listed_generation is not None
+                                and identity.provision_generation != listed_generation
+                            )
+                            or (
+                                listed_vm_uid is not None
+                                and identity.vm_uid != listed_vm_uid
+                            )
+                            or (
+                                listed_root_uid is not None
+                                and identity.rootdisk_pvc_uid != listed_root_uid
+                            )
+                        ):
+                            permit.skip("vm_identity_superseded", settled=True)
+                        else:
+                            inst.metadata["_completion_lifecycle_vm_identity"] = (
+                                identity
+                            )
+                yield permit
+            finally:
+                inst.metadata.pop("_completion_lifecycle_permit", None)
+                inst.metadata.pop("_completion_lifecycle_vm_identity", None)
+
+    @asynccontextmanager
+    async def _action_scope(
+        self,
+        inst: Instance,
+        *,
+        source: str,
+    ) -> AsyncIterator[tuple[LifecycleActionPermit, bool]]:
+        existing = inst.metadata.get("_completion_lifecycle_permit")
+        if isinstance(existing, LifecycleActionPermit):
+            yield existing, False
+            return
+        async with self.lifecycle_action(inst, source=source) as permit:
+            yield permit, True
+
+    async def _permit_external(self, permit: LifecycleActionPermit) -> bool:
+        if not permit.local:
+            return False
+        if self._completion_lifecycle is None or permit.claim is None:
+            return True
+        return await self._completion_lifecycle.refresh(permit)
+
     async def record_attempt(self, inst: Instance) -> None:
         """Persist an incremented snapshot-attempt counter to the bound VM ctx."""
         if _is_stateless_instance(inst):
@@ -411,6 +542,11 @@ class VMInstanceManager:
         if not bound:
             return
         nxt = (inst.metadata.get("snapshot_attempts") or 0) + 1
+        permit = inst.metadata.get("_completion_lifecycle_permit")
+        if isinstance(
+            permit, LifecycleActionPermit
+        ) and not await self._permit_external(permit):
+            return
         try:
             if inst.metadata.get("scope") == "thread":
                 await self._db.merge_thread_vm_context(
@@ -420,6 +556,9 @@ class VMInstanceManager:
                 await self._db.merge_vm_context(bound, {"snapshot_attempts": nxt})
         except Exception:
             logger.exception("Failed to record snapshot attempt for VM %s", inst.id)
+            return
+        if isinstance(permit, LifecycleActionPermit):
+            permit.complete()
 
     async def give_up(self, inst: Instance, grace_s: int) -> None:
         """Escape hatch: dirty + unreachable + attempts exhausted.
@@ -434,32 +573,59 @@ class VMInstanceManager:
         disk is still a dataVolumeTemplate the VM owns and cascade-deletes, so
         this degrades to the old behaviour rather than breaking.
         """
-        if _is_stateless_instance(inst):
+        if self._completion_lifecycle is None:
+            if _is_stateless_instance(inst):
+                return
+            await self.delete(inst, grace_s, purge_disk=False)
+            bound = inst.bound_to
+            if not bound:
+                return
+            try:
+                if inst.metadata.get("scope") == "thread":
+                    await self._db.merge_thread_vm_context(bound, {"rootdisk": "kept"})
+                else:
+                    await self._db.merge_vm_context(bound, {"rootdisk": "kept"})
+            except Exception:
+                logger.exception("Failed to record kept rootdisk for VM %s", inst.id)
             return
-        if await self._completion_control_owns_instance(inst):
-            return
-        await self.delete(inst, grace_s, purge_disk=False)
-        bound = inst.bound_to
-        if not bound:
-            return
-        # Marks the disk for the kept-disk GC sweep, and makes it visible in
-        # the entity's context rather than only in controller logs.
-        try:
-            if inst.metadata.get("scope") == "thread":
-                await self._db.merge_thread_vm_context(bound, {"rootdisk": "kept"})
-            else:
-                await self._db.merge_vm_context(bound, {"rootdisk": "kept"})
-        except Exception:
-            logger.exception("Failed to record kept rootdisk for VM %s", inst.id)
+
+        async with self._action_scope(inst, source="give_up") as (permit, _owns):
+            if not permit.local or _is_stateless_instance(inst):
+                return
+            if not await self._delete_owned(inst, purge_disk=False):
+                return
+            bound = inst.bound_to
+            if not bound:
+                return
+            # Marks the disk for the kept-disk GC sweep, and makes it visible in
+            # the entity's context rather than only in controller logs.
+            try:
+                if not await self._permit_external(permit):
+                    return
+                if inst.metadata.get("scope") == "thread":
+                    await self._db.merge_thread_vm_context(bound, {"rootdisk": "kept"})
+                else:
+                    await self._db.merge_vm_context(bound, {"rootdisk": "kept"})
+            except Exception:
+                logger.exception("Failed to record kept rootdisk for VM %s", inst.id)
+                return
+            if not await self._permit_external(permit):
+                return
+            permit.complete()
 
     async def snapshot(self, inst: Instance) -> str | None:
+        if self._completion_lifecycle is None:
+            return await self._snapshot_owned(inst)
+        async with self._action_scope(inst, source="snapshot") as (permit, owns):
+            if not permit.local:
+                return None
+            result = await self._snapshot_owned(inst)
+            if owns and result is not None:
+                permit.complete()
+            return result
+
+    async def _snapshot_owned(self, inst: Instance) -> str | None:
         if _is_stateless_instance(inst):
-            return None
-        if await self._completion_control_owns_instance(inst):
-            logger.info(
-                "VM lifecycle snapshot deferred to active control for job %s",
-                inst.bound_to,
-            )
             return None
         if self._snapshot is None or not getattr(self._snapshot, "is_available", False):
             return None
@@ -470,19 +636,52 @@ class VMInstanceManager:
         bound = inst.bound_to
         if not bound:
             return None
+        permit = inst.metadata.get("_completion_lifecycle_permit")
+        identity = inst.metadata.get("_completion_lifecycle_vm_identity")
+        if isinstance(
+            permit, LifecycleActionPermit
+        ) and not await self._permit_external(permit):
+            return None
+        if (
+            self._completion_lifecycle is not None
+            and isinstance(permit, LifecycleActionPermit)
+            and permit.claim is not None
+        ):
+            if not isinstance(identity, VMTeardownIdentity):
+                permit.skip("vm_snapshot_identity_unknown")
+                return None
+            async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                disposition = await self._provisioner.revalidate_vm_teardown_identity(
+                    bound, identity
+                )
+            if disposition != "matched":
+                permit.skip(
+                    "vm_identity_superseded"
+                    if disposition == "superseded"
+                    else "vm_identity_unknown",
+                    settled=disposition == "superseded",
+                )
+                return None
+            if not await self._permit_external(permit):
+                return None
         is_thread = inst.metadata.get("scope") == "thread"
         try:
-            ok = await self._snapshot.capture_vm_snapshot(
-                job_id=bound,
-                ssh_host=ssh_host,
-                ssh_port=int(ssh_port),
-                source_type="vm",
-                entity_type="threads" if is_thread else "jobs",
-                work_marker=inst.metadata.get("total_turns"),
-            )
+            async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                ok = await self._snapshot.capture_vm_snapshot(
+                    job_id=bound,
+                    ssh_host=ssh_host,
+                    ssh_port=int(ssh_port),
+                    source_type="vm",
+                    entity_type="threads" if is_thread else "jobs",
+                    work_marker=inst.metadata.get("total_turns"),
+                )
             if ok:
                 # Success clears the escape-hatch retry counter.
                 try:
+                    if isinstance(
+                        permit, LifecycleActionPermit
+                    ) and not await self._permit_external(permit):
+                        return None
                     if is_thread:
                         await self._db.merge_thread_vm_context(
                             bound, {"snapshot_attempts": 0}
@@ -491,6 +690,10 @@ class VMInstanceManager:
                         await self._db.merge_vm_context(bound, {"snapshot_attempts": 0})
                 except Exception:
                     logger.exception("Failed to reset attempts for VM %s", inst.id)
+                if isinstance(
+                    permit, LifecycleActionPermit
+                ) and not await self._permit_external(permit):
+                    return None
                 return bound
             return None
         except Exception:
@@ -526,27 +729,58 @@ class VMInstanceManager:
     async def delete(
         self, inst: Instance, grace_s: int, purge_disk: bool = True
     ) -> None:
+        if self._completion_lifecycle is None:
+            await self._delete_owned(inst, purge_disk=purge_disk)
+            return
+        async with self._action_scope(inst, source="delete") as (permit, _owns):
+            if not permit.local:
+                return
+            if await self._delete_owned(inst, purge_disk=purge_disk):
+                permit.complete()
+
+    async def _delete_owned(self, inst: Instance, *, purge_disk: bool) -> bool:
         if _is_stateless_instance(inst):
-            return
-        if await self._completion_control_owns_instance(inst):
-            logger.info(
-                "VM lifecycle teardown deferred to active control for job %s",
-                inst.bound_to,
-            )
-            return
+            return False
         if not self._provisioner_available():
-            return
+            return False
         bound = inst.bound_to
         if not bound:
             logger.debug("delete skipped: no bound id for VM %s", inst.id)
-            return
+            return False
+        permit = inst.metadata.get("_completion_lifecycle_permit")
+        if isinstance(
+            permit, LifecycleActionPermit
+        ) and not await self._permit_external(permit):
+            return False
         try:
             if inst.metadata.get("scope") == "thread":
-                await self._provisioner.delete_thread_vm(bound, purge_disk=purge_disk)
+                return bool(
+                    await self._provisioner.delete_thread_vm(
+                        bound, purge_disk=purge_disk
+                    )
+                )
+            identity = inst.metadata.get("_completion_lifecycle_vm_identity")
+            if isinstance(identity, VMTeardownIdentity):
+                async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                    outcome = await self._provisioner.delete_vm_captured(
+                        bound, identity, purge_disk=purge_disk
+                    )
+                if isinstance(
+                    permit, LifecycleActionPermit
+                ) and not await self._permit_external(permit):
+                    return False
+                if outcome.disposition == "identity_superseded":
+                    if isinstance(permit, LifecycleActionPermit):
+                        permit.skip("vm_identity_superseded", settled=True)
+                    return True
+                return bool(outcome.deleted)
             else:
-                await self._provisioner.delete_vm(bound, purge_disk=purge_disk)
+                return bool(
+                    await self._provisioner.delete_vm(bound, purge_disk=purge_disk)
+                )
         except Exception:
             logger.exception("Failed to delete VM %s", inst.id)
+            return False
 
     async def reap_orphans(self) -> int:
         """Backstop GC: delete VMs whose owning row is gone from BOTH tables.
@@ -576,7 +810,13 @@ class VMInstanceManager:
         # Rides the same tick rather than adding a second scheduler.
         await self.purge_kept_disks()
         try:
-            vms = await self._provisioner.list_vms()
+            if self._completion_lifecycle is None:
+                vms = await self._provisioner.list_vms()
+            else:
+                async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                    vms = await self._provisioner.list_vms(
+                        include_teardown_identity=True
+                    )
         except Exception:
             logger.exception("VM orphan sweep: list failed")
             return 0
@@ -611,10 +851,47 @@ class VMInstanceManager:
                 continue
             if row_exists:
                 continue
-            if await self._completion_control_owns_job(entity_id):
+            if self._completion_lifecycle is None:
+                # Dark-path invariant: preserve the pre-Gate-3 orphan action
+                # exactly.  Identity-bearing inventory and the captured delete
+                # contract are rollout-only because old controllers do not
+                # return those fields.
+                try:
+                    if await self._provisioner.delete_vm(entity_id):
+                        reaped += 1
+                        logger.warning(
+                            "Orphan VM reaped: %s (no jobs/threads row, age %.0fs)",
+                            vm.get("vm_name") or entity_id,
+                            age,
+                        )
+                except Exception:
+                    logger.exception("Orphan VM delete failed: %s", entity_id)
                 continue
+            generation = vm.get("provision_generation")
+            vm_uid = vm.get("vm_uid")
+            rootdisk_uid = vm.get("rootdisk_pvc_uid")
+            if (
+                not isinstance(generation, str)
+                or not isinstance(vm_uid, str)
+                or not isinstance(rootdisk_uid, str)
+            ):
+                logger.warning(
+                    "VM orphan sweep: inventory lacks authenticated identity "
+                    "for %s — preserving it",
+                    entity_id,
+                )
+                continue
+            identity = VMTeardownIdentity(
+                provision_generation=generation,
+                vm_uid=vm_uid,
+                rootdisk_pvc_uid=rootdisk_uid,
+            )
             try:
-                if await self._provisioner.delete_vm(entity_id):
+                async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                    outcome = await self._provisioner.delete_orphan_vm_captured(
+                        entity_id, identity, purge_disk=True
+                    )
+                if outcome.deleted:
                     reaped += 1
                     logger.warning(
                         "Orphan VM reaped: %s (no jobs/threads row, age %.0fs)",
@@ -649,17 +926,32 @@ class VMInstanceManager:
             return 0
         try:
             async with self._db.acquire() as conn:
-                rows = await conn.fetch(
-                    """
-                    SELECT id::text AS id, execution_lane
-                    FROM jobs
-                    WHERE status = ANY($1::text[])
-                      AND context->'vm'->>'rootdisk' = 'kept'
-                      AND execution_lane IS DISTINCT FROM 'stateless'
-                    LIMIT 100
-                    """,
-                    list(_TERMINAL_JOB_STATUSES),
-                )
+                if self._completion_lifecycle is None:
+                    rows = await conn.fetch(
+                        """
+                        SELECT id::text AS id, execution_lane
+                        FROM jobs
+                        WHERE status = ANY($1::text[])
+                          AND context->'vm'->>'rootdisk' = 'kept'
+                          AND execution_lane IS DISTINCT FROM 'stateless'
+                        LIMIT 100
+                        """,
+                        list(_TERMINAL_JOB_STATUSES),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        """
+                        SELECT id::text AS id, status::text AS status,
+                               execution_lane,
+                               context->'vm' AS vm_context
+                        FROM jobs
+                        WHERE status = ANY($1::text[])
+                          AND context->'vm'->>'rootdisk' = 'kept'
+                          AND execution_lane IS DISTINCT FROM 'stateless'
+                        LIMIT 100
+                        """,
+                        list(_TERMINAL_JOB_STATUSES),
+                    )
         except Exception:
             logger.exception("Kept-disk sweep: query failed")
             return 0
@@ -673,18 +965,60 @@ class VMInstanceManager:
             job_id = row["id"] if isinstance(row, dict) else row.get("id")
             if not job_id:
                 continue
-            if await self._completion_control_owns_job(str(job_id)):
+            if self._completion_lifecycle is None:
+                try:
+                    # Idempotent: a VM that is already gone 404s, which the
+                    # provisioner treats as success, and the disk still goes.
+                    if not await self._provisioner.delete_vm(job_id, purge_disk=True):
+                        continue
+                    await self._db.merge_vm_context(job_id, {"rootdisk": None})
+                    purged += 1
+                    logger.info("Kept rootdisk reclaimed for terminal job %s", job_id)
+                except Exception:
+                    logger.exception("Kept-disk purge failed for job %s", job_id)
                 continue
-            try:
-                # Idempotent: a VM that is already gone 404s, which the
-                # provisioner treats as success, and the disk still goes.
-                if not await self._provisioner.delete_vm(job_id, purge_disk=True):
+            vm_context = _coerce_jsonb(row.get("vm_context"))
+            inst = Instance(
+                kind=self.kind,
+                id=str(vm_context.get("vm_name") or f"vm-job-{str(job_id)[:12]}"),
+                bound_to=str(job_id),
+                metadata={
+                    "scope": "job",
+                    "job_status": str(row.get("status")),
+                    "execution_lane": str(row.get("execution_lane") or "pinned"),
+                    "provision_generation": vm_context.get("provision_generation"),
+                    "vm_uid": vm_context.get("vm_uid"),
+                    "rootdisk_pvc_uid": vm_context.get("rootdisk_pvc_uid"),
+                },
+            )
+            async with self.lifecycle_action(inst, source="kept_disk") as permit:
+                if not permit.local or not await self._permit_external(permit):
                     continue
-                await self._db.merge_vm_context(job_id, {"rootdisk": None})
-                purged += 1
-                logger.info("Kept rootdisk reclaimed for terminal job %s", job_id)
-            except Exception:
-                logger.exception("Kept-disk purge failed for job %s", job_id)
+                identity = inst.metadata.get("_completion_lifecycle_vm_identity")
+                if not isinstance(identity, VMTeardownIdentity):
+                    continue
+                try:
+                    # Idempotent: a VM that is already gone 404s, which the
+                    # provisioner treats as success, and the disk still goes.
+                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                        outcome = await self._provisioner.delete_vm_captured(
+                            str(job_id), identity, purge_disk=True
+                        )
+                    if not await self._permit_external(permit):
+                        continue
+                    if outcome.disposition == "identity_superseded":
+                        permit.skip("vm_identity_superseded", settled=True)
+                        continue
+                    if not outcome.deleted:
+                        continue
+                    await self._db.merge_vm_context(job_id, {"rootdisk": None})
+                    if not await self._permit_external(permit):
+                        continue
+                    permit.complete()
+                    purged += 1
+                    logger.info("Kept rootdisk reclaimed for terminal job %s", job_id)
+                except Exception:
+                    logger.exception("Kept-disk purge failed for job %s", job_id)
         return purged
 
     # -------------------------------------------------------------------------
@@ -693,50 +1027,6 @@ class VMInstanceManager:
 
     def _provisioner_available(self) -> bool:
         return bool(getattr(self._provisioner, "is_available", False))
-
-    async def _completion_control_owns_job(self, job_id: str) -> bool:
-        """Whether a live or malformed control marker owns this job's VM.
-
-        Uses the canonical PostgreSQL-15-safe JSON-number predicate and the DB
-        clock.  An unavailable lookup fails closed only while the rollout flag
-        is on; flag off returns before acquiring a connection.
-        """
-
-        if not self._completion_commands_enabled:
-            return False
-        if self._db is None or not job_id:
-            return True
-        try:
-            async with self._db.acquire() as conn:
-                value = await conn.fetchval(
-                    f"""
-                    SELECT ({_completion_control_active_sql("context")})
-                    FROM jobs
-                    WHERE id = $1::uuid
-                    """,
-                    job_id,
-                )
-            return bool(value)
-        except Exception:
-            logger.exception(
-                "Completion control lookup failed for job %s; preserving VM",
-                job_id,
-            )
-            return True
-
-    async def _completion_control_owns_instance(self, inst: Instance) -> bool:
-        """Action-time control-marker check for job-bound VMs only."""
-
-        if not self._completion_commands_enabled:
-            return False
-        if (
-            inst.metadata.get("scope") == "thread"
-            or inst.metadata.get("thread_status") is not None
-        ):
-            return False
-        if not inst.bound_to:
-            return bool(inst.metadata.get("completion_control_owned"))
-        return await self._completion_control_owns_job(str(inst.bound_to))
 
     async def _fetch_vm_rows(self) -> list[dict[str, Any]]:
         """Pull both job-bound and thread-bound VMs.
@@ -864,6 +1154,20 @@ class VMInstanceManager:
             "snapshot_attempts": vm_ctx.get("snapshot_attempts") or 0,
             "snapshot_status": row.get("snapshot_status"),
         }
+        if self._completion_lifecycle is not None:
+            metadata.update(
+                {
+                    "provision_generation": vm_ctx.get("provision_generation"),
+                    "vm_uid": vm_ctx.get("vm_uid"),
+                    "rootdisk_pvc_uid": vm_ctx.get("rootdisk_pvc_uid"),
+                    "identity_authenticated": (
+                        vm_ctx.get("identity_authenticated") is True
+                    ),
+                    "identity_provision_generation": vm_ctx.get(
+                        "identity_provision_generation"
+                    ),
+                }
+            )
         if scope == "job":
             metadata["job_status"] = row.get("owner_status")
             metadata["job_updated_at"] = row.get("owner_updated_at")

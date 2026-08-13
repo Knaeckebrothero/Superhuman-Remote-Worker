@@ -3229,6 +3229,32 @@ class TestLifecycleIdentityGeneration:
         assert status["rootdisk_pvc_uid"] == (
             f"root-pvc-uid-{SAMPLE_JOB_CONFIG['job_id']}"
         )
+        assert "rootdisk_identity_known" not in status
+
+    @pytest.mark.asyncio
+    async def test_exact_absence_status_opt_in_adds_rootdisk_identity_evidence(
+        self, controller
+    ):
+        job_id = SAMPLE_JOB_CONFIG["job_id"]
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{job_id}",
+                "uid": "admitted-vm-uid-001",
+                "annotations": {
+                    "srw.io/provision-generation": PROVISION_GENERATION,
+                },
+            },
+            "status": {"printableStatus": "Running"},
+        }
+
+        status = await controller._do_status(
+            job_id,
+            PROVISION_GENERATION,
+            exact_absence=True,
+        )
+
+        assert status["rootdisk_identity_known"] is True
+        assert status["rootdisk_pvc_uid"] == f"root-pvc-uid-{job_id}"
 
     @pytest.mark.asyncio
     async def test_authenticated_delete_uses_admitted_uid_precondition(
@@ -3281,6 +3307,67 @@ class TestLifecycleIdentityGeneration:
         ):
             await controller._do_delete(
                 job_id, provision_generation=PROVISION_GENERATION
+            )
+
+        controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_captured_delete_response_loss_converges_when_vm_and_disk_absent(
+        self, controller
+    ):
+        def _missing(**_kwargs):
+            raise _FakeApiException(status=404, body="gone")
+
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _missing
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = (
+            _FakeApiException(status=404, body="gone")
+        )
+
+        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+            result = await controller._do_delete(
+                "response-lost",
+                provision_generation=PROVISION_GENERATION,
+                expected_vm_uid="old-vm-uid",
+                expected_rootdisk_pvc_uid="old-root-uid",
+            )
+
+        assert result["status"] == "deleted"
+        assert result["generation_evidence"] == "request-echo-vm-absent"
+        controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absent_vm_with_replacement_rootdisk_uid_is_superseded(
+        self, controller
+    ):
+        def _get(**kwargs):
+            if kwargs.get("plural") == KUBEVIRT_PLURAL:
+                raise _FakeApiException(status=404, body="gone")
+            return None
+
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _get
+        controller.core_api.read_namespaced_persistent_volume_claim.return_value = (
+            types.SimpleNamespace(
+                metadata=types.SimpleNamespace(
+                    name=_rootdisk_name("replacement-disk"),
+                    uid="replacement-root-uid",
+                    labels={
+                        "srw.io/owner-kind": "job",
+                        "srw.io/owner-id": "replacement-disk",
+                    },
+                )
+            )
+        )
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = None
+
+        with (
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            pytest.raises(RuntimeError, match="superseded rootdisk PVC UID"),
+        ):
+            await controller._do_delete(
+                "replacement-disk",
+                provision_generation=PROVISION_GENERATION,
+                expected_vm_uid="old-vm-uid",
+                expected_rootdisk_pvc_uid="old-root-uid",
             )
 
         controller.k8s_client.delete_namespaced_custom_object.assert_not_called()

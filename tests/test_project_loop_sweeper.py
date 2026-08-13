@@ -126,6 +126,7 @@ def _db(
     db.get_job.side_effect = lambda job_id: by_id.get(str(job_id))
     db.get_newest_loop_stage.return_value = _newest_stage(jobs)
     db.heal_project_loop_stage.return_value = stage_heal_wins
+    db.project_loop_members_have_live_completion_command.return_value = False
     db.claim_project_loop_stage_barrier.return_value = barrier_wins
     db.clear_project_loop_ghost_stage.return_value = ghost_clear_wins
     db.adopt_project_loop_pointer_turn.return_value = adopt_wins
@@ -271,6 +272,36 @@ class TestHealWedgedLoop:
         db = _db([_loop()], [orphan], stage_heal_wins=False)
         assert await _heal_wedged_loop(db, _loop()) is None
 
+    @pytest.mark.asyncio
+    async def test_live_finalizer_stands_down_before_heal(self):
+        orphan = _job(10, "scholar")
+        loop = _loop()
+        db = _db([loop], [orphan])
+        db.project_loop_members_have_live_completion_command.return_value = True
+
+        assert (
+            await _heal_wedged_loop(db, loop, completion_commands_enabled=True) is None
+        )
+        db.project_loop_members_have_live_completion_command.assert_awaited_once_with(
+            [orphan["id"]]
+        )
+        db.heal_project_loop_stage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_expired_or_parked_command_does_not_hide_old_heal(self):
+        orphan = _job(10, "scholar")
+        loop = _loop()
+        db = _db([loop], [orphan])
+        # The authoritative DB helper returns false for resume_finalizer,
+        # park_alert, and alert_only routes. Only stand_down is deference.
+        db.project_loop_members_have_live_completion_command.return_value = False
+
+        assert (
+            await _heal_wedged_loop(db, loop, completion_commands_enabled=True)
+            is orphan
+        )
+        db.heal_project_loop_stage.assert_awaited_once()
+
 
 class TestHealAgeGate:
     """Empty pointers are only a tear once they're OLD — every healthy
@@ -284,6 +315,7 @@ class TestHealAgeGate:
         db = _db([loop], [orphan])
         assert await _heal_wedged_loop(db, loop) is None
         db.get_newest_loop_stage.assert_not_awaited()
+        db.project_loop_members_have_live_completion_command.assert_not_awaited()
         db.heal_project_loop_stage.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -352,6 +384,33 @@ class TestSweepStage:
         advance.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_live_finalizer_stands_down_before_member_status_scan(self):
+        job = _job(9, "developer", status="completed", seq_index=2, remaining=25)
+        loop = self._stage_loop([job["id"]])
+        db = _db([loop], [job])
+        db.project_loop_members_have_live_completion_command.return_value = True
+        advance = AsyncMock()
+
+        assert await _sweep_tick(db, advance, completion_commands_enabled=True) == 0
+        db.project_loop_members_have_live_completion_command.assert_awaited_once_with(
+            [job["id"]]
+        )
+        db.get_loop_stage_member_statuses.assert_not_awaited()
+        advance.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_flag_off_keeps_legacy_call_graph_vacuous(self):
+        job = _job(9, "developer", status="completed", seq_index=2, remaining=25)
+        loop = self._stage_loop([job["id"]])
+        db = _db([loop], [job])
+        db.project_loop_members_have_live_completion_command.return_value = True
+        advance = AsyncMock()
+
+        assert await _sweep_tick(db, advance) == 1
+        db.project_loop_members_have_live_completion_command.assert_not_awaited()
+        advance.assert_awaited_once_with(job, {}, [])
+
+    @pytest.mark.asyncio
     async def test_fanout_all_terminal_advances_via_barrier(self):
         a = _job(2, "scholar", seq_index=0, remaining=7)
         b = _job(2, "product-qa", seq_index=0, remaining=7)
@@ -368,6 +427,50 @@ class TestSweepStage:
         db = _db([self._stage_loop([a["id"], b["id"]])], [b, a])
         advance = AsyncMock()
         assert await _sweep_tick(db, advance) == 0
+        advance.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pending_atomic_handoff_reconciles_before_loop_scan(self):
+        # Crash point: DB transaction committed its predecessor descriptor but
+        # the process died anywhere in the external tail. The general scan is
+        # independent of successor baseline/status and even loop status.
+        job = _job(10, "critic", status="created", seq_index=1, remaining=4)
+        loop = self._stage_loop([job["id"]])
+        db = _db([loop], [job])
+        advance = AsyncMock()
+        reconcile = AsyncMock(return_value=1)
+
+        assert (
+            await _sweep_tick(
+                db,
+                advance,
+                completion_commands_enabled=True,
+                reconcile_handoff_fn=reconcile,
+            )
+            == 1
+        )
+        reconcile.assert_awaited_once_with()
+        advance.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_flag_off_never_calls_atomic_handoff_reconciler(self):
+        job = _job(10, "critic", status="created", seq_index=1, remaining=4)
+        loop = self._stage_loop([job["id"]])
+        db = _db([loop], [job])
+        advance = AsyncMock()
+        reconcile = AsyncMock(return_value=True)
+
+        # No flag-on kwarg means the historical call graph: status scan then
+        # return, with no command relation or M3 handoff callback touched.
+        assert (
+            await _sweep_tick(
+                db,
+                advance,
+                reconcile_handoff_fn=reconcile,
+            )
+            == 0
+        )
+        reconcile.assert_not_awaited()
         advance.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -469,6 +572,18 @@ class TestSweepTick:
         db.update_project_loop.assert_not_awaited()
         advance.assert_not_awaited()
         db.heal_project_loop_stage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_legacy_pointer_adopt_defers_to_live_finalizer(self):
+        job = _job(9, "developer", status="completed", seq_index=2, remaining=25)
+        loop = _loop(current_job_id=job["id"])
+        db = _db([loop], [job])
+        db.project_loop_members_have_live_completion_command.return_value = True
+        advance = AsyncMock()
+
+        assert await _sweep_tick(db, advance, completion_commands_enabled=True) == 0
+        db.adopt_project_loop_pointer_turn.assert_not_awaited()
+        advance.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_adopt_lost_guard_no_advance(self):

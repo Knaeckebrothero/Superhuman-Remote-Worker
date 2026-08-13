@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -12,12 +13,16 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
+import main
+from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.completion_finalizer import (
     CompletionDispositionSuperseded,
+    CompletionEffectRunner,
     CompletionFinalizer,
     CompletionLeaseLost,
 )
 from orchestrator.services.job_completion_commands import accept_completion_command
+from src.shared import worker_queue
 
 
 SCHEMA_FILE = (
@@ -87,6 +92,20 @@ async def _accepted_pinned(pg, *, report_id: UUID | None = None):
     return accepted, job_id, agent_id
 
 
+def _pool_db(pg) -> PostgresDB:
+    database = PostgresDB.__new__(PostgresDB)
+    database._pool = pg
+    return database
+
+
+async def _claimed_runner(db, command_id: str) -> CompletionEffectRunner:
+    finalizer = CompletionFinalizer(db, leader_id="critic-synthesizer-test")
+    command, owner = await finalizer._claim(command_id, inline=True)
+    assert command is not None
+    assert owner is not None
+    return CompletionEffectRunner(db, command=command, owner=owner)
+
+
 @pytest.mark.asyncio
 async def test_two_claimers_execute_one_effect_and_replay_one_outcome(pg):
     accepted, _, _ = await _accepted_pinned(pg)
@@ -137,6 +156,586 @@ async def test_two_claimers_execute_one_effect_and_replay_one_outcome(pg):
     assert replay.disposition == "terminal"
     assert replay.outcome == outcome
     assert effect_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_superseded_effect_is_replay_terminal_and_command_can_finish(pg):
+    accepted, _, _ = await _accepted_pinned(pg)
+    effect_calls = 0
+
+    async def workflow(runner):
+        async def lose_world_state_cas():
+            nonlocal effect_calls
+            effect_calls += 1
+            return {"won": False, "observed_status": "pending_review"}
+
+        detail = await runner.run_transactional(
+            name="critic_spawn_world_cas",
+            group="verification",
+            callback=lose_world_state_cas,
+            supersede_if=lambda output: output["won"] is False,
+        )
+        return {"status": "handled", "detail": detail}
+
+    finalizer = CompletionFinalizer(pg, workflow=workflow, leader_id="supersede")
+    result = await finalizer.finalize_command(accepted.command_id)
+
+    assert result.disposition == "done"
+    assert effect_calls == 1
+    async with pg.acquire() as conn:
+        command_state = await conn.fetchval(
+            "SELECT state FROM job_completion_commands WHERE id=$1",
+            UUID(accepted.command_id),
+        )
+        effect = await conn.fetchrow(
+            "SELECT state, detail, completed_at, complete_by "
+            "FROM completion_effects WHERE producer_kind='job_completion' "
+            "AND producer_id=$1 AND effect_name='critic_spawn_world_cas'",
+            UUID(accepted.command_id),
+        )
+    assert command_state == "done"
+    assert effect["state"] == "superseded"
+    assert effect["completed_at"] is not None
+    assert effect["complete_by"] is None
+    assert json.loads(effect["detail"])["output"] == {
+        "won": False,
+        "observed_status": "pending_review",
+    }
+
+    replay = await finalizer.finalize_command(accepted.command_id)
+    assert replay.disposition == "terminal"
+    assert effect_calls == 1
+
+
+async def _critic_verdict_fixture(
+    pg,
+    *,
+    target_status: str = "reviewing",
+    target_lane: str = "pinned",
+    finding_claim: str = "fix it",
+):
+    async with pg.acquire() as conn:
+        agent_id = await conn.fetchval(
+            "INSERT INTO agents (config_name, hostname, status) "
+            "VALUES ('critic', $1, 'working') RETURNING id",
+            f"critic-{uuid4().hex[:10]}",
+        )
+        target_id = await conn.fetchval(
+            "INSERT INTO jobs (description, status, execution_lane, context, "
+            "resolved_config) VALUES ('target', $1, $2, '{}'::jsonb, "
+            '\'{"agent":{"autonomy":"review"}}\'::jsonb) RETURNING id',
+            target_status,
+            target_lane,
+        )
+        if target_lane == "stateless":
+            await conn.execute(
+                "INSERT INTO run_queue (unit_id, unit_kind, state) "
+                "VALUES ($1, 'worker_batch', 'done')",
+                target_id,
+            )
+        critic_id = await conn.fetchval(
+            "INSERT INTO jobs (description, status, execution_lane, "
+            "assigned_agent_id, parent_job_id, context) "
+            "VALUES ('critic', 'processing', 'pinned', $1, $2, "
+            "jsonb_build_object('verification_target', $2::uuid::text)) "
+            "RETURNING id",
+            agent_id,
+            target_id,
+        )
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_build_object("
+            "'verification_rounds', jsonb_build_array(jsonb_build_object("
+            "'round', 1, 'critic_job_id', $2::uuid::text, "
+            "'verdict', 'returned', 'opened', jsonb_build_array("
+            "jsonb_build_object('id', 'F1', 'severity', 'high', "
+            "'claim', $3::text, 'status', 'OPEN'))))) WHERE id=$1",
+            target_id,
+            critic_id,
+            finding_claim,
+        )
+    accepted = await accept_completion_command(
+        pg,
+        job_id=str(critic_id),
+        payload={
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": None,
+            "freeze_data": None,
+        },
+        lease_token=None,
+        agent_id=str(agent_id),
+        client_report_id=str(uuid4()),
+        requested_by="critic-synthesizer-test",
+    )
+    async with pg.acquire() as conn:
+        await conn.execute("UPDATE jobs SET status='completed' WHERE id=$1", critic_id)
+    return accepted, target_id, critic_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_lane", ["pinned", "stateless"])
+async def test_s27_reviewing_cas_and_effect_marker_commit_together(
+    pg, monkeypatch, target_lane
+):
+    accepted, target_id, critic_id = await _critic_verdict_fixture(
+        pg, target_lane=target_lane
+    )
+    db = _pool_db(pg)
+    monkeypatch.setattr(main, "postgres_db", db)
+    runner = await _claimed_runner(db, accepted.command_id)
+    critic = await db.get_job(str(critic_id))
+
+    plan = await runner.run_transactional(
+        name="critic_verdict",
+        group="critic_verdict",
+        callback=lambda: main._materialize_critic_verdict_transactional(critic),
+        supersede_if=lambda output: output["world_cas_won"] is False,
+    )
+
+    assert plan["world_cas_won"] is True
+    assert plan["outcome"] == "returned"
+    async with pg.acquire() as conn:
+        target = await conn.fetchrow(
+            "SELECT status::text, context, freeze_data FROM jobs WHERE id=$1",
+            target_id,
+        )
+        effect = await conn.fetchrow(
+            "SELECT state, detail, pg_column_size(detail) AS detail_bytes "
+            "FROM completion_effects "
+            "WHERE producer_kind='job_completion' AND producer_id=$1 "
+            "AND effect_name='critic_verdict'",
+            UUID(accepted.command_id),
+        )
+        queue = await conn.fetchrow(
+            "SELECT state, input_seq FROM run_queue WHERE unit_id=$1", target_id
+        )
+    assert target["status"] == "paused"
+    assert target["freeze_data"] is None
+    target_context = json.loads(target["context"])
+    assert "F1" in target_context["queued_feedback"]
+    assert effect["state"] == "done"
+    assert effect["detail_bytes"] < 8 * 1024
+    assert json.loads(effect["detail"])["output"]["world_cas_won"] is True
+    if target_lane == "stateless":
+        assert queue["state"] == "queued"
+        assert queue["input_seq"] == 1
+    else:
+        assert queue is None
+
+
+@pytest.mark.asyncio
+async def test_s27_oversized_findings_persist_in_domain_not_effect_detail(
+    pg, monkeypatch
+):
+    large_claim = "oversized-finding-" + ("x" * 20_000)
+    accepted, target_id, critic_id = await _critic_verdict_fixture(
+        pg, finding_claim=large_claim
+    )
+    db = _pool_db(pg)
+    monkeypatch.setattr(main, "postgres_db", db)
+    runner = await _claimed_runner(db, accepted.command_id)
+    critic = await db.get_job(str(critic_id))
+
+    plan = await runner.run_transactional(
+        name="critic_verdict",
+        group="critic_verdict",
+        callback=lambda: main._materialize_critic_verdict_transactional(critic),
+        supersede_if=lambda output: output["world_cas_won"] is False,
+    )
+
+    assert plan == {
+        "applicable": True,
+        "world_cas_won": True,
+        "outcome": "returned",
+        "target_job_id": str(target_id),
+        "critic_job_id": str(critic_id),
+        "new_status": "paused",
+        "open_finding_count": 1,
+        "actions": [],
+    }
+    async with pg.acquire() as conn:
+        target_feedback = await conn.fetchval(
+            "SELECT context->>'queued_feedback' FROM jobs WHERE id=$1", target_id
+        )
+        detail_bytes = await conn.fetchval(
+            "SELECT pg_column_size(detail) FROM completion_effects "
+            "WHERE producer_kind='job_completion' AND producer_id=$1 "
+            "AND effect_name='critic_verdict'",
+            UUID(accepted.command_id),
+        )
+    assert large_claim in target_feedback
+    assert detail_bytes < 8 * 1024
+
+
+@pytest.mark.asyncio
+async def test_s27_stateless_return_uses_ledger_recomputed_after_queue_lock(
+    pg, monkeypatch
+):
+    accepted, target_id, critic_id = await _critic_verdict_fixture(
+        pg,
+        target_lane="stateless",
+        finding_claim="hint finding must not survive",
+    )
+    db = _pool_db(pg)
+    monkeypatch.setattr(main, "postgres_db", db)
+    original_enqueue = worker_queue.enqueue_worker_batch_wake
+
+    async def enqueue_then_change_ledger(conn, **kwargs):
+        admitted = await original_enqueue(conn, **kwargs)
+        # The queue row is now locked by the synthesizer transaction, while a
+        # concurrent verdict writer can still commit a newer target ledger.
+        # S27 must derive feedback only after its subsequent jobs-row lock.
+        locked_world = {
+            "verification_rounds": [
+                {
+                    "round": 1,
+                    "critic_job_id": str(critic_id),
+                    "verdict": "returned",
+                    "opened": [
+                        {
+                            "id": "F2",
+                            "severity": "critical",
+                            "claim": "locked finding wins",
+                            "status": "OPEN",
+                        }
+                    ],
+                }
+            ]
+        }
+        async with pg.acquire() as rival:
+            await rival.execute(
+                "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+                target_id,
+                json.dumps(locked_world),
+            )
+        return admitted
+
+    monkeypatch.setattr(
+        worker_queue,
+        "enqueue_worker_batch_wake",
+        enqueue_then_change_ledger,
+    )
+    runner = await _claimed_runner(db, accepted.command_id)
+    critic = await db.get_job(str(critic_id))
+
+    plan = await runner.run_transactional(
+        name="critic_verdict",
+        group="critic_verdict",
+        callback=lambda: main._materialize_critic_verdict_transactional(critic),
+        supersede_if=lambda output: output["world_cas_won"] is False,
+    )
+
+    assert plan["world_cas_won"] is True
+    async with pg.acquire() as conn:
+        feedback = await conn.fetchval(
+            "SELECT context->>'queued_feedback' FROM jobs WHERE id=$1",
+            target_id,
+        )
+        queue = await conn.fetchrow(
+            "SELECT state, input_seq FROM run_queue WHERE unit_id=$1", target_id
+        )
+    assert "locked finding wins" in feedback
+    assert "hint finding must not survive" not in feedback
+    assert queue["state"] == "queued"
+    assert queue["input_seq"] == 1
+
+
+@pytest.mark.asyncio
+async def test_s27_multibyte_escalation_is_bounded_before_domain_write(pg, monkeypatch):
+    accepted, target_id, critic_id = await _critic_verdict_fixture(pg)
+    db = _pool_db(pg)
+    monkeypatch.setattr(main, "postgres_db", db)
+    huge_reason = "誤" * 20_000
+    monkeypatch.setattr(
+        main,
+        "_resolve_critic_outcome",
+        lambda *_args: ("escalate", huge_reason),
+    )
+    runner = await _claimed_runner(db, accepted.command_id)
+    critic = await db.get_job(str(critic_id))
+
+    plan = await runner.run_transactional(
+        name="critic_verdict",
+        group="critic_verdict",
+        callback=lambda: main._materialize_critic_verdict_transactional(critic),
+        supersede_if=lambda output: output["world_cas_won"] is False,
+    )
+
+    assert plan["world_cas_won"] is True
+    assert plan["outcome"] == "escalate"
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT error_message, status::text FROM jobs WHERE id=$1", target_id
+        )
+        detail_bytes = await conn.fetchval(
+            "SELECT pg_column_size(detail) FROM completion_effects "
+            "WHERE producer_kind='job_completion' AND producer_id=$1 "
+            "AND effect_name='critic_verdict'",
+            UUID(accepted.command_id),
+        )
+    assert row["status"] == "pending_review"
+    assert len(row["error_message"].encode("utf-8")) <= 1024
+    assert row["error_message"].endswith("…")
+    assert detail_bytes < 8 * 1024
+
+
+@pytest.mark.asyncio
+async def test_s27_human_decision_supersedes_effect_without_followup(pg, monkeypatch):
+    accepted, target_id, critic_id = await _critic_verdict_fixture(
+        pg, target_status="pending_review"
+    )
+    db = _pool_db(pg)
+    monkeypatch.setattr(main, "postgres_db", db)
+    runner = await _claimed_runner(db, accepted.command_id)
+    critic = await db.get_job(str(critic_id))
+
+    plan = await runner.run_transactional(
+        name="critic_verdict",
+        group="critic_verdict",
+        callback=lambda: main._materialize_critic_verdict_transactional(critic),
+        supersede_if=lambda output: output["world_cas_won"] is False,
+    )
+
+    assert plan["world_cas_won"] is False
+    assert plan["observed_status"] == "pending_review"
+    async with pg.acquire() as conn:
+        assert (
+            await conn.fetchval("SELECT status::text FROM jobs WHERE id=$1", target_id)
+            == "pending_review"
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT state FROM completion_effects "
+                "WHERE producer_kind='job_completion' AND producer_id=$1 "
+                "AND effect_name='critic_verdict'",
+                UUID(accepted.command_id),
+            )
+            == "superseded"
+        )
+
+
+async def _verification_parent_fixture(pg):
+    async with pg.acquire() as conn:
+        agent_id = await conn.fetchval(
+            "INSERT INTO agents (config_name, hostname, status) "
+            "VALUES ('developer', $1, 'working') RETURNING id",
+            f"verification-{uuid4().hex[:10]}",
+        )
+        parent_id = await conn.fetchval(
+            "INSERT INTO jobs (description, status, execution_lane, "
+            "assigned_agent_id, context, resolved_config, freeze_data) "
+            "VALUES ('verification target', 'processing', 'pinned', $1, "
+            '\'{"datasource_selection":{"datasource_ids":[],'
+            '"policy_revisions":{}}}\'::jsonb, '
+            '\'{"verification":{"enabled":true,'
+            '"critic_config":"critic","max_rounds":3}}\'::jsonb, '
+            '\'{"freeze_type":"job_complete","summary":"done",'
+            '"deliverables":["output/result.md"]}\'::jsonb) RETURNING id',
+            agent_id,
+        )
+    accepted = await accept_completion_command(
+        pg,
+        job_id=str(parent_id),
+        payload={
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": None,
+            "freeze_data": {
+                "freeze_type": "job_complete",
+                "summary": "done",
+                "deliverables": ["output/result.md"],
+            },
+        },
+        lease_token=None,
+        agent_id=str(agent_id),
+        client_report_id=str(uuid4()),
+        requested_by="verification-synthesizer-test",
+    )
+    async with pg.acquire() as conn:
+        await conn.execute("UPDATE jobs SET status='reviewing' WHERE id=$1", parent_id)
+    return accepted, parent_id
+
+
+@pytest.mark.asyncio
+async def test_s30_materializes_one_critic_before_external_handoff(pg, monkeypatch):
+    accepted, parent_id = await _verification_parent_fixture(pg)
+    db = _pool_db(pg)
+    monkeypatch.setattr(main, "postgres_db", db)
+    runner = await _claimed_runner(db, accepted.command_id)
+    parent = await db.get_job(str(parent_id))
+
+    plan = await runner.run_transactional(
+        name="verification_critic_spawn",
+        group="verification",
+        callback=lambda: main._materialize_verification_critic_transactional(
+            parent,
+            {"should_stop": True, "goal_achieved": True, "error": None},
+            expected_round=0,
+        ),
+        supersede_if=lambda output: output["world_cas_won"] is False,
+    )
+
+    assert plan["world_cas_won"] is True
+    assert plan["action"] == "handoff"
+    async with pg.acquire() as conn:
+        critics = await conn.fetch(
+            "SELECT id, branch_name, context FROM jobs "
+            "WHERE parent_job_id=$1 AND context->>'verification_target'=$1::text",
+            parent_id,
+        )
+        effect = await conn.fetchrow(
+            "SELECT state, pg_column_size(detail) AS detail_bytes "
+            "FROM completion_effects "
+            "WHERE producer_kind='job_completion' AND producer_id=$1 "
+            "AND effect_name='verification_critic_spawn'",
+            UUID(accepted.command_id),
+        )
+    assert [str(row["id"]) for row in critics] == [plan["critic_job_id"]]
+    assert critics[0]["branch_name"] is None
+    assert effect["state"] == "done"
+    assert effect["detail_bytes"] < 8 * 1024
+
+
+@pytest.mark.asyncio
+async def test_s30_create_job_and_effect_marker_roll_back_as_one_unit(pg, monkeypatch):
+    accepted, parent_id = await _verification_parent_fixture(pg)
+    db = _pool_db(pg)
+    monkeypatch.setattr(main, "postgres_db", db)
+    workspace_handoff = AsyncMock()
+    dispatch = MagicMock()
+    monkeypatch.setattr(main, "_setup_verification_critic_workspace", workspace_handoff)
+    monkeypatch.setattr(main, "_trigger_dispatch", dispatch)
+    runner = await _claimed_runner(db, accepted.command_id)
+    parent = await db.get_job(str(parent_id))
+
+    def fail_after_materialization(_output):
+        raise RuntimeError("rollback after critic insert")
+
+    with pytest.raises(RuntimeError, match="rollback after critic insert"):
+        await runner.run_transactional(
+            name="verification_critic_spawn",
+            group="verification",
+            callback=lambda: main._materialize_verification_critic_transactional(
+                parent,
+                {"should_stop": True, "goal_achieved": True, "error": None},
+                expected_round=0,
+            ),
+            supersede_if=fail_after_materialization,
+        )
+
+    async with pg.acquire() as conn:
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM jobs WHERE parent_job_id=$1 "
+            "AND context->>'verification_target'=$1::text)",
+            parent_id,
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM completion_effects "
+            "WHERE producer_kind='job_completion' AND producer_id=$1 "
+            "AND effect_name='verification_critic_spawn')",
+            UUID(accepted.command_id),
+        )
+    workspace_handoff.assert_not_awaited()
+    dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_s30_multibyte_delivery_error_is_bounded_before_domain_write(
+    pg, monkeypatch
+):
+    accepted, parent_id = await _verification_parent_fixture(pg)
+    db = _pool_db(pg)
+    monkeypatch.setattr(main, "postgres_db", db)
+    runner = await _claimed_runner(db, accepted.command_id)
+    parent = await db.get_job(str(parent_id))
+    huge_error = "配" * 20_000
+    parent["freeze_data"] = {
+        "freeze_type": "job_complete",
+        "delivery_failed": True,
+        "delivery_error": huge_error,
+    }
+
+    plan = await runner.run_transactional(
+        name="verification_critic_spawn",
+        group="verification",
+        callback=lambda: main._materialize_verification_critic_transactional(
+            parent,
+            {"should_stop": True, "goal_achieved": True, "error": None},
+            expected_round=0,
+        ),
+        supersede_if=lambda output: output["world_cas_won"] is False,
+    )
+
+    assert plan["world_cas_won"] is True
+    assert plan["action"] == "escalate"
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT error_message, status::text FROM jobs WHERE id=$1", parent_id
+        )
+        detail_bytes = await conn.fetchval(
+            "SELECT pg_column_size(detail) FROM completion_effects "
+            "WHERE producer_kind='job_completion' AND producer_id=$1 "
+            "AND effect_name='verification_critic_spawn'",
+            UUID(accepted.command_id),
+        )
+    assert row["status"] == "pending_review"
+    assert len(row["error_message"].encode("utf-8")) <= 1024
+    assert row["error_message"].endswith("…")
+    assert detail_bytes < 8 * 1024
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("miss", ["status", "round"])
+async def test_s30_reviewing_or_round_miss_supersedes_without_spawn(
+    pg, monkeypatch, miss
+):
+    accepted, parent_id = await _verification_parent_fixture(pg)
+    db = _pool_db(pg)
+    monkeypatch.setattr(main, "postgres_db", db)
+    runner = await _claimed_runner(db, accepted.command_id)
+    parent = await db.get_job(str(parent_id))
+    async with pg.acquire() as conn:
+        if miss == "status":
+            await conn.execute(
+                "UPDATE jobs SET status='pending_review' WHERE id=$1", parent_id
+            )
+        else:
+            await conn.execute(
+                "UPDATE jobs SET context=jsonb_set(context, "
+                "'{verification_rounds}', '[{\"round\":1}]'::jsonb) WHERE id=$1",
+                parent_id,
+            )
+
+    plan = await runner.run_transactional(
+        name="verification_critic_spawn",
+        group="verification",
+        callback=lambda: main._materialize_verification_critic_transactional(
+            parent,
+            {"should_stop": True, "goal_achieved": True, "error": None},
+            expected_round=0,
+        ),
+        supersede_if=lambda output: output["world_cas_won"] is False,
+    )
+
+    assert plan["world_cas_won"] is False
+    assert plan["observed_status"] == (
+        "pending_review" if miss == "status" else "reviewing:round-1"
+    )
+    async with pg.acquire() as conn:
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM jobs WHERE parent_job_id=$1 "
+            "AND context->>'verification_target'=$1::text)",
+            parent_id,
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT state FROM completion_effects "
+                "WHERE producer_kind='job_completion' AND producer_id=$1 "
+                "AND effect_name='verification_critic_spawn'",
+                UUID(accepted.command_id),
+            )
+            == "superseded"
+        )
 
 
 @pytest.mark.asyncio

@@ -362,6 +362,8 @@ class NatsBridge:
         purge_disk: bool = True,
         provision_generation: str | None = None,
         entity_type: str = "job",
+        expected_vm_uid: str | None = None,
+        expected_rootdisk_pvc_uid: str | None = None,
     ) -> bool:
         """Publish a VM deletion request.
 
@@ -400,6 +402,10 @@ class NatsBridge:
         }
         if generation is not None:
             payload["provision_generation"] = generation
+        if expected_vm_uid is not None:
+            payload["expected_vm_uid"] = expected_vm_uid
+        if expected_rootdisk_pvc_uid is not None:
+            payload["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
         payload = sign_payload(
             payload,
             direction="request",
@@ -435,6 +441,8 @@ class NatsBridge:
         job_id: str,
         timeout: float = 5.0,
         provision_generation: str | None = None,
+        *,
+        exact_absence: bool = False,
     ) -> Optional[dict]:
         """Query live VM status via NATS request/reply.
 
@@ -467,6 +475,8 @@ class NatsBridge:
         payload = {"job_id": job_id, "orchestrator_id": self._orchestrator_id}
         if generation is not None:
             payload["provision_generation"] = generation
+        if exact_absence:
+            payload["exact_absence"] = True
         payload = sign_payload(
             payload,
             direction="request",
@@ -536,7 +546,12 @@ class NatsBridge:
             logger.debug("VM status query failed for job %s: %s", job_id, e)
             return None
 
-    async def request_vm_list(self, timeout: float = 5.0) -> Optional[list]:
+    async def request_vm_list(
+        self,
+        timeout: float = 5.0,
+        *,
+        include_teardown_identity: bool = False,
+    ) -> Optional[list]:
         """List the controller's managed VMs via NATS request/reply.
 
         Inventory source for the lifecycle VM orphan sweep. Returns the list
@@ -554,7 +569,14 @@ class NatsBridge:
             return None
 
         payload = sign_payload(
-            {"orchestrator_id": self._orchestrator_id},
+            {
+                "orchestrator_id": self._orchestrator_id,
+                **(
+                    {"include_teardown_identity": True}
+                    if include_teardown_identity
+                    else {}
+                ),
+            },
             direction="request",
             operation="list",
             secret=self._lifecycle_hmac_secret,

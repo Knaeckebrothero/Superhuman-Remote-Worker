@@ -31,6 +31,7 @@ import asyncio
 import base64
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .cloud import (
@@ -41,6 +42,11 @@ from .cloud import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _permit(authority_check: Callable[[], Awaitable[None]] | None) -> None:
+    if authority_check is not None:
+        await authority_check()
 
 
 def _job_context(job: dict[str, Any]) -> dict[str, Any]:
@@ -103,6 +109,7 @@ async def seed_project_folder_baseline(
     gitea_client: Any,
     main_cloud_router: MainCloudRouter,
     require_complete: bool = False,
+    authority_check: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Walk the project's cloud folder, push files into Gitea, stamp baseline.
 
@@ -138,16 +145,20 @@ async def seed_project_folder_baseline(
             payload["error"] = error
         if entries is not None:
             payload["entries"] = entries
+        await _permit(authority_check)
         try:
             await postgres_db.merge_job_context(job_id, {"cloud_baseline": payload})
         except Exception:
             logger.exception(
                 "Mode A: failed to update baseline state for job %s", job_id
             )
+        await _permit(authority_check)
 
     try:
         # Idempotency: a re-run after a successful seed should no-op.
+        await _permit(authority_check)
         existing = await postgres_db.get_job(job_id)
+        await _permit(authority_check)
         if existing and existing.get("cloud_diff_baseline_commit"):
             existing_baseline = _job_context(existing).get("cloud_baseline") or {}
             if not isinstance(existing_baseline, dict):
@@ -199,9 +210,11 @@ async def seed_project_folder_baseline(
 
         # 1. Enumerate everything under the project folder.
         try:
+            await _permit(authority_check)
             entries: list[ProjectFolderEntry] = await backend.list_project_folder(
                 handle
             )
+            await _permit(authority_check)
         except CloudBackendError as e:
             logger.warning(
                 "Mode A: job %s — list_project_folder failed (%s); skipping seed",
@@ -227,7 +240,9 @@ async def seed_project_folder_baseline(
             # Still record a baseline commit hash so completion-time diff
             # has something to diff against (the empty tree).
             # We do this by capturing the current HEAD of the job branch.
+            await _permit(authority_check)
             head_sha = await _read_head_commit(gitea_client, repo_name, branch)
+            await _permit(authority_check)
             if not head_sha:
                 await _set_state("failed", error="could not read empty baseline HEAD")
                 return
@@ -240,9 +255,11 @@ async def seed_project_folder_baseline(
         failed_files = 0
         for entry in files:
             try:
+                await _permit(authority_check)
                 blob = await backend.get_project_folder_file_bytes(
                     handle, path=entry.path
                 )
+                await _permit(authority_check)
             except CloudBackendError as e:
                 logger.warning(
                     "Mode A: job %s — failed to fetch %s (%s); skipping",
@@ -261,6 +278,7 @@ async def seed_project_folder_baseline(
                 content_text = blob.decode("utf-8")
             except UnicodeDecodeError:
                 if require_complete:
+                    await _permit(authority_check)
                     ok = await gitea_client.change_files(
                         repo_name,
                         branch or "main",
@@ -274,6 +292,7 @@ async def seed_project_folder_baseline(
                             job_short=job_short, project_name=project_name
                         ),
                     )
+                    await _permit(authority_check)
                     if ok:
                         seeded += 1
                     else:
@@ -293,6 +312,7 @@ async def seed_project_folder_baseline(
                     )
                 continue
             gitea_path = f"{target_subpath}/{entry.path}"
+            await _permit(authority_check)
             ok = await gitea_client.create_or_update_file(
                 repo_name,
                 gitea_path,
@@ -302,6 +322,7 @@ async def seed_project_folder_baseline(
                 ),
                 branch=branch,
             )
+            await _permit(authority_check)
             if ok:
                 seeded += 1
             else:
@@ -324,7 +345,9 @@ async def seed_project_folder_baseline(
             return
 
         # 3. Capture the head of the branch as the baseline commit.
+        await _permit(authority_check)
         baseline_sha = await _read_head_commit(gitea_client, repo_name, branch)
+        await _permit(authority_check)
         if not baseline_sha:
             logger.warning(
                 "Mode A: job %s — could not read HEAD after seeding; "
@@ -334,7 +357,9 @@ async def seed_project_folder_baseline(
             await _set_state("failed", error="could not read HEAD after seed")
             return
 
+        await _permit(authority_check)
         await postgres_db.update_job_cloud_diff(job_id, baseline_commit=baseline_sha)
+        await _permit(authority_check)
         logger.info(
             "Mode A: job %s — seeded %d file(s), skipped %d binary, baseline=%s",
             job_short,
@@ -344,6 +369,14 @@ async def seed_project_folder_baseline(
         )
         await _set_state("ready", entries=entries_map)
     except Exception as e:
+        if authority_check is not None:
+            # Durable project-loop handoff authority failures are fail-closed:
+            # never convert lease loss into a baseline "failed" write by the
+            # stale owner, and never let provisioning continue to later work.
+            from services.project_loop_atomic import ProjectLoopHandoffAuthorityLost
+
+            if isinstance(e, ProjectLoopHandoffAuthorityLost):
+                raise
         logger.exception(
             "Mode A: job %s — baseline seed unexpectedly failed", job_short
         )

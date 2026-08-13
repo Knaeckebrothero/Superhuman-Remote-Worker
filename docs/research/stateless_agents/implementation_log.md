@@ -4169,3 +4169,100 @@ new failure. Repository-wide Ruff check/format, Python compilation, whitespace,
 Squawk v2.59.0, and the full app/vector/audit schema snapshot replay all pass.
 The preserved live residue remains **2 parked + 1 pending commands and 2 pending
 effects**; M2 did not fabricate, unpark or clean any fixture row.
+
+# Session 17 — Gate 3 step 4, M3 bidirectional deference (2026-08-13)
+
+## M3 shipped — one synthesizer, one durable owner
+
+- Completion effects now accept a transactional `supersede_if` predicate. A
+  losing world-state CAS settles that effect as the replayable terminal state
+  `superseded`; replay, dependency checks and command finish consistently treat
+  `done|superseded` as terminal, while effect-derived authority remains
+  deliberately `done`-only. With `COMPLETION_COMMANDS_ENABLED=false`, the
+  legacy callback still runs directly and the predicate is not evaluated.
+- Both reviewing-parent watchdog arms defer only to a live completion owner,
+  covering the target and any verification child. S27 now applies its locked
+  target transition and effect marker transactionally, with external
+  notification/dispatch follow-up only for the winner. S30 locks the exact
+  `reviewing` parent and natural verification round, inserts at most one critic
+  in the same transaction as its effect marker, and performs Gitea/workspace
+  handoff separately. A watchdog or human decision that wins makes the
+  finalizer effect supersede instead of moving the target back.
+- Project-loop advancement now locks and validates the exact member world,
+  inserts stage-N+1 jobs, updates loop pointers/counters/campaign state, and
+  persists a bounded handoff descriptor in one application transaction. The
+  old Class-B empty-barrier window no longer exists. S32 uses the same exact
+  world CAS and supersedes after a healer wins; the sweeper stands down only
+  for a live finalizer, while expired/parked work is routed and allowed to
+  contend. The separately replayable external handoff has an exact-output,
+  DB-clock lease with claimant-fenced renew/finish and authority checks around
+  every independent consequence.
+- Vector migration `0018_project_loop_ttl_effects.sql` adds the
+  `(loop_id, total_jobs_run)` response-loss ledger. Its insert and the knowledge
+  TTL decrement share one vector transaction. Deterministic message identities
+  similarly make one durable insert the only notification publisher. The
+  migration was applied by Tilt and frozen; M3 required no app migration.
+- Lifecycle cleanup replaces the M2 observational command veto with shared
+  routed ownership. A live command yields `stand_down`; an expired or alert
+  route enqueues the same command attempt and S36 journal instead of starting a
+  parallel cleanup or redispatching an agent. Command-free lifecycle work owns
+  one renewable `_completion_control_claim` across snapshot through deletion;
+  a stale owner cannot clear it or start a follow-on.
+- Kubernetes teardown captures exact Pod/PVC/Service UIDs. Dirty snapshots also
+  bind Pod UID, IP and SSH host key; clean/unreachable and orphan-PVC paths do
+  not invent an SSH dependency. VM teardown carries provision generation, VM
+  UID and root-disk UID through direct, HTTP, NATS and controller paths and
+  fails closed when a purge identity is unknown. Docker retains its legacy
+  cleanup. A hybrid workspace captures both Kubernetes and VM identities before
+  I/O and reconciles each independently: retry/unknown outranks identity
+  supersession, which outranks completion, so a replacement survives while an
+  exact old resource on the other backend can still converge. Replacement
+  supersession is local to S36.
+- All M3 behavior rides the existing commands flag. Closed-path tests prove no
+  command-relation query, lifecycle capability field, loop ledger call,
+  `supersede_if` evaluation, metadata addition or collaborator-order change.
+
+## M3 k3d soak evidence
+
+Rows 1 and 2 used literal DB-clock elapsed time, never backdated timestamps.
+There is still no production completion-command unpark verb, and M3
+intentionally removes the old loop claim-to-spawn state, so the disclosed
+park/retry and legacy barrier calls below are controlled fault construction,
+not claimed product verbs. Every mutation was UUID/run-tag guarded and excluded
+the three preserved command IDs.
+
+| Row | Evidence |
+|---|---|
+| 1 — reviewing/critic | S17 durably wrote `reviewing` at **11:14:16.857591Z**. At 1,899.494 seconds it was still reviewing with zero critics; the live 300-second watchdog naturally wrote `pending_review` at **11:48:36.472592Z**. The read at 2,145.614 seconds still had zero critics. A guarded human `run_critic` retry plus controlled unpark then exercised real S30. The handcrafted fixture first demonstrated the correct fail-closed connector response because it lacked immutable `datasource_selection`; after a disclosed, single-transaction fixture-ledger correction to an authoritative empty selection, S1/S17 replay and real S30 produced exactly one critic, `89227f57-...`, with S30 `done`, `world_cas_won=true`, and the parent coherently `reviewing`. No S30 external handoff effect ran. |
+| 2 — loop heal/advance | A controlled legacy barrier construction at **11:14:16.814369Z** naturally parked the command. At 600.604 seconds the cleared loop still had zero successors. The live sweeper then atomically created sole stage-N+1 job `5d7f1ec6-...` and repointed the loop at **11:24:36.772967Z**; reads at 630.638 and 743 seconds showed exactly that one successor. The extra harness expectation that it be born paused was not part of the acceptance row; it was actually `created` with cloud baseline seeding, and no blind correction was made. |
+| 8 — same-name Pod | Real S36 stored an active authorization and captured Pod UID A `78773b27-...`, PVC UID `9b1b0465-...`, and Service UID `012afef2-...` before an injected release failure naturally parked the command. UID-A deletion was exact-preconditioned and absent by **11:22:51.179673Z**. A real same-name replacement reached ready with UID B `f8b91924-...`; exact command/effect replay settled S36 `superseded` with `identity_superseded` at **11:22:57.671292Z**, while UID B and the original PVC/Service identities still existed. |
+
+All disposable resources were enumerated before cleanup. Row 1's critic had
+already reached `processing`, so it was quiesced through the production
+dual-callable cancel endpoint (HTTP 200), not a blind DB write. Its exact
+workspace resources reached absence, its four-object snapshot prefix was
+deleted through `SnapshotService`, Gitea was 404, and all six vector job tables
+were empty. The fixture cleanup committed at **12:22:06.750391Z**. Two real,
+append-only metering facts for that short-lived workspace intentionally remain
+(`gib-hour` and `vcpu-hour`); they were not bypass-deleted.
+
+Final independent proof found zero disposable DB/Kubernetes/vector/S3/Gitea
+footprint and restored the exact preserved baseline: **7 done, 2 parked and 1
+pending commands; 112 done and 2 pending effects**. The protected command/effect
+projection was unchanged.
+
+Verification at the M3 boundary: the current affected matrix passed
+**1,142/1,142**, including real-Postgres contention and response-loss tests.
+The repository-wide non-fail-fast suite produced **17,561 passed, 163 skipped,
+11 failed**, with the exact baseline environment-only failures and no new
+failure. Ruff check/format over 1,134 files, Python compilation, whitespace,
+Squawk v2.59.0 on vector migration 0018 (zero findings), and complete
+app/vector/audit schema replay and snapshot freshness all pass.
+
+### Morning hand-check
+
+Repeat row 1 from a naturally admitted production job: let the watchdog win,
+use the future operator unpark verb, and confirm exactly one critic without a
+fixture-ledger correction. That is the one live row whose handcrafted setup
+omitted an immutable admission field; the fail-closed response was correct,
+but it makes the production-shaped retry the most valuable hand check.

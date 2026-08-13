@@ -69,6 +69,7 @@ class _Connection:
         self.transaction_events: list[str] = []
         self.pending_mutations: list[str] = []
         self.calls: list[tuple[str, str, int, asyncio.Task[Any] | None]] = []
+        self.settled_states: list[str] = []
 
     def transaction(self) -> _Transaction:
         return _Transaction(self)
@@ -125,6 +126,7 @@ class _Connection:
             return 1
         if normalized.startswith("with completed_effect as"):
             self._mutation(normalized)
+            self.settled_states.append(str(args[5]))
             return 1
         raise AssertionError(f"unexpected fetchval SQL: {normalized}")
 
@@ -249,6 +251,36 @@ async def test_transactional_effect_rejects_effect_group_retry_modes():
     assert ledger.pool_events == []
     assert parent.calls == []
     assert child.calls == []
+
+
+@pytest.mark.asyncio
+async def test_transactional_world_cas_miss_and_supersede_marker_share_transaction():
+    runner, database, ledger, parent, child = _runner_database()
+
+    async def lose_world_cas() -> dict[str, Any]:
+        assert await database.merge_job_context(JOB_ID, {"synthesizer": "lost"})
+        return {"won": False}
+
+    result = await runner.run_transactional(
+        name="atomic_counter",
+        group="recovery",
+        callback=lose_world_cas,
+        supersede_if=lambda output: output["won"] is False,
+    )
+
+    assert result == {"won": False}
+    assert parent.settled_states == ["superseded"]
+    domain_write = next(
+        call for call in parent.calls if call[1].startswith("update jobs set context =")
+    )
+    completion_marker = next(
+        call for call in parent.calls if call[1].startswith("with completed_effect as")
+    )
+    assert domain_write[2] > 0
+    assert completion_marker[2] > 0
+    assert domain_write[3] is completion_marker[3] is asyncio.current_task()
+    assert child.calls == []
+    assert ledger.pool_events == ["acquire:parent", "release:parent"]
 
 
 @pytest.mark.asyncio

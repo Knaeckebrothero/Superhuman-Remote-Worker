@@ -2448,6 +2448,89 @@ class ContainerProvisioner:
             ssh_port=attestation.port,
         )
 
+    async def classify_workspace_teardown_identity(
+        self,
+        owner: WorkspaceOwner,
+        identity: WorkspaceTeardownIdentity,
+    ) -> str:
+        """Classify a failed captured release without adopting stable names.
+
+        ``identity_superseded`` is reserved for a proven Pod/PVC/Service UID
+        replacement.  API ambiguity remains ``unknown`` so the S36 journal
+        retries; exact captured or absent resources remain ``matched``.
+        """
+
+        if not self._k8s_available:
+            return "unknown"
+        if identity.pod_uid is None:
+            pod_authority = (
+                "exact_absent"
+                if await self._captured_teardown_pod_is_absent(owner)
+                else "unknown"
+            )
+        else:
+            pod_authority = await self.workspace_pod_authority(
+                owner,
+                expected_runtime_incarnation=identity.pod_uid,
+            )
+        if pod_authority == "replacement":
+            return "identity_superseded"
+        if pod_authority == "unknown":
+            return "unknown"
+
+        async def _resource_matches(
+            *,
+            expected_uid: str | None,
+            read: Callable[[], Awaitable[Any]],
+            authenticate: Callable[[Any], str],
+        ) -> str:
+            try:
+                resource = await read()
+            except Exception as exc:
+                return "matched" if getattr(exc, "status", None) == 404 else "unknown"
+            try:
+                observed_uid = authenticate(resource)
+            except WorkspaceRuntimeAuthorityError:
+                return "identity_superseded"
+            if expected_uid is None or observed_uid != expected_uid:
+                return "identity_superseded"
+            return "matched"
+
+        async def _read_pvc() -> Any:
+            return await asyncio.to_thread(
+                self._core_api.read_namespaced_persistent_volume_claim,
+                name=_pvc_name_for(owner),
+                namespace=self._namespace,
+            )
+
+        async def _read_service() -> Any:
+            return await asyncio.to_thread(
+                self._core_api.read_namespaced_service,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+
+        pvc = await _resource_matches(
+            expected_uid=identity.pvc_uid,
+            read=_read_pvc,
+            authenticate=lambda resource: self._require_stateless_pvc_identity(
+                resource,
+                owner=owner,
+                pvc_name=_pvc_name_for(owner),
+                allow_any_storage_class=True,
+            ),
+        )
+        if pvc != "matched":
+            return pvc
+        return await _resource_matches(
+            expected_uid=identity.service_uid,
+            read=_read_service,
+            authenticate=lambda resource: self._require_stateless_service_identity(
+                resource,
+                owner=owner,
+            ),
+        )
+
     async def release_workspace(
         self,
         owner: "WorkspaceOwner",

@@ -19,6 +19,7 @@ from orchestrator.services.lifecycle import (
     WorkspaceInstanceManager,
     expected_workspace_shas,
 )
+from orchestrator.services.container_provisioner import WorkspaceTeardownIdentity
 from services.workspace_lifecycle import WorkspaceOwner
 
 
@@ -31,6 +32,7 @@ def _make_pod(name: str, labels: dict | None = None, phase: str = "Running"):
     pod = MagicMock()
     pod.metadata.name = name
     pod.metadata.labels = labels or {}
+    pod.metadata.uid = "11111111-1111-4111-8111-111111111111"
     pod.status.phase = phase
     return pod
 
@@ -60,7 +62,24 @@ def _make_manager(
     pod_list.items = pods or []
     container._core_api.list_namespaced_pod.return_value = pod_list
     container.delete_workspace = AsyncMock(return_value=True)
+    container.delete_workspace_pvc = AsyncMock(return_value=True)
     container._delete_service = AsyncMock(return_value=True)
+    container.capture_workspace_teardown_identity = AsyncMock(
+        return_value=WorkspaceTeardownIdentity(
+            pod_uid="11111111-1111-4111-8111-111111111111",
+            pvc_uid="22222222-2222-4222-8222-222222222222",
+            service_uid="33333333-3333-4333-8333-333333333333",
+        )
+    )
+    container.capture_terminal_workspace_identity = AsyncMock(
+        return_value=WorkspaceTeardownIdentity(
+            pod_uid="11111111-1111-4111-8111-111111111111",
+            pvc_uid="22222222-2222-4222-8222-222222222222",
+            service_uid="33333333-3333-4333-8333-333333333333",
+            pod_ip="10.0.0.7",
+            ssh_host_key_fingerprint="SHA256:lifecycle-test",
+        )
+    )
 
     suspension = MagicMock()
     suspension.is_enabled = suspension_enabled
@@ -75,7 +94,37 @@ def _make_manager(
     db.get_job = AsyncMock(side_effect=lambda jid: (job_rows or {}).get(jid))
     db.acquire = MagicMock()
     conn = AsyncMock()
-    conn.fetchrow = AsyncMock(side_effect=lambda sql, tid: (thread_rows or {}).get(tid))
+
+    async def _fetchrow(sql, *args):
+        identity = str(args[0]) if args else ""
+        if "UPDATE jobs" in sql and "RETURNING" in sql:
+            return {"id": identity, "context": {}}
+        if "job_completion_sweep_exclusions" in sql:
+            return (
+                {
+                    "command_id": "44444444-4444-4444-8444-444444444444",
+                    "route": "stand_down",
+                }
+                if completion_command_exists
+                else None
+            )
+        if "FROM jobs" in sql and "FOR UPDATE" in sql:
+            row = (job_rows or {}).get(identity)
+            if row is None:
+                return None
+            return {
+                "status": row.get("status"),
+                "execution_lane": row.get("execution_lane") or "pinned",
+                "context": row.get("context") or {},
+                "control_active": completion_control_active,
+            }
+        return (thread_rows or {}).get(identity)
+
+    conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+    tx = AsyncMock()
+    tx.__aenter__ = AsyncMock(return_value=None)
+    tx.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx)
 
     async def _fetchval(sql, *_args):
         if "_completion_control_claim" in sql:
@@ -90,13 +139,17 @@ def _make_manager(
     ctx.__aexit__ = AsyncMock(return_value=False)
     db.acquire.return_value = ctx
 
+    router = MagicMock()
+    router.enqueue_job = AsyncMock()
     mgr = WorkspaceInstanceManager(
         container_provisioner=container,
         suspension_service=suspension,
         snapshot_service=snapshot,
         db=db,
         completion_commands_enabled=completion_commands_enabled,
+        completion_router=router if completion_commands_enabled else None,
     )
+    mgr._test_completion_router = router
     return mgr, container, suspension, snapshot, db
 
 
@@ -630,6 +683,9 @@ class TestCompletionFinalizerTeardownOwnership:
 
         assert "completion_finalization_owned" not in inst.metadata
         assert "completion_control_owned" not in inst.metadata
+        assert "completion_lifecycle_disposition" not in inst.metadata
+        assert "execution_lane" not in inst.metadata
+        assert "pod_uid" not in inst.metadata
         assert await mgr.is_healthy(inst) is False
         assert await mgr.is_reapable(inst) is True
         conn = db.acquire.return_value.__aenter__.return_value
@@ -701,12 +757,14 @@ class TestCompletionFinalizerTeardownOwnership:
         )
         conn = db.acquire.return_value.__aenter__.return_value
 
-        async def _fetchval(sql, *_args):
-            if "job_completion_commands" in sql:
-                raise RuntimeError("completion relation unavailable")
-            return False
+        base_fetchrow = conn.fetchrow.side_effect
 
-        conn.fetchval.side_effect = _fetchval
+        async def _fetchrow(sql, *args):
+            if "job_completion_sweep_exclusions" in sql:
+                raise RuntimeError("completion relation unavailable")
+            return await base_fetchrow(sql, *args)
+
+        conn.fetchrow.side_effect = _fetchrow
 
         with patch(
             "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
@@ -714,7 +772,8 @@ class TestCompletionFinalizerTeardownOwnership:
         ):
             [inst] = await mgr.list_instances()
 
-        assert inst.metadata["completion_finalization_owned"] is True
+        assert inst.metadata["completion_lifecycle_disposition"] == "unknown"
+        assert inst.metadata["completion_lifecycle_deferred"] is True
         assert await mgr.is_reapable(inst) is False
 
     @pytest.mark.asyncio
@@ -729,15 +788,19 @@ class TestCompletionFinalizerTeardownOwnership:
             job_rows={"jdone": job},
             completion_commands_enabled=True,
         )
-        command = {"unfinished": False}
+        command = {"route": None}
         conn = db.acquire.return_value.__aenter__.return_value
+        base_fetchrow = conn.fetchrow.side_effect
 
-        async def _fetchval(sql, *_args):
-            if "job_completion_commands" in sql:
-                return command["unfinished"]
-            return False
+        async def _fetchrow(sql, *args):
+            if "job_completion_sweep_exclusions" in sql and command["route"]:
+                return {
+                    "command_id": "44444444-4444-4444-8444-444444444444",
+                    "route": command["route"],
+                }
+            return await base_fetchrow(sql, *args)
 
-        conn.fetchval.side_effect = _fetchval
+        conn.fetchrow.side_effect = _fetchrow
 
         with patch(
             "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
@@ -746,7 +809,7 @@ class TestCompletionFinalizerTeardownOwnership:
             [inst] = await mgr.list_instances()
         assert inst.metadata["completion_finalization_owned"] is False
 
-        command["unfinished"] = True
+        command["route"] = "resume_finalizer"
         assert await mgr.snapshot(inst) is None
         await mgr.delete(inst, grace_s=0)
         container.create_workspace = AsyncMock(return_value=True)
@@ -765,13 +828,15 @@ class TestCompletionFinalizerTeardownOwnership:
         snapshot.capture_vm_snapshot.assert_not_awaited()
         container.delete_workspace.assert_not_awaited()
         container.create_workspace.assert_not_awaited()
-        command_queries = [
+        route_queries = [
             str(call.args[0])
-            for call in conn.fetchval.await_args_list
-            if "job_completion_commands" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
+            if "job_completion_sweep_exclusions" in str(call.args[0])
         ]
-        assert len(command_queries) == 4  # list + snapshot + delete + give_up
-        assert "'pending', 'finalizing', 'parked'" in command_queries[0]
+        # list + snapshot + delete. give_up's fixture has no jobs row and is
+        # therefore a command-ineligible legacy orphan without a route read.
+        assert len(route_queries) == 3
+        assert mgr._test_completion_router.enqueue_job.await_count == 2
 
 
 class TestCompletionControlLifecycleOwnership:
@@ -809,8 +874,8 @@ class TestCompletionControlLifecycleOwnership:
         conn = db.acquire.return_value.__aenter__.return_value
         [sql] = [
             str(call.args[0])
-            for call in conn.fetchval.await_args_list
-            if "_completion_control_claim" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
+            if "FROM jobs" in str(call.args[0]) and "FOR UPDATE" in str(call.args[0])
         ]
         assert "jsonb_typeof" in sql
         assert "clock_timestamp()" in sql
@@ -819,6 +884,7 @@ class TestCompletionControlLifecycleOwnership:
     @pytest.mark.asyncio
     async def test_action_time_recheck_blocks_snapshot_delete_and_give_up(self):
         mgr, container, _, snapshot, db = _make_manager(
+            job_rows={"j1": {"status": "paused", "context": {}}},
             completion_commands_enabled=True,
             completion_control_active=True,
         )
@@ -845,8 +911,8 @@ class TestCompletionControlLifecycleOwnership:
         conn = db.acquire.return_value.__aenter__.return_value
         marker_queries = [
             call
-            for call in conn.fetchval.await_args_list
-            if "_completion_control_claim" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
+            if "FROM jobs" in str(call.args[0]) and "FOR UPDATE" in str(call.args[0])
         ]
         assert len(marker_queries) == 3
 
@@ -860,20 +926,229 @@ class TestCompletionControlLifecycleOwnership:
         )
         conn = db.acquire.return_value.__aenter__.return_value
 
-        async def _fetchval(sql, *_args):
-            if "_completion_control_claim" in sql:
-                raise RuntimeError("control lookup unavailable")
-            return False
+        base_fetchrow = conn.fetchrow.side_effect
 
-        conn.fetchval.side_effect = _fetchval
+        async def _fetchrow(sql, *args):
+            if "FROM jobs" in sql and "FOR UPDATE" in sql:
+                raise RuntimeError("control lookup unavailable")
+            return await base_fetchrow(sql, *args)
+
+        conn.fetchrow.side_effect = _fetchrow
         with patch(
             "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
             side_effect=_fake_to_thread,
         ):
             [inst] = await mgr.list_instances()
 
-        assert inst.metadata["completion_control_owned"] is True
+        assert inst.metadata["completion_lifecycle_disposition"] == "unknown"
         assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_dirty_flip_requires_terminal_snapshot_attestation(self, monkeypatch):
+        monkeypatch.delenv("WORKSPACE_IMAGE", raising=False)
+        pod = _make_pod("workspace-j1", labels={"srw/job-id": "j1"})
+        mgr, container, _, snapshot, db = _make_manager(
+            pods=[pod],
+            job_rows={
+                "j1": {
+                    "status": "completed",
+                    "execution_lane": "pinned",
+                    "context": {"workspace_container": {"pod_ip": "10.0.0.7"}},
+                }
+            },
+            completion_commands_enabled=True,
+        )
+        mgr.is_dirty = AsyncMock(side_effect=[False, True])
+        mgr.is_reachable = AsyncMock(return_value=True)
+        mgr.reap_orphans = AsyncMock(return_value=0)
+
+        report = await InstanceLifecycleReconciler([mgr]).tick()
+
+        assert report["workspace"]["reaped"] == 0
+        snapshot.capture_vm_snapshot.assert_not_awaited()
+        container.delete_workspace.assert_not_awaited()
+        db.merge_workspace_container_context.assert_not_awaited()
+        container.capture_terminal_workspace_identity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_captured_delete_waits_for_exact_absence_before_follow_on(self):
+        mgr, container, _, _, _ = _make_manager(
+            job_rows={
+                "j1": {
+                    "status": "completed",
+                    "execution_lane": "pinned",
+                    "context": {},
+                }
+            },
+            completion_commands_enabled=True,
+        )
+        container.delete_workspace.return_value = False
+        inst = Instance(
+            kind="workspace",
+            id="workspace-j1",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "completed",
+                "execution_lane": "pinned",
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+                "volume_ephemeral": False,
+            },
+        )
+
+        await mgr.delete(inst, grace_s=0)
+
+        container.delete_workspace.assert_awaited_once_with(
+            WorkspaceOwner.job("j1"),
+            expected_runtime_incarnation="11111111-1111-4111-8111-111111111111",
+            captured_teardown_uid="11111111-1111-4111-8111-111111111111",
+            wait_for_exact_absence=True,
+            exact_absence_timeout_seconds=45.0,
+        )
+        container.delete_workspace_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_lost_term_after_exact_delete_has_no_pvc_or_service_follow_on(self):
+        mgr, container, _, _, db = _make_manager(
+            job_rows={
+                "j1": {
+                    "status": "completed",
+                    "execution_lane": "pinned",
+                    "context": {},
+                }
+            },
+            completion_commands_enabled=True,
+        )
+        calls = 0
+
+        async def _refresh(permit):
+            nonlocal calls
+            calls += 1
+            if calls >= 3:
+                permit.lost.set()
+                return False
+            return True
+
+        mgr._completion_lifecycle.refresh = AsyncMock(side_effect=_refresh)
+        inst = Instance(
+            kind="workspace",
+            id="workspace-j1",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "completed",
+                "execution_lane": "pinned",
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+                "volume_ephemeral": False,
+            },
+        )
+
+        await mgr.delete(inst, grace_s=0)
+
+        container.delete_workspace.assert_awaited_once()
+        container.delete_workspace_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
+        conn = db.acquire.return_value.__aenter__.return_value
+        assert not any(
+            "- '_completion_control_claim'" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failed_resource", ["pvc", "service"])
+    async def test_ambiguous_residual_delete_retains_lifecycle_claim(
+        self, failed_resource
+    ):
+        mgr, container, _, _, db = _make_manager(
+            job_rows={
+                "j1": {
+                    "status": "completed",
+                    "execution_lane": "pinned",
+                    "context": {},
+                }
+            },
+            completion_commands_enabled=True,
+        )
+        container.delete_workspace_pvc.return_value = failed_resource != "pvc"
+        container._delete_service.return_value = failed_resource != "service"
+        inst = Instance(
+            kind="workspace",
+            id="workspace-j1",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "completed",
+                "execution_lane": "pinned",
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+                "volume_ephemeral": False,
+            },
+        )
+
+        await mgr.delete(inst, grace_s=0)
+
+        container.delete_workspace.assert_awaited_once()
+        container.delete_workspace_pvc.assert_awaited_once_with(
+            WorkspaceOwner.job("j1"),
+            require_exact_owner=True,
+            expected_uid="22222222-2222-4222-8222-222222222222",
+        )
+        if failed_resource == "pvc":
+            container._delete_service.assert_not_awaited()
+        else:
+            container._delete_service.assert_awaited_once_with(
+                WorkspaceOwner.job("j1"),
+                require_exact_owner=True,
+                expected_uid="33333333-3333-4333-8333-333333333333",
+            )
+        conn = db.acquire.return_value.__aenter__.return_value
+        assert not any(
+            "- '_completion_control_claim'" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_captured_absent_residuals_are_not_name_deleted(self):
+        mgr, container, _, _, db = _make_manager(
+            job_rows={
+                "j1": {
+                    "status": "completed",
+                    "execution_lane": "pinned",
+                    "context": {},
+                }
+            },
+            completion_commands_enabled=True,
+        )
+        container.capture_workspace_teardown_identity.return_value = (
+            WorkspaceTeardownIdentity(
+                pod_uid="11111111-1111-4111-8111-111111111111",
+                pvc_uid=None,
+                service_uid=None,
+            )
+        )
+        inst = Instance(
+            kind="workspace",
+            id="workspace-j1",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "completed",
+                "execution_lane": "pinned",
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+                "volume_ephemeral": False,
+            },
+        )
+
+        await mgr.delete(inst, grace_s=0)
+
+        container.delete_workspace.assert_awaited_once()
+        container.delete_workspace_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
+        conn = db.acquire.return_value.__aenter__.return_value
+        assert any(
+            "- '_completion_control_claim'" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
+        )
 
 
 # =============================================================================
@@ -1816,19 +2091,24 @@ class TestReapOrphans:
     async def test_completion_owner_blocks_orphan_pvc_then_done_allows_reap(self):
         mgr, container, _, _, db = _make_manager(
             pods=[],
+            job_rows={"jdone": {"status": "completed", "context": {}}},
             thread_rows={"jdone": {"status": "completed"}},
             completion_commands_enabled=True,
         )
         self._wire_pvcs(container, [_make_pvc("pvc-workspace-jdone", "jdone")])
-        command = {"unfinished": True}
+        command = {"route": "stand_down"}
         conn = db.acquire.return_value.__aenter__.return_value
+        base_fetchrow = conn.fetchrow.side_effect
 
-        async def _fetchval(sql, *_args):
-            if "job_completion_commands" in sql:
-                return command["unfinished"]
-            return False
+        async def _fetchrow(sql, *args):
+            if "job_completion_sweep_exclusions" in sql and command["route"]:
+                return {
+                    "command_id": "44444444-4444-4444-8444-444444444444",
+                    "route": command["route"],
+                }
+            return await base_fetchrow(sql, *args)
 
-        conn.fetchval.side_effect = _fetchval
+        conn.fetchrow.side_effect = _fetchrow
 
         with patch(
             "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
@@ -1838,23 +2118,38 @@ class TestReapOrphans:
         container._delete_pvc.assert_not_awaited()
         container._delete_service.assert_not_awaited()
 
-        command["unfinished"] = False
+        command["route"] = None
+        # Model the successful jobs-row marker write/clear used by the second
+        # pass; the first pass stands down before reaching either statement.
+        routed_fetchrow = conn.fetchrow.side_effect
+
+        async def _claiming_fetchrow(sql, *args):
+            if "UPDATE jobs" in sql and "RETURNING" in sql:
+                return {"id": args[0], "context": {}}
+            return await routed_fetchrow(sql, *args)
+
+        conn.fetchrow.side_effect = _claiming_fetchrow
         with patch(
             "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
             side_effect=_fake_to_thread,
         ):
             assert await mgr.reap_orphans() == 1
         container._delete_pvc.assert_awaited_once_with(
-            "pvc-workspace-jdone", expected_owner=WorkspaceOwner.job("jdone")
+            "pvc-workspace-jdone",
+            expected_owner=WorkspaceOwner.job("jdone"),
+            expected_uid="22222222-2222-4222-8222-222222222222",
         )
         container._delete_service.assert_awaited_once_with(
-            WorkspaceOwner.job("jdone"), require_exact_owner=True
+            WorkspaceOwner.job("jdone"),
+            require_exact_owner=True,
+            expected_uid="33333333-3333-4333-8333-333333333333",
         )
 
     @pytest.mark.asyncio
     async def test_control_marker_blocks_orphan_pvc_destructive_recheck(self):
         mgr, container, _, _, db = _make_manager(
             pods=[],
+            job_rows={"jdone": {"status": "completed", "context": {}}},
             thread_rows={"jdone": {"status": "completed"}},
             completion_commands_enabled=True,
             completion_control_active=True,
@@ -1871,8 +2166,8 @@ class TestReapOrphans:
         container._delete_service.assert_not_awaited()
         conn = db.acquire.return_value.__aenter__.return_value
         assert any(
-            "_completion_control_claim" in str(call.args[0])
-            for call in conn.fetchval.await_args_list
+            "FROM jobs" in str(call.args[0]) and "FOR UPDATE" in str(call.args[0])
+            for call in conn.fetchrow.await_args_list
         )
 
     @pytest.mark.asyncio

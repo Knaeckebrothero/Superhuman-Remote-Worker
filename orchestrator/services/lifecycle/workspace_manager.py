@@ -21,12 +21,18 @@ import logging
 import os
 import socket
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
-
-from database.postgres import _completion_control_active_sql
+from typing import Any, AsyncIterator
 
 from .types import Instance
+from services.container_provisioner import WorkspaceTeardownIdentity
+from services.completion_lifecycle import (
+    CompletionLifecycleOwnership,
+    LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS,
+    LifecycleActionPermit,
+    LifecycleRouteDecision,
+)
 from services.workspace_lifecycle import WorkspaceOwner
 
 logger = logging.getLogger(__name__)
@@ -276,6 +282,7 @@ class WorkspaceInstanceManager:
         label_selector: str = _LABEL_SELECTOR,
         *,
         completion_commands_enabled: bool = False,
+        completion_router: Any | None = None,
     ):
         # Loose typing matches the agent manager — production passes the
         # singleton modules; tests pass mocks. Only the methods used here
@@ -285,18 +292,23 @@ class WorkspaceInstanceManager:
         self._snapshot = snapshot_service
         self._db = db
         self._label_selector = label_selector
-        # Gate-3 step 3 owns terminal workspace teardown while a durable
-        # completion command is unfinished.  This is deliberately constructor-
-        # gated (rather than reading the environment here) so flag-off callers
-        # preserve the exact legacy path, including zero reads of the new
-        # relations.  Step 4's routed lifecycle sweep will eventually replace
-        # this conservative ownership veto.
+        # Constructor-gated so flag-off callers preserve the exact legacy path,
+        # including zero reads of Gate-3 relations and zero reserved metadata.
         self._completion_commands_enabled = completion_commands_enabled
+        self._completion_lifecycle = (
+            CompletionLifecycleOwnership(db, completion_router)
+            if completion_commands_enabled and completion_router is not None
+            else None
+        )
         # Reachability probe cache: pod_ip -> (probed_at, ok). Single
         # orchestrator process, so a plain dict is sufficient.
         self._reach_cache: dict[str, tuple[float, bool]] = {}
         self._reach_ttl_s: float = 30.0
         self._clock = time.monotonic
+
+    @property
+    def completion_lifecycle_ownership_enabled(self) -> bool:
+        return self._completion_lifecycle is not None
 
     # -------------------------------------------------------------------------
     # Protocol implementation
@@ -325,6 +337,10 @@ class WorkspaceInstanceManager:
                 "volume_ephemeral": _pod_volume_is_ephemeral(pod),
                 "pod_age_s": _pod_age_seconds(pod),
             }
+            if self._completion_lifecycle is not None:
+                pod_uid = getattr(pod.metadata, "uid", None)
+                if isinstance(pod_uid, str) and pod_uid:
+                    metadata["pod_uid"] = pod_uid
             if thread_id:
                 row = await self._fetch_thread(thread_id)
                 if row is _FETCH_FAILED:
@@ -350,10 +366,6 @@ class WorkspaceInstanceManager:
                     metadata["snapshot_status"] = snap.get("status")
             elif job_id:
                 row = await self._fetch_job(job_id)
-                if self._completion_commands_enabled:
-                    metadata[
-                        "completion_control_owned"
-                    ] = await self._completion_control_owns_workspace(job_id)
                 if row is _FETCH_FAILED:
                     pass  # unknown state — leave metadata bare, never reap
                 elif row is None:
@@ -373,10 +385,30 @@ class WorkspaceInstanceManager:
                     metadata["snapshot_attempts"] = ws_ctx.get("snapshot_attempts") or 0
                     snap = ctx.get("snapshot") or {}
                     metadata["snapshot_status"] = snap.get("status")
-                    if self._completion_commands_enabled:
-                        metadata[
-                            "completion_finalization_owned"
-                        ] = await self._completion_finalization_owns_workspace(job_id)
+                    if self._completion_lifecycle is not None:
+                        metadata["execution_lane"] = (
+                            row.get("execution_lane") or "pinned"
+                        )
+                        decision = await self._completion_lifecycle.classify(
+                            job_id, source="lifecycle_workspace_list"
+                        )
+                        metadata["completion_lifecycle_disposition"] = (
+                            decision.disposition
+                        )
+                        metadata["completion_lifecycle_route"] = decision.route
+                        metadata["completion_lifecycle_command_id"] = (
+                            decision.command_id
+                        )
+                        metadata["completion_lifecycle_deferred"] = decision.deferred
+                        # Compatibility telemetry during the routed-veto
+                        # migration. This is observational only; action-time
+                        # ownership comes from the durable claim/router above.
+                        metadata["completion_finalization_owned"] = (
+                            decision.command_id is not None
+                        )
+                        metadata["completion_control_owned"] = (
+                            decision.reason == "active_control_claim"
+                        )
                     # Only a reapable-status parent can be torn down, so only
                     # then does the live-child guard matter — skip the query
                     # otherwise. Keys the guard on the real dependency (a critic
@@ -405,15 +437,10 @@ class WorkspaceInstanceManager:
             # stateless session workspace.  In particular, a Failed pod must
             # not take the reconciler's immediate unhealthy-delete shortcut.
             return True
-        if inst.metadata.get("completion_finalization_owned"):
-            # The durable S36 effect, not the unhealthy shortcut, owns this
-            # exact workspace while the command remains unfinished.
-            return True
-        if inst.metadata.get("completion_control_owned"):
-            # A human control has fenced the agent and may be between its DB
-            # transition and external workspace I/O.  Keep every lifecycle
-            # shortcut off the same physical resource until that bounded claim
-            # expires (malformed markers stay fail-closed).
+        if inst.metadata.get("completion_lifecycle_deferred"):
+            # Live commands stand down; expired/parked commands have already
+            # been nudged into the shared durable router.  Neither path may use
+            # the generic unhealthy-delete shortcut.
             return True
         # Phase 2a: phase Running is the cheap signal. Phase 2b adds a
         # crash detector that catches Unknown/Failed pods explicitly.
@@ -429,9 +456,7 @@ class WorkspaceInstanceManager:
         """
         if _is_stateless_thread_instance(inst):
             return False
-        if inst.metadata.get("completion_finalization_owned"):
-            return False
-        if inst.metadata.get("completion_control_owned"):
+        if inst.metadata.get("completion_lifecycle_deferred"):
             return False
         if inst.metadata.get("has_live_shared_child"):
             return False
@@ -471,9 +496,7 @@ class WorkspaceInstanceManager:
         """
         if _is_stateless_thread_instance(inst):
             return False
-        if inst.metadata.get("completion_finalization_owned"):
-            return False
-        if inst.metadata.get("completion_control_owned"):
+        if inst.metadata.get("completion_lifecycle_deferred"):
             return False
         if inst.metadata.get("has_live_shared_child"):
             return False
@@ -637,6 +660,143 @@ class WorkspaceInstanceManager:
     async def attempts_exhausted(self, inst: Instance) -> bool:
         return (inst.metadata.get("snapshot_attempts") or 0) >= self._max_attempts()
 
+    @staticmethod
+    def _legacy_permit(inst: Instance) -> LifecycleActionPermit:
+        return LifecycleActionPermit(
+            LifecycleRouteDecision(
+                job_id=str(inst.bound_to or inst.id),
+                disposition="legacy",
+            )
+        )
+
+    @asynccontextmanager
+    async def lifecycle_action(
+        self,
+        inst: Instance,
+        *,
+        source: str,
+    ) -> AsyncIterator[LifecycleActionPermit]:
+        """Hold one command/control-visible claim across snapshot -> delete."""
+
+        existing = inst.metadata.get("_completion_lifecycle_permit")
+        if isinstance(existing, LifecycleActionPermit):
+            yield existing
+            return
+
+        labels = inst.metadata.get("labels") or {}
+        job_bound = (
+            "srw/thread-id" not in labels
+            and inst.metadata.get("thread_status") is None
+            and bool(inst.bound_to)
+        )
+        if self._completion_lifecycle is None or not job_bound:
+            permit = self._legacy_permit(inst)
+            inst.metadata["_completion_lifecycle_permit"] = permit
+            try:
+                yield permit
+            finally:
+                inst.metadata.pop("_completion_lifecycle_permit", None)
+            return
+
+        expected_status = str(
+            inst.metadata.get("job_status")
+            or ("missing" if inst.metadata.get("bound_row_missing") else "unknown")
+        )
+        expected_lane = str(inst.metadata.get("execution_lane") or "pinned")
+        async with self._completion_lifecycle.action(
+            str(inst.bound_to),
+            source=f"lifecycle_workspace_{source}"[:64],
+            resource_kind="workspace",
+            resource_identity=str(inst.metadata.get("pod_uid") or inst.id),
+            expected_status=expected_status,
+            expected_lane=expected_lane,
+        ) as permit:
+            inst.metadata["_completion_lifecycle_permit"] = permit
+            try:
+                if permit.local and self._provisioner_ready():
+                    if not await self._permit_external(permit):
+                        yield permit
+                        return
+                    owner = WorkspaceOwner.job(str(inst.bound_to))
+                    # Every destructive route first captures the UID-only
+                    # teardown identity.  Requiring SSH attestation here would
+                    # strand clean or unreachable terminal Pods behind a long
+                    # lifecycle lease even though those routes never snapshot.
+                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                        identity = (
+                            await self._provisioner.capture_workspace_teardown_identity(
+                                owner
+                            )
+                        )
+                    needs_snapshot_authority = bool(
+                        source in {"reap", "snapshot"}
+                        and inst.metadata.get("pod_ip")
+                        and self._snapshot is not None
+                        and getattr(self._snapshot, "is_available", False)
+                        and await self.is_dirty(inst)
+                        and await self.is_reachable(inst)
+                    )
+                    if needs_snapshot_authority:
+                        if not await self._permit_external(permit):
+                            yield permit
+                            return
+                        async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                            terminal_identity = await self._provisioner.capture_terminal_workspace_identity(
+                                owner
+                            )
+                        # The attestation upgrade must describe the same
+                        # immutable objects captured before the reachability
+                        # probe.  A same-name replacement is never adopted.
+                        if (
+                            terminal_identity.pod_uid != identity.pod_uid
+                            or terminal_identity.pvc_uid != identity.pvc_uid
+                            or terminal_identity.service_uid != identity.service_uid
+                        ):
+                            permit.skip("workspace_identity_changed", settled=True)
+                            yield permit
+                            return
+                        identity = terminal_identity
+                    listed_uid = inst.metadata.get("pod_uid")
+                    listed_pod_ip = inst.metadata.get("pod_ip")
+                    if (listed_uid is not None and identity.pod_uid != listed_uid) or (
+                        listed_pod_ip is not None
+                        and identity.pod_ip is not None
+                        and identity.pod_ip != listed_pod_ip
+                    ):
+                        # The object listed by this tick is already gone.  A
+                        # same-name replacement is not lifecycle's target.
+                        permit.skip("workspace_identity_changed", settled=True)
+                    elif (
+                        identity.pod_uid is None
+                        and source != "orphan_pvc"
+                        and not inst.metadata.get("bound_row_missing")
+                    ):
+                        permit.skip("workspace_identity_absent", settled=True)
+                    elif source == "orphan_pvc" and identity.pvc_uid is None:
+                        permit.skip("workspace_pvc_identity_unknown")
+                    else:
+                        inst.metadata["_completion_lifecycle_workspace_identity"] = (
+                            identity
+                        )
+                yield permit
+            finally:
+                inst.metadata.pop("_completion_lifecycle_permit", None)
+                inst.metadata.pop("_completion_lifecycle_workspace_identity", None)
+
+    @asynccontextmanager
+    async def _action_scope(
+        self,
+        inst: Instance,
+        *,
+        source: str,
+    ) -> AsyncIterator[tuple[LifecycleActionPermit, bool]]:
+        existing = inst.metadata.get("_completion_lifecycle_permit")
+        if isinstance(existing, LifecycleActionPermit):
+            yield existing, False
+            return
+        async with self.lifecycle_action(inst, source=source) as permit:
+            yield permit, True
+
     async def record_attempt(self, inst: Instance) -> None:
         """Persist an incremented snapshot-attempt counter to the bound row."""
         if _is_stateless_thread_instance(inst):
@@ -647,6 +807,11 @@ class WorkspaceInstanceManager:
         if not bound:
             return
         nxt = (inst.metadata.get("snapshot_attempts") or 0) + 1
+        permit = inst.metadata.get("_completion_lifecycle_permit")
+        if isinstance(
+            permit, LifecycleActionPermit
+        ) and not await self._permit_external(permit):
+            return
         labels = inst.metadata.get("labels") or {}
         try:
             if "srw/thread-id" in labels:
@@ -659,6 +824,9 @@ class WorkspaceInstanceManager:
                 )
         except Exception:
             logger.exception("Failed to record snapshot attempt for %s", inst.id)
+            return
+        if isinstance(permit, LifecycleActionPermit):
+            permit.complete()
 
     async def give_up(self, inst: Instance, grace_s: int) -> None:
         """Escape hatch: dirty + unreachable + attempts exhausted.
@@ -676,29 +844,58 @@ class WorkspaceInstanceManager:
         question is "does anyone still need a running pod", not "may the volume
         die". Branch (a): see workspace_pvc_branch_a_implementation.md.
         """
-        if _is_stateless_thread_instance(inst):
+        if self._completion_lifecycle is None:
+            if _is_stateless_thread_instance(inst):
+                return
+            bound = inst.bound_to
+            if not bound:
+                return
+            labels = inst.metadata.get("labels") or {}
+            owner = (
+                WorkspaceOwner.session(bound)
+                if "srw/thread-id" in labels
+                else WorkspaceOwner.job(bound)
+            )
+            await self.delete(inst, grace_s)
+            if not self._is_terminal(inst) and not inst.metadata.get(
+                "volume_ephemeral", True
+            ):
+                try:
+                    await self._provisioner.create_workspace(owner)
+                except Exception:
+                    logger.exception("PVC give_up recreate failed for %s", inst.id)
             return
-        if await self._completion_control_owns_instance(inst):
-            return
-        if await self._completion_finalization_owns_instance(inst):
-            return
-        bound = inst.bound_to
-        if not bound:
-            return
-        labels = inst.metadata.get("labels") or {}
-        owner = (
-            WorkspaceOwner.session(bound)
-            if "srw/thread-id" in labels
-            else WorkspaceOwner.job(bound)
-        )
-        await self.delete(inst, grace_s)
-        if not self._is_terminal(inst) and not inst.metadata.get(
-            "volume_ephemeral", True
-        ):
-            try:
-                await self._provisioner.create_workspace(owner)
-            except Exception:
-                logger.exception("PVC give_up recreate failed for %s", inst.id)
+
+        async with self._action_scope(inst, source="give_up") as (permit, _owns):
+            if not permit.local or _is_stateless_thread_instance(inst):
+                return
+            bound = inst.bound_to
+            if not bound:
+                return
+            labels = inst.metadata.get("labels") or {}
+            owner = (
+                WorkspaceOwner.session(bound)
+                if "srw/thread-id" in labels
+                else WorkspaceOwner.job(bound)
+            )
+            if not await self._permit_external(permit):
+                return
+            if not await self._delete_owned(inst, grace_s):
+                return
+            if not self._is_terminal(inst) and not inst.metadata.get(
+                "volume_ephemeral", True
+            ):
+                if not await self._permit_external(permit):
+                    return
+                try:
+                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                        await self._provisioner.create_workspace(owner)
+                    if not await self._permit_external(permit):
+                        return
+                except Exception:
+                    logger.exception("PVC give_up recreate failed for %s", inst.id)
+                    return
+            permit.complete()
 
     async def snapshot(self, inst: Instance) -> str | None:
         """Capture the workspace contents to S3.
@@ -707,19 +904,20 @@ class WorkspaceInstanceManager:
         SnapshotService keys by job/thread id), or ``None`` if the
         snapshot path isn't usable for this instance.
         """
+        if self._completion_lifecycle is None:
+            return await self._snapshot_owned(inst)
+        async with self._action_scope(inst, source="snapshot") as (permit, owns):
+            if not permit.local:
+                return None
+            result = await self._snapshot_owned(inst)
+            if owns and result is not None:
+                permit.complete()
+            return result
+
+    async def _snapshot_owned(self, inst: Instance) -> str | None:
+        """Snapshot with lifecycle/command ownership already decided."""
+
         if _is_stateless_thread_instance(inst):
-            return None
-        if await self._completion_control_owns_instance(inst):
-            logger.info(
-                "Lifecycle snapshot deferred to active control for job %s",
-                inst.bound_to,
-            )
-            return None
-        if await self._completion_finalization_owns_instance(inst):
-            logger.info(
-                "Lifecycle snapshot deferred to completion finalizer for job %s",
-                inst.bound_to,
-            )
             return None
         if self._snapshot is None or not getattr(self._snapshot, "is_available", False):
             return None
@@ -729,19 +927,49 @@ class WorkspaceInstanceManager:
         bound = inst.bound_to
         if not bound:
             return None
-        try:
-            ok = await self._snapshot.capture_vm_snapshot(
-                job_id=bound,
-                ssh_host=ssh_host,
-                ssh_port=30022,
-                source_type="pod",
-                entity_type=(
-                    "threads"
-                    if "srw/thread-id" in (inst.metadata.get("labels") or {})
-                    else "jobs"
-                ),
-                work_marker=inst.metadata.get("total_turns"),
+        permit = inst.metadata.get("_completion_lifecycle_permit")
+        identity = inst.metadata.get("_completion_lifecycle_workspace_identity")
+        if (
+            self._completion_lifecycle is not None
+            and isinstance(permit, LifecycleActionPermit)
+            and permit.claim is not None
+            and (
+                not isinstance(identity, WorkspaceTeardownIdentity)
+                or not identity.pod_ip
+                or not identity.ssh_host_key_fingerprint
             )
+        ):
+            permit.skip("snapshot_identity_unattested", settled=True)
+            return None
+        if isinstance(
+            permit, LifecycleActionPermit
+        ) and not await self._permit_external(permit):
+            return None
+        try:
+            async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                ok = await self._snapshot.capture_vm_snapshot(
+                    job_id=bound,
+                    ssh_host=(identity.pod_ip if identity is not None else ssh_host),
+                    ssh_port=(identity.ssh_port if identity is not None else 30022),
+                    source_type="pod",
+                    entity_type=(
+                        "threads"
+                        if "srw/thread-id" in (inst.metadata.get("labels") or {})
+                        else "jobs"
+                    ),
+                    work_marker=inst.metadata.get("total_turns"),
+                    **(
+                        {
+                            "expected_host_key_fingerprint": (
+                                identity.ssh_host_key_fingerprint
+                            ),
+                            "expected_runtime_incarnation": identity.pod_uid,
+                        }
+                        if identity is not None
+                        and identity.ssh_host_key_fingerprint is not None
+                        else {}
+                    ),
+                )
             if ok:
                 # Mark the in-memory instance too — the reconciler calls
                 # delete() right after a successful snapshot(), and delete()
@@ -750,6 +978,10 @@ class WorkspaceInstanceManager:
                 # Success clears the escape-hatch retry counter.
                 labels = inst.metadata.get("labels") or {}
                 try:
+                    if isinstance(
+                        permit, LifecycleActionPermit
+                    ) and not await self._permit_external(permit):
+                        return None
                     if "srw/thread-id" in labels:
                         await self._db.merge_thread_workspace_context(
                             bound, {"snapshot_attempts": 0}
@@ -760,6 +992,10 @@ class WorkspaceInstanceManager:
                         )
                 except Exception:
                     logger.exception("Failed to reset attempts for %s", inst.id)
+                if isinstance(
+                    permit, LifecycleActionPermit
+                ) and not await self._permit_external(permit):
+                    return None
                 return bound
             return None
         except Exception:
@@ -805,37 +1041,60 @@ class WorkspaceInstanceManager:
         await self.delete(inst, grace_s)
 
     async def delete(self, inst: Instance, grace_s: int) -> None:
+        if self._completion_lifecycle is None:
+            await self._delete_owned(inst, grace_s)
+            return
+        async with self._action_scope(inst, source="delete") as (permit, _owns):
+            if not permit.local:
+                return
+            if await self._delete_owned(inst, grace_s):
+                permit.complete()
+
+    async def _delete_owned(self, inst: Instance, grace_s: int) -> bool:
+        """Delete only the identity captured inside the lifecycle claim."""
+
         if _is_stateless_thread_instance(inst):
-            return
-        if await self._completion_control_owns_instance(inst):
-            logger.info(
-                "Lifecycle teardown deferred to active control for job %s",
-                inst.bound_to,
-            )
-            return
-        if await self._completion_finalization_owns_instance(inst):
-            logger.info(
-                "Lifecycle teardown deferred to completion finalizer for job %s",
-                inst.bound_to,
-            )
-            return
+            return False
         if not self._provisioner_ready():
-            return
+            return False
         bound = inst.bound_to
         if not bound:
             logger.debug("delete skipped: no bound job/thread for %s", inst.id)
-            return
+            return False
         labels = inst.metadata.get("labels") or {}
         owner = (
             WorkspaceOwner.session(bound)
             if "srw/thread-id" in labels
             else WorkspaceOwner.job(bound)
         )
+        identity = inst.metadata.get("_completion_lifecycle_workspace_identity")
+        delete_kwargs: dict[str, Any] = {}
+        if identity is not None and identity.pod_uid is not None:
+            delete_kwargs = {
+                "expected_runtime_incarnation": identity.pod_uid,
+                "captured_teardown_uid": identity.pod_uid,
+                "wait_for_exact_absence": True,
+                "exact_absence_timeout_seconds": 45.0,
+            }
+        permit = inst.metadata.get("_completion_lifecycle_permit")
+        if isinstance(
+            permit, LifecycleActionPermit
+        ) and not await self._permit_external(permit):
+            return False
         try:
-            await self._provisioner.delete_workspace(owner)
+            async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                deleted = await self._provisioner.delete_workspace(
+                    owner, **delete_kwargs
+                )
+            if isinstance(
+                permit, LifecycleActionPermit
+            ) and not await self._permit_external(permit):
+                return False
         except Exception:
             logger.exception("Failed to delete workspace pod %s", inst.id)
-            return
+            return False
+        if not deleted and self._completion_lifecycle is not None:
+            return False
         # Reap-and-restore handoff: a NON-terminal emptyDir workspace whose
         # state was captured to S3 is 'suspended', not 'deleted' — the next
         # dispatch then routes through the suspension restore
@@ -855,6 +1114,10 @@ class WorkspaceInstanceManager:
             and inst.metadata.get("volume_ephemeral", True)
             and inst.metadata.get("snapshot_status") == "available"
         ):
+            if isinstance(
+                permit, LifecycleActionPermit
+            ) and not await self._permit_external(permit):
+                return False
             try:
                 if "srw/thread-id" in labels:
                     await self._db.merge_thread_workspace_context(
@@ -871,6 +1134,10 @@ class WorkspaceInstanceManager:
                 )
             except Exception:
                 logger.exception("Failed to mark %s suspended after reap", inst.id)
+            if isinstance(
+                permit, LifecycleActionPermit
+            ) and not await self._permit_external(permit):
+                return False
         # PVC GC (Branch a leak guard): a PVC-backed workspace keeps its volume
         # across pod recreates (suspend/restore, drift recovery, give_up
         # reattach), so we reclaim it ONLY when the volume itself is garbage:
@@ -887,11 +1154,30 @@ class WorkspaceInstanceManager:
         if self._is_volume_reclaimable(inst) and not inst.metadata.get(
             "volume_ephemeral", True
         ):
+            if isinstance(
+                permit, LifecycleActionPermit
+            ) and not await self._permit_external(permit):
+                return False
             try:
-                await self._provisioner.delete_workspace_pvc(
-                    owner,
-                    require_exact_owner=True,
-                )
+                if self._completion_lifecycle is not None and (
+                    identity is None or identity.pvc_uid is None
+                ):
+                    # A missing UID in the captured tuple is authenticated
+                    # absence. Never turn a later same-name PVC into our target.
+                    pvc_deleted = identity is not None
+                else:
+                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                        pvc_deleted = await self._provisioner.delete_workspace_pvc(
+                            owner,
+                            require_exact_owner=True,
+                            **(
+                                {"expected_uid": identity.pvc_uid}
+                                if identity is not None and identity.pvc_uid is not None
+                                else {}
+                            ),
+                        )
+                if self._completion_lifecycle is not None and not pvc_deleted:
+                    return False
                 logger.info(
                     "Workspace PVC reclaimed for %s %s (work is gone, not merely idle)",
                     owner.kind,
@@ -899,18 +1185,52 @@ class WorkspaceInstanceManager:
                 )
             except Exception:
                 logger.exception("Failed to delete reclaimable PVC for %s", inst.id)
+                if self._completion_lifecycle is not None:
+                    return False
             # The stable-DNS Service shares the PVC's lifecycle — reclaim it too.
             # It follows the volume, not the pod: an idle-reaped session keeps
             # both (a resume reattaches the claim and the Service already points
             # at the recreated pod), and recreating a Service is a 409-idempotent
             # no-op anyway, so keeping one costs nothing.
+            if isinstance(
+                permit, LifecycleActionPermit
+            ) and not await self._permit_external(permit):
+                return False
             try:
-                await self._provisioner._delete_service(
-                    owner,
-                    require_exact_owner=True,
-                )
+                if self._completion_lifecycle is not None and (
+                    identity is None or identity.service_uid is None
+                ):
+                    service_deleted = identity is not None
+                else:
+                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                        service_deleted = await self._provisioner._delete_service(
+                            owner,
+                            require_exact_owner=True,
+                            **(
+                                {"expected_uid": identity.service_uid}
+                                if identity is not None
+                                and identity.service_uid is not None
+                                else {}
+                            ),
+                        )
+                if self._completion_lifecycle is not None and not service_deleted:
+                    return False
+                if isinstance(
+                    permit, LifecycleActionPermit
+                ) and not await self._permit_external(permit):
+                    return False
             except Exception:
                 logger.exception("Failed to delete reclaimable Service for %s", inst.id)
+                if self._completion_lifecycle is not None:
+                    return False
+        return True
+
+    async def _permit_external(self, permit: LifecycleActionPermit) -> bool:
+        if not permit.local:
+            return False
+        if self._completion_lifecycle is None or permit.claim is None:
+            return True
+        return await self._completion_lifecycle.refresh(permit)
 
     async def reap_orphans(self) -> int:
         """Backstop GC: delete workspace PVCs whose owning work is gone.
@@ -1055,9 +1375,17 @@ class WorkspaceInstanceManager:
             # genuinely gone (reap); query raised → unknown (skip).
             try:
                 async with self._db.acquire() as conn:
-                    row = await conn.fetchrow(
-                        "SELECT status FROM jobs WHERE id = $1::uuid", job_id
-                    )
+                    if self._completion_lifecycle is None:
+                        row = await conn.fetchrow(
+                            "SELECT status FROM jobs WHERE id = $1::uuid",
+                            job_id,
+                        )
+                    else:
+                        row = await conn.fetchrow(
+                            "SELECT status, execution_lane FROM jobs "
+                            "WHERE id = $1::uuid",
+                            job_id,
+                        )
             except Exception:
                 logger.exception(
                     "Orphan PVC sweep: job lookup failed for %s — skipping", job_id
@@ -1066,36 +1394,93 @@ class WorkspaceInstanceManager:
             status = row["status"] if row else None
             if row is not None and status not in _TERMINAL_JOB_STATUSES:
                 continue  # job still active → keep its volume
-            # Recheck immediately before destructive orphan cleanup.  The live
-            # Pod path has the same action-time guard in delete(); PVC-only
-            # remnants never pass through that method.
-            if await self._completion_control_owns_workspace(job_id):
-                continue
-            if await self._completion_finalization_owns_workspace(job_id):
-                continue
-            try:
-                if await self._provisioner._delete_pvc(
-                    name,
-                    expected_owner=WorkspaceOwner.job(job_id),
-                ):
-                    reaped += 1
-                    logger.info(
-                        "Orphan workspace PVC reaped: %s (job=%s status=%s)",
+            if self._completion_lifecycle is None:
+                try:
+                    if await self._provisioner._delete_pvc(
                         name,
-                        job_id,
-                        status or "gone",
+                        expected_owner=WorkspaceOwner.job(job_id),
+                    ):
+                        reaped += 1
+                        logger.info(
+                            "Orphan workspace PVC reaped: %s (job=%s status=%s)",
+                            name,
+                            job_id,
+                            status or "gone",
+                        )
+                except Exception:
+                    logger.exception("Orphan PVC delete failed: %s", name)
+                try:
+                    await self._provisioner._delete_service(
+                        WorkspaceOwner.job(job_id),
+                        require_exact_owner=True,
                     )
-            except Exception:
-                logger.exception("Orphan PVC delete failed: %s", name)
-            # Reclaim the stable-DNS Service for the same orphan (shares the PVC
-            # lifecycle). The Service name == the workspace pod name.
-            try:
-                await self._provisioner._delete_service(
-                    WorkspaceOwner.job(job_id),
-                    require_exact_owner=True,
+                except Exception:
+                    logger.exception("Orphan Service delete failed for job %s", job_id)
+                continue
+            orphan_inst = Instance(
+                kind=self.kind,
+                id=name,
+                bound_to=job_id,
+                metadata={
+                    "labels": {"srw/job-id": job_id},
+                    "bound_row_missing": row is None,
+                    "job_status": str(status) if status is not None else None,
+                    "execution_lane": (
+                        str(row.get("execution_lane") or "pinned")
+                        if row is not None
+                        else "pinned"
+                    ),
+                },
+            )
+            async with self.lifecycle_action(
+                orphan_inst, source="orphan_pvc"
+            ) as permit:
+                if not permit.local:
+                    continue
+                identity = orphan_inst.metadata.get(
+                    "_completion_lifecycle_workspace_identity"
                 )
-            except Exception:
-                logger.exception("Orphan Service delete failed for job %s", job_id)
+                if not await self._permit_external(permit):
+                    continue
+                try:
+                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                        pvc_deleted = await self._provisioner._delete_pvc(
+                            name,
+                            expected_owner=WorkspaceOwner.job(job_id),
+                            expected_uid=identity.pvc_uid,
+                        )
+                except Exception:
+                    logger.exception("Orphan PVC delete failed: %s", name)
+                    continue
+                if not pvc_deleted or not await self._permit_external(permit):
+                    continue
+                # Reclaim the stable-DNS Service for the same orphan (shares the
+                # PVC lifecycle). Identity is captured under the same claim.
+                try:
+                    if identity.service_uid is None:
+                        service_deleted = True
+                    else:
+                        async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                            service_deleted = await self._provisioner._delete_service(
+                                WorkspaceOwner.job(job_id),
+                                require_exact_owner=True,
+                                expected_uid=identity.service_uid,
+                            )
+                        if not await self._permit_external(permit):
+                            continue
+                except Exception:
+                    logger.exception("Orphan Service delete failed for job %s", job_id)
+                    continue
+                if not service_deleted:
+                    continue
+                permit.complete()
+                reaped += 1
+                logger.info(
+                    "Orphan workspace PVC reaped: %s (job=%s status=%s)",
+                    name,
+                    job_id,
+                    status or "gone",
+                )
         if reaped:
             logger.warning(
                 "Orphan PVC sweep reclaimed %d workspace PVC(s) — inline "
@@ -1111,105 +1496,6 @@ class WorkspaceInstanceManager:
 
     def _provisioner_ready(self) -> bool:
         return bool(getattr(self._provisioner, "_k8s_available", False))
-
-    async def _completion_finalization_owns_workspace(self, job_id: str) -> bool:
-        """Whether durable completion currently owns this job's S36 teardown.
-
-        This is intentionally broader than the migration's sweep-exclusion
-        view.  Expired pending/finalizing rows are still owned by the finalizer
-        resume drain, and parked rows are an operator hold; letting the generic
-        lifecycle actor run a parallel snapshot/delete for any of them defeats
-        S36's UID-keyed replay contract.
-
-        Flag off returns before touching the DB.  Flag on fails closed on an
-        unavailable relation/DB because preserving a workspace is recoverable;
-        deleting one without knowing who owns it is not.
-        """
-
-        if not self._completion_commands_enabled:
-            return False
-        if self._db is None or not job_id:
-            return True
-        try:
-            async with self._db.acquire() as conn:
-                return bool(
-                    await conn.fetchval(
-                        """
-                        SELECT EXISTS (
-                            SELECT 1
-                            FROM job_completion_commands
-                            WHERE job_id = $1::uuid
-                              AND state IN ('pending', 'finalizing', 'parked')
-                        )
-                        """,
-                        job_id,
-                    )
-                )
-        except Exception:
-            logger.exception(
-                "Completion ownership lookup failed for job %s; preserving workspace",
-                job_id,
-            )
-            return True
-
-    async def _completion_control_owns_workspace(self, job_id: str) -> bool:
-        """Whether a live or malformed control marker owns this job resource.
-
-        The predicate uses PostgreSQL's clock, not an orchestrator wall clock,
-        so every lifecycle actor agrees with the admission barrier about claim
-        expiry.  The JSON-number shape check is PostgreSQL-15-safe and treats a
-        malformed reserved marker as active.  Flag off returns before acquiring
-        a connection; flag on fails closed because preserving a resource is the
-        recoverable direction.
-        """
-
-        if not self._completion_commands_enabled:
-            return False
-        if self._db is None or not job_id:
-            return True
-        try:
-            async with self._db.acquire() as conn:
-                value = await conn.fetchval(
-                    f"""
-                    SELECT ({_completion_control_active_sql("context")})
-                    FROM jobs
-                    WHERE id = $1::uuid
-                    """,
-                    job_id,
-                )
-            return bool(value)
-        except Exception:
-            logger.exception(
-                "Completion control lookup failed for job %s; preserving workspace",
-                job_id,
-            )
-            return True
-
-    async def _completion_control_owns_instance(self, inst: Instance) -> bool:
-        """Action-time control-marker check for job-bound workspaces only."""
-
-        if not self._completion_commands_enabled:
-            return False
-        labels = inst.metadata.get("labels") or {}
-        if "srw/thread-id" in labels or inst.metadata.get("thread_status") is not None:
-            return False
-        if not inst.bound_to:
-            return bool(inst.metadata.get("completion_control_owned"))
-        return await self._completion_control_owns_workspace(str(inst.bound_to))
-
-    async def _completion_finalization_owns_instance(self, inst: Instance) -> bool:
-        """Action-time S36 ownership check for job-bound workspaces only."""
-
-        if not self._completion_commands_enabled:
-            return False
-        labels = inst.metadata.get("labels") or {}
-        if "srw/thread-id" in labels or inst.metadata.get("thread_status") is not None:
-            return False
-        if not inst.bound_to:
-            # A list-time positive remains a veto even for a malformed test or
-            # partially observed instance that lost its bound identifier.
-            return bool(inst.metadata.get("completion_finalization_owned"))
-        return await self._completion_finalization_owns_workspace(str(inst.bound_to))
 
     async def _list_pods(self) -> list[Any]:
         try:

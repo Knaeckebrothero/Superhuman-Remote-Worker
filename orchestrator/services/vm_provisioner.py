@@ -27,6 +27,7 @@ The VM endpoints and lifecycle hooks in main.py use this provisioner exclusively
 
 import asyncio
 from collections.abc import Mapping
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -86,6 +87,32 @@ MAX_DESCRIPTION_LEN = 200
 
 _OWNER_KINDS = frozenset({"job", "thread"})
 _PROVISION_GENERATION_ANNOTATION = "srw.io/provision-generation"
+
+
+@dataclass(frozen=True, slots=True)
+class VMTeardownIdentity:
+    """Immutable VM incarnation captured before a destructive lifecycle call."""
+
+    provision_generation: str
+    vm_uid: str | None
+    rootdisk_pvc_uid: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class VMTeardownResult:
+    """Bounded result distinguishing completion from identity supersession."""
+
+    disposition: str
+    deleted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _VMTeardownProbe:
+    """Authenticated observation used to reconcile an ambiguous delete."""
+
+    disposition: str
+    identity: VMTeardownIdentity | None = None
+    rootdisk_identity_known: bool = False
 
 
 def _escape_for_job_config(description: str) -> str:
@@ -678,6 +705,319 @@ class VMProvisioner:
 
         return False
 
+    async def capture_vm_teardown_identity(self, job_id: str) -> VMTeardownIdentity:
+        """Capture one authenticated VM generation/UID tuple for replay.
+
+        The provision generation is mandatory on every backend.  Immutable VM
+        and rootdisk UIDs are included only when the controller/direct API has
+        authenticated them for that exact generation; an unauthenticated guest
+        report can never become teardown authority.
+        """
+
+        if not self._db:
+            raise RuntimeError("VM teardown identity database is unavailable")
+        row = await self._db.get_job(job_id)
+        if not isinstance(row, dict):
+            raise RuntimeError("VM teardown job no longer exists")
+        context = _extract_vm_context(row)
+        generation = _provision_generation(context.get("provision_generation"))
+        if generation is None:
+            raise RuntimeError("VM teardown provision generation is unavailable")
+
+        authenticated = (
+            context.get("identity_authenticated") is True
+            and _provision_generation(context.get("identity_provision_generation"))
+            == generation
+        )
+        vm_uid = _safe_vm_uid(context.get("vm_uid")) if authenticated else None
+        rootdisk_uid = (
+            _safe_vm_uid(context.get("rootdisk_pvc_uid")) if authenticated else None
+        )
+        if vm_uid is None or rootdisk_uid is None:
+            probe = await self._probe_vm_teardown_identity(job_id, generation)
+            if probe.disposition == "unknown":
+                raise RuntimeError("VM teardown identity probe is unavailable")
+            if probe.disposition == "superseded":
+                raise RuntimeError("VM teardown provision generation changed")
+            if probe.identity is not None:
+                probed_vm_uid = probe.identity.vm_uid
+                probed_rootdisk_uid = probe.identity.rootdisk_pvc_uid
+                if (
+                    vm_uid is not None
+                    and probed_vm_uid is not None
+                    and vm_uid != probed_vm_uid
+                ) or (
+                    rootdisk_uid is not None
+                    and probe.rootdisk_identity_known
+                    and rootdisk_uid != probed_rootdisk_uid
+                ):
+                    raise RuntimeError("VM teardown immutable identity changed")
+                if vm_uid is None:
+                    vm_uid = probed_vm_uid
+                if rootdisk_uid is None and probe.rootdisk_identity_known:
+                    rootdisk_uid = probed_rootdisk_uid
+            if probe.disposition == "present" and (
+                not probe.rootdisk_identity_known or rootdisk_uid is None
+            ):
+                raise RuntimeError("VM teardown rootdisk identity is unavailable")
+        return VMTeardownIdentity(
+            provision_generation=generation,
+            vm_uid=vm_uid,
+            rootdisk_pvc_uid=rootdisk_uid,
+        )
+
+    async def _probe_vm_teardown_identity(
+        self,
+        job_id: str,
+        generation: str,
+    ) -> _VMTeardownProbe:
+        """Probe the exact backend without collapsing absence into transport loss."""
+
+        result: Mapping[str, Any] | None
+        if nats_bridge.is_available:
+            result = await nats_bridge.query_vm_status(
+                job_id,
+                provision_generation=generation,
+                exact_absence=True,
+            )
+        elif self._http_available:
+            result = await self._query_http(
+                job_id,
+                provision_generation=generation,
+                exact_absence=True,
+            )
+        elif self._k8s_available:
+            result = await self._query_direct(
+                job_id,
+                entity_type="job",
+                absent_generation=generation,
+            )
+        else:
+            return _VMTeardownProbe("unknown")
+
+        if not isinstance(result, Mapping):
+            return _VMTeardownProbe("unknown")
+        if result.get("_identity_authenticated") is not True:
+            return _VMTeardownProbe("unknown")
+        observed_generation = _provision_generation(result.get("provision_generation"))
+        if observed_generation != generation:
+            return _VMTeardownProbe("superseded")
+        status = str(result.get("status") or "")
+        rootdisk_known = result.get("rootdisk_identity_known") is True
+        identity = VMTeardownIdentity(
+            provision_generation=generation,
+            vm_uid=_safe_vm_uid(result.get("vm_uid")),
+            rootdisk_pvc_uid=_safe_vm_uid(result.get("rootdisk_pvc_uid")),
+        )
+        if status == "not_found":
+            return _VMTeardownProbe(
+                "absent",
+                identity,
+                rootdisk_identity_known=rootdisk_known,
+            )
+        if status in {"query_failed", "delete_failed"} or identity.vm_uid is None:
+            return _VMTeardownProbe("unknown")
+        return _VMTeardownProbe(
+            "present",
+            identity,
+            rootdisk_identity_known=rootdisk_known,
+        )
+
+    async def revalidate_vm_teardown_identity(
+        self,
+        job_id: str,
+        identity: VMTeardownIdentity,
+    ) -> str:
+        """Re-prove an exact VM incarnation immediately before snapshot I/O."""
+
+        generation = _provision_generation(identity.provision_generation)
+        if generation is None:
+            return "unknown"
+        if await self._current_provision_generation("job", job_id) != generation:
+            return "superseded"
+        probe = await self._probe_vm_teardown_identity(job_id, generation)
+        classification = self._classify_captured_probe(probe, identity, purge_disk=True)
+        if classification == "matched":
+            return "matched"
+        if classification in {"superseded", "completed"}:
+            return "superseded"
+        return "unknown"
+
+    @staticmethod
+    def _classify_captured_probe(
+        probe: _VMTeardownProbe,
+        identity: VMTeardownIdentity,
+        *,
+        purge_disk: bool = True,
+    ) -> str:
+        """Map one authenticated observation to completed/matched/superseded."""
+
+        if probe.disposition in {"unknown", "superseded"}:
+            return probe.disposition
+        current = probe.identity
+        if current is None:
+            return "unknown"
+        if probe.disposition == "present":
+            if identity.vm_uid is None or current.vm_uid != identity.vm_uid:
+                return "superseded"
+            if purge_disk:
+                if not probe.rootdisk_identity_known:
+                    return "unknown"
+                if identity.rootdisk_pvc_uid is None:
+                    return "unknown"
+                if current.rootdisk_pvc_uid != identity.rootdisk_pvc_uid:
+                    return "superseded"
+            return "matched"
+        if not probe.rootdisk_identity_known:
+            return "unknown"
+        if current.rootdisk_pvc_uid is None:
+            # VM and rootdisk both proven absent: a lost delete response is
+            # exact idempotent success even when DB context is still stale.
+            return "completed"
+        if identity.rootdisk_pvc_uid is None:
+            return "unknown"
+        if current.rootdisk_pvc_uid != identity.rootdisk_pvc_uid:
+            return "superseded"
+        return "matched" if purge_disk else "completed"
+
+    async def delete_vm_captured(
+        self,
+        job_id: str,
+        identity: VMTeardownIdentity,
+        *,
+        purge_disk: bool = True,
+    ) -> VMTeardownResult:
+        """Delete only the VM/rootdisk incarnation captured in an intent."""
+
+        generation = _provision_generation(identity.provision_generation)
+        if generation is None:
+            return VMTeardownResult("identity_invalid", False)
+        current_generation = await self._current_provision_generation("job", job_id)
+        if current_generation != generation:
+            return VMTeardownResult("identity_superseded", False)
+        probe = await self._probe_vm_teardown_identity(job_id, generation)
+        classification = self._classify_captured_probe(
+            probe, identity, purge_disk=purge_disk
+        )
+        if classification == "superseded":
+            return VMTeardownResult("identity_superseded", False)
+        if classification == "completed":
+            return VMTeardownResult("completed", True)
+        if classification != "matched":
+            return VMTeardownResult("identity_unknown", False)
+        await self._delete_vm_with_identity(
+            job_id,
+            purge_disk=purge_disk,
+            provision_generation=generation,
+            expected_vm_uid=_safe_vm_uid(identity.vm_uid),
+            expected_rootdisk_pvc_uid=_safe_vm_uid(identity.rootdisk_pvc_uid),
+        )
+        reprobe = await self._probe_vm_teardown_identity(job_id, generation)
+        reclassification = self._classify_captured_probe(
+            reprobe, identity, purge_disk=purge_disk
+        )
+        if reclassification == "completed":
+            return VMTeardownResult("completed", True)
+        if reclassification == "superseded":
+            return VMTeardownResult("identity_superseded", False)
+        return VMTeardownResult("retry_pending", False)
+
+    async def release_vm_captured(
+        self,
+        job_id: str,
+        identity: VMTeardownIdentity,
+        *,
+        ssh_host: str | None = None,
+        ssh_port: int | None = None,
+    ) -> VMTeardownResult:
+        """Best-effort archive, then release only the captured VM incarnation."""
+
+        generation = _provision_generation(identity.provision_generation)
+        if generation is None:
+            return VMTeardownResult("identity_invalid", False)
+        if await self._current_provision_generation("job", job_id) != generation:
+            return VMTeardownResult("identity_superseded", False)
+        probe = await self._probe_vm_teardown_identity(job_id, generation)
+        classification = self._classify_captured_probe(probe, identity, purge_disk=True)
+        if classification == "superseded":
+            return VMTeardownResult("identity_superseded", False)
+        if classification == "completed":
+            return VMTeardownResult("completed", True)
+        if classification != "matched":
+            return VMTeardownResult("identity_unknown", False)
+
+        if (
+            self._snapshot_service
+            and self._snapshot_service.is_available
+            and ssh_host
+            and ssh_port
+        ):
+            try:
+                captured = await self._snapshot_service.capture_vm_snapshot(
+                    job_id=job_id,
+                    ssh_host=ssh_host,
+                    ssh_port=int(ssh_port),
+                    source_type="vm",
+                )
+                if not captured:
+                    logger.warning(
+                        "Captured VM snapshot skipped for job %s; deleting exact "
+                        "incarnation under terminal teardown policy",
+                        job_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "Captured VM snapshot failed for job %s; deleting exact "
+                    "incarnation under terminal teardown policy",
+                    job_id,
+                )
+        return await self.delete_vm_captured(job_id, identity, purge_disk=True)
+
+    async def delete_orphan_vm_captured(
+        self,
+        job_id: str,
+        identity: VMTeardownIdentity,
+        *,
+        purge_disk: bool = True,
+    ) -> VMTeardownResult:
+        """Delete an inventory-proven VM after both owning rows are absent."""
+
+        generation = _provision_generation(identity.provision_generation)
+        vm_uid = _safe_vm_uid(identity.vm_uid)
+        rootdisk_uid = _safe_vm_uid(identity.rootdisk_pvc_uid)
+        if (
+            generation is None
+            or vm_uid is None
+            or (purge_disk and rootdisk_uid is None)
+        ):
+            return VMTeardownResult("identity_unknown", False)
+        probe = await self._probe_vm_teardown_identity(job_id, generation)
+        classification = self._classify_captured_probe(
+            probe, identity, purge_disk=purge_disk
+        )
+        if classification == "completed":
+            return VMTeardownResult("completed", True)
+        if classification == "superseded":
+            return VMTeardownResult("identity_superseded", False)
+        if classification != "matched":
+            return VMTeardownResult("identity_unknown", False)
+        await self._delete_vm_with_identity(
+            job_id,
+            purge_disk=purge_disk,
+            provision_generation=generation,
+            expected_vm_uid=vm_uid,
+            expected_rootdisk_pvc_uid=rootdisk_uid,
+        )
+        reprobe = await self._probe_vm_teardown_identity(job_id, generation)
+        reclassification = self._classify_captured_probe(
+            reprobe, identity, purge_disk=purge_disk
+        )
+        if reclassification == "completed":
+            return VMTeardownResult("completed", True)
+        if reclassification == "superseded":
+            return VMTeardownResult("identity_superseded", False)
+        return VMTeardownResult("retry_pending", False)
+
     async def delete_vm(self, job_id: str, purge_disk: bool = True) -> bool:
         """Delete a VM for a job.
 
@@ -694,25 +1034,54 @@ class VMProvisioner:
             True if the request was accepted, False otherwise.
         """
         generation = await self._current_provision_generation("job", job_id)
+        return await self._delete_vm_with_identity(
+            job_id,
+            purge_disk=purge_disk,
+            provision_generation=generation,
+        )
+
+    async def _delete_vm_with_identity(
+        self,
+        job_id: str,
+        *,
+        purge_disk: bool,
+        provision_generation: str | None,
+        expected_vm_uid: str | None = None,
+        expected_rootdisk_pvc_uid: str | None = None,
+    ) -> bool:
+        generation = _provision_generation(provision_generation)
         if nats_bridge.is_available:
-            return await nats_bridge.request_vm_delete(
-                job_id,
-                purge_disk=purge_disk,
-                provision_generation=generation,
-                entity_type="job",
-            )
+            kwargs: dict[str, Any] = {
+                "purge_disk": purge_disk,
+                "provision_generation": generation,
+                "entity_type": "job",
+            }
+            if expected_vm_uid is not None:
+                kwargs["expected_vm_uid"] = expected_vm_uid
+            if expected_rootdisk_pvc_uid is not None:
+                kwargs["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
+            return await nats_bridge.request_vm_delete(job_id, **kwargs)
 
         if self._http_available:
-            return await self._delete_http(
-                job_id,
-                entity_type="job",
-                purge_disk=purge_disk,
-                provision_generation=generation,
-            )
+            kwargs = {
+                "entity_type": "job",
+                "purge_disk": purge_disk,
+                "provision_generation": generation,
+            }
+            if expected_vm_uid is not None:
+                kwargs["expected_vm_uid"] = expected_vm_uid
+            if expected_rootdisk_pvc_uid is not None:
+                kwargs["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
+            return await self._delete_http(job_id, **kwargs)
 
         if self._k8s_available:
             self._warn_direct_mode_purges(job_id, purge_disk)
-            return await self._delete_direct(job_id, provision_generation=generation)
+            kwargs = {"provision_generation": generation}
+            if expected_vm_uid is not None:
+                kwargs["expected_vm_uid"] = expected_vm_uid
+            if expected_rootdisk_pvc_uid is not None:
+                kwargs["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
+            return await self._delete_direct(job_id, **kwargs)
 
         return False
 
@@ -903,6 +1272,8 @@ class VMProvisioner:
         else:
             return None
         if result is not None:
+            if result.get("status") == "not_found":
+                return None
             authenticated = result.get("_identity_authenticated") is True
             current = await self._persist_status_identity(entity_type, job_id, result)
             if authenticated and not current:
@@ -910,7 +1281,9 @@ class VMProvisioner:
             result.pop("_identity_authenticated", None)
         return result
 
-    async def list_vms(self) -> Optional[list]:
+    async def list_vms(
+        self, *, include_teardown_identity: bool = False
+    ) -> Optional[list]:
         """Enumerate the VMs the backend is actually running.
 
         Inventory source for the lifecycle VM orphan sweep — the DB-derived
@@ -921,13 +1294,19 @@ class VMProvisioner:
         "unknown", never "no VMs" — callers must not reap on it.
         """
         if nats_bridge.is_available:
+            if include_teardown_identity:
+                return await nats_bridge.request_vm_list(include_teardown_identity=True)
             return await nats_bridge.request_vm_list()
 
         if self._http_available:
-            return await self._list_http()
+            return await self._list_http(
+                include_teardown_identity=include_teardown_identity
+            )
 
         if self._k8s_available:
-            return await self._list_direct()
+            return await self._list_direct(
+                include_teardown_identity=include_teardown_identity
+            )
 
         return None
 
@@ -958,14 +1337,31 @@ class VMProvisioner:
     ) -> str | None:
         """Read the exact admitted root PVC identity for direct K8s mode."""
 
+        _known, uid = await self._rootdisk_pvc_probe(
+            owner_id=owner_id,
+            owner_kind=owner_kind,
+            wait=wait,
+        )
+        return uid
+
+    async def _rootdisk_pvc_probe(
+        self,
+        *,
+        owner_id: str,
+        owner_kind: str,
+        wait: bool,
+    ) -> tuple[bool, str | None]:
+        """Return ``(known, uid)`` so exact absence is not transport loss."""
+
         if self._core_k8s is None:
             logger.warning(
                 "Rootdisk PVC identity unavailable for %s: CoreV1Api is not initialized",
                 owner_id,
             )
-            return None
+            return False, None
         name = f"agent-vm-{owner_id}-rootdisk"
         attempts = max(1, VM_ROOTDISK_PVC_UID_ATTEMPTS if wait else 1)
+        exact_absence = False
         for attempt in range(attempts):
             try:
                 pvc = await asyncio.to_thread(
@@ -978,7 +1374,8 @@ class VMProvisioner:
                     logger.warning(
                         "Rootdisk PVC identity read failed for %s: %s", name, exc
                     )
-                    return None
+                    return False, None
+                exact_absence = True
             else:
                 uid = _admitted_pvc_uid(
                     pvc,
@@ -987,15 +1384,18 @@ class VMProvisioner:
                     expected_owner_kind=owner_kind,
                 )
                 if uid is not None:
-                    return uid
+                    return True, uid
+                return False, None
             if attempt + 1 < attempts and VM_ROOTDISK_PVC_UID_RETRY_SECONDS > 0:
                 await asyncio.sleep(VM_ROOTDISK_PVC_UID_RETRY_SECONDS)
+        if exact_absence:
+            return True, None
         logger.warning(
             "Rootdisk PVC %s was not admitted with the expected immutable identity; "
             "storage attribution will remain unknown",
             name,
         )
-        return None
+        return False, None
 
     async def _create_direct(
         self,
@@ -1091,7 +1491,12 @@ class VMProvisioner:
             return False
 
     async def _delete_direct(
-        self, job_id: str, *, provision_generation: str | None = None
+        self,
+        job_id: str,
+        *,
+        provision_generation: str | None = None,
+        expected_vm_uid: str | None = None,
+        expected_rootdisk_pvc_uid: str | None = None,
     ) -> bool:
         """Delete a VM via direct Kubernetes API call."""
         vm_name = f"agent-vm-{job_id}"
@@ -1133,6 +1538,24 @@ class VMProvisioner:
                     job_id,
                 )
                 return False
+            if expected_vm_uid is not None and vm_uid != expected_vm_uid:
+                logger.info(
+                    "Captured VM UID superseded for %s; preserving replacement",
+                    job_id,
+                )
+                return False
+            if expected_rootdisk_pvc_uid is not None:
+                current_rootdisk_uid = await self._rootdisk_pvc_uid(
+                    owner_id=job_id,
+                    owner_kind="job",
+                    wait=False,
+                )
+                if current_rootdisk_uid != expected_rootdisk_pvc_uid:
+                    logger.info(
+                        "Captured rootdisk UID superseded for %s; preserving replacement",
+                        job_id,
+                    )
+                    return False
             await asyncio.to_thread(
                 self._k8s.delete_namespaced_custom_object,
                 group=KUBEVIRT_GROUP,
@@ -1163,7 +1586,11 @@ class VMProvisioner:
             return False
 
     async def _query_direct(
-        self, job_id: str, *, entity_type: str = "job"
+        self,
+        job_id: str,
+        *,
+        entity_type: str = "job",
+        absent_generation: str | None = None,
     ) -> Optional[dict]:
         """Query VM status via direct Kubernetes API call."""
         vm_name = f"agent-vm-{job_id}"
@@ -1198,17 +1625,45 @@ class VMProvisioner:
             generation = _admitted_provision_generation(vm)
             if generation is not None:
                 result["provision_generation"] = generation
-            rootdisk_pvc_uid = await self._rootdisk_pvc_uid(
-                owner_id=job_id,
-                owner_kind=entity_type,
-                wait=False,
-            )
+            if absent_generation is not None:
+                rootdisk_known, rootdisk_pvc_uid = await self._rootdisk_pvc_probe(
+                    owner_id=job_id,
+                    owner_kind=entity_type,
+                    wait=False,
+                )
+                result["rootdisk_identity_known"] = rootdisk_known
+            else:
+                # The ordinary lifecycle/status path keeps its historical
+                # result shape.  Absence authority is opt-in for teardown.
+                rootdisk_pvc_uid = await self._rootdisk_pvc_uid(
+                    owner_id=job_id,
+                    owner_kind=entity_type,
+                    wait=False,
+                )
             if rootdisk_pvc_uid is not None:
                 result["rootdisk_pvc_uid"] = rootdisk_pvc_uid
             if generation is not None and "vm_uid" in result:
                 result["_identity_authenticated"] = True
             return result
         except Exception as e:
+            if getattr(e, "status", None) == 404 and absent_generation is not None:
+                rootdisk_known, rootdisk_pvc_uid = await self._rootdisk_pvc_probe(
+                    owner_id=job_id,
+                    owner_kind=entity_type,
+                    wait=False,
+                )
+                return {
+                    "job_id": job_id,
+                    "status": "not_found",
+                    "provision_generation": absent_generation,
+                    "rootdisk_identity_known": rootdisk_known,
+                    **(
+                        {"rootdisk_pvc_uid": rootdisk_pvc_uid}
+                        if rootdisk_pvc_uid is not None
+                        else {}
+                    ),
+                    "_identity_authenticated": True,
+                }
             logger.debug("VM status query failed for job %s: %s", job_id, e)
             return None
 
@@ -1444,6 +1899,8 @@ class VMProvisioner:
         entity_type: str = "job",
         purge_disk: bool = True,
         provision_generation: str | None = None,
+        expected_vm_uid: str | None = None,
+        expected_rootdisk_pvc_uid: str | None = None,
     ) -> bool:
         """Delete a VM by sending DELETE to the co-located VM controller."""
         if self._http_client is None:
@@ -1462,11 +1919,19 @@ class VMProvisioner:
             "purge_disk": purge_disk,
             "provision_generation": generation,
         }
+        if expected_vm_uid is not None:
+            signed_payload["expected_vm_uid"] = expected_vm_uid
+        if expected_rootdisk_pvc_uid is not None:
+            signed_payload["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
         params: dict[str, str] = {}
         if not purge_disk:
             params["purge_disk"] = "false"
         if generation is not None:
             params["provision_generation"] = generation
+        if expected_vm_uid is not None:
+            params["expected_vm_uid"] = expected_vm_uid
+        if expected_rootdisk_pvc_uid is not None:
+            params["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
         params.update(
             _http_lifecycle_query(
                 signed_payload,
@@ -1527,6 +1992,8 @@ class VMProvisioner:
         job_id: str,
         timeout: float = 5.0,
         provision_generation: str | None = None,
+        *,
+        exact_absence: bool = False,
     ) -> Optional[dict]:
         """Query VM status via the co-located VM controller."""
         if self._http_client is None:
@@ -1542,6 +2009,9 @@ class VMProvisioner:
         params: dict[str, str] = {}
         if generation is not None:
             params["provision_generation"] = generation
+        if exact_absence:
+            signed_payload["exact_absence"] = True
+            params["exact_absence"] = "true"
         params.update(
             _http_lifecycle_query(
                 signed_payload,
@@ -1580,7 +2050,9 @@ class VMProvisioner:
             logger.debug("HTTP status query failed for job %s: %s", job_id, e)
             return None
 
-    async def _list_http(self) -> Optional[list]:
+    async def _list_http(
+        self, *, include_teardown_identity: bool = False
+    ) -> Optional[list]:
         """List managed VMs via the co-located VM controller.
 
         A 404 means the controller predates the list op — unknown, not empty.
@@ -1589,9 +2061,18 @@ class VMProvisioner:
             return None
 
         try:
+            signed_payload = {
+                **(
+                    {"include_teardown_identity": True}
+                    if include_teardown_identity
+                    else {}
+                )
+            }
             params = _http_lifecycle_query(
-                {}, operation="list", secret=self._lifecycle_hmac_secret
+                signed_payload, operation="list", secret=self._lifecycle_hmac_secret
             )
+            if include_teardown_identity:
+                params["include_teardown_identity"] = "true"
             resp = await self._http_client.get(
                 "/vms",
                 params=params,
@@ -1614,7 +2095,9 @@ class VMProvisioner:
             logger.debug("HTTP VM list failed: %s", e)
             return None
 
-    async def _list_direct(self) -> Optional[list]:
+    async def _list_direct(
+        self, *, include_teardown_identity: bool = False
+    ) -> Optional[list]:
         """List managed VMs via direct Kubernetes API call.
 
         Mirrors the controller's ``_do_list``: agent VMs only, golden
@@ -1638,14 +2121,28 @@ class VMProvisioner:
             name = meta.get("name", "")
             if not name.startswith("agent-vm-") or name.startswith("agent-vm-golden-"):
                 continue
-            out.append(
-                {
-                    "vm_name": name,
-                    "entity_id": name[len("agent-vm-") :],
-                    "created_at": meta.get("creationTimestamp"),
-                    "phase": item.get("status", {}).get("printableStatus", "Unknown"),
-                }
-            )
+            entity_id = name[len("agent-vm-") :]
+            inventory = {
+                "vm_name": name,
+                "entity_id": entity_id,
+                "created_at": meta.get("creationTimestamp"),
+                "phase": item.get("status", {}).get("printableStatus", "Unknown"),
+            }
+            if include_teardown_identity:
+                generation = _admitted_provision_generation(item)
+                vm_uid = _admitted_vm_uid(item, expected_name=name)
+                rootdisk_uid = await self._rootdisk_pvc_uid(
+                    owner_id=entity_id,
+                    owner_kind=None,
+                    wait=False,
+                )
+                if generation is not None:
+                    inventory["provision_generation"] = generation
+                if vm_uid is not None:
+                    inventory["vm_uid"] = vm_uid
+                if rootdisk_uid is not None:
+                    inventory["rootdisk_pvc_uid"] = rootdisk_uid
+            out.append(inventory)
         return out
 
     async def _set_context(

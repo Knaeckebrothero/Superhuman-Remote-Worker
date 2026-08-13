@@ -400,6 +400,7 @@ class TestProvisionJobRepo:
         assert "repo/" not in floor_lines
         patched_loop_seed.assert_awaited_once()
         assert patched_loop_seed.await_args.kwargs["require_complete"] is True
+        assert "authority_check" not in patched_loop_seed.await_args.kwargs
 
     @pytest.mark.asyncio
     async def test_loop_gitignore_floor_idempotent(
