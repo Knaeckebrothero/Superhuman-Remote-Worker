@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone
 import os
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -15,6 +17,7 @@ import src.api.persistent_app as pa
 import src.api.turn_executor as turn_executor
 from src.agent import UniversalAgent, _stateless_worker_remote_authority
 from src.core.workspace_backend import WorkspaceUnavailableError
+from src.core.backends.remote import RemoteBackend
 from src.graph import route_entry
 from src.shared.run_queue import ClaimedUnit, EnqueueResult
 from src.shared.job_steering import CheckpointSteeringAcker, context_delivery_key
@@ -23,6 +26,7 @@ from src.shared.worker_queue import (
     WorkerCompletionAcceptance,
     WorkerRenewal,
     WorkerRotation,
+    get_worker_completion_acceptance,
 )
 
 WORKSPACE_GENERATION = "11111111-1111-4111-8111-111111111111"
@@ -63,6 +67,40 @@ def _renewal(status="processing") -> WorkerRenewal:
         job_context={},
         pending_guidance=(),
         queued_replies=(),
+    )
+
+
+def _acceptance(
+    *,
+    command_id=None,
+    command_state="done",
+    job_status="completed",
+    outcome=None,
+    deadline_expired=False,
+    deadline_remaining_seconds=60.0,
+    lease_remaining_seconds=30.0,
+    run_after_remaining_seconds=0.0,
+) -> WorkerCompletionAcceptance:
+    now = datetime.now(timezone.utc)
+    return WorkerCompletionAcceptance(
+        job_status=job_status,
+        queue_state="done",
+        command_state=command_state,
+        command_id=command_id or uuid4(),
+        command_outcome=(
+            {"new_status": job_status} if outcome is None else dict(outcome)
+        ),
+        deadline_at=now + timedelta(seconds=deadline_remaining_seconds),
+        lease_expires_at=(
+            now + timedelta(seconds=lease_remaining_seconds)
+            if lease_remaining_seconds is not None
+            else None
+        ),
+        run_after=now + timedelta(seconds=run_after_remaining_seconds),
+        deadline_expired=deadline_expired,
+        deadline_remaining_seconds=deadline_remaining_seconds,
+        lease_remaining_seconds=lease_remaining_seconds,
+        run_after_remaining_seconds=run_after_remaining_seconds,
     )
 
 
@@ -180,6 +218,8 @@ class _FakeAgent:
         self.final_state = final_state
         self.process_calls = []
         self.cleanup_calls = []
+        self.hold_calls = 0
+        self.hold_event = asyncio.Event()
         self._orchestrator_client = None
 
     async def process_job(self, *args, **kwargs):
@@ -193,6 +233,10 @@ class _FakeAgent:
 
     async def cleanup_worker_claim(self, *, preserve_shell):
         self.cleanup_calls.append(preserve_shell)
+
+    async def hold_worker_finalization(self):
+        self.hold_calls += 1
+        self.hold_event.set()
 
 
 class _FakeClient:
@@ -352,12 +396,7 @@ async def test_command_accept_queue_closure_is_not_misclassified_as_lease_loss(
     )
     executor._completion_commands_enabled = True
     renew.side_effect = [_renewal("processing"), None]
-    acceptance = WorkerCompletionAcceptance(
-        job_status="completed",
-        queue_state="done",
-        command_state="done" if report_result else "pending",
-        command_id=uuid4(),
-    )
+    acceptance = _acceptance()
     accepted_lookup = AsyncMock(return_value=acceptance)
     monkeypatch.setattr(
         turn_executor,
@@ -377,7 +416,588 @@ async def test_command_accept_queue_closure_is_not_misclassified_as_lease_loss(
     release.assert_not_awaited()
     rotate.assert_not_awaited()
     assert executor._lease.lost.is_set() is False
-    assert agent.cleanup_calls == ([False] if report_result else [True])
+    assert agent.hold_calls == 0
+    assert agent.cleanup_calls == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_state", ["pending", "finalizing"])
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled"])
+async def test_accepted_unfinished_command_holds_then_retires_terminal_shell_once(
+    worker_runtime,
+    monkeypatch,
+    command_state,
+    terminal_status,
+):
+    claim = _claim(input_seq=31, prior="processing")
+    final = {"should_stop": True, "goal_achieved": True, "error": None}
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch,
+        claim,
+        final,
+    )
+    executor._completion_commands_enabled = True
+    executor._sleep_worker_finalization_poll = AsyncMock()
+    renew.side_effect = [_renewal("processing"), None]
+    command_id = uuid4()
+    accepted_lookup = AsyncMock(
+        side_effect=[
+            _acceptance(
+                command_id=command_id,
+                command_state=command_state,
+                job_status="processing",
+                outcome={},
+            ),
+            _acceptance(
+                command_id=command_id,
+                command_state="done",
+                job_status=terminal_status,
+                outcome={"new_status": terminal_status},
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        turn_executor,
+        "get_worker_completion_acceptance",
+        accepted_lookup,
+    )
+
+    await executor._serve_worker_claim(claim)
+
+    assert agent.hold_calls == 1
+    assert agent.cleanup_calls == [False]
+    assert accepted_lookup.await_args_list[1].kwargs["command_id"] == command_id
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+    rotate.assert_not_awaited()
+    client.report_completion.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored_status",
+    [
+        "processing",
+        "reviewing",
+        "pending_review",
+        "paused",
+        "waiting",
+        "waiting_for_reply",
+    ],
+)
+async def test_accepted_unfinished_command_preserves_all_nonterminal_outcomes(
+    worker_runtime,
+    monkeypatch,
+    stored_status,
+):
+    claim = _claim(input_seq=31, prior="processing")
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch,
+        claim,
+        {"should_stop": True, "goal_achieved": True},
+    )
+    executor._completion_commands_enabled = True
+    executor._sleep_worker_finalization_poll = AsyncMock()
+    renew.side_effect = [_renewal("processing"), None]
+    command_id = uuid4()
+    accepted_lookup = AsyncMock(
+        side_effect=[
+            _acceptance(
+                command_id=command_id,
+                command_state="pending",
+                job_status="processing",
+                outcome={},
+            ),
+            _acceptance(
+                command_id=command_id,
+                command_state="done",
+                job_status=stored_status,
+                outcome={"new_status": stored_status},
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        turn_executor,
+        "get_worker_completion_acceptance",
+        accepted_lookup,
+    )
+
+    await executor._serve_worker_claim(claim)
+
+    assert agent.hold_calls == 1
+    assert agent.cleanup_calls == [True]
+    assert accepted_lookup.await_args_list[1].kwargs["command_id"] == command_id
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+    rotate.assert_not_awaited()
+    client.report_completion.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command_state", "outcome", "preserve_shell"),
+    [
+        ("superseded", {"observed_status": "cancelled"}, False),
+        ("superseded", {"observed_job_status": "failed"}, False),
+        ("superseded", {"observed_status": "paused"}, True),
+        ("force_resolved", {"terminal_status": "completed"}, False),
+        ("force_resolved", {"terminal_status": "failed"}, False),
+        ("force_resolved", {"terminal_status": "cancelled"}, False),
+    ],
+)
+async def test_accepted_command_uses_finalized_outcome_not_fixture_job_status(
+    worker_runtime,
+    monkeypatch,
+    command_state,
+    outcome,
+    preserve_shell,
+):
+    claim = _claim(input_seq=31, prior="processing")
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch,
+        claim,
+        {"should_stop": True, "goal_achieved": True},
+    )
+    executor._completion_commands_enabled = True
+    renew.side_effect = [_renewal("processing"), None]
+    acceptance = _acceptance(
+        command_state=command_state,
+        # Deliberately contradictory: disposition must come from outcome.
+        job_status="processing" if not preserve_shell else "completed",
+        outcome=outcome,
+    )
+    accepted_lookup = AsyncMock(return_value=acceptance)
+    monkeypatch.setattr(
+        turn_executor,
+        "get_worker_completion_acceptance",
+        accepted_lookup,
+    )
+
+    await executor._serve_worker_claim(claim)
+
+    assert agent.hold_calls == 0
+    assert agent.cleanup_calls == [preserve_shell]
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+    rotate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tail",
+    [
+        _acceptance(command_state="parked", job_status="processing", outcome={}),
+        _acceptance(
+            command_state="pending",
+            job_status="processing",
+            outcome={},
+            deadline_expired=True,
+            deadline_remaining_seconds=0.0,
+        ),
+        None,
+    ],
+    ids=["parked", "deadline", "lookup-loss"],
+)
+async def test_accepted_hold_hands_back_nonfinalized_command_without_queue_verb(
+    worker_runtime,
+    monkeypatch,
+    tail,
+):
+    claim = _claim(input_seq=31, prior="processing")
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch,
+        claim,
+        {"should_stop": True, "goal_achieved": True},
+    )
+    executor._completion_commands_enabled = True
+    executor._sleep_worker_finalization_poll = AsyncMock()
+    renew.side_effect = [_renewal("processing"), None]
+    command_id = uuid4()
+    first = _acceptance(
+        command_id=command_id,
+        command_state="pending",
+        job_status="processing",
+        outcome={},
+    )
+    if tail is not None:
+        tail = replace(tail, command_id=command_id)
+    accepted_lookup = AsyncMock(side_effect=[first, tail])
+    monkeypatch.setattr(
+        turn_executor,
+        "get_worker_completion_acceptance",
+        accepted_lookup,
+    )
+
+    await executor._serve_worker_claim(claim)
+
+    assert agent.hold_calls == 1
+    assert agent.cleanup_calls == [True]
+    assert accepted_lookup.await_args_list[1].kwargs["command_id"] == command_id
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+    rotate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_accepted_hold_preserves_shell_without_requeue(
+    worker_runtime,
+    monkeypatch,
+):
+    claim = _claim(input_seq=31, prior="processing")
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch,
+        claim,
+        {"should_stop": True, "goal_achieved": True},
+    )
+    executor._completion_commands_enabled = True
+    renew.side_effect = [_renewal("processing"), None]
+    command_id = uuid4()
+    accepted_lookup = AsyncMock(
+        return_value=_acceptance(
+            command_id=command_id,
+            command_state="pending",
+            job_status="processing",
+            outcome={},
+        )
+    )
+    monkeypatch.setattr(
+        turn_executor,
+        "get_worker_completion_acceptance",
+        accepted_lookup,
+    )
+    sleep_started = asyncio.Event()
+
+    async def block_poll(_seconds):
+        sleep_started.set()
+        await asyncio.Event().wait()
+
+    executor._sleep_worker_finalization_poll = block_poll
+
+    task = asyncio.create_task(executor._serve_worker_claim(claim))
+    await sleep_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert agent.hold_calls == 1
+    assert agent.cleanup_calls == [True]
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+    rotate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_crashed_accepted_hold_defers_to_command_backstop_without_requeue(
+    worker_runtime,
+    monkeypatch,
+):
+    claim = _claim(input_seq=31, prior="processing")
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch,
+        claim,
+        {"should_stop": True, "goal_achieved": True},
+    )
+    executor._completion_commands_enabled = True
+    renew.side_effect = [_renewal("processing"), None]
+    accepted_lookup = AsyncMock(
+        return_value=_acceptance(
+            command_state="pending",
+            job_status="processing",
+            outcome={},
+        )
+    )
+    monkeypatch.setattr(
+        turn_executor,
+        "get_worker_completion_acceptance",
+        accepted_lookup,
+    )
+    executor._sleep_worker_finalization_poll = AsyncMock(
+        side_effect=RuntimeError("driver crashed after B4 accept")
+    )
+
+    await executor._serve_worker_claim(claim)
+
+    assert agent.hold_calls == 1
+    assert agent.cleanup_calls == [True]
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+    rotate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_completion_acceptance_lookup_returns_db_clock_bounds_and_exact_command():
+    command_id = uuid4()
+    unit_id = uuid4()
+    now = datetime.now(timezone.utc)
+    row = {
+        "job_status": "processing",
+        "queue_state": "done",
+        "command_state": "finalizing",
+        "command_id": command_id,
+        "command_outcome": {"attempt": 2},
+        "deadline_at": now + timedelta(minutes=2),
+        "lease_expires_at": now + timedelta(seconds=20),
+        "run_after": now,
+        "deadline_expired": False,
+        "deadline_remaining_seconds": 120.0,
+        "lease_remaining_seconds": 20.0,
+        "run_after_remaining_seconds": 0.0,
+    }
+    conn = SimpleNamespace(fetchrow=AsyncMock(return_value=row))
+
+    accepted = await get_worker_completion_acceptance(
+        conn,
+        unit_id=unit_id,
+        lease_token=7,
+        command_id=command_id,
+    )
+
+    assert accepted is not None
+    assert accepted.command_id == command_id
+    assert accepted.command_outcome == {"attempt": 2}
+    assert accepted.deadline_remaining_seconds == 120.0
+    assert accepted.lease_remaining_seconds == 20.0
+    assert accepted.deadline_expired is False
+    assert conn.fetchrow.await_args.args[1:] == (unit_id, 7, command_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preserve_shell", [False, True])
+async def test_agent_finalization_hold_retires_admission_then_disposes_shell_once(
+    preserve_shell,
+):
+    events: list[str] = []
+    backend = SimpleNamespace(
+        retire_shell_owner=MagicMock(
+            side_effect=lambda: events.append("retire_admission")
+        ),
+        make_terminal_shell_cleanup_capability=MagicMock(),
+        retire=MagicMock(side_effect=lambda: events.append("retire_backend")),
+    )
+    terminal_cleanup = MagicMock(side_effect=lambda: events.append("terminal_cleanup"))
+    backend.make_terminal_shell_cleanup_capability.side_effect = lambda: (
+        events.append("fork_cleanup") or terminal_cleanup
+    )
+    shell = SimpleNamespace(
+        cleanup=MagicMock(side_effect=lambda: events.append("shell_cleanup"))
+    )
+    tool_context = SimpleNamespace(
+        shell_manager=shell,
+        citation_verdict_callback=object(),
+    )
+    agent = UniversalAgent.__new__(UniversalAgent)
+    agent._current_job_id = "job-a"
+    agent._worker_lease_token = 7
+    agent._workspace_manager = SimpleNamespace(backend=backend)
+    agent._shell_manager = shell
+    agent._tool_context = tool_context
+    agent._doc_registration_task = None
+    agent._knowledge_graph = None
+    agent._datasource_connections = {
+        "postgresql": SimpleNamespace(
+            close=MagicMock(side_effect=lambda: events.append("scrub"))
+        )
+    }
+    agent._datasource_clients = {}
+    agent._datasource_files_manifest = None
+    agent._checkpoint_conn = None
+    agent._checkpointer = object()
+    agent._worker_env_restore = {}
+    agent._job_metadata = {"secret": "scrub-me"}
+    agent._todo_manager = object()
+    agent._tools = [object()]
+    agent._graph = object()
+    agent._worker_checkpoint_post_commit = object()
+    agent._defer_job_cleanup = True
+
+    await agent.hold_worker_finalization()
+
+    assert events == [
+        "retire_admission",
+        "fork_cleanup",
+        "retire_backend",
+        "scrub",
+    ]
+    assert agent._shell_manager is None
+    assert agent._worker_finalization_backend is backend
+    assert agent._worker_terminal_shell_cleanup is terminal_cleanup
+    assert agent._worker_finalization_held is True
+    assert tool_context.shell_manager is None
+    assert tool_context.citation_verdict_callback is None
+    assert agent._tool_context is None
+    assert agent._job_metadata is None
+    assert agent._checkpointer is None
+    assert agent._graph is None
+
+    # Idempotent hold must neither re-retire admission nor scrub/disconnect twice.
+    await agent.hold_worker_finalization()
+    assert events == [
+        "retire_admission",
+        "fork_cleanup",
+        "retire_backend",
+        "scrub",
+    ]
+
+    await agent.cleanup_worker_claim(preserve_shell=preserve_shell)
+
+    assert backend.retire_shell_owner.call_count == 1
+    shell.cleanup.assert_not_called()
+    assert terminal_cleanup.call_count == (0 if preserve_shell else 1)
+    assert backend.retire.call_count == 1
+    assert events == (
+        [
+            "retire_admission",
+            "fork_cleanup",
+            "retire_backend",
+            "scrub",
+        ]
+        if preserve_shell
+        else [
+            "retire_admission",
+            "fork_cleanup",
+            "retire_backend",
+            "scrub",
+            "terminal_cleanup",
+        ]
+    )
+    assert agent._shell_manager is None
+    assert agent._worker_finalization_backend is None
+    assert agent._worker_finalization_held is False
+
+
+@pytest.mark.asyncio
+async def test_agent_hold_drains_admitted_resource_io_and_retires_original_backend():
+    job_id = str(uuid4())
+    workspace_generation = str(uuid4())
+    runtime_incarnation = str(uuid4())
+    backend = RemoteBackend(
+        host="workspace.invalid",
+        key_path="/unused/test-key",
+        job_id=job_id,
+        workspace_generation=workspace_generation,
+        runtime_incarnation=runtime_incarnation,
+        workspace_owner_kind="job",
+        workspace_owner_id=job_id,
+    )
+    backend.set_shell_owner_token(7)
+    backend._shell_generation = "a" * 32
+    admitted = threading.Event()
+    release = threading.Event()
+
+    def admitted_exec(*_args, **_kwargs):
+        admitted.set()
+        assert release.wait(timeout=2)
+        return "finished", 0
+
+    backend._exec_with_status = MagicMock(side_effect=admitted_exec)
+    agent = UniversalAgent.__new__(UniversalAgent)
+    agent._current_job_id = job_id
+    agent._worker_lease_token = 7
+    agent._workspace_manager = SimpleNamespace(backend=backend)
+    agent._shell_manager = object()
+    agent._tool_context = None
+    agent._doc_registration_task = None
+    agent._knowledge_graph = None
+    agent._datasource_connections = {}
+    agent._datasource_clients = {}
+    agent._datasource_files_manifest = None
+    agent._checkpoint_conn = None
+    agent._checkpointer = None
+    agent._worker_env_restore = {}
+    agent._job_metadata = {}
+    agent._todo_manager = None
+    agent._tools = []
+    agent._graph = object()
+    agent._worker_checkpoint_post_commit = None
+    agent._defer_job_cleanup = True
+
+    resource_task = asyncio.create_task(
+        asyncio.to_thread(backend.exec_claim_resource, ":")
+    )
+    assert await asyncio.to_thread(admitted.wait, 1)
+    hold_task = asyncio.create_task(agent.hold_worker_finalization())
+    await asyncio.sleep(0.02)
+
+    # retire() cannot publish the hold until the admitted resource mutation
+    # leaves its local admission lock.
+    assert hold_task.done() is False
+    release.set()
+    assert await resource_task == "finished"
+    await hold_task
+
+    assert backend._retired is True
+    assert backend._claim_resource_retired is True
+    with pytest.raises(WorkspaceUnavailableError):
+        backend.exec_claim_resource(":")
+    with pytest.raises(WorkspaceUnavailableError):
+        backend.write_file("late.txt", "must fail")
+    capability = agent._worker_terminal_shell_cleanup
+    assert callable(capability)
+    assert not hasattr(capability, "exec_command")
+    assert not hasattr(capability, "write_file")
+    assert not hasattr(capability, "shell_run")
+
+    await agent.cleanup_worker_claim(preserve_shell=True)
+
+
+def test_remote_terminal_cleanup_capability_has_exact_fence_and_only_cleanup(
+    monkeypatch,
+):
+    job_id = str(uuid4())
+    workspace_generation = str(uuid4())
+    runtime_incarnation = str(uuid4())
+    backend = RemoteBackend(
+        host="workspace.invalid",
+        key_path="/unused/test-key",
+        job_id=job_id,
+        workspace_generation=workspace_generation,
+        runtime_incarnation=runtime_incarnation,
+        workspace_owner_kind="job",
+        workspace_owner_id=job_id,
+    )
+    backend.set_shell_owner_token(19)
+    observed: list[tuple[str, str, str, int | None, bool, bool]] = []
+
+    def terminal_cleanup(cleanup_backend):
+        observed.append(
+            (
+                cleanup_backend._job_id,
+                cleanup_backend._workspace_generation,
+                cleanup_backend._runtime_incarnation,
+                cleanup_backend._shell_owner_token,
+                cleanup_backend._shell_retired,
+                cleanup_backend._claim_resource_retired,
+            )
+        )
+
+    retired: list[RemoteBackend] = []
+    monkeypatch.setattr(RemoteBackend, "shell_cleanup", terminal_cleanup)
+    monkeypatch.setattr(
+        RemoteBackend,
+        "retire",
+        lambda cleanup_backend: retired.append(cleanup_backend),
+    )
+
+    capability = backend.make_terminal_shell_cleanup_capability()
+
+    assert callable(capability)
+    assert not hasattr(capability, "exec_command")
+    assert not hasattr(capability, "write_file")
+    assert not hasattr(capability, "shell_run")
+    with pytest.raises(AttributeError):
+        capability.shell_owner_token = 20
+    capability()
+    assert observed == [
+        (
+            job_id,
+            workspace_generation,
+            runtime_incarnation,
+            19,
+            True,
+            True,
+        )
+    ]
+    assert len(retired) == 1
 
 
 @pytest.mark.asyncio

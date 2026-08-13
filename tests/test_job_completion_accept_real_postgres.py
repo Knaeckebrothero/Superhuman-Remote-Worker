@@ -15,6 +15,7 @@ maintaining a permissive test-only schema that can drift from production.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -32,6 +33,7 @@ from orchestrator.services.job_completion_commands import (
     canonical_completion_payload,
     completion_payload_digest,
 )
+from src.shared.worker_queue import get_worker_completion_acceptance
 
 
 SCHEMA_FILE = (
@@ -286,6 +288,103 @@ async def test_stateless_accept_fences_stale_token_without_any_mutation_then_clo
         "input_seq": 11,
         "consumed_seq": 11,
     }
+
+
+@pytest.mark.asyncio
+async def test_b4_closed_worker_exposes_exact_command_outcome_and_db_clock_bounds(pg):
+    lease_token = 47
+    async with pg.acquire() as conn:
+        job_id = await _insert_job(conn, lane="stateless")
+        await _insert_worker_lease(conn, job_id=job_id, lease_token=lease_token)
+
+    accepted = await _accept(
+        pg,
+        job_id=job_id,
+        lease_token=lease_token,
+        client_report_id=uuid4(),
+    )
+    command_id = UUID(accepted.command_id)
+    assert accepted.queue_terminalized
+
+    async with pg.acquire() as conn:
+        stored_times = await conn.fetchrow(
+            """
+            UPDATE job_completion_commands
+            SET state = 'finalizing', attempts = 1,
+                finalizing_by = 'worker-handoff-proof',
+                deadline_at = clock_timestamp() + interval '2 minutes',
+                lease_expires_at = clock_timestamp() + interval '1 minute',
+                run_after = clock_timestamp() + interval '30 seconds'
+            WHERE id = $1
+            RETURNING deadline_at, lease_expires_at, run_after
+            """,
+            command_id,
+        )
+        before = await conn.fetchval("SELECT clock_timestamp()")
+        finalizing = await get_worker_completion_acceptance(
+            conn,
+            unit_id=job_id,
+            lease_token=lease_token,
+            command_id=command_id,
+        )
+        after = await conn.fetchval("SELECT clock_timestamp()")
+
+        outcome = {
+            "new_status": "pending_review",
+            "report_seq": accepted.report_seq,
+        }
+        await conn.execute(
+            """
+            UPDATE job_completion_commands
+            SET state = 'done', outcome = $2::jsonb, finalized_at = now(),
+                finalizing_by = NULL, lease_expires_at = NULL
+            WHERE id = $1
+            """,
+            command_id,
+            json.dumps(outcome),
+        )
+        done = await get_worker_completion_acceptance(
+            conn,
+            unit_id=job_id,
+            lease_token=lease_token,
+            command_id=command_id,
+        )
+        wrong_command = await get_worker_completion_acceptance(
+            conn,
+            unit_id=job_id,
+            lease_token=lease_token,
+            command_id=uuid4(),
+        )
+
+    assert finalizing is not None
+    assert finalizing.job_status == "processing"
+    assert finalizing.queue_state == "done"
+    assert finalizing.command_state == "finalizing"
+    assert finalizing.command_id == command_id
+    assert finalizing.command_outcome == {}
+    assert finalizing.deadline_at == stored_times["deadline_at"]
+    assert finalizing.lease_expires_at == stored_times["lease_expires_at"]
+    assert finalizing.run_after == stored_times["run_after"]
+    assert not finalizing.deadline_expired
+
+    for remaining, target in (
+        (finalizing.deadline_remaining_seconds, finalizing.deadline_at),
+        (finalizing.lease_remaining_seconds, finalizing.lease_expires_at),
+        (finalizing.run_after_remaining_seconds, finalizing.run_after),
+    ):
+        assert remaining is not None
+        assert target is not None
+        lower_bound = max(0.0, (target - after).total_seconds())
+        upper_bound = max(0.0, (target - before).total_seconds())
+        assert lower_bound - 0.05 <= remaining <= upper_bound + 0.05
+
+    assert done is not None
+    assert done.command_id == command_id
+    assert done.command_state == "done"
+    assert done.command_outcome == outcome
+    assert done.lease_expires_at is None
+    assert done.lease_remaining_seconds is None
+    assert wrong_command is None
 
 
 @pytest.mark.asyncio
