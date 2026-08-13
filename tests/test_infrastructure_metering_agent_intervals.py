@@ -364,6 +364,14 @@ def _journal_connection(
             "agent_pod",
         ),
         (
+            _item(
+                name="srw-agent-stateless-75fb684dbb-x1",
+                labels={"app": "srw-agent-stateless", "srw/component": "agent"},
+            ),
+            PodProductClass.STATELESS_AGENT,
+            "agent_pod",
+        ),
+        (
             _item(name="postgres", labels={"app": "postgres"}),
             PodProductClass.OTHER,
             None,
@@ -385,6 +393,7 @@ def test_product_classifier_keeps_workspace_agent_and_other_shapes_distinct(
     elif expected in {
         PodProductClass.DYNAMIC_AGENT,
         PodProductClass.PERSISTENT_AGENT,
+        PodProductClass.STATELESS_AGENT,
     }:
         assert classification.activation_key == "agent_pod"
 
@@ -430,6 +439,46 @@ def test_dynamic_session_requires_full_uuid_and_matching_short_hint() -> None:
     invalid = classify_product_pod(invalid_item)
     assert not invalid.identity_consistent
     assert invalid.reason_code == "dynamic-agent-identity-conflict"
+
+
+def _stateless_item(extra_labels: dict[str, str] | None = None) -> InventoryItem:
+    labels = {"app": "srw-agent-stateless", "srw/component": "agent"}
+    labels.update(extra_labels or {})
+    return _item(name="srw-agent-stateless-75fb684dbb-x1", labels=labels)
+
+
+@pytest.mark.asyncio
+async def test_stateless_pool_attributes_to_platform_without_registration() -> None:
+    """The executor pool never registers per-pod identity, so attribution must
+    resolve to shared-platform up front — no mutual-binding lookup, no
+    binding cursor (the confirm path requires exactly that shape)."""
+    conn = AsyncMock()
+
+    attribution = await resolve_agent_pod_attribution(
+        conn, project_agent_pod(_stateless_item())
+    )
+
+    assert attribution.scope == "shared-platform"
+    assert attribution.owner_kind == "platform"
+    assert attribution.reason_code == "stateless-executor-pool"
+    assert attribution.agent_id is None
+    assert attribution.binding_revision is None
+    conn.fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stateless_pod_with_identity_labels_fails_toward_unknown() -> None:
+    """Identity labels contradict the pool's contract (pods serve many units);
+    a mislabeled pod must not be silently attributed to the platform."""
+    item = _stateless_item({"srw/job-id": str(JOB_ID)})
+    classification = classify_product_pod(item)
+    assert not classification.identity_consistent
+    assert classification.reason_code == "stateless-agent-identity-conflict"
+
+    attribution = await resolve_agent_pod_attribution(
+        AsyncMock(), project_agent_pod(item)
+    )
+    assert attribution.scope == "unknown"
 
 
 @pytest.mark.asyncio
