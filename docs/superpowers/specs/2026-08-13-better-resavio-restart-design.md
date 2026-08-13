@@ -398,3 +398,25 @@ archive notes pushed at `5044b83`. Not yet indexed — the connector needs step 
 `kbGitAllowedHosts: "srw-gitea:3000"`; `helm template` confirmed to emit
 `KB_GIT_ALLOWED_HOSTS: "srw-gitea:3000"`. Uncommitted and unpushed — pushing it
 carries four other unpushed `develop` commits, so it needs an explicit go-ahead.
+
+**Steps 8–9 (2026-08-13).** Code connector `2991589e` linked to the new project; it now carries
+all three connectors (native KB, history KB, KurortEngine repository). Binding convention note
+`where-the-code-lives-repos-kurortengine` authored into the live vault (`71fce98`), incremental
+reindex `Upserted: 1` — 477 notes, all with `search_doc` + embedding. Verified on the **agent's**
+retrieval path (chunk hybrid), which matches it for "where does the code live", "where do I write
+code", "do not write to repo" and "how is work delivered"; note-level FTS does *not* rank it for
+the looser phrasings, which is why the same fact is also carried in the project description where
+no retrieval is involved.
+
+**Two defects found and filed** while wiring the history connector — neither blocks the restart:
+
+- `docs/issues/kb_sweep_indexes_archived_projects_and_starves_connectors.md` — the sweep has no
+  project-status filter, and natives sweep before externals with no budget.
+- `docs/issues/kb_connector_token_auth_over_http_fails_invisibly.md` — token auth is correctly
+  refused over http, but the error is raised during source construction, before anything writes
+  `kb_index_watermark`, so the connector retried and failed every tick for over an hour behind a
+  stale, unrelated error.
+
+**History vault: not on the critical path.** It needs `kbGitAllowedHosts` to carry
+`git.srw.works` (prepared, render-verified, unpushed). The loop needs only the code repo and the
+live vault, both done. The archive is a scholar convenience and can land whenever.
