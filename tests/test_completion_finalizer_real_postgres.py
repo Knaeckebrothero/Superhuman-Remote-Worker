@@ -13,6 +13,7 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.services.completion_finalizer import (
+    CompletionDispositionSuperseded,
     CompletionFinalizer,
     CompletionLeaseLost,
 )
@@ -208,6 +209,218 @@ async def test_expired_owner_is_fenced_from_renew_and_finish_after_takeover(pg):
         await finalizer._finish(accepted.command_id, "old-owner", {"status": "stale"})
 
 
+@pytest.mark.asyncio
+async def test_cancel_after_accept_supersedes_before_workflow_or_effects(pg):
+    accepted, job_id, _ = await _accepted_pinned(pg)
+    async with pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET status='cancelled' WHERE id=$1",
+            job_id,
+        )
+    workflow_calls = 0
+
+    async def workflow(_runner):
+        nonlocal workflow_calls
+        workflow_calls += 1
+        return {"status": "handled", "new_status": "completed"}
+
+    result = await CompletionFinalizer(pg, workflow=workflow).finalize_command(
+        accepted.command_id
+    )
+
+    assert result.disposition == "superseded"
+    assert workflow_calls == 0
+    async with pg.acquire() as conn:
+        command = await conn.fetchrow(
+            "SELECT state, attempts, accepted_job_status, outcome, finalized_at, "
+            "error_code, finalizing_by, lease_expires_at FROM "
+            "job_completion_commands WHERE id=$1",
+            UUID(accepted.command_id),
+        )
+        effect_count = await conn.fetchval(
+            "SELECT count(*) FROM completion_effects "
+            "WHERE producer_kind='job_completion' AND producer_id=$1",
+            UUID(accepted.command_id),
+        )
+    outcome = json.loads(command["outcome"])
+    assert command["state"] == "superseded"
+    assert command["attempts"] == 1
+    assert command["accepted_job_status"] == "processing"
+    assert command["finalized_at"] is not None
+    assert command["error_code"] == "entry_status_superseded"
+    assert command["finalizing_by"] is None
+    assert command["lease_expires_at"] is None
+    assert outcome["observed_status"] == "cancelled"
+    assert outcome["expected_entry_statuses"] == ["processing"]
+    assert outcome["abandoned_effects"] == []
+    assert effect_count == 0
+
+
+@pytest.mark.asyncio
+async def test_typed_s17_race_supersedes_exact_term_and_abandons_pending_effect(pg):
+    accepted, job_id, _ = await _accepted_pinned(pg)
+
+    async def workflow(runner):
+        async def s17_attempt():
+            async with pg.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET status='cancelled' WHERE id=$1",
+                    job_id,
+                )
+            raise CompletionDispositionSuperseded(
+                observed_status="cancelled",
+                expected_statuses=("processing",),
+            )
+
+        await runner.run(
+            name="main_status_write",
+            group="job_disposition",
+            callback=s17_attempt,
+        )
+        raise AssertionError("typed status race did not stop the workflow")
+
+    result = await CompletionFinalizer(pg, workflow=workflow).finalize_command(
+        accepted.command_id
+    )
+
+    assert result.disposition == "superseded"
+    async with pg.acquire() as conn:
+        command = await conn.fetchrow(
+            "SELECT state, attempts, outcome, finalized_at, error_code, "
+            "finalizing_by, lease_expires_at FROM job_completion_commands "
+            "WHERE id=$1",
+            UUID(accepted.command_id),
+        )
+        effect = await conn.fetchrow(
+            "SELECT state, error_code FROM completion_effects "
+            "WHERE producer_kind='job_completion' AND producer_id=$1 "
+            "AND effect_name='main_status_write'",
+            UUID(accepted.command_id),
+        )
+    outcome = json.loads(command["outcome"])
+    assert command["state"] == "superseded"
+    assert command["attempts"] == 1
+    assert command["finalized_at"] is not None
+    assert command["error_code"] == "entry_status_superseded"
+    assert command["finalizing_by"] is None
+    assert command["lease_expires_at"] is None
+    assert outcome["observed_status"] == "cancelled"
+    assert outcome["abandoned_effects"] == ["main_status_write"]
+    assert effect["state"] == "pending"
+    assert effect["error_code"] == "CompletionDispositionSuperseded"
+
+
+@pytest.mark.asyncio
+async def test_post_s17_cancel_supersedes_before_class_c_effect(pg):
+    accepted, job_id, _ = await _accepted_pinned(pg)
+    class_c_calls = 0
+
+    async def workflow(runner):
+        async def write_s17():
+            async with pg.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET status='completed' WHERE id=$1",
+                    job_id,
+                )
+            return {"new_status": "completed"}
+
+        await runner.run(
+            name="main_status_write",
+            group="job_disposition",
+            callback=write_s17,
+        )
+        async with pg.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET status='cancelled' WHERE id=$1",
+                job_id,
+            )
+        await runner.assert_disposition_authority()
+
+        async def must_not_run():
+            nonlocal class_c_calls
+            class_c_calls += 1
+            return {"grafted": True}
+
+        await runner.run(
+            name="subjob_output_graft",
+            group="subjob_graft",
+            callback=must_not_run,
+        )
+        raise AssertionError("post-S17 cancel did not stop Class C")
+
+    result = await CompletionFinalizer(pg, workflow=workflow).finalize_command(
+        accepted.command_id
+    )
+
+    assert result.disposition == "superseded"
+    assert class_c_calls == 0
+    async with pg.acquire() as conn:
+        command = await conn.fetchrow(
+            "SELECT state, outcome, error_code FROM job_completion_commands "
+            "WHERE id=$1",
+            UUID(accepted.command_id),
+        )
+        effects = await conn.fetch(
+            "SELECT effect_name, state FROM completion_effects "
+            "WHERE producer_kind='job_completion' AND producer_id=$1 "
+            "ORDER BY effect_name",
+            UUID(accepted.command_id),
+        )
+    assert command["state"] == "superseded"
+    assert command["error_code"] == "entry_status_superseded"
+    assert json.loads(command["outcome"])["observed_status"] == "cancelled"
+    assert [(row["effect_name"], row["state"]) for row in effects] == [
+        ("main_status_write", "done")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completed_s23_pause_is_command_owned_disposition_authority(pg):
+    accepted, job_id, _ = await _accepted_pinned(pg)
+
+    async def workflow(runner):
+        async def write_s17():
+            async with pg.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET status='pending_review' WHERE id=$1",
+                    job_id,
+                )
+            return {"new_status": "pending_review"}
+
+        await runner.run(
+            name="main_status_write",
+            group="job_disposition",
+            callback=write_s17,
+        )
+
+        async def auto_deny_resume():
+            async with pg.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET status='paused' WHERE id=$1",
+                    job_id,
+                )
+            return {"auto_denied": True}
+
+        await runner.run(
+            name="auto_deny_resume",
+            group="auto_deny_resume",
+            callback=auto_deny_resume,
+        )
+        await runner.assert_disposition_authority()
+        return {"status": "handled", "new_status": "paused"}
+
+    result = await CompletionFinalizer(pg, workflow=workflow).finalize_command(
+        accepted.command_id
+    )
+
+    assert result.disposition == "done"
+    assert result.outcome == {"status": "handled", "new_status": "paused"}
+    async with pg.acquire() as conn:
+        assert await conn.fetchval("SELECT status FROM jobs WHERE id=$1", job_id) == (
+            "paused"
+        )
+
+
 async def _outcome(status: str) -> dict[str, str]:
     return {"status": status}
 
@@ -229,7 +442,11 @@ async def test_report_sequence_and_inline_grace_gate_background_claims(pg):
         client_report_id=str(uuid4()),
         requested_by="real-pg-finalizer-test",
     )
-    finalizer = CompletionFinalizer(pg, workflow=lambda runner: _outcome("done"))
+
+    async def ordered_noop(_runner):
+        return {"status": "done", "new_status": "processing"}
+
+    finalizer = CompletionFinalizer(pg, workflow=ordered_noop)
 
     grace = await finalizer.finalize_command(first.command_id, inline=False)
     assert grace.disposition == "busy"
@@ -240,6 +457,59 @@ async def test_report_sequence_and_inline_grace_gate_background_claims(pg):
 
     assert (await finalizer.finalize_command(first.command_id)).disposition == "done"
     assert (await finalizer.finalize_command(second.command_id)).disposition == "done"
+
+
+@pytest.mark.asyncio
+async def test_successor_adopts_done_predecessor_status_not_stale_accept_snapshot(pg):
+    first, job_id, agent_id = await _accepted_pinned(pg)
+    second = await accept_completion_command(
+        pg,
+        job_id=str(job_id),
+        payload={
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": "late crash report",
+            "freeze_data": None,
+        },
+        lease_token=None,
+        agent_id=str(agent_id),
+        client_report_id=str(uuid4()),
+        requested_by="real-pg-finalizer-test",
+    )
+
+    async def complete_first(_runner):
+        async with pg.acquire() as conn:
+            await conn.execute("UPDATE jobs SET status='completed' WHERE id=$1", job_id)
+        return {"status": "handled", "new_status": "completed"}
+
+    first_result = await CompletionFinalizer(
+        pg, workflow=complete_first
+    ).finalize_command(first.command_id)
+    observed_entry: str | None = None
+
+    async def absorb_late_error(runner):
+        nonlocal observed_entry
+        observed_entry = str(runner.command["resolved_entry_status"])
+        return {"status": "handled", "new_status": "completed"}
+
+    second_result = await CompletionFinalizer(
+        pg, workflow=absorb_late_error
+    ).finalize_command(second.command_id)
+
+    assert first_result.disposition == "done"
+    assert second_result.disposition == "done"
+    assert observed_entry == "completed"
+    async with pg.acquire() as conn:
+        states = await conn.fetch(
+            "SELECT report_seq, state, outcome FROM job_completion_commands "
+            "WHERE job_id=$1 ORDER BY report_seq",
+            job_id,
+        )
+        status = await conn.fetchval("SELECT status FROM jobs WHERE id=$1", job_id)
+    assert [row["state"] for row in states] == ["done", "done"]
+    assert json.loads(states[0]["outcome"])["new_status"] == "completed"
+    assert json.loads(states[1]["outcome"])["new_status"] == "completed"
+    assert status == "completed"
 
 
 @pytest.mark.asyncio

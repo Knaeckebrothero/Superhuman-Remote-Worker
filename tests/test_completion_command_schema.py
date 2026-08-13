@@ -22,6 +22,7 @@ MIGRATIONS = (
     MIGRATION_DIR / "0140_job_completion_commands.sql",
     MIGRATION_DIR / "0141_job_completion_sweep_routing.sql",
     MIGRATION_DIR / "0142_job_completion_sweep_route_precedence.sql",
+    MIGRATION_DIR / "0143_job_completion_accept_status.sql",
 )
 
 
@@ -252,6 +253,7 @@ async def test_state_checks_reject_every_half_written_terminal_shape(conn, overr
             "state": "superseded",
             "outcome": {"winner_report_seq": 1},
             "finalized_at": "2026-08-12T00:00:00Z",
+            "error_code": "entry_status_superseded",
         },
         {
             "state": "force_resolved",
@@ -275,6 +277,103 @@ async def test_client_report_id_deduplicates_per_job(conn):
     with pytest.raises(UniqueViolationError, match="uq_job_completion_client"):
         await _insert_command(conn, first_job, report_seq=2, client_report_id=report_id)
     await _insert_command(conn, second_job, client_report_id=report_id)
+
+
+@pytest.mark.asyncio
+async def test_accepted_job_status_is_nullable_but_never_blank(conn):
+    job_id = await _job(conn)
+    command_id = await _insert_command(conn, job_id)
+
+    assert (
+        await conn.fetchval(
+            "SELECT accepted_job_status FROM job_completion_commands WHERE id=$1",
+            command_id,
+        )
+        is None
+    )
+    with pytest.raises(
+        CheckViolationError, match="job_completion_accepted_status_nonempty"
+    ):
+        await conn.execute(
+            "UPDATE job_completion_commands SET accepted_job_status='   ' WHERE id=$1",
+            command_id,
+        )
+    await conn.execute(
+        "UPDATE job_completion_commands SET accepted_job_status='processing' "
+        "WHERE id=$1",
+        command_id,
+    )
+    assert (
+        await conn.fetchval(
+            "SELECT accepted_job_status FROM job_completion_commands WHERE id=$1",
+            command_id,
+        )
+        == "processing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_0143_backfills_only_completed_s1_proof_and_normalizes_superseded(
+    conn,
+):
+    await conn.execute("DROP VIEW IF EXISTS job_completion_sweep_exclusions")
+    await conn.execute("DROP TABLE IF EXISTS job_completion_sweep_actions CASCADE")
+    await conn.execute("DROP TABLE IF EXISTS completion_effects CASCADE")
+    await conn.execute("DROP TABLE IF EXISTS completion_finalizer_leases CASCADE")
+    await conn.execute("DROP TABLE IF EXISTS job_completion_commands CASCADE")
+    await conn.execute("DROP TABLE IF EXISTS jobs CASCADE")
+    await conn.execute("CREATE TABLE jobs (id UUID PRIMARY KEY)")
+    for migration in MIGRATIONS[:-1]:
+        await conn.execute(migration.read_text())
+
+    job_id = await _job(conn)
+    proved = await _insert_command(conn, job_id, report_seq=1)
+    pending = await _insert_command(conn, job_id, report_seq=2)
+    unjournaled = await _insert_command(conn, job_id, report_seq=3)
+    historical_superseded = await _insert_command(
+        conn,
+        job_id,
+        report_seq=4,
+        state="superseded",
+        outcome={"status": "superseded"},
+        finalized_at="2026-08-12T00:00:00Z",
+        error_code=None,
+    )
+    await conn.executemany(
+        """
+        INSERT INTO completion_effects (
+            producer_kind, producer_id, effect_name, effect_group, state, detail
+        ) VALUES ('job_completion', $1, 'late_callback_guard', 'entry', $2, $3::jsonb)
+        """,
+        [
+            (
+                proved,
+                "done",
+                json.dumps({"output": {"entry_status": " processing "}}),
+            ),
+            (
+                pending,
+                "pending",
+                json.dumps({"output": {"entry_status": "paused"}}),
+            ),
+        ],
+    )
+
+    await conn.execute(MIGRATIONS[-1].read_text())
+
+    rows = await conn.fetch(
+        "SELECT id, accepted_job_status, state, error_code, finalizing_by, "
+        "lease_expires_at FROM job_completion_commands ORDER BY report_seq"
+    )
+    by_id = {row["id"]: row for row in rows}
+    assert by_id[proved]["accepted_job_status"] == "processing"
+    assert by_id[pending]["accepted_job_status"] is None
+    assert by_id[unjournaled]["accepted_job_status"] is None
+    normalized = by_id[historical_superseded]
+    assert normalized["state"] == "superseded"
+    assert normalized["error_code"] == "entry_status_superseded"
+    assert normalized["finalizing_by"] is None
+    assert normalized["lease_expires_at"] is None
 
 
 @pytest.mark.asyncio

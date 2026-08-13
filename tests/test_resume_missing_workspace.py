@@ -176,3 +176,25 @@ class TestResumeJobOnAgentRefusesWorkspacelessJob:
         shed = AsyncMock(side_effect=RuntimeError("Not connected to database"))
         with patch.object(om.postgres_db, "shed_workspace_context", shed):
             assert await om._resume_job_on_agent(job, agent) is False
+
+    @pytest.mark.asyncio
+    async def test_flag_on_refusal_does_not_shed_after_dispatch_claim(self):
+        import orchestrator.main as om
+
+        job = {
+            "id": "4435994d-b029-444d-8a3c-26c64abd456a",
+            "config_override": {"workspace": {"backend": "vm"}},
+            "context": {"vm": {"status": "failed"}},
+        }
+        agent = {
+            "id": "c5651fce-c097-419c-822e-ada39c8c9d43",
+            "pod_ip": "10.42.0.9",
+        }
+        shed = AsyncMock()
+        with (
+            patch.object(om, "COMPLETION_COMMANDS_ENABLED", True),
+            patch.object(om.postgres_db, "shed_workspace_context", shed),
+        ):
+            assert await om._resume_job_on_agent(job, agent) is False
+
+        shed.assert_not_awaited()

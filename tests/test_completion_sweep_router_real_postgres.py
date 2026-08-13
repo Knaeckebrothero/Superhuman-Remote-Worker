@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,8 @@ from orchestrator.services.completion_sweep_router import (
     CompletionSweepRouter,
     _ClaimedAction,
 )
+from orchestrator.database.postgres import PostgresDB
+from src.shared.worker_queue import claim_worker_batch
 
 
 SCHEMA_FILE = (
@@ -105,6 +108,18 @@ async def _command(
         )
 
 
+def _db_from_pool(pool) -> PostgresDB:
+    db = PostgresDB.__new__(PostgresDB)
+
+    @asynccontextmanager
+    async def acquire():
+        async with pool.acquire() as conn:
+            yield conn
+
+    db.acquire = acquire
+    return db
+
+
 def _finalizer_result(command_id: str):
     return SimpleNamespace(
         command_id=command_id,
@@ -113,6 +128,207 @@ def _finalizer_result(command_id: str):
         outcome={"ignored": "x" * 20_000},
         error_code=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_resume_bypass_rolls_back_and_claim_skips_blocked_fifo_head(pg):
+    """The accepted-202 catastrophe dies at both mutation and claim layers."""
+
+    blocked_job = uuid4()
+    eligible_job = uuid4()
+    async with pg.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO jobs (id, description, status, execution_lane)
+            VALUES ($1, 'blocked', 'paused', 'stateless'),
+                   ($2, 'eligible', 'paused', 'stateless')
+            """,
+            blocked_job,
+            eligible_job,
+        )
+        await conn.execute(
+            """
+            INSERT INTO run_queue (
+                unit_id, unit_kind, state, priority, queued_at, run_after
+            ) VALUES
+                ($1, 'worker_batch', 'done', 100, now() - interval '2 minutes', now()),
+                ($2, 'worker_batch', 'queued', 0, now() - interval '1 minute', now())
+            """,
+            blocked_job,
+            eligible_job,
+        )
+    await _command(pg, blocked_job, state="pending")
+
+    db = _db_from_pool(pg)
+    assert not await db.queue_stateless_job_for_resume(
+        str(blocked_job),
+        {"queued_feedback": "must not start round two"},
+        expected_status="paused",
+        completion_commands_enabled=True,
+    )
+    async with pg.acquire() as conn:
+        blocked_after_resume = await conn.fetchrow(
+            "SELECT state, lease_token FROM run_queue WHERE unit_id=$1",
+            blocked_job,
+        )
+        blocked_status = await conn.fetchval(
+            "SELECT status::text FROM jobs WHERE id=$1", blocked_job
+        )
+    assert blocked_after_resume["state"] == "done"
+    assert blocked_after_resume["lease_token"] == 0
+    assert blocked_status == "paused"
+
+    # Bypass the public verb exactly as the catastrophe trace does.  The
+    # worker-side predicate is an independent safety layer: a command-blocked
+    # high-priority head must remain byte-for-byte queued while the claimant
+    # skips it and leases the next eligible unit.
+    async with pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE run_queue SET state='queued' WHERE unit_id=$1",
+            blocked_job,
+        )
+        blocked_before_claim = await conn.fetchrow(
+            "SELECT state, lease_token, attempts_since_completion, leased_by, "
+            "leased_until FROM run_queue WHERE unit_id=$1",
+            blocked_job,
+        )
+    assert blocked_before_claim["state"] == "queued"
+
+    claim = await claim_worker_batch(
+        pg,
+        pod_name="m2-claim-proof",
+        affinity_grace_seconds=0,
+        completion_commands_enabled=True,
+    )
+    assert claim is not None
+    assert claim.unit_id == eligible_job
+
+    async with pg.acquire() as conn:
+        blocked_after_claim = await conn.fetchrow(
+            "SELECT state, lease_token, attempts_since_completion, leased_by, "
+            "leased_until FROM run_queue WHERE unit_id=$1",
+            blocked_job,
+        )
+    assert dict(blocked_after_claim) == dict(blocked_before_claim)
+
+
+@pytest.mark.asyncio
+async def test_accept_holding_job_lock_wins_against_concurrent_pinned_resume(pg):
+    """The post-lock command read observes an accept that commits while waiting."""
+
+    job_id = await _job(pg)
+    db = _db_from_pool(pg)
+    accept_conn = await pg.acquire()
+    transaction = accept_conn.transaction()
+    await transaction.start()
+    committed = False
+    resume_task = None
+    try:
+        await accept_conn.fetchval("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", job_id)
+        resume_task = asyncio.create_task(
+            db.queue_job_for_resume(
+                str(job_id),
+                {"queued_feedback": "round two"},
+                expected_status="processing",
+                completion_commands_enabled=True,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not resume_task.done()
+        await accept_conn.execute(
+            """
+            INSERT INTO job_completion_commands (
+                job_id, report_seq, client_report_id, payload, payload_digest,
+                origin, requested_by, state, run_after, deadline_at, code_version
+            ) VALUES (
+                $1, 1, $2, '{}'::jsonb, 'digest', 'operator', 'race-test',
+                'pending', now(), now() + interval '1 hour', 'test-version'
+            )
+            """,
+            job_id,
+            uuid4(),
+        )
+        await transaction.commit()
+        committed = True
+        assert not await asyncio.wait_for(resume_task, timeout=2)
+    finally:
+        if not committed:
+            await transaction.rollback()
+        if resume_task is not None and not resume_task.done():
+            resume_task.cancel()
+            await asyncio.gather(resume_task, return_exceptions=True)
+        await pg.release(accept_conn)
+
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status::text AS status, context FROM jobs WHERE id=$1", job_id
+        )
+    assert row["status"] == "processing"
+    context = row["context"]
+    if isinstance(context, str):
+        context = json.loads(context)
+    assert "queued_feedback" not in (context or {})
+
+
+@pytest.mark.asyncio
+async def test_pinned_resume_holding_job_lock_closes_late_accept_fence(pg):
+    job_id = await _job(pg)
+    resume_conn = await pg.acquire()
+    transaction = resume_conn.transaction()
+    await transaction.start()
+    committed = False
+    accept_task = None
+
+    async def _late_accept() -> bool:
+        async with pg.acquire() as conn:
+            async with conn.transaction():
+                status = await conn.fetchval(
+                    "SELECT status::text FROM jobs WHERE id=$1 FOR UPDATE", job_id
+                )
+                if status != "processing":
+                    return False
+                await conn.execute(
+                    """
+                    INSERT INTO job_completion_commands (
+                        job_id, report_seq, client_report_id, payload,
+                        payload_digest, origin, requested_by, state,
+                        run_after, deadline_at, code_version
+                    ) VALUES (
+                        $1, 1, $2, '{}'::jsonb, 'digest', 'operator',
+                        'late-accept', 'pending', now(),
+                        now() + interval '1 hour', 'test-version'
+                    )
+                    """,
+                    job_id,
+                    uuid4(),
+                )
+                return True
+
+    try:
+        await resume_conn.fetchval("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", job_id)
+        accept_task = asyncio.create_task(_late_accept())
+        await asyncio.sleep(0.05)
+        assert not accept_task.done()
+        await resume_conn.execute(
+            "UPDATE jobs SET status='paused' WHERE id=$1 AND status='processing'",
+            job_id,
+        )
+        await transaction.commit()
+        committed = True
+        assert not await asyncio.wait_for(accept_task, timeout=2)
+    finally:
+        if not committed:
+            await transaction.rollback()
+        if accept_task is not None and not accept_task.done():
+            accept_task.cancel()
+            await asyncio.gather(accept_task, return_exceptions=True)
+        await pg.release(resume_conn)
+
+    async with pg.acquire() as conn:
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM job_completion_commands WHERE job_id=$1)",
+            job_id,
+        )
 
 
 class _BlockingFinalizer:

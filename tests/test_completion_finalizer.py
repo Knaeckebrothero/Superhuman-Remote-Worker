@@ -18,12 +18,14 @@ from uuid import UUID
 import pytest
 
 from orchestrator.services.completion_finalizer import (
+    CompletionDispositionSuperseded,
     CompletionEffectInFlight,
     CompletionEffectRunner,
     CompletionEffectVersionError,
     CompletionFinalizer,
     CompletionFinalizerError,
     CompletionLeaseLost,
+    CompletionTeardownSupersedeBlocked,
     EFFECT_DETAIL_LIMIT_BYTES,
     LeaderTerm,
 )
@@ -63,6 +65,7 @@ def _command(
         "reported_at": NOW,
         "accepted_lease_token": 9,
         "accepted_agent_id": None,
+        "accepted_job_status": "processing",
         "origin": "agent",
         "requested_by": "test-agent",
         "state": state,
@@ -90,8 +93,11 @@ class _Transaction(AbstractAsyncContextManager[None]):
 class _StatefulConnection:
     """Small asyncpg stand-in that enforces the finalizer's SQL predicates."""
 
-    def __init__(self, *commands: dict[str, Any]) -> None:
+    def __init__(
+        self, *commands: dict[str, Any], job_status: str = "processing"
+    ) -> None:
         self.now = NOW
+        self.job_status = job_status
         self.commands = {UUID(str(row["id"])): dict(row) for row in commands}
         self.effects: dict[tuple[UUID, str], dict[str, Any]] = {}
         self.leader: dict[str, Any] | None = None
@@ -143,6 +149,106 @@ class _StatefulConnection:
 
         if normalized.startswith("select * from job_completion_commands"):
             return self._row(args[0])
+
+        if normalized.startswith("select status::text as status from jobs"):
+            return {"status": self.job_status}
+
+        if normalized.startswith(
+            "select command.id, command.job_id, command.report_seq"
+        ):
+            command_id, job_id, owner = args
+            command_id = UUID(str(command_id))
+            command = self.commands.get(command_id)
+            if (
+                command is None
+                or command["job_id"] != UUID(str(job_id))
+                or not self._command_term_live(command_id, owner)
+                or command["deadline_at"] <= self.now
+            ):
+                return None
+            s1 = self.effects.get((command_id, "late_callback_guard"))
+            predecessors = sorted(
+                (
+                    candidate
+                    for candidate in self.commands.values()
+                    if candidate["job_id"] == command["job_id"]
+                    and candidate["report_seq"] < command["report_seq"]
+                ),
+                key=lambda row: row["report_seq"],
+                reverse=True,
+            )
+            predecessor = predecessors[0] if predecessors else None
+            return {
+                "id": command["id"],
+                "job_id": command["job_id"],
+                "report_seq": command["report_seq"],
+                "accepted_job_status": command.get("accepted_job_status"),
+                "s1_state": s1.get("state") if s1 else None,
+                "s1_detail": dict(s1.get("detail") or {}) if s1 else None,
+                "predecessor_report_seq": (
+                    predecessor["report_seq"] if predecessor else None
+                ),
+                "predecessor_state": (predecessor["state"] if predecessor else None),
+                "predecessor_outcome": (
+                    predecessor.get("outcome") if predecessor else None
+                ),
+            }
+
+        if normalized.startswith("select command.id, disposition.state"):
+            command_id, job_id, owner = args
+            command_id = UUID(str(command_id))
+            command = self.commands.get(command_id)
+            if (
+                command is None
+                or command["job_id"] != UUID(str(job_id))
+                or not self._command_term_live(command_id, owner)
+                or command["deadline_at"] <= self.now
+            ):
+                return None
+            disposition = self.effects.get((command_id, "main_status_write"))
+            auto_deny = self.effects.get((command_id, "auto_deny_resume"))
+            teardown = self.effects.get((command_id, "workspace_archive_teardown"))
+            return {
+                "id": command["id"],
+                "disposition_state": (
+                    disposition.get("state") if disposition else None
+                ),
+                "disposition_detail": (
+                    dict(disposition.get("detail") or {}) if disposition else None
+                ),
+                "auto_deny_state": auto_deny.get("state") if auto_deny else None,
+                "auto_deny_detail": (
+                    dict(auto_deny.get("detail") or {}) if auto_deny else None
+                ),
+                "teardown_state": teardown.get("state") if teardown else None,
+                "teardown_detail": (
+                    dict(teardown.get("detail") or {}) if teardown else None
+                ),
+            }
+
+        if normalized.startswith(
+            "select id, job_id, report_seq, accepted_job_status "
+            "from job_completion_commands"
+        ):
+            command_id, job_id, owner = args
+            command_id = UUID(str(command_id))
+            command = self.commands.get(command_id)
+            if (
+                command is None
+                or command["job_id"] != UUID(str(job_id))
+                or not self._command_term_live(command_id, owner)
+                or command["deadline_at"] <= self.now
+            ):
+                return None
+            return {
+                key: command.get(key)
+                for key in (
+                    "id",
+                    "job_id",
+                    "report_seq",
+                    "accepted_job_status",
+                )
+            }
 
         if normalized.startswith(
             "update job_completion_commands as command set state = 'parked'"
@@ -342,6 +448,27 @@ class _StatefulConnection:
             )
             return dict(command)
 
+        if normalized.startswith(
+            "update job_completion_commands set state = 'superseded'"
+        ):
+            command_id, owner, outcome_json, error_code = args
+            command_id = UUID(str(command_id))
+            command = self.commands[command_id]
+            if (
+                not self._command_term_live(command_id, owner)
+                or command["deadline_at"] <= self.now
+            ):
+                return None
+            command.update(
+                state="superseded",
+                outcome=json.loads(outcome_json),
+                finalized_at=self.now,
+                error_code=error_code,
+                finalizing_by=None,
+                lease_expires_at=None,
+            )
+            return dict(command)
+
         if normalized.startswith("update job_completion_commands set state = 'parked'"):
             command_id, owner, error_code = args
             command_id = UUID(str(command_id))
@@ -394,6 +521,25 @@ class _StatefulConnection:
             return {"elected_at": self.now}
 
         raise AssertionError(f"unexpected fetchrow query: {sql}")
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        normalized = self._record("fetch", sql, args)
+        if normalized.startswith(
+            "select effect_name, state, detail from completion_effects"
+        ):
+            command_id = UUID(str(args[0]))
+            return [
+                {
+                    "effect_name": effect_name,
+                    "state": effect["state"],
+                    "detail": dict(effect.get("detail") or {}),
+                }
+                for (producer_id, effect_name), effect in sorted(
+                    self.effects.items(), key=lambda item: item[0][1]
+                )
+                if producer_id == command_id and effect["state"] != "done"
+            ]
+        raise AssertionError(f"unexpected fetch query: {sql}")
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
         normalized = self._record("fetchval", sql, args)
@@ -605,6 +751,82 @@ async def test_effect_intent_precedes_callback_and_completed_detail_replays() ->
         name="workspace_archive", group="teardown", callback=must_not_run
     ) == {"pod_uid": "uid-a"}
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_class_c_authority_guard_detects_post_s17_control_write() -> None:
+    conn = _StatefulConnection(_finalizing(), job_status="cancelled")
+    conn.effects[(COMMAND_ID, "main_status_write")] = {
+        "effect_name": "main_status_write",
+        "effect_group": "job_disposition",
+        "state": "done",
+        "attempts": 1,
+        "max_attempts": 5,
+        "intent_at": NOW,
+        "complete_by": None,
+        "completed_at": NOW,
+        "detail": {"output": {"new_status": "completed"}},
+        "error_code": None,
+    }
+    runner = CompletionEffectRunner(
+        conn,
+        command=conn.commands[COMMAND_ID],
+        owner="owner-a",
+    )
+
+    with pytest.raises(CompletionDispositionSuperseded) as raised:
+        await runner.assert_disposition_authority()
+
+    assert raised.value.observed_status == "cancelled"
+    assert raised.value.expected_statuses == ("completed",)
+
+
+@pytest.mark.asyncio
+async def test_class_c_authority_guard_is_vacuous_without_s17() -> None:
+    conn = _StatefulConnection(_finalizing(), job_status="cancelled")
+    runner = CompletionEffectRunner(
+        conn,
+        command=conn.commands[COMMAND_ID],
+        owner="owner-a",
+    )
+
+    await runner.assert_disposition_authority()
+
+
+@pytest.mark.asyncio
+async def test_class_c_authority_accepts_completed_s23_owned_pause() -> None:
+    conn = _StatefulConnection(_finalizing(), job_status="paused")
+    conn.effects[(COMMAND_ID, "main_status_write")] = {
+        "effect_name": "main_status_write",
+        "effect_group": "job_disposition",
+        "state": "done",
+        "attempts": 1,
+        "max_attempts": 5,
+        "intent_at": NOW,
+        "complete_by": None,
+        "completed_at": NOW,
+        "detail": {"output": {"new_status": "pending_review"}},
+        "error_code": None,
+    }
+    conn.effects[(COMMAND_ID, "auto_deny_resume")] = {
+        "effect_name": "auto_deny_resume",
+        "effect_group": "auto_deny_resume",
+        "state": "done",
+        "attempts": 1,
+        "max_attempts": 5,
+        "intent_at": NOW,
+        "complete_by": None,
+        "completed_at": NOW,
+        "detail": {"output": {"auto_denied": True}},
+        "error_code": None,
+    }
+    runner = CompletionEffectRunner(
+        conn,
+        command=conn.commands[COMMAND_ID],
+        owner="owner-a",
+    )
+
+    await runner.assert_disposition_authority()
 
 
 @pytest.mark.asyncio
@@ -1011,6 +1233,227 @@ async def test_predecessor_and_run_after_gate_background_claim_only() -> None:
     claimed, inline_owner = await finalizer._claim(str(SECOND_COMMAND_ID), inline=True)
     assert inline_owner is not None
     assert claimed is not None and claimed["state"] == "finalizing"
+
+
+@pytest.mark.asyncio
+async def test_entry_status_race_supersedes_whole_command_before_workflow() -> None:
+    conn = _StatefulConnection(_command(), job_status="cancelled")
+    workflow_called = False
+
+    async def workflow(_runner: CompletionEffectRunner) -> dict[str, Any]:
+        nonlocal workflow_called
+        workflow_called = True
+        return {"new_status": "completed"}
+
+    result = await CompletionFinalizer(conn, workflow=workflow).finalize_command(
+        str(COMMAND_ID)
+    )
+
+    assert result.disposition == "superseded"
+    assert result.state == "superseded"
+    assert result.error_code == "entry_status_superseded"
+    assert workflow_called is False
+    assert result.outcome == {
+        "status": "superseded",
+        "job_id": str(JOB_ID),
+        "report_seq": 1,
+        "reason": "entry_status_superseded",
+        "accepted_job_status": "processing",
+        "expected_entry_statuses": ["processing"],
+        "observed_status": "cancelled",
+        "winning_report_seq": None,
+        "abandoned_effects": [],
+    }
+    command = conn.commands[COMMAND_ID]
+    assert command["state"] == "superseded"
+    assert command["outcome"] == result.outcome
+    assert command["finalized_at"] == NOW
+    assert command["error_code"] == "entry_status_superseded"
+    assert command["finalizing_by"] is None
+    assert command["lease_expires_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_unproven_legacy_null_entry_status_supersedes_fail_closed() -> None:
+    legacy = _command()
+    legacy["accepted_job_status"] = None
+    conn = _StatefulConnection(legacy)
+
+    async def must_not_run(_runner: CompletionEffectRunner) -> dict[str, Any]:
+        raise AssertionError("legacy NULL command guessed current jobs.status")
+
+    result = await CompletionFinalizer(conn, workflow=must_not_run).finalize_command(
+        str(COMMAND_ID)
+    )
+
+    assert result.disposition == "superseded"
+    assert result.outcome is not None
+    assert result.outcome["accepted_job_status"] is None
+    assert result.outcome["expected_entry_statuses"] == []
+    assert result.outcome["observed_status"] == "processing"
+
+
+@pytest.mark.asyncio
+async def test_successor_adopts_immediate_done_predecessor_status_in_order() -> None:
+    predecessor = _command(state="done")
+    predecessor.update(
+        outcome={"status": "handled", "new_status": "completed"},
+        finalized_at=NOW,
+    )
+    successor = _command(SECOND_COMMAND_ID, report_seq=2)
+    conn = _StatefulConnection(predecessor, successor, job_status="completed")
+    observed_entry: str | None = None
+
+    async def workflow(runner: CompletionEffectRunner) -> dict[str, Any]:
+        nonlocal observed_entry
+        observed_entry = str(runner.command["resolved_entry_status"])
+        return {"status": "handled", "new_status": "completed"}
+
+    result = await CompletionFinalizer(conn, workflow=workflow).finalize_command(
+        str(SECOND_COMMAND_ID)
+    )
+
+    assert result.disposition == "done"
+    assert observed_entry == "completed"
+    assert conn.commands[SECOND_COMMAND_ID]["state"] == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("predecessor_state", ["superseded", "force_resolved"])
+async def test_successor_does_not_adopt_operator_or_superseded_predecessor(
+    predecessor_state: str,
+) -> None:
+    predecessor = _command(state=predecessor_state)
+    predecessor.update(
+        outcome={"status": predecessor_state, "new_status": "completed"},
+        finalized_at=NOW,
+        error_code=(
+            "entry_status_superseded"
+            if predecessor_state == "superseded"
+            else "forced_by_operator"
+        ),
+    )
+    successor = _command(SECOND_COMMAND_ID, report_seq=2)
+    # Even returning to the successor's original accept status cannot bless a
+    # report whose immediate predecessor did not produce an ordinary done
+    # disposition. The lower terminal row is now the ordering authority.
+    conn = _StatefulConnection(predecessor, successor, job_status="processing")
+    workflow_called = False
+
+    async def workflow(_runner: CompletionEffectRunner) -> dict[str, Any]:
+        nonlocal workflow_called
+        workflow_called = True
+        return {"new_status": "completed"}
+
+    result = await CompletionFinalizer(conn, workflow=workflow).finalize_command(
+        str(SECOND_COMMAND_ID)
+    )
+
+    assert result.disposition == "superseded"
+    assert workflow_called is False
+    assert result.outcome is not None
+    assert result.outcome["expected_entry_statuses"] == ["processing"]
+    assert result.outcome["observed_status"] == "processing"
+
+
+@pytest.mark.asyncio
+async def test_completed_s1_proof_keeps_same_command_retry_resumable() -> None:
+    conn = _StatefulConnection(_command(), job_status="paused")
+    conn.effects[(COMMAND_ID, "late_callback_guard")] = {
+        "effect_name": "late_callback_guard",
+        "effect_group": "entry",
+        "state": "done",
+        "attempts": 1,
+        "max_attempts": 5,
+        "intent_at": NOW,
+        "complete_by": None,
+        "completed_at": NOW,
+        "detail": {"output": {"entry_status": "processing", "matched": False}},
+        "error_code": None,
+    }
+
+    async def workflow(runner: CompletionEffectRunner) -> dict[str, Any]:
+        assert runner.command["resolved_entry_status"] == "processing"
+        return {"status": "handled", "new_status": "paused"}
+
+    result = await CompletionFinalizer(conn, workflow=workflow).finalize_command(
+        str(COMMAND_ID)
+    )
+
+    assert result.disposition == "done"
+    assert result.outcome == {"status": "handled", "new_status": "paused"}
+
+
+@pytest.mark.asyncio
+async def test_typed_workflow_race_supersedes_with_abandoned_effects_not_retry() -> (
+    None
+):
+    conn = _StatefulConnection(_command())
+    conn.effects[(COMMAND_ID, "workspace_archive_teardown")] = {
+        "effect_name": "workspace_archive_teardown",
+        "effect_group": "workspace_teardown",
+        "state": "pending",
+        "attempts": 1,
+        "max_attempts": 5,
+        "intent_at": NOW,
+        "complete_by": None,
+        "completed_at": None,
+        "detail": {},
+        "error_code": None,
+    }
+
+    async def workflow(_runner: CompletionEffectRunner) -> dict[str, Any]:
+        conn.job_status = "cancelled"
+        raise CompletionDispositionSuperseded(
+            observed_status="cancelled",
+            expected_statuses=("processing",),
+        )
+
+    result = await CompletionFinalizer(conn, workflow=workflow).finalize_command(
+        str(COMMAND_ID)
+    )
+
+    assert result.disposition == "superseded"
+    assert result.outcome is not None
+    assert result.outcome["observed_status"] == "cancelled"
+    assert result.outcome["abandoned_effects"] == ["workspace_archive_teardown"]
+    assert conn.commands[COMMAND_ID]["attempts"] == 1
+    assert conn.commands[COMMAND_ID]["state"] == "superseded"
+
+
+@pytest.mark.asyncio
+async def test_whole_command_supersede_cannot_abandon_authorized_s36() -> None:
+    conn = _StatefulConnection(_command())
+    conn.effects[(COMMAND_ID, "workspace_archive_teardown")] = {
+        "effect_name": "workspace_archive_teardown",
+        "effect_group": "workspace_teardown",
+        "state": "pending",
+        "attempts": 1,
+        "max_attempts": 5,
+        "intent_at": NOW,
+        "complete_by": None,
+        "completed_at": None,
+        "detail": {"teardown_authorization": {"active": True, "report_seq": 1}},
+        "error_code": None,
+    }
+
+    async def workflow(_runner: CompletionEffectRunner) -> dict[str, Any]:
+        conn.job_status = "cancelled"
+        raise CompletionDispositionSuperseded(
+            observed_status="cancelled",
+            expected_statuses=("processing",),
+        )
+
+    result = await CompletionFinalizer(conn, workflow=workflow).finalize_command(
+        str(COMMAND_ID)
+    )
+
+    assert result.disposition == "retry"
+    assert result.error_code == CompletionTeardownSupersedeBlocked.__name__
+    assert conn.commands[COMMAND_ID]["state"] == "pending"
+    assert conn.effects[(COMMAND_ID, "workspace_archive_teardown")]["state"] == (
+        "pending"
+    )
 
 
 @pytest.mark.asyncio

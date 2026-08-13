@@ -122,6 +122,8 @@ from database.postgres import (  # noqa: E402
     DatasourceProjectAuthorizationError,
     DatasourcePolicyValidationError,
     DatasourceScopeAuthorizationError,
+    _completion_control_active_sql,
+    _completion_control_owned_active_sql,
 )
 from security.auth import (  # noqa: E402
     get_current_user,
@@ -1905,6 +1907,11 @@ async def _fail_expired_vm_upgrade_jobs() -> int:
             "WHERE completion_route.job_id = j.id)"
         )
     )
+    control_guard = (
+        ""
+        if not COMPLETION_COMMANDS_ENABLED
+        else f" AND NOT ({_completion_control_active_sql('j.context')})"
+    )
     async with postgres_db.acquire() as conn:
         rows = await conn.fetch(
             f"""
@@ -1923,6 +1930,7 @@ async def _fail_expired_vm_upgrade_jobs() -> int:
                     AND s.status = 'pending'
               )
               {completion_exclusion}
+              {control_guard}
             """
         )
         for row in rows:
@@ -1936,10 +1944,16 @@ async def _fail_expired_vm_upgrade_jobs() -> int:
                     "WHERE completion_route.job_id = jobs.id)"
                 )
             )
+            update_control_guard = (
+                ""
+                if not COMPLETION_COMMANDS_ENABLED
+                else f" AND NOT ({_completion_control_active_sql('context')})"
+            )
             await conn.execute(
                 f"UPDATE jobs SET status = 'failed', freeze_data = NULL, "
                 "error_message = $2, updated_at = CURRENT_TIMESTAMP "
-                f"WHERE id = $1 AND status = 'paused'{update_exclusion}",
+                f"WHERE id = $1 AND status = 'paused'{update_exclusion}"
+                f"{update_control_guard}",
                 row["id"],
                 "vm_upgrade_expired: the VM-upgrade approval window (24h) "
                 "closed with no decision. Re-run or resume the job — the sudo "
@@ -4303,7 +4317,10 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
 
     _log_token = bind_log_context(job_id=job_id, agent_id=agent_id)
     try:
-        job_start = await _build_job_start_request(job)
+        job_start = await _build_job_start_request(
+            job,
+            persist_dispatch_state=not COMPLETION_COMMANDS_ENABLED,
+        )
         if job_start is None:
             return False
 
@@ -4322,11 +4339,21 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             )
             return False
 
-        await postgres_db.update_job_status(
-            job_id=job_id,
-            status="processing",
-            assigned_agent_id=agent_id,
-        )
+        if COMPLETION_COMMANDS_ENABLED:
+            if not await postgres_db.confirm_pinned_job_dispatch(job_id, agent_id):
+                logger.warning(
+                    "Dispatch: stale success from agent %s for job %s; "
+                    "control/ownership changed",
+                    agent_id,
+                    job_id,
+                )
+                return False
+        else:
+            await postgres_db.update_job_status(
+                job_id=job_id,
+                status="processing",
+                assigned_agent_id=agent_id,
+            )
         await postgres_db.heartbeat(
             agent_id=agent_id,
             status="working",
@@ -4393,17 +4420,18 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         # ever rebuilding the workspace. Best-effort — refusing the resume is
         # valid on its own, and this runs outside the try below, so letting a
         # shed error escape would break callers that expect a bool.
-        try:
-            await postgres_db.shed_workspace_context(
-                job_id, _WORKSPACE_CONTEXT_KEYS[missing_workspace]
-            )
-        except Exception:
-            logger.warning(
-                "Resume dispatch: could not shed stale %s context for job %s",
-                missing_workspace,
-                job_id,
-                exc_info=True,
-            )
+        if not COMPLETION_COMMANDS_ENABLED:
+            try:
+                await postgres_db.shed_workspace_context(
+                    job_id, _WORKSPACE_CONTEXT_KEYS[missing_workspace]
+                )
+            except Exception:
+                logger.warning(
+                    "Resume dispatch: could not shed stale %s context for job %s",
+                    missing_workspace,
+                    job_id,
+                    exc_info=True,
+                )
         return False
 
     try:
@@ -4417,11 +4445,12 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 job_id,
                 exc_info=True,
             )
-            await postgres_db.update_job_status(
-                job_id,
-                status="failed",
-                error_message="connector_unavailable",
-            )
+            if not COMPLETION_COMMANDS_ENABLED:
+                await postgres_db.update_job_status(
+                    job_id,
+                    status="failed",
+                    error_message="connector_unavailable",
+                )
             return False
 
         has_knowledge_scope = bool(job.get("project_id")) or any(
@@ -4467,11 +4496,12 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 )
             except GrantDenied as gd:
                 logger.warning("Resume denied for job %s: %s", job.get("id"), gd)
-                await postgres_db.update_job_status(
-                    str(job["id"]),
-                    status="failed",
-                    error_message=_grant_violations_detail(gd.violations),
-                )
+                if not COMPLETION_COMMANDS_ENABLED:
+                    await postgres_db.update_job_status(
+                        str(job["id"]),
+                        status="failed",
+                        error_message=_grant_violations_detail(gd.violations),
+                    )
                 return False
 
         if resolved_ds:
@@ -4558,9 +4588,10 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                     "backend='sandbox' or 'vm', or detach the repository."
                 )
                 logger.error("Resume dispatch: job %s rejected — %s", job_id, msg)
-                await postgres_db.update_job_status(
-                    job_id=job_id, status="failed", error_message=msg
-                )
+                if not COMPLETION_COMMANDS_ENABLED:
+                    await postgres_db.update_job_status(
+                        job_id=job_id, status="failed", error_message=msg
+                    )
                 return False
             try:
                 config_override = _inject_lite_workspace_config(
@@ -4570,9 +4601,10 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 logger.error(
                     "Resume dispatch: job %s lite-config error: %s", job_id, exc
                 )
-                await postgres_db.update_job_status(
-                    job_id=job_id, status="failed", error_message=str(exc)
-                )
+                if not COMPLETION_COMMANDS_ENABLED:
+                    await postgres_db.update_job_status(
+                        job_id=job_id, status="failed", error_message=str(exc)
+                    )
                 return False
 
         # Extract queued feedback (stored by the resume endpoint when no agent
@@ -4661,15 +4693,29 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             )
             if value
         ]
-        if consumed_keys:
+        if consumed_keys and not COMPLETION_COMMANDS_ENABLED:
             await postgres_db.delete_job_context_keys(job_id, consumed_keys)
 
-        # Update job status and assign to agent
-        await postgres_db.update_job_status(
-            job_id=job_id,
-            status="processing",
-            assigned_agent_id=agent_id,
-        )
+        if COMPLETION_COMMANDS_ENABLED:
+            if not await postgres_db.confirm_pinned_job_dispatch(
+                job_id,
+                agent_id,
+                consumed_context_keys=consumed_keys,
+            ):
+                logger.warning(
+                    "Resume dispatch: stale success from agent %s for job %s; "
+                    "control/ownership changed",
+                    agent_id,
+                    job_id,
+                )
+                return False
+        else:
+            # Update job status and assign to agent
+            await postgres_db.update_job_status(
+                job_id=job_id,
+                status="processing",
+                assigned_agent_id=agent_id,
+            )
 
         await postgres_db.heartbeat(
             agent_id=agent_id,
@@ -4703,26 +4749,54 @@ async def _initiate_pause(job: dict) -> None:
         logger.warning(f"Preempt: no pod IP for job {job_id} agent — cannot pause")
         return
 
+    pause_claim = None
+    release_pause_claim = False
     try:
+        if COMPLETION_COMMANDS_ENABLED:
+            pause_claim = await _claim_completion_pause(
+                job_id,
+                source="dispatcher_preempt",
+                expected_agent_id=(
+                    str(job["assigned_agent_id"])
+                    if job.get("assigned_agent_id")
+                    else None
+                ),
+            )
         agent_url = f"http://{job['pod_ip']}:{job['pod_port']}/job/pause"
         async with httpx.AsyncClient(timeout=130.0) as client:
             response = await client.post(agent_url)
 
-        if response.status_code in (200, 408):
-            # 200 = paused, 408 = timed out but flag set (will pause after current node)
+        if response.status_code == 200:
+            release_pause_claim = True
             logger.info(
                 f"Preempt: pause request sent for job {job_id} on agent {agent_id}"
             )
-            # DB update handled by agent + orchestrator fallback
-            await postgres_db.pause_job(job_id)
+            if not COMPLETION_COMMANDS_ENABLED:
+                await postgres_db.pause_job(job_id)
+        elif response.status_code == 408:
+            logger.warning(
+                "Preempt: pause timed out for job %s; retaining bounded control hold",
+                job_id,
+            )
+            if not COMPLETION_COMMANDS_ENABLED:
+                await postgres_db.pause_job(job_id)
         else:
             logger.warning(
                 f"Preempt: agent returned {response.status_code} for pause of job {job_id}"
             )
 
+    except HTTPException as exc:
+        logger.info("Preempt: pause claim lost for job %s: %s", job_id, exc.detail)
     except Exception as e:
         logger.warning(f"Preempt: failed to pause job {job_id}: {e}")
     finally:
+        if pause_claim is not None and release_pause_claim:
+            await _abort_completion_control_claim(pause_claim)
+        elif pause_claim is not None:
+            logger.warning(
+                "Preempt: retaining pause control hold for job %s until bounded expiry",
+                job_id,
+            )
         _pause_pending_job_ids.discard(job_id)
 
 
@@ -7969,13 +8043,19 @@ async def _try_dispatch_pending_jobs() -> None:
             # stateless set is admitted to run_queue and never reaches that
             # half of this function.
             pending_jobs = (
-                await postgres_db.get_dispatchable_jobs(limit=50)
+                await postgres_db.get_dispatchable_jobs(
+                    limit=50,
+                    **_completion_dispatch_guard_kwargs(),
+                )
                 if AUTO_ASSIGN_ENABLED
                 else []
             )
             if STATELESS_WORKER_ENABLED:
                 pending_jobs.extend(
-                    await postgres_db.get_admittable_stateless_jobs(limit=50)
+                    await postgres_db.get_admittable_stateless_jobs(
+                        limit=50,
+                        **_completion_dispatch_guard_kwargs(),
+                    )
                 )
             if not pending_jobs:
                 return
@@ -8593,6 +8673,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         job_id,
                         fair_key=(str(job["user_id"]) if job.get("user_id") else None),
                         priority=int(job.get("priority") or 0),
+                        **_completion_dispatch_guard_kwargs(),
                     )
                     if not admitted:
                         logger.warning(
@@ -8651,7 +8732,11 @@ async def _try_dispatch_pending_jobs() -> None:
                 # candidate, but only one CAS wins — the loser skips. The claim
                 # sets status='processing'+assigned_agent_id; a failed
                 # dispatch/resume below self-heals via recover_orphaned_jobs.
-                if not await postgres_db.claim_job_for_agent(job_id, str(agent["id"])):
+                if not await postgres_db.claim_job_for_agent(
+                    job_id,
+                    str(agent["id"]),
+                    **_completion_dispatch_guard_kwargs(),
+                ):
                     logger.debug(
                         "Dispatcher: job %s already claimed by another replica; skipping",
                         job_id,
@@ -9882,6 +9967,7 @@ class CustomJSONResponse(JSONResponse):
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     global _completion_finalizer_instance, _completion_sweep_router_instance
+    global _completion_control_instance
     global _shutdown_event
 
     # Hard-fail if the legacy LLM_BASE_URL env var is set. The env-var-driven
@@ -11091,6 +11177,7 @@ async def lifespan(app: FastAPI):
             stateless_cancel_fn=(
                 postgres_db.cancel_and_settle_stale_stateless_verification_subjob
             ),
+            completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
         )
     )
     # Backstop for session wakes: deliver any completion notice whose
@@ -11214,6 +11301,7 @@ async def lifespan(app: FastAPI):
             suspension_service=workspace_suspension_service,
             snapshot_service=snapshot_service,
             db=postgres_db,
+            completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
         )
     )
     # Startup reconciliation: rebuild the in-memory view from K8s
@@ -11328,6 +11416,7 @@ async def lifespan(app: FastAPI):
     await postgres_db.disconnect()
     _completion_finalizer_instance = None
     _completion_sweep_router_instance = None
+    _completion_control_instance = None
 
 
 app = FastAPI(
@@ -12795,15 +12884,55 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
     pinned_children = [c for c in children if c.get("execution_lane") != "stateless"]
     stateless_children = [c for c in children if c.get("execution_lane") == "stateless"]
 
-    await asyncio.gather(
-        *[_signal_cancel(c) for c in pinned_children],
-        *[_cleanup_child(c) for c in pinned_children],
-        return_exceptions=True,
-    )
+    pinned_settled = True
+    if COMPLETION_COMMANDS_ENABLED:
+
+        async def _cancel_pinned_child(child: dict) -> bool:
+            child_id = str(child["id"])
+            won = await postgres_db.linearize_pinned_cancel(
+                child_id,
+                expected_status=str(child.get("status") or ""),
+                completion_commands_enabled=True,
+            )
+            if not won:
+                refreshed = await postgres_db.get_job(child_id)
+                return not refreshed or refreshed.get("status") in (
+                    "completed",
+                    "failed",
+                    "cancelled",
+                )
+            await asyncio.gather(
+                _signal_cancel(child),
+                _cleanup_child(child),
+                return_exceptions=True,
+            )
+            return True
+
+        pinned_results = await asyncio.gather(
+            *[_cancel_pinned_child(c) for c in pinned_children],
+            return_exceptions=True,
+        )
+        for child, result in zip(pinned_children, pinned_results, strict=True):
+            if result is True:
+                continue
+            pinned_settled = False
+            logger.error(
+                "Cascade cancellation stood down for pinned child %s because "
+                "another completion/control owner won",
+                child.get("id"),
+            )
+    else:
+        await asyncio.gather(
+            *[_signal_cancel(c) for c in pinned_children],
+            *[_cleanup_child(c) for c in pinned_children],
+            return_exceptions=True,
+        )
 
     async def _cancel_stateless_child(child: dict) -> bool:
         child_id = str(child["id"])
-        cancelled, _queue_closed = await postgres_db.cancel_stateless_job(child_id)
+        cancelled, _queue_closed = await postgres_db.cancel_stateless_job(
+            child_id, **_completion_dispatch_guard_kwargs()
+        )
         if cancelled:
             return await _wait_for_stateless_cancel_settle(child_id)
         refreshed = await postgres_db.get_job(child_id)
@@ -12846,7 +12975,7 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
 
     # Bulk cancel in DB
     pinned_ids = [str(c["id"]) for c in pinned_children]
-    if pinned_ids:
+    if pinned_ids and not COMPLETION_COMMANDS_ENABLED:
         async with postgres_db.acquire() as conn:
             await conn.execute(
                 """
@@ -12861,7 +12990,7 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
             )
 
     logger.info(f"Cascade-cancelled {len(children)} descendant(s) of job {job_id}")
-    return stateless_settled
+    return pinned_settled and stateless_settled
 
 
 async def _cascade_pause_to_children(job_id: str) -> None:
@@ -12882,36 +13011,111 @@ async def _cascade_pause_to_children(job_id: str) -> None:
         c for c in processing if c.get("execution_lane") == "stateless"
     ]
 
-    async def _signal_pause(child: dict) -> None:
+    async def _signal_pause(
+        child: dict,
+        *,
+        already_paused: bool = False,
+        require_positive_quiescence: bool = False,
+    ) -> bool:
         child_id = str(child["id"])
         agent_id = child.get("assigned_agent_id")
-        if not agent_id:
-            return
-        agent = await postgres_db.get_agent(str(agent_id))
-        if not agent or not agent.get("pod_ip") or agent["status"] == "offline":
-            return
-        agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/pause"
-        try:
-            async with httpx.AsyncClient(timeout=130.0) as client:
-                await client.post(agent_url)
-        except Exception as e:
-            logger.warning(f"Could not reach agent to pause child {child_id}: {e}")
+        if not agent_id and not require_positive_quiescence:
+            return True
+        if agent_id:
+            agent = await postgres_db.get_agent(str(agent_id))
+            if not agent or not agent.get("pod_ip") or agent["status"] == "offline":
+                if not require_positive_quiescence:
+                    return True
+            else:
+                agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/pause"
+                try:
+                    async with httpx.AsyncClient(timeout=130.0) as client:
+                        response = await client.post(agent_url)
+                except Exception as e:
+                    logger.warning(
+                        f"Could not reach agent to pause child {child_id}: {e}"
+                    )
+                    if require_positive_quiescence:
+                        return False
+                else:
+                    if response.status_code != 200:
+                        logger.warning(
+                            "Cascade pause for child %s was not positively "
+                            "acknowledged (%s)%s",
+                            child_id,
+                            response.status_code,
+                            (
+                                "; retaining bounded control hold"
+                                if require_positive_quiescence
+                                else ""
+                            ),
+                        )
+                        if require_positive_quiescence:
+                            return False
 
         vm_ctx = _get_vm_context(child)
         if vm_ctx:
             try:
-                await vm_provisioner.send_control(child_id, "freeze")
+                vm_frozen = bool(await vm_provisioner.send_control(child_id, "freeze"))
+                if require_positive_quiescence and not vm_frozen:
+                    return False
             except Exception as e:
                 logger.warning(f"VM freeze failed for child {child_id}: {e}")
+                if require_positive_quiescence:
+                    return False
 
-        await postgres_db.pause_job(child_id)
+        if not already_paused:
+            await postgres_db.pause_job(child_id)
+        return True
 
-    await asyncio.gather(
-        *[_signal_pause(c) for c in pinned_processing],
-        return_exceptions=True,
-    )
+    if COMPLETION_COMMANDS_ENABLED:
+
+        async def _linearize_and_signal_pause(child: dict) -> None:
+            child_id = str(child["id"])
+            try:
+                pause_claim = await _claim_completion_pause(
+                    child_id,
+                    source="cascade_pause",
+                    expected_agent_id=(
+                        str(child["assigned_agent_id"])
+                        if child.get("assigned_agent_id")
+                        else None
+                    ),
+                )
+            except HTTPException:
+                logger.info(
+                    "Cascade pause: child %s changed or is controlled; "
+                    "skipping external pause",
+                    child_id,
+                )
+                return
+            quiescent = await _signal_pause(
+                child,
+                already_paused=True,
+                require_positive_quiescence=True,
+            )
+            if quiescent:
+                await _abort_completion_control_claim(pause_claim)
+            else:
+                logger.warning(
+                    "Cascade pause: retaining child %s control hold until "
+                    "bounded expiry",
+                    child_id,
+                )
+
+        await asyncio.gather(
+            *[_linearize_and_signal_pause(c) for c in pinned_processing],
+            return_exceptions=True,
+        )
+    else:
+        await asyncio.gather(
+            *[_signal_pause(c) for c in pinned_processing],
+            return_exceptions=True,
+        )
     for child in stateless_processing:
-        await postgres_db.pause_stateless_job(str(child["id"]))
+        await postgres_db.pause_stateless_job(
+            str(child["id"]), **_completion_dispatch_guard_kwargs()
+        )
 
     logger.info(
         f"Cascade-paused {len(processing)} processing descendant(s) of job {job_id}"
@@ -13006,9 +13210,13 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
     to the agent pod.
     """
     _, job = await require_internal_or_job_access(request, postgres_db, job_id)
+    early_pinned_cancel = False
+
     try:
         if job.get("execution_lane") == "stateless":
-            success, _queue_closed = await postgres_db.cancel_stateless_job(job_id)
+            success, _queue_closed = await postgres_db.cancel_stateless_job(
+                job_id, **_completion_dispatch_guard_kwargs()
+            )
             if not success:
                 refreshed = await postgres_db.get_job(job_id)
                 if refreshed and refreshed.get("execution_lane") == "pinned":
@@ -13026,6 +13234,15 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                     raise HTTPException(
                         status_code=409,
                         detail="Job deletion is already in progress",
+                    )
+                elif (
+                    refreshed
+                    and refreshed.get("status") not in ("completed", "cancelled")
+                    and _active_completion_control_claim(refreshed)
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="job control is in progress",
                     )
                 elif not refreshed or refreshed.get("status") != "cancelled":
                     raise HTTPException(
@@ -13073,6 +13290,33 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                 _kick_session_wake_drain(postgres_db)
                 _trigger_dispatch()
                 return {"status": "cancelled"}
+
+        if COMPLETION_COMMANDS_ENABLED and job.get("execution_lane") == "pinned":
+            # Linearize the user's cancellation before agent/VM/workspace I/O.
+            # The finalizer's expected-status CAS must observe this terminal
+            # control even if external quiescence takes minutes.  Checkpoint
+            # pruning stays after quiescence below.
+            early_pinned_cancel = await postgres_db.linearize_pinned_cancel(
+                job_id,
+                expected_status=str(job.get("status") or ""),
+                completion_commands_enabled=True,
+            )
+            if not early_pinned_cancel:
+                refreshed = await postgres_db.get_job(job_id)
+                if (
+                    refreshed
+                    and refreshed.get("status") not in ("completed", "cancelled")
+                    and _active_completion_control_claim(refreshed)
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="job control is in progress",
+                    )
+                if not refreshed or refreshed.get("status") != "cancelled":
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Job cannot be cancelled (already completed or cancelled)",
+                    )
 
         # If job is assigned to an agent, send cancel request to agent pod
         assigned_agent_id = job.get("assigned_agent_id")
@@ -13134,6 +13378,11 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                     status_code=400,
                     detail="Job cannot be cancelled (already completed or cancelled)",
                 )
+        if early_pinned_cancel:
+            try:
+                await postgres_db.delete_checkpoint_thread(job_id)
+            except Exception as exc:
+                logger.debug("checkpoint prune skipped for %s: %s", job_id, exc)
 
         # Cascade cancel to all child/subjobs
         await _cascade_cancel_to_children(job_id)
@@ -13186,8 +13435,15 @@ async def pause_job(request: Request, job_id: str) -> dict[str, str]:
             )
 
         if job.get("execution_lane") == "stateless":
-            success = await postgres_db.pause_stateless_job(job_id)
+            success = await postgres_db.pause_stateless_job(
+                job_id, **_completion_dispatch_guard_kwargs()
+            )
             if not success:
+                refreshed = await postgres_db.get_job(job_id)
+                if _active_completion_control_claim(refreshed):
+                    raise HTTPException(
+                        status_code=409, detail="job control is in progress"
+                    )
                 raise HTTPException(
                     status_code=400,
                     detail="Job cannot be paused (status may have changed)",
@@ -13196,47 +13452,92 @@ async def pause_job(request: Request, job_id: str) -> dict[str, str]:
             await _cascade_pause_to_children(job_id)
             return {"status": "paused", "job_id": job_id}
 
-        # Send pause request to agent pod
-        assigned_agent_id = job.get("assigned_agent_id")
-        if assigned_agent_id:
-            agent = await postgres_db.get_agent(str(assigned_agent_id))
-            if agent and agent.get("pod_ip") and agent["status"] not in ("offline",):
-                agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/pause"
-                try:
-                    async with httpx.AsyncClient(timeout=130.0) as client:
-                        response = await client.post(agent_url)
+        # Flag-on publishes paused + an exact marker before old-executor I/O.
+        # The marker remains on ambiguous timeout/failure so no successor can
+        # be dispatched into a still-running agent or stale VM freeze.
+        pause_claim = (
+            await _claim_completion_pause(
+                job_id,
+                source="public_pause",
+                expected_agent_id=(
+                    str(job["assigned_agent_id"])
+                    if job.get("assigned_agent_id")
+                    else None
+                ),
+            )
+            if COMPLETION_COMMANDS_ENABLED
+            else None
+        )
+        release_pause_claim = False
+        try:
+            assigned_agent_id = job.get("assigned_agent_id")
+            agent_quiescent = not assigned_agent_id
+            if assigned_agent_id:
+                agent = await postgres_db.get_agent(str(assigned_agent_id))
+                if not agent or not agent.get("pod_ip") or agent["status"] == "offline":
+                    agent_quiescent = True
+                else:
+                    agent_url = (
+                        f"http://{agent['pod_ip']}:{agent['pod_port']}/job/pause"
+                    )
+                    try:
+                        async with httpx.AsyncClient(timeout=130.0) as client:
+                            response = await client.post(agent_url)
                         if response.status_code == 200:
+                            agent_quiescent = True
                             logger.info(f"Agent confirmed pause for job {job_id}")
                         elif response.status_code == 408:
-                            # Pause timed out but flag is set — agent will pause after current node
                             logger.warning(
-                                f"Pause timed out for job {job_id} — will pause after current node"
+                                "Pause timed out for job %s; retaining control "
+                                "hold until bounded expiry",
+                                job_id,
                             )
                         else:
                             logger.warning(
-                                f"Agent pause returned {response.status_code}: {response.text}"
+                                f"Agent pause returned {response.status_code}: "
+                                f"{response.text}"
                             )
-                except httpx.TimeoutException:
-                    logger.warning(f"Timeout sending pause to agent for job {job_id}")
-                except Exception as e:
-                    logger.warning(f"Could not reach agent to pause job {job_id}: {e}")
+                    except httpx.TimeoutException:
+                        logger.warning(
+                            f"Timeout sending pause to agent for job {job_id}"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Could not reach agent to pause job {job_id}: {e}"
+                        )
 
-        # If job has a VM, send freeze via NATS (requires management daemon)
-        vm_ctx = (
-            (job.get("context") or {}).get("vm")
-            if isinstance(job.get("context"), dict)
-            else None
-        )
-        if vm_ctx:
-            await vm_provisioner.send_control(job_id, "freeze")
-
-        # Update DB — the agent also does this, but we ensure it here as fallback
-        success = await postgres_db.pause_job(job_id)
-        if not success:
-            raise HTTPException(
-                status_code=400,
-                detail="Job cannot be paused (status may have changed)",
+            vm_ctx = (
+                (job.get("context") or {}).get("vm")
+                if isinstance(job.get("context"), dict)
+                else None
             )
+            vm_quiescent = True
+            if vm_ctx:
+                try:
+                    vm_quiescent = bool(
+                        await vm_provisioner.send_control(job_id, "freeze")
+                    )
+                except Exception:
+                    vm_quiescent = False
+                    raise
+
+            if pause_claim is None:
+                success = await postgres_db.pause_job(job_id)
+                if not success:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Job cannot be paused (status may have changed)",
+                    )
+            release_pause_claim = agent_quiescent and vm_quiescent
+        finally:
+            if pause_claim is not None and release_pause_claim:
+                await _abort_completion_control_claim(pause_claim)
+            elif pause_claim is not None:
+                logger.warning(
+                    "Pause control hold retained for job %s after ambiguous "
+                    "quiescence; bounded expiry will release it",
+                    job_id,
+                )
 
         # 'paused' is officer-only inside maybe_wake_session — it never enters
         # the ordinary jobs outbox (risk 6), but a paused job is exactly what
@@ -13254,7 +13555,12 @@ async def pause_job(request: Request, job_id: str) -> dict[str, str]:
 
 
 @app.put("/api/jobs/{job_id}/agent-release")
-async def agent_release_job(request: Request, job_id: str) -> dict[str, str]:
+async def agent_release_job(
+    request: Request,
+    job_id: str,
+    agent_id: str | None = None,
+    lease_token: int | None = None,
+) -> dict[str, str]:
     """Agent-initiated job release (no agent callback). **Internal** (P4b)
     — requires ``X-Internal-Key``. Ingress strips this path.
 
@@ -13266,8 +13572,53 @@ async def agent_release_job(request: Request, job_id: str) -> dict[str, str]:
     """
     await require_internal(request)
     try:
-        success = await postgres_db.pause_job(job_id)
+        if not COMPLETION_COMMANDS_ENABLED:
+            success = await postgres_db.pause_job(job_id)
+        else:
+            job = await postgres_db.get_job(job_id)
+            if not job:
+                success = False
+            elif job.get("execution_lane") == "stateless":
+                if lease_token is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Agent release does not hold the worker lease",
+                    )
+                success = await postgres_db.pause_stateless_job(
+                    job_id,
+                    completion_commands_enabled=True,
+                    expected_lease_token=lease_token,
+                )
+            else:
+                if agent_id is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Agent release does not identify the assigned agent",
+                    )
+                success = await postgres_db.pause_job(
+                    job_id,
+                    completion_commands_enabled=True,
+                    expected_agent_id=agent_id,
+                )
         if not success:
+            refreshed = (
+                await postgres_db.get_job(job_id)
+                if COMPLETION_COMMANDS_ENABLED
+                else None
+            )
+            if _active_completion_control_claim(refreshed):
+                raise HTTPException(
+                    status_code=409, detail="job control is in progress"
+                )
+            if (
+                COMPLETION_COMMANDS_ENABLED
+                and refreshed
+                and refreshed.get("status") == "processing"
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Job ownership changed before agent release",
+                )
             raise HTTPException(
                 status_code=400,
                 detail="Job cannot be paused (not found or status changed)",
@@ -13306,6 +13657,10 @@ class MessageSendRequest(BaseModel):
         None,
         ge=1,
         description="Exact stateless worker lease; ignored for pinned jobs",
+    )
+    agent_id: str | None = Field(
+        None,
+        description="Exact pinned agent assignment; ignored for stateless jobs",
     )
 
 
@@ -13501,6 +13856,31 @@ async def send_agent_message(
         # Get sequence number
         sequence = await postgres_db.get_message_sequence(job_id, thread_id)
 
+        freeze_data: dict[str, Any] | None = None
+        if request.mode == "blocking":
+            freeze_data = {
+                "status": "waiting_for_reply",
+                "freeze_type": "blocking_message",
+                "thread_id": thread_id,
+                "subject": request.subject,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "job_id": job_id,
+            }
+            if COMPLETION_COMMANDS_ENABLED:
+                lane = str(job.get("execution_lane") or "pinned")
+                published = await postgres_db.publish_blocking_message(
+                    job_id,
+                    freeze_data,
+                    expected_lane=lane,
+                    lease_token=request.lease_token,
+                    agent_id=request.agent_id,
+                )
+                if not published:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Job changed before blocking message was committed",
+                    )
+
         # Dispatch to all configured notification channels
         dispatch_results = await notification_service.dispatch(
             user_id=user_id,
@@ -13535,15 +13915,8 @@ async def send_agent_message(
         )
 
         # If blocking mode, update job status and store freeze data
-        if request.mode == "blocking":
-            freeze_data = {
-                "status": "waiting_for_reply",
-                "freeze_type": "blocking_message",
-                "thread_id": thread_id,
-                "subject": request.subject,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "job_id": job_id,
-            }
+        if request.mode == "blocking" and not COMPLETION_COMMANDS_ENABLED:
+            assert freeze_data is not None
             if job.get("execution_lane") == "stateless":
                 if request.lease_token is None:
                     raise HTTPException(
@@ -13777,7 +14150,9 @@ async def _queue_supervisor_guidance(
         "source": thread_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    if not await postgres_db.append_pending_guidance(str(job["id"]), entry):
+    if not await postgres_db.append_pending_guidance(
+        str(job["id"]), entry, **_completion_dispatch_guard_kwargs()
+    ):
         return None
     logger.info(
         "Queued supervisor guidance %s for job %s (thread %s)",
@@ -13819,6 +14194,28 @@ async def _route_inbound_reply(
     job = await postgres_db.get_job(job_id)
     if not job:
         raise ValueError(f"Job '{job_id}' not found")
+    await _guard_completion_control(job_id, source="inbound_reply")
+
+    async def _resume_reply_or_conflict(*, reason: str) -> None:
+        resumed = await _internal_resume_job(
+            job_id,
+            feedback=message,
+            reason=reason,
+            expected_status=str(job.get("status") or ""),
+        )
+        if resumed:
+            return
+        # Distinguish a command winner when possible, but never report an
+        # immediate delivery that did not win its status/queue mutation.
+        await _guard_completion_control(job_id, source="inbound_reply")
+        refreshed = await postgres_db.get_job(job_id)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Job changed while the inbound reply was being delivered"
+                + (f" (status: {refreshed.get('status')})" if refreshed else "")
+            ),
+        )
 
     # Resolve user_id from sender email or job owner
     user_id = None
@@ -13836,17 +14233,20 @@ async def _route_inbound_reply(
     # Get sequence number
     sequence = await postgres_db.get_message_sequence(job_id, thread_id)
 
-    # Log inbound message
-    await postgres_db.log_message(
-        job_id=job_id,
-        user_id=user_id,
-        thread_id=thread_id,
-        direction="inbound",
-        subject="(reply)",
-        message=message,
-        status="delivered",
-        email_message_id=email_message_id,
-    )
+    async def _delivered(strategy: str) -> tuple[str, int]:
+        # Record "delivered" only after the selected context/resume mutation
+        # won its command-aware CAS. A losing control remains a clean 409.
+        await postgres_db.log_message(
+            job_id=job_id,
+            user_id=user_id,
+            thread_id=thread_id,
+            direction="inbound",
+            subject="(reply)",
+            message=message,
+            status="delivered",
+            email_message_id=email_message_id,
+        )
+        return strategy, sequence
 
     # Check if job is waiting for a reply on this thread
     job_status = job.get("status", "")
@@ -13864,15 +14264,13 @@ async def _route_inbound_reply(
     )
 
     if is_blocking_reply:
-        await _internal_resume_job(
-            job_id,
-            feedback=message,
+        await _resume_reply_or_conflict(
             reason=(
                 "This job froze waiting for a reply to its outbound message; "
                 "the reply below answers it."
             ),
         )
-        return "immediate_resume", sequence
+        return await _delivered("immediate_resume")
 
     # Look up user delivery preferences
     user_prefs = {}
@@ -13893,22 +14291,18 @@ async def _route_inbound_reply(
     if urgent and urgent_override:
         strategy = await _queue_supervisor_guidance(job, thread_id, message)
         if strategy:
-            return strategy, sequence
-        await _internal_resume_job(
-            job_id, feedback=message, reason=_URGENT_RESUME_REASON
-        )
-        return "immediate_interrupt", sequence
+            return await _delivered(strategy)
+        await _resume_reply_or_conflict(reason=_URGENT_RESUME_REASON)
+        return await _delivered("immediate_interrupt")
 
     # Check user's async reply preference (same semantics as urgent above)
     async_pref = user_prefs.get("async_reply", "next_strategic_phase")
     if async_pref == "immediate_interrupt":
         strategy = await _queue_supervisor_guidance(job, thread_id, message)
         if strategy:
-            return strategy, sequence
-        await _internal_resume_job(
-            job_id, feedback=message, reason=_URGENT_RESUME_REASON
-        )
-        return "immediate_interrupt", sequence
+            return await _delivered(strategy)
+        await _resume_reply_or_conflict(reason=_URGENT_RESUME_REASON)
+        return await _delivered("immediate_interrupt")
 
     # LLM triage: let auxiliary model decide guidance-now vs queue
     if async_pref == "llm_triage" and job.get("status") == "processing":
@@ -13930,7 +14324,7 @@ async def _route_inbound_reply(
                         job_id[:8],
                         decision.get("reason", ""),
                     )
-                    return "llm_triage_guidance", sequence
+                    return await _delivered("llm_triage_guidance")
                 # No live run after all — fall through to the queued lane.
         except Exception as e:
             logger.warning("LLM triage failed, falling through to queue: %s", e)
@@ -13939,7 +14333,7 @@ async def _route_inbound_reply(
     # concurrent inbound replies both land — the old read-modify-write full-dict
     # rewrite lost one of a racing pair (its RMW window spans the LLM triage
     # call above).
-    await postgres_db.append_queued_reply(
+    queued_reply = await postgres_db.append_queued_reply(
         job_id,
         {
             "id": str(uuid4()),
@@ -13947,7 +14341,14 @@ async def _route_inbound_reply(
             "message": message,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         },
+        **_completion_dispatch_guard_kwargs(),
     )
+    if not queued_reply:
+        await _guard_completion_control(job_id, source="inbound_reply")
+        raise HTTPException(
+            status_code=409,
+            detail="Job changed while the inbound reply was being queued",
+        )
 
     # Broadcast reply_delivered to cockpit SSE
     try:
@@ -13963,7 +14364,7 @@ async def _route_inbound_reply(
     except Exception:
         pass  # Non-critical
 
-    return "next_strategic_phase", sequence
+    return await _delivered("next_strategic_phase")
 
 
 @app.post("/api/jobs/{job_id}/messages/{thread_id}/reply")
@@ -14672,49 +15073,79 @@ async def _apply_vm_upgrade_decision(
     # A deny may also re-drive a row the system already auto-denied (covers
     # the fallback where the auto-deny resume failed and left the job frozen).
     redrivable_statuses = {target_status} | ({"auto_denied"} if not approve else set())
+    control_claim = None
 
-    if status == "pending":
-        expires_at = row.get("expires_at")
-        if expires_at is not None and expires_at < datetime.now(timezone.utc):
-            # The sweeper will flip it to 'expired' shortly; reject the late
-            # decision now (stale-token model) rather than racing the sweep.
+    try:
+        if status == "pending":
+            await _guard_completion_control(job_id, source="sudo_vm_decision")
+            expires_at = row.get("expires_at")
+            if expires_at is not None and expires_at < datetime.now(timezone.utc):
+                # The sweeper will flip it to 'expired' shortly; reject the late
+                # decision now (stale-token model) rather than racing the sweep.
+                raise HTTPException(
+                    status_code=409,
+                    detail="Approval window has expired — re-run the job to raise "
+                    "a new request",
+                )
+            if COMPLETION_COMMANDS_ENABLED:
+                job = await postgres_db.get_job(job_id)
+                if not job:
+                    raise HTTPException(
+                        status_code=404, detail=f"Job '{job_id}' not found"
+                    )
+                control_claim = await _claim_completion_control(
+                    {**job, "id": job_id}, source="sudo_vm_decision"
+                )
+            decide = sudo_gate.approve_request if approve else sudo_gate.deny_request
+            result = await decide(request_id, reason=reason, decided_by=decided_by)
+            if not result:
+                raise HTTPException(
+                    status_code=404, detail=f"Sudo request '{request_id}' not found"
+                )
+            if "error" in result:
+                # Lost the first-decider race between our read and the flip.
+                raise HTTPException(status_code=409, detail=result["error"])
+        elif status in redrivable_statuses:
+            job = await postgres_db.get_job(job_id)
+            if not _job_frozen_for_vm_upgrade(job):
+                return {
+                    "id": request_id,
+                    "status": status,
+                    "job_id": job_id,
+                    "note": "already decided and job already driven — no-op",
+                }
+            control_claim = await _claim_completion_control(
+                {**job, "id": job_id}, source="sudo_vm_redrive"
+            )
+            # Same decision repeated while the job is still frozen → re-drive it.
+        else:
             raise HTTPException(
                 status_code=409,
-                detail="Approval window has expired — re-run the job to raise "
-                "a new request",
+                detail=f"Request already '{status}' — decisions are "
+                "first-decider-wins and bound to the request id",
             )
-        decide = sudo_gate.approve_request if approve else sudo_gate.deny_request
-        result = await decide(request_id, reason=reason, decided_by=decided_by)
-        if not result:
-            raise HTTPException(
-                status_code=404, detail=f"Sudo request '{request_id}' not found"
-            )
-        if "error" in result:
-            # Lost the first-decider race between our read and the flip.
-            raise HTTPException(status_code=409, detail=result["error"])
-    elif status in redrivable_statuses:
-        job = await postgres_db.get_job(job_id)
-        if not _job_frozen_for_vm_upgrade(job):
-            return {
-                "id": request_id,
-                "status": status,
-                "job_id": job_id,
-                "note": "already decided and job already driven — no-op",
-            }
-        # Same decision repeated while the job is still frozen → re-drive it.
-    else:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Request already '{status}' — decisions are "
-            "first-decider-wins and bound to the request id",
-        )
 
-    if approve and upgrade:
-        job_action = await _upgrade_job_to_vm_internal(job_id)
-    else:
-        job_action = await _resume_job_without_vm_internal(
-            job_id, decided_by=decided_by, reason=reason, denied=not approve
-        )
+        if approve and upgrade:
+            if control_claim is None:
+                job_action = await _upgrade_job_to_vm_internal(job_id)
+            else:
+                job_action = await _upgrade_job_to_vm_internal(
+                    job_id, control_claim=control_claim
+                )
+        elif control_claim is None:
+            job_action = await _resume_job_without_vm_internal(
+                job_id, decided_by=decided_by, reason=reason, denied=not approve
+            )
+        else:
+            job_action = await _resume_job_without_vm_internal(
+                job_id,
+                decided_by=decided_by,
+                reason=reason,
+                denied=not approve,
+                control_claim=control_claim,
+            )
+    finally:
+        await _abort_completion_control_claim(control_claim)
 
     return {
         "id": request_id,
@@ -14937,6 +15368,7 @@ async def resume_job(
     _, job = await require_internal_or_job_access(req, postgres_db, job_id)
     if request is None:
         request = JobResumeRequest()
+    await _guard_completion_control(job_id, source="public_resume")
 
     # Resume PEP (decision 9, B3): re-check the runner's CURRENT grants against the
     # job's stored config before replaying it. Placed before the resume try so a 403
@@ -15074,6 +15506,7 @@ async def resume_job(
             *,
             workspace_preflight_required: bool = False,
             workspace_context_key: str | None = None,
+            control_claim: Any | None = None,
         ) -> dict[str, str]:
             """Park the job as 'paused' (dispatchable, unassigned) and kick the
             auto-dispatcher. Used both when no agent is ready and when the
@@ -15106,6 +15539,7 @@ async def resume_job(
                     workspace_context_key,
                     context_merge,
                     expected_status=expected_status,
+                    **_completion_resume_guard_kwargs(),
                 )
             elif job.get("execution_lane") == "stateless":
                 queued = await postgres_db.queue_stateless_job_for_resume(
@@ -15114,7 +15548,22 @@ async def resume_job(
                     priority=int(job.get("priority") or 0),
                     fair_key=(str(job["user_id"]) if job.get("user_id") else None),
                     expected_status=expected_status,
+                    **_completion_resume_guard_kwargs(),
                 )
+            elif workspace_preflight_required and control_claim is not None:
+                if workspace_context_key is None:
+                    raise RuntimeError("workspace preflight requires a context key")
+                try:
+                    queued = await postgres_db.prepare_pinned_job_for_workspace_resume(
+                        job_id,
+                        workspace_context_key,
+                        context_merge,
+                        expected_status=expected_status,
+                        completion_control_claim_id=str(control_claim.claim_id),
+                    )
+                except Exception:
+                    await _abort_completion_control_claim(control_claim)
+                    raise
             else:
                 # Missing stateless workspaces deliberately return through the
                 # leader preflight before any queue row becomes runnable.
@@ -15122,6 +15571,7 @@ async def resume_job(
                     job_id,
                     context_merge,
                     expected_status=expected_status,
+                    **_completion_resume_guard_kwargs(),
                 )
             if not queued and job.get("execution_lane") == "stateless":
                 # A legacy/operator-created VM row may be repaired to the
@@ -15135,22 +15585,49 @@ async def resume_job(
                     and refreshed.get("execution_lane") == "pinned"
                     and str(refreshed.get("status") or "") == expected_status
                 ):
-                    if workspace_preflight_required:
+                    if workspace_preflight_required and COMPLETION_COMMANDS_ENABLED:
                         if workspace_context_key is None:
                             raise RuntimeError(
                                 "workspace preflight requires a context key"
                             )
-                        await postgres_db.shed_workspace_context(
-                            job_id, workspace_context_key
+                        fallback_claim = await _claim_completion_control(
+                            {**refreshed, "id": job_id},
+                            source="missing_workspace_resume",
                         )
-                    queued = await postgres_db.queue_job_for_resume(
-                        job_id,
-                        context_merge,
-                        expected_status=expected_status,
-                    )
+                        try:
+                            queued = await postgres_db.prepare_pinned_job_for_workspace_resume(
+                                job_id,
+                                workspace_context_key,
+                                context_merge,
+                                expected_status=expected_status,
+                                completion_control_claim_id=str(
+                                    fallback_claim.claim_id
+                                ),
+                            )
+                        except Exception:
+                            await _abort_completion_control_claim(fallback_claim)
+                            raise
+                        if not queued:
+                            await _abort_completion_control_claim(fallback_claim)
+                    else:
+                        if workspace_preflight_required:
+                            if workspace_context_key is None:
+                                raise RuntimeError(
+                                    "workspace preflight requires a context key"
+                                )
+                            await postgres_db.shed_workspace_context(
+                                job_id, workspace_context_key
+                            )
+                        queued = await postgres_db.queue_job_for_resume(
+                            job_id,
+                            context_merge,
+                            expected_status=expected_status,
+                            **_completion_resume_guard_kwargs(),
+                        )
                     if queued:
                         job.update(refreshed)
             if not queued:
+                await _abort_completion_control_claim(control_claim)
                 refreshed = await postgres_db.get_job(job_id)
                 refreshed_context = (refreshed or {}).get("context") or {}
                 if isinstance(refreshed_context, str):
@@ -15195,12 +15672,18 @@ async def resume_job(
         missing_workspace = _resume_missing_workspace(job)
         if missing_workspace:
             workspace_context_key = _WORKSPACE_CONTEXT_KEYS[missing_workspace]
-            if job.get("execution_lane") != "stateless":
+            control_claim = None
+            if COMPLETION_COMMANDS_ENABLED and job.get("execution_lane") != "stateless":
+                control_claim = await _claim_completion_control(
+                    {**job, "id": job_id}, source="missing_workspace_resume"
+                )
+            elif job.get("execution_lane") != "stateless":
                 await postgres_db.shed_workspace_context(job_id, workspace_context_key)
             return await _queue_for_dispatch(
                 f"No live {missing_workspace} workspace — queued for re-provisioning",
                 workspace_preflight_required=True,
                 workspace_context_key=workspace_context_key,
+                control_claim=control_claim,
             )
 
         # Stateless jobs never select or POST to a registered agent. A live
@@ -15208,6 +15691,15 @@ async def resume_job(
         # worker_batch enqueue commit together in queue-first order.
         if job.get("execution_lane") == "stateless":
             return await _queue_for_dispatch("Stateless job queued for worker claim")
+
+        if COMPLETION_COMMANDS_ENABLED:
+            # The command-aware path linearizes the resume in the guarded jobs
+            # mutation before any pod POST.  The dispatcher then performs the
+            # external delivery from that durable state; flag-off preserves
+            # the historical direct-resume fast path exactly.
+            return await _queue_for_dispatch(
+                "Completion-safe resume queued for auto-dispatch"
+            )
 
         # Determine which agent to use
         # Convert to string since DB returns asyncpg UUID objects
@@ -15352,6 +15844,9 @@ async def approve_job(
     _, job = await require_internal_or_job_access(req, postgres_db, job_id)
     if request is None:
         request = JobApproveRequest()
+    await _guard_completion_control(job_id, source="public_approve")
+    control_claim = None
+    control_claim_finished = False
 
     try:
         # 1. Validate status (gate already loaded the job and raised 404 if missing)
@@ -15370,6 +15865,9 @@ async def approve_job(
                     "before the job becomes terminal."
                 ),
             )
+        control_claim = await _claim_completion_control(
+            {**job, "id": job_id}, source="public_approve"
+        )
 
         # 2. Read freeze data — DB first, Gitea fallback, local fallback
         frozen_data = None
@@ -15413,12 +15911,30 @@ async def approve_job(
                     priority=int(job.get("priority") or 0),
                     fair_key=(str(job["user_id"]) if job.get("user_id") else None),
                     expected_status=str(job["status"]),
+                    **_completion_resume_guard_kwargs(control_claim=control_claim),
                 )
                 if not queued:
                     raise HTTPException(
                         status_code=409,
                         detail="Job changed while approval was re-enqueuing it",
                     )
+                control_claim_finished = control_claim is not None
+            elif control_claim is not None:
+                # The claim cleared the predecessor's assigned-agent fence.
+                # Re-enter through dispatcher ownership instead of reviving
+                # that now-stale in-process agent.
+                queued = await postgres_db.queue_job_for_resume(
+                    job_id,
+                    expected_status=str(job["status"]),
+                    **_completion_resume_guard_kwargs(control_claim=control_claim),
+                )
+                if not queued:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Job changed while approval was re-enqueuing it",
+                    )
+                control_claim_finished = True
+                _trigger_dispatch()
             else:
                 if local_frozen.exists():
                     local_frozen.unlink()
@@ -15429,7 +15945,9 @@ async def approve_job(
                         "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
                         job_id,
                     )
-            if job.get("execution_lane") == "stateless" and local_frozen.exists():
+            if (
+                job.get("execution_lane") == "stateless" or control_claim is not None
+            ) and local_frozen.exists():
                 local_frozen.unlink()
 
             msg = (
@@ -15461,7 +15979,7 @@ async def approve_job(
         completion_json = json.dumps(completion_data, indent=2, ensure_ascii=False)
 
         stateless_approval_committed = False
-        if job.get("execution_lane") == "stateless":
+        if job.get("execution_lane") == "stateless" and control_claim is None:
             # Linearize the stateless approval before any durable artifact
             # advertises completion. Cancel/resume take the same queue->jobs
             # lock order, so a stale verb fails without deleting the frozen
@@ -15516,7 +16034,33 @@ async def approve_job(
                 frozen_path.unlink()
 
         # 5. Update DB: status → completed, clear freeze_data, set completed_at
-        if not stateless_approval_committed:
+        if control_claim is not None:
+            from services.completion_control import CompletionControlClaimConflict
+
+            try:
+                async with _get_completion_control().finish_claim(control_claim) as (
+                    conn,
+                    _locked_job,
+                ):
+                    updated = await conn.fetchrow(
+                        "UPDATE jobs SET status = 'completed', "
+                        "freeze_data = NULL, assigned_agent_id = NULL, "
+                        "completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), "
+                        "updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = $1::uuid AND status::text = $2::text "
+                        "AND execution_lane = $3::text RETURNING id",
+                        job_id,
+                        str(job["status"]),
+                        str(job.get("execution_lane") or "pinned"),
+                    )
+                    if updated is None:
+                        raise CompletionControlClaimConflict(
+                            "job changed while approval was being committed"
+                        )
+            except CompletionControlClaimConflict as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            control_claim_finished = True
+        elif not stateless_approval_committed:
             async with postgres_db.acquire() as conn:
                 await conn.execute(
                     "UPDATE jobs SET status = 'completed', freeze_data = NULL, "
@@ -15580,6 +16124,9 @@ async def approve_job(
     except Exception as e:
         logger.exception(f"Failed to approve job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        if control_claim is not None and not control_claim_finished:
+            await _abort_completion_control_claim(control_claim)
 
 
 @app.post("/api/jobs/{job_id}/upgrade-to-vm")
@@ -15594,7 +16141,11 @@ async def upgrade_job_to_vm(request: Request, job_id: str) -> dict[str, Any]:
     return await _upgrade_job_to_vm_internal(job_id)
 
 
-async def _upgrade_job_to_vm_internal(job_id: str) -> dict[str, Any]:
+async def _upgrade_job_to_vm_internal(
+    job_id: str,
+    *,
+    control_claim: Any | None = None,
+) -> dict[str, Any]:
     """Core of the VM upgrade — request-free so the sudo decision paths can
     call it directly (the endpoint wrapper handles auth). It:
 
@@ -15617,12 +16168,17 @@ async def _upgrade_job_to_vm_internal(job_id: str) -> dict[str, Any]:
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+        await _guard_completion_control(job_id, source="upgrade_to_vm")
 
         if job["status"] not in ("pending_review", "reviewing", "paused"):
             raise HTTPException(
                 status_code=400,
                 detail=f"Job cannot be upgraded (status: {job['status']}). "
                 f"Only frozen jobs can be upgraded to VMs.",
+            )
+        if control_claim is None:
+            control_claim = await _claim_completion_control(
+                {**job, "id": job_id}, source="upgrade_to_vm"
             )
 
         # 2. Read freeze data to validate freeze type
@@ -15691,20 +16247,48 @@ async def _upgrade_job_to_vm_internal(job_id: str) -> dict[str, Any]:
                         "AND unit_kind = 'worker_batch' FOR UPDATE",
                         job_id,
                     )
+                if COMPLETION_COMMANDS_ENABLED:
+                    completion_blocked = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM "
+                        "job_completion_sweep_exclusions AS completion_route "
+                        "WHERE completion_route.job_id=$1::uuid)",
+                        job_id,
+                    )
+                    if completion_blocked:
+                        raise HTTPException(
+                            status_code=409, detail="completion finalizing"
+                        )
+                control_drop = (
+                    " - '_completion_control_claim'"
+                    if control_claim is not None
+                    else ""
+                )
+                control_guard = (
+                    " AND ("
+                    + _completion_control_owned_active_sql("context", "$5")
+                    + ")"
+                    if control_claim is not None
+                    else ""
+                )
+                update_args: tuple[Any, ...] = (
+                    json.dumps(vm_updates),
+                    job_id,
+                    str(job["status"]),
+                    str(job.get("execution_lane") or "pinned"),
+                )
+                if control_claim is not None:
+                    update_args += (str(control_claim.claim_id),)
                 updated = await conn.fetchrow(
-                    "UPDATE jobs SET context = jsonb_set("
-                    "        COALESCE(context, '{}'::jsonb), '{vm}', "
+                    f"UPDATE jobs SET context = jsonb_set("
+                    f"        COALESCE(context, '{{}}'::jsonb){control_drop}, '{{vm}}', "
                     "        COALESCE(context->'vm', '{}'::jsonb) || $1::jsonb"
                     "    ), "
                     "    status = 'paused', freeze_data = NULL, "
                     "    assigned_agent_id = NULL, execution_lane = 'pinned', "
                     "    updated_at = CURRENT_TIMESTAMP "
                     "WHERE id = $2::uuid AND status::text = $3::text "
-                    "AND execution_lane = $4::text RETURNING id",
-                    json.dumps(vm_updates),
-                    job_id,
-                    str(job["status"]),
-                    str(job.get("execution_lane") or "pinned"),
+                    f"AND execution_lane = $4::text{control_guard} RETURNING id",
+                    *update_args,
                 )
                 if updated is None:
                     raise HTTPException(
@@ -15750,6 +16334,8 @@ async def _upgrade_job_to_vm_internal(job_id: str) -> dict[str, Any]:
     except Exception as e:
         logger.exception(f"Failed to upgrade job {job_id} to VM: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        await _abort_completion_control_claim(control_claim)
 
 
 async def _capture_workspace_snapshot_for_freeze(job: dict, job_id: str) -> bool:
@@ -15801,6 +16387,9 @@ async def _resume_job_without_vm_internal(
     decided_by: str = "operator",
     reason: str = "",
     denied: bool = True,
+    completion_owner_command_id: str | None = None,
+    completion_owner: str | None = None,
+    control_claim: Any | None = None,
 ) -> dict[str, Any]:
     """Continue-as-New on the original workspace tier after a vm_upgrade
     decision that does NOT provision a VM (operator deny, resume-without-vm,
@@ -15818,6 +16407,12 @@ async def _resume_job_without_vm_internal(
     job = await postgres_db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    if (completion_owner_command_id is None) != (completion_owner is None):
+        raise ValueError(
+            "completion owner command id and owner must be supplied together"
+        )
+    if completion_owner_command_id is None:
+        await _guard_completion_control(job_id, source="sudo_resume_without_vm")
 
     if job["status"] not in ("pending_review", "reviewing", "paused"):
         raise HTTPException(
@@ -15858,27 +16453,45 @@ async def _resume_job_without_vm_internal(
         "command": command,
         "decided_at": datetime.now(timezone.utc).isoformat(),
     }
+    if completion_owner_command_id is None and control_claim is None:
+        control_claim = await _claim_completion_control(
+            {**job, "id": job_id}, source="sudo_resume_without_vm"
+        )
 
     # Remove local freeze artifact (parity with the upgrade arm). Stateless
     # waits until its queue/status CAS succeeds below; a stale control request
     # must leave the operator evidence intact.
     local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
     if job.get("execution_lane") != "stateless" and local_frozen.exists():
-        local_frozen.unlink()
+        try:
+            local_frozen.unlink()
+        except Exception:
+            await _abort_completion_control_claim(control_claim)
+            raise
 
     # ONE statement: sticky denial + queued feedback + clear freeze + unassign
     # + paused (dispatchable) — fused so the dispatcher can never observe a
     # half-written decision.
     resume_context = {"sudo_denial": sudo_denial, "queued_feedback": feedback}
     if job.get("execution_lane") == "stateless":
-        queued = await postgres_db.queue_stateless_job_for_resume(
-            job_id,
-            resume_context,
-            priority=int(job.get("priority") or 0),
-            fair_key=(str(job["user_id"]) if job.get("user_id") else None),
-            expected_status=str(job["status"]),
-        )
+        try:
+            queued = await postgres_db.queue_stateless_job_for_resume(
+                job_id,
+                resume_context,
+                priority=int(job.get("priority") or 0),
+                fair_key=(str(job["user_id"]) if job.get("user_id") else None),
+                expected_status=str(job["status"]),
+                **_completion_resume_guard_kwargs(
+                    completion_owner_command_id,
+                    completion_owner,
+                    control_claim,
+                ),
+            )
+        except Exception:
+            await _abort_completion_control_claim(control_claim)
+            raise
         if not queued:
+            await _abort_completion_control_claim(control_claim)
             raise HTTPException(
                 status_code=409,
                 detail="Job changed while it was being re-enqueued without a VM",
@@ -15886,15 +16499,72 @@ async def _resume_job_without_vm_internal(
         if local_frozen.exists():
             local_frozen.unlink()
     else:
-        async with postgres_db.acquire() as conn:
-            await conn.execute(
-                "UPDATE jobs SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
-                "status = 'paused', freeze_data = NULL, "
-                "assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
-                "WHERE id = $2::uuid",
-                json.dumps(resume_context),
-                job_id,
-            )
+        try:
+            async with postgres_db.acquire() as conn:
+                if COMPLETION_COMMANDS_ENABLED:
+                    async with conn.transaction():
+                        completion_blocked = (
+                            await postgres_db._completion_resume_blocked_on_conn(
+                                conn,
+                                UUID(job_id),
+                                completion_owner_command_id=(
+                                    completion_owner_command_id
+                                ),
+                                completion_owner=completion_owner,
+                            )
+                        )
+                        if completion_blocked:
+                            raise HTTPException(
+                                status_code=409, detail="completion finalizing"
+                            )
+                        control_drop = (
+                            " - '_completion_control_claim'"
+                            if control_claim is not None
+                            else ""
+                        )
+                        control_guard = (
+                            " AND ("
+                            + _completion_control_owned_active_sql("context", "$4")
+                            + ")"
+                            if control_claim is not None
+                            else ""
+                        )
+                        args: tuple[Any, ...] = (
+                            json.dumps(resume_context),
+                            job_id,
+                            str(job["status"]),
+                        )
+                        if control_claim is not None:
+                            args += (str(control_claim.claim_id),)
+                        updated = await conn.execute(
+                            "UPDATE jobs SET context = "
+                            f"(COALESCE(context, '{{}}'::jsonb){control_drop}) "
+                            "|| $1::jsonb, status = 'paused', freeze_data = NULL, "
+                            "assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
+                            "WHERE id = $2::uuid AND status::text = $3::text"
+                            f"{control_guard}",
+                            *args,
+                        )
+                        if control_claim is not None and updated != "UPDATE 1":
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "Job changed while it was being resumed "
+                                    "without a VM"
+                                ),
+                            )
+                else:
+                    await conn.execute(
+                        "UPDATE jobs SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
+                        "status = 'paused', freeze_data = NULL, "
+                        "assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = $2::uuid",
+                        json.dumps(resume_context),
+                        job_id,
+                    )
+        except Exception:
+            await _abort_completion_control_claim(control_claim)
+            raise
 
     logger.info(
         f"Job {job_id} resumed without VM "
@@ -15924,6 +16594,8 @@ async def _internal_resume_job(
     *,
     expected_status: str | None = None,
     additional_context: Mapping[str, Any] | None = None,
+    completion_owner_command_id: str | None = None,
+    completion_owner: str | None = None,
 ) -> bool:
     """Queue a job for resume via the auto-dispatcher.
 
@@ -15973,6 +16645,9 @@ async def _internal_resume_job(
         )
         return False
 
+    if completion_owner_command_id is None:
+        await _guard_completion_control(job_id, source="internal_resume")
+
     if job.get("execution_lane") == "stateless":
         queued = await postgres_db.queue_stateless_job_for_resume(
             job_id,
@@ -15980,6 +16655,9 @@ async def _internal_resume_job(
             priority=int(job.get("priority") or 0),
             fair_key=(str(job["user_id"]) if job.get("user_id") else None),
             expected_status=observed_status,
+            **_completion_resume_guard_kwargs(
+                completion_owner_command_id, completion_owner
+            ),
         )
         if not queued:
             refreshed = await postgres_db.get_job(job_id)
@@ -15992,6 +16670,9 @@ async def _internal_resume_job(
                     job_id,
                     updates,
                     expected_status=observed_status,
+                    **_completion_resume_guard_kwargs(
+                        completion_owner_command_id, completion_owner
+                    ),
                 )
                 if queued:
                     job = refreshed
@@ -16000,6 +16681,9 @@ async def _internal_resume_job(
             job_id,
             updates,
             expected_status=observed_status,
+            **_completion_resume_guard_kwargs(
+                completion_owner_command_id, completion_owner
+            ),
         )
     if not queued:
         logger.warning("_internal_resume_job: queue CAS lost for job %s", job_id)
@@ -16435,6 +17119,7 @@ async def _handle_scholar_completion(
             priority=int(parent.get("priority") or 0),
             fair_key=(str(parent["user_id"]) if parent.get("user_id") else None),
             expected_status="waiting",
+            **_completion_resume_guard_kwargs(),
         )
         if not resumed:
             logger.debug(
@@ -16549,6 +17234,7 @@ async def _handle_delegation_child_completion(
             priority=int(parent.get("priority") or 0),
             fair_key=(str(parent["user_id"]) if parent.get("user_id") else None),
             expected_status="waiting",
+            **_completion_resume_guard_kwargs(),
         )
     else:
         # Pinned parity: store the bounded rebuild before the historical
@@ -16720,7 +17406,9 @@ async def _check_delegation_timeouts() -> int:
                             (
                                 cancelled,
                                 _queue_closed,
-                            ) = await postgres_db.cancel_stateless_job(child_id)
+                            ) = await postgres_db.cancel_stateless_job(
+                                child_id, **_completion_dispatch_guard_kwargs()
+                            )
                             settled = bool(
                                 cancelled
                                 and await _wait_for_stateless_cancel_settle(child_id)
@@ -16802,6 +17490,7 @@ async def _check_delegation_timeouts() -> int:
                     priority=int(row.get("priority") or 0),
                     fair_key=(str(row["user_id"]) if row.get("user_id") else None),
                     expected_status="waiting",
+                    **_completion_resume_guard_kwargs(),
                 )
             else:
                 # Historical pinned path: context first, then the HA-safe
@@ -19211,9 +19900,11 @@ async def complete_job(
 
     from services.job_completion_commands import (
         CompletionCommandNotFound,
+        CompletionControlInProgress,
         CompletionFenceRejected,
         CompletionInProgress,
         CompletionPayloadMismatch,
+        CompletionTeardownInProgress,
         accept_completion_command,
     )
 
@@ -19249,6 +19940,14 @@ async def complete_job(
             detail=str(exc),
             headers={"Retry-After": "1"},
         ) from exc
+    except CompletionTeardownInProgress as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+            headers={"Retry-After": "1"},
+        ) from exc
+    except CompletionControlInProgress as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except CompletionFenceRejected as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -19328,7 +20027,16 @@ async def complete_job(
         callback=_inline_workflow,
         inline=True,
     )
-    if finalized.disposition in {"done", "terminal"} and finalized.outcome:
+    if (
+        finalized.disposition
+        in {
+            "done",
+            "terminal",
+            "superseded",
+            "force_resolved",
+        }
+        and finalized.outcome
+    ):
         _raise_durable_completion_http_outcome(finalized.outcome)
         return finalized.outcome
     if inline_error is not None:
@@ -19351,6 +20059,7 @@ async def complete_job(
 _DURABLE_COMPLETION_HTTP_ERROR = "_completion_http_error"
 _completion_finalizer_instance: Any | None = None
 _completion_sweep_router_instance: Any | None = None
+_completion_control_instance: Any | None = None
 
 
 def _durable_completion_http_outcome(exc: HTTPException) -> dict[str, Any]:
@@ -19445,6 +20154,126 @@ def _get_completion_sweep_router() -> Any:
     return _completion_sweep_router_instance
 
 
+def _get_completion_control() -> Any:
+    """Build the command-aware HTTP/control admission barrier lazily."""
+
+    global _completion_control_instance
+    if _completion_control_instance is None:
+        from services.completion_control import CompletionControl
+
+        _completion_control_instance = CompletionControl(
+            postgres_db,
+            _get_completion_sweep_router(),
+        )
+    return _completion_control_instance
+
+
+async def _guard_completion_control(job_id: str, *, source: str) -> None:
+    """Refuse a resume-like verb while terminal finalization owns the job."""
+
+    if not COMPLETION_COMMANDS_ENABLED:
+        return
+    decision = await _get_completion_control().guard_job(job_id, source=source)
+    if decision.blocked:
+        raise HTTPException(status_code=409, detail="completion finalizing")
+
+
+async def _claim_completion_control(job: Mapping[str, Any], *, source: str) -> Any:
+    """Fence an executor before a human control performs external work."""
+
+    if not COMPLETION_COMMANDS_ENABLED:
+        return None
+    from services.completion_control import CompletionControlClaimConflict
+
+    try:
+        return await _get_completion_control().claim_job(
+            str(job["id"]),
+            source=source,
+            expected_status=str(job.get("status") or ""),
+            expected_lane=str(job.get("execution_lane") or "pinned"),
+        )
+    except CompletionControlClaimConflict as exc:
+        detail = str(exc)
+        if detail == "completion finalizing":
+            raise HTTPException(status_code=409, detail=detail) from exc
+        raise HTTPException(status_code=409, detail=detail) from exc
+
+
+async def _claim_completion_pause(
+    job_id: str,
+    *,
+    source: str,
+    expected_agent_id: str | None,
+) -> Any:
+    """Publish pinned pause before slow old-executor/VM I/O."""
+
+    if not COMPLETION_COMMANDS_ENABLED:
+        return None
+    from services.completion_control import CompletionControlClaimConflict
+
+    try:
+        return await _get_completion_control().claim_pause_job(
+            job_id,
+            source=source,
+            expected_agent_id=expected_agent_id,
+        )
+    except CompletionControlClaimConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+async def _abort_completion_control_claim(claim: Any) -> None:
+    """Best-effort exact-marker release after validation/external failure."""
+
+    if claim is None:
+        return
+    try:
+        await _get_completion_control().abort_claim(claim)
+    except Exception:
+        logger.exception(
+            "Failed to release completion control claim %s for job %s",
+            getattr(claim, "claim_id", "unknown"),
+            getattr(claim, "job_id", "unknown"),
+        )
+
+
+def _completion_resume_guard_kwargs(
+    command_id: str | None = None,
+    owner: str | None = None,
+    control_claim: Any | None = None,
+) -> dict[str, Any]:
+    """Keep the default-off DB-helper invocation byte-for-byte historical."""
+
+    if not COMPLETION_COMMANDS_ENABLED:
+        return {}
+    values: dict[str, Any] = {"completion_commands_enabled": True}
+    if command_id is not None or owner is not None:
+        values.update(
+            completion_owner_command_id=command_id,
+            completion_owner=owner,
+        )
+    if control_claim is not None:
+        values["completion_control_claim_id"] = str(control_claim.claim_id)
+    return values
+
+
+def _completion_dispatch_guard_kwargs() -> dict[str, bool]:
+    """Keep default-off dispatcher DB calls on their historical signatures."""
+
+    return {"completion_commands_enabled": True} if COMPLETION_COMMANDS_ENABLED else {}
+
+
+def _active_completion_control_claim(
+    job: Mapping[str, Any] | None,
+) -> bool:
+    """Classify the reserved marker without importing Gate-3 code flag-off."""
+
+    if not COMPLETION_COMMANDS_ENABLED or not job:
+        return False
+    from services.completion_control import completion_control_claim_active
+
+    return completion_control_claim_active(job.get("context"))
+
+
 _LEGACY_COMPLETION_EFFECT_PLAN: tuple[tuple[str, str], ...] = (
     ("late_callback_guard", "entry"),  # S1
     ("clear_stale_failure", "entry"),  # S2
@@ -19534,6 +20363,219 @@ async def _run_completion_effect(
     )
 
 
+async def _run_completion_workspace_teardown(
+    job_id: str,
+    effect_runner: Any | None,
+) -> dict[str, Any]:
+    """Run S36 under its durable report-order/admission authorization.
+
+    The authorization transaction cannot span external archive/delete I/O. It
+    therefore installs a pending-effect marker under the jobs-row lock before
+    any backend is touched. A higher report that acquired the same lock first
+    makes this S36 a durable handoff with no external calls.
+
+    Every command-backed backend uses this same journal and authorization. The
+    Kubernetes arm alone retains the stricter UID/snapshot identity protocol;
+    VM, Docker, and the default-off route keep their historical cleanup call.
+    """
+
+    async def _archive_and_teardown_workspace() -> dict[str, Any]:
+        try:
+            if effect_runner is not None:
+                authorization = await effect_runner.authorize_workspace_teardown()
+                if not authorization.authorized:
+                    if authorization.superseded:
+                        return {
+                            "actions": [],
+                            "error": (
+                                "jobs status changed before workspace teardown "
+                                "authorization"
+                            ),
+                            "teardown_disposition": "world_state_superseded",
+                            "observed_status": authorization.observed_status,
+                            "expected_status": authorization.expected_status,
+                        }
+                    if authorization.operator_hold:
+                        return {
+                            "actions": [],
+                            "error": (
+                                "workspace teardown authorization marker conflicts "
+                                "with current jobs status"
+                            ),
+                            "teardown_disposition": "operator_hold",
+                            "observed_status": authorization.observed_status,
+                            "expected_status": authorization.expected_status,
+                        }
+                    return {
+                        "actions": [],
+                        "teardown_disposition": "deferred",
+                        "higher_report_seq": authorization.higher_report_seq,
+                    }
+
+            use_uid_fenced_kubernetes_teardown = False
+            teardown_intent: dict[str, Any] | None = None
+            if effect_runner is not None:
+                teardown_intent = await effect_runner.capture_intent(
+                    "workspace_archive_teardown"
+                )
+                use_uid_fenced_kubernetes_teardown = bool(
+                    teardown_intent is not None
+                    and teardown_intent.get("kind") == "kubernetes"
+                )
+                teardown_job = await postgres_db.get_job(job_id)
+                if not use_uid_fenced_kubernetes_teardown and teardown_job is not None:
+                    workspace_context = _get_container_context(teardown_job)
+                    vm_context = _get_vm_context(teardown_job)
+                    workspace_is_active = bool(workspace_context) and (
+                        workspace_context.get("status")
+                        not in ("deleted", "deleting", "released", None)
+                    )
+                    vm_is_active = bool(vm_context) and (
+                        vm_context.get("status") not in ("deleted", "deleting")
+                    )
+                    use_uid_fenced_kubernetes_teardown = (
+                        workspace_is_active
+                        and workspace_context.get("provisioner") != "docker"
+                        and not vm_is_active
+                    )
+
+            if use_uid_fenced_kubernetes_teardown:
+                owner = WorkspaceOwner.job(job_id)
+                intent = teardown_intent
+                if intent is None:
+                    captured = (
+                        await container_provisioner.capture_terminal_workspace_identity(
+                            owner
+                        )
+                    )
+                    intent = await effect_runner.capture_intent(
+                        "workspace_archive_teardown",
+                        {
+                            "kind": "kubernetes",
+                            "pod_uid": captured.pod_uid,
+                            "pvc_uid": captured.pvc_uid,
+                            "service_uid": captured.service_uid,
+                            "pod_ip": captured.pod_ip,
+                            "ssh_host_key_fingerprint": (
+                                captured.ssh_host_key_fingerprint
+                            ),
+                            "ssh_port": captured.ssh_port,
+                            "snapshot_generation": effect_runner.command_id,
+                            "snapshot_created_at": (
+                                datetime.now(timezone.utc).isoformat()
+                            ),
+                        },
+                    )
+
+                if intent is None or intent.get("kind") != "kubernetes":
+                    raise RuntimeError(
+                        "workspace teardown intent is missing Kubernetes identity"
+                    )
+                pod_uid = intent.get("pod_uid")
+                pvc_uid = intent.get("pvc_uid")
+                service_uid = intent.get("service_uid")
+                pod_ip = intent.get("pod_ip")
+                host_key = intent.get("ssh_host_key_fingerprint")
+                ssh_port = intent.get("ssh_port")
+                snapshot_generation = intent.get("snapshot_generation")
+                snapshot_created_at = intent.get("snapshot_created_at")
+                if not isinstance(pod_uid, str) or not pod_uid:
+                    raise RuntimeError("workspace teardown intent has invalid Pod UID")
+                if pvc_uid is not None and (
+                    not isinstance(pvc_uid, str) or not pvc_uid
+                ):
+                    raise RuntimeError("workspace teardown intent has invalid PVC UID")
+                if service_uid is not None and (
+                    not isinstance(service_uid, str) or not service_uid
+                ):
+                    raise RuntimeError(
+                        "workspace teardown intent has invalid Service UID"
+                    )
+                if not isinstance(pod_ip, str) or not pod_ip:
+                    raise RuntimeError("workspace teardown intent has invalid Pod IP")
+                if not isinstance(host_key, str) or not host_key:
+                    raise RuntimeError(
+                        "workspace teardown intent has invalid SSH host key"
+                    )
+                if isinstance(ssh_port, bool) or not isinstance(ssh_port, int):
+                    raise RuntimeError("workspace teardown intent has invalid SSH port")
+                if (
+                    snapshot_generation != effect_runner.command_id
+                    or not isinstance(snapshot_created_at, str)
+                    or not snapshot_created_at
+                ):
+                    raise RuntimeError(
+                        "workspace teardown intent has invalid snapshot identity"
+                    )
+                teardown_identity = WorkspaceTeardownIdentity(
+                    pod_uid=pod_uid,
+                    pvc_uid=pvc_uid,
+                    service_uid=service_uid,
+                    pod_ip=pod_ip,
+                    ssh_host_key_fingerprint=host_key,
+                    ssh_port=ssh_port,
+                )
+
+                released = await container_provisioner.release_workspace(
+                    owner,
+                    teardown_identity=teardown_identity,
+                    require_snapshot=True,
+                    expected_runtime_incarnation=pod_uid,
+                    expected_host_key_fingerprint=host_key,
+                    strict_terminal_snapshot=True,
+                    terminal_snapshot_generation=snapshot_generation,
+                    terminal_snapshot_created_at=snapshot_created_at,
+                    strict=True,
+                    exact_absence_timeout_seconds=(
+                        _COMPLETION_S36_EXACT_ABSENCE_TIMEOUT_SECONDS
+                    ),
+                )
+                if not released:
+                    raise RuntimeError(
+                        "UID-fenced Kubernetes workspace release was not confirmed"
+                    )
+                cleanup_actions = ["k8s workspace released"]
+            else:
+                cleanup_actions = await _archive_and_cleanup_workspace(job_id)
+        except Exception as exc:
+            logger.warning(
+                "Workspace cleanup failed for job %s (non-blocking): %s",
+                job_id,
+                exc,
+            )
+            return {
+                "actions": [f"workspace cleanup failed: {exc}"],
+                "error": str(exc),
+                "teardown_disposition": "retry_pending",
+            }
+        return {
+            "actions": list(cleanup_actions),
+            "teardown_disposition": "completed",
+        }
+
+    output = await _run_completion_effect(
+        effect_runner,
+        "workspace_archive_teardown",
+        "workspace_teardown",
+        _archive_and_teardown_workspace,
+        retry_if=lambda output: bool(output.get("error")),
+        effect_timeout_seconds=890.0,
+        command_lease_seconds=900.0,
+    )
+    if output.get("teardown_disposition") == "world_state_superseded":
+        # The retryable output above deliberately keeps S36 pending. Raising
+        # after the runner has persisted it lets the finalizer supersede the
+        # whole command without ever treating teardown as complete.
+        from services.completion_finalizer import CompletionDispositionSuperseded
+
+        raise CompletionDispositionSuperseded(
+            observed_status=str(output.get("observed_status") or "unknown"),
+            expected_statuses=(str(output.get("expected_status") or ""),),
+            reason="workspace_teardown_status_superseded",
+        )
+    return output
+
+
 async def _complete_job_legacy(
     request: Request,
     job_id: str,
@@ -19569,6 +20611,13 @@ async def _complete_job_legacy(
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
         completion_entry_status = str(job.get("status") or "")
+        if _effect_runner is not None:
+            resolved_entry_status = str(
+                getattr(_effect_runner, "command", {}).get("resolved_entry_status", "")
+                or ""
+            ).strip()
+            if resolved_entry_status:
+                completion_entry_status = resolved_entry_status
         stateless_completion = job.get("execution_lane", "pinned") == "stateless"
         completion_result = body.model_dump(
             exclude={"lease_token", "agent_id", "client_report_id"},
@@ -19598,6 +20647,39 @@ async def _complete_job_legacy(
         entry_llm_outage = (
             entry_llm_outage if isinstance(entry_llm_outage, Mapping) else {}
         )
+
+        async def _raise_completion_control_race(
+            observed_status: str | None = None,
+            *,
+            legacy_detail: str = (
+                "Completion report lost an out-of-band job control race"
+            ),
+        ) -> None:
+            current_status = str(observed_status or "").strip()
+            if not current_status:
+                current = await postgres_db.get_job(job_id)
+                current_status = str((current or {}).get("status") or "unknown")
+            if _effect_runner is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=legacy_detail,
+                )
+            logger.warning(
+                "Completion disposition lost control race "
+                "job=%s lease_token=%s entry_status=%s current_status=%s",
+                job_id,
+                body.lease_token,
+                completion_entry_status,
+                current_status,
+            )
+            from services.completion_finalizer import (
+                CompletionDispositionSuperseded,
+            )
+
+            raise CompletionDispositionSuperseded(
+                observed_status=current_status,
+                expected_statuses=(completion_entry_status,),
+            )
 
         # Thin S3 entry fence. Rotation never reaches this route; a genuine
         # terminal stateless report must prove the exact live worker lease.
@@ -19728,6 +20810,7 @@ async def _complete_job_legacy(
                     "llm_outage_retry_pause",
                     "deliverable_contract_gate",
                     "main_status_write",
+                    "auto_deny_resume",
                 )
                 for effect_name in disposition_effects:
                     if not await _effect_runner.has_completed(effect_name):
@@ -19746,6 +20829,10 @@ async def _complete_job_legacy(
                     elif effect_name == "deliverable_contract_gate":
                         effect_status = (
                             "paused" if effect_output.get("bounced") else effect_status
+                        )
+                    elif effect_name == "auto_deny_resume":
+                        effect_status = (
+                            "paused" if effect_output.get("auto_denied") else None
                         )
                     if effect_status == completion_current_status:
                         owned_disposition = True
@@ -19771,9 +20858,9 @@ async def _complete_job_legacy(
                         # marker is the reconcile proof after a marker crash.
                         owned_disposition = True
             if not owned_disposition:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
+                await _raise_completion_control_race(
+                    completion_current_status,
+                    legacy_detail=(
                         "Completion finalization lost an out-of-band job control race"
                     ),
                 )
@@ -19821,11 +20908,25 @@ async def _complete_job_legacy(
                 job_id,
                 job["status"],
             )
+            late_actions = [f"late callback ignored; job already {job['status']}"]
+            if _effect_runner is not None:
+                # Ordered reports normally make a trailing crash/error report a
+                # terminal no-op. If the lower report deferred S36 after seeing
+                # this report's HWM, the no-op must nevertheless run *only* the
+                # teardown tail. Continuing through the full legacy body would
+                # repeat unrelated Class B/C effects.
+                handoff = await _effect_runner.workspace_teardown_handoff()
+                if handoff.required:
+                    workspace_cleanup = await _run_completion_workspace_teardown(
+                        job_id,
+                        _effect_runner,
+                    )
+                    late_actions.extend(workspace_cleanup["actions"])
             return {
                 "status": "handled",
                 "job_id": job_id,
                 "new_status": job["status"],
-                "actions": [f"late callback ignored; job already {job['status']}"],
+                "actions": late_actions,
             }
 
         # Stateless END checkpoints are intentionally re-reported after an
@@ -20054,12 +21155,7 @@ async def _complete_job_legacy(
                         **update_kwargs,
                     )
                     if _effect_runner is not None and not disposition_updated:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                "Completion report lost an out-of-band job control race"
-                            ),
-                        )
+                        await _raise_completion_control_race()
                     return {
                         "status": "handled",
                         "job_id": job_id,
@@ -20088,6 +21184,11 @@ async def _complete_job_legacy(
             }
 
             async def _pause_infra_transient() -> dict[str, Any] | None:
+                if _effect_runner is not None:
+                    if not await postgres_db.pause_job(
+                        job_id, completion_commands_enabled=True
+                    ):
+                        await _raise_completion_control_race()
                 try:
                     # Durable attempt counter first — it must survive the sweeper
                     # clearing freeze_data, or the ceiling is unreachable.
@@ -20109,6 +21210,8 @@ async def _complete_job_legacy(
                             job_id,
                         )
                 except Exception as exc:
+                    if _effect_runner is not None:
+                        raise
                     # Without the freeze the sweeper cannot find the job again,
                     # so preserve the legacy fall-through disposition.
                     logger.error(
@@ -20118,14 +21221,7 @@ async def _complete_job_legacy(
                         exc,
                     )
                     return None
-                if not await postgres_db.pause_job(job_id):
-                    if _effect_runner is not None:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                "Completion report lost an out-of-band job control race"
-                            ),
-                        )
+                if _effect_runner is None and not await postgres_db.pause_job(job_id):
                     return None
                 logger.warning(
                     "Job %s: paused for transient infrastructure failure "
@@ -20228,12 +21324,7 @@ async def _complete_job_legacy(
                     _recover_pod_workspace,
                 )
                 if _effect_runner is not None and not pod_recovery.get("paused", True):
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "Completion report lost an out-of-band job control race"
-                        ),
-                    )
+                    await _raise_completion_control_race()
                 return pod_recovery
 
             # --- VM recovery (legacy path, unchanged) -------------------------
@@ -20256,6 +21347,12 @@ async def _complete_job_legacy(
                 logger.warning(
                     f"Job {job_id}: workspace unavailable — attempting VM recovery"
                 )
+                if COMPLETION_COMMANDS_ENABLED:
+                    paused = await postgres_db.pause_job(
+                        job_id, completion_commands_enabled=True
+                    )
+                    if not paused:
+                        await _raise_completion_control_race()
                 # Set recovering flag *before* issuing delete to prevent re-entry.
                 # Replace context.vm wholesale (recovery intentionally resets the
                 # vm object) via a top-level merge that preserves other keys.
@@ -20274,7 +21371,8 @@ async def _complete_job_legacy(
                 # Delete the old VM but retain the persistent root disk.
                 if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
                     await vm_provisioner.delete_vm(job_id, purge_disk=False)
-                await postgres_db.pause_job(job_id)
+                if not COMPLETION_COMMANDS_ENABLED:
+                    await postgres_db.pause_job(job_id)
                 _trigger_dispatch()
                 return {
                     "status": "handled",
@@ -20378,15 +21476,17 @@ async def _complete_job_legacy(
                 async def _pause_for_memory_retry() -> dict[str, Any]:
                     # Atomic increment (race-proof) — a duplicate re-dispatch of
                     # the same paused job must not stall the counter.
-                    retry_count = await postgres_db.increment_job_memory_retry(job_id)
-                    paused = bool(await postgres_db.pause_job(job_id))
-                    if _effect_runner is not None and not paused:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                "Completion report lost an out-of-band job control race"
-                            ),
+                    if _effect_runner is not None:
+                        paused = bool(
+                            await postgres_db.pause_job(
+                                job_id, completion_commands_enabled=True
+                            )
                         )
+                        if not paused:
+                            await _raise_completion_control_race()
+                    retry_count = await postgres_db.increment_job_memory_retry(job_id)
+                    if _effect_runner is None:
+                        paused = bool(await postgres_db.pause_job(job_id))
                     if paused and _effect_runner is None:
                         _trigger_dispatch()
                     return {"paused": paused, "retry_count": retry_count}
@@ -20408,9 +21508,9 @@ async def _complete_job_legacy(
                         completion_entry_status,
                         "paused",
                     ):
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
+                        await _raise_completion_control_race(
+                            completion_current_status,
+                            legacy_detail=(
                                 "Completion finalization lost an out-of-band job "
                                 "control race"
                             ),
@@ -20452,6 +21552,14 @@ async def _complete_job_legacy(
                 )
 
                 async def _pause_for_llm_outage() -> dict[str, Any]:
+                    if _effect_runner is not None:
+                        paused = bool(
+                            await postgres_db.pause_job(
+                                job_id, completion_commands_enabled=True
+                            )
+                        )
+                        if not paused:
+                            await _raise_completion_control_race()
                     now = datetime.now(timezone.utc)
                     advanced = await postgres_db.increment_job_llm_outage_attempt(
                         job_id,
@@ -20499,19 +21607,15 @@ async def _complete_job_legacy(
                                 next_retry.isoformat(),
                             )
                     except Exception as exc:
+                        if _effect_runner is not None:
+                            raise
                         logger.warning(
                             "Failed to write llm_outage next_retry_at for %s: %s",
                             job_id,
                             exc,
                         )
-                    paused = bool(await postgres_db.pause_job(job_id))
-                    if _effect_runner is not None and not paused:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                "Completion report lost an out-of-band job control race"
-                            ),
-                        )
+                    if _effect_runner is None:
+                        paused = bool(await postgres_db.pause_job(job_id))
                     return {
                         "paused": paused,
                         "attempt": attempt,
@@ -20531,9 +21635,9 @@ async def _complete_job_legacy(
                         completion_entry_status,
                         "paused",
                     ):
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
+                        await _raise_completion_control_race(
+                            completion_current_status,
+                            legacy_detail=(
                                 "Completion finalization lost an out-of-band job "
                                 "control race"
                             ),
@@ -20607,6 +21711,14 @@ async def _complete_job_legacy(
                     completion_entry_status
                     if stateless_completion or _effect_runner is not None
                     else None
+                ),
+                completion_owner_command_id=(
+                    str(_effect_runner.command_id)
+                    if _effect_runner is not None
+                    else None
+                ),
+                completion_owner=(
+                    str(_effect_runner.owner) if _effect_runner is not None else None
                 ),
             )
 
@@ -20879,10 +21991,7 @@ async def _complete_job_legacy(
                         completion_entry_status,
                         current_status,
                     )
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Completion report lost an out-of-band job control race",
-                    )
+                    await _raise_completion_control_race(current_status)
                 return {
                     "new_status": new_status,
                     "had_assigned_agent": had_assigned_agent,
@@ -21146,6 +22255,16 @@ async def _complete_job_legacy(
                                     decided_by="system",
                                     reason=denial_detail,
                                     denied=True,
+                                    completion_owner_command_id=(
+                                        _effect_runner.command_id
+                                        if _effect_runner is not None
+                                        else None
+                                    ),
+                                    completion_owner=(
+                                        _effect_runner.owner
+                                        if _effect_runner is not None
+                                        else None
+                                    ),
                                 )
                             except Exception as exc:
                                 # Preserve the legacy fallback to manual review.
@@ -21232,6 +22351,13 @@ async def _complete_job_legacy(
                     )
                     if freeze_notification["sent"]:
                         actions.append(f"notification sent ({ft})")
+
+        # A legitimate control writer may win after S17 commits. Revalidate
+        # that exact command-owned disposition immediately before the first
+        # Class C effect; a miss supersedes the whole command before graft,
+        # spawn, merge, parent-unblock, or teardown can begin.
+        if _effect_runner is not None:
+            await _effect_runner.assert_disposition_authority()
 
         # 2. Subjob output graft (uniform for all subjob types; critic skipped inside)
         if job.get("parent_job_id"):
@@ -21531,179 +22657,9 @@ async def _complete_job_legacy(
 
         # 7. Archive workspace (snapshot to S3) and clean up VM/container
         if job.get("status") in ("completed", "failed"):
-            initial_workspace_context = _get_container_context(job)
-            initial_vm_context = _get_vm_context(job)
-            durable_kubernetes_teardown = bool(
-                _effect_runner is not None
-                and (
-                    await _effect_runner.has_started("workspace_archive_teardown")
-                    or (
-                        initial_workspace_context.get("provisioner") != "docker"
-                        and not initial_vm_context
-                    )
-                )
-            )
-            teardown_runner = _effect_runner if durable_kubernetes_teardown else None
-
-            async def _archive_and_teardown_workspace() -> dict[str, Any]:
-                try:
-                    use_uid_fenced_kubernetes_teardown = False
-                    teardown_intent: dict[str, Any] | None = None
-                    if teardown_runner is not None:
-                        teardown_intent = await teardown_runner.capture_intent(
-                            "workspace_archive_teardown"
-                        )
-                        use_uid_fenced_kubernetes_teardown = bool(
-                            teardown_intent is not None
-                            and teardown_intent.get("kind") == "kubernetes"
-                        )
-                        teardown_job = await postgres_db.get_job(job_id)
-                        if (
-                            not use_uid_fenced_kubernetes_teardown
-                            and teardown_job is not None
-                        ):
-                            workspace_context = _get_container_context(teardown_job)
-                            vm_context = _get_vm_context(teardown_job)
-                            workspace_is_active = bool(workspace_context) and (
-                                workspace_context.get("status")
-                                not in ("deleted", "deleting", "released", None)
-                            )
-                            vm_is_active = bool(vm_context) and (
-                                vm_context.get("status") not in ("deleted", "deleting")
-                            )
-                            use_uid_fenced_kubernetes_teardown = (
-                                workspace_is_active
-                                and workspace_context.get("provisioner") != "docker"
-                                and not vm_is_active
-                            )
-
-                    if use_uid_fenced_kubernetes_teardown:
-                        owner = WorkspaceOwner.job(job_id)
-                        intent = teardown_intent
-                        if intent is None:
-                            captured = await container_provisioner.capture_terminal_workspace_identity(
-                                owner
-                            )
-                            intent = await teardown_runner.capture_intent(
-                                "workspace_archive_teardown",
-                                {
-                                    "kind": "kubernetes",
-                                    "pod_uid": captured.pod_uid,
-                                    "pvc_uid": captured.pvc_uid,
-                                    "service_uid": captured.service_uid,
-                                    "pod_ip": captured.pod_ip,
-                                    "ssh_host_key_fingerprint": (
-                                        captured.ssh_host_key_fingerprint
-                                    ),
-                                    "ssh_port": captured.ssh_port,
-                                    "snapshot_generation": (teardown_runner.command_id),
-                                    "snapshot_created_at": (
-                                        datetime.now(timezone.utc).isoformat()
-                                    ),
-                                },
-                            )
-
-                        if intent is None or intent.get("kind") != "kubernetes":
-                            raise RuntimeError(
-                                "workspace teardown intent is missing Kubernetes identity"
-                            )
-                        pod_uid = intent.get("pod_uid")
-                        pvc_uid = intent.get("pvc_uid")
-                        service_uid = intent.get("service_uid")
-                        pod_ip = intent.get("pod_ip")
-                        host_key = intent.get("ssh_host_key_fingerprint")
-                        ssh_port = intent.get("ssh_port")
-                        snapshot_generation = intent.get("snapshot_generation")
-                        snapshot_created_at = intent.get("snapshot_created_at")
-                        if not isinstance(pod_uid, str) or not pod_uid:
-                            raise RuntimeError(
-                                "workspace teardown intent has invalid Pod UID"
-                            )
-                        if pvc_uid is not None and (
-                            not isinstance(pvc_uid, str) or not pvc_uid
-                        ):
-                            raise RuntimeError(
-                                "workspace teardown intent has invalid PVC UID"
-                            )
-                        if service_uid is not None and (
-                            not isinstance(service_uid, str) or not service_uid
-                        ):
-                            raise RuntimeError(
-                                "workspace teardown intent has invalid Service UID"
-                            )
-                        if not isinstance(pod_ip, str) or not pod_ip:
-                            raise RuntimeError(
-                                "workspace teardown intent has invalid Pod IP"
-                            )
-                        if not isinstance(host_key, str) or not host_key:
-                            raise RuntimeError(
-                                "workspace teardown intent has invalid SSH host key"
-                            )
-                        if isinstance(ssh_port, bool) or not isinstance(ssh_port, int):
-                            raise RuntimeError(
-                                "workspace teardown intent has invalid SSH port"
-                            )
-                        if (
-                            snapshot_generation != teardown_runner.command_id
-                            or not isinstance(snapshot_created_at, str)
-                            or not snapshot_created_at
-                        ):
-                            raise RuntimeError(
-                                "workspace teardown intent has invalid snapshot identity"
-                            )
-                        teardown_identity = WorkspaceTeardownIdentity(
-                            pod_uid=pod_uid,
-                            pvc_uid=pvc_uid,
-                            service_uid=service_uid,
-                            pod_ip=pod_ip,
-                            ssh_host_key_fingerprint=host_key,
-                            ssh_port=ssh_port,
-                        )
-
-                        released = await container_provisioner.release_workspace(
-                            owner,
-                            teardown_identity=teardown_identity,
-                            require_snapshot=True,
-                            expected_runtime_incarnation=pod_uid,
-                            expected_host_key_fingerprint=host_key,
-                            strict_terminal_snapshot=True,
-                            terminal_snapshot_generation=snapshot_generation,
-                            terminal_snapshot_created_at=snapshot_created_at,
-                            strict=True,
-                            exact_absence_timeout_seconds=(
-                                _COMPLETION_S36_EXACT_ABSENCE_TIMEOUT_SECONDS
-                            ),
-                        )
-                        if not released:
-                            raise RuntimeError(
-                                "UID-fenced Kubernetes workspace release was not confirmed"
-                            )
-                        cleanup_actions = ["k8s workspace released"]
-                    else:
-                        # Includes every default-off call plus the VM and Docker
-                        # lanes, whose established cleanup semantics are not in
-                        # Gate 3's Kubernetes-only S36 scope.
-                        cleanup_actions = await _archive_and_cleanup_workspace(job_id)
-                except Exception as exc:
-                    logger.warning(
-                        "Workspace cleanup failed for job %s (non-blocking): %s",
-                        job_id,
-                        exc,
-                    )
-                    return {
-                        "actions": [f"workspace cleanup failed: {exc}"],
-                        "error": str(exc),
-                    }
-                return {"actions": list(cleanup_actions)}
-
-            workspace_cleanup = await _run_completion_effect(
-                teardown_runner,
-                "workspace_archive_teardown",
-                "workspace_teardown",
-                _archive_and_teardown_workspace,
-                retry_if=lambda output: bool(output.get("error")),
-                effect_timeout_seconds=890.0,
-                command_lease_seconds=900.0,
+            workspace_cleanup = await _run_completion_workspace_teardown(
+                job_id,
+                _effect_runner,
             )
             actions.extend(workspace_cleanup["actions"])
 
@@ -21732,6 +22688,16 @@ async def _complete_job_legacy(
     except HTTPException:
         raise
     except Exception as e:
+        if _effect_runner is not None:
+            # Keep the default-off route from importing the finalizer. Durable
+            # status races are command state-machine signals, not HTTP-500
+            # failures, and must reach CompletionFinalizer's supersede handler.
+            from services.completion_finalizer import (
+                CompletionDispositionSuperseded,
+            )
+
+            if isinstance(e, CompletionDispositionSuperseded):
+                raise
         logger.exception(f"Failed to handle completion for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -22723,6 +23689,7 @@ async def get_job_diff(request: Request, job_id: str) -> dict[str, Any]:
             status_code=404,
             detail="Job has no Mode A diff baseline.",
         )
+
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available.")
     from services.diff_source import GiteaDiffSource
@@ -22829,6 +23796,7 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     See docs/done/job_cloud_export.md §3.5.
     """
     _, job = await require_job_access(request, postgres_db, job_id)
+    await _guard_completion_control(job_id, source="mode_a_accept")
 
     # --- Gates -------------------------------------------------------
     if job.get("status") != "pending_review":
@@ -22852,6 +23820,7 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
                 "only pending diffs can be accepted."
             ),
         )
+
     if not job.get("cloud_diff_baseline_commit"):
         raise HTTPException(
             status_code=409,
@@ -22885,6 +23854,10 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     if not backend.is_initialized:
         raise HTTPException(status_code=503, detail="Cloud backend not initialized.")
 
+    control_claim = await _claim_completion_control(
+        {**job, "id": job_id}, source="mode_a_accept"
+    )
+
     # --- External-modification gate ---------------------------------
     from services.job_cloud_baseline import (
         apply_diff_to_cloud,
@@ -22893,7 +23866,18 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
         project_folder_slug,
     )
 
-    diff_summary = await get_diff_summary(job=job, gitea_client=gitea_client)
+    try:
+        diff_summary = await (
+            asyncio.wait_for(
+                get_diff_summary(job=job, gitea_client=gitea_client),
+                timeout=120.0,
+            )
+            if control_claim is not None
+            else get_diff_summary(job=job, gitea_client=gitea_client)
+        )
+    except Exception:
+        await _abort_completion_control_claim(control_claim)
+        raise
     slug = project_folder_slug(job, project)
     prefix = f"projects/{slug}/"
     affected_paths = {
@@ -22901,13 +23885,23 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
         for entry in ((diff_summary or {}).get("files") or [])
         if str(entry.get("path") or "").startswith(prefix)
     }
-    diverged = await detect_external_mods(
-        job=job,
-        project=project,
-        main_cloud_router=main_cloud_router,
-        scope_paths=affected_paths,
-    )
+    try:
+        detect_call = detect_external_mods(
+            job=job,
+            project=project,
+            main_cloud_router=main_cloud_router,
+            scope_paths=affected_paths,
+        )
+        diverged = await (
+            asyncio.wait_for(detect_call, timeout=180.0)
+            if control_claim is not None
+            else detect_call
+        )
+    except Exception:
+        await _abort_completion_control_claim(control_claim)
+        raise
     if diverged:
+        await _abort_completion_control_claim(control_claim)
         raise HTTPException(
             status_code=409,
             detail={
@@ -22921,16 +23915,26 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
         )
 
     # --- Apply -------------------------------------------------------
-    result = await apply_diff_to_cloud(
-        job=job,
-        project=project,
-        gitea_client=gitea_client,
-        main_cloud_router=main_cloud_router,
-    )
+    try:
+        apply_call = apply_diff_to_cloud(
+            job=job,
+            project=project,
+            gitea_client=gitea_client,
+            main_cloud_router=main_cloud_router,
+        )
+        result = await (
+            asyncio.wait_for(apply_call, timeout=20 * 60.0)
+            if control_claim is not None
+            else apply_call
+        )
+    except Exception:
+        await _abort_completion_control_claim(control_claim)
+        raise
     if result.get("errors"):
         # Partial failure: cloud is now in a mixed state. Surface the
         # errors so the user can see what missed; don't transition the
         # job — user can retry.
+        await _abort_completion_control_claim(control_claim)
         raise HTTPException(
             status_code=502,
             detail={
@@ -22942,9 +23946,6 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
         )
 
     # --- Status transition ------------------------------------------
-    await postgres_db.update_job_cloud_diff(job_id, diff_status="accepted")
-    await postgres_db.update_job_merge_status(job_id, merge_status="cloud-applied")
-    await postgres_db.update_job_status(job_id, status="completed")
     delivery = {
         "delivery_status": "cloud-applied",
         "needs_review": False,
@@ -22953,7 +23954,44 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
         "applied": int(result.get("applied") or 0),
         "deleted": int(result.get("deleted") or 0),
     }
-    await postgres_db.merge_job_context(job_id, {"loop_cloud_delivery": delivery})
+    if control_claim is not None:
+        from services.completion_control import CompletionControlClaimConflict
+
+        try:
+            async with _get_completion_control().finish_claim(control_claim) as (
+                conn,
+                _locked_job,
+            ):
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE jobs
+                    SET diff_status='accepted', merge_status='cloud-applied',
+                        status='completed', assigned_agent_id=NULL,
+                        completed_at=COALESCE(completed_at, CURRENT_TIMESTAMP),
+                        context=COALESCE(context, '{}'::jsonb) || $2::jsonb,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=$1::uuid
+                      AND status='pending_review'
+                      AND diff_status='pending'
+                      AND execution_lane=$3::text
+                    RETURNING id
+                    """,
+                    job_id,
+                    json.dumps({"loop_cloud_delivery": delivery}),
+                    str(job.get("execution_lane") or "pinned"),
+                )
+                if updated is None:
+                    raise CompletionControlClaimConflict(
+                        "job changed while Mode A accept was being committed"
+                    )
+        except CompletionControlClaimConflict as exc:
+            await _abort_completion_control_claim(control_claim)
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    else:
+        await postgres_db.update_job_cloud_diff(job_id, diff_status="accepted")
+        await postgres_db.update_job_merge_status(job_id, merge_status="cloud-applied")
+        await postgres_db.update_job_status(job_id, status="completed")
+        await postgres_db.merge_job_context(job_id, {"loop_cloud_delivery": delivery})
     job["status"] = "completed"
     job["diff_status"] = "accepted"
     job["merge_status"] = "cloud-applied"
@@ -23011,6 +24049,7 @@ async def reject_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     See docs/done/job_cloud_export.md §3.6.
     """
     _, job = await require_job_access(request, postgres_db, job_id)
+    await _guard_completion_control(job_id, source="mode_a_reject")
 
     if job.get("status") != "pending_review":
         raise HTTPException(
@@ -23034,16 +24073,53 @@ async def reject_job_diff(request: Request, job_id: str) -> dict[str, Any]:
             ),
         )
 
-    await postgres_db.update_job_cloud_diff(job_id, diff_status="rejected")
-    await postgres_db.update_job_merge_status(job_id, merge_status="cloud-rejected")
-    await postgres_db.update_job_status(job_id, status="completed")
+    control_claim = await _claim_completion_control(
+        {**job, "id": job_id}, source="mode_a_reject"
+    )
     delivery = {
         "delivery_status": "cloud-rejected",
         "needs_review": False,
         "delivery_sha": None,
         "notes": ["project-file diff rejected; cloud folder left unchanged"],
     }
-    await postgres_db.merge_job_context(job_id, {"loop_cloud_delivery": delivery})
+    if control_claim is not None:
+        from services.completion_control import CompletionControlClaimConflict
+
+        try:
+            async with _get_completion_control().finish_claim(control_claim) as (
+                conn,
+                _locked_job,
+            ):
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE jobs
+                    SET diff_status='rejected', merge_status='cloud-rejected',
+                        status='completed', assigned_agent_id=NULL,
+                        completed_at=COALESCE(completed_at, CURRENT_TIMESTAMP),
+                        context=COALESCE(context, '{}'::jsonb) || $2::jsonb,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=$1::uuid
+                      AND status='pending_review'
+                      AND diff_status='pending'
+                      AND execution_lane=$3::text
+                    RETURNING id
+                    """,
+                    job_id,
+                    json.dumps({"loop_cloud_delivery": delivery}),
+                    str(job.get("execution_lane") or "pinned"),
+                )
+                if updated is None:
+                    raise CompletionControlClaimConflict(
+                        "job changed while Mode A reject was being committed"
+                    )
+        except CompletionControlClaimConflict as exc:
+            await _abort_completion_control_claim(control_claim)
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    else:
+        await postgres_db.update_job_cloud_diff(job_id, diff_status="rejected")
+        await postgres_db.update_job_merge_status(job_id, merge_status="cloud-rejected")
+        await postgres_db.update_job_status(job_id, status="completed")
+        await postgres_db.merge_job_context(job_id, {"loop_cloud_delivery": delivery})
     job["status"] = "completed"
     job["diff_status"] = "rejected"
     job["merge_status"] = "cloud-rejected"
@@ -23773,13 +24849,39 @@ async def assign_job_to_agent(
                 detail=f"Job cannot be assigned (status: {job['status']})",
             )
 
+        await _guard_completion_control(job_id, source="manual_assign")
+
         missing_workspace = _resume_missing_workspace(job)
         if missing_workspace:
-            await postgres_db.shed_workspace_context(
-                job_id, _WORKSPACE_CONTEXT_KEYS[missing_workspace]
-            )
-            if job["status"] != "created":
-                queued = await postgres_db.queue_job_for_resume(job_id)
+            if COMPLETION_COMMANDS_ENABLED:
+                control_claim = await _claim_completion_control(
+                    {**job, "id": job_id}, source="manual_assign_workspace"
+                )
+                try:
+                    queued = await postgres_db.prepare_pinned_job_for_workspace_resume(
+                        job_id,
+                        _WORKSPACE_CONTEXT_KEYS[missing_workspace],
+                        expected_status=str(job["status"]),
+                        completion_control_claim_id=str(control_claim.claim_id),
+                    )
+                except Exception:
+                    await _abort_completion_control_claim(control_claim)
+                    raise
+                if not queued:
+                    await _abort_completion_control_claim(control_claim)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Job changed while it was being queued for provisioning",
+                    )
+            else:
+                await postgres_db.shed_workspace_context(
+                    job_id, _WORKSPACE_CONTEXT_KEYS[missing_workspace]
+                )
+            if job["status"] != "created" and not COMPLETION_COMMANDS_ENABLED:
+                queued = await postgres_db.queue_job_for_resume(
+                    job_id,
+                    **_completion_resume_guard_kwargs(),
+                )
                 if not queued:
                     raise HTTPException(
                         status_code=409,
@@ -23809,6 +24911,17 @@ async def assign_job_to_agent(
             raise HTTPException(
                 status_code=400,
                 detail="Agent has no pod IP configured",
+            )
+
+        if COMPLETION_COMMANDS_ENABLED and not await postgres_db.claim_job_for_agent(
+            job_id,
+            agent_id,
+            completion_commands_enabled=True,
+            allow_failed=True,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Job changed while it was being assigned",
             )
 
         # Use resume path for paused jobs that actually ran, start path for

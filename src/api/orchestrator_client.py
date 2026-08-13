@@ -1633,7 +1633,12 @@ class OrchestratorClient:
             logger.error(f"Unexpected error triggering subjob merge: {e}")
             return False
 
-    async def report_pause(self, job_id: str) -> bool:
+    async def report_pause(
+        self,
+        job_id: str,
+        *,
+        lease_token: int | None = None,
+    ) -> bool:
         """Report that the agent is releasing a job (e.g. during graceful shutdown).
 
         Tells the orchestrator to set the job to 'paused' and clear its agent
@@ -1653,7 +1658,12 @@ class OrchestratorClient:
         url = f"{self.orchestrator_url}/api/jobs/{job_id}/agent-release"
 
         try:
-            response = await self._client.put(url, timeout=10.0)
+            params: dict[str, str | int] = {}
+            if self.agent_id:
+                params["agent_id"] = self.agent_id
+            if lease_token is not None:
+                params["lease_token"] = lease_token
+            response = await self._client.put(url, params=params, timeout=10.0)
             if response.status_code == 200:
                 logger.info(f"Orchestrator accepted agent-release for job {job_id}")
                 return True

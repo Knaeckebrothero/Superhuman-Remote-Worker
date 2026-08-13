@@ -1,6 +1,7 @@
 """Manual assignment must preserve the dispatcher's workspace preflight."""
 
 from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
 
 import pytest
 
@@ -47,11 +48,96 @@ def collaborators(monkeypatch):
     monkeypatch.setattr(main.postgres_db, "get_agent", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "shed_workspace_context", AsyncMock())
     monkeypatch.setattr(
+        main.postgres_db,
+        "prepare_pinned_job_for_workspace_resume",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        main.postgres_db, "claim_job_for_agent", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(
         main.postgres_db, "queue_job_for_resume", AsyncMock(return_value=True)
     )
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
     monkeypatch.setattr(main, "_dispatch_job_to_agent", AsyncMock(return_value=True))
     monkeypatch.setattr(main, "_resume_job_on_agent", AsyncMock(return_value=True))
+
+
+@pytest.mark.asyncio
+async def test_flag_on_manual_assign_guard_blocks_before_workspace_or_agent_io(
+    collaborators, monkeypatch
+):
+    job = _job("paused", workspace_status="failed")
+    main.postgres_db.get_job.return_value = job
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    blocked = main.HTTPException(status_code=409, detail="completion finalizing")
+    guard = AsyncMock(side_effect=blocked)
+    monkeypatch.setattr(main, "_guard_completion_control", guard)
+
+    with pytest.raises(main.HTTPException) as exc:
+        await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+
+    assert exc.value.status_code == 409
+    guard.assert_awaited_once_with(JOB_ID, source="manual_assign")
+    main.postgres_db.shed_workspace_context.assert_not_awaited()
+    main.postgres_db.prepare_pinned_job_for_workspace_resume.assert_not_awaited()
+    main.postgres_db.get_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_flag_on_missing_workspace_uses_claimed_atomic_preflight(
+    collaborators, monkeypatch
+):
+    job = _job("failed", workspace_status="failed")
+    main.postgres_db.get_job.return_value = job
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(main, "_guard_completion_control", AsyncMock())
+    claim = SimpleNamespace(claim_id="00000000-0000-0000-0000-000000000301")
+    claim_control = AsyncMock(return_value=claim)
+    monkeypatch.setattr(main, "_claim_completion_control", claim_control)
+
+    result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+
+    assert result["status"] == "queued"
+    claim_control.assert_awaited_once_with(job, source="manual_assign_workspace")
+    main.postgres_db.prepare_pinned_job_for_workspace_resume.assert_awaited_once_with(
+        JOB_ID,
+        "workspace_container",
+        expected_status="failed",
+        completion_control_claim_id=claim.claim_id,
+    )
+    main.postgres_db.shed_workspace_context.assert_not_awaited()
+    main.postgres_db.queue_job_for_resume.assert_not_awaited()
+    main.postgres_db.get_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_flag_on_live_workspace_claims_before_agent_post(
+    collaborators, monkeypatch
+):
+    job = _job("failed", workspace_status="ready")
+    main.postgres_db.get_job.return_value = job
+    main.postgres_db.get_agent.return_value = _agent()
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(main, "_guard_completion_control", AsyncMock())
+    order: list[str] = []
+    main.postgres_db.claim_job_for_agent.side_effect = (
+        lambda *_args, **_kwargs: order.append("claim") or True
+    )
+    main._dispatch_job_to_agent.side_effect = (
+        lambda *_args, **_kwargs: order.append("post") or True
+    )
+
+    result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+
+    assert result["status"] == "assigned"
+    assert order == ["claim", "post"]
+    main.postgres_db.claim_job_for_agent.assert_awaited_once_with(
+        JOB_ID,
+        AGENT_ID,
+        completion_commands_enabled=True,
+        allow_failed=True,
+    )
 
 
 class TestManualAssignWorkspacePreflight:

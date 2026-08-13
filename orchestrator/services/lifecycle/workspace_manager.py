@@ -24,6 +24,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from database.postgres import _completion_control_active_sql
+
 from .types import Instance
 from services.workspace_lifecycle import WorkspaceOwner
 
@@ -348,6 +350,10 @@ class WorkspaceInstanceManager:
                     metadata["snapshot_status"] = snap.get("status")
             elif job_id:
                 row = await self._fetch_job(job_id)
+                if self._completion_commands_enabled:
+                    metadata[
+                        "completion_control_owned"
+                    ] = await self._completion_control_owns_workspace(job_id)
                 if row is _FETCH_FAILED:
                     pass  # unknown state — leave metadata bare, never reap
                 elif row is None:
@@ -403,6 +409,12 @@ class WorkspaceInstanceManager:
             # The durable S36 effect, not the unhealthy shortcut, owns this
             # exact workspace while the command remains unfinished.
             return True
+        if inst.metadata.get("completion_control_owned"):
+            # A human control has fenced the agent and may be between its DB
+            # transition and external workspace I/O.  Keep every lifecycle
+            # shortcut off the same physical resource until that bounded claim
+            # expires (malformed markers stay fail-closed).
+            return True
         # Phase 2a: phase Running is the cheap signal. Phase 2b adds a
         # crash detector that catches Unknown/Failed pods explicitly.
         return inst.metadata.get("pod_phase") in (None, "Running", "Pending")
@@ -418,6 +430,8 @@ class WorkspaceInstanceManager:
         if _is_stateless_thread_instance(inst):
             return False
         if inst.metadata.get("completion_finalization_owned"):
+            return False
+        if inst.metadata.get("completion_control_owned"):
             return False
         if inst.metadata.get("has_live_shared_child"):
             return False
@@ -458,6 +472,8 @@ class WorkspaceInstanceManager:
         if _is_stateless_thread_instance(inst):
             return False
         if inst.metadata.get("completion_finalization_owned"):
+            return False
+        if inst.metadata.get("completion_control_owned"):
             return False
         if inst.metadata.get("has_live_shared_child"):
             return False
@@ -662,6 +678,8 @@ class WorkspaceInstanceManager:
         """
         if _is_stateless_thread_instance(inst):
             return
+        if await self._completion_control_owns_instance(inst):
+            return
         if await self._completion_finalization_owns_instance(inst):
             return
         bound = inst.bound_to
@@ -690,6 +708,12 @@ class WorkspaceInstanceManager:
         snapshot path isn't usable for this instance.
         """
         if _is_stateless_thread_instance(inst):
+            return None
+        if await self._completion_control_owns_instance(inst):
+            logger.info(
+                "Lifecycle snapshot deferred to active control for job %s",
+                inst.bound_to,
+            )
             return None
         if await self._completion_finalization_owns_instance(inst):
             logger.info(
@@ -782,6 +806,12 @@ class WorkspaceInstanceManager:
 
     async def delete(self, inst: Instance, grace_s: int) -> None:
         if _is_stateless_thread_instance(inst):
+            return
+        if await self._completion_control_owns_instance(inst):
+            logger.info(
+                "Lifecycle teardown deferred to active control for job %s",
+                inst.bound_to,
+            )
             return
         if await self._completion_finalization_owns_instance(inst):
             logger.info(
@@ -1039,6 +1069,8 @@ class WorkspaceInstanceManager:
             # Recheck immediately before destructive orphan cleanup.  The live
             # Pod path has the same action-time guard in delete(); PVC-only
             # remnants never pass through that method.
+            if await self._completion_control_owns_workspace(job_id):
+                continue
             if await self._completion_finalization_owns_workspace(job_id):
                 continue
             try:
@@ -1119,6 +1151,51 @@ class WorkspaceInstanceManager:
                 job_id,
             )
             return True
+
+    async def _completion_control_owns_workspace(self, job_id: str) -> bool:
+        """Whether a live or malformed control marker owns this job resource.
+
+        The predicate uses PostgreSQL's clock, not an orchestrator wall clock,
+        so every lifecycle actor agrees with the admission barrier about claim
+        expiry.  The JSON-number shape check is PostgreSQL-15-safe and treats a
+        malformed reserved marker as active.  Flag off returns before acquiring
+        a connection; flag on fails closed because preserving a resource is the
+        recoverable direction.
+        """
+
+        if not self._completion_commands_enabled:
+            return False
+        if self._db is None or not job_id:
+            return True
+        try:
+            async with self._db.acquire() as conn:
+                value = await conn.fetchval(
+                    f"""
+                    SELECT ({_completion_control_active_sql("context")})
+                    FROM jobs
+                    WHERE id = $1::uuid
+                    """,
+                    job_id,
+                )
+            return bool(value)
+        except Exception:
+            logger.exception(
+                "Completion control lookup failed for job %s; preserving workspace",
+                job_id,
+            )
+            return True
+
+    async def _completion_control_owns_instance(self, inst: Instance) -> bool:
+        """Action-time control-marker check for job-bound workspaces only."""
+
+        if not self._completion_commands_enabled:
+            return False
+        labels = inst.metadata.get("labels") or {}
+        if "srw/thread-id" in labels or inst.metadata.get("thread_status") is not None:
+            return False
+        if not inst.bound_to:
+            return bool(inst.metadata.get("completion_control_owned"))
+        return await self._completion_control_owns_workspace(str(inst.bound_to))
 
     async def _completion_finalization_owns_instance(self, inst: Instance) -> bool:
         """Action-time S36 ownership check for job-bound workspaces only."""

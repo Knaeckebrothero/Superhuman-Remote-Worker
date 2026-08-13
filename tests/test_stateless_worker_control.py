@@ -157,6 +157,7 @@ async def test_leased_cancel_publishes_status_without_pruning_checkpoint():
     cancel_sql = " ".join(job_update.args[0].split())
     assert "status::text <> 'completed'" in cancel_sql
     assert "_stateless_delete_pending" in cancel_sql
+    assert "_completion_control_claim" not in cancel_sql
     # A response-lost retry after cleanup cleared the marker must be able to
     # re-arm idempotent cleanup instead of waiting the full settle timeout.
     assert "status::text <> 'cancelled' OR NOT" in cancel_sql
@@ -460,6 +461,61 @@ async def test_stateless_resume_sql_rejects_durable_delete_intent():
 
 
 @pytest.mark.asyncio
+async def test_resume_mutation_guard_names_shared_view_only_when_enabled():
+    conn = AsyncMock()
+    conn.fetchrow.return_value = None
+    db = _db_with_conn(conn)
+
+    await db._queue_job_for_resume_on_conn(
+        conn,
+        UUID(JOB_ID),
+        None,
+        void_completion_decision=True,
+        completion_commands_enabled=True,
+    )
+
+    sql = " ".join(conn.fetchrow.await_args.args[0].split())
+    assert "job_completion_sweep_exclusions" in sql
+    assert "completion_route.job_id = jobs.id" in sql
+
+
+@pytest.mark.asyncio
+async def test_resume_owner_exemption_requires_live_exact_finalizer_term():
+    conn = AsyncMock()
+    conn.fetchrow.return_value = None
+    db = _db_with_conn(conn)
+    command_id = "22222222-2222-2222-2222-222222222222"
+
+    await db._queue_job_for_resume_on_conn(
+        conn,
+        UUID(JOB_ID),
+        None,
+        void_completion_decision=True,
+        completion_commands_enabled=True,
+        completion_owner_command_id=command_id,
+        completion_owner="finalizer:exact-term",
+    )
+
+    call = conn.fetchrow.await_args
+    sql = " ".join(call.args[0].split())
+    assert "owning.state = 'finalizing'" in sql
+    assert "owning.finalizing_by" in sql
+    assert "owning.lease_expires_at > now()" in sql
+    assert UUID(command_id) in call.args
+    assert "finalizer:exact-term" in call.args
+
+    with pytest.raises(ValueError, match="must be supplied together"):
+        await db._queue_job_for_resume_on_conn(
+            conn,
+            UUID(JOB_ID),
+            None,
+            void_completion_decision=True,
+            completion_commands_enabled=True,
+            completion_owner_command_id=command_id,
+        )
+
+
+@pytest.mark.asyncio
 async def test_explicit_resume_unparks_then_updates_job_in_one_transaction():
     conn = MagicMock()
     conn.transaction.return_value = _AsyncCM()
@@ -624,6 +680,32 @@ async def test_workspace_reprovision_resume_stamps_generation_without_runnable_u
     assert merged["queued_feedback"] == "continue after rebuild"
     assert UUID(merged["worker_resume_id"])
     assert UUID(merged["queued_feedback_delivery_id"])
+
+
+@pytest.mark.asyncio
+async def test_workspace_reprovision_command_guard_runs_before_context_shed():
+    conn = MagicMock()
+    conn.transaction.return_value = _AsyncCM()
+    conn.fetchrow = AsyncMock(
+        return_value={"unit_kind": "worker_batch", "state": "done", "input_seq": 9}
+    )
+    conn.fetchval = AsyncMock(side_effect=[UUID(JOB_ID), True])
+    db = _db_with_conn(conn)
+
+    assert not await db.prepare_stateless_job_for_workspace_resume(
+        JOB_ID,
+        "workspace_container",
+        expected_status="pending_review",
+        completion_commands_enabled=True,
+    )
+
+    assert conn.fetchval.await_count == 2
+    assert "FOR UPDATE" in conn.fetchval.await_args_list[0].args[0]
+    assert "job_completion_sweep_exclusions" in conn.fetchval.await_args_list[1].args[0]
+    assert not any(
+        call.args and "last_' || $2::text" in call.args[0]
+        for call in conn.fetchrow.await_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -920,6 +1002,228 @@ async def test_cancel_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_flag_on_pinned_cancel_linearizes_before_agent_post_and_prunes_after(
+    monkeypatch,
+):
+    from orchestrator import main
+
+    agent_id = "22222222-2222-2222-2222-222222222222"
+    job = {
+        "id": JOB_ID,
+        "status": "processing",
+        "execution_lane": "pinned",
+        "assigned_agent_id": agent_id,
+        "context": {},
+    }
+    order = []
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(
+        main,
+        "require_internal_or_job_access",
+        AsyncMock(return_value=(None, job)),
+    )
+    linearize = AsyncMock(
+        side_effect=lambda *_a, **_k: order.append("linearize") or True
+    )
+    monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", linearize)
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_agent",
+        AsyncMock(
+            return_value={
+                "id": agent_id,
+                "pod_ip": "127.0.0.1",
+                "pod_port": 8000,
+                "status": "working",
+            }
+        ),
+    )
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"graceful": True}
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.post = AsyncMock(
+        side_effect=lambda *_a, **_k: order.append("post") or response
+    )
+    monkeypatch.setattr(main.httpx, "AsyncClient", MagicMock(return_value=client))
+    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", AsyncMock())
+    monkeypatch.setattr(main.postgres_db, "cancel_job", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_job",
+        AsyncMock(return_value={**job, "status": "cancelled"}),
+    )
+    prune = AsyncMock(side_effect=lambda *_: order.append("prune"))
+    monkeypatch.setattr(main.postgres_db, "delete_checkpoint_thread", prune)
+    monkeypatch.setattr(
+        main, "_cascade_cancel_to_children", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(main, "_handle_scholar_completion", AsyncMock())
+    monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
+    monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
+    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+
+    assert await main.cancel_job(MagicMock(), JOB_ID) == {"status": "cancelled"}
+
+    assert order == ["linearize", "post", "prune"]
+
+
+@pytest.mark.asyncio
+async def test_flag_on_completed_pinned_cancel_stays_completed_without_cleanup(
+    monkeypatch,
+):
+    from orchestrator import main
+
+    job = {
+        "id": JOB_ID,
+        "status": "completed",
+        "execution_lane": "pinned",
+        "assigned_agent_id": None,
+        "context": {},
+    }
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(
+        main,
+        "require_internal_or_job_access",
+        AsyncMock(return_value=(None, job)),
+    )
+    linearize = AsyncMock(return_value=False)
+    monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", linearize)
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_job",
+        AsyncMock(return_value={**job, "status": "completed"}),
+    )
+    cleanup = AsyncMock()
+    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
+    monkeypatch.setattr(main.postgres_db, "cancel_job", AsyncMock())
+    monkeypatch.setattr(main.postgres_db, "delete_checkpoint_thread", AsyncMock())
+    monkeypatch.setattr(main, "_cascade_cancel_to_children", AsyncMock())
+
+    with pytest.raises(HTTPException) as exc:
+        await main.cancel_job(MagicMock(), JOB_ID)
+
+    assert exc.value.status_code == 400
+    linearize.assert_awaited_once_with(
+        JOB_ID,
+        expected_status="completed",
+        completion_commands_enabled=True,
+    )
+    cleanup.assert_not_awaited()
+    main.postgres_db.cancel_job.assert_not_awaited()
+    main.postgres_db.delete_checkpoint_thread.assert_not_awaited()
+    main._cascade_cancel_to_children.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pinned_cancel_linearizer_has_terminal_status_parity_guard():
+    conn = AsyncMock()
+    conn.execute.return_value = "UPDATE 0"
+    db = _db_with_conn(conn)
+
+    assert not await db.linearize_pinned_cancel(JOB_ID, expected_status="completed")
+
+    sql = " ".join(conn.execute.await_args.args[0].split())
+    assert "status::text = $2::text" in sql
+    assert "status NOT IN ('completed', 'cancelled')" in sql
+    assert "_completion_control_claim" not in sql
+    assert conn.execute.await_args.args[2] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_cancel_sql_names_control_marker_only_when_completion_flag_on():
+    conn = MagicMock()
+    conn.transaction.return_value = _AsyncCM()
+    conn.execute = AsyncMock(return_value="UPDATE 0")
+
+    async def fetchrow(sql, *_args):
+        normalized = " ".join(sql.split())
+        if normalized.startswith("SELECT state FROM run_queue"):
+            return {"state": "queued"}
+        if normalized.startswith("UPDATE run_queue"):
+            return {"state": "done"}
+        if normalized.startswith("UPDATE jobs"):
+            return None
+        raise AssertionError(normalized)
+
+    conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    db = _db_with_conn(conn)
+
+    assert not await db.linearize_pinned_cancel(
+        JOB_ID,
+        expected_status="processing",
+        completion_commands_enabled=True,
+    )
+    pinned_sql = " ".join(conn.execute.await_args.args[0].split())
+    assert "_completion_control_claim" in pinned_sql
+
+    assert await db.cancel_stateless_job(JOB_ID, completion_commands_enabled=True) == (
+        False,
+        False,
+    )
+    stateless_sql = next(
+        " ".join(call.args[0].split())
+        for call in conn.fetchrow.await_args_list
+        if call.args and "UPDATE jobs" in call.args[0]
+    )
+    assert "_completion_control_claim" in stateless_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["pinned", "stateless"])
+async def test_flag_on_cancel_returns_exact_409_for_active_control_claim(
+    monkeypatch, lane
+):
+    from orchestrator import main
+
+    job = {
+        "id": JOB_ID,
+        "execution_lane": lane,
+        "status": "processing",
+        "assigned_agent_id": None,
+        "context": {
+            "_completion_control_claim": {
+                "version": 1,
+                "expires_epoch": 4_102_444_800,
+            }
+        },
+    }
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(
+        main,
+        "require_internal_or_job_access",
+        AsyncMock(return_value=(None, job)),
+    )
+    monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=job))
+    stateless_cancel = AsyncMock(return_value=(False, False))
+    pinned_cancel = AsyncMock(return_value=False)
+    monkeypatch.setattr(main.postgres_db, "cancel_stateless_job", stateless_cancel)
+    monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", pinned_cancel)
+    cleanup = AsyncMock()
+    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
+
+    with pytest.raises(HTTPException) as exc:
+        await main.cancel_job(MagicMock(), JOB_ID)
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "job control is in progress"
+    cleanup.assert_not_awaited()
+    if lane == "pinned":
+        pinned_cancel.assert_awaited_once_with(
+            JOB_ID,
+            expected_status="processing",
+            completion_commands_enabled=True,
+        )
+        stateless_cancel.assert_not_awaited()
+    else:
+        stateless_cancel.assert_awaited_once_with(
+            JOB_ID, completion_commands_enabled=True
+        )
+        pinned_cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_cancel_endpoint_closes_queued_stateless_unit_without_agent_post(
     monkeypatch,
 ):
@@ -1155,6 +1459,75 @@ async def test_cascade_cancel_reports_unsettled_stateless_child(monkeypatch):
     )
 
     assert not await main._cascade_cancel_to_children(JOB_ID)
+
+
+@pytest.mark.asyncio
+async def test_flag_on_cascade_pinned_control_loser_has_zero_external_io(monkeypatch):
+    from orchestrator import main
+
+    child = {
+        "id": PARENT_ID,
+        "status": "processing",
+        "execution_lane": "pinned",
+        "assigned_agent_id": None,
+        "context": {
+            "_completion_control_claim": {
+                "version": 1,
+                "expires_epoch": 4_102_444_800,
+            }
+        },
+    }
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(
+        main.postgres_db, "get_descendant_jobs", AsyncMock(return_value=[child])
+    )
+    linearize = AsyncMock(return_value=False)
+    monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", linearize)
+    monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=child))
+    cleanup = AsyncMock()
+    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", cleanup)
+    monkeypatch.setattr(main.postgres_db, "get_agent", AsyncMock())
+
+    assert not await main._cascade_cancel_to_children(JOB_ID)
+
+    linearize.assert_awaited_once_with(
+        PARENT_ID,
+        expected_status="processing",
+        completion_commands_enabled=True,
+    )
+    cleanup.assert_not_awaited()
+    main.postgres_db.get_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_flag_on_cascade_pinned_cancel_linearizes_before_cleanup(monkeypatch):
+    from orchestrator import main
+
+    child = {
+        "id": PARENT_ID,
+        "status": "paused",
+        "execution_lane": "pinned",
+        "assigned_agent_id": None,
+        "context": {},
+    }
+    order: list[str] = []
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(
+        main.postgres_db, "get_descendant_jobs", AsyncMock(return_value=[child])
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "linearize_pinned_cancel",
+        AsyncMock(side_effect=lambda *_a, **_k: order.append("linearize") or True),
+    )
+    monkeypatch.setattr(
+        main,
+        "_archive_and_cleanup_workspace",
+        AsyncMock(side_effect=lambda *_a, **_k: order.append("cleanup")),
+    )
+
+    assert await main._cascade_cancel_to_children(JOB_ID)
+    assert order == ["linearize", "cleanup"]
 
 
 @pytest.mark.asyncio

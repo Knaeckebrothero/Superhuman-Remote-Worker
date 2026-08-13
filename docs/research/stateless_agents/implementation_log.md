@@ -4090,3 +4090,82 @@ The repository-wide suite produced **17,336 passed, 163 skipped, 11 failed**,
 with the exact baseline failure list and no new failure. Squawk v2.59.0 found
 zero issues in 0141+0142; schema snapshot freshness/idempotence, repository-wide
 Ruff check and format check (1,122 files), and whitespace checks pass.
+
+# Session 16 — Gate 3 step 4, M2 command/control linearization (2026-08-13)
+
+## M2 shipped — controls lose cleanly, successors cannot claim
+
+- Completion admission now persists the jobs-row status observed under its
+  queue-to-jobs lock. A finalizer resolves that immutable accept-time authority
+  (or the immediately preceding command's proven `done` outcome), and a foreign
+  status wins by settling the whole command `superseded` before Class C. This
+  closes both cancel-after-accept-before-S1 and the ordinary mid-handler Class-A
+  race; an unproven pre-0143 command fails closed rather than adopting the
+  current jobs row.
+- Resume, approve, Mode-A accept/reject, blocking feedback, VM decisions,
+  manual assignment, cancel, pause/preemption/drain, agent release and their
+  cascade paths now serialize on the jobs row. Slow human-control operations
+  publish a fixed-shape, bounded `_completion_control_claim` while fencing the
+  old pinned assignment or stateless queue token. Completion admission,
+  dispatcher/worker admission, watchdogs, lifecycle cleanup and other controls
+  stand down on that marker. Exact owners must consume it before its DB-clock
+  expiry; malformed markers fail closed. Flag-off callers retain their legacy
+  SQL, collaborator order and response behavior and do not name the new
+  relations or marker.
+- Worker-batch claiming filters command-owned units before leasing, skips a
+  blocked FIFO head, and rechecks after the jobs lock. Pinned dispatcher scans
+  and atomic claims use the same command/control exclusions. Post-agent replies
+  no longer resurrect a row after a concurrent control: only the exact still-
+  assigned pinned owner, with no marker, may consume queued context or publish
+  its heartbeat. A bypassed public resume therefore cannot produce a successor
+  claim while an unfinished completion command owns the job.
+- Pause is a two-phase control rather than a DB-first redispatch window. The
+  paused status, assignment fence and marker commit together; the old-agent/VM
+  calls follow; the marker clears only on positive quiescence and otherwise
+  expires through the bounded recovery path. Durable finalizer pause/recovery
+  effects perform their guarded pause as the first transactional mutation.
+  Kubernetes pod recovery records its UID-keyed delete-pending state before
+  deletion and reconciles it on replay; a lost CAS performs no context write,
+  delete or dispatch.
+- S36 now has a jobs-lock authorization marker shared with fresh command
+  admission. If a higher report acquired the lock first, the lower command
+  durably defers without archive/delete; if S36 authorized first, a fresh higher
+  report is rejected until that exact pending effect settles. A late no-op in
+  `completed`, `pending_review` or `reviewing` consumes only its immediate
+  predecessor's deferred teardown, so ordered trailing reports neither repeat
+  unrelated effects nor leak the workspace. Kubernetes, VM and Docker command-
+  backed teardowns all use the same journal/authority protocol; Kubernetes
+  retains the exact UID/snapshot implementation.
+- Lifecycle workspace and VM managers conservatively preserve resources for a
+  live/malformed control marker and recheck before snapshot, delete, give-up and
+  orphan cleanup. This is the M2 control exclusion only. M3 will replace the
+  existing completion-command veto with routed ownership and must also close
+  the remaining read-before-external-I/O interval by giving lifecycle actions
+  a durable shared owner rather than adding another observational check.
+
+Migration 0143 adds nullable `accepted_job_status`. It backfills only from a
+completed S1 journal row, never from mutable current job state, and tightens the
+canonical `superseded` terminal shape. Tilt applied these bytes before the
+pinned-linter pass, so the migration remains frozen at SHA-256
+`c292602dddf5…`; the documented Squawk exclusion is limited to its two
+empty/default-off-table CHECK findings. Schema replay through 0143 is byte-for-
+byte current, and migrations 0141–0143 remain checksummed in k3d.
+
+The required catastrophe is covered in real PostgreSQL both ways: accept-first
+makes resume return exact 409 with zero job/context/queue mutation, while a
+control claim-first fences completion admission. Directly queued blocked units
+remain untouched and a later eligible unit is claimable. Expired/pending
+commands allocate one M1 resume action rather than dispatching an agent;
+parked commands remain operator holds. S36 authorization/admission interleavings
+likewise prove exactly one external teardown owner.
+
+Verification at the M2 boundary: the independently selected affected matrix
+passed **869/869**, including PG15 command/control interleavings, accepted-status
+supersession, worker head-skipping, pause/cancel/cascade ordering, durable pod
+recovery, watchdog exclusions, lifecycle marker guards, S36 handoff chains and
+flag-off vacuity. The repository-wide non-fail-fast suite produced **17,451
+passed, 163 skipped, 11 failed**, with the exact baseline failure list and no
+new failure. Repository-wide Ruff check/format, Python compilation, whitespace,
+Squawk v2.59.0, and the full app/vector/audit schema snapshot replay all pass.
+The preserved live residue remains **2 parked + 1 pending commands and 2 pending
+effects**; M2 did not fabricate, unpark or clean any fixture row.

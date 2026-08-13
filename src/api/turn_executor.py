@@ -536,6 +536,7 @@ class StatelessTurnExecutor:
                     worker_claim = await claim_worker_batch(
                         self._db,
                         pod_name=self._pod_name,
+                        completion_commands_enabled=(self._completion_commands_enabled),
                     )
                 except Exception as e:
                     logger.warning("worker_batch claim poll failed (transient): %s", e)

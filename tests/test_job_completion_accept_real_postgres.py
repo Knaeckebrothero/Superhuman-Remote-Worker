@@ -172,7 +172,8 @@ async def test_pinned_accept_requires_the_exact_assigned_agent(pg):
     async with pg.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT report_seq, client_report_id, accepted_lease_token, "
-            "accepted_agent_id FROM job_completion_commands WHERE job_id = $1",
+            "accepted_agent_id, accepted_job_status "
+            "FROM job_completion_commands WHERE job_id = $1",
             accepted_job_id,
         )
     assert dict(row) == {
@@ -180,6 +181,7 @@ async def test_pinned_accept_requires_the_exact_assigned_agent(pg):
         "client_report_id": report_id,
         "accepted_lease_token": None,
         "accepted_agent_id": assigned_agent_id,
+        "accepted_job_status": "processing",
     }
 
     with pytest.raises(CompletionFenceRejected):
@@ -253,7 +255,8 @@ async def test_stateless_accept_fences_stale_token_without_any_mutation_then_clo
     async with pg.acquire() as conn:
         command = await conn.fetchrow(
             "SELECT report_seq, client_report_id, accepted_lease_token, "
-            "accepted_agent_id FROM job_completion_commands WHERE job_id = $1",
+            "accepted_agent_id, accepted_job_status "
+            "FROM job_completion_commands WHERE job_id = $1",
             job_id,
         )
         queue = await conn.fetchrow(
@@ -267,6 +270,7 @@ async def test_stateless_accept_fences_stale_token_without_any_mutation_then_clo
         "client_report_id": report_id,
         "accepted_lease_token": lease_token,
         "accepted_agent_id": None,
+        "accepted_job_status": "processing",
     }
     assert dict(queue) == {
         "state": "done",

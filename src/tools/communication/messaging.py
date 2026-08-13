@@ -227,6 +227,11 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
                             if context._stateless_worker
                             else None
                         ),
+                        "agent_id": (
+                            getattr(context.orchestrator_client, "agent_id", None)
+                            if not context._stateless_worker
+                            else None
+                        ),
                     },
                 )
 
