@@ -28,6 +28,8 @@ import logging
 import re
 from typing import Any, Optional, Tuple
 
+from services.kb_forge import kb_client_for_repo
+
 # The vault prefix and the repo resolution are both owned by the reindexer:
 # the writer and the sweep MUST agree on repo and path or they silently
 # diverge (that is the shape of kb_reindex_watermark_never_advances).
@@ -229,7 +231,24 @@ async def materialize_knowledge_note(
     branch = branch or "main"
     body = str(content).encode("utf-8")
 
-    exists, blob_sha = await _path_exists(gitea_client, repo_name, branch, path)
+    try:
+        repo_client = await kb_client_for_repo(postgres_db, gitea_client, resolved)
+    except Exception:  # noqa: BLE001 — credential/config failures stay non-fatal
+        logger.error(
+            "kb-materialize: no usable %s client for project %s",
+            resolved.forge,
+            project_id,
+            exc_info=True,
+        )
+        return _result(
+            _STATUS_FAILED,
+            reason="client-error",
+            repo=repo_name,
+            branch=branch,
+            path=path,
+        )
+
+    exists, blob_sha = await _path_exists(repo_client, repo_name, branch, path)
     if exists and blob_sha and blob_sha == _git_blob_sha(body):
         logger.debug(
             "kb-materialize: %s@%s already holds %s byte-for-byte — no commit",
@@ -256,12 +275,16 @@ async def materialize_knowledge_note(
     operation = "update" if exists else "create"
     message = _commit_message(slug, job_id)
     payload = {"path": path, "content_b64": base64.b64encode(body).decode("ascii")}
+    if blob_sha:
+        # GitHub's contents API requires the current blob SHA for an update.
+        # GiteaClient deliberately ignores this extra duck-typed field.
+        payload["sha"] = blob_sha
 
     for attempt, op in enumerate(
         (operation, "create" if operation == "update" else "update")
     ):
         try:
-            committed = await gitea_client.change_files(
+            committed = await repo_client.change_files(
                 repo_name, branch, [{**payload, "operation": op}], message=message
             )
         except Exception as e:  # noqa: BLE001 — non-fatal by contract

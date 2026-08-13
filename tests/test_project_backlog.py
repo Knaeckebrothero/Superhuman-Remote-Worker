@@ -1590,6 +1590,77 @@ class TestCloseBacklogTicketRepoResolution:
         )
 
     @pytest.mark.asyncio
+    async def test_github_repo_reads_snapshot_and_updates_with_blob_sha(self):
+        import contextlib
+
+        from orchestrator.services.kb_reindex import resolve_kb_repo
+
+        datasource_id = uuid.uuid4()
+        db = _repo_db(
+            knowledge=[
+                {
+                    "name": "Design Vault",
+                    "repo_url": "https://github.com/acme/design-vault.git",
+                    "branch": "vault/main",
+                }
+            ]
+        )
+        db.get_native_project_kb_datasource_ref = AsyncMock(
+            return_value={"id": datasource_id, "config": {"root_path": "knowledge"}}
+        )
+        github = MagicMock()
+        github.list_tree = AsyncMock(
+            return_value=[
+                {
+                    "path": "knowledge/feature-x.md",
+                    "type": "blob",
+                    "sha": "existing-blob",
+                }
+            ]
+        )
+        github.change_files = AsyncMock(return_value=True)
+
+        class Source:
+            async def get_head(self):
+                return "head-sha"
+
+            @contextlib.asynccontextmanager
+            async def snapshot(self, ref):
+                assert ref == "head-sha"
+                snapshot = MagicMock()
+                snapshot.get_file = AsyncMock(
+                    return_value=(
+                        "---\nid: feature-x\ntype: feature\nstatus: active\n---\n# T\n"
+                    )
+                )
+                yield snapshot
+
+        with (
+            patch(
+                "orchestrator.services.project_backlog.kb_client_for_repo",
+                AsyncMock(return_value=github),
+            ) as select,
+            patch(
+                "orchestrator.services.project_backlog.GiteaKnowledgeGitSource",
+                return_value=Source(),
+            ),
+        ):
+            ok, gitea, _conn = await self._close(db)
+
+        assert ok is True
+        ref = await resolve_kb_repo(db, self.PROJECT_ID)
+        assert ref is not None
+        select.assert_awaited_once_with(db, gitea, ref)
+        gitea.get_file_content.assert_not_awaited()
+        gitea.create_or_update_file.assert_not_awaited()
+        github.change_files.assert_awaited_once()
+        repo, branch, files = github.change_files.await_args.args[:3]
+        assert (repo, branch) == ("design-vault", "vault/main")
+        assert files[0]["path"] == "knowledge/feature-x.md"
+        assert files[0]["operation"] == "update"
+        assert files[0]["sha"] == "existing-blob"
+
+    @pytest.mark.asyncio
     async def test_repo_less_project_degrades_to_an_index_only_close(self, caplog):
         """A project with neither repo has no file to mirror to. Gitea must
         not be called at all (the old code would have asked for a repo whose

@@ -238,7 +238,44 @@ class TestMaterializeUpdate:
 
         assert result["status"] == "committed"
         assert result["operation"] == "update"
-        assert g.change_files.await_args.args[2][0]["operation"] == "update"
+        file = g.change_files.await_args.args[2][0]
+        assert file["operation"] == "update"
+        assert file["sha"] == "stale" + "0" * 35
+
+    @pytest.mark.asyncio
+    async def test_github_descriptor_selects_external_client_not_gitea(self):
+        gitea = _make_gitea()
+        github = _make_gitea(tree_paths={PATH: "stale" + "0" * 35})
+        ref = KbRepoRef(
+            forge="github",
+            repo_url="https://github.com/acme/design-vault.git",
+            owner="acme",
+            repo="design-vault",
+            branch="main",
+            credential_ref="55555555-6666-7777-8888-999999999999",
+        )
+        db = AsyncMock()
+        with (
+            _patch_resolve(ref),
+            patch(
+                "services.kb_materialize.kb_client_for_repo",
+                AsyncMock(return_value=github),
+            ) as select,
+        ):
+            result = await materialize_knowledge_note(
+                postgres_db=db,
+                gitea_client=gitea,
+                project_id=PROJECT,
+                slug=SLUG,
+                content=BODY,
+                job_id=JOB,
+            )
+
+        assert result["status"] == "committed"
+        select.assert_awaited_once_with(db, gitea, ref)
+        gitea.list_tree.assert_not_awaited()
+        gitea.change_files.assert_not_awaited()
+        github.change_files.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_identical_bytes_are_not_recommitted(self):

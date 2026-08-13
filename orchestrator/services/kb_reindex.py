@@ -47,6 +47,8 @@ from src.tools.knowledge.gardener import (
     parse_note_md,
 )
 
+from .kb_forge import kb_client_for_repo
+
 logger = logging.getLogger(__name__)
 
 # Sweeper cadence. Coarse by design: the post-merge trigger covers the loop's
@@ -1073,8 +1075,9 @@ async def kb_sweep_tick(
                 # Raced with a repo detach between the enumeration and here.
                 continue
             repo_name, branch = resolved.repo, resolved.branch
+            repo_client = await kb_client_for_repo(postgres_db, gitea_client, resolved)
             result = await reindex_fn(
-                gitea_client=gitea_client,
+                gitea_client=repo_client,
                 store=store,
                 embedding_service=embedding_service,
                 kb_id=project_id,

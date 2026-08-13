@@ -102,6 +102,7 @@ from pydantic import (  # noqa: E402
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     field_validator,
     model_validator,
 )
@@ -9673,6 +9674,37 @@ class UserSettingsUpdate(BaseModel):
         return v
 
 
+class ExternalKnowledgeBase(BaseModel):
+    """An existing private GitHub repo to use as a project's live vault."""
+
+    repo_url: str = Field(..., description="Existing GitHub repository URL")
+    branch: str = Field("main", description="Writable vault branch")
+    token: SecretStr = Field(..., description="Fine-grained GitHub contents PAT")
+    forge: Literal["github"] | None = Field(
+        None,
+        description="Required for GitHub Enterprise; github.com is inferred",
+    )
+
+    @field_validator("branch")
+    @classmethod
+    def _valid_branch(cls, value: str) -> str:
+        branch = str(value or "").strip()
+        if (
+            not branch
+            or branch.startswith("-")
+            or any(char in branch for char in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("branch must be a non-empty Git ref")
+        return branch
+
+    @field_validator("token")
+    @classmethod
+    def _valid_token(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
+            raise ValueError("token must not be empty")
+        return value
+
+
 class ProjectCreate(BaseModel):
     """Request body for creating a project."""
 
@@ -9686,6 +9718,10 @@ class ProjectCreate(BaseModel):
         None, description="Default config overrides"
     )
     user_id: str = Field(..., description="Owner user UUID")
+    external_kb: ExternalKnowledgeBase | None = Field(
+        None,
+        description="Existing private GitHub repo for the writable project KB",
+    )
 
 
 class ProjectUpdate(BaseModel):
@@ -23773,7 +23809,7 @@ def _normalize_kb_config(
 
     raw = dict(config or {})
     native_project = raw.pop(NATIVE_PROJECT_CONFIG_KEY, None) if stored else None
-    unknown = sorted(set(raw) - {"root_path"})
+    unknown = sorted(set(raw) - {"root_path", "forge"})
     if unknown:
         raise HTTPException(
             status_code=400,
@@ -23806,6 +23842,22 @@ def _normalize_kb_config(
             )
         parts.append(part)
     normalized_config = {"root_path": "/".join(parts)}
+    forge = raw.get("forge")
+    if forge is not None:
+        if not isinstance(forge, str):
+            raise HTTPException(status_code=400, detail="KB forge must be a string")
+        from src.services.forge import SUPPORTED_FORGES
+
+        normalized_forge = forge.strip().lower()
+        if normalized_forge not in SUPPORTED_FORGES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsupported KB forge {normalized_forge!r}; expected one of "
+                    f"{sorted(SUPPORTED_FORGES)}"
+                ),
+            )
+        normalized_config["forge"] = normalized_forge
     if native_project:
         normalized_config[NATIVE_PROJECT_CONFIG_KEY] = str(native_project)
     return normalized_config
@@ -44985,6 +45037,130 @@ async def _provision_project_knowledge_repo(
     return datasource
 
 
+def _external_kb_values(
+    external_kb: ExternalKnowledgeBase,
+) -> tuple[str, str, str, str, str, dict[str, str], bool]:
+    """Validate an external live-vault request and return secret-bearing values.
+
+    The tuple stays local to the provisioning call. It is never logged or
+    returned, and the PAT moves directly into ``datasources.credentials``.
+    """
+    from src.services.forge import ForgeError, parse_owner_repo
+
+    repo_url = _validate_kb_repository_url(external_kb.repo_url)
+    credentials = {
+        "auth_method": "token",
+        "token": external_kb.token.get_secret_value().strip(),
+    }
+    _validate_kb_repository_auth(repo_url, credentials)
+
+    host = (urlparse(repo_url).hostname or "").lower().rstrip(".")
+    explicit = external_kb.forge is not None
+    forge = external_kb.forge or (
+        "github" if host in {"github.com", "www.github.com"} else ""
+    )
+    if forge != "github":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "External writable project KBs currently support GitHub only; "
+                "set forge='github' for GitHub Enterprise"
+            ),
+        )
+    try:
+        owner, repo = parse_owner_repo(repo_url)
+    except ForgeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return repo_url, external_kb.branch, forge, owner, repo, credentials, explicit
+
+
+async def _provision_external_project_knowledge_repo(
+    project: dict[str, Any],
+    owner_id: str | None,
+    external_kb: ExternalKnowledgeBase,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Attach an existing GitHub repo and store its PAT on the native KB row."""
+    from services.kb_datasources import NATIVE_PROJECT_CONFIG_KEY
+
+    (
+        repo_url,
+        branch,
+        forge,
+        _owner,
+        repo_name,
+        credentials,
+        explicit_forge,
+    ) = _external_kb_values(external_kb)
+    project_id = str(project["id"])
+    id8 = project_id[:8]
+    repo_row = await postgres_db.add_project_repository(
+        project_id=project_id,
+        name=repo_name,
+        repo_url=repo_url,
+        role="knowledge",
+        description="External project knowledge vault (OKF notes under knowledge/)",
+        is_managed=False,
+        branch=branch,
+    )
+    config = {"root_path": "knowledge", NATIVE_PROJECT_CONFIG_KEY: project_id}
+    if explicit_forge:
+        config["forge"] = forge
+
+    try:
+        datasource_ref = await postgres_db.get_native_project_kb_datasource_ref(
+            project_id
+        )
+        if datasource_ref and datasource_ref.get("id"):
+            datasource_id = str(datasource_ref["id"])
+            updated = await postgres_db.update_datasource(
+                datasource_id,
+                credentials=credentials,
+                config=config,
+            )
+            if not updated:
+                raise RuntimeError("Native project KB datasource update failed")
+            datasource = await postgres_db.get_datasource(datasource_id)
+            if datasource is None:
+                raise RuntimeError("Native project KB datasource disappeared")
+        else:
+            datasource = await postgres_db.create_datasource(
+                name=f"{project['name']} Knowledge ({id8})",
+                ds_type="kb",
+                connection_url=None,
+                description=(
+                    f"This project's knowledge base, stored in `{repo_name}`. "
+                    "Notes written with kb_write land here."
+                ),
+                credentials=credentials,
+                config=config,
+                created_by=owner_id,
+                read_only=True,
+                scope_mode="projects",
+                auto_attach=True,
+                project_ids=[project_id],
+            )
+    except Exception:
+        repo_id = repo_row.get("id") if isinstance(repo_row, dict) else None
+        if repo_id:
+            try:
+                await postgres_db.remove_project_repository(str(repo_id))
+            except Exception:
+                logger.exception(
+                    "Failed to roll back external KB repository row for project %s",
+                    project_id,
+                )
+        raise
+
+    logger.info(
+        "Attached external %s knowledge repo '%s' + KB connector %s to project %s",
+        forge,
+        repo_name,
+        datasource["id"],
+        project_id,
+    )
+    return repo_row, datasource
+
+
 @app.post("/api/projects")
 async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any]:
     """Create a new project with the requesting user as owner."""
@@ -45004,6 +45180,10 @@ async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any
     validated_project_override = _with_validated_tool_overrides(
         body.default_config_override
     )
+    # Validate the full URL/auth/forge tuple before creating the project so a
+    # rejected external-vault request cannot leave a half-created project.
+    if body.external_kb is not None:
+        _external_kb_values(body.external_kb)
     try:
         project = await postgres_db.create_project(
             name=body.name,
@@ -45023,7 +45203,11 @@ async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any
         # Create only the dedicated KB vault. Root jobs get isolated repositories
         # when they are created; project membership never selects a shared
         # workspace. See project_jobs_repo_retirement.md.
-        if gitea_client.is_initialized:
+        if body.external_kb is not None:
+            await _provision_external_project_knowledge_repo(
+                project, owner_id, body.external_kb
+            )
+        elif gitea_client.is_initialized:
             # The vault is written server-side and never cloned into a workspace.
             # A Gitea hiccup remains non-fatal to project creation, but no new
             # project falls back to a jobs repo because none is provisioned.
@@ -45047,6 +45231,47 @@ async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any
         return project
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/projects/{project_id}/knowledge/repository")
+async def attach_project_knowledge_repository(
+    request: Request,
+    project_id: str,
+    body: ExternalKnowledgeBase,
+) -> dict[str, Any]:
+    """Attach an external GitHub live vault to an existing repo-less project.
+
+    Replacing or migrating an existing knowledge-role repository is
+    deliberately not implicit: v1 has no approved note/history migration.
+    """
+    caller, project = await require_project_owner(request, postgres_db, project_id)
+    existing = await postgres_db.get_project_repositories(project_id, role="knowledge")
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Project already has a knowledge repository; migration/replacement "
+                "is not supported by this attach path"
+            ),
+        )
+    _external_kb_values(body)
+    try:
+        repository, datasource = await _provision_external_project_knowledge_repo(
+            project,
+            str(caller["id"]) if caller.get("id") else None,
+            body,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail="Failed to attach external knowledge repository"
+        ) from exc
+    return {
+        "status": "attached",
+        "repository": redact_repository(repository),
+        "datasource": redact_datasource(datasource),
+    }
 
 
 @app.get("/api/projects")
@@ -46725,13 +46950,16 @@ async def _reindex_project_kb(
     """
     from src.services.knowledge_store import KnowledgeStore
 
+    from services.kb_forge import kb_client_for_repo
     from services.kb_reindex import reindex_kb, resolve_kb_repo
 
+    repo_client = gitea_client
     if not repo_name:
         resolved = await resolve_kb_repo(postgres_db, project_id)
         if not resolved:
             return {"status": "no-repo"}
         repo_name, branch = resolved.repo, resolved.branch
+        repo_client = await kb_client_for_repo(postgres_db, gitea_client, resolved)
     svc = await _build_kb_embedding_service()
     if svc is None:
         logger.warning(
@@ -46742,7 +46970,7 @@ async def _reindex_project_kb(
         return {"status": "no-embedding-service"}
     store = KnowledgeStore(db=vector_db, embedding_service=svc)
     return await reindex_kb(
-        gitea_client=gitea_client,
+        gitea_client=repo_client,
         store=store,
         embedding_service=svc,
         kb_id=UUID(project_id),
