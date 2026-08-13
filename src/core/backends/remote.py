@@ -24,6 +24,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -321,6 +322,68 @@ def _parse_shell_completion_record(
     return exit_code, cwd
 
 
+@dataclass(frozen=True, slots=True)
+class _RemoteTerminalShellCleanupCapability:
+    """Immutable exact authority exposing only one terminal cleanup call."""
+
+    host: str
+    port: int
+    username: str
+    key_path: Optional[str]
+    workspace_path: str
+    job_id: str
+    scrollback_limit: int
+    default_timeout: int
+    no_change_timeout: float
+    max_tabs: int
+    blocked_commands: tuple[str, ...]
+    sandbox_cwd: str
+    connect_timeout: int
+    max_retries: int
+    retry_timeouts_as_booting: bool
+    sudo_action: str
+    sudo_block_message: Optional[str]
+    workspace_generation: str
+    runtime_incarnation: str
+    expected_host_key_fingerprint: Optional[str]
+    workspace_owner_kind: str
+    workspace_owner_id: str
+    shell_owner_token: int
+
+    def __call__(self) -> None:
+        cleanup_backend = RemoteBackend(
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            key_path=self.key_path,
+            workspace_path=self.workspace_path,
+            job_id=self.job_id,
+            scrollback_limit=self.scrollback_limit,
+            default_timeout=self.default_timeout,
+            no_change_timeout=self.no_change_timeout,
+            max_tabs=self.max_tabs,
+            blocked_commands=list(self.blocked_commands),
+            sandbox_cwd=self.sandbox_cwd,
+            connect_timeout=self.connect_timeout,
+            max_retries=self.max_retries,
+            retry_timeouts_as_booting=self.retry_timeouts_as_booting,
+            sudo_action=self.sudo_action,
+            sudo_block_message=self.sudo_block_message,
+            workspace_generation=self.workspace_generation,
+            runtime_incarnation=self.runtime_incarnation,
+            expected_host_key_fingerprint=self.expected_host_key_fingerprint,
+            workspace_owner_kind=self.workspace_owner_kind,
+            workspace_owner_id=self.workspace_owner_id,
+        )
+        cleanup_backend.set_shell_owner_token(self.shell_owner_token)
+        cleanup_backend.retire_shell_owner()
+        cleanup_backend.retire_claim_resource_owner()
+        try:
+            cleanup_backend.shell_cleanup()
+        finally:
+            cleanup_backend.retire()
+
+
 class RemoteBackend(WorkspaceBackend):
     """Workspace on a remote host (sandbox container or VM), accessed via SSH/SFTP.
 
@@ -556,6 +619,58 @@ class RemoteBackend(WorkspaceBackend):
             self._tabs.clear()
             self._shell_generation = None
             self._shell_protocol_current = False
+
+    def make_terminal_shell_cleanup_capability(self) -> Callable[[], None]:
+        """Fork a cleanup-only owner before retiring a stateless backend.
+
+        A completion command can be durably accepted before its terminal job
+        disposition is known.  The reporting worker must then retire this
+        backend completely so a cancelled SFTP/resource thread cannot mutate
+        after acceptance, while still retaining the ability to enact a later
+        terminal tmux disposition.  Reusing this backend cannot satisfy both:
+        :meth:`retire` deliberately prevents reconnects.
+
+        The returned immutable callable stores only exact authority and is not
+        exposed to tools.  On invocation it creates a private backend whose
+        ordinary shell and claim-resource admissions start retired; its sole
+        operation is ``shell_cleanup``, whose durable token/generation/runtime
+        fences explicitly permit cleanup after local shell retirement.
+        """
+
+        if self._shell_owner_token is None or not self.workspace_incarnation_fenced:
+            raise WorkspaceUnavailableError(
+                "Terminal shell cleanup capability requires an exact "
+                "stateless runtime fence"
+            )
+        assert self._workspace_generation is not None
+        assert self._runtime_incarnation is not None
+        assert self._workspace_owner_kind is not None
+        assert self._workspace_owner_id is not None
+        return _RemoteTerminalShellCleanupCapability(
+            host=self._host,
+            port=self._port,
+            username=self._username,
+            key_path=self._key_path,
+            workspace_path=self._remote_root,
+            job_id=self._job_id,
+            scrollback_limit=self._scrollback_limit,
+            default_timeout=self._default_timeout,
+            no_change_timeout=self._no_change_timeout,
+            max_tabs=self._max_tabs,
+            blocked_commands=tuple(self._blocked_commands),
+            sandbox_cwd=self._sandbox_cwd,
+            connect_timeout=self._connect_timeout,
+            max_retries=self._max_retries,
+            retry_timeouts_as_booting=self._retry_timeouts_as_booting,
+            sudo_action=self._sudo_action,
+            sudo_block_message=self._sudo_block_message,
+            workspace_generation=self._workspace_generation,
+            runtime_incarnation=self._runtime_incarnation,
+            expected_host_key_fingerprint=self._expected_host_key_fingerprint,
+            workspace_owner_kind=self._workspace_owner_kind,
+            workspace_owner_id=self._workspace_owner_id,
+            shell_owner_token=self._shell_owner_token,
+        )
 
     def claim_shell_owner(self) -> None:
         """Eagerly promote this stateless claim before attach-time shell work."""

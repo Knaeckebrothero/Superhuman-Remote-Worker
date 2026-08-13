@@ -21,7 +21,7 @@ import zipfile
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 import aiosqlite
 import yaml
@@ -308,6 +308,14 @@ class UniversalAgent:
         self._defer_job_cleanup = False
         self._worker_checkpoint_post_commit = None
         self._worker_env_restore: Dict[str, Optional[str]] = {}
+        # A durable completion accept closes run_queue before its background
+        # finalizer has chosen the job disposition.  During that gap the
+        # worker must make every local tool inert while retaining the exact
+        # shell/backend handles needed to enact a later terminal outcome.
+        self._worker_finalization_held = False
+        self._worker_finalization_backend: Any | None = None
+        self._worker_terminal_shell_cleanup: Callable[[], None] | None = None
+        self._worker_shell_admission_retired = False
 
         # Phase-specific LLMs (created if phase overrides configured)
         self._strategic_llm: Optional[BaseChatModel] = None
@@ -873,6 +881,14 @@ class UniversalAgent:
             if int(worker_lease_token) <= 0:
                 raise ValueError("worker_lease_token must be positive")
             if (
+                getattr(self, "_worker_finalization_held", False)
+                or getattr(self, "_worker_finalization_backend", None) is not None
+                or getattr(self, "_worker_terminal_shell_cleanup", None) is not None
+            ):
+                raise RuntimeError(
+                    "A new worker claim cannot replace a finalization-pending hold"
+                )
+            if (
                 worker_batch_target_wall_seconds is None
                 or float(worker_batch_target_wall_seconds) <= 0
             ):
@@ -880,6 +896,7 @@ class UniversalAgent:
             self._worker_lease_token = int(worker_lease_token)
             self._defer_job_cleanup = bool(defer_cleanup)
             self._worker_checkpoint_post_commit = worker_checkpoint_post_commit
+            self._worker_shell_admission_retired = False
         else:
             self._worker_lease_token = None
             self._defer_job_cleanup = False
@@ -1808,9 +1825,10 @@ class UniversalAgent:
 
     async def _cleanup_checkpointer(self) -> None:
         """Clean up checkpointer connection."""
-        if self._checkpoint_conn:
+        checkpoint_conn = getattr(self, "_checkpoint_conn", None)
+        if checkpoint_conn:
             try:
-                await self._checkpoint_conn.close()
+                await checkpoint_conn.close()
             except Exception as e:
                 logger.warning(f"Error closing checkpointer connection: {e}")
         # Fenced worker savers borrow from a lifespan-owned process pool and
@@ -1821,7 +1839,7 @@ class UniversalAgent:
 
     def _cleanup_shell_manager(self) -> None:
         """Clean up ShellManager (kill tmux session)."""
-        if self._shell_manager:
+        if getattr(self, "_shell_manager", None):
             try:
                 self._shell_manager.cleanup()
             except Exception:
@@ -1863,7 +1881,7 @@ class UniversalAgent:
         self._worker_env_restore = {key: os.environ.get(key) for key in keys}
 
     def _restore_worker_environment(self) -> None:
-        restore = self._worker_env_restore
+        restore = getattr(self, "_worker_env_restore", {})
         self._worker_env_restore = {}
         for key, value in restore.items():
             if value is None:
@@ -1883,52 +1901,52 @@ class UniversalAgent:
             except Exception:
                 logger.debug("Worker embedding singleton scrub failed", exc_info=True)
 
-    async def cleanup_worker_claim(self, *, preserve_shell: bool) -> None:
-        """Retire all claim-local runtime state under the driver's disposition.
+    def _worker_workspace_backend(self) -> Any | None:
+        """Return the exact backend retained for this worker disposition."""
 
-        ``preserve_shell=True`` is used for rotation, retry and lease handoff:
-        it closes this Python owner's admission and SSH transport without
-        killing the durable workspace tmux session.  A genuine terminal stop
-        passes ``False`` and keeps the historical destructive shell cleanup.
-        """
+        retained = getattr(self, "_worker_finalization_backend", None)
+        if retained is not None:
+            return retained
+        workspace_manager = getattr(self, "_workspace_manager", None)
+        if workspace_manager is None:
+            return None
+        try:
+            from .core.virtual_dirs import unwrap_backend
 
-        backend = None
-        if self._workspace_manager is not None:
-            try:
-                from .core.virtual_dirs import unwrap_backend
+            return unwrap_backend(workspace_manager.backend)
+        except Exception:
+            logger.debug("Could not unwrap worker workspace backend", exc_info=True)
+            return None
 
-                backend = unwrap_backend(self._workspace_manager.backend)
-            except Exception:
-                logger.debug("Could not unwrap worker workspace backend", exc_info=True)
+    def _retire_worker_shell_admission(self, backend: Any | None) -> None:
+        """Close local tmux admission once, retaining terminal cleanup power."""
 
-        if backend is not None:
-            retire_shell_owner = getattr(backend, "retire_shell_owner", None)
-            if retire_shell_owner is not None:
-                try:
-                    # First teardown action: cancelled synchronous work may
-                    # still hold this object, but can no longer submit tmux I/O.
-                    retire_shell_owner()
-                except Exception:
-                    logger.warning(
-                        "Worker shell admission retirement failed", exc_info=True
-                    )
-
-        if preserve_shell:
-            if self._shell_manager is not None:
-                logger.info(
-                    "Preserving remote shell for worker handoff: job=%s token=%s",
-                    self._current_job_id,
-                    self._worker_lease_token,
-                )
-            self._shell_manager = None
+        if backend is None or getattr(self, "_worker_shell_admission_retired", False):
+            return
+        retire_shell_owner = getattr(backend, "retire_shell_owner", None)
+        if retire_shell_owner is None:
+            self._worker_shell_admission_retired = True
+            return
+        try:
+            # Cancelled synchronous work may still hold this object, but can
+            # no longer submit tmux I/O after this returns.  RemoteBackend's
+            # terminal shell_cleanup deliberately remains available after the
+            # local admission bit is retired.
+            retire_shell_owner()
+        except Exception:
+            logger.warning("Worker shell admission retirement failed", exc_info=True)
         else:
-            self._cleanup_shell_manager()
+            self._worker_shell_admission_retired = True
 
-        if self._tool_context is not None:
-            self._tool_context.shell_manager = None
-            self._tool_context.citation_verdict_callback = None
+    async def _scrub_worker_claim_locals(self) -> None:
+        """Remove tenant-local state without deciding the remote shell fate."""
 
-        if self._doc_registration_task is not None:
+        tool_context = getattr(self, "_tool_context", None)
+        if tool_context is not None:
+            tool_context.shell_manager = None
+            tool_context.citation_verdict_callback = None
+
+        if getattr(self, "_doc_registration_task", None) is not None:
             task = self._doc_registration_task
             self._doc_registration_task = None
             if not task.done():
@@ -1942,11 +1960,114 @@ class UniversalAgent:
                     "Worker document registration cleanup failed", exc_info=True
                 )
 
-        self._close_datasource_connections()
+        # Legacy/unit-test ``__new__`` instances may predate optional
+        # datasource attributes.  Full initialized workers always take the
+        # production cleanup path; sparse instances still get an idempotent
+        # hold instead of failing before admission is closed.
+        if all(
+            hasattr(self, name)
+            for name in (
+                "_knowledge_graph",
+                "_datasource_connections",
+                "_datasource_clients",
+                "_datasource_files_manifest",
+            )
+        ):
+            self._close_datasource_connections()
         await self._cleanup_checkpointer()
         self._restore_worker_environment()
 
-        if backend is not None:
+        # Keep only the exact job id/token for bounded hold logging and the
+        # separately retained shell/backend handles.  Graph, tool, todo,
+        # credential and checkpoint state must not survive while this shared
+        # executor waits for an orchestrator outcome.
+        self._job_metadata = None
+        self._todo_manager = None
+        self._tool_context = None
+        self._tools = None
+        self._graph = None
+        self._worker_checkpoint_post_commit = None
+        self._defer_job_cleanup = False
+
+    async def hold_worker_finalization(self) -> None:
+        """Enter the inert, bounded hold after durable completion acceptance.
+
+        This is deliberately not ``cleanup_worker_claim(preserve_shell=True)``:
+        that handoff drops terminal cleanup authority.  The hold drains and
+        retires the original backend plus all tenant state, retaining only a
+        cleanup-only clone with the exact immutable runtime fence.  A later
+        :meth:`cleanup_worker_claim` performs the one final disposition.
+        """
+
+        if getattr(self, "_worker_finalization_held", False):
+            return
+        backend = self._worker_workspace_backend()
+        self._worker_finalization_backend = backend
+        self._retire_worker_shell_admission(backend)
+
+        # Retain only a cleanup-only clone carrying immutable workspace/job/
+        # runtime/token authority.  The original backend is then fully retired,
+        # which drains admitted resource/SFTP calls and prevents cancelled
+        # worker threads from reconnecting after the B4 acceptance boundary.
+        if getattr(self, "_shell_manager", None) is not None:
+            make_cleanup = getattr(
+                backend, "make_terminal_shell_cleanup_capability", None
+            )
+            if make_cleanup is None:
+                raise RuntimeError(
+                    "Finalization hold requires a cleanup-only shell capability"
+                )
+            self._worker_terminal_shell_cleanup = make_cleanup()
+        retire = getattr(backend, "retire", None) if backend else None
+        if retire is not None:
+            await asyncio.to_thread(retire)
+        await self._scrub_worker_claim_locals()
+        self._workspace_manager = None
+        self._shell_manager = None
+        self._worker_finalization_held = True
+
+    async def cleanup_worker_claim(self, *, preserve_shell: bool) -> None:
+        """Retire all claim-local runtime state under the driver's disposition.
+
+        ``preserve_shell=True`` is used for rotation, retry and lease handoff:
+        it closes this Python owner's admission and SSH transport without
+        killing the durable workspace tmux session.  A genuine terminal stop
+        passes ``False`` and keeps the historical destructive shell cleanup.
+        """
+
+        backend = self._worker_workspace_backend()
+        backend_already_retired = bool(
+            getattr(self, "_worker_finalization_held", False)
+            and backend is getattr(self, "_worker_finalization_backend", None)
+        )
+        self._retire_worker_shell_admission(backend)
+
+        terminal_cleanup = getattr(self, "_worker_terminal_shell_cleanup", None)
+        if terminal_cleanup is not None:
+            if not preserve_shell:
+                try:
+                    await asyncio.to_thread(terminal_cleanup)
+                except Exception:
+                    logger.warning(
+                        "Worker terminal shell retirement was not acknowledged",
+                        exc_info=True,
+                    )
+            self._worker_terminal_shell_cleanup = None
+            self._shell_manager = None
+        elif preserve_shell:
+            if getattr(self, "_shell_manager", None) is not None:
+                logger.info(
+                    "Preserving remote shell for worker handoff: job=%s token=%s",
+                    self._current_job_id,
+                    self._worker_lease_token,
+                )
+            self._shell_manager = None
+        else:
+            self._cleanup_shell_manager()
+
+        await self._scrub_worker_claim_locals()
+
+        if backend is not None and not backend_already_retired:
             retire = getattr(backend, "retire", None)
             disconnect = getattr(backend, "disconnect", None)
             try:
@@ -1967,6 +2088,10 @@ class UniversalAgent:
         self._worker_lease_token = None
         self._worker_checkpoint_post_commit = None
         self._defer_job_cleanup = False
+        self._worker_finalization_held = False
+        self._worker_finalization_backend = None
+        self._worker_terminal_shell_cleanup = None
+        self._worker_shell_admission_retired = False
 
     async def _yield_error_state(
         self, error_state: Dict[str, Any]

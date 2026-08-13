@@ -89,6 +89,7 @@ from ..shared.run_queue import (
 from ..shared.session_retirement import acknowledge_session_claim_quiesced
 from ..shared.worker_queue import (
     WorkerClaim,
+    WorkerCompletionAcceptance,
     WorkerRenewal,
     claim_worker_batch,
     complete_worker_batch,
@@ -117,10 +118,14 @@ CLOUD_PUSH_WAIT_SECONDS = 60.0  # §5.3.5 option (i): the lease covers the push
 TURN_ABORT_GRACE_SECONDS = 15.0  # polite-unwind budget after an interrupt
 COMPLETE_RETRY_ATTEMPTS = 3
 PENDING_ROWS_LIMIT = 50
+WORKER_FINALIZATION_POLL_SECONDS = 1.0
 
 _WORKER_PRESERVE_SHELL_STATUSES = frozenset(
     {"paused", "pending_review", "reviewing", "waiting", "waiting_for_reply"}
 )
+_WORKER_TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_WORKER_UNFINISHED_COMMAND_STATES = frozenset({"pending", "finalizing"})
+_WORKER_FINALIZED_COMMAND_STATES = frozenset({"done", "superseded", "force_resolved"})
 
 
 def _enabled_env(name: str, default: bool = False) -> bool:
@@ -356,6 +361,7 @@ class StatelessTurnExecutor:
         self._worker_preempted = asyncio.Event()
         self._worker_preempt_status: Optional[str] = None
         self._worker_terminal_report_generation: tuple[str, int] | None = None
+        self._worker_completion_accepted_generation: tuple[str, int] | None = None
 
         # S1 acceptance (zero in-process claim state): everything below is
         # either the soft-affinity hint or plumbing. Correctness never
@@ -635,6 +641,7 @@ class StatelessTurnExecutor:
         self._worker_preempted = asyncio.Event()
         self._worker_preempt_status = None
         self._worker_terminal_report_generation = None
+        self._worker_completion_accepted_generation = None
         heartbeat_task = asyncio.create_task(
             self._worker_heartbeat_loop(claim),
             name=f"worker-lease-heartbeat-{unit_id[:8]}",
@@ -680,6 +687,17 @@ class StatelessTurnExecutor:
                 # benignly re-report the durable END checkpoint.
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._cleanup_worker_runtime(preserve_shell=True)
+                if self._worker_completion_accepted_generation == (
+                    unit_id,
+                    int(token),
+                ):
+                    logger.warning(
+                        "worker accepted completion hold failed; durable command "
+                        "backstop retains ownership: unit=%s token=%d",
+                        unit_id,
+                        token,
+                    )
+                    return
                 await self._release_worker_claim(
                     claim,
                     reason="terminal_report_failed",
@@ -996,7 +1014,6 @@ class StatelessTurnExecutor:
                     failed_report_status = renewal.job_status
                     self._observe_worker_renewal(job_id, renewal)
             if accepted_completion is not None:
-                await self._cleanup_worker_runtime(preserve_shell=True)
                 logger.info(
                     "worker completion already accepted: unit=%s token=%d "
                     "command=%s state=%s after ambiguous HTTP result",
@@ -1004,6 +1021,11 @@ class StatelessTurnExecutor:
                     token,
                     accepted_completion.command_id,
                     accepted_completion.command_state,
+                )
+                await self._finish_accepted_worker_completion(
+                    claim,
+                    accepted_completion,
+                    http_result_ambiguous=True,
                 )
                 return
             if self._lease.lost.is_set():
@@ -1063,21 +1085,16 @@ class StatelessTurnExecutor:
                 http_complete_calls=1,
             )
             return
+        if accepted_completion is not None:
+            await self._finish_accepted_worker_completion(
+                claim,
+                accepted_completion,
+                http_result_ambiguous=False,
+            )
+            return
         await self._cleanup_worker_runtime(
             preserve_shell=post_report_status in _WORKER_PRESERVE_SHELL_STATUSES
         )
-        if accepted_completion is not None:
-            logger.info(
-                "worker_batch terminal accepted: unit=%s token=%d "
-                "queue_state=%s command=%s command_state=%s "
-                "complete_calls=0 http_complete_calls=1",
-                job_id,
-                token,
-                accepted_completion.queue_state,
-                accepted_completion.command_id,
-                accepted_completion.command_state,
-            )
-            return
         state = await complete_worker_batch(
             self._db,
             unit_id=unit.unit_id,
@@ -1291,17 +1308,24 @@ class StatelessTurnExecutor:
                 return
             self._observe_worker_renewal(job_id, renewal)
 
-    async def _accepted_worker_completion(self, claim: WorkerClaim) -> Any | None:
+    async def _accepted_worker_completion(
+        self,
+        claim: WorkerClaim,
+        *,
+        command_id: Any | None = None,
+    ) -> WorkerCompletionAcceptance | None:
         """Return an exact B4 accept only while the shared rollout gate is on."""
 
         if not self._completion_commands_enabled:
             return None
         try:
-            return await get_worker_completion_acceptance(
-                self._db,
-                unit_id=claim.unit_id,
-                lease_token=claim.lease_token,
-            )
+            kwargs: dict[str, Any] = {
+                "unit_id": claim.unit_id,
+                "lease_token": claim.lease_token,
+            }
+            if command_id is not None:
+                kwargs["command_id"] = command_id
+            return await get_worker_completion_acceptance(self._db, **kwargs)
         except Exception as exc:
             logger.warning(
                 "worker completion-acceptance lookup failed for unit %s "
@@ -1310,6 +1334,132 @@ class StatelessTurnExecutor:
                 exc,
             )
             return None
+
+    @staticmethod
+    def _stored_worker_completion_status(
+        accepted: WorkerCompletionAcceptance,
+    ) -> str | None:
+        """Resolve shell disposition from the finalized command's own result."""
+
+        outcome = accepted.command_outcome
+        state = accepted.command_state
+        value: Any = None
+        if state == "done":
+            value = outcome.get("new_status")
+        elif state == "superseded":
+            value = outcome.get("observed_status") or outcome.get("observed_job_status")
+        elif state == "force_resolved":
+            value = outcome.get("terminal_status")
+        normalized = str(value or "").strip()
+        return normalized or None
+
+    @staticmethod
+    def _worker_finalization_poll_delay(
+        accepted: WorkerCompletionAcceptance,
+    ) -> float:
+        """Bound the next observation by DB-clock run/lease/deadline horizons."""
+
+        horizons = [
+            WORKER_FINALIZATION_POLL_SECONDS,
+            accepted.deadline_remaining_seconds,
+        ]
+        if accepted.command_state == "pending":
+            horizons.append(accepted.run_after_remaining_seconds)
+        elif (
+            accepted.command_state == "finalizing"
+            and accepted.lease_remaining_seconds is not None
+        ):
+            horizons.append(accepted.lease_remaining_seconds)
+        positive = [value for value in horizons if value > 0]
+        return max(0.05, min(positive or [WORKER_FINALIZATION_POLL_SECONDS]))
+
+    async def _sleep_worker_finalization_poll(self, seconds: float) -> None:
+        """Sleep seam kept separate from the worker lease heartbeat in tests."""
+
+        await asyncio.sleep(seconds)
+
+    async def _finish_accepted_worker_completion(
+        self,
+        claim: WorkerClaim,
+        accepted: WorkerCompletionAcceptance,
+        *,
+        http_result_ambiguous: bool,
+    ) -> None:
+        """Hold an accepted worker shell until its exact command resolves.
+
+        B4 already changed the queue row to ``done``; releasing or completing
+        it here would create a second execution owner.  Pending/finalizing work
+        instead retires local shell admission and scrubs claim-local state,
+        then observes the same command through the established B4 lookup.  Its
+        PostgreSQL deadline is the absolute local wait bound.  Parked, lookup
+        loss, deadline, or cancellation hands the still-live remote shell to
+        the command/lifecycle backstop without requeueing.  Only an explicit
+        terminal status in the stored finalized outcome destroys tmux.
+        """
+
+        current = accepted
+        self._worker_completion_accepted_generation = (
+            str(claim.unit_id),
+            int(claim.lease_token),
+        )
+        held = False
+        while (
+            current.command_state in _WORKER_UNFINISHED_COMMAND_STATES
+            and not current.deadline_expired
+        ):
+            if not held:
+                agent = _pa()._agent
+                if agent is not None:
+                    await agent.hold_worker_finalization()
+                held = True
+                logger.info(
+                    "worker finalization-pending hold: unit=%s token=%d "
+                    "command=%s state=%s deadline_in=%.3fs",
+                    claim.unit_id,
+                    claim.lease_token,
+                    current.command_id,
+                    current.command_state,
+                    current.deadline_remaining_seconds,
+                )
+            await self._sleep_worker_finalization_poll(
+                self._worker_finalization_poll_delay(current)
+            )
+            observed = await self._accepted_worker_completion(
+                claim,
+                command_id=current.command_id,
+            )
+            if observed is None:
+                await self._cleanup_worker_runtime(preserve_shell=True)
+                logger.warning(
+                    "worker finalization hold handed off after lookup loss: "
+                    "unit=%s token=%d command=%s",
+                    claim.unit_id,
+                    claim.lease_token,
+                    current.command_id,
+                )
+                return
+            current = observed
+
+        resolved_status = (
+            self._stored_worker_completion_status(current)
+            if current.command_state in _WORKER_FINALIZED_COMMAND_STATES
+            else None
+        )
+        preserve_shell = resolved_status not in _WORKER_TERMINAL_JOB_STATUSES
+        await self._cleanup_worker_runtime(preserve_shell=preserve_shell)
+        logger.info(
+            "worker_batch completion handoff settled: unit=%s token=%d "
+            "queue_state=%s command=%s command_state=%s outcome_status=%s "
+            "shell=%s ambiguous_http=%s complete_calls=0 http_complete_calls=1",
+            claim.unit_id,
+            claim.lease_token,
+            current.queue_state,
+            current.command_id,
+            current.command_state,
+            resolved_status,
+            "preserved" if preserve_shell else "retired",
+            http_result_ambiguous,
+        )
 
     def _observe_worker_renewal(self, job_id: str, renewal: WorkerRenewal) -> None:
         self._seed_worker_inboxes(

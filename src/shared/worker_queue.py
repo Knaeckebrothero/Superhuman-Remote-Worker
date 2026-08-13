@@ -191,14 +191,36 @@ _ACCEPTED_WORKER_COMPLETION_SQL = """
 SELECT job.status::text AS job_status,
        queue.state AS queue_state,
        command.state AS command_state,
-       command.id AS command_id
+       command.id AS command_id,
+       command.outcome AS command_outcome,
+       command.deadline_at,
+       command.lease_expires_at,
+       command.run_after,
+       command.deadline_at <= clock_timestamp() AS deadline_expired,
+       GREATEST(
+           0.0,
+           extract(epoch FROM (command.deadline_at-clock_timestamp()))
+       )::float8 AS deadline_remaining_seconds,
+       CASE WHEN command.lease_expires_at IS NULL THEN NULL
+            ELSE GREATEST(
+                0.0,
+                extract(epoch FROM (
+                    command.lease_expires_at-clock_timestamp()
+                ))
+            )::float8
+       END AS lease_remaining_seconds,
+       GREATEST(
+           0.0,
+           extract(epoch FROM (command.run_after-clock_timestamp()))
+       )::float8 AS run_after_remaining_seconds
 FROM run_queue AS queue
 JOIN jobs AS job ON job.id = queue.unit_id
 JOIN LATERAL (
-    SELECT id, state
+    SELECT id, state, outcome, deadline_at, lease_expires_at, run_after
     FROM job_completion_commands
     WHERE job_id = queue.unit_id
       AND accepted_lease_token = $2::bigint
+      AND ($3::uuid IS NULL OR id = $3::uuid)
     ORDER BY report_seq DESC
     LIMIT 1
 ) AS command ON TRUE
@@ -319,12 +341,26 @@ class WorkerRenewal:
 
 @dataclass(frozen=True, slots=True)
 class WorkerCompletionAcceptance:
-    """A queue lease closed by durable completion-command admission (B4)."""
+    """A queue lease closed by durable completion-command admission (B4).
+
+    The timing fields are calculated by PostgreSQL's clock.  A worker whose
+    queue row is already ``done`` can therefore wait for the exact command's
+    stored outcome without trusting pod clock skew or inventing a second
+    liveness deadline.
+    """
 
     job_status: str
     queue_state: str
     command_state: str
     command_id: UUID
+    command_outcome: dict[str, Any]
+    deadline_at: datetime
+    lease_expires_at: datetime | None
+    run_after: datetime
+    deadline_expired: bool
+    deadline_remaining_seconds: float
+    lease_remaining_seconds: float | None
+    run_after_remaining_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,6 +770,7 @@ async def get_worker_completion_acceptance(
     *,
     unit_id: UUID | str,
     lease_token: int,
+    command_id: UUID | str | None = None,
 ) -> WorkerCompletionAcceptance | None:
     """Recognize B4 queue closure without misclassifying it as a stolen lease.
 
@@ -742,13 +779,17 @@ async def get_worker_completion_acceptance(
     receives no renewal even though it remains the accepted reporter.  This
     exact token-to-command join distinguishes that benign terminal handoff from
     a real reaper steal; callers must never treat a merely ``done`` queue row as
-    proof on its own.
+    proof on its own.  The first lookup may discover the accepted report by
+    token.  A finalization-pending worker supplies ``command_id`` thereafter so
+    a later report under the same token cannot switch the outcome being
+    observed.
     """
 
     row = await conn.fetchrow(
         _ACCEPTED_WORKER_COMPLETION_SQL,
         _uuid(unit_id),
         int(lease_token),
+        _uuid(command_id) if command_id is not None else None,
     )
     if row is None:
         return None
@@ -757,6 +798,18 @@ async def get_worker_completion_acceptance(
         queue_state=str(row["queue_state"]),
         command_state=str(row["command_state"]),
         command_id=_uuid(row["command_id"]),
+        command_outcome=_json_object(row["command_outcome"]),
+        deadline_at=row["deadline_at"],
+        lease_expires_at=row["lease_expires_at"],
+        run_after=row["run_after"],
+        deadline_expired=bool(row["deadline_expired"]),
+        deadline_remaining_seconds=float(row["deadline_remaining_seconds"]),
+        lease_remaining_seconds=(
+            float(row["lease_remaining_seconds"])
+            if row["lease_remaining_seconds"] is not None
+            else None
+        ),
+        run_after_remaining_seconds=float(row["run_after_remaining_seconds"]),
     )
 
 

@@ -4440,3 +4440,32 @@ router/control/loop matrix passed **32/32**. Ruff check/format and whitespace
 checks are clean. The M4 repository-wide run already collected these two tests
 and finished at **17,651 passed, 163 skipped, 11 exact baseline environment
 failures**. M5 changes no runtime, migration, chart or live k3d state.
+
+# Session 20 — Gate 3 step 5, background stateless finalization (2026-08-13)
+
+## M1 — worker shell/lifecycle handoff
+
+The worker now treats durable completion acceptance as a handoff boundary, not
+as a terminal disposition. Once B4 closes the exact `worker_batch` queue lease,
+the driver retires local shell admission, drains and permanently retires the
+original RemoteBackend (including already-admitted resource/SFTP work), scrubs
+tenant-local graph, tool, datasource, checkpoint and environment state, and
+retains only an immutable exact-authority callable capable of fenced terminal
+tmux cleanup. It polls the same accepted command ID through the existing B4
+lookup channel; all timing and the absolute bound come from the command's
+PostgreSQL `run_after`, finalizer lease and `deadline_at` clocks. `done`,
+`superseded` and `force_resolved` decode only their stored outcome. Only
+`completed`, `failed` or `cancelled` invokes terminal cleanup, exactly once;
+review, pause, waiting and retry outcomes preserve the remote shell. Park,
+deadline, lookup loss, executor cancellation or a driver crash also preserve
+the shell and issue no queue complete/release/requeue verb, leaving the durable
+command, lifecycle manager and UID-fenced S36 as the backstop.
+
+Verification: `test_stateless_worker_runtime.py` plus `test_turn_executor.py`
+passed **111/111**. The focused RemoteBackend retirement/cleanup/resource-fence
+selection passed **6/6** (258 deselected). Ruff check and format-check over all
+six changed Python paths, `py_compile`, and `git diff --check` are clean. A
+real-Postgres B4 proof passed **1/1**: it checks the exact command outcome,
+command-ID pin and DB-clock deadline/lease/run-after bounds after the worker
+queue is durably closed. M1 changes no schema, chart, endpoint routing or live
+fixture state.
