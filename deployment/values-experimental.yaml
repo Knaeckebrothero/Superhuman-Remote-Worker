@@ -67,7 +67,7 @@ image:
   agent:
     tag: sha-e617d97
   cockpit:
-    tag: sha-e617d97
+    tag: sha-96479b0
   mcp:
     tag: sha-e617d97
     digest: sha256:626f36650f64fe3a54509578843a86bcaa6d93a1c6b11c12824ad64e403c5641
@@ -85,8 +85,8 @@ provenance:
       sourceRevision: e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e
       releaseVersion: "0.0.0-dev.sha-e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e"
     cockpit:
-      sourceRevision: e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e
-      releaseVersion: "0.0.0-dev.sha-e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e"
+      sourceRevision: 96479b0456e081343ce6429518e6340a0364c69b
+      releaseVersion: "0.0.0-dev.sha-96479b0456e081343ce6429518e6340a0364c69b"
     mcp:
       sourceRevision: e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e
       releaseVersion: "0.0.0-dev.sha-e617d97a74cd68b7182ed9e0f6b3d00e822f0e4e"
