@@ -5,7 +5,7 @@ tags:
   - git-integration
   - projects
   - datasources
-status: design
+status: implemented
 created: 2026-08-13
 related:
   - "[[knowledge_base_repo_separation]]"
@@ -21,8 +21,8 @@ related:
 > specifically a private GitHub repo — instead of the cluster's internal Gitea. Reading from
 > external repos already works; only the write path is Gitea-bound.
 
-**Status:** Design, nothing built. Decisions taken 2026-08-13 (§2).
-All `file:line` references verified at `89dbadb0`.
+**Status:** Implemented 2026-08-13. Decisions taken 2026-08-13 (§2).
+Original `file:line` references were verified at `89dbadb0`.
 
 ## 1. Why
 
@@ -131,6 +131,12 @@ repos, contents read/write only.
 creation entirely** and records the external repo as the `knowledge`-role row — rather than
 creating a Gitea repo and replacing it, which would leave an orphan. Existing projects get a
 separate attach path.
+
+Implemented request shape: `external_kb: {repo_url, branch, token, forge?}`. `forge` is inferred
+for `github.com` and is required as `github` for GitHub Enterprise. Existing repo-less projects
+attach through `POST /api/projects/{project_id}/knowledge/repository`. The attach route refuses
+to replace an existing `knowledge`-role repository: automatic content/history migration remains
+out of scope under §8.2.
 
 ## 5. Implementation order
 
