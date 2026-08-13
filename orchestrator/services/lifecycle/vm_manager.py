@@ -31,6 +31,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from database.postgres import _completion_control_active_sql
 from services.ssh_helpers import orchestrator_can_reach
 
 from .types import Instance
@@ -162,11 +163,17 @@ class VMInstanceManager:
         suspension_service: Any,
         snapshot_service: Any,
         db: Any,
+        *,
+        completion_commands_enabled: bool = False,
     ):
         self._provisioner = vm_provisioner
         self._suspension = suspension_service
         self._snapshot = snapshot_service
         self._db = db
+        # Constructor gating keeps the rollback path byte-for-byte legacy: with
+        # completion commands disabled, no lifecycle query names or reads the
+        # reserved control marker.
+        self._completion_commands_enabled = completion_commands_enabled
         # Reachability probe cache: ssh_host -> (probed_at, ok).
         self._reach_cache: dict[str, tuple[float, bool]] = {}
         self._reach_ttl_s: float = 30.0
@@ -188,6 +195,14 @@ class VMInstanceManager:
             inst = self._row_to_instance(row)
             if inst is None:
                 continue
+            if (
+                self._completion_commands_enabled
+                and inst.metadata.get("scope") == "job"
+                and inst.bound_to
+            ):
+                inst.metadata[
+                    "completion_control_owned"
+                ] = await self._completion_control_owns_job(inst.bound_to)
             # Live-child guard: only a reapable-status *job* VM can be torn down,
             # and only a job VM can have a critic subjob, so scope the query to
             # that case. Threads have no critic children.
@@ -209,6 +224,8 @@ class VMInstanceManager:
             # Suppress the reconciler's immediate unhealthy-delete shortcut;
             # terminal/loss retirement is the sole physical cleanup owner.
             return True
+        if inst.metadata.get("completion_control_owned"):
+            return True
         # VMs report status in their own context. ``failed`` (a provisioning
         # failure) is now filtered out in _row_to_instance (_PARKED_VM_STATUSES)
         # so the dispatcher can hold it parked without the reconciler force-
@@ -222,6 +239,8 @@ class VMInstanceManager:
 
     async def is_idle(self, inst: Instance) -> bool:
         if _is_stateless_instance(inst):
+            return False
+        if inst.metadata.get("completion_control_owned"):
             return False
         if inst.metadata.get("has_live_shared_child"):
             return False
@@ -274,6 +293,8 @@ class VMInstanceManager:
         docs/issues/reviewing_parent_pod_reaped_under_critic.md.
         """
         if _is_stateless_instance(inst):
+            return False
+        if inst.metadata.get("completion_control_owned"):
             return False
         if inst.metadata.get("has_live_shared_child"):
             return False
@@ -415,6 +436,8 @@ class VMInstanceManager:
         """
         if _is_stateless_instance(inst):
             return
+        if await self._completion_control_owns_instance(inst):
+            return
         await self.delete(inst, grace_s, purge_disk=False)
         bound = inst.bound_to
         if not bound:
@@ -431,6 +454,12 @@ class VMInstanceManager:
 
     async def snapshot(self, inst: Instance) -> str | None:
         if _is_stateless_instance(inst):
+            return None
+        if await self._completion_control_owns_instance(inst):
+            logger.info(
+                "VM lifecycle snapshot deferred to active control for job %s",
+                inst.bound_to,
+            )
             return None
         if self._snapshot is None or not getattr(self._snapshot, "is_available", False):
             return None
@@ -498,6 +527,12 @@ class VMInstanceManager:
         self, inst: Instance, grace_s: int, purge_disk: bool = True
     ) -> None:
         if _is_stateless_instance(inst):
+            return
+        if await self._completion_control_owns_instance(inst):
+            logger.info(
+                "VM lifecycle teardown deferred to active control for job %s",
+                inst.bound_to,
+            )
             return
         if not self._provisioner_available():
             return
@@ -576,6 +611,8 @@ class VMInstanceManager:
                 continue
             if row_exists:
                 continue
+            if await self._completion_control_owns_job(entity_id):
+                continue
             try:
                 if await self._provisioner.delete_vm(entity_id):
                     reaped += 1
@@ -636,6 +673,8 @@ class VMInstanceManager:
             job_id = row["id"] if isinstance(row, dict) else row.get("id")
             if not job_id:
                 continue
+            if await self._completion_control_owns_job(str(job_id)):
+                continue
             try:
                 # Idempotent: a VM that is already gone 404s, which the
                 # provisioner treats as success, and the disk still goes.
@@ -654,6 +693,50 @@ class VMInstanceManager:
 
     def _provisioner_available(self) -> bool:
         return bool(getattr(self._provisioner, "is_available", False))
+
+    async def _completion_control_owns_job(self, job_id: str) -> bool:
+        """Whether a live or malformed control marker owns this job's VM.
+
+        Uses the canonical PostgreSQL-15-safe JSON-number predicate and the DB
+        clock.  An unavailable lookup fails closed only while the rollout flag
+        is on; flag off returns before acquiring a connection.
+        """
+
+        if not self._completion_commands_enabled:
+            return False
+        if self._db is None or not job_id:
+            return True
+        try:
+            async with self._db.acquire() as conn:
+                value = await conn.fetchval(
+                    f"""
+                    SELECT ({_completion_control_active_sql("context")})
+                    FROM jobs
+                    WHERE id = $1::uuid
+                    """,
+                    job_id,
+                )
+            return bool(value)
+        except Exception:
+            logger.exception(
+                "Completion control lookup failed for job %s; preserving VM",
+                job_id,
+            )
+            return True
+
+    async def _completion_control_owns_instance(self, inst: Instance) -> bool:
+        """Action-time control-marker check for job-bound VMs only."""
+
+        if not self._completion_commands_enabled:
+            return False
+        if (
+            inst.metadata.get("scope") == "thread"
+            or inst.metadata.get("thread_status") is not None
+        ):
+            return False
+        if not inst.bound_to:
+            return bool(inst.metadata.get("completion_control_owned"))
+        return await self._completion_control_owns_job(str(inst.bound_to))
 
     async def _fetch_vm_rows(self) -> list[dict[str, Any]]:
         """Pull both job-bound and thread-bound VMs.

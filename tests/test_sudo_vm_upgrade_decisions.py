@@ -26,6 +26,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
@@ -106,6 +107,30 @@ class TestJobFrozenPredicate:
 
 
 class TestApplyVmUpgradeDecision:
+    @pytest.mark.asyncio
+    async def test_completion_barrier_precedes_pending_decision_row_flip(self):
+        gate = MagicMock()
+        gate.approve_request = AsyncMock()
+        blocked = AsyncMock(side_effect=HTTPException(409, "completion finalizing"))
+
+        with (
+            patch.object(orch_main, "sudo_gate", gate),
+            patch.object(orch_main, "_guard_completion_control", blocked),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await orch_main._apply_vm_upgrade_decision(
+                    REQ_ID,
+                    _vm_upgrade_row(),
+                    approve=True,
+                    upgrade=True,
+                    reason="ok",
+                    decided_by="op",
+                )
+
+        assert exc.value.status_code == 409
+        blocked.assert_awaited_once_with(JOB_ID, source="sudo_vm_decision")
+        gate.approve_request.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_pending_approve_upgrades_job(self):
         row = _vm_upgrade_row()
@@ -329,6 +354,85 @@ class TestResumeWithoutVm:
         ):
             await orch_main._resume_job_without_vm_internal(JOB_ID)
         assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_flag_on_finalizer_owner_bypasses_only_its_pinned_command(
+        self, tmp_path
+    ):
+        job = {**_frozen_job(), "execution_lane": "pinned"}
+        db, conn = _db_with_execute(job)
+        transaction = MagicMock()
+        transaction.__aenter__ = AsyncMock(return_value=None)
+        transaction.__aexit__ = AsyncMock(return_value=False)
+        conn.transaction = MagicMock(return_value=transaction)
+        db._completion_resume_blocked_on_conn = AsyncMock(return_value=False)
+        guard = AsyncMock(side_effect=AssertionError("owner used public guard"))
+        ws = MagicMock()
+        ws.base_path = tmp_path
+
+        with (
+            patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", True),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "workspace_service", ws),
+            patch.object(orch_main, "_guard_completion_control", guard),
+            patch.object(orch_main, "_trigger_dispatch", MagicMock()),
+        ):
+            result = await orch_main._resume_job_without_vm_internal(
+                JOB_ID,
+                decided_by="system",
+                reason="not allowed",
+                completion_owner_command_id=REQ_ID,
+                completion_owner="finalizer-owner",
+            )
+
+        guard.assert_not_awaited()
+        db._completion_resume_blocked_on_conn.assert_awaited_once_with(
+            conn,
+            UUID(JOB_ID),
+            completion_owner_command_id=REQ_ID,
+            completion_owner="finalizer-owner",
+        )
+        assert "status = 'paused'" in conn.execute.await_args.args[0]
+        assert result["status"] == "denied_vm_upgrade"
+
+    @pytest.mark.asyncio
+    async def test_flag_on_finalizer_owner_reaches_stateless_resume_cas(self, tmp_path):
+        job = {
+            **_frozen_job(),
+            "execution_lane": "stateless",
+            "priority": 4,
+            "user_id": None,
+        }
+        db = MagicMock()
+        db.get_job = AsyncMock(return_value=job)
+        db.queue_stateless_job_for_resume = AsyncMock(return_value=True)
+        guard = AsyncMock(side_effect=AssertionError("owner used public guard"))
+        ws = MagicMock()
+        ws.base_path = tmp_path
+
+        with (
+            patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", True),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "workspace_service", ws),
+            patch.object(orch_main, "_guard_completion_control", guard),
+            patch.object(orch_main, "_trigger_dispatch", MagicMock()),
+        ):
+            await orch_main._resume_job_without_vm_internal(
+                JOB_ID,
+                completion_owner_command_id=REQ_ID,
+                completion_owner="finalizer-owner",
+            )
+
+        guard.assert_not_awaited()
+        db.queue_stateless_job_for_resume.assert_awaited_once()
+        assert db.queue_stateless_job_for_resume.await_args.kwargs == {
+            "priority": 4,
+            "fair_key": None,
+            "expected_status": "paused",
+            "completion_commands_enabled": True,
+            "completion_owner_command_id": REQ_ID,
+            "completion_owner": "finalizer-owner",
+        }
 
 
 # =============================================================================

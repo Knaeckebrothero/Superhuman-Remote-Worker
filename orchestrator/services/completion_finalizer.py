@@ -63,6 +63,37 @@ class CompletionLeaseLost(CompletionFinalizerError):
     """The exact command owner no longer has authority to write."""
 
 
+class CompletionDispositionSuperseded(CompletionFinalizerError):
+    """A legitimate jobs-row writer displaced this command's disposition."""
+
+    def __init__(
+        self,
+        *,
+        observed_status: str,
+        expected_statuses: Sequence[str],
+        reason: str = "entry_status_superseded",
+    ) -> None:
+        self.observed_status = str(observed_status or "unknown")
+        self.expected_statuses = tuple(
+            dict.fromkeys(
+                status
+                for value in expected_statuses
+                if (status := str(value or "").strip())
+            )
+        )
+        normalized_reason = str(reason or "entry_status_superseded").strip()
+        self.reason = (normalized_reason or "entry_status_superseded")[:128]
+        super().__init__(
+            "completion disposition superseded: observed "
+            f"{self.observed_status!r}, expected one of "
+            f"{self.expected_statuses!r}"
+        )
+
+
+class CompletionTeardownSupersedeBlocked(CompletionFinalizerError):
+    """An authorized S36 callback may still be performing external work."""
+
+
 class CompletionEffectInFlight(CompletionFinalizerError):
     """An earlier effect attempt is still inside its ambiguity window."""
 
@@ -330,6 +361,7 @@ def _bounded_effect_detail(
     output: Any,
     *,
     intent: Any = _NO_EFFECT_INTENT,
+    teardown_authorization: Any = _NO_EFFECT_INTENT,
 ) -> str:
     """Serialize replay data while enforcing the design's 8 KiB row bound.
 
@@ -346,6 +378,12 @@ def _bounded_effect_detail(
         # the replay output is written.  Replacing it here would reopen the ABA
         # hole after a crash following Kubernetes deletion.
         detail = {"intent": intent, **detail}
+    if teardown_authorization is not _NO_EFFECT_INTENT:
+        # S36's jobs-lock authorization is the admission barrier for an
+        # external callback that may outlive every finalizer clock. Preserve
+        # it across pending->pending retry rewrites; only the same UPDATE that
+        # settles the effect to done may remove it.
+        detail = {"teardown_authorization": teardown_authorization, **detail}
     try:
         return _bounded_detail(detail)
     except CompletionFinalizerError:
@@ -530,6 +568,160 @@ class CompletionEffectRunner:
             )
         persisted = _json_object(captured["detail"]) or {}
         return dict(persisted["intent"])
+
+    async def authorize_workspace_teardown(self) -> Any:
+        """Install S36's durable admission barrier under the jobs-row lock."""
+
+        from services.completion_teardown_authority import (
+            authorize_workspace_teardown,
+        )
+
+        return await authorize_workspace_teardown(
+            self._db,
+            job_id=str(self.command["job_id"]),
+            command_id=self.command_id,
+            owner=self.owner,
+        )
+
+    async def workspace_teardown_handoff(self) -> Any:
+        """Return whether the newest lower report deferred S36 to this one."""
+
+        from services.completion_teardown_authority import workspace_teardown_handoff
+
+        return await workspace_teardown_handoff(
+            self._db,
+            job_id=str(self.command["job_id"]),
+            before_report_seq=int(self.command["report_seq"]),
+        )
+
+    async def assert_disposition_authority(self) -> None:
+        """Fence Class C against a jobs-row writer that won after S17.
+
+        S17's completed effect output is the command-owned proof of the status
+        this workflow wrote.  Taking the jobs-row lock makes this check order
+        with cancel, preemption, drain, and human-control updates.  A workflow
+        with no S17 has no disposition to defend and remains unchanged.
+
+        An already-authorized S36 is deliberately non-abandonable: its
+        external callback may outlive every database lease.  A mismatched
+        status in that state fails closed instead of emitting a whole-command
+        supersede signal.
+        """
+
+        async with _connection(self._db) as conn:
+            async with conn.transaction():
+                job = await conn.fetchrow(
+                    """
+                    SELECT status::text AS status
+                    FROM jobs
+                    WHERE id = $1::uuid
+                    FOR UPDATE
+                    """,
+                    UUID(str(self.command["job_id"])),
+                )
+                if job is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {self.command_id} lost its jobs row"
+                    )
+                authority = await conn.fetchrow(
+                    """
+                    SELECT command.id,
+                           disposition.state AS disposition_state,
+                           disposition.detail AS disposition_detail,
+                           auto_deny.state AS auto_deny_state,
+                           auto_deny.detail AS auto_deny_detail,
+                           teardown.state AS teardown_state,
+                           teardown.detail AS teardown_detail
+                    FROM job_completion_commands AS command
+                    LEFT JOIN completion_effects AS disposition
+                      ON disposition.producer_kind = 'job_completion'
+                     AND disposition.producer_id = command.id
+                     AND disposition.effect_name = 'main_status_write'
+                     AND disposition.effect_group = 'job_disposition'
+                    LEFT JOIN completion_effects AS auto_deny
+                      ON auto_deny.producer_kind = 'job_completion'
+                     AND auto_deny.producer_id = command.id
+                     AND auto_deny.effect_name = 'auto_deny_resume'
+                     AND auto_deny.effect_group = 'auto_deny_resume'
+                    LEFT JOIN completion_effects AS teardown
+                      ON teardown.producer_kind = 'job_completion'
+                     AND teardown.producer_id = command.id
+                     AND teardown.effect_name = 'workspace_archive_teardown'
+                     AND teardown.effect_group = 'workspace_teardown'
+                    WHERE command.id = $1::uuid
+                      AND command.job_id = $2::uuid
+                      AND command.state = 'finalizing'
+                      AND command.finalizing_by = $3::text
+                      AND command.lease_expires_at > now()
+                      AND command.deadline_at > now()
+                    """,
+                    UUID(self.command_id),
+                    UUID(str(self.command["job_id"])),
+                    self.owner,
+                )
+                if authority is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {self.command_id} lost its "
+                        "disposition-authority term"
+                    )
+
+                disposition_state = str(
+                    _row_value(authority, "disposition_state", "") or ""
+                )
+                if not disposition_state:
+                    return
+                if disposition_state != "done":
+                    raise CompletionFinalizerError(
+                        f"completion command {self.command_id} reached Class C "
+                        "before S17 settled"
+                    )
+                disposition_detail = (
+                    _json_object(_row_value(authority, "disposition_detail")) or {}
+                )
+                disposition_output = disposition_detail.get("output")
+                expected_status = (
+                    str(disposition_output.get("new_status") or "").strip()
+                    if isinstance(disposition_output, Mapping)
+                    else ""
+                )
+                if not expected_status:
+                    raise CompletionFinalizerError(
+                        f"completion command {self.command_id} has no proven S17 status"
+                    )
+
+                expected_statuses = [expected_status]
+                auto_deny_detail = (
+                    _json_object(_row_value(authority, "auto_deny_detail")) or {}
+                )
+                auto_deny_output = auto_deny_detail.get("output")
+                if (
+                    str(_row_value(authority, "auto_deny_state", "")) == "done"
+                    and isinstance(auto_deny_output, Mapping)
+                    and auto_deny_output.get("auto_denied") is True
+                ):
+                    expected_statuses.append("paused")
+
+                current_status = str(job["status"] or "")
+                if current_status in expected_statuses:
+                    return
+
+                teardown_detail = (
+                    _json_object(_row_value(authority, "teardown_detail")) or {}
+                )
+                teardown_authorization = teardown_detail.get("teardown_authorization")
+                if (
+                    str(_row_value(authority, "teardown_state", "")) == "pending"
+                    and isinstance(teardown_authorization, Mapping)
+                    and teardown_authorization.get("active") is True
+                ):
+                    raise CompletionTeardownSupersedeBlocked(
+                        f"completion command {self.command_id} cannot abandon "
+                        "an authorized workspace teardown"
+                    )
+                raise CompletionDispositionSuperseded(
+                    observed_status=current_status,
+                    expected_statuses=expected_statuses,
+                )
 
     async def _prepare(
         self,
@@ -894,6 +1086,9 @@ class CompletionEffectRunner:
             name,
             output,
             intent=prior_detail.get("intent", _NO_EFFECT_INTENT),
+            teardown_authorization=prior_detail.get(
+                "teardown_authorization", _NO_EFFECT_INTENT
+            ),
         )
         jitter = max(0.0, min(0.2, self._random_source() * 0.2))
         async with _connection(self._db) as conn:
@@ -1335,6 +1530,275 @@ class CompletionFinalizer:
             return await self._fetch_command(command_id), None
         return _command_dict(row), owner
 
+    async def _supersede_locked(
+        self,
+        conn: Any,
+        *,
+        command: Mapping[str, Any],
+        owner: str,
+        signal: CompletionDispositionSuperseded,
+    ) -> FinalizationResult:
+        """Terminalize one whole command while its jobs row is locked."""
+
+        command_id = str(command["id"])
+        abandoned_rows = await conn.fetch(
+            """
+            SELECT effect_name, state, detail
+            FROM completion_effects
+            WHERE producer_kind = 'job_completion'
+              AND producer_id = $1::uuid
+              AND state <> 'done'
+            ORDER BY effect_name
+            """,
+            UUID(command_id),
+        )
+        for effect in abandoned_rows:
+            if str(effect["effect_name"]) != "workspace_archive_teardown":
+                continue
+            detail = _json_object(_row_value(effect, "detail")) or {}
+            authorization = detail.get("teardown_authorization")
+            if (
+                str(_row_value(effect, "state", "")) == "pending"
+                and isinstance(authorization, Mapping)
+                and authorization.get("active") is True
+            ):
+                raise CompletionTeardownSupersedeBlocked(
+                    f"completion command {command_id} cannot abandon an "
+                    "authorized workspace teardown"
+                )
+        abandoned_effects = [str(row["effect_name"]) for row in abandoned_rows]
+        outcome = {
+            "status": "superseded",
+            "job_id": str(command["job_id"]),
+            "report_seq": int(command["report_seq"]),
+            "reason": signal.reason,
+            "accepted_job_status": command.get("accepted_job_status"),
+            "expected_entry_statuses": list(signal.expected_statuses),
+            "observed_status": signal.observed_status,
+            "winning_report_seq": None,
+            "abandoned_effects": abandoned_effects,
+        }
+        outcome_json = json.dumps(
+            outcome,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+            allow_nan=False,
+        )
+        row = await conn.fetchrow(
+            """
+            UPDATE job_completion_commands
+            SET state = 'superseded', outcome = $3::jsonb,
+                finalized_at = now(), error_code = $4::text,
+                finalizing_by = NULL, lease_expires_at = NULL
+            WHERE id = $1::uuid
+              AND state = 'finalizing'
+              AND finalizing_by = $2::text
+              AND lease_expires_at > now()
+              AND deadline_at > now()
+            RETURNING *
+            """,
+            UUID(command_id),
+            owner,
+            outcome_json,
+            signal.reason,
+        )
+        if row is None:
+            raise CompletionLeaseLost(
+                f"completion command {command_id} lost its supersede term"
+            )
+        return FinalizationResult(
+            command_id=command_id,
+            state="superseded",
+            disposition="superseded",
+            outcome=outcome,
+            error_code=signal.reason,
+        )
+
+    async def _resolve_entry_authority(
+        self,
+        command: Mapping[str, Any],
+        owner: str,
+    ) -> str | FinalizationResult:
+        """Resolve the jobs status this ordered command is allowed to apply.
+
+        Fresh work uses the status captured under the admission lock. A later
+        report may instead consume the immediate predecessor's proven output.
+        A retry that already completed S1 keeps that command-owned snapshot and
+        lets the legacy workflow's exact-effect proof reconcile later writes.
+        """
+
+        command_id = str(command["id"])
+        job_id = str(command["job_id"])
+        async with _connection(self.db) as conn:
+            async with conn.transaction():
+                job = await conn.fetchrow(
+                    """
+                    SELECT status::text AS status
+                    FROM jobs
+                    WHERE id = $1::uuid
+                    FOR UPDATE
+                    """,
+                    UUID(job_id),
+                )
+                if job is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {command_id} lost its jobs row"
+                    )
+                authority = await conn.fetchrow(
+                    """
+                    SELECT command.id, command.job_id, command.report_seq,
+                           command.accepted_job_status,
+                           s1.state AS s1_state, s1.detail AS s1_detail,
+                           predecessor.report_seq AS predecessor_report_seq,
+                           predecessor.state AS predecessor_state,
+                           predecessor.outcome AS predecessor_outcome
+                    FROM job_completion_commands AS command
+                    LEFT JOIN completion_effects AS s1
+                      ON s1.producer_kind = 'job_completion'
+                     AND s1.producer_id = command.id
+                     AND s1.effect_name = 'late_callback_guard'
+                     AND s1.effect_group = 'entry'
+                    LEFT JOIN LATERAL (
+                        SELECT prior.report_seq, prior.state, prior.outcome
+                        FROM job_completion_commands AS prior
+                        WHERE prior.job_id = command.job_id
+                          AND prior.report_seq < command.report_seq
+                        ORDER BY prior.report_seq DESC
+                        LIMIT 1
+                    ) AS predecessor ON TRUE
+                    WHERE command.id = $1::uuid
+                      AND command.job_id = $2::uuid
+                      AND command.state = 'finalizing'
+                      AND command.finalizing_by = $3::text
+                      AND command.lease_expires_at > now()
+                      AND command.deadline_at > now()
+                    """,
+                    UUID(command_id),
+                    UUID(job_id),
+                    owner,
+                )
+                if authority is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {command_id} lost its authority term"
+                    )
+
+                current_status = str(job["status"] or "")
+                accepted_status = str(
+                    _row_value(authority, "accepted_job_status", "") or ""
+                ).strip()
+                s1_detail = _json_object(_row_value(authority, "s1_detail")) or {}
+                s1_output = s1_detail.get("output")
+                s1_entry_status = (
+                    str(s1_output.get("entry_status") or "").strip()
+                    if isinstance(s1_output, Mapping)
+                    else ""
+                )
+                if (
+                    str(_row_value(authority, "s1_state", "")) == "done"
+                    and s1_entry_status
+                ):
+                    return s1_entry_status
+
+                predecessor_outcome = (
+                    _json_object(_row_value(authority, "predecessor_outcome")) or {}
+                )
+                predecessor_status = str(
+                    predecessor_outcome.get("new_status") or ""
+                ).strip()
+                predecessor_proved = (
+                    str(_row_value(authority, "predecessor_state", "")) == "done"
+                    and predecessor_status
+                )
+                predecessor_exists = (
+                    _row_value(authority, "predecessor_report_seq") is not None
+                )
+                if predecessor_exists:
+                    # Once a lower report exists, acceptance may have happened
+                    # before that report finalized. Its output, not the stale
+                    # accept snapshot, is the only sequential authority.
+                    if predecessor_proved and current_status == predecessor_status:
+                        return predecessor_status
+                elif accepted_status and current_status == accepted_status:
+                    return accepted_status
+
+                expected_statuses = [accepted_status]
+                if predecessor_proved:
+                    expected_statuses.append(predecessor_status)
+                signal = CompletionDispositionSuperseded(
+                    observed_status=current_status,
+                    expected_statuses=expected_statuses,
+                )
+                authoritative_command = {
+                    "id": str(authority["id"]),
+                    "job_id": str(authority["job_id"]),
+                    "report_seq": int(authority["report_seq"]),
+                    "accepted_job_status": _row_value(authority, "accepted_job_status"),
+                }
+                return await self._supersede_locked(
+                    conn,
+                    command=authoritative_command,
+                    owner=owner,
+                    signal=signal,
+                )
+
+    async def _supersede(
+        self,
+        command: Mapping[str, Any],
+        owner: str,
+        signal: CompletionDispositionSuperseded,
+    ) -> FinalizationResult:
+        """Settle a workflow-detected status race under the exact live term."""
+
+        command_id = str(command["id"])
+        job_id = str(command["job_id"])
+        async with _connection(self.db) as conn:
+            async with conn.transaction():
+                job = await conn.fetchrow(
+                    """
+                    SELECT status::text AS status
+                    FROM jobs
+                    WHERE id = $1::uuid
+                    FOR UPDATE
+                    """,
+                    UUID(job_id),
+                )
+                if job is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {command_id} lost its jobs row"
+                    )
+                exact = await conn.fetchrow(
+                    """
+                    SELECT id, job_id, report_seq, accepted_job_status
+                    FROM job_completion_commands
+                    WHERE id = $1::uuid
+                      AND job_id = $2::uuid
+                      AND state = 'finalizing'
+                      AND finalizing_by = $3::text
+                      AND lease_expires_at > now()
+                      AND deadline_at > now()
+                    """,
+                    UUID(command_id),
+                    UUID(job_id),
+                    owner,
+                )
+                if exact is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {command_id} lost its supersede term"
+                    )
+                locked_signal = CompletionDispositionSuperseded(
+                    observed_status=str(job["status"] or ""),
+                    expected_statuses=signal.expected_statuses,
+                    reason=signal.reason,
+                )
+                return await self._supersede_locked(
+                    conn,
+                    command=exact,
+                    owner=owner,
+                    signal=locked_signal,
+                )
+
     async def _renew_command(self, command_id: str, owner: str) -> bool:
         async with _connection(self.db) as conn:
             renewed = await conn.fetchval(
@@ -1693,6 +2157,11 @@ class CompletionFinalizer:
                 error_code=command.get("error_code"),
             )
 
+        entry_authority = await self._resolve_entry_authority(command, owner)
+        if isinstance(entry_authority, FinalizationResult):
+            return entry_authority
+        command["resolved_entry_status"] = entry_authority
+
         workflow = callback or self.workflow
         if workflow is None:
             raise CompletionFinalizerError("no completion workflow is configured")
@@ -1718,6 +2187,16 @@ class CompletionFinalizer:
                 "completion command %s cancelled while finalizing", command_id
             )
             raise
+        except CompletionDispositionSuperseded as signal:
+            try:
+                return await self._supersede(command, owner, signal)
+            except CompletionTeardownSupersedeBlocked as exc:
+                # S36's durable authorization may outlive both the effect and
+                # command clocks. Never terminalize its command while that
+                # external callback could still be reconciling.
+                return await self._retry_or_park(command_id, owner, exc)
+        except CompletionTeardownSupersedeBlocked as exc:
+            return await self._retry_or_park(command_id, owner, exc)
         except CompletionLeaseLost:
             raise
         except Exception as exc:
@@ -1955,9 +2434,11 @@ __all__ = [
     "CompletionEffectRetryRequested",
     "CompletionEffectRunner",
     "CompletionEffectVersionError",
+    "CompletionDispositionSuperseded",
     "CompletionFinalizer",
     "CompletionFinalizerError",
     "CompletionLeaseLost",
+    "CompletionTeardownSupersedeBlocked",
     "EFFECT_DETAIL_LIMIT_BYTES",
     "EFFECT_LEASE_SECONDS",
     "FinalizationResult",

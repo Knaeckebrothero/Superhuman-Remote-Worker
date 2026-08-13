@@ -115,6 +115,77 @@ def _routing_db(job):
 
 class TestUrgentReplyRoutesToGuidance:
     @pytest.mark.asyncio
+    async def test_completion_guard_blocks_before_reply_log_or_context_mutation(self):
+        import orchestrator.main as om
+
+        db = _routing_db(_job(status="processing"))
+        guard = AsyncMock(
+            side_effect=HTTPException(status_code=409, detail="completion finalizing")
+        )
+        with (
+            patch.object(om, "postgres_db", db),
+            patch.object(om, "_guard_completion_control", guard),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await om._route_inbound_reply(
+                JOB_ID, "officer", "do not race completion", urgent=True
+            )
+
+        assert exc.value.status_code == 409
+        guard.assert_awaited_once_with(JOB_ID, source="inbound_reply")
+        db.get_message_sequence.assert_not_awaited()
+        db.log_message.assert_not_awaited()
+        db.append_pending_guidance.assert_not_awaited()
+        db.append_queued_reply.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_immediate_resume_cas_loss_is_conflict_not_success(self):
+        import orchestrator.main as om
+
+        job = _job(status="paused")
+        db = _routing_db(job)
+        resume = AsyncMock(return_value=False)
+        guard = AsyncMock()
+        with (
+            patch.object(om, "postgres_db", db),
+            patch.object(om, "_guard_completion_control", guard),
+            patch.object(om, "_internal_resume_job", resume),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await om._route_inbound_reply(
+                JOB_ID, "officer", "wake only if fenced", urgent=True
+            )
+
+        assert exc.value.status_code == 409
+        assert guard.await_count == 2
+        resume.assert_awaited_once()
+        db.log_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_flag_on_queued_reply_losing_command_cas_is_clean_conflict(self):
+        import orchestrator.main as om
+
+        db = _routing_db(_job(status="processing"))
+        db.append_queued_reply.return_value = False
+        guard = AsyncMock()
+        with (
+            patch.object(om, "COMPLETION_COMMANDS_ENABLED", True),
+            patch.object(om, "postgres_db", db),
+            patch.object(om, "_guard_completion_control", guard),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await om._route_inbound_reply(
+                JOB_ID, "officer", "queue only if I win", urgent=False
+            )
+
+        assert exc.value.status_code == 409
+        db.append_queued_reply.assert_awaited_once()
+        assert db.append_queued_reply.await_args.kwargs == {
+            "completion_commands_enabled": True
+        }
+        db.log_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_urgent_on_processing_job_appends_guidance_no_resume(self):
         """The P1-A headline: urgent steer on a live run appends to
         context.pending_guidance and triggers NO resume/pause."""

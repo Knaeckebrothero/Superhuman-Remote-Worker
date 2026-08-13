@@ -63,6 +63,24 @@ class CompletionInProgress(CompletionCommandError):
         super().__init__(f"completion command {command_id} is {state}")
 
 
+class CompletionTeardownInProgress(CompletionCommandError):
+    """Fresh admission is fenced by an authorized external S36 callback."""
+
+    def __init__(self, command_id: str, report_seq: int) -> None:
+        self.command_id = str(command_id)
+        self.report_seq = int(report_seq)
+        super().__init__(
+            f"completion command {self.command_id} workspace teardown is finalizing"
+        )
+
+
+class CompletionControlInProgress(CompletionCommandError):
+    """Fresh admission lost to a durably claimed human control."""
+
+    def __init__(self) -> None:
+        super().__init__("job control is in progress")
+
+
 @dataclass(frozen=True, slots=True)
 class CompletionAcceptResult:
     """The durable result of fresh admission or an exact-key replay."""
@@ -78,6 +96,7 @@ class CompletionAcceptResult:
     abandoned_effects: tuple[str, ...]
     client_report_id: str
     queue_terminalized: bool
+    accepted_job_status: str | None
 
     @property
     def replayed(self) -> bool:
@@ -167,6 +186,11 @@ def _result_from_row(
         abandoned_effects=abandoned_effects,
         client_report_id=str(row["client_report_id"]),
         queue_terminalized=queue_terminalized,
+        accepted_job_status=(
+            str(row["accepted_job_status"])
+            if row["accepted_job_status"] is not None
+            else None
+        ),
     )
 
 
@@ -259,7 +283,8 @@ async def accept_completion_command(
             job = await conn.fetchrow(
                 """
                 SELECT id, status::text AS status, execution_lane,
-                       assigned_agent_id, completion_seq_hwm
+                       assigned_agent_id, completion_seq_hwm, context,
+                       extract(epoch FROM now())::float8 AS db_now_epoch
                 FROM jobs
                 WHERE id = $1::uuid
                 FOR UPDATE
@@ -277,7 +302,7 @@ async def accept_completion_command(
                     """
                     SELECT id, job_id, report_seq, client_report_id, payload,
                            payload_digest, accepted_lease_token,
-                           accepted_agent_id, state, outcome
+                           accepted_agent_id, accepted_job_status, state, outcome
                     FROM job_completion_commands
                     WHERE job_id = $1::uuid AND client_report_id = $2::uuid
                     """,
@@ -302,6 +327,19 @@ async def accept_completion_command(
                         disposition=_replay_disposition(state),
                         queue_terminalized=existing["accepted_lease_token"] is not None,
                     )
+
+            # Exact-key replay stays valid after a human control fences the
+            # old executor. Fresh admission, however, must lose before any
+            # INSERT/HWM write. The owner fence is also rotated by claim_job;
+            # this explicit marker check provides the truthful collision.
+            from services.completion_control import (
+                completion_control_claim_active,
+            )
+
+            if completion_control_claim_active(
+                job.get("context"), now_epoch=job.get("db_now_epoch")
+            ):
+                raise CompletionControlInProgress
 
             lane = str(job["execution_lane"] or "pinned")
             accepted_token: int | None = None
@@ -337,6 +375,24 @@ async def accept_completion_command(
                         "completion report does not match the assigned agent"
                     )
 
+            # An authorized S36 callback may resume after every finalizer clock
+            # has expired.  The jobs-row lock shared with its authorization is
+            # the linearization point: exact-key replays above remain
+            # replayable, while a fresh higher report is rejected before an HWM
+            # bump or command INSERT can make teardown ownership ambiguous.
+            from services.completion_teardown_authority import (
+                active_workspace_teardown_authorization,
+            )
+
+            active_teardown = await active_workspace_teardown_authorization(
+                conn, job_id=str(job_uuid)
+            )
+            if active_teardown is not None:
+                raise CompletionTeardownInProgress(
+                    active_teardown.command_id,
+                    active_teardown.report_seq,
+                )
+
             report_seq = int(job["completion_seq_hwm"] or 0) + 1
             report_uuid = supplied_report_uuid or UUID(
                 fallback_client_report_id(str(job_uuid), report_seq)
@@ -349,17 +405,18 @@ async def accept_completion_command(
                 INSERT INTO job_completion_commands (
                     job_id, report_seq, client_report_id, payload,
                     payload_digest, accepted_lease_token, accepted_agent_id,
-                    origin, requested_by, deadline_at, code_version, run_after
+                    accepted_job_status, origin, requested_by, deadline_at,
+                    code_version, run_after
                 ) VALUES (
                     $1::uuid, $2::bigint, $3::uuid, $4::jsonb,
                     $5::text, $6::bigint, $7::uuid,
-                    'agent', $8::text,
-                    now() + make_interval(secs => $9::float8), $10::text,
-                    now() + make_interval(secs => $11::float8)
+                    $8::text, 'agent', $9::text,
+                    now() + make_interval(secs => $10::float8), $11::text,
+                    now() + make_interval(secs => $12::float8)
                 )
                 RETURNING id, job_id, report_seq, client_report_id, payload,
                           payload_digest, accepted_lease_token,
-                          accepted_agent_id, state, outcome
+                          accepted_agent_id, accepted_job_status, state, outcome
                 """,
                 job_uuid,
                 report_seq,
@@ -368,6 +425,7 @@ async def accept_completion_command(
                 digest,
                 accepted_token,
                 accepted_agent,
+                str(job["status"]),
                 requested_by,
                 float(COMPLETION_DEADLINE_SECONDS),
                 code_version,
@@ -414,9 +472,11 @@ __all__ = [
     "CompletionAcceptResult",
     "CompletionCommandError",
     "CompletionCommandNotFound",
+    "CompletionControlInProgress",
     "CompletionFenceRejected",
     "CompletionInProgress",
     "CompletionPayloadMismatch",
+    "CompletionTeardownInProgress",
     "accept_completion_command",
     "canonical_completion_payload",
     "completion_payload_digest",

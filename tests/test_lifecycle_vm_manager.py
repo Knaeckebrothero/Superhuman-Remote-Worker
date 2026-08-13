@@ -35,6 +35,8 @@ def _make_manager(
     snapshot_available: bool = True,
     suspension_enabled: bool = True,
     shared_child_exists: bool = False,
+    completion_commands_enabled: bool = False,
+    completion_control_active: bool = False,
 ):
     provisioner = MagicMock()
     provisioner.is_available = is_available
@@ -56,8 +58,15 @@ def _make_manager(
 
     # Two-call pattern: first fetch is jobs, second is threads.
     conn.fetch = AsyncMock(side_effect=[job_rows or [], thread_rows or []])
-    # Backs the live-shared-child EXISTS query (_live_shared_child_exists).
-    conn.fetchval = AsyncMock(return_value=shared_child_exists)
+
+    # Backs the live-shared-child EXISTS query and the flag-gated control-marker
+    # query.  The latter is never reached in default-off tests.
+    async def _fetchval(sql, *_args):
+        if "_completion_control_claim" in sql:
+            return completion_control_active
+        return shared_child_exists
+
+    conn.fetchval = AsyncMock(side_effect=_fetchval)
     ctx = AsyncMock()
     ctx.__aenter__ = AsyncMock(return_value=conn)
     ctx.__aexit__ = AsyncMock(return_value=False)
@@ -68,6 +77,7 @@ def _make_manager(
         suspension_service=suspension,
         snapshot_service=snapshot,
         db=db,
+        completion_commands_enabled=completion_commands_enabled,
     )
     return mgr, provisioner, suspension, snapshot, db
 
@@ -112,6 +122,55 @@ class TestListInstances:
     async def test_empty_when_provisioner_unavailable(self):
         mgr, *_ = _make_manager(is_available=False)
         assert await mgr.list_instances() == []
+
+    @pytest.mark.asyncio
+    async def test_flag_off_does_not_read_or_publish_control_marker(self):
+        job = {
+            "id": "job-legacy",
+            "status": "processing",
+            "execution_lane": "pinned",
+            "context": {"vm": {"status": "ready", "ssh_host": "10.0.0.8"}},
+        }
+        mgr, _, _, _, db = _make_manager(job_rows=[job])
+
+        [inst] = await mgr.list_instances()
+
+        assert "completion_control_owned" not in inst.metadata
+        conn = db.acquire.return_value.__aenter__.return_value
+        conn.fetchval.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_or_malformed_control_marker_is_listed_as_owner(self):
+        job = {
+            "id": "job-controlled",
+            "status": "completed",
+            "execution_lane": "pinned",
+            "context": {
+                "_completion_control_claim": "malformed",
+                "vm": {"status": "ready", "ssh_host": "10.0.0.9"},
+            },
+        }
+        mgr, _, _, _, db = _make_manager(
+            job_rows=[job],
+            completion_commands_enabled=True,
+            completion_control_active=True,
+        )
+
+        [inst] = await mgr.list_instances()
+
+        assert inst.metadata["completion_control_owned"] is True
+        assert await mgr.is_healthy(inst) is True
+        assert await mgr.is_idle(inst) is False
+        assert await mgr.is_reapable(inst) is False
+        conn = db.acquire.return_value.__aenter__.return_value
+        [sql] = [
+            str(call.args[0])
+            for call in conn.fetchval.await_args_list
+            if "_completion_control_claim" in str(call.args[0])
+        ]
+        assert "jsonb_typeof" in sql
+        assert "clock_timestamp()" in sql
+        assert "expires_epoch" in sql
 
     @pytest.mark.asyncio
     async def test_returns_job_vm(self):
@@ -865,6 +924,58 @@ class TestDelete:
         provisioner.delete_thread_vm.assert_not_called()
 
 
+class TestCompletionControlLifecycleOwnership:
+    @pytest.mark.asyncio
+    async def test_action_time_recheck_blocks_snapshot_delete_and_give_up(self):
+        mgr, provisioner, _, snapshot, db = _make_manager(
+            completion_commands_enabled=True,
+            completion_control_active=True,
+        )
+        inst = Instance(
+            kind="vm",
+            id="vm-job-1",
+            bound_to="job-1",
+            metadata={
+                "scope": "job",
+                "job_status": "paused",
+                "ssh_host": "10.0.0.7",
+            },
+        )
+
+        assert await mgr.snapshot(inst) is None
+        await mgr.delete(inst, grace_s=0)
+        await mgr.give_up(inst, grace_s=0)
+
+        snapshot.capture_vm_snapshot.assert_not_awaited()
+        provisioner.delete_vm.assert_not_awaited()
+        db.merge_vm_context.assert_not_awaited()
+        conn = db.acquire.return_value.__aenter__.return_value
+        marker_queries = [
+            call
+            for call in conn.fetchval.await_args_list
+            if "_completion_control_claim" in str(call.args[0])
+        ]
+        assert len(marker_queries) == 3
+
+    @pytest.mark.asyncio
+    async def test_lookup_error_fails_closed_before_delete(self):
+        mgr, provisioner, _, _, db = _make_manager(
+            completion_commands_enabled=True,
+        )
+        conn = db.acquire.return_value.__aenter__.return_value
+        conn.fetchval.side_effect = RuntimeError("db clock unavailable")
+        inst = Instance(
+            kind="vm",
+            id="vm-job-1",
+            bound_to="job-1",
+            metadata={"scope": "job"},
+        )
+
+        await mgr.delete(inst, grace_s=0)
+
+        provisioner.delete_vm.assert_not_awaited()
+
+
 # =============================================================================
 # Reap predicates (ReapableInstanceManager) — mirror workspace, VM-adjusted
 # =============================================================================
@@ -1328,6 +1439,19 @@ class TestReapOrphans:
         provisioner.delete_vm.assert_awaited_once_with(self.ORPHAN_ID)
 
     @pytest.mark.asyncio
+    async def test_control_marker_blocks_orphan_destructive_recheck(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
+        mgr, provisioner, _, _, _ = _make_manager(
+            completion_commands_enabled=True,
+            completion_control_active=True,
+        )
+        provisioner.list_vms = AsyncMock(return_value=[self._vm()])
+
+        assert await mgr.reap_orphans() == 0
+
+        provisioner.delete_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_spares_young_orphan(self, monkeypatch):
         # Never reap an in-flight provision whose row hasn't landed yet.
         monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
@@ -1444,6 +1568,20 @@ class TestKeptDiskSweep:
 
         assert purged == 1
         provisioner.delete_vm.assert_awaited_once_with("job-1", purge_disk=True)
+
+    @pytest.mark.asyncio
+    async def test_control_marker_blocks_kept_disk_destructive_recheck(self):
+        mgr, provisioner, _, _, db = _make_manager(
+            completion_commands_enabled=True,
+            completion_control_active=True,
+        )
+        conn = db.acquire.return_value.__aenter__.return_value
+        conn.fetch.side_effect = None
+        conn.fetch.return_value = [{"id": "job-1", "execution_lane": "pinned"}]
+
+        assert await mgr.purge_kept_disks() == 0
+
+        provisioner.delete_vm.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_purge_clears_the_marker(self):

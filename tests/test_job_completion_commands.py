@@ -18,6 +18,7 @@ from uuid import UUID
 import pytest
 
 from orchestrator.services.job_completion_commands import (
+    CompletionControlInProgress,
     CompletionFenceRejected,
     CompletionInProgress,
     CompletionPayloadMismatch,
@@ -67,6 +68,7 @@ def _existing_command(
         "payload_digest": completion_payload_digest(JOB_ID, stored_payload),
         "accepted_lease_token": accepted_lease_token,
         "accepted_agent_id": accepted_agent_id,
+        "accepted_job_status": "processing",
         "state": state,
         "outcome": outcome,
         "error_code": error_code,
@@ -168,6 +170,8 @@ class _RecordingConnection:
             "execution_lane": self.lane,
             "assigned_agent_id": self.assigned_agent_id,
             "completion_seq_hwm": self.completion_seq_hwm,
+            "context": {},
+            "db_now_epoch": 1_800_000_000.0,
         }
 
     def _queue(self) -> dict[str, Any]:
@@ -191,6 +195,7 @@ class _RecordingConnection:
             "payload_digest": args[4],
             "accepted_lease_token": args[5],
             "accepted_agent_id": args[6],
+            "accepted_job_status": args[7],
             "state": "pending",
             "outcome": None,
         }
@@ -199,6 +204,11 @@ class _RecordingConnection:
         normalized = self._record("fetchrow", sql, args)
         if normalized.startswith("insert into job_completion_commands"):
             return self._inserted(args)
+        if (
+            "from completion_effects as effect" in normalized
+            and "teardown_authorization" in normalized
+        ):
+            return None
         if "from job_completion_commands" in normalized:
             return self.existing
         if "from run_queue" in normalized:
@@ -341,6 +351,70 @@ async def test_equal_retry_in_flight_is_409_semantics(state: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fresh_report_loses_to_active_control_before_first_write() -> None:
+    conn = _RecordingConnection(
+        lane="pinned",
+        assigned_agent_id=AGENT_ID,
+    )
+    original_job = conn._job
+    conn._job = lambda: {
+        **original_job(),
+        "context": {
+            "_completion_control_claim": {
+                "version": 1,
+                "expires_epoch": 1_800_000_001.0,
+            }
+        },
+    }
+
+    with pytest.raises(CompletionControlInProgress):
+        await accept_completion_command(
+            _RecordingDB(conn),
+            job_id=str(JOB_ID),
+            payload=_payload(),
+            lease_token=None,
+            agent_id=str(AGENT_ID),
+            client_report_id=str(CLIENT_REPORT_ID),
+            requested_by="agent:test",
+        )
+
+    assert _mutating_calls(conn) == []
+
+
+@pytest.mark.asyncio
+async def test_exact_report_replay_precedes_active_control_marker() -> None:
+    conn = _RecordingConnection(
+        existing=_existing_command(
+            state="done",
+            outcome={"status": "handled"},
+        )
+    )
+    original_job = conn._job
+    conn._job = lambda: {
+        **original_job(),
+        "context": {
+            "_completion_control_claim": {
+                "version": 1,
+                "expires_epoch": 1_800_000_001.0,
+            }
+        },
+    }
+
+    result = await accept_completion_command(
+        _RecordingDB(conn),
+        job_id=str(JOB_ID),
+        payload=_payload(),
+        lease_token="41",
+        agent_id=None,
+        client_report_id=str(CLIENT_REPORT_ID),
+        requested_by="agent:test",
+    )
+
+    assert result.disposition == "replay_done"
+    assert _mutating_calls(conn) == []
+
+
+@pytest.mark.asyncio
 async def test_payload_mismatch_takes_precedence_over_in_flight_state() -> None:
     conn = _RecordingConnection(existing=_existing_command(state="pending"))
 
@@ -420,6 +494,7 @@ async def test_terminal_retry_matrix_replays_stored_disposition(
     assert result.winning_report_seq == winning_seq
     assert tuple(result.abandoned_effects or ()) == abandoned
     assert result.queue_terminalized is True
+    assert result.accepted_job_status == "processing"
     assert _mutating_calls(conn) == []
 
 
@@ -505,6 +580,9 @@ async def test_stateless_admission_locks_queue_before_job_and_inserts_first() ->
     assert result.report_seq == 7
     assert result.state == "pending"
     assert result.queue_terminalized is True
+    assert result.accepted_job_status == "processing"
+    insert = _mutating_calls(conn)[0]
+    assert insert.args[7] == "processing"
 
 
 @pytest.mark.asyncio
@@ -577,6 +655,7 @@ async def test_pinned_agent_identity_is_fenced_under_job_lock() -> None:
     )
     assert result.disposition == "fresh"
     assert result.queue_terminalized is False
+    assert result.accepted_job_status == "processing"
 
 
 @pytest.mark.asyncio

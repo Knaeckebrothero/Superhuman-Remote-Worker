@@ -25,6 +25,7 @@ from starlette.responses import JSONResponse
 import main
 from services import job_completion_commands as commands
 from services import completion as completion_service
+from services.completion_finalizer import CompletionDispositionSuperseded
 
 
 JOB_ID = "11111111-2222-3333-4444-555555555555"
@@ -39,12 +40,17 @@ class _RecordingRunner:
 
     def __init__(self) -> None:
         self.command_id = COMMAND_ID
+        self.command: dict[str, object] = {}
         self.owner = "recording-finalizer-owner"
         self.started: set[str] = set()
         self.details: dict[str, object] = {}
         self.pending: dict[str, object] = {}
         self.intents: dict[str, dict[str, object]] = {}
         self.higher_report_seq = False
+        self.teardown_authority_disposition: str | None = None
+        self.teardown_handoff = False
+        self.disposition_authority_checks = 0
+        self.disposition_authority_hook = None
         self.probe_order: list[str] = []
         self.order: list[tuple[str, str]] = []
         self.callback_counts: Counter[str] = Counter()
@@ -120,6 +126,31 @@ class _RecordingRunner:
             return None
         self.intents[name] = copy.deepcopy(detail)
         return copy.deepcopy(detail)
+
+    async def authorize_workspace_teardown(self):
+        disposition = self.teardown_authority_disposition or (
+            "deferred" if self.higher_report_seq else "authorized"
+        )
+        return SimpleNamespace(
+            authorized=disposition == "authorized",
+            higher_report_seq=(2 if disposition == "deferred" else None),
+            superseded=disposition == "world_state_superseded",
+            operator_hold=disposition == "operator_hold",
+            observed_status=(
+                "cancelled"
+                if disposition in {"world_state_superseded", "operator_hold"}
+                else "completed"
+            ),
+            expected_status="completed",
+        )
+
+    async def workspace_teardown_handoff(self):
+        return SimpleNamespace(required=self.teardown_handoff)
+
+    async def assert_disposition_authority(self) -> None:
+        self.disposition_authority_checks += 1
+        if self.disposition_authority_hook is not None:
+            await self.disposition_authority_hook()
 
 
 class _RouteDB:
@@ -216,6 +247,7 @@ def _accepted(
         abandoned_effects=abandoned_effects,
         client_report_id=str(REPORT_ID),
         queue_terminalized=False,
+        accepted_job_status="processing",
     )
 
 
@@ -361,6 +393,118 @@ async def test_effect_runner_replays_early_return_without_reentering_guard(
     assert database.status_write_count == 0
 
 
+@pytest.mark.parametrize("late_status", ["completed", "pending_review", "reviewing"])
+@pytest.mark.asyncio
+async def test_late_noop_runs_only_deferred_s36_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    late_status: str,
+) -> None:
+    database = _RouteDB(_route_job(status=late_status))
+    runner = _RecordingRunner()
+    runner.teardown_handoff = True
+    terminal_effects = AsyncMock(return_value={"actions": ["must not run"]})
+    workspace_cleanup = AsyncMock(return_value=["workspace archived"])
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=terminal_effects,
+        workspace_cleanup=workspace_cleanup,
+    )
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    assert result == {
+        "status": "handled",
+        "job_id": JOB_ID,
+        "new_status": late_status,
+        "actions": [
+            f"late callback ignored; job already {late_status}",
+            "workspace archived",
+        ],
+    }
+    assert runner.order == [
+        ("late_callback_guard", "entry"),
+        ("workspace_archive_teardown", "workspace_teardown"),
+    ]
+    assert runner.details["workspace_archive_teardown"] == {
+        "actions": ["workspace archived"],
+        "teardown_disposition": "completed",
+    }
+    assert database.status_write_count == 0
+    terminal_effects.assert_not_awaited()
+    workspace_cleanup.assert_awaited_once_with(JOB_ID)
+
+
+@pytest.mark.asyncio
+async def test_review_late_noop_without_handoff_does_not_run_s36(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _RouteDB(_route_job(status="pending_review"))
+    runner = _RecordingRunner()
+    workspace_cleanup = AsyncMock(return_value=["must not run"])
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=AsyncMock(return_value={"actions": ["must not run"]}),
+        workspace_cleanup=workspace_cleanup,
+    )
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    assert result["new_status"] == "pending_review"
+    assert result["actions"] == ["late callback ignored; job already pending_review"]
+    assert runner.order == [("late_callback_guard", "entry")]
+    workspace_cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_intermediate_late_noop_defers_s36_to_still_higher_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _RouteDB(_route_job(status="completed"))
+    runner = _RecordingRunner()
+    runner.teardown_handoff = True
+    runner.higher_report_seq = True
+    terminal_effects = AsyncMock(return_value={"actions": ["must not run"]})
+    workspace_cleanup = AsyncMock(return_value=["must not run"])
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=terminal_effects,
+        workspace_cleanup=workspace_cleanup,
+    )
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    assert result["actions"] == ["late callback ignored; job already completed"]
+    assert runner.details["workspace_archive_teardown"] == {
+        "actions": [],
+        "teardown_disposition": "deferred",
+        "higher_report_seq": 2,
+    }
+    assert database.status_write_count == 0
+    terminal_effects.assert_not_awaited()
+    workspace_cleanup.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_effect_runner_reconstructs_normal_result_without_repeating_effects(
     monkeypatch: pytest.MonkeyPatch,
@@ -439,7 +583,8 @@ async def test_effect_runner_reconstructs_normal_result_without_repeating_effect
     assert await runner.has_completed("main_status_write")
     assert "main_status_write" in runner.transactional_names
     assert await runner.completed_detail("workspace_archive_teardown") == {
-        "actions": ["workspace archived"]
+        "actions": ["workspace archived"],
+        "teardown_disposition": "completed",
     }
     assert database.status_write_count == 1
     assert database.job["status"] == "completed"
@@ -474,7 +619,7 @@ async def test_resume_rejects_same_status_without_this_commands_completed_marker
         workspace_cleanup=workspace_cleanup,
     )
 
-    with pytest.raises(HTTPException) as raised:
+    with pytest.raises(CompletionDispositionSuperseded) as raised:
         await main._complete_job_legacy(
             MagicMock(),
             JOB_ID,
@@ -483,11 +628,170 @@ async def test_resume_rejects_same_status_without_this_commands_completed_marker
             _effect_runner=runner,
         )
 
-    assert raised.value.status_code == 409
-    assert "out-of-band job control race" in str(raised.value.detail)
+    assert raised.value.observed_status == "completed"
+    assert raised.value.expected_statuses == ("processing",)
     assert database.status_write_count == 0
     terminal_effects.assert_not_awaited()
     workspace_cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_s17_cas_miss_raises_typed_whole_command_supersede(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _RouteDB(_route_job())
+    runner = _RecordingRunner()
+    runner.command["resolved_entry_status"] = "processing"
+    terminal_effects = AsyncMock(return_value={"actions": ["must not run"]})
+    workspace_cleanup = AsyncMock(return_value=["must not run"])
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=terminal_effects,
+        workspace_cleanup=workspace_cleanup,
+    )
+
+    async def lose_s17(_job_id: str, **_updates) -> bool:
+        database.job["status"] = "cancelled"
+        return False
+
+    monkeypatch.setattr(database, "update_job_status", lose_s17)
+
+    with pytest.raises(CompletionDispositionSuperseded) as raised:
+        await main._complete_job_legacy(
+            MagicMock(),
+            JOB_ID,
+            _body(),
+            _authorized=True,
+            _effect_runner=runner,
+        )
+
+    assert raised.value.observed_status == "cancelled"
+    assert raised.value.expected_statuses == ("processing",)
+    assert "main_status_write" in runner.started
+    assert "main_status_write" not in runner.details
+    terminal_effects.assert_not_awaited()
+    workspace_cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_s17_is_fenced_before_any_class_c_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _RouteDB(_route_job())
+    runner = _RecordingRunner()
+    runner.command["resolved_entry_status"] = "processing"
+    terminal_effects = AsyncMock(return_value={"actions": ["must not run"]})
+    workspace_cleanup = AsyncMock(return_value=["must not run"])
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=terminal_effects,
+        workspace_cleanup=workspace_cleanup,
+    )
+
+    async def cancel_at_class_c_boundary() -> None:
+        assert runner.details["main_status_write"]["new_status"] == "completed"
+        database.job["status"] = "cancelled"
+        raise CompletionDispositionSuperseded(
+            observed_status="cancelled",
+            expected_statuses=("completed",),
+        )
+
+    runner.disposition_authority_hook = cancel_at_class_c_boundary
+
+    with pytest.raises(CompletionDispositionSuperseded) as raised:
+        await main._complete_job_legacy(
+            MagicMock(),
+            JOB_ID,
+            _body(),
+            _authorized=True,
+            _effect_runner=runner,
+        )
+
+    assert raised.value.observed_status == "cancelled"
+    assert raised.value.expected_statuses == ("completed",)
+    assert runner.disposition_authority_checks == 1
+    assert not runner.started.intersection(
+        {
+            "subjob_output_graft",
+            "critic_verdict",
+            "scholar_parent_unblock",
+            "delegation_parent_unblock",
+            "verification_critic_spawn",
+            "curation_final_pass",
+            "project_loop_advance",
+            "terminal_merge_change_record",
+            "session_wake_enqueue",
+            "dispatch_trigger",
+            "workspace_archive_teardown",
+        }
+    )
+    terminal_effects.assert_not_awaited()
+    workspace_cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_flag_on_s23_auto_deny_uses_exact_finalizer_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _RouteDB(_route_job())
+    runner = _RecordingRunner()
+    runner.command["resolved_entry_status"] = "processing"
+    terminal_effects = AsyncMock(return_value={"actions": []})
+    workspace_cleanup = AsyncMock(return_value=[])
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=terminal_effects,
+        workspace_cleanup=workspace_cleanup,
+    )
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(
+        main,
+        "_check_vm_permission",
+        AsyncMock(side_effect=HTTPException(status_code=403, detail="not allowed")),
+    )
+    monkeypatch.setattr(
+        main.sudo_gate,
+        "insert_vm_upgrade_request",
+        AsyncMock(return_value="sudo-request-1"),
+    )
+    resume = AsyncMock(return_value={"status": "denied_vm_upgrade"})
+    monkeypatch.setattr(main, "_resume_job_without_vm_internal", resume)
+    body = main.JobCompleteRequest(
+        should_stop=True,
+        goal_achieved=False,
+        freeze_data={
+            "freeze_type": "vm_upgrade_required",
+            "command": "sudo apt install example",
+            "reason": "package required",
+        },
+        lease_token=17,
+        agent_id=AGENT_ID,
+        client_report_id=REPORT_ID,
+    )
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        body,
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    resume.assert_awaited_once_with(
+        JOB_ID,
+        decided_by="system",
+        reason="not allowed",
+        denied=True,
+        completion_owner_command_id=COMMAND_ID,
+        completion_owner=runner.owner,
+    )
+    assert runner.details["auto_deny_resume"] == {"auto_denied": True}
+    assert runner.disposition_authority_checks == 1
+    assert result["new_status"] == "paused"
+    assert "vm upgrade auto-denied" in result["actions"][-1]
 
 
 @pytest.mark.asyncio
@@ -990,7 +1294,8 @@ async def test_terminal_delivery_failure_does_not_block_teardown_and_replays_onl
     }
     assert "terminal_merge_change_record" not in runner.details
     assert runner.details["workspace_archive_teardown"] == {
-        "actions": ["workspace archived"]
+        "actions": ["workspace archived"],
+        "teardown_disposition": "completed",
     }
     assert {
         "terminal_merge_change_record",
@@ -1058,7 +1363,8 @@ async def test_session_wake_failure_does_not_block_independent_teardown(
     }
     assert "session_wake_enqueue" not in runner.details
     assert runner.details["workspace_archive_teardown"] == {
-        "actions": ["workspace archived"]
+        "actions": ["workspace archived"],
+        "teardown_disposition": "completed",
     }
     assert runner.order.index(("session_wake_enqueue", "session_wake_enqueue")) < (
         runner.order.index(("workspace_archive_teardown", "workspace_teardown"))
@@ -1137,6 +1443,7 @@ async def test_teardown_failure_stays_pending_and_replay_skips_done_delivery(
     assert runner.pending["workspace_archive_teardown"] == {
         "actions": ["workspace cleanup failed: kubernetes unavailable"],
         "error": "kubernetes unavailable",
+        "teardown_disposition": "retry_pending",
     }
     terminal_effects.assert_awaited_once()
     workspace_cleanup.assert_awaited_once_with(JOB_ID)
@@ -1156,12 +1463,75 @@ async def test_teardown_failure_stays_pending_and_replay_skips_done_delivery(
     ]
     assert "workspace_archive_teardown" not in runner.pending
     assert runner.details["workspace_archive_teardown"] == {
-        "actions": ["workspace archived"]
+        "actions": ["workspace archived"],
+        "teardown_disposition": "completed",
     }
     assert runner.callback_counts["terminal_merge_change_record"] == 1
     assert runner.callback_counts["workspace_archive_teardown"] == 2
     terminal_effects.assert_awaited_once()
     assert workspace_cleanup.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_s17_supersedes_before_s36_without_settling_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _RouteDB(_route_job(status="cancelled"))
+    runner = _RecordingRunner()
+    runner.details["main_status_write"] = {
+        "new_status": "completed",
+        "had_assigned_agent": True,
+        "stash_and_clear_freeze": False,
+    }
+    runner.teardown_authority_disposition = "world_state_superseded"
+    workspace_cleanup = AsyncMock(return_value=["must not release"])
+    monkeypatch.setattr(main, "postgres_db", database)
+    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", workspace_cleanup)
+
+    with pytest.raises(CompletionDispositionSuperseded) as raised:
+        await main._run_completion_workspace_teardown(JOB_ID, runner)
+
+    assert raised.value.observed_status == "cancelled"
+    assert raised.value.expected_statuses == ("completed",)
+    assert raised.value.reason == "workspace_teardown_status_superseded"
+    assert runner.pending["workspace_archive_teardown"] == {
+        "actions": [],
+        "error": "jobs status changed before workspace teardown authorization",
+        "teardown_disposition": "world_state_superseded",
+        "observed_status": "cancelled",
+        "expected_status": "completed",
+    }
+    assert "workspace_archive_teardown" not in runner.details
+    assert runner.probe_order == []
+    workspace_cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_active_s36_marker_status_drift_parks_without_clearing_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _RouteDB(_route_job(status="cancelled"))
+    runner = _RecordingRunner()
+    runner.teardown_authority_disposition = "operator_hold"
+    workspace_cleanup = AsyncMock(return_value=["must not release"])
+    monkeypatch.setattr(main, "postgres_db", database)
+    monkeypatch.setattr(main, "_archive_and_cleanup_workspace", workspace_cleanup)
+
+    output = await main._run_completion_workspace_teardown(JOB_ID, runner)
+
+    assert output == {
+        "actions": [],
+        "error": (
+            "workspace teardown authorization marker conflicts with current jobs status"
+        ),
+        "teardown_disposition": "operator_hold",
+        "observed_status": "cancelled",
+        "expected_status": "completed",
+    }
+    assert runner.pending["workspace_archive_teardown"] == output
+    assert "workspace_archive_teardown" not in runner.details
+    assert runner.probe_order == []
+    workspace_cleanup.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1590,6 +1960,50 @@ async def test_fresh_admission_precedes_inline_finalization_and_returns_exact_ou
         client_report_id=str(REPORT_ID),
         requested_by=f"agent:{AGENT_ID}",
     )
+
+
+@pytest.mark.asyncio
+async def test_fresh_superseded_finalization_returns_terminal_outcome_not_202(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = {
+        "status": "superseded",
+        "job_id": JOB_ID,
+        "report_seq": 3,
+        "reason": "entry_status_superseded",
+        "accepted_job_status": "processing",
+        "expected_entry_statuses": ["processing"],
+        "observed_status": "cancelled",
+        "winning_report_seq": None,
+        "abandoned_effects": [],
+    }
+    finalize = AsyncMock(
+        return_value=SimpleNamespace(
+            disposition="superseded",
+            state="superseded",
+            outcome=outcome,
+        )
+    )
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(main, "require_internal", AsyncMock())
+    monkeypatch.setattr(
+        commands,
+        "accept_completion_command",
+        AsyncMock(return_value=_accepted("fresh")),
+    )
+    monkeypatch.setattr(
+        main,
+        "_get_completion_finalizer",
+        MagicMock(return_value=SimpleNamespace(finalize_command=finalize)),
+    )
+    legacy = AsyncMock(side_effect=AssertionError("superseded workflow must not run"))
+    monkeypatch.setattr(main, "_complete_job_legacy", legacy)
+
+    handled = await main.complete_job(MagicMock(), JOB_ID, _body())
+
+    assert handled == outcome
+    legacy.assert_not_awaited()
+    finalize.assert_awaited_once()
 
 
 @pytest.mark.asyncio

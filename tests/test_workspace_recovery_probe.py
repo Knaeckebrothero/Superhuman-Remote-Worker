@@ -223,7 +223,7 @@ class TestHandlePodWorkspaceRecovery:
                 completion_finalizing_by="owner-a",
             )
 
-        db.pause_job_shed_freeze.assert_not_awaited()
+        db.pause_job_shed_freeze.assert_awaited_once()
         trigger_dispatch.assert_not_called()
 
     @pytest.mark.asyncio
@@ -245,7 +245,7 @@ class TestHandlePodWorkspaceRecovery:
                 completion_finalizing_by="owner-a",
             )
 
-        db.pause_job_shed_freeze.assert_not_awaited()
+        db.pause_job_shed_freeze.assert_awaited_once()
         trigger_dispatch.assert_not_called()
 
     @pytest.mark.asyncio
@@ -269,6 +269,31 @@ class TestHandlePodWorkspaceRecovery:
 
         delete_workspace.assert_not_awaited()
         db.pause_job_shed_freeze.assert_not_awaited()
+        trigger_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_durable_pause_loss_performs_no_delete_or_context_merge(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(
+            pod_alive=False, pause_ok=False
+        )
+        job = _job()
+
+        result = await handle_pod_workspace_recovery(
+            job,
+            job["id"],
+            _ERROR,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+            completion_command_id="44444444-4444-4444-8444-444444444444",
+            completion_finalizing_by="owner-a",
+        )
+
+        assert result["paused"] is False
+        db.pause_job_shed_freeze.assert_awaited_once()
+        delete_workspace.assert_not_awaited()
+        db.merge_workspace_container_context.assert_not_awaited()
         trigger_dispatch.assert_not_called()
 
     @pytest.mark.asyncio
@@ -430,18 +455,20 @@ class TestHandlePodWorkspaceRecovery:
             completion_finalizing_by="owner-a",
         )
 
-        counter_call = db.merge_workspace_container_context.await_args
-        assert counter_call.kwargs == {
-            "completion_command_id": command_id,
-            "completion_finalizing_by": "owner-a",
-        }
-        assert counter_call.args[1]["recovery_attempt_command_id"] == command_id
         pause_call = db.pause_job_shed_freeze.await_args
         assert pause_call.kwargs["completion_command_id"] == command_id
         assert pause_call.kwargs["completion_finalizing_by"] == "owner-a"
         marker = pause_call.kwargs["workspace_context_updates"]
+        assert marker["recovery_attempt_command_id"] == command_id
+        assert marker["recovery_delete_pending"] is True
         assert marker["recovery_completion_command_id"] == command_id
         assert marker["recovery_completion_outcome"] == result
+        clear_call = db.merge_workspace_container_context.await_args
+        assert clear_call.kwargs == {
+            "completion_command_id": command_id,
+            "completion_finalizing_by": "owner-a",
+        }
+        assert clear_call.args[1] == {"recovery_delete_pending": False}
 
     @pytest.mark.asyncio
     async def test_durable_recovery_reconciles_atomic_disposition_without_reprobe(self):
@@ -479,6 +506,50 @@ class TestHandlePodWorkspaceRecovery:
         db.merge_workspace_container_context.assert_not_awaited()
         db.pause_job_shed_freeze.assert_not_awaited()
         delete_workspace.assert_not_awaited()
+        trigger_dispatch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_durable_recovery_reconciles_pending_exact_uid_delete(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
+        command_id = "44444444-4444-4444-8444-444444444444"
+        outcome = {
+            "status": "handled",
+            "job_id": _job()["id"],
+            "new_status": "paused",
+            "paused": True,
+            "actions": ["workspace recovery: reconciled"],
+        }
+        job = _job(attempts=2)
+        job["context"]["workspace_container"].update(
+            {
+                "recovery_completion_command_id": command_id,
+                "recovery_completion_outcome": outcome,
+                "recovery_delete_pending": True,
+            }
+        )
+
+        assert (
+            await handle_pod_workspace_recovery(
+                job,
+                job["id"],
+                _ERROR,
+                db=db,
+                delete_workspace=delete_workspace,
+                trigger_dispatch=trigger_dispatch,
+                probe=probe,
+                completion_command_id=command_id,
+                completion_finalizing_by="owner-b",
+            )
+            == outcome
+        )
+        delete_workspace.assert_awaited_once_with(job["id"])
+        db.merge_workspace_container_context.assert_awaited_once_with(
+            job["id"],
+            {"recovery_delete_pending": False},
+            completion_command_id=command_id,
+            completion_finalizing_by="owner-b",
+        )
+        db.pause_job_shed_freeze.assert_not_awaited()
         trigger_dispatch.assert_called_once()
 
 

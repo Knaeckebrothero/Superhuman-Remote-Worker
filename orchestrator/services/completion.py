@@ -515,6 +515,18 @@ async def handle_pod_workspace_recovery(
                     # a later owner retries the UID-fenced cleanup.
                     raise
             else:
+                if container_ctx.get("recovery_delete_pending") is True:
+                    await _delete_for_recovery()
+                    cleared = await db.merge_workspace_container_context(
+                        job_id,
+                        {"recovery_delete_pending": False},
+                        completion_command_id=completion_command_id,
+                        completion_finalizing_by=completion_finalizing_by,
+                    )
+                    if not cleared:
+                        raise RuntimeError(
+                            "workspace recovery lost its delete-reconcile term"
+                        )
                 trigger_dispatch()
             return dict(stored_outcome)
 
@@ -586,6 +598,79 @@ async def handle_pod_workspace_recovery(
     host = container_ctx.get("host")
     port = int(container_ctx.get("port") or 30022)
     pod_alive = bool(host) and await probe(host, port)
+
+    if completion_command_id is not None:
+        if not pod_alive and not container_ctx.get("_runtime_incarnation"):
+            raise RuntimeError(
+                "durable workspace recovery is missing the captured Pod UID"
+            )
+        if pod_alive:
+            logger.warning(
+                f"Job {job_id}: workspace reported unavailable but sshd probe on "
+                f"{host}:{port} succeeded — keeping pod, re-dispatch "
+                f"(attempt {attempts}/{cap})"
+            )
+            container_updates = {
+                "recovery_attempts": attempts,
+                "previous_error": error.get("message") or "workspace_unavailable",
+                "recovery_attempt_command_id": completion_command_id,
+                "recovery_delete_pending": False,
+            }
+            action = (
+                f"workspace recovery: pod alive on probe — kept, re-dispatch "
+                f"(attempt {attempts}/{cap})"
+            )
+        else:
+            logger.warning(
+                f"Job {job_id}: workspace unavailable — pod recovery "
+                f"attempt {attempts}/{cap} (PVC reattach)"
+            )
+            container_updates = {
+                "status": "deleted",
+                "pod_ip": None,
+                "recovery_attempts": attempts,
+                "previous_error": error.get("message") or "workspace_unavailable",
+                "recovery_attempt_command_id": completion_command_id,
+                "recovery_delete_pending": True,
+            }
+            action = (
+                f"workspace recovery: dead pod deleted (PVC kept), "
+                f"re-dispatch for reattach (attempt {attempts}/{cap})"
+            )
+
+        outcome = {
+            "status": "handled",
+            "job_id": job_id,
+            "new_status": "paused",
+            "actions": [action],
+            "paused": True,
+        }
+        paused = await db.pause_job_shed_freeze(
+            job_id,
+            completion_command_id=completion_command_id,
+            completion_finalizing_by=completion_finalizing_by,
+            workspace_context_updates={
+                **container_updates,
+                "recovery_completion_command_id": completion_command_id,
+                "recovery_completion_outcome": outcome,
+            },
+        )
+        if not paused:
+            outcome["paused"] = False
+            return outcome
+
+        if not pod_alive:
+            await _delete_for_recovery()
+            cleared = await db.merge_workspace_container_context(
+                job_id,
+                {"recovery_delete_pending": False},
+                completion_command_id=completion_command_id,
+                completion_finalizing_by=completion_finalizing_by,
+            )
+            if not cleared:
+                raise RuntimeError("workspace recovery lost its delete-complete term")
+        trigger_dispatch()
+        return outcome
 
     if pod_alive:
         # The workspace answers — the report was a misclassification or a

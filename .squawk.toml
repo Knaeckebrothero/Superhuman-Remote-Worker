@@ -87,6 +87,16 @@ excluded_rules = [
 #                this chain). Splitting to NOT VALID + a later VALIDATE would
 #                open a window in which a violating row could land, i.e.
 #                strictly worse than the atomic form.
+#        - app/0143: two constraint-missing-not-valid findings on the Gate-3
+#                completion command table. The commands feature is tracked
+#                default-off, so production applies this migration before it
+#                can contain rows; local k3d had only the deliberately retained
+#                soak fixtures. The checks were therefore bounded empty-table
+#                validation, protected by a 2 s lock timeout. Tilt applied and
+#                checksummed these bytes before the pinned-linter pass, so an
+#                in-place annotation or NOT VALID rewrite would violate the
+#                migration ledger. Future constraints retain the normal
+#                NOT VALID + later VALIDATE rule.
 excluded_paths = [
     "orchestrator/database/migrations/app/0001_initial.sql",
     "orchestrator/database/migrations/vector/0001_initial.sql",
@@ -98,5 +108,6 @@ excluded_paths = [
     "orchestrator/database/migrations/app/0122_thread_cloud_sync_generations.sql",
     "orchestrator/database/migrations/app/0123_thread_cloud_sync_baselines.sql",
     "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql",
+    "orchestrator/database/migrations/app/0143_job_completion_accept_status.sql",
     "orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]

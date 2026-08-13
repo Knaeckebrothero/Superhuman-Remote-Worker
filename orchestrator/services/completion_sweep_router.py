@@ -36,6 +36,7 @@ CompletionSweepDisposition = Literal[
     "legacy",
     "stand_down",
     "busy",
+    "queued",
     "already_done",
     "completed",
     "claim_lost",
@@ -200,7 +201,7 @@ class CompletionSweepRouter:
         )
 
     async def _allocate_and_claim(
-        self, job_id: str, *, source: str
+        self, job_id: str, *, source: str, claim_action: bool = True
     ) -> tuple[CompletionSweepResult | None, _ClaimedAction | None]:
         """Classify, allocate, and claim while holding the jobs-row lock."""
 
@@ -298,6 +299,21 @@ class CompletionSweepRouter:
                             if isinstance(stored_result, Mapping)
                             else None
                         ),
+                    ), None
+
+                if not claim_action:
+                    if state == "pending":
+                        return self._result(
+                            job_id,
+                            "queued",
+                            route_row=route_row,
+                            action_attempt=action_attempt,
+                        ), None
+                    return self._result(
+                        job_id,
+                        "busy",
+                        route_row=route_row,
+                        action_attempt=action_attempt,
                     ), None
 
                 exact_owner = f"{self.claimant_id}:{uuid4()}"
@@ -545,6 +561,25 @@ class CompletionSweepRouter:
             action_attempt=action.attempt,
             action_result=result,
         )
+
+    async def enqueue_job(self, job_id: Any, *, source: str) -> CompletionSweepResult:
+        """Durably nudge an actionable route without running the finalizer inline.
+
+        Resume/control HTTP verbs use this bounded path before returning 409.
+        The ordinary router loop claims the pending action, while the unique
+        ``(command_id, command_attempt)`` key makes concurrent nudges benign.
+        """
+
+        canonical_job_id = _canonical_uuid(job_id, label="job_id")
+        clean_source = _source(source)
+        immediate, action = await self._allocate_and_claim(
+            canonical_job_id,
+            source=clean_source,
+            claim_action=False,
+        )
+        assert action is None
+        assert immediate is not None
+        return immediate
 
     async def route_once(
         self, limit: int = 50, source: str = "completion_router"

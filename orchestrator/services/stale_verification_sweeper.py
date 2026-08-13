@@ -61,6 +61,7 @@ async def stale_verification_sweeper_loop(
     shutdown_event: asyncio.Event,
     *,
     stateless_cancel_fn: StatelessCancelFn | None = None,
+    completion_commands_enabled: bool = False,
 ) -> None:
     """Reap orphaned verification subjobs until ``shutdown_event`` is set."""
     logger.info(
@@ -79,6 +80,7 @@ async def stale_verification_sweeper_loop(
                 REVIEWING_STUCK_MINUTES,
                 wallclock_minutes=REVIEWING_WALLCLOCK_CEILING_MINUTES,
                 stateless_cancel_fn=stateless_cancel_fn,
+                completion_commands_enabled=completion_commands_enabled,
             )
             if cancelled:
                 logger.info(
@@ -112,6 +114,7 @@ async def _sweep_tick(
     notifier: Any = None,
     wallclock_minutes: int | None = None,
     stateless_cancel_fn: StatelessCancelFn | None = None,
+    completion_commands_enabled: bool = False,
 ) -> tuple[int, int]:
     """Run one sweep. Returns ``(cancelled_subjobs, unstuck_parents)``.
 
@@ -138,11 +141,16 @@ async def _sweep_tick(
                     job_id,
                 )
 
-    unstuck_rows = await db.unstick_reviewing_parents(grace_minutes)
+    completion_guard = (
+        {"completion_commands_enabled": True} if completion_commands_enabled else {}
+    )
+    unstuck_rows = await db.unstick_reviewing_parents(grace_minutes, **completion_guard)
 
     escalated_rows: list[dict[str, Any]] = []
     if wallclock_minutes and wallclock_minutes > 0:
-        escalated_rows = await db.unstick_reviewing_parents_wallclock(wallclock_minutes)
+        escalated_rows = await db.unstick_reviewing_parents_wallclock(
+            wallclock_minutes, **completion_guard
+        )
         for row in escalated_rows:
             logger.warning(
                 "Verification wall-clock ceiling (%d min) hit for parent %s — "

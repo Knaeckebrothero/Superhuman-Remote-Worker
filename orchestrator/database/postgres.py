@@ -100,6 +100,46 @@ def _completion_sweep_exclusion_clause(
     )
 
 
+def _completion_control_active_sql(context_expression: str) -> str:
+    """SQL predicate for a live or malformed control marker.
+
+    A JSON number avoids any fallible text-to-timestamp cast (and works on the
+    production PostgreSQL 15 cluster). Unknown/malformed marker shapes stay
+    fail-closed.
+    """
+
+    marker = f"({context_expression})->'_completion_control_claim'"
+    expiry = f"{marker}->'expires_epoch'"
+    return (
+        "CASE "
+        f"WHEN NOT (COALESCE({context_expression}, '{{}}'::jsonb) "
+        "? '_completion_control_claim') THEN false "
+        f"WHEN jsonb_typeof({marker}) IS DISTINCT FROM 'object' THEN true "
+        f"WHEN {marker}->>'version' IS DISTINCT FROM '1' THEN true "
+        f"WHEN jsonb_typeof({expiry}) IS DISTINCT FROM 'number' THEN true "
+        f"ELSE ({expiry}#>>'{{}}')::numeric "
+        "> extract(epoch FROM clock_timestamp()) END"
+    )
+
+
+def _completion_control_owned_active_sql(
+    context_expression: str,
+    claim_parameter: str,
+) -> str:
+    """Strict exact-owner predicate for a still-live control marker."""
+
+    marker = f"({context_expression})->'_completion_control_claim'"
+    expiry = f"{marker}->'expires_epoch'"
+    return (
+        f"jsonb_typeof({marker}) = 'object' "
+        f"AND {marker}->>'version' = '1' "
+        f"AND {marker}->>'claim_id' = {claim_parameter}::text "
+        f"AND jsonb_typeof({expiry}) = 'number' "
+        f"AND ({expiry}#>>'{{}}')::numeric "
+        "> extract(epoch FROM clock_timestamp())"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _TaskTransactionScope:
     """One connection reusable only by the task that opened its transaction.
@@ -1932,7 +1972,53 @@ class PostgresDB:
                 logger.debug("checkpoint prune skipped for %s: %s", job_id, e)
         return cancelled
 
-    async def cancel_stateless_job(self, job_id: str) -> tuple[bool, bool]:
+    async def linearize_pinned_cancel(
+        self,
+        job_id: str,
+        *,
+        expected_status: str,
+        completion_commands_enabled: bool = False,
+    ) -> bool:
+        """Publish pinned cancellation before external quiescence/cleanup.
+
+        Unlike :meth:`cancel_job`, this deliberately does not prune the graph
+        checkpoint.  The API performs that destructive step only after the
+        agent has been asked to quiesce and workspace cleanup has returned.
+        """
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('context')})"
+            if completion_commands_enabled
+            else ""
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                f"""
+                UPDATE jobs
+                SET status = 'cancelled',
+                    assigned_agent_id = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                  AND execution_lane = 'pinned'
+                  AND status::text = $2::text
+                  AND status NOT IN ('completed', 'cancelled')
+                  {control_guard}
+                """,
+                uuid_val,
+                expected_status,
+            )
+        return result == "UPDATE 1"
+
+    async def cancel_stateless_job(
+        self,
+        job_id: str,
+        *,
+        completion_commands_enabled: bool = False,
+    ) -> tuple[bool, bool]:
         """Cancel a stateless job with queue-first serialization.
 
         Queued/parked units become ``done`` immediately. A leased unit keeps
@@ -1950,6 +2036,11 @@ class PostgresDB:
         class _CancelCASLostError(Exception):
             pass
 
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('context')})"
+            if completion_commands_enabled
+            else ""
+        )
         queue_closed = False
         try:
             async with self.acquire() as conn:
@@ -1966,24 +2057,25 @@ class PostgresDB:
                         conn, job_id=job_uuid
                     )
                     row = await conn.fetchrow(
-                        """
+                        f"""
                         UPDATE jobs
                            SET status = 'cancelled',
                                assigned_agent_id = NULL,
-                               context = COALESCE(context, '{}'::jsonb)
-                                   || '{"_stateless_cancel_cleanup_pending": true}'::jsonb,
+                               context = COALESCE(context, '{{}}'::jsonb)
+                                   || '{{"_stateless_cancel_cleanup_pending": true}}'::jsonb,
                                updated_at = CURRENT_TIMESTAMP
                          WHERE id = $1
                            AND execution_lane = 'stateless'
                            AND status::text <> 'completed'
                            AND NOT (
-                               COALESCE(context, '{}'::jsonb)
+                               COALESCE(context, '{{}}'::jsonb)
                                ? '_stateless_delete_pending'
                            )
+                           {control_guard}
                            AND (
                                status::text <> 'cancelled'
                                OR NOT (
-                                   COALESCE(context, '{}'::jsonb)
+                                   COALESCE(context, '{{}}'::jsonb)
                                    ? '_stateless_cancel_cleanup_pending'
                                )
                            )
@@ -2301,7 +2393,13 @@ class PostgresDB:
         await self.delete_checkpoint_thread(job_id, strict=True)
         return True
 
-    async def pause_job(self, job_id: str) -> bool:
+    async def pause_job(
+        self,
+        job_id: str,
+        *,
+        completion_commands_enabled: bool = False,
+        expected_agent_id: str | None = None,
+    ) -> bool:
         """Pause a running job. Clears assigned_agent_id so the agent is freed.
 
         The job enters 'paused' status and will be auto-resumed by the dispatcher
@@ -2318,21 +2416,55 @@ class PostgresDB:
         except ValueError:
             return False
 
+        expected_agent_uuid: UUID | None = None
+        if completion_commands_enabled and expected_agent_id is not None:
+            try:
+                expected_agent_uuid = UUID(expected_agent_id)
+            except ValueError:
+                return False
+
         async with self.acquire() as conn:
-            result = await conn.execute(
-                """
+            if not completion_commands_enabled:
+                result = await conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'paused',
+                        assigned_agent_id = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $1 AND status = 'processing'
+                    """,
+                    uuid_val,
+                )
+            else:
+                owner_guard = (
+                    " AND assigned_agent_id = $2::uuid"
+                    if expected_agent_uuid is not None
+                    else ""
+                )
+                result = await conn.execute(
+                    f"""
                 UPDATE jobs
                 SET status = 'paused',
                     assigned_agent_id = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = $1 AND status = 'processing'
+                  AND execution_lane = 'pinned'
+                  {owner_guard}
+                  AND NOT ({_completion_control_active_sql("context")})
                 """,
-                uuid_val,
-            )
+                    uuid_val,
+                    *([expected_agent_uuid] if expected_agent_uuid is not None else []),
+                )
 
         return result == "UPDATE 1"
 
-    async def pause_stateless_job(self, job_id: str) -> bool:
+    async def pause_stateless_job(
+        self,
+        job_id: str,
+        *,
+        completion_commands_enabled: bool = False,
+        expected_lease_token: int | None = None,
+    ) -> bool:
         """Publish a stateless preemption under the queue-first lock order.
 
         A leased holder keeps its row so renewal can discover ``paused`` and
@@ -2348,20 +2480,43 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 queue = await conn.fetchrow(
-                    "SELECT state FROM run_queue "
-                    "WHERE unit_id = $1 AND unit_kind = 'worker_batch' "
+                    (
+                        "SELECT state, lease_token FROM run_queue "
+                        if completion_commands_enabled
+                        else "SELECT state FROM run_queue "
+                    )
+                    + "WHERE unit_id = $1 AND unit_kind = 'worker_batch' "
                     "FOR UPDATE",
                     job_uuid,
                 )
-                job = await conn.fetchrow(
-                    "SELECT status::text AS status, execution_lane FROM jobs "
-                    "WHERE id = $1 FOR UPDATE",
-                    job_uuid,
-                )
+                if completion_commands_enabled:
+                    job = await conn.fetchrow(
+                        f"SELECT status::text AS status, execution_lane, "
+                        f"({_completion_control_active_sql('context')}) "
+                        "AS control_active FROM jobs "
+                        "WHERE id = $1 FOR UPDATE",
+                        job_uuid,
+                    )
+                else:
+                    job = await conn.fetchrow(
+                        "SELECT status::text AS status, execution_lane FROM jobs "
+                        "WHERE id = $1 FOR UPDATE",
+                        job_uuid,
+                    )
                 if (
                     job is None
                     or job["execution_lane"] != "stateless"
                     or job["status"] != "processing"
+                    or (completion_commands_enabled and bool(job["control_active"]))
+                    or (
+                        completion_commands_enabled
+                        and expected_lease_token is not None
+                        and (
+                            queue is None
+                            or queue["state"] != "leased"
+                            or int(queue["lease_token"]) != int(expected_lease_token)
+                        )
+                    )
                 ):
                     return False
                 if queue is not None and queue["state"] in ("queued", "parked"):
@@ -2450,6 +2605,7 @@ class PostgresDB:
                 f"AND command.finalizing_by = ${owner_param}::text "
                 "AND command.lease_expires_at > now() "
                 "AND command.deadline_at > now())"
+                f" AND NOT ({_completion_control_active_sql('context')})"
             )
 
         async with self.acquire() as conn:
@@ -2635,6 +2791,7 @@ class PostgresDB:
                 f"AND command.finalizing_by = ${owner_param}::text "
                 "AND command.lease_expires_at > now() "
                 "AND command.deadline_at > now())"
+                f" AND NOT ({_completion_control_active_sql('context')})"
             )
 
         terminal_lane: str | None = None
@@ -3574,6 +3731,45 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def confirm_pinned_job_dispatch(
+        self,
+        job_id: str,
+        agent_id: str,
+        *,
+        consumed_context_keys: List[str] | None = None,
+    ) -> bool:
+        """Validate post-POST ownership and consume payload keys atomically.
+
+        The flag-on pre-POST claim is the sole status/assignment write. This
+        post-POST CAS must not resurrect a pause/control winner; it merely
+        proves the exact agent still owns a processing row and removes keys the
+        accepted resume consumed.
+        """
+
+        try:
+            job_uuid = UUID(job_id)
+            agent_uuid = UUID(agent_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE jobs
+                SET context=COALESCE(context, '{{}}'::jsonb) - $3::text[],
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=$1::uuid
+                  AND execution_lane='pinned'
+                  AND status='processing'
+                  AND assigned_agent_id=$2::uuid
+                  AND NOT ({_completion_control_active_sql("context")})
+                RETURNING id
+                """,
+                job_uuid,
+                agent_uuid,
+                list(consumed_context_keys or []),
+            )
+        return row is not None
+
     async def set_completion_decision(
         self, job_id: str, decision: Dict[str, Any]
     ) -> bool:
@@ -3616,7 +3812,13 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
-    async def append_queued_reply(self, job_id: str, reply: Dict[str, Any]) -> bool:
+    async def append_queued_reply(
+        self,
+        job_id: str,
+        reply: Dict[str, Any],
+        *,
+        completion_commands_enabled: bool = False,
+    ) -> bool:
         """Atomically append one reply object to ``context.queued_replies``.
 
         Single-statement ``jsonb_set(..., arr || $1)`` so two concurrent inbound
@@ -3652,11 +3854,41 @@ class PostgresDB:
             "WHERE id = $2"
         )
         async with self.acquire() as conn:
-            result = await conn.execute(query, json_module.dumps(reply), uuid_val)
+            if not completion_commands_enabled:
+                result = await conn.execute(query, json_module.dumps(reply), uuid_val)
+            else:
+                async with conn.transaction():
+                    locked = await conn.fetchval(
+                        "SELECT id FROM jobs WHERE id=$1::uuid FOR UPDATE",
+                        uuid_val,
+                    )
+                    if locked is None:
+                        return False
+                    blocked = await conn.fetchval(
+                        f"""
+                        SELECT EXISTS (
+                            SELECT 1 FROM job_completion_sweep_exclusions
+                            WHERE job_id=$1::uuid
+                        ) OR ({_completion_control_active_sql("context")})
+                        FROM jobs WHERE id=$1::uuid
+                        """,
+                        uuid_val,
+                    )
+                    if blocked:
+                        return False
+                    result = await conn.execute(
+                        query, json_module.dumps(reply), uuid_val
+                    )
 
         return result == "UPDATE 1"
 
-    async def append_pending_guidance(self, job_id: str, entry: Dict[str, Any]) -> bool:
+    async def append_pending_guidance(
+        self,
+        job_id: str,
+        entry: Dict[str, Any],
+        *,
+        completion_commands_enabled: bool = False,
+    ) -> bool:
         """Atomically append one guidance entry to ``context.pending_guidance``.
 
         The non-destructive steer lane (P1-A of
@@ -3694,7 +3926,31 @@ class PostgresDB:
             "WHERE id = $2"
         )
         async with self.acquire() as conn:
-            result = await conn.execute(query, json_module.dumps(entry), uuid_val)
+            if not completion_commands_enabled:
+                result = await conn.execute(query, json_module.dumps(entry), uuid_val)
+            else:
+                async with conn.transaction():
+                    locked = await conn.fetchval(
+                        "SELECT id FROM jobs WHERE id=$1::uuid FOR UPDATE",
+                        uuid_val,
+                    )
+                    if locked is None:
+                        return False
+                    blocked = await conn.fetchval(
+                        f"""
+                        SELECT EXISTS (
+                            SELECT 1 FROM job_completion_sweep_exclusions
+                            WHERE job_id=$1::uuid
+                        ) OR ({_completion_control_active_sql("context")})
+                        FROM jobs WHERE id=$1::uuid
+                        """,
+                        uuid_val,
+                    )
+                    if blocked:
+                        return False
+                    result = await conn.execute(
+                        query, json_module.dumps(entry), uuid_val
+                    )
 
         return result == "UPDATE 1"
 
@@ -4458,6 +4714,7 @@ class PostgresDB:
                 "AND command.finalizing_by = $4::text "
                 "AND command.lease_expires_at > now() "
                 "AND command.deadline_at > now())"
+                f" AND NOT ({_completion_control_active_sql('context')})"
             )
 
         query = (
@@ -6640,6 +6897,11 @@ class PostgresDB:
                 completion_exclusion = _completion_sweep_exclusion_clause(
                     completion_commands_enabled
                 )
+                control_guard = (
+                    f" AND NOT ({_completion_control_active_sql('context')})"
+                    if completion_commands_enabled
+                    else ""
+                )
                 await conn.execute(
                     f"""
                     UPDATE jobs
@@ -6653,6 +6915,7 @@ class PostgresDB:
                       -- (docs/features/stateless_agents.md §5.4.4).
                       AND jobs.execution_lane = 'pinned'
                       {completion_exclusion}
+                      {control_guard}
                     """,
                     agent_id,
                 )
@@ -7046,6 +7309,11 @@ class PostgresDB:
         completion_exclusion = _completion_sweep_exclusion_clause(
             completion_commands_enabled
         )
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('context')})"
+            if completion_commands_enabled
+            else ""
+        )
         async with self.acquire() as conn:
             result = await conn.execute(
                 f"""
@@ -7069,6 +7337,7 @@ class PostgresDB:
                       )
                   )
                   {completion_exclusion}
+                  {control_guard}
                 """
             )
 
@@ -7087,6 +7356,7 @@ class PostgresDB:
                       SELECT id FROM agents WHERE status = 'offline'
                   )
                   {completion_exclusion}
+                  {control_guard}
                 """
             )
 
@@ -7107,6 +7377,7 @@ class PostgresDB:
                       SELECT id FROM agents WHERE status = 'offline'
                   )
                   {completion_exclusion}
+                  {control_guard}
                 """
             )
 
@@ -7132,6 +7403,7 @@ class PostgresDB:
                   AND assigned_agent_id IS NULL
                   AND freeze_data->>'freeze_type' = ANY($1::text[])
                   {completion_exclusion}
+                  {control_guard}
                 """,
                 sorted(AUTO_REDISPATCH_FREEZE_TYPES),
             )
@@ -7172,6 +7444,11 @@ class PostgresDB:
         completion_exclusion = _completion_sweep_exclusion_clause(
             completion_commands_enabled
         )
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('context')})"
+            if completion_commands_enabled
+            else ""
+        )
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"""
@@ -7187,6 +7464,7 @@ class PostgresDB:
                    AND lease_expires_at IS NOT NULL
                    AND lease_expires_at < NOW()
                    {completion_exclusion}
+                   {control_guard}
                 RETURNING id
                 """
             )
@@ -7705,7 +7983,10 @@ class PostgresDB:
         return dict(row) if row else None
 
     async def unstick_reviewing_parents(
-        self, grace_minutes: int = 30
+        self,
+        grace_minutes: int = 30,
+        *,
+        completion_commands_enabled: bool = False,
     ) -> List[Dict[str, Any]]:
         """Un-stick parents wedged in 'reviewing' whose critic pipeline is dead.
 
@@ -7747,9 +8028,16 @@ class PostgresDB:
         Returns:
             One dict ``{id, user_id, config_name}`` per parent un-stuck.
         """
+        query = self._UNSTICK_REVIEWING_SQL
+        if completion_commands_enabled:
+            query = query.replace(
+                "        RETURNING p.id, p.user_id, p.config_name",
+                f"           AND NOT ({_completion_control_active_sql('p.context')})\n"
+                "        RETURNING p.id, p.user_id, p.config_name",
+            )
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                self._UNSTICK_REVIEWING_SQL,
+                query,
                 grace_minutes,
             )
         return [dict(r) for r in rows]
@@ -7795,7 +8083,10 @@ class PostgresDB:
     """
 
     async def unstick_reviewing_parents_wallclock(
-        self, ceiling_minutes: int
+        self,
+        ceiling_minutes: int,
+        *,
+        completion_commands_enabled: bool = False,
     ) -> List[Dict[str, Any]]:
         """Escalate parents stuck in 'reviewing' under a LIVE critic.
 
@@ -7817,9 +8108,16 @@ class PostgresDB:
         Returns:
             One dict ``{id, user_id, config_name}`` per escalated parent.
         """
+        query = self._UNSTICK_REVIEWING_WALLCLOCK_SQL
+        if completion_commands_enabled:
+            query = query.replace(
+                "        RETURNING p.id, p.user_id, p.config_name",
+                f"           AND NOT ({_completion_control_active_sql('p.context')})\n"
+                "        RETURNING p.id, p.user_id, p.config_name",
+            )
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                self._UNSTICK_REVIEWING_WALLCLOCK_SQL,
+                query,
                 ceiling_minutes,
             )
         return [dict(r) for r in rows]
@@ -7836,7 +8134,14 @@ class PostgresDB:
     # DISPATCHER QUERIES (Auto-Assignment)
     # =========================================================================
 
-    async def claim_job_for_agent(self, job_id: str, agent_id: str) -> bool:
+    async def claim_job_for_agent(
+        self,
+        job_id: str,
+        agent_id: str,
+        *,
+        completion_commands_enabled: bool = False,
+        allow_failed: bool = False,
+    ) -> bool:
         """Atomically claim a dispatchable job for an agent (M1 — HA dispatch).
 
         Returns True iff THIS call won the claim. The CAS predicate
@@ -7859,30 +8164,65 @@ class PostgresDB:
             agent_uuid = UUID(agent_id)
         except ValueError:
             return False
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('context')})"
+            if completion_commands_enabled
+            else ""
+        )
+        status_guard = (
+            "AND status IN ('created', 'paused', 'failed')"
+            if allow_failed
+            else "AND status IN ('created', 'paused')"
+        )
         async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                UPDATE jobs
-                   SET status = 'processing',
-                       assigned_agent_id = $2,
-                       lease_expires_at = NOW() + make_interval(
-                           secs => $3::int
-                       ),
-                       error_message = NULL,
-                       error_details = NULL,
-                       updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $1
-                   -- One claim authority per job (§5.4.4). Fail closed for
-                   -- unknown lanes instead of handing them to legacy pods.
-                   AND execution_lane = 'pinned'
-                   AND assigned_agent_id IS NULL
-                   AND status IN ('created', 'paused')
-                RETURNING id
-                """,
-                job_uuid,
-                agent_uuid,
-                JOB_LEASE_PICKUP_SECONDS,
-            )
+            query = f"""
+                    UPDATE jobs
+                       SET status = 'processing',
+                           assigned_agent_id = $2,
+                           lease_expires_at = NOW() + make_interval(
+                               secs => $3::int
+                           ),
+                           error_message = NULL,
+                           error_details = NULL,
+                           updated_at = CURRENT_TIMESTAMP
+                     WHERE id = $1
+                       -- One claim authority per job (§5.4.4). Fail closed for
+                       -- unknown lanes instead of handing them to legacy pods.
+                       AND execution_lane = 'pinned'
+                       AND assigned_agent_id IS NULL
+                       {status_guard}
+                       {control_guard}
+                    RETURNING id
+                    """
+            if not completion_commands_enabled:
+                row = await conn.fetchrow(
+                    query,
+                    job_uuid,
+                    agent_uuid,
+                    JOB_LEASE_PICKUP_SECONDS,
+                )
+            else:
+                async with conn.transaction():
+                    locked = await conn.fetchval(
+                        "SELECT id FROM jobs WHERE id=$1::uuid FOR UPDATE",
+                        job_uuid,
+                    )
+                    if locked is None:
+                        return False
+                    blocked = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 "
+                        "FROM job_completion_sweep_exclusions "
+                        "WHERE job_id=$1::uuid)",
+                        job_uuid,
+                    )
+                    if blocked:
+                        return False
+                    row = await conn.fetchrow(
+                        query,
+                        job_uuid,
+                        agent_uuid,
+                        JOB_LEASE_PICKUP_SECONDS,
+                    )
             return row is not None
 
     async def claim_delegation_resume(self, job_id: str) -> bool:
@@ -8578,6 +8918,10 @@ class PostgresDB:
         void_completion_decision: bool,
         stateless_only: bool = False,
         expected_status: str | None = None,
+        completion_commands_enabled: bool = False,
+        completion_owner_command_id: str | None = None,
+        completion_owner: str | None = None,
+        completion_control_claim_id: str | None = None,
     ):
         """The Class-A resume write, reusable inside a caller transaction."""
         # Fixed literals chosen by trusted booleans — never caller SQL.
@@ -8594,10 +8938,49 @@ class PostgresDB:
         args: tuple[Any, ...] = (job_uuid, json.dumps(context_merge or {}))
         if expected_status is not None:
             args += (expected_status,)
+        control_drop = ""
+        control_guard = ""
+        if completion_control_claim_id is not None:
+            args += (str(UUID(completion_control_claim_id)),)
+            claim_arg = len(args)
+            control_drop = " - '_completion_control_claim'"
+            control_guard = (
+                " AND ("
+                + _completion_control_owned_active_sql("context", f"${claim_arg}")
+                + ")"
+            )
+        elif completion_commands_enabled:
+            control_guard = f" AND NOT ({_completion_control_active_sql('context')})"
+        if completion_commands_enabled:
+            owner_arg = ""
+            if (completion_owner_command_id is None) != (completion_owner is None):
+                raise ValueError(
+                    "completion owner command id and owner must be supplied together"
+                )
+            if completion_owner_command_id is not None:
+                args += (UUID(completion_owner_command_id), completion_owner)
+                command_arg = len(args) - 1
+                owner_value_arg = len(args)
+                owner_arg = (
+                    " AND NOT ("
+                    f"completion_route.command_id = ${command_arg}::uuid "
+                    "AND EXISTS (SELECT 1 FROM job_completion_commands AS owning "
+                    "WHERE owning.id = completion_route.command_id "
+                    "AND owning.state = 'finalizing' "
+                    f"AND owning.finalizing_by = ${owner_value_arg}::text "
+                    "AND owning.lease_expires_at > now()))"
+                )
+            completion_guard = (
+                " AND NOT EXISTS ("
+                "SELECT 1 FROM job_completion_sweep_exclusions AS completion_route "
+                f"WHERE completion_route.job_id = jobs.id{owner_arg})"
+            )
+        else:
+            completion_guard = ""
         return await conn.fetchrow(
             f"""
             UPDATE jobs
-               SET context = (COALESCE(context, '{{}}'::jsonb){drop_decision})
+               SET context = (COALESCE(context, '{{}}'::jsonb){drop_decision}{control_drop})
                              || $2::jsonb
                              || CASE
                                     WHEN freeze_data IS NULL THEN '{{}}'::jsonb
@@ -8609,10 +8992,62 @@ class PostgresDB:
                    assigned_agent_id = NULL,
                    freeze_data = NULL,
                    updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}
+             WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{completion_guard}{control_guard}
             RETURNING id, priority, user_id
             """,
             *args,
+        )
+
+    async def _completion_resume_blocked_on_conn(
+        self,
+        conn,
+        job_uuid: UUID,
+        *,
+        completion_owner_command_id: str | None = None,
+        completion_owner: str | None = None,
+    ) -> bool:
+        """Classify after acquiring the jobs-row serialization lock."""
+
+        if (completion_owner_command_id is None) != (completion_owner is None):
+            raise ValueError(
+                "completion owner command id and owner must be supplied together"
+            )
+        await conn.fetchval(
+            "SELECT id FROM jobs WHERE id=$1::uuid FOR UPDATE", job_uuid
+        )
+        if completion_owner_command_id is None:
+            return bool(
+                await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM "
+                    "job_completion_sweep_exclusions AS completion_route "
+                    "WHERE completion_route.job_id=$1::uuid)",
+                    job_uuid,
+                )
+            )
+        return bool(
+            await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM job_completion_sweep_exclusions AS completion_route
+                    WHERE completion_route.job_id=$1::uuid
+                      AND NOT (
+                          completion_route.command_id=$2::uuid
+                          AND EXISTS (
+                              SELECT 1
+                              FROM job_completion_commands AS owning
+                              WHERE owning.id=completion_route.command_id
+                                AND owning.state='finalizing'
+                                AND owning.finalizing_by=$3::text
+                                AND owning.lease_expires_at > now()
+                          )
+                      )
+                )
+                """,
+                job_uuid,
+                UUID(completion_owner_command_id),
+                completion_owner,
+            )
         )
 
     async def queue_job_for_resume(
@@ -8622,6 +9057,10 @@ class PostgresDB:
         *,
         void_completion_decision: bool = True,
         expected_status: str | None = None,
+        completion_commands_enabled: bool = False,
+        completion_owner_command_id: str | None = None,
+        completion_owner: str | None = None,
+        completion_control_claim_id: str | None = None,
     ) -> bool:
         """Park a job as 'paused' (dispatchable) in ONE statement.
 
@@ -8660,13 +9099,35 @@ class PostgresDB:
         except ValueError:
             return False
         async with self.acquire() as conn:
-            row = await self._queue_job_for_resume_on_conn(
-                conn,
-                job_uuid,
-                context_merge,
-                void_completion_decision=void_completion_decision,
-                expected_status=expected_status,
-            )
+            if completion_commands_enabled:
+                async with conn.transaction():
+                    if await self._completion_resume_blocked_on_conn(
+                        conn,
+                        job_uuid,
+                        completion_owner_command_id=completion_owner_command_id,
+                        completion_owner=completion_owner,
+                    ):
+                        return False
+                    row = await self._queue_job_for_resume_on_conn(
+                        conn,
+                        job_uuid,
+                        context_merge,
+                        void_completion_decision=void_completion_decision,
+                        expected_status=expected_status,
+                        completion_commands_enabled=True,
+                        completion_owner_command_id=completion_owner_command_id,
+                        completion_owner=completion_owner,
+                        completion_control_claim_id=completion_control_claim_id,
+                    )
+            else:
+                row = await self._queue_job_for_resume_on_conn(
+                    conn,
+                    job_uuid,
+                    context_merge,
+                    void_completion_decision=void_completion_decision,
+                    expected_status=expected_status,
+                    completion_control_claim_id=completion_control_claim_id,
+                )
             return row is not None
 
     async def queue_stateless_job_for_resume(
@@ -8678,15 +9139,16 @@ class PostgresDB:
         priority: int = 0,
         fair_key: str | None = None,
         expected_status: str | None = None,
+        completion_commands_enabled: bool = False,
+        completion_owner_command_id: str | None = None,
+        completion_owner: str | None = None,
+        completion_control_claim_id: str | None = None,
     ) -> bool:
         """Atomically shed a stateless freeze and revive its worker unit.
 
         Queue-first lock ordering matches worker claim/renewal. If the jobs-row
         CAS loses (deleted or lane changed), the enqueue is rolled back with it.
         """
-        # TODO(Gate 3 step 2+): once completion commands exist, this human
-        # resume seam must refuse/reconcile a still-pending terminal command
-        # before it makes the worker unit runnable again.
         try:
             job_uuid = UUID(job_id)
         except ValueError:
@@ -8721,6 +9183,16 @@ class PostgresDB:
                         fair_key=fair_key,
                         priority=int(priority),
                     )
+                    if (
+                        completion_commands_enabled
+                        and await self._completion_resume_blocked_on_conn(
+                            conn,
+                            job_uuid,
+                            completion_owner_command_id=completion_owner_command_id,
+                            completion_owner=completion_owner,
+                        )
+                    ):
+                        raise _ResumeCASLostError
                     if await reset_worker_batch_attempts(conn, job_id=job_uuid) is None:
                         raise _ResumeCASLostError
                     if admitted.state == "parked":
@@ -8736,6 +9208,10 @@ class PostgresDB:
                         void_completion_decision=void_completion_decision,
                         stateless_only=True,
                         expected_status=expected_status,
+                        completion_commands_enabled=completion_commands_enabled,
+                        completion_owner_command_id=completion_owner_command_id,
+                        completion_owner=completion_owner,
+                        completion_control_claim_id=completion_control_claim_id,
                     )
                     if row is None:
                         raise _ResumeCASLostError
@@ -8750,6 +9226,7 @@ class PostgresDB:
         context_merge: Dict[str, Any] | None = None,
         *,
         expected_status: str,
+        completion_commands_enabled: bool = False,
     ) -> bool:
         """Prepare an explicit worker resume that needs K8s reprovisioning.
 
@@ -8777,6 +9254,13 @@ class PostgresDB:
             async with self.acquire() as conn:
                 async with conn.transaction():
                     await hold_worker_batch_for_preflight(conn, job_id=job_uuid)
+                    if (
+                        completion_commands_enabled
+                        and await self._completion_resume_blocked_on_conn(
+                            conn, job_uuid
+                        )
+                    ):
+                        raise _ResumeCASLostError
                     shed = await conn.fetchrow(
                         """
                         UPDATE jobs
@@ -8808,6 +9292,87 @@ class PostgresDB:
                         void_completion_decision=True,
                         stateless_only=True,
                         expected_status=expected_status,
+                        completion_commands_enabled=completion_commands_enabled,
+                    )
+                    if queued is None:
+                        raise _ResumeCASLostError
+            return True
+        except _ResumeCASLostError:
+            return False
+
+    async def prepare_pinned_job_for_workspace_resume(
+        self,
+        job_id: str,
+        workspace_context_key: str,
+        context_merge: Dict[str, Any] | None = None,
+        *,
+        expected_status: str,
+        completion_control_claim_id: str,
+    ) -> bool:
+        """Atomically shed stale workspace state and consume a control claim.
+
+        This is the pinned counterpart to the stateless preflight helper. It is
+        command-path only: the historical flag-off caller keeps its separate
+        shed + queue calls byte-for-byte.
+        """
+
+        if workspace_context_key not in {"vm", "workspace_container"}:
+            raise ValueError("unsupported workspace context key")
+        try:
+            job_uuid = UUID(job_id)
+            claim_id = str(UUID(completion_control_claim_id))
+        except ValueError:
+            return False
+
+        class _ResumeCASLostError(Exception):
+            pass
+
+        try:
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    # Preserve queue-before-jobs order even for an accidental
+                    # legacy worker row attached to a now-pinned job.
+                    await conn.fetchrow(
+                        "SELECT unit_id FROM run_queue "
+                        "WHERE unit_id=$1::uuid FOR UPDATE",
+                        job_uuid,
+                    )
+                    if await self._completion_resume_blocked_on_conn(conn, job_uuid):
+                        raise _ResumeCASLostError
+                    shed = await conn.fetchrow(
+                        f"""
+                        UPDATE jobs
+                        SET context = CASE
+                            WHEN COALESCE(context, '{{}}'::jsonb) ? $2::text
+                            THEN (COALESCE(context, '{{}}'::jsonb) - $2::text)
+                                 || jsonb_build_object(
+                                        'last_' || $2::text,
+                                        context -> $2::text
+                                    )
+                            ELSE COALESCE(context, '{{}}'::jsonb)
+                            END,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE id=$1::uuid
+                          AND execution_lane='pinned'
+                          AND status::text=$3::text
+                          AND ({_completion_control_owned_active_sql("context", "$4")})
+                        RETURNING id
+                        """,
+                        job_uuid,
+                        workspace_context_key,
+                        expected_status,
+                        claim_id,
+                    )
+                    if shed is None:
+                        raise _ResumeCASLostError
+                    queued = await self._queue_job_for_resume_on_conn(
+                        conn,
+                        job_uuid,
+                        context_merge,
+                        void_completion_decision=True,
+                        expected_status=expected_status,
+                        completion_commands_enabled=True,
+                        completion_control_claim_id=claim_id,
                     )
                     if queued is None:
                         raise _ResumeCASLostError
@@ -8832,6 +9397,11 @@ class PostgresDB:
         completion_exclusion = _completion_sweep_exclusion_clause(
             completion_commands_enabled
         )
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('context')})"
+            if completion_commands_enabled
+            else ""
+        )
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"""
@@ -8844,6 +9414,7 @@ class PostgresDB:
                   AND freeze_data ? 'next_retry_at'
                   AND (freeze_data->>'next_retry_at')::timestamptz <= now()
                   {completion_exclusion}
+                  {control_guard}
                 ORDER BY (freeze_data->>'next_retry_at')::timestamptz ASC
                 LIMIT $2
                 """,
@@ -8874,6 +9445,11 @@ class PostgresDB:
         completion_exclusion = _completion_sweep_exclusion_clause(
             completion_commands_enabled
         )
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('context')})"
+            if completion_commands_enabled
+            else ""
+        )
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 f"""
@@ -8887,6 +9463,7 @@ class PostgresDB:
                    AND freeze_data ? 'next_retry_at'
                    AND (freeze_data->>'next_retry_at')::timestamptz <= now()
                    {completion_exclusion}
+                   {control_guard}
                 RETURNING id
                 """,
                 uuid_val,
@@ -8909,6 +9486,11 @@ class PostgresDB:
         completion_exclusion = _completion_sweep_exclusion_clause(
             completion_commands_enabled
         )
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('context')})"
+            if completion_commands_enabled
+            else ""
+        )
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"""
@@ -8921,6 +9503,7 @@ class PostgresDB:
                   AND freeze_data ? 'next_retry_at'
                   AND (freeze_data->>'next_retry_at')::timestamptz <= now()
                   {completion_exclusion}
+                  {control_guard}
                 ORDER BY (freeze_data->>'next_retry_at')::timestamptz ASC
                 LIMIT $1
                 """,
@@ -8948,6 +9531,11 @@ class PostgresDB:
         completion_exclusion = _completion_sweep_exclusion_clause(
             completion_commands_enabled
         )
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('context')})"
+            if completion_commands_enabled
+            else ""
+        )
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 f"""
@@ -8960,6 +9548,7 @@ class PostgresDB:
                    AND freeze_data->>'freeze_type' = 'llm_unavailable'
                    AND (freeze_data->>'next_retry_at')::timestamptz <= now()
                    {completion_exclusion}
+                   {control_guard}
                 RETURNING id
                 """,
                 uuid_val,
@@ -8989,6 +9578,11 @@ class PostgresDB:
         completion_exclusion = _completion_sweep_exclusion_clause(
             completion_commands_enabled
         )
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('context')})"
+            if completion_commands_enabled
+            else ""
+        )
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 f"""
@@ -8999,8 +9593,9 @@ class PostgresDB:
                        updated_at = CURRENT_TIMESTAMP
                  WHERE id = $1
                    AND status = 'paused'
-                   AND freeze_data->>'freeze_type' = 'llm_unavailable'
-                   {completion_exclusion}
+                  AND freeze_data->>'freeze_type' = 'llm_unavailable'
+                  {completion_exclusion}
+                  {control_guard}
                 RETURNING id
                 """,
                 uuid_val,
@@ -9008,7 +9603,12 @@ class PostgresDB:
             )
             return row is not None
 
-    async def get_dispatchable_jobs(self, limit: int = 20) -> List[Dict[str, Any]]:
+    async def get_dispatchable_jobs(
+        self,
+        limit: int = 20,
+        *,
+        completion_commands_enabled: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Get jobs waiting for assignment, ordered by priority then creation time.
 
         Returns jobs in 'created' (new) or 'paused' (preempted) status
@@ -9026,9 +9626,17 @@ class PostgresDB:
         statuses LITERAL — rewriting to ``status = ANY($1)`` makes the predicate
         non-immutable at plan time and permanently disables that index.
         """
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('j.context')})"
+            if completion_commands_enabled
+            else ""
+        )
+        completion_exclusion = _completion_sweep_exclusion_clause(
+            completion_commands_enabled, job_alias="j"
+        )
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT j.id, j.description, j.status, j.config_name,
                        j.config_override, j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority, j.runner_kind,
@@ -9043,6 +9651,8 @@ class PostgresDB:
                   AND j.execution_lane = 'pinned'
                   AND j.assigned_agent_id IS NULL
                   AND j.freeze_data IS NULL
+                  {completion_exclusion}
+                  {control_guard}
                   -- Mode A: skip jobs whose cloud-folder baseline is still
                   -- being seeded. The seed task flips this to 'ready' (or
                   -- 'failed', in which case we still dispatch so the job
@@ -9087,7 +9697,10 @@ class PostgresDB:
         return [dict(row) for row in rows]
 
     async def get_admittable_stateless_jobs(
-        self, limit: int = 50
+        self,
+        limit: int = 50,
+        *,
+        completion_commands_enabled: bool = False,
     ) -> List[Dict[str, Any]]:
         """Return stateless jobs whose workspace may be preflighted/enqueued.
 
@@ -9097,9 +9710,17 @@ class PostgresDB:
         dispatcher runs the same workspace state machine for these rows, then
         admits them to ``run_queue`` instead of selecting an agent.
         """
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('j.context')})"
+            if completion_commands_enabled
+            else ""
+        )
+        completion_exclusion = _completion_sweep_exclusion_clause(
+            completion_commands_enabled, job_alias="j"
+        )
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT j.id, j.description, j.status, j.config_name,
                        j.config_override, j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority, j.runner_kind,
@@ -9111,6 +9732,8 @@ class PostgresDB:
                   AND j.execution_lane = 'stateless'
                   AND j.assigned_agent_id IS NULL
                   AND j.freeze_data IS NULL
+                  {completion_exclusion}
+                  {control_guard}
                   AND COALESCE(
                       j.context->'cloud_baseline'->>'state', 'ready'
                   ) <> 'seeding'
@@ -9151,6 +9774,7 @@ class PostgresDB:
         *,
         fair_key: str | None,
         priority: int,
+        completion_commands_enabled: bool = False,
     ) -> tuple[bool, str | None]:
         """Atomically expose a verified k8s-ready stateless job to workers.
 
@@ -9179,8 +9803,16 @@ class PostgresDB:
                         fair_key=fair_key,
                         priority=int(priority),
                     )
+                    control_guard = (
+                        f" AND NOT ({_completion_control_active_sql('context')})"
+                        if completion_commands_enabled
+                        else ""
+                    )
+                    completion_exclusion = _completion_sweep_exclusion_clause(
+                        completion_commands_enabled
+                    )
                     row = await conn.fetchrow(
-                        """
+                        f"""
                         SELECT id
                           FROM jobs
                          WHERE id = $1
@@ -9188,6 +9820,8 @@ class PostgresDB:
                            AND status IN ('created', 'paused')
                            AND assigned_agent_id IS NULL
                            AND freeze_data IS NULL
+                           {completion_exclusion}
+                           {control_guard}
                            AND CASE
                                WHEN COALESCE(
                                    context->>'inherits_parent_workspace',
@@ -14562,6 +15196,95 @@ class PostgresDB:
                 user_id,
             )
             return result == "UPDATE 1"
+
+    async def publish_blocking_message(
+        self,
+        job_id: str,
+        freeze_data: Dict[str, Any],
+        *,
+        expected_lane: str,
+        lease_token: int | None = None,
+        agent_id: str | None = None,
+    ) -> bool:
+        """Fence a blocking outbound message before notification side effects.
+
+        Stateless callers take the canonical queue→jobs lock order and prove
+        their exact lease. Pinned callers prove the exact assigned agent under
+        the jobs-row lock. In both lanes the completion-command barrier and
+        control marker are re-read only after that lock is held.
+        """
+
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return False
+        if expected_lane not in {"pinned", "stateless"}:
+            return False
+
+        agent_uuid: UUID | None = None
+        if expected_lane == "pinned":
+            if agent_id is None:
+                return False
+            try:
+                agent_uuid = UUID(agent_id)
+            except ValueError:
+                return False
+        elif lease_token is None:
+            return False
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                queue = None
+                if expected_lane == "stateless":
+                    queue = await conn.fetchrow(
+                        "SELECT state, lease_token FROM run_queue "
+                        "WHERE unit_id=$1::uuid "
+                        "AND unit_kind='worker_batch' FOR UPDATE",
+                        job_uuid,
+                    )
+                job = await conn.fetchrow(
+                    f"SELECT status::text AS status, execution_lane, "
+                    "assigned_agent_id, "
+                    f"({_completion_control_active_sql('context')}) "
+                    "AS control_active FROM jobs WHERE id=$1::uuid FOR UPDATE",
+                    job_uuid,
+                )
+                if job is None:
+                    return False
+                command_blocked = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 "
+                    "FROM job_completion_sweep_exclusions "
+                    "WHERE job_id=$1::uuid)",
+                    job_uuid,
+                )
+                if (
+                    command_blocked
+                    or bool(job["control_active"])
+                    or job["status"] != "processing"
+                    or job["execution_lane"] != expected_lane
+                ):
+                    return False
+                if expected_lane == "stateless":
+                    if (
+                        queue is None
+                        or queue["state"] != "leased"
+                        or int(queue["lease_token"]) != int(lease_token)
+                    ):
+                        return False
+                elif str(job["assigned_agent_id"] or "") != str(agent_uuid):
+                    return False
+
+                updated = await conn.fetchrow(
+                    "UPDATE jobs SET status='waiting_for_reply', "
+                    "freeze_data=$2::jsonb, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE id=$1::uuid AND status='processing' "
+                    "AND execution_lane=$3::text "
+                    "RETURNING id",
+                    job_uuid,
+                    json.dumps(freeze_data),
+                    expected_lane,
+                )
+                return updated is not None
 
     async def update_mcp_token_last_used(self, token_hash: str) -> None:
         """Update the last_used_at timestamp for an MCP token.

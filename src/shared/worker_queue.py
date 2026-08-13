@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -44,6 +45,23 @@ _RUNNABLE_JOB_STATUSES = frozenset({"created", "paused", "processing"})
 # and ``completed`` can become visible while the terminal HTTP handler is
 # still returning and must not masquerade as an out-of-band control.
 _PREEMPTED_JOB_STATUSES = frozenset({"failed", "cancelled", "paused"})
+
+_CONTROL_CLAIM_ACTIVE_SQL = """
+CASE
+    WHEN NOT (COALESCE(job.context, '{}'::jsonb)
+              ? '_completion_control_claim') THEN false
+    WHEN jsonb_typeof(job.context->'_completion_control_claim')
+         IS DISTINCT FROM 'object' THEN true
+    WHEN job.context->'_completion_control_claim'->>'version'
+         IS DISTINCT FROM '1' THEN true
+    WHEN jsonb_typeof(
+        job.context->'_completion_control_claim'->'expires_epoch'
+    ) IS DISTINCT FROM 'number' THEN true
+    ELSE (
+        job.context->'_completion_control_claim'->'expires_epoch'#>>'{}'
+    )::numeric > extract(epoch FROM now())
+END
+"""
 
 _LOCK_JOB_SQL = """
 SELECT job.status::text AS status,
@@ -73,6 +91,48 @@ WHERE id = $1::uuid
   AND assigned_agent_id IS NULL
   AND ($2::text <> 'paused' OR freeze_data IS NULL)
 RETURNING id
+"""
+
+# Worker-specific composition is allowed to join jobs/completion state; the
+# generic run_queue substrate intentionally is not.  Selecting the eligible
+# row before leasing means a blocked FIFO head is skipped without consuming a
+# token or starving the next runnable worker.
+_CLAIM_COMMAND_AWARE_WORKER_SQL = f"""
+WITH candidate AS (
+    SELECT queue.unit_id
+    FROM run_queue AS queue
+    JOIN jobs AS job ON job.id = queue.unit_id
+    WHERE queue.state = 'queued'
+      AND queue.unit_kind = 'worker_batch'
+      AND queue.run_after <= now()
+      AND (queue.last_leased_by IS NULL
+           OR queue.last_leased_by = $1::text
+           OR queue.queued_at <= now() - make_interval(secs => $3::float8))
+      AND NOT EXISTS (
+          SELECT 1
+          FROM job_completion_sweep_exclusions AS completion_route
+          WHERE completion_route.job_id = job.id
+      )
+      AND NOT ({_CONTROL_CLAIM_ACTIVE_SQL})
+    ORDER BY queue.priority DESC, queue.queued_at, queue.enqueue_ord
+    LIMIT 1
+    FOR UPDATE OF queue SKIP LOCKED
+)
+UPDATE run_queue AS queue
+SET state = 'leased',
+    lease_token = queue.lease_token + 1,
+    leased_by = $1::text,
+    last_leased_by = $1::text,
+    leased_until = now() + make_interval(secs => $2::float8),
+    interrupt_admission_lease_token = NULL,
+    interrupt_admission_turn_id = NULL,
+    attempts_since_completion = queue.attempts_since_completion + 1
+FROM candidate
+WHERE queue.unit_id = candidate.unit_id
+RETURNING queue.unit_id, queue.unit_kind, queue.fair_key, queue.lease_token,
+          queue.input_seq, queue.consumed_seq, queue.control_input_seq,
+          queue.control_consumed_seq, queue.attempts_since_completion,
+          queue.leased_until
 """
 
 _PARK_REJECTED_VM_JOB_SQL = """
@@ -309,6 +369,29 @@ def _json_object(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _completion_control_claim_active(context: Any) -> bool:
+    parsed = _json_object(context)
+    if "_completion_control_claim" not in parsed:
+        return False
+    marker = parsed["_completion_control_claim"]
+    if not isinstance(marker, dict):
+        return True
+    if marker.get("version") != 1:
+        return True
+    raw_expiry = marker.get("expires_epoch")
+    if not isinstance(raw_expiry, (int, float)) or isinstance(raw_expiry, bool):
+        return True
+    try:
+        expiry = float(raw_expiry)
+    except (OverflowError, TypeError, ValueError):
+        return True
+    if not math.isfinite(expiry):
+        return True
+    import time
+
+    return expiry > time.time()
+
+
 def _dict_entries(value: Any) -> tuple[dict[str, Any], ...]:
     if not isinstance(value, list):
         return ()
@@ -479,6 +562,7 @@ async def claim_worker_batch(
     pod_name: str,
     lease_ttl_seconds: float = LEASE_TTL_SECONDS,
     affinity_grace_seconds: float = AFFINITY_GRACE_SECONDS,
+    completion_commands_enabled: bool = False,
 ) -> WorkerClaim | None:
     """Claim a worker queue row and CAS its job to ``processing`` atomically.
 
@@ -491,17 +575,59 @@ async def claim_worker_batch(
 
     async with _connection(db) as conn:
         async with conn.transaction():
-            unit = await claim_unit(
-                conn,
-                unit_kind=UNIT_KIND_WORKER_BATCH,
-                pod_name=pod_name,
-                lease_ttl_seconds=lease_ttl_seconds,
-                affinity_grace_seconds=affinity_grace_seconds,
-            )
+            if completion_commands_enabled:
+                claimed_row = await conn.fetchrow(
+                    _CLAIM_COMMAND_AWARE_WORKER_SQL,
+                    pod_name,
+                    lease_ttl_seconds,
+                    affinity_grace_seconds,
+                )
+                unit = (
+                    ClaimedUnit(**dict(claimed_row))
+                    if claimed_row is not None
+                    else None
+                )
+            else:
+                # Preserve the pre-Gate-3 call path exactly when dark.  In
+                # particular, it must not parse or name command relations.
+                unit = await claim_unit(
+                    conn,
+                    unit_kind=UNIT_KIND_WORKER_BATCH,
+                    pod_name=pod_name,
+                    lease_ttl_seconds=lease_ttl_seconds,
+                    affinity_grace_seconds=affinity_grace_seconds,
+                )
             if unit is None:
                 return None
 
             job = await conn.fetchrow(_LOCK_JOB_SQL, unit.unit_id)
+            if completion_commands_enabled:
+                completion_blocked = await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM job_completion_sweep_exclusions AS completion_route
+                        WHERE completion_route.job_id=$1::uuid
+                    )
+                    """,
+                    unit.unit_id,
+                )
+                if completion_blocked:
+                    # Accept and claim share queue->jobs lock order, so this
+                    # should be unreachable after the candidate predicate.
+                    # Roll back the lease rather than ever running through a
+                    # command that appeared at the boundary.
+                    raise RuntimeError(
+                        "completion command appeared during worker claim "
+                        f"(job={unit.unit_id})"
+                    )
+                if job is not None and _completion_control_claim_active(
+                    job.get("context")
+                ):
+                    raise RuntimeError(
+                        "completion control appeared during worker claim "
+                        f"(job={unit.unit_id})"
+                    )
             prior_status = str(job["status"]) if job is not None else None
             job_context = _json_object(job.get("context")) if job is not None else {}
             resume_id_value = job_context.get("worker_resume_id")

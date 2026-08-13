@@ -34,6 +34,25 @@ def _unit(*, input_seq=None, token=4) -> ClaimedUnit:
     )
 
 
+def test_control_marker_nan_expiry_fails_closed():
+    assert worker_queue._completion_control_claim_active(
+        {
+            "_completion_control_claim": {
+                "version": 1,
+                "expires_epoch": float("nan"),
+            }
+        }
+    )
+    assert worker_queue._completion_control_claim_active(
+        {
+            "_completion_control_claim": {
+                "version": 1,
+                "expires_epoch": 10**10000,
+            }
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_claim_cas_accepts_processing_reclaim(monkeypatch):
     conn = _Connection()
@@ -62,6 +81,56 @@ async def test_claim_cas_accepts_processing_reclaim(monkeypatch):
     cas_sql = conn.fetchrow.await_args_list[1].args[0]
     assert "status = 'processing'" in cas_sql
     assert "assigned_agent_id IS NULL" in cas_sql
+
+
+@pytest.mark.asyncio
+async def test_command_aware_claim_skips_ineligible_head_in_composed_query(monkeypatch):
+    conn = _Connection()
+    unit = _unit()
+    conn.fetchrow.side_effect = [
+        unit.__dict__
+        if hasattr(unit, "__dict__")
+        else {
+            "unit_id": unit.unit_id,
+            "unit_kind": unit.unit_kind,
+            "fair_key": unit.fair_key,
+            "lease_token": unit.lease_token,
+            "input_seq": unit.input_seq,
+            "consumed_seq": unit.consumed_seq,
+            "control_input_seq": unit.control_input_seq,
+            "control_consumed_seq": unit.control_consumed_seq,
+            "attempts_since_completion": unit.attempts_since_completion,
+            "leased_until": unit.leased_until,
+        },
+        {
+            "status": "processing",
+            "execution_lane": "stateless",
+            "assigned_agent_id": None,
+            "freeze_data": None,
+            "context": {},
+        },
+        {"id": unit.unit_id},
+    ]
+    conn.fetchval.return_value = False
+    legacy_claim = AsyncMock()
+    monkeypatch.setattr(worker_queue, "claim_unit", legacy_claim)
+
+    claim = await worker_queue.claim_worker_batch(
+        conn,
+        pod_name="pod-b",
+        completion_commands_enabled=True,
+    )
+
+    assert claim is not None
+    legacy_claim.assert_not_awaited()
+    candidate_sql = conn.fetchrow.await_args_list[0].args[0]
+    assert "job_completion_sweep_exclusions" in candidate_sql
+    assert "_completion_control_claim" in candidate_sql
+    assert "expires_epoch" in candidate_sql
+    assert "ORDER BY queue.priority DESC, queue.queued_at" in candidate_sql
+    assert "FOR UPDATE OF queue SKIP LOCKED" in candidate_sql
+    recheck_sql = conn.fetchval.await_args.args[0]
+    assert "job_completion_sweep_exclusions" in recheck_sql
 
 
 @pytest.mark.asyncio
