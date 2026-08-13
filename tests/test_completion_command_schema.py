@@ -11,13 +11,17 @@ from asyncpg import CheckViolationError, UniqueViolationError
 from testcontainers.postgres import PostgresContainer
 
 
-MIGRATION = (
+MIGRATION_DIR = (
     Path(__file__).resolve().parents[1]
     / "orchestrator"
     / "database"
     / "migrations"
     / "app"
-    / "0140_job_completion_commands.sql"
+)
+MIGRATIONS = (
+    MIGRATION_DIR / "0140_job_completion_commands.sql",
+    MIGRATION_DIR / "0141_job_completion_sweep_routing.sql",
+    MIGRATION_DIR / "0142_job_completion_sweep_route_precedence.sql",
 )
 
 
@@ -32,12 +36,16 @@ async def conn(pg_dsn):
     connection = await asyncpg.connect(pg_dsn)
     await connection.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
     await connection.execute("DROP VIEW IF EXISTS job_completion_sweep_exclusions")
+    await connection.execute(
+        "DROP TABLE IF EXISTS job_completion_sweep_actions CASCADE"
+    )
     await connection.execute("DROP TABLE IF EXISTS completion_effects CASCADE")
     await connection.execute("DROP TABLE IF EXISTS completion_finalizer_leases CASCADE")
     await connection.execute("DROP TABLE IF EXISTS job_completion_commands CASCADE")
     await connection.execute("DROP TABLE IF EXISTS jobs CASCADE")
     await connection.execute("CREATE TABLE jobs (id UUID PRIMARY KEY)")
-    await connection.execute(MIGRATION.read_text())
+    for migration in MIGRATIONS:
+        await connection.execute(migration.read_text())
     try:
         yield connection
     finally:
@@ -61,6 +69,9 @@ async def _insert_command(conn, job_id, **overrides):
         "origin": "agent",
         "requested_by": "test-agent",
         "state": "pending",
+        "attempts": 0,
+        "max_attempts": 5,
+        "run_after": "2000-01-01T00:00:00Z",
         "lease_expires_at": None,
         "deadline_at": "2100-01-01T00:00:00Z",
         "code_version": "test",
@@ -74,12 +85,13 @@ async def _insert_command(conn, job_id, **overrides):
         INSERT INTO job_completion_commands (
             job_id, report_seq, client_report_id, payload, payload_digest,
             accepted_lease_token, accepted_agent_id, origin, requested_by,
-            state, lease_expires_at, deadline_at, code_version, outcome,
-            finalized_at, error_code
+            state, attempts, max_attempts, run_after, lease_expires_at,
+            deadline_at, code_version, outcome, finalized_at, error_code
         ) VALUES (
             $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9,
-            $10, $11::text::timestamptz, $12::text::timestamptz, $13,
-            $14::jsonb, $15::text::timestamptz, $16
+            $10, $11, $12, $13::text::timestamptz,
+            $14::text::timestamptz, $15::text::timestamptz, $16,
+            $17::jsonb, $18::text::timestamptz, $19
         )
         RETURNING id
         """,
@@ -93,6 +105,9 @@ async def _insert_command(conn, job_id, **overrides):
         values["origin"],
         values["requested_by"],
         values["state"],
+        values["attempts"],
+        values["max_attempts"],
+        values["run_after"],
         values["lease_expires_at"],
         values["deadline_at"],
         values["code_version"],
@@ -101,6 +116,52 @@ async def _insert_command(conn, job_id, **overrides):
         else None,
         values["finalized_at"],
         values["error_code"],
+    )
+
+
+async def _insert_sweep_action(conn, job_id, command_id, **overrides):
+    values = {
+        "attempt": 1,
+        "command_attempt": 0,
+        "route": "resume_finalizer",
+        "source": "test-rescuer",
+        "state": "pending",
+        "claimed_by": None,
+        "claimed_at": None,
+        "claim_expires_at": None,
+        "result": None,
+        "error_code": None,
+        "completed_at": None,
+    }
+    values.update(overrides)
+    return await conn.fetchval(
+        """
+        INSERT INTO job_completion_sweep_actions (
+            job_id, attempt, command_id, command_attempt, route, source,
+            state, claimed_by, claimed_at, claim_expires_at, result,
+            error_code, completed_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8,
+            $9::text::timestamptz, $10::text::timestamptz, $11::jsonb,
+            $12, $13::text::timestamptz
+        )
+        RETURNING attempt
+        """,
+        job_id,
+        values["attempt"],
+        command_id,
+        values["command_attempt"],
+        values["route"],
+        values["source"],
+        values["state"],
+        values["claimed_by"],
+        values["claimed_at"],
+        values["claim_expires_at"],
+        json.dumps(values["result"], sort_keys=True)
+        if values["result"] is not None
+        else None,
+        values["error_code"],
+        values["completed_at"],
     )
 
 
@@ -246,19 +307,53 @@ async def test_drain_index_exists_and_effects_has_only_its_primary_key(conn):
 
 
 @pytest.mark.asyncio
-async def test_sweep_view_excludes_only_live_or_parked_commands(conn):
+async def test_sweep_view_routes_every_unfinished_command_state(conn):
+    no_command_job = await _job(conn)
     live_job = await _job(conn)
+    live_capped_job = await _job(conn)
     expired_job = await _job(conn)
+    pending_job = await _job(conn)
+    deadline_job = await _job(conn)
+    capped_job = await _job(conn)
     parked_job = await _job(conn)
     done_job = await _job(conn)
     await _insert_command(
         conn,
         live_job,
+        state="finalizing",
+        attempts=1,
+        lease_expires_at="2100-01-01T00:00:00Z",
+    )
+    await _insert_command(
+        conn,
+        live_capped_job,
+        state="finalizing",
+        attempts=5,
+        max_attempts=5,
         lease_expires_at="2100-01-01T00:00:00Z",
     )
     await _insert_command(
         conn,
         expired_job,
+        state="finalizing",
+        attempts=1,
+        lease_expires_at="2000-01-01T00:00:00Z",
+    )
+    await _insert_command(conn, pending_job)
+    await _insert_command(
+        conn,
+        deadline_job,
+        state="finalizing",
+        attempts=1,
+        deadline_at="2000-01-01T00:00:00Z",
+        lease_expires_at="2000-01-01T00:00:00Z",
+    )
+    await _insert_command(
+        conn,
+        capped_job,
+        state="finalizing",
+        attempts=5,
+        max_attempts=5,
         lease_expires_at="2000-01-01T00:00:00Z",
     )
     await _insert_command(
@@ -266,7 +361,8 @@ async def test_sweep_view_excludes_only_live_or_parked_commands(conn):
         parked_job,
         state="parked",
         error_code="operator_required",
-        lease_expires_at="2000-01-01T00:00:00Z",
+        deadline_at="2000-01-01T00:00:00Z",
+        lease_expires_at="2100-01-01T00:00:00Z",
     )
     await _insert_command(
         conn,
@@ -276,13 +372,229 @@ async def test_sweep_view_excludes_only_live_or_parked_commands(conn):
         finalized_at="2026-08-12T00:00:00Z",
         lease_expires_at="2100-01-01T00:00:00Z",
     )
-    excluded = {
-        row["job_id"]
+    routes = {
+        row["job_id"]: row["route"]
         for row in await conn.fetch(
-            "SELECT job_id FROM job_completion_sweep_exclusions ORDER BY job_id"
+            "SELECT job_id, route FROM job_completion_sweep_exclusions"
         )
     }
-    assert excluded == {live_job, parked_job}
+    assert routes == {
+        live_job: "stand_down",
+        live_capped_job: "stand_down",
+        expired_job: "resume_finalizer",
+        pending_job: "resume_finalizer",
+        deadline_job: "park_alert",
+        capped_job: "park_alert",
+        parked_job: "alert_only",
+    }
+    assert no_command_job not in routes
+    assert done_job not in routes
+
+
+@pytest.mark.asyncio
+async def test_sweep_view_chooses_oldest_unfinished_report_sequence(conn):
+    ordered_job = await _job(conn)
+    first_id = await _insert_command(
+        conn,
+        ordered_job,
+        report_seq=1,
+        lease_expires_at="2000-01-01T00:00:00Z",
+    )
+    await _insert_command(
+        conn,
+        ordered_job,
+        report_seq=2,
+        state="parked",
+        error_code="later_operator_hold",
+    )
+
+    after_terminal_job = await _job(conn)
+    await _insert_command(
+        conn,
+        after_terminal_job,
+        report_seq=1,
+        state="done",
+        outcome={"status": "completed"},
+        finalized_at="2026-08-12T00:00:00Z",
+    )
+    second_id = await _insert_command(
+        conn,
+        after_terminal_job,
+        report_seq=2,
+        lease_expires_at="2100-01-01T00:00:00Z",
+    )
+
+    first_route = await conn.fetchrow(
+        "SELECT command_id, report_seq, route "
+        "FROM job_completion_sweep_exclusions WHERE job_id=$1",
+        ordered_job,
+    )
+    assert dict(first_route) == {
+        "command_id": first_id,
+        "report_seq": 1,
+        "route": "resume_finalizer",
+    }
+
+    second_route = await conn.fetchrow(
+        "SELECT command_id, report_seq, route "
+        "FROM job_completion_sweep_exclusions WHERE job_id=$1",
+        after_terminal_job,
+    )
+    assert dict(second_route) == {
+        "command_id": second_id,
+        "report_seq": 2,
+        "route": "resume_finalizer",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sweep_attempt_hwm_and_all_valid_action_shapes(conn):
+    job_id = await _job(conn)
+    assert (
+        await conn.fetchval(
+            "SELECT completion_sweep_attempt_hwm FROM jobs WHERE id=$1", job_id
+        )
+        == 0
+    )
+
+    command_ids = [
+        await _insert_command(conn, job_id, report_seq=report_seq)
+        for report_seq in (1, 2, 3)
+    ]
+    attempts = []
+    for _ in command_ids:
+        attempts.append(
+            await conn.fetchval(
+                "UPDATE jobs SET completion_sweep_attempt_hwm = "
+                "completion_sweep_attempt_hwm + 1 WHERE id=$1 "
+                "RETURNING completion_sweep_attempt_hwm",
+                job_id,
+            )
+        )
+    assert attempts == [1, 2, 3]
+
+    await _insert_sweep_action(conn, job_id, command_ids[0], attempt=1)
+    await _insert_sweep_action(
+        conn,
+        job_id,
+        command_ids[1],
+        attempt=2,
+        command_attempt=1,
+        route="park_alert",
+        state="claimed",
+        claimed_by="orchestrator-a",
+        claimed_at="2026-08-13T00:00:00Z",
+        claim_expires_at="2026-08-13T00:02:00Z",
+    )
+    await _insert_sweep_action(
+        conn,
+        job_id,
+        command_ids[2],
+        attempt=3,
+        command_attempt=2,
+        route="alert_only",
+        state="done",
+        claimed_at="2026-08-13T00:00:00Z",
+        completed_at="2026-08-13T00:00:01Z",
+        result={"alerted": True},
+    )
+    assert (
+        await conn.fetchval(
+            "SELECT count(*) FROM job_completion_sweep_actions WHERE job_id=$1",
+            job_id,
+        )
+        == 3
+    )
+
+
+@pytest.mark.asyncio
+async def test_sweep_action_deduplicates_and_route_can_change_while_pending(conn):
+    job_id = await _job(conn)
+    first_command = await _insert_command(conn, job_id, report_seq=1)
+    second_command = await _insert_command(conn, job_id, report_seq=2)
+    await _insert_sweep_action(conn, job_id, first_command)
+
+    with pytest.raises(
+        UniqueViolationError, match="uq_job_completion_sweep_command_attempt"
+    ):
+        await _insert_sweep_action(
+            conn,
+            job_id,
+            first_command,
+            attempt=2,
+            route="park_alert",
+            source="competing-rescuer",
+        )
+    with pytest.raises(UniqueViolationError, match="job_completion_sweep_actions_pkey"):
+        await _insert_sweep_action(conn, job_id, second_command, attempt=1)
+
+    assert (
+        await conn.fetchval(
+            "UPDATE job_completion_sweep_actions SET route='park_alert', "
+            "updated_at=now() WHERE job_id=$1 AND attempt=1 RETURNING route",
+            job_id,
+        )
+        == "park_alert"
+    )
+    assert (
+        await conn.fetchval(
+            "SELECT count(*) FROM job_completion_sweep_actions WHERE job_id=$1",
+            job_id,
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"attempt": 0},
+        {"command_attempt": -1},
+        {"route": "stand_down"},
+        {"source": "   "},
+        {"state": "unknown"},
+        {"claimed_by": "owner"},
+        {"state": "claimed", "claimed_by": "owner"},
+        {
+            "state": "claimed",
+            "claimed_by": "owner",
+            "claimed_at": "2026-08-13T00:02:00Z",
+            "claim_expires_at": "2026-08-13T00:01:00Z",
+        },
+        {
+            "state": "done",
+            "claimed_at": "2026-08-13T00:00:00Z",
+            "completed_at": "2026-08-13T00:00:01Z",
+        },
+        {
+            "state": "done",
+            "claimed_at": "2026-08-13T00:00:00Z",
+            "completed_at": "2026-08-13T00:00:01Z",
+            "result": [],
+        },
+    ],
+)
+async def test_sweep_action_checks_reject_invalid_shapes(conn, overrides):
+    job_id = await _job(conn)
+    command_id = await _insert_command(conn, job_id)
+    with pytest.raises(CheckViolationError):
+        await _insert_sweep_action(conn, job_id, command_id, **overrides)
+
+
+@pytest.mark.asyncio
+async def test_sweep_action_command_delete_cascades(conn):
+    job_id = await _job(conn)
+    command_id = await _insert_command(conn, job_id)
+    await _insert_sweep_action(conn, job_id, command_id)
+    await conn.execute("DELETE FROM job_completion_commands WHERE id=$1", command_id)
+    assert (
+        await conn.fetchval(
+            "SELECT count(*) FROM job_completion_sweep_actions WHERE job_id=$1",
+            job_id,
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio

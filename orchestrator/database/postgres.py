@@ -77,6 +77,29 @@ _DOCKER_INVENTORY_COLUMNS = (
 )
 
 
+def _completion_sweep_exclusion_clause(
+    enabled: bool, *, job_alias: str = "jobs"
+) -> str:
+    """Return the shared Gate-3 rescue-ownership predicate when enabled.
+
+    The disabled arm is the empty string on purpose: callers using the legacy
+    path must not even parse or plan a reference to the rollout-only view.
+    Restrict aliases to the two literal spellings used below so this helper
+    never becomes an identifier-formatting surface.
+    """
+
+    if not enabled:
+        return ""
+    if job_alias not in {"jobs", "j"}:
+        raise ValueError("unsupported jobs alias for completion sweep exclusion")
+    return (
+        " AND NOT EXISTS ("
+        "SELECT 1 FROM job_completion_sweep_exclusions AS completion_route "
+        f"WHERE completion_route.job_id = {job_alias}.id"
+        ")"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _TaskTransactionScope:
     """One connection reusable only by the task that opened its transaction.
@@ -6555,6 +6578,7 @@ class PostgresDB:
         pod_uid: str | None = None,
         expected_agent_id: str | None = None,
         insert_only: bool = False,
+        completion_commands_enabled: bool = False,
     ) -> Dict[str, Any]:
         """Register a new agent or update existing one.
 
@@ -6613,8 +6637,11 @@ class PostgresDB:
                 # Pause any processing jobs still assigned to this agent.
                 # The new instance won't know about them, so they'd be
                 # stuck in 'processing' forever without this.
+                completion_exclusion = _completion_sweep_exclusion_clause(
+                    completion_commands_enabled
+                )
                 await conn.execute(
-                    """
+                    f"""
                     UPDATE jobs
                     SET status = 'paused',
                         assigned_agent_id = NULL,
@@ -6625,6 +6652,7 @@ class PostgresDB:
                       -- registered-agent row; run_queue owns its rescue
                       -- (docs/features/stateless_agents.md §5.4.4).
                       AND jobs.execution_lane = 'pinned'
+                      {completion_exclusion}
                     """,
                     agent_id,
                 )
@@ -6995,7 +7023,9 @@ class PostgresDB:
             return int(result.split()[1])
         return 0
 
-    async def recover_orphaned_jobs(self) -> int:
+    async def recover_orphaned_jobs(
+        self, *, completion_commands_enabled: bool = False
+    ) -> int:
         """Pause jobs still assigned to offline, deleted, or non-working agents.
 
         Finds jobs in 'processing' status that are orphaned because:
@@ -7013,9 +7043,12 @@ class PostgresDB:
         Returns:
             Number of jobs recovered
         """
+        completion_exclusion = _completion_sweep_exclusion_clause(
+            completion_commands_enabled
+        )
         async with self.acquire() as conn:
             result = await conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET status = 'paused',
                     assigned_agent_id = NULL,
@@ -7035,6 +7068,7 @@ class PostgresDB:
                           WHERE status IN ('ready', 'booting')
                       )
                   )
+                  {completion_exclusion}
                 """
             )
 
@@ -7042,7 +7076,7 @@ class PostgresDB:
             # Don't change status — the job must stay in 'waiting' until its
             # children complete and the unblock handler fires.
             result2 = await conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET assigned_agent_id = NULL,
                     updated_at = CURRENT_TIMESTAMP
@@ -7052,6 +7086,7 @@ class PostgresDB:
                   AND assigned_agent_id IN (
                       SELECT id FROM agents WHERE status = 'offline'
                   )
+                  {completion_exclusion}
                 """
             )
 
@@ -7061,7 +7096,7 @@ class PostgresDB:
             # assignment) is un-dispatchable until the 24h agent GC's FK
             # cascade — sweep it free here instead.
             result3 = await conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET assigned_agent_id = NULL,
                     updated_at = CURRENT_TIMESTAMP
@@ -7071,6 +7106,7 @@ class PostgresDB:
                   AND assigned_agent_id IN (
                       SELECT id FROM agents WHERE status = 'offline'
                   )
+                  {completion_exclusion}
                 """
             )
 
@@ -7085,16 +7121,17 @@ class PostgresDB:
             # query parameter so this recovery path cannot drift from status
             # determination when a new continuation freeze is introduced.
             result4 = await conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET freeze_data = NULL,
-                    context = COALESCE(context, '{}'::jsonb)
+                    context = COALESCE(context, '{{}}'::jsonb)
                               || jsonb_build_object('last_freeze_data', freeze_data),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status = 'paused'
                   AND jobs.execution_lane = 'pinned'
                   AND assigned_agent_id IS NULL
                   AND freeze_data->>'freeze_type' = ANY($1::text[])
+                  {completion_exclusion}
                 """,
                 sorted(AUTO_REDISPATCH_FREEZE_TYPES),
             )
@@ -7110,7 +7147,9 @@ class PostgresDB:
             count += int(result4.split()[1])
         return count
 
-    async def recover_expired_lease_jobs(self) -> List[str]:
+    async def recover_expired_lease_jobs(
+        self, *, completion_commands_enabled: bool = False
+    ) -> List[str]:
         """Pause processing jobs whose execution lease has expired.
 
         The lease is the direct liveness signal (docs/features/
@@ -7130,9 +7169,12 @@ class PostgresDB:
             The recovered job ids (callers log each — an expired lease is an
             incident signal, not routine noise).
         """
+        completion_exclusion = _completion_sweep_exclusion_clause(
+            completion_commands_enabled
+        )
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 UPDATE jobs
                    SET status = 'paused',
                        assigned_agent_id = NULL,
@@ -7144,6 +7186,7 @@ class PostgresDB:
                    AND jobs.execution_lane = 'pinned'
                    AND lease_expires_at IS NOT NULL
                    AND lease_expires_at < NOW()
+                   {completion_exclusion}
                 RETURNING id
                 """
             )
@@ -8773,7 +8816,11 @@ class PostgresDB:
             return False
 
     async def list_due_backoff_jobs(
-        self, freeze_type: str, limit: int = 50
+        self,
+        freeze_type: str,
+        limit: int = 50,
+        *,
+        completion_commands_enabled: bool = False,
     ) -> List[Dict[str, Any]]:
         """Paused jobs of ``freeze_type`` whose backoff timer is due.
 
@@ -8782,9 +8829,12 @@ class PostgresDB:
         ``status='paused'``, agent freed, and a ``freeze_data.next_retry_at``
         that has arrived. Oldest-due first so a backlog drains fairly.
         """
+        completion_exclusion = _completion_sweep_exclusion_clause(
+            completion_commands_enabled
+        )
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT id, config_name, context, freeze_data, user_id, project_id,
                        parent_job_id, creation_order
                 FROM jobs
@@ -8793,6 +8843,7 @@ class PostgresDB:
                   AND freeze_data->>'freeze_type' = $1
                   AND freeze_data ? 'next_retry_at'
                   AND (freeze_data->>'next_retry_at')::timestamptz <= now()
+                  {completion_exclusion}
                 ORDER BY (freeze_data->>'next_retry_at')::timestamptz ASC
                 LIMIT $2
                 """,
@@ -8801,7 +8852,13 @@ class PostgresDB:
             )
         return [dict(row) for row in rows]
 
-    async def claim_backoff_redispatch(self, job_id: str, freeze_type: str) -> bool:
+    async def claim_backoff_redispatch(
+        self,
+        job_id: str,
+        freeze_type: str,
+        *,
+        completion_commands_enabled: bool = False,
+    ) -> bool:
         """Atomically clear a backoff freeze so the dispatcher re-queues the job.
 
         CAS guarded on ``status='paused'`` + ``freeze_type`` + ``next_retry_at``
@@ -8814,9 +8871,12 @@ class PostgresDB:
             uuid_val = UUID(job_id)
         except ValueError:
             return False
+        completion_exclusion = _completion_sweep_exclusion_clause(
+            completion_commands_enabled
+        )
         async with self.acquire() as conn:
             row = await conn.fetchrow(
-                """
+                f"""
                 UPDATE jobs
                    SET freeze_data = NULL,
                        assigned_agent_id = NULL,
@@ -8826,6 +8886,7 @@ class PostgresDB:
                    AND freeze_data->>'freeze_type' = $2
                    AND freeze_data ? 'next_retry_at'
                    AND (freeze_data->>'next_retry_at')::timestamptz <= now()
+                   {completion_exclusion}
                 RETURNING id
                 """,
                 uuid_val,
@@ -8833,7 +8894,9 @@ class PostgresDB:
             )
             return row is not None
 
-    async def list_due_llm_outage_jobs(self, limit: int = 50) -> List[Dict[str, Any]]:
+    async def list_due_llm_outage_jobs(
+        self, limit: int = 50, *, completion_commands_enabled: bool = False
+    ) -> List[Dict[str, Any]]:
         """Paused ``llm_unavailable`` jobs whose backoff timer is due for re-dispatch.
 
         Read by the outage sweeper each tick: ``status='paused'``, agent freed,
@@ -8843,9 +8906,12 @@ class PostgresDB:
         (docs/features/llm_outage_subjob_resilience.md). See
         docs/features/llm_outage_pause_and_backoff_redispatch.md.
         """
+        completion_exclusion = _completion_sweep_exclusion_clause(
+            completion_commands_enabled
+        )
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT id, config_name, context, freeze_data, user_id, project_id,
                        parent_job_id, creation_order
                 FROM jobs
@@ -8854,6 +8920,7 @@ class PostgresDB:
                   AND freeze_data->>'freeze_type' = 'llm_unavailable'
                   AND freeze_data ? 'next_retry_at'
                   AND (freeze_data->>'next_retry_at')::timestamptz <= now()
+                  {completion_exclusion}
                 ORDER BY (freeze_data->>'next_retry_at')::timestamptz ASC
                 LIMIT $1
                 """,
@@ -8861,7 +8928,9 @@ class PostgresDB:
             )
         return [dict(row) for row in rows]
 
-    async def claim_llm_outage_redispatch(self, job_id: str) -> bool:
+    async def claim_llm_outage_redispatch(
+        self, job_id: str, *, completion_commands_enabled: bool = False
+    ) -> bool:
         """Atomically clear an ``llm_unavailable`` freeze so the dispatcher re-queues it.
 
         CAS guarded on ``status='paused'`` + ``freeze_type`` + ``next_retry_at``
@@ -8876,9 +8945,12 @@ class PostgresDB:
             uuid_val = UUID(job_id)
         except ValueError:
             return False
+        completion_exclusion = _completion_sweep_exclusion_clause(
+            completion_commands_enabled
+        )
         async with self.acquire() as conn:
             row = await conn.fetchrow(
-                """
+                f"""
                 UPDATE jobs
                    SET freeze_data = NULL,
                        assigned_agent_id = NULL,
@@ -8887,13 +8959,20 @@ class PostgresDB:
                    AND status = 'paused'
                    AND freeze_data->>'freeze_type' = 'llm_unavailable'
                    AND (freeze_data->>'next_retry_at')::timestamptz <= now()
+                   {completion_exclusion}
                 RETURNING id
                 """,
                 uuid_val,
             )
             return row is not None
 
-    async def fail_llm_outage_job(self, job_id: str, reason: str) -> bool:
+    async def fail_llm_outage_job(
+        self,
+        job_id: str,
+        reason: str,
+        *,
+        completion_commands_enabled: bool = False,
+    ) -> bool:
         """Terminally fail a paused ``llm_unavailable`` job past its give-up ceiling.
 
         CAS guarded (``status='paused'`` + ``freeze_type``) so the sweeper
@@ -8907,9 +8986,12 @@ class PostgresDB:
             uuid_val = UUID(job_id)
         except ValueError:
             return False
+        completion_exclusion = _completion_sweep_exclusion_clause(
+            completion_commands_enabled
+        )
         async with self.acquire() as conn:
             row = await conn.fetchrow(
-                """
+                f"""
                 UPDATE jobs
                    SET status = 'failed',
                        error_message = $2,
@@ -8918,6 +9000,7 @@ class PostgresDB:
                  WHERE id = $1
                    AND status = 'paused'
                    AND freeze_data->>'freeze_type' = 'llm_unavailable'
+                   {completion_exclusion}
                 RETURNING id
                 """,
                 uuid_val,

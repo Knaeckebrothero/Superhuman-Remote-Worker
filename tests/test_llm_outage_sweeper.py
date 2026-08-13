@@ -67,6 +67,10 @@ def wired(monkeypatch):
 async def test_no_due_jobs_no_dispatch(wired):
     db, trigger = wired
     assert await main._llm_outage_sweep_once() == (0, 0)
+    db.list_due_llm_outage_jobs.assert_awaited_once_with(
+        limit=50,
+        completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED,
+    )
     trigger.assert_not_called()
 
 
@@ -77,7 +81,9 @@ async def test_due_under_ceiling_redispatches(wired):
         return_value=[_due_job("j1", first_ago=3600)]
     )
     assert await main._llm_outage_sweep_once() == (1, 0)
-    db.claim_llm_outage_redispatch.assert_awaited_once_with("j1")
+    db.claim_llm_outage_redispatch.assert_awaited_once_with(
+        "j1", completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED
+    )
     db.fail_llm_outage_job.assert_not_awaited()
     trigger.assert_called_once()
 
@@ -101,7 +107,11 @@ async def test_over_ceiling_fails_not_redispatched(wired):
         return_value=[_due_job("j1", first_ago=LLM_OUTAGE_CEILING_SECONDS + 3600)]
     )
     assert await main._llm_outage_sweep_once() == (0, 1)
-    db.fail_llm_outage_job.assert_awaited_once()
+    assert db.fail_llm_outage_job.await_args.args[0] == "j1"
+    assert "past the give-up ceiling" in db.fail_llm_outage_job.await_args.args[1]
+    assert db.fail_llm_outage_job.await_args.kwargs == {
+        "completion_commands_enabled": main.COMPLETION_COMMANDS_ENABLED
+    }
     db.claim_llm_outage_redispatch.assert_not_awaited()
     trigger.assert_not_called()
 
@@ -208,6 +218,8 @@ async def test_born_parked_job_wakes_and_claims(wired):
     db, trigger = wired
     db.list_due_llm_outage_jobs = AsyncMock(return_value=[_born_parked_job("j-park")])
     assert await main._llm_outage_sweep_once() == (1, 0)
-    db.claim_llm_outage_redispatch.assert_awaited_once_with("j-park")
+    db.claim_llm_outage_redispatch.assert_awaited_once_with(
+        "j-park", completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED
+    )
     db.fail_llm_outage_job.assert_not_awaited()
     trigger.assert_called_once()

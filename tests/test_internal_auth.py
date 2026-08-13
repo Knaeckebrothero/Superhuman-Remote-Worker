@@ -273,6 +273,10 @@ class TestPureInternalEndpoints:
             response = await orch_main.register_agent(MagicMock(), reg)
 
         assert response.agent_id == "agent-new"
+        assert (
+            db.register_agent.await_args.kwargs["completion_commands_enabled"]
+            is orch_main.COMPLETION_COMMANDS_ENABLED
+        )
         assert db.register_agent.await_args.kwargs["insert_only"] is True
         assert db.register_agent.await_args.kwargs["expected_agent_id"] is None
         bind.assert_awaited_once_with("thread-1", "agent-new", None)

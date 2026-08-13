@@ -5467,20 +5467,127 @@ COMMENT ON TABLE public.job_completion_commands IS 'Durable, commit-ordered comp
 
 
 --
+-- Name: job_completion_sweep_actions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.job_completion_sweep_actions (
+    job_id uuid NOT NULL,
+    attempt bigint NOT NULL,
+    command_id uuid NOT NULL,
+    command_attempt integer NOT NULL,
+    route text NOT NULL,
+    source text NOT NULL,
+    state text DEFAULT 'pending'::text NOT NULL,
+    claimed_by text,
+    claimed_at timestamp with time zone,
+    claim_expires_at timestamp with time zone,
+    result jsonb,
+    error_code text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    CONSTRAINT job_completion_sweep_action_shape CHECK ((((state = 'pending'::text) AND (claimed_by IS NULL) AND (claimed_at IS NULL) AND (claim_expires_at IS NULL) AND (result IS NULL) AND (error_code IS NULL) AND (completed_at IS NULL)) OR ((state = 'claimed'::text) AND (claimed_by IS NOT NULL) AND (btrim(claimed_by) <> ''::text) AND (claimed_at IS NOT NULL) AND (claim_expires_at IS NOT NULL) AND (claim_expires_at > claimed_at) AND (result IS NULL) AND (error_code IS NULL) AND (completed_at IS NULL)) OR ((state = 'done'::text) AND (claimed_by IS NULL) AND (claim_expires_at IS NULL) AND (claimed_at IS NOT NULL) AND (completed_at IS NOT NULL) AND (completed_at >= claimed_at) AND ((result IS NOT NULL) OR (error_code IS NOT NULL))))),
+    CONSTRAINT job_completion_sweep_attempt_positive CHECK ((attempt > 0)),
+    CONSTRAINT job_completion_sweep_command_attempt_nonnegative CHECK ((command_attempt >= 0)),
+    CONSTRAINT job_completion_sweep_error_nonempty CHECK (((error_code IS NULL) OR (btrim(error_code) <> ''::text))),
+    CONSTRAINT job_completion_sweep_result_object CHECK (((result IS NULL) OR (jsonb_typeof(result) = 'object'::text))),
+    CONSTRAINT job_completion_sweep_route_value CHECK ((route = ANY (ARRAY['resume_finalizer'::text, 'park_alert'::text, 'alert_only'::text]))),
+    CONSTRAINT job_completion_sweep_source_nonempty CHECK ((btrim(source) <> ''::text)),
+    CONSTRAINT job_completion_sweep_state_value CHECK ((state = ANY (ARRAY['pending'::text, 'claimed'::text, 'done'::text])))
+);
+
+
+--
+-- Name: TABLE job_completion_sweep_actions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.job_completion_sweep_actions IS 'Durable class-1 rescue actions for unfinished completion commands. One job-local attempt is allocated under the jobs-row lock; the action claim has a visibility lease, and UNIQUE(command_id, command_attempt) lets a pending action change route without a second reap firing.';
+
+
+--
+-- Name: COLUMN job_completion_sweep_actions.command_attempt; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.job_completion_sweep_actions.command_attempt IS 'Finalizer attempt observed when this reap action was allocated. Together with command_id it deduplicates competing rescuers for that exact attempt.';
+
+
+--
+-- Name: COLUMN job_completion_sweep_actions.route; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.job_completion_sweep_actions.route IS 'Actionable route from job_completion_sweep_exclusions: resume_finalizer, park_alert, or alert_only. stand_down never creates an action row.';
+
+
+--
+-- Name: COLUMN job_completion_sweep_actions.source; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.job_completion_sweep_actions.source IS 'Class-1 rescuer that first materialized the action (orphan, job lease, stale-agent, pause redispatch, or registration recovery).';
+
+
+--
+-- Name: COLUMN job_completion_sweep_actions.claim_expires_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.job_completion_sweep_actions.claim_expires_at IS 'Visibility deadline for the action claimant. An expired claimed row is eligible for takeover; claimed_by alone is never an ownership fence.';
+
+
+--
 -- Name: job_completion_sweep_exclusions; Type: VIEW; Schema: public; Owner: -
 --
 
 CREATE VIEW public.job_completion_sweep_exclusions AS
- SELECT DISTINCT command.job_id
-   FROM public.job_completion_commands command
-  WHERE ((command.state = ANY (ARRAY['pending'::text, 'finalizing'::text, 'parked'::text])) AND ((command.lease_expires_at > now()) OR (command.state = 'parked'::text)));
+ WITH authoritative AS (
+         SELECT command_1.id,
+            command_1.job_id,
+            command_1.report_seq,
+            command_1.client_report_id,
+            command_1.payload,
+            command_1.payload_digest,
+            command_1.reported_at,
+            command_1.accepted_lease_token,
+            command_1.accepted_agent_id,
+            command_1.origin,
+            command_1.requested_by,
+            command_1.state,
+            command_1.attempts,
+            command_1.max_attempts,
+            command_1.run_after,
+            command_1.lease_expires_at,
+            command_1.deadline_at,
+            command_1.finalizing_by,
+            command_1.code_version,
+            command_1.outcome,
+            command_1.finalized_at,
+            command_1.error_code,
+            row_number() OVER (PARTITION BY command_1.job_id ORDER BY command_1.report_seq) AS command_order
+           FROM public.job_completion_commands command_1
+          WHERE (command_1.state = ANY (ARRAY['pending'::text, 'finalizing'::text, 'parked'::text]))
+        )
+ SELECT command.job_id,
+    command.id AS command_id,
+    command.report_seq,
+    command.state AS command_state,
+    command.attempts AS command_attempts,
+    command.max_attempts,
+    command.run_after,
+    command.lease_expires_at,
+    command.deadline_at,
+        CASE
+            WHEN (command.state = 'parked'::text) THEN 'alert_only'::text
+            WHEN ((command.state = 'finalizing'::text) AND (command.lease_expires_at > now())) THEN 'stand_down'::text
+            WHEN ((command.deadline_at <= now()) OR (command.attempts >= command.max_attempts)) THEN 'park_alert'::text
+            ELSE 'resume_finalizer'::text
+        END AS route
+   FROM authoritative command
+  WHERE (command.command_order = 1);
 
 
 --
 -- Name: VIEW job_completion_sweep_exclusions; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON VIEW public.job_completion_sweep_exclusions IS 'Single source of truth for jobs-side sweep exclusion: live finalizer leases and parked operator work only. Expired commands must route to the finalizer resume path rather than disappear from all rescuers.';
+COMMENT ON VIEW public.job_completion_sweep_exclusions IS 'Single source of truth for class-1 completion rescue routing. One row is the oldest pending, finalizing, or parked command per job: parked alerts only; live finalizer leases stand down; non-live deadline/retry-cap rows park and alert; all others resume from durable effect progress.';
 
 
 --
@@ -5551,6 +5658,7 @@ CREATE TABLE public.jobs (
     failed_at timestamp with time zone,
     execution_lane text DEFAULT 'pinned'::text NOT NULL,
     completion_seq_hwm bigint DEFAULT 0 NOT NULL,
+    completion_sweep_attempt_hwm bigint DEFAULT 0 NOT NULL,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
     CONSTRAINT jobs_wake_state_known CHECK ((wake_state = ANY (ARRAY['none'::text, 'pending'::text, 'sending'::text, 'sent'::text, 'dead'::text]))),
@@ -5633,6 +5741,13 @@ COMMENT ON COLUMN public.jobs.execution_lane IS 'Which execution plane owns this
 --
 
 COMMENT ON COLUMN public.jobs.completion_seq_hwm IS 'Highest commit-ordered job_completion_commands.report_seq allocated for this job. Admission increments it while holding the jobs row lock; never allocate completion order from an IDENTITY/sequence.';
+
+
+--
+-- Name: COLUMN jobs.completion_sweep_attempt_hwm; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.jobs.completion_sweep_attempt_hwm IS 'Highest job_completion_sweep_actions.attempt allocated for this job. Routing increments it while holding the jobs row lock; the resulting (job_id, attempt) pair is the reap-action dedup key.';
 
 
 --
@@ -8861,6 +8976,14 @@ ALTER TABLE ONLY public.job_completion_commands
 
 
 --
+-- Name: job_completion_sweep_actions job_completion_sweep_actions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_completion_sweep_actions
+    ADD CONSTRAINT job_completion_sweep_actions_pkey PRIMARY KEY (job_id, attempt);
+
+
+--
 -- Name: job_datasources job_datasources_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -9789,6 +9912,14 @@ ALTER TABLE ONLY public.job_completion_commands
 
 
 --
+-- Name: job_completion_sweep_actions uq_job_completion_sweep_command_attempt; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_completion_sweep_actions
+    ADD CONSTRAINT uq_job_completion_sweep_command_attempt UNIQUE (command_id, command_attempt);
+
+
+--
 -- Name: models uq_model_provider_v2; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -10333,6 +10464,13 @@ CREATE INDEX idx_job_change_records_project_created ON public.job_change_records
 --
 
 CREATE INDEX idx_job_completion_drain ON public.job_completion_commands USING btree (run_after) WHERE (state = ANY (ARRAY['pending'::text, 'finalizing'::text]));
+
+
+--
+-- Name: idx_job_completion_sweep_actions_claim; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_job_completion_sweep_actions_claim ON public.job_completion_sweep_actions USING btree (state, claim_expires_at, created_at) WHERE (state = ANY (ARRAY['pending'::text, 'claimed'::text]));
 
 
 --
@@ -12493,6 +12631,22 @@ ALTER TABLE ONLY public.job_change_records
 
 ALTER TABLE ONLY public.job_completion_commands
     ADD CONSTRAINT job_completion_commands_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: job_completion_sweep_actions job_completion_sweep_actions_command_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_completion_sweep_actions
+    ADD CONSTRAINT job_completion_sweep_actions_command_id_fkey FOREIGN KEY (command_id) REFERENCES public.job_completion_commands(id) ON DELETE CASCADE;
+
+
+--
+-- Name: job_completion_sweep_actions job_completion_sweep_actions_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_completion_sweep_actions
+    ADD CONSTRAINT job_completion_sweep_actions_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
 
 
 --

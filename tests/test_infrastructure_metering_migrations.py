@@ -139,7 +139,8 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 # awareness (0126), the exact-lease interrupt inbox (0127-0129), and the
 # verification-critic dedupe/concurrent unique-index rollout (0130-0132), and
 # the S2 durable persistent-session residue tables (0133), and the Gate-3
-# completion command substrate (0140; 0134-0139 are reserved).
+# completion command substrate (0140; 0134-0139 are reserved), and the routed
+# completion-sweep substrate (0141).
 APP_DATASOURCE_TOMBSTONES_MIGRATION = (
     ROOT / "orchestrator/database/migrations/app/0115_datasource_tombstones.sql"
 )
@@ -199,7 +200,14 @@ APP_THREAD_SESSION_DURABLE_STATE = (
 APP_JOB_COMPLETION_COMMANDS = (
     ROOT / "orchestrator/database/migrations/app/0140_job_completion_commands.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_JOB_COMPLETION_COMMANDS
+APP_JOB_COMPLETION_SWEEP_ROUTING = (
+    ROOT / "orchestrator/database/migrations/app/0141_job_completion_sweep_routing.sql"
+)
+APP_JOB_COMPLETION_SWEEP_ROUTE_PRECEDENCE = (
+    ROOT
+    / "orchestrator/database/migrations/app/0142_job_completion_sweep_route_precedence.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_JOB_COMPLETION_SWEEP_ROUTE_PRECEDENCE
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
