@@ -55,7 +55,7 @@ after the 2026-08-04 cutover.
 | D2 | Code compounds into a **git `role=source` repo**, not the cloud folder | The user's call; gives real history, PRs and CI on the product, which the cloud-folder path cannot |
 | D3 | Repo hosted on **GitHub, private**, created by the user from a staging folder | User's call; overrides the Gitea default proposed during design |
 | D4 | Live KB = the **476 active design notes**; everything else becomes a **read-only external `kb` connector** | 73% of the active index was curator output, against a retrieval path already measured as similarity-luck |
-| D5 | Agent pushes using a **fine-grained PAT scoped to the one repo**, embedded in the stored `repo_url` | Works with today's `_clone_auxiliary_repos`; blast radius is one private repo |
+| D5 | Code attached as a **`repository` datasource**, not a `role=source` project repository; PAT held in the datasource's encrypted `credentials` | **Corrected 2026-08-13** — this is the mechanism actually used. Credentials are encrypted at rest and injected only at clone time, rather than living in a stored `repo_url`. See §3b |
 | D6 | A **HEAD-comparison guard** becomes the delivery signal for execution turns | `delivery_status` is structurally `no-changes` for this project now; something must be able to say "nothing landed" |
 | D7 | `repo/` → `repos/KurortEngine/` **rewritten in the live slice only** | The live slice is forward-looking guidance; the history slice is an archive and rewriting it would falsify the record |
 | D8 | Workspace backend **container**, not `vm` | All six recorded loops ran `vm`; `docs/issues/vm_reliability_assessment.md` puts VM infra-failures at 2.2× container, and loop `3ed022a5` died `stop_reason=failures` on three consecutive VM provisioning failures |
@@ -70,7 +70,7 @@ Three repositories and one connector over a new project:
 
 | what | where | attachment | agent access |
 |---|---|---|---|
-| Code | `github.com/<owner>/KurortEngine` (private) | `role=source`, name `KurortEngine` | clones to `repos/KurortEngine/`; branch → push → PR |
+| Code | `github.com/Knaeckebrothero/KurortEngine` (private) | `repository` datasource `2991589e`, `config.forge=github` | clones to `repos/KurortEngine/`; branch → push → PR |
 | Live vault | Gitea `project-<id8>-knowledge`, auto-provisioned | `role=knowledge` → native project KB | `kb_write`, `search_knowledge` |
 | History vault | internal Gitea, new repo `srw/<name>` | external `kb` connector (`connection_url: http://srw-gitea:3000/...`) | `search_knowledge`, read-only |
 | Cloud Space | auto-provisioned with the project | — | non-code deliverables only |
@@ -134,6 +134,41 @@ service listens on 3000, `http://` is an accepted scheme, and the `host:port`
 allowlist form is supported. Credentials must **not** be embedded in the URL — the
 validator raises on that — so they go in the datasource's `credentials` field,
 which also means the KB credential never enters a workspace.
+
+## 3b. How the code repo actually attaches (corrected 2026-08-13)
+
+The design assumed a `role=source` row in `project_repositories`. The mechanism in
+use is a **`repository` datasource**, and it is the better of the two. Both exist and
+they are separate clone paths:
+
+| path | source of truth | clones via | credentials |
+|---|---|---|---|
+| `_clone_auxiliary_repos` (`workspace.py:743`) | `project_repositories` rows | job dispatch builds `repositories_payload` from `get_project_repositories` (`main.py:3882`) | whatever is embedded in the stored `repo_url` |
+| `clone_repository_datasources` (`datasource_setup.py:856`) | `repository` datasources | forge-aware, registers into `workspace_manager.source_repos` | encrypted `credentials` column, injected at clone time as `oauth2:<token>@host` |
+
+The datasource path is preferable: the PAT is encrypted at rest (`v1:` envelope,
+`orchestrator/security/crypto.py`) and never sits in a stored URL.
+
+Two properties that matter operationally:
+
+- **Clone directory.** `resolve_repo_clone_names` (`:821`) derives it from the
+  *upstream repo name in the URL*, not the connector label. Verified:
+  `https://github.com/Knaeckebrothero/KurortEngine.git` → `repos/KurortEngine`,
+  which is exactly the path D7's rewrite pointed 1,085 note references at.
+- **Shell-capable backend required.** The docstring is explicit: "there is
+  deliberately NO agent-local fallback: without a shell-capable backend the
+  datasources are skipped with an error." A lite tier therefore yields no checkout.
+  D8's container backend satisfies this.
+
+`read_only` on a repository datasource surfaces as `project_read_only` and only
+labels the connector read-only in the tool layer (`datasource_setup.py:313`); it does
+not gate the shell, so it stays advisory exactly as `knowledge_base_repo_separation`
+§3.2 warned.
+
+**State as of 2026-08-13:** repo pushed at `0de25e0` (205 files, 23 mockups, all 13
+`.yaml` visible, recursion guard included); datasource `2991589e` carries the URL,
+`config.forge=github`, `default_branch=main`, and encrypted credentials. It is still
+linked to the old project `68137e29` and must be re-linked to the new one.
 
 ## 4. Corpus split
 
@@ -265,8 +300,8 @@ content is client material for Hotel Rheinland.
 
 ```
 0.  Fix the test_ac6 recursion                       ← DONE 2026-08-13
-1.  User creates github.com/<owner>/KurortEngine (private) from KurortEngine/
-2.  User mints a fine-grained PAT scoped to that repo
+1.  User creates github.com/<owner>/KurortEngine (private)          ← DONE, @0de25e0
+2.  User mints the PAT and stores it on the repository datasource   ← DONE 2026-08-13
 3.  Archive project 68137e29 (D10); create the new project, reusing the name →
     auto-provisions project-<id8>-knowledge + kb connector
 4.  Push BetterResavio-KB/live/knowledge/ into the knowledge repo; reindex; time it
@@ -274,7 +309,7 @@ content is client material for Hotel Rheinland.
 6.  Create the Gitea history repo, push history/knowledge/, attach it as an
     external kb connector (credentials in the datasource, not the URL)
 7.  Verify 476 notes under kb_id=project_id, 2,635 under the connector UUID, none twice
-8.  Attach KurortEngine as role=source with the PAT-bearing URL
+8.  Link the KurortEngine repository datasource (2991589e) to the new project
 9.  Author the "code lives at repos/KurortEngine/" convention note into the live vault
 10. Build the HEAD-comparison guard (D6)
 11. One manual developer job, watched end to end: clone → branch → push → PR → HEAD delta
@@ -316,3 +351,50 @@ until a single job has been observed to move `KurortEngine`'s HEAD.
    by line.
 5. **Curator bloat on the new vault.** D4 cleans the corpus once; nothing stops it
    refilling at the rate that produced 935 learnings in a month.
+
+---
+
+## 13. Execution log — 2026-08-13
+
+**Steps 1–2 (user).** `github.com/Knaeckebrothero/KurortEngine` created and pushed at
+`0de25e0` — 205 files, 23 mockups, all 13 `.yaml` visible, the AC-6 recursion guard
+included. PAT stored on repository datasource `2991589e` (`config.forge=github`,
+`default_branch=main`), credentials encrypted at rest. Still linked to the archived
+project; step 8 re-links it.
+
+**Step 3.** `68137e29` renamed *"Better Resavio (pre-split archive)"* and set
+`archived`; its 3,111-note index is retained untouched. New project
+**`a572e4a0-d97a-4103-91fd-92a980d6717d`** created. Auto-provisioning verified:
+`project-a572e4a0-knowledge` (role `knowledge`, managed), native `kb` connector
+`7c1a1ad3` carrying `native_project_id` + `root_path: knowledge`, a Nextcloud Space
+(id 8), and **no jobs repo**.
+
+**Step 4.** 476 live notes pushed at `2da2e815`; reindex 10:02:49 → 10:09:53 =
+**7m04s**, ~1.12 notes/s over 4.9 MB.
+
+| check | result |
+|---|---|
+| notes indexed under `kb_id = project_id` | **476 / 476** |
+| `path`, `search_doc`, `embedding` populated | 476 each — both `0ef826ca` fixes hold at scale |
+| distinct slugs | 476 — zero collisions, as §4 predicted |
+| type split | decision 289 · goal 83 · plan 57 · code 33 · feature 4 · question 4 · source 3 · idea 2 · issue 1 — exactly the planned slice |
+| links extracted | **1,539** |
+| chunks | 3,104 |
+| indexed under the connector's own UUID | **0** — the `native_project_id` marker holds |
+| duplicate slugs within the project | 0 |
+| `search_knowledge` | returns 10 real design notes for "Kurtaxe exemption" |
+
+> The same slugs also appear under `kb_id = 68137e29`. That is the retained archive
+> (D10), not a double-index: two projects, two indexes, one shared slug namespace.
+
+> `search_knowledge` returning nothing for a five-term query is not a defect —
+> `websearch_to_tsquery` ANDs terms (`'kurortengin' & 'repositori' & 'layout' &
+> 'code' & 'live'`) and no single note carries all five.
+
+**Step 6, partly.** `srw/better-resavio-history` created (private) and all **2,635**
+archive notes pushed at `5044b83`. Not yet indexed — the connector needs step 5.
+
+**Step 5 prepared, not applied.** `helm/values.yaml` set to
+`kbGitAllowedHosts: "srw-gitea:3000"`; `helm template` confirmed to emit
+`KB_GIT_ALLOWED_HOSTS: "srw-gitea:3000"`. Uncommitted and unpushed — pushing it
+carries four other unpushed `develop` commits, so it needs an explicit go-ahead.
