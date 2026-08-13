@@ -1812,6 +1812,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: develop
+          # Full history: the staleness guard below compares commit ancestry.
+          fetch-depth: 0
 
       - name: Install tools
         run: |
@@ -1919,6 +1921,20 @@ jobs:
           COMPONENT_SHA: ${{ needs.changes.outputs.orchestrator-sha }}
         run: |
           : "${COMPONENT_SHA:=$GITHUB_SHA}"
+          # Staleness guard — docs/issues/ci_deploy_race_reverts_image_tags.md.
+          # Overlapping runs each derive this identity from their own checkout, so
+          # the run that finishes LAST can otherwise write an older sha over a
+          # newer one and silently revert a verified deploy. Skip only when the
+          # recorded revision is known AND is not an ancestor of ours; an unknown
+          # revision (this branch is rebased often) falls through and writes.
+          CURRENT_SHA=$(yq -r '.provenance.components.orchestrator.sourceRevision // ""' \
+            deployment/values-experimental.yaml)
+          if [ -n "$CURRENT_SHA" ] \
+             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
+             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
+            echo "::notice::skipping stale orchestrator tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
+            exit 0
+          fi
           export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
           export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
           yq -i '
@@ -1938,6 +1954,20 @@ jobs:
           COMPONENT_SHA: ${{ needs.changes.outputs.agent-sha }}
         run: |
           : "${COMPONENT_SHA:=$GITHUB_SHA}"
+          # Staleness guard — docs/issues/ci_deploy_race_reverts_image_tags.md.
+          # Overlapping runs each derive this identity from their own checkout, so
+          # the run that finishes LAST can otherwise write an older sha over a
+          # newer one and silently revert a verified deploy. Skip only when the
+          # recorded revision is known AND is not an ancestor of ours; an unknown
+          # revision (this branch is rebased often) falls through and writes.
+          CURRENT_SHA=$(yq -r '.provenance.components.agent.sourceRevision // ""' \
+            deployment/values-experimental.yaml)
+          if [ -n "$CURRENT_SHA" ] \
+             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
+             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
+            echo "::notice::skipping stale agent tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
+            exit 0
+          fi
           export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
           export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
           yq -i '
@@ -1952,6 +1982,20 @@ jobs:
           COMPONENT_SHA: ${{ needs.changes.outputs.cockpit-sha }}
         run: |
           : "${COMPONENT_SHA:=$GITHUB_SHA}"
+          # Staleness guard — docs/issues/ci_deploy_race_reverts_image_tags.md.
+          # Overlapping runs each derive this identity from their own checkout, so
+          # the run that finishes LAST can otherwise write an older sha over a
+          # newer one and silently revert a verified deploy. Skip only when the
+          # recorded revision is known AND is not an ancestor of ours; an unknown
+          # revision (this branch is rebased often) falls through and writes.
+          CURRENT_SHA=$(yq -r '.provenance.components.cockpit.sourceRevision // ""' \
+            deployment/values-experimental.yaml)
+          if [ -n "$CURRENT_SHA" ] \
+             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
+             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
+            echo "::notice::skipping stale cockpit tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
+            exit 0
+          fi
           export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
           export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
           yq -i '
@@ -1967,6 +2011,20 @@ jobs:
           COMPONENT_DIGEST: ${{ needs.build-mcp.outputs.digest }}
         run: |
           : "${COMPONENT_SHA:=$GITHUB_SHA}"
+          # Staleness guard — docs/issues/ci_deploy_race_reverts_image_tags.md.
+          # Overlapping runs each derive this identity from their own checkout, so
+          # the run that finishes LAST can otherwise write an older sha over a
+          # newer one and silently revert a verified deploy. Skip only when the
+          # recorded revision is known AND is not an ancestor of ours; an unknown
+          # revision (this branch is rebased often) falls through and writes.
+          CURRENT_SHA=$(yq -r '.provenance.components.mcp.sourceRevision // ""' \
+            deployment/values-experimental.yaml)
+          if [ -n "$CURRENT_SHA" ] \
+             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
+             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
+            echo "::notice::skipping stale mcp tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
+            exit 0
+          fi
           test -n "$COMPONENT_DIGEST"
           case "$COMPONENT_DIGEST" in sha256:*) ;; *) exit 1 ;; esac
           export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
@@ -1984,6 +2042,20 @@ jobs:
           COMPONENT_SHA: ${{ needs.changes.outputs.workspace-sha }}
         run: |
           : "${COMPONENT_SHA:=$GITHUB_SHA}"
+          # Staleness guard — docs/issues/ci_deploy_race_reverts_image_tags.md.
+          # Overlapping runs each derive this identity from their own checkout, so
+          # the run that finishes LAST can otherwise write an older sha over a
+          # newer one and silently revert a verified deploy. Skip only when the
+          # recorded revision is known AND is not an ancestor of ours; an unknown
+          # revision (this branch is rebased often) falls through and writes.
+          CURRENT_SHA=$(yq -r '.provenance.components.workspace.sourceRevision // ""' \
+            deployment/values-experimental.yaml)
+          if [ -n "$CURRENT_SHA" ] \
+             && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
+             && ! git merge-base --is-ancestor "$CURRENT_SHA" "$COMPONENT_SHA"; then
+            echo "::notice::skipping stale workspace tag: deployed $CURRENT_SHA is not an ancestor of $COMPONENT_SHA"
+            exit 0
+          fi
           export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
           export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
           yq -i '
