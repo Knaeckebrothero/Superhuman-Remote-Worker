@@ -4749,3 +4749,40 @@ and whitespace checks are clean. No live job, workspace or completion row was
 read for mutation, and the two protected probes and three protected untracked
 paths remain untouched. The next app migration is **0147** and the next vector
 migration is **0020**.
+
+## M2 — interrupt production path already closed by S2
+
+Recon was dispositive, so this milestone adds no second interrupt mechanism.
+Stateless sessions already use migrations 0127–0129's exact-turn interrupt
+request/receipt protocol: owner-gated public REST admits the immutable client
+request UUID only against the exact live `session_turn` token and target turn,
+the executor opens a watcher around that one turn, signals live RAM before
+writing the linked `interrupt.ack`, and the reaper/terminal recovery paths
+settle an admitted request after owner loss without signalling successor RAM.
+NOTIFY is a latency hint and the bounded poll is the correctness backstop.
+Cockpit keeps the request identity across ambiguous HTTP retry and correlates
+only the matching receipt. The older 0119 inbox remains the scalar-control
+protocol and is intentionally not retrofitted for a synchronous turn stop.
+
+Pinned sessions already have REST parity: the public route forwards the exact
+request UUID and target turn to the live agent REST handler, which applies hard
+or graceful interruption only while that turn is open. The legacy control-WS
+verb remains an uncorrelated compatibility path. A new stateless request with
+no exact live gate returns **409 before INSERT**; retries of a UUID that was
+already committed remain observable. That clean refusal is the adopted
+no-live-claim contract: interrupt does not consume an idle/queued turn, retarget
+a successor, fabricate a no-op receipt, or leave a dangling pending row. A
+queued-turn-cancel verb would be a separate product decision.
+
+M2 is therefore a verification/status milestone, not an implementation
+milestone. It changes no production code, migration, schema snapshot, chart or
+live state. The exact inbox/consumer/reaper matrix passed **106/106** and the
+Python executor/graph/agent integration selection passed **20/20** on current
+bytes. The Cockpit REST/correlation/self-healing/reducer selection passed
+**20/20** (298 filtered), including old-ack/new-turn isolation. The exact
+schema/admission-gate selection collected **8 expected skips** because
+`RUN_QUEUE_TEST_DSN` is absent, so M2 makes no new real-Postgres claim. An
+independent read-only audit found no P0/P1 across public admission, executor
+watcher closure, owner-loss convergence, pinned forwarding or Cockpit retry.
+No live resource was queried or mutated; the protected stateless hand-check and
+pinned probe remain untouched.
