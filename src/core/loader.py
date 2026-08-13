@@ -1422,6 +1422,13 @@ class LLMConfig:
     # settings matrix (`settings.extra_body`) or explicit config; declared
     # values win over factory-computed extra_body entries.
     extra_body: Optional[Dict[str, Any]] = None
+    # OpenAI cache-routing hint, injected at RUNTIME by callers that own a
+    # stable conversation identity (the session paths pass a per-thread key so
+    # the provider-side prefix cache survives pod rotation on the stateless
+    # lane — stateless_agents.md OQ5). Never set from YAML, and only
+    # transmitted to first-party OpenAI: compatible endpoints (vLLM et al.)
+    # may reject unknown body fields and run their own keyless prefix caches.
+    prompt_cache_key: Optional[str] = None
 
     # Phase-specific overrides (optional)
     strategic: Optional[PhaseLLMOverride] = None
@@ -3513,6 +3520,13 @@ def _create_openai_llm(
     # declared values win over factory-computed entries.
     if config.extra_body:
         extra_body = deep_merge(extra_body, config.extra_body)
+
+    # Runtime cache-routing hint (see LLMConfig.prompt_cache_key). First-party
+    # OpenAI only: an explicit base_url means an OpenAI-compatible endpoint,
+    # which may reject unknown body fields and prefix-caches without a key.
+    # setdefault so an explicitly declared value keeps winning.
+    if config.prompt_cache_key and (not base_url or "api.openai.com" in base_url):
+        extra_body.setdefault("prompt_cache_key", config.prompt_cache_key)
 
     # Add timeout if specified
     if config.timeout is not None:
