@@ -71,6 +71,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libmagic1 \
     openssh-client \
     rclone \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from builder (system-owned, read-only is fine)

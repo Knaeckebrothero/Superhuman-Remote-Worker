@@ -1207,6 +1207,7 @@ async def test_flagged_kubernetes_teardown_captures_and_uses_exact_uids(
                 "workspace_archive_teardown"
             ]["snapshot_created_at"],
             "strict": True,
+            "exact_absence_timeout_seconds": 45.0,
         }
         runner.probe_order.append("release")
         return True
@@ -1252,6 +1253,8 @@ async def test_flagged_kubernetes_teardown_captures_and_uses_exact_uids(
         "intent_write",
         "release",
     ]
+    assert runner.callback_counts["workspace_archive_teardown"] == 1
+    assert "workspace_archive_teardown" not in runner.pending
     legacy_cleanup.assert_not_awaited()
 
 
@@ -1335,6 +1338,7 @@ async def test_kubernetes_teardown_resume_reuses_intent_after_pod_disappears(
             "terminal_snapshot_generation": COMMAND_ID,
             "terminal_snapshot_created_at": snapshot_created_at,
             "strict": True,
+            "exact_absence_timeout_seconds": 45.0,
         }
         for call in release_mock.await_args_list
     )
@@ -1545,7 +1549,10 @@ async def test_fresh_admission_precedes_inline_finalization_and_returns_exact_ou
     finalize_mock = AsyncMock(side_effect=finalize)
     finalizer = SimpleNamespace(finalize_command=finalize_mock)
     finalizer_getter = MagicMock(return_value=finalizer)
+    delay = AsyncMock()
     monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(main, "COMPLETION_FINALIZER_INLINE_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(main.asyncio, "sleep", delay)
     monkeypatch.setattr(main, "postgres_db", database)
     monkeypatch.setattr(main, "require_internal", AsyncMock(side_effect=auth))
     monkeypatch.setattr(main, "_complete_job_legacy", legacy_mock)
@@ -1564,6 +1571,7 @@ async def test_fresh_admission_precedes_inline_finalization_and_returns_exact_ou
         _effect_runner=runner,
     )
     finalizer_getter.assert_called_once_with()
+    delay.assert_not_awaited()
     finalize_mock.assert_awaited_once()
     accept_mock.assert_awaited_once_with(
         database,
@@ -1582,6 +1590,72 @@ async def test_fresh_admission_precedes_inline_finalization_and_returns_exact_ou
         client_report_id=str(REPORT_ID),
         requested_by=f"agent:{AGENT_ID}",
     )
+
+
+@pytest.mark.asyncio
+async def test_fresh_admission_exposes_local_force_delete_window(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[str] = []
+
+    async def accept(*_args, **_kwargs):
+        events.append("accept")
+        return _accepted("fresh")
+
+    async def delay(seconds: float) -> None:
+        events.append(f"delay:{seconds}")
+
+    async def finalize(command_id, *, callback, inline):
+        assert command_id == COMMAND_ID
+        assert inline is True
+        events.append("finalize")
+        outcome = await callback(_RecordingRunner())
+        return SimpleNamespace(
+            disposition="done",
+            state="done",
+            outcome=outcome,
+        )
+
+    async def legacy(*_args, **_kwargs):
+        events.append("legacy")
+        return {"status": "success", "job_id": JOB_ID}
+
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(main, "COMPLETION_FINALIZER_INLINE_DELAY_SECONDS", 15.0)
+    monkeypatch.setattr(main, "require_internal", AsyncMock())
+    monkeypatch.setattr(main, "_complete_job_legacy", AsyncMock(side_effect=legacy))
+    monkeypatch.setattr(
+        commands, "accept_completion_command", AsyncMock(side_effect=accept)
+    )
+    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock(side_effect=delay))
+    monkeypatch.setattr(
+        main,
+        "_get_completion_finalizer",
+        MagicMock(
+            return_value=SimpleNamespace(
+                finalize_command=AsyncMock(side_effect=finalize)
+            )
+        ),
+    )
+
+    with caplog.at_level("INFO"):
+        handled = await main.complete_job(MagicMock(), JOB_ID, _body())
+
+    assert handled == {"status": "success", "job_id": JOB_ID}
+    assert events == ["accept", "finalize", "delay:15.0", "legacy"]
+    accepted_records = [
+        record.getMessage()
+        for record in caplog.records
+        if "Completion command" in record.getMessage()
+    ]
+    assert accepted_records == [
+        f"Completion command {COMMAND_ID} accepted for job {JOB_ID}",
+        f"Completion command {COMMAND_ID} claimed for job {JOB_ID}; "
+        "inline delay 15.000s",
+    ]
+    assert all(str(AGENT_ID) not in record for record in accepted_records)
+    assert all("lease" not in record.lower() for record in accepted_records)
 
 
 @pytest.mark.asyncio

@@ -3917,3 +3917,112 @@ takeover. The repository-wide non-fail-fast suite produced the exact baseline
 set again: **17,259 passed, 163 skipped, 11 failed**, with no new failure.
 Repository-wide Ruff check and format check (1,116 files) and the whitespace
 gate pass. M4 operational parity/kill proof and optional M5 remain.
+
+## M4 shipped — default-off flag and k3d parity/recovery proof
+
+The whole command/finalizer path is wired through the single
+`COMPLETION_COMMANDS_ENABLED` gate. The chart default is `false`; the shared
+ConfigMap carries it to the stateless execution plane and the orchestrator has
+an explicit `configMapKeyRef`. The ignored local overlay is the only place it
+was opened for this soak. `COMPLETION_FINALIZER_INLINE_DELAY_SECONDS` is a
+second, default-zero local fault-injection setting: a positive value pauses
+inside the already-claimed inline workflow, after accept and before S1. It was
+15 seconds only for the pod-kill captures and is back to **0** in the final
+running deployment. The tracked chart remains `false`/`0`.
+
+Eleven focused regression cases were added for the flag/rendering, claimed
+fault window, strict archive runtime contract, lifecycle ownership veto, and
+UID-bounded deletion. The final affected M4 matrix passed **429/429**. The
+post-fix non-fail-fast repository suite passed **17,269**, skipped **163**, and
+failed only the exact 11 baseline environment cases. Repository-wide Ruff,
+touched-file format, both required Helm lints, Squawk v2.59.0 (0 findings),
+whitespace, and the full three-schema snapshot/idempotence replay all pass.
+
+### k3d parity table
+
+These are individual observed samples, not a p95 claim.
+
+| Proof | Flag OFF control | Flag ON normal | Flag ON pod-kill recovery |
+|---|---|---|---|
+| Pinned completion | HTTP 200 in 0.048 s, `pending_review`, then approve in 0.374 s -> `completed` | HTTP 200 in 0.285 s, same response keys/types/actions and status path; approve in 0.454 s -> `completed` | Accepted/claimed command was `finalizing`, attempt 1, live owner/lease, **0 effects**, while the job was still `processing`; serving orchestrator Pod was force-deleted |
+| Durable rows | commands=0, effects=0, leader leases=0, job HWM=0 | command `9193b633-…` done on attempt 1; 16 unique effects, all done on attempt 1 | command `577831df-…` done on attempt 2 after natural lease expiry (~141 s from claim); all 16 effects done on attempt 1 |
+| Domain parity | `completed_at` set only on approval, 0 critic children, notification/dispatch and cleanup observed | identical `completed_at`/critic count and response actions; expected wake/dispatch effects done; workspace cleanup converged | exact `(effect_name,effect_group)` set equals the normal ON command; stored response replayed with `Idempotent-Replayed`; approval completed normally |
+
+The OFF fixture was `6eb4fe1d-…`; the ON comparison fixture was
+`ad2a0f63-…`; the required accept-before-effect kill fixture was
+`2f0f7bab-…`. Runtime bytes, ConfigMap and Pod environment were checked before
+trusting each phase. The OFF phase happened on a virgin migrated cluster, so
+the zero-row claim is a total count rather than a delta.
+
+A stronger, deliberately later crash was also exercised against job
+`7582ab02-…`, command `66b7383f-…`: the process died after 15 effects existed
+and S36 had begun. The old 900-second effect term expired naturally; the new
+leader reclaimed it, finished the same command on command attempt 2, and left
+16 unique done effects. Fifteen remained at attempt 1 and only
+`workspace_archive_teardown` reached attempt 2. Its command-keyed object-store
+prefix contains exactly one archive/manifest pair; compressed SHA, zstd/tar,
+strict manifest identity, canonical-manifest repair and the exact proof marker
+all verified. Pod, PVC and Service are absent.
+
+### Soak findings folded into M4
+
+The first terminal soak exposed three real integration holes; none was hidden
+or repaired by editing durable rows:
+
+1. The orchestrator runtime image lacked the `zstd` binary that strict terminal
+   validation invokes, and the first validator command discarded stderr. Both
+   production/dev runtime images now install `zstd`, validation preserves its
+   diagnostic, and image-contract tests cover exit 127. This is an honest
+   runtime dependency repair (including a new image capability with the gate
+   off), while the closed completion-command path itself remains relation- and
+   behavior-dark.
+2. The generic lifecycle reaper observed the early legacy-compatible
+   `completed` status and ran an ordinary snapshot/delete while S36 was still
+   pending. A conservative, flag-gated ownership veto now preserves job
+   workspaces whenever a command is pending/finalizing/parked, rechecking at
+   snapshot, delete, give-up and orphan-PVC action time and failing closed on a
+   lookup error. Flag off returns before any new-relation read and preserves the
+   exact legacy metadata shape. This is only an S36 ownership exclusion; it
+   does **not** activate step-4 status reordering, routed sweeps, redispatch, or
+   worker admission.
+3. Kubernetes honored the workspace Pod's ordinary 120-second termination
+   grace when the requested 10-second value appeared only as a query argument.
+   Captured S36 now carries the same 10-second grace in the UID-preconditioned
+   `DeleteOptions` body and bounds the exact-absence proof at 45 seconds;
+   legacy/default-off callers keep their old request body. On the rebuilt
+   image, fresh pinned terminal job `11036e16-…` returned the complete legacy
+   HTTP 200 body in **12.476 seconds**, below the agent's 60-second timeout.
+   Its command and all 16 effects settled on attempt 1, the strict snapshot and
+   exact marker deep-verified, and Pod/PVC/Service reached zero.
+
+The two pre-fix failures remain as operator evidence because there is no safe
+unpark/force-resolve verb in tonight's scope and raw SQL state fabrication
+would invalidate the proof. Command `c6735d9d-…` is parked behind the missing
+`zstd` plus lifecycle race; command `b9ab9aa6-…` is parked behind the old
+30-second/120-second deletion mismatch. Each retains one pending S36 effect.
+The latter job also has successor command `a010c9f0-…` pending at report_seq 2,
+correctly blocked by predecessor ordering. Final new-table residue is therefore
+**2 parked, 1 pending, 0 finalizing commands; 2 pending effects; 1 live leader
+lease**. All post-fix normal and killed fixtures have zero unfinished effects.
+
+The requested stateless-session check ultimately passed on a fresh disposable
+virtual thread (`db95072f-…`) with an explicit reachable `gpt-5-mini` model:
+one human input produced exactly one `COMPLETION-PARITY-OK` AI row in 48 seconds,
+then the queue settled `done` at token 1 with `input_seq=consumed_seq=2798` and
+zero new or thread-attributable job-completion commands. The original
+long-lived probe's configured
+`gemma-4-moe` endpoint repeatedly timed out; its first try produced a contained
+`Connection error`, the retry was interrupted through the correlated public
+verb, and its queue also settled cleanly. That provider outage was not treated
+as completion-path evidence.
+
+There is no M5 change. Decision-(6) routing/status activation, worker
+admission, and winner/supersession remain deliberately unstarted.
+
+### Morning hand-check
+
+Inspect the force-deleted mid-S36 fixture (`7582ab02-…` / command
+`66b7383f-…`) end to end: command attempt 2 and S36 attempt 2, exactly one
+command-keyed strict archive/manifest pair with the marker intact, and the
+captured Pod/PVC/Service UIDs absent. This is the highest-risk claim that a
+row-count-only review could accidentally overstate.

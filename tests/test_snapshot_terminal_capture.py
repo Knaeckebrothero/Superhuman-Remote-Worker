@@ -41,6 +41,23 @@ def _host_key_scan_process() -> tuple[MagicMock, str]:
     return process, fingerprint
 
 
+def test_orchestrator_runtime_images_include_snapshot_validator() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    for relative_path in (
+        "docker/Dockerfile.orchestrator",
+        "docker/Dockerfile.orchestrator.dev",
+    ):
+        dockerfile = (repository / relative_path).read_text(encoding="utf-8")
+        runtime_stage = dockerfile.rsplit("FROM python:3.11-slim", 1)[1]
+        runtime_packages = runtime_stage.split(
+            "RUN apt-get update && apt-get install -y --no-install-recommends", 1
+        )[1].split("&& rm -rf /var/lib/apt/lists/*", 1)[0]
+
+        assert "\n    zstd \\" in runtime_packages, (
+            f"{relative_path} must install zstd in its runtime stage"
+        )
+
+
 @pytest.mark.asyncio
 async def test_strict_capture_rejects_partial_archive_from_failed_tar() -> None:
     service = SnapshotService()
@@ -71,6 +88,54 @@ async def test_strict_capture_rejects_partial_archive_from_failed_tar() -> None:
     assert captured is False
     service.upload_snapshot.assert_not_awaited()
     assert failed.stderr.read.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_strict_archive_validation_preserves_validator_stderr() -> None:
+    service = SnapshotService()
+    service._available = True
+    service._set_snapshot_context = AsyncMock()
+    service.upload_snapshot = AsyncMock(return_value=True)
+    capture = _capture_process(stdout=[b"complete-archive"], returncode=0)
+    verify = MagicMock()
+    verify.stderr.read = AsyncMock(
+        side_effect=[b"bash: line 1: zstd: command not found\n", b""]
+    )
+    verify.wait = AsyncMock(return_value=127)
+    verify.returncode = 127
+    scan, fingerprint = _host_key_scan_process()
+    create = AsyncMock(side_effect=[scan, capture, verify])
+
+    with patch(
+        "orchestrator.services.snapshot_service.asyncio.create_subprocess_exec",
+        new=create,
+    ):
+        captured = await service.capture_vm_snapshot(
+            job_id="terminal-thread",
+            ssh_host="10.0.0.5",
+            ssh_port=30022,
+            source_type="pod",
+            entity_type="threads",
+            expected_host_key_fingerprint=fingerprint,
+            strict_terminal=True,
+        )
+
+    assert captured is False
+    service.upload_snapshot.assert_not_awaited()
+    validator_command = create.await_args_list[2].args[-1]
+    assert "zstd -t --" in validator_command
+    assert ">/dev/null 2>&1" not in validator_command
+    service._set_snapshot_context.assert_any_await(
+        "terminal-thread",
+        {
+            "status": "capture_failed",
+            "error": (
+                "terminal snapshot archive validation failed: "
+                "bash: line 1: zstd: command not found\n"
+            ),
+        },
+        entity_type="threads",
+    )
 
 
 @pytest.mark.asyncio

@@ -272,6 +272,8 @@ class WorkspaceInstanceManager:
         snapshot_service: Any,
         db: Any,
         label_selector: str = _LABEL_SELECTOR,
+        *,
+        completion_commands_enabled: bool = False,
     ):
         # Loose typing matches the agent manager — production passes the
         # singleton modules; tests pass mocks. Only the methods used here
@@ -281,6 +283,13 @@ class WorkspaceInstanceManager:
         self._snapshot = snapshot_service
         self._db = db
         self._label_selector = label_selector
+        # Gate-3 step 3 owns terminal workspace teardown while a durable
+        # completion command is unfinished.  This is deliberately constructor-
+        # gated (rather than reading the environment here) so flag-off callers
+        # preserve the exact legacy path, including zero reads of the new
+        # relations.  Step 4's routed lifecycle sweep will eventually replace
+        # this conservative ownership veto.
+        self._completion_commands_enabled = completion_commands_enabled
         # Reachability probe cache: pod_ip -> (probed_at, ok). Single
         # orchestrator process, so a plain dict is sufficient.
         self._reach_cache: dict[str, tuple[float, bool]] = {}
@@ -358,6 +367,10 @@ class WorkspaceInstanceManager:
                     metadata["snapshot_attempts"] = ws_ctx.get("snapshot_attempts") or 0
                     snap = ctx.get("snapshot") or {}
                     metadata["snapshot_status"] = snap.get("status")
+                    if self._completion_commands_enabled:
+                        metadata[
+                            "completion_finalization_owned"
+                        ] = await self._completion_finalization_owns_workspace(job_id)
                     # Only a reapable-status parent can be torn down, so only
                     # then does the live-child guard matter — skip the query
                     # otherwise. Keys the guard on the real dependency (a critic
@@ -386,6 +399,10 @@ class WorkspaceInstanceManager:
             # stateless session workspace.  In particular, a Failed pod must
             # not take the reconciler's immediate unhealthy-delete shortcut.
             return True
+        if inst.metadata.get("completion_finalization_owned"):
+            # The durable S36 effect, not the unhealthy shortcut, owns this
+            # exact workspace while the command remains unfinished.
+            return True
         # Phase 2a: phase Running is the cheap signal. Phase 2b adds a
         # crash detector that catches Unknown/Failed pods explicitly.
         return inst.metadata.get("pod_phase") in (None, "Running", "Pending")
@@ -399,6 +416,8 @@ class WorkspaceInstanceManager:
         bound work is in a quiescent state, regardless of how long.
         """
         if _is_stateless_thread_instance(inst):
+            return False
+        if inst.metadata.get("completion_finalization_owned"):
             return False
         if inst.metadata.get("has_live_shared_child"):
             return False
@@ -437,6 +456,8 @@ class WorkspaceInstanceManager:
         docs/issues/reviewing_parent_pod_reaped_under_critic.md.
         """
         if _is_stateless_thread_instance(inst):
+            return False
+        if inst.metadata.get("completion_finalization_owned"):
             return False
         if inst.metadata.get("has_live_shared_child"):
             return False
@@ -641,6 +662,8 @@ class WorkspaceInstanceManager:
         """
         if _is_stateless_thread_instance(inst):
             return
+        if await self._completion_finalization_owns_instance(inst):
+            return
         bound = inst.bound_to
         if not bound:
             return
@@ -667,6 +690,12 @@ class WorkspaceInstanceManager:
         snapshot path isn't usable for this instance.
         """
         if _is_stateless_thread_instance(inst):
+            return None
+        if await self._completion_finalization_owns_instance(inst):
+            logger.info(
+                "Lifecycle snapshot deferred to completion finalizer for job %s",
+                inst.bound_to,
+            )
             return None
         if self._snapshot is None or not getattr(self._snapshot, "is_available", False):
             return None
@@ -753,6 +782,12 @@ class WorkspaceInstanceManager:
 
     async def delete(self, inst: Instance, grace_s: int) -> None:
         if _is_stateless_thread_instance(inst):
+            return
+        if await self._completion_finalization_owns_instance(inst):
+            logger.info(
+                "Lifecycle teardown deferred to completion finalizer for job %s",
+                inst.bound_to,
+            )
             return
         if not self._provisioner_ready():
             return
@@ -1001,6 +1036,11 @@ class WorkspaceInstanceManager:
             status = row["status"] if row else None
             if row is not None and status not in _TERMINAL_JOB_STATUSES:
                 continue  # job still active → keep its volume
+            # Recheck immediately before destructive orphan cleanup.  The live
+            # Pod path has the same action-time guard in delete(); PVC-only
+            # remnants never pass through that method.
+            if await self._completion_finalization_owns_workspace(job_id):
+                continue
             try:
                 if await self._provisioner._delete_pvc(
                     name,
@@ -1039,6 +1079,60 @@ class WorkspaceInstanceManager:
 
     def _provisioner_ready(self) -> bool:
         return bool(getattr(self._provisioner, "_k8s_available", False))
+
+    async def _completion_finalization_owns_workspace(self, job_id: str) -> bool:
+        """Whether durable completion currently owns this job's S36 teardown.
+
+        This is intentionally broader than the migration's sweep-exclusion
+        view.  Expired pending/finalizing rows are still owned by the finalizer
+        resume drain, and parked rows are an operator hold; letting the generic
+        lifecycle actor run a parallel snapshot/delete for any of them defeats
+        S36's UID-keyed replay contract.
+
+        Flag off returns before touching the DB.  Flag on fails closed on an
+        unavailable relation/DB because preserving a workspace is recoverable;
+        deleting one without knowing who owns it is not.
+        """
+
+        if not self._completion_commands_enabled:
+            return False
+        if self._db is None or not job_id:
+            return True
+        try:
+            async with self._db.acquire() as conn:
+                return bool(
+                    await conn.fetchval(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM job_completion_commands
+                            WHERE job_id = $1::uuid
+                              AND state IN ('pending', 'finalizing', 'parked')
+                        )
+                        """,
+                        job_id,
+                    )
+                )
+        except Exception:
+            logger.exception(
+                "Completion ownership lookup failed for job %s; preserving workspace",
+                job_id,
+            )
+            return True
+
+    async def _completion_finalization_owns_instance(self, inst: Instance) -> bool:
+        """Action-time S36 ownership check for job-bound workspaces only."""
+
+        if not self._completion_commands_enabled:
+            return False
+        labels = inst.metadata.get("labels") or {}
+        if "srw/thread-id" in labels or inst.metadata.get("thread_status") is not None:
+            return False
+        if not inst.bound_to:
+            # A list-time positive remains a veto even for a malformed test or
+            # partially observed instance that lost its bound identifier.
+            return bool(inst.metadata.get("completion_finalization_owned"))
+        return await self._completion_finalization_owns_workspace(str(inst.bound_to))
 
     async def _list_pods(self) -> list[Any]:
         try:

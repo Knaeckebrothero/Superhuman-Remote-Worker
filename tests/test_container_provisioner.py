@@ -703,6 +703,7 @@ class TestReleaseWorkspace:
             owner,
             expected_runtime_incarnation=runtime,
             wait_for_exact_absence=True,
+            exact_absence_timeout_seconds=30.0,
         )
 
 
@@ -4762,6 +4763,93 @@ class TestWorkspaceNamedResourceAuthority:
         p._delete_service.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_s36_absence_timeout_finishes_after_default_window_first_try(
+        self,
+    ):
+        """S36 can exceed the old 30-second poll without exceeding HTTP timeout."""
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
+
+        class _NotFound(Exception):
+            status = 404
+
+        p = self._provisioner()
+        p.workspace_pod_authority = AsyncMock(
+            side_effect=["exact_live", "exact_terminal"]
+        )
+        p.get_workspace_status = AsyncMock(
+            return_value={
+                "runtime_incarnation": self.POD_UID,
+                "pod_ip": "10.0.0.8",
+                "ready": True,
+            }
+        )
+        p._delete_seed_configmap = AsyncMock(return_value=True)
+        p._set_context = AsyncMock()
+        p.delete_workspace_pvc = AsyncMock(return_value=True)
+        p._delete_service = AsyncMock(return_value=True)
+
+        # The initial authority read plus 31 one-second absence polls still see
+        # the captured UID. The next poll finally reaches authoritative 404.
+        # A 30-second bound would return False before that last poll.
+        reads = 0
+        captured_pod = _owned_pod(self.OWNER, uid=self.POD_UID)
+
+        def read_pod(**_kwargs):
+            nonlocal reads
+            reads += 1
+            if reads <= 32:
+                return captured_pod
+            raise _NotFound()
+
+        p._core_api.read_namespaced_pod.side_effect = read_pod
+        clock = {"now": 0.0}
+        loop = MagicMock()
+        loop.time.side_effect = lambda: clock["now"]
+
+        async def advance_clock(seconds):
+            clock["now"] += seconds
+
+        with (
+            patch(
+                "orchestrator.services.container_provisioner.asyncio.get_event_loop",
+                return_value=loop,
+            ),
+            patch(
+                "orchestrator.services.container_provisioner.asyncio.sleep",
+                new=advance_clock,
+            ),
+            patch(
+                "orchestrator.services.container_provisioner.workspace_metering.close_interval",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            released = await p.release_workspace(
+                self.OWNER,
+                teardown_identity=WorkspaceTeardownIdentity(
+                    pod_uid=self.POD_UID,
+                    pvc_uid=self.RESOURCE_UID,
+                    service_uid=self.RESOURCE_UID,
+                    pod_ip="10.0.0.8",
+                ),
+                capture_snapshot=False,
+                strict=True,
+                exact_absence_timeout_seconds=45.0,
+            )
+
+        assert released is True
+        assert clock["now"] == 31.0
+        assert reads == 33
+        assert p._core_api.delete_namespaced_pod.call_count == 1
+        assert p._core_api.delete_namespaced_pod.call_args.kwargs["body"] == {
+            "gracePeriodSeconds": 10,
+            "preconditions": {"uid": self.POD_UID},
+        }
+        p.delete_workspace_pvc.assert_awaited_once()
+        p._delete_service.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_s36_strict_release_captures_command_keyed_terminal_snapshot(self):
         from orchestrator.services.container_provisioner import (
             WorkspaceTeardownIdentity,
@@ -4939,8 +5027,14 @@ class TestWorkspaceNamedResourceAuthority:
             wait_for_exact_absence=True,
             captured_teardown_uid=self.POD_UID,
         )
-        assert p._core_api.delete_namespaced_pod.call_args.kwargs["body"] == {
-            "preconditions": {"uid": self.POD_UID}
+        assert p._core_api.delete_namespaced_pod.call_args.kwargs == {
+            "name": self.OWNER.pod_name,
+            "namespace": p._namespace,
+            "grace_period_seconds": 10,
+            "body": {
+                "gracePeriodSeconds": 10,
+                "preconditions": {"uid": self.POD_UID},
+            },
         }
         p._set_context.assert_not_awaited()
 
@@ -4961,6 +5055,9 @@ class TestWorkspaceNamedResourceAuthority:
             expected_runtime_incarnation=self.POD_UID,
             wait_for_exact_absence=True,
         )
+        assert p._core_api.delete_namespaced_pod.call_args.kwargs["body"] == {
+            "preconditions": {"uid": self.POD_UID}
+        }
         p._set_context.assert_not_awaited()
 
     @pytest.mark.asyncio
