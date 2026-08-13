@@ -284,6 +284,7 @@ def _accepted(
     outcome: dict | None = None,
     winning_report_seq: int | None = None,
     abandoned_effects: tuple[str, ...] = (),
+    queue_terminalized: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         disposition=disposition,
@@ -296,7 +297,7 @@ def _accepted(
         winning_report_seq=winning_report_seq,
         abandoned_effects=abandoned_effects,
         client_report_id=str(REPORT_ID),
-        queue_terminalized=False,
+        queue_terminalized=queue_terminalized,
         accepted_job_status="processing",
     )
 
@@ -2736,7 +2737,7 @@ async def test_default_off_bypasses_command_module_and_preserves_legacy_contract
 async def test_accepted_stateless_command_does_not_recheck_terminalized_worker_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Accept owns the worker fence; legacy mode still checks the live lease."""
+    """The persisted workflow owns the accepted fence; legacy checks the lease."""
 
     from src.shared import worker_queue
 
@@ -2745,32 +2746,20 @@ async def test_accepted_stateless_command_does_not_recheck_terminalized_worker_l
     database = _RouteDB(job)
     runner = _RecordingRunner()
     stale_lease = AsyncMock(return_value=False)
-    accept = AsyncMock(return_value=_accepted("fresh"))
-
-    async def finalize(command_id, *, callback, inline):
-        assert command_id == COMMAND_ID
-        assert inline is True
-        outcome = await callback(runner)
-        return SimpleNamespace(
-            disposition="done",
-            state="done",
-            outcome=outcome,
-        )
-
-    finalizer = SimpleNamespace(finalize_command=AsyncMock(side_effect=finalize))
     monkeypatch.setattr(main, "postgres_db", database)
     monkeypatch.setattr(main, "require_internal", AsyncMock())
-    monkeypatch.setattr(
-        main, "_get_completion_finalizer", MagicMock(return_value=finalizer)
-    )
-    monkeypatch.setattr(commands, "accept_completion_command", accept)
     monkeypatch.setattr(worker_queue, "worker_lease_is_current", stale_lease)
 
     # Command admission already checked token 17 and terminalized that queue
-    # unit. The durable workflow must use its immutable accepted fence instead
-    # of requiring a lease that can no longer be live after accept.
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
-    handled = await main.complete_job(MagicMock(), JOB_ID, _body())
+    # unit. Invoke the persisted workflow directly: the HTTP route now returns
+    # 202 for this case and the background drain supplies the effect runner.
+    handled = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
 
     assert handled == {
         "status": "handled",
@@ -2779,7 +2768,6 @@ async def test_accepted_stateless_command_does_not_recheck_terminalized_worker_l
         "actions": ["late callback ignored; job already completed"],
     }
     stale_lease.assert_not_awaited()
-    accept.assert_awaited_once()
 
     # With the gate closed there is no accepted command fence, so the same
     # stale token must still fail the historical thin entry check.
@@ -2796,11 +2784,68 @@ async def test_accepted_stateless_command_does_not_recheck_terminalized_worker_l
         "job_id": JOB_ID,
         "lease_token": 17,
     }
-    assert accept.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_fresh_admission_precedes_inline_finalization_and_returns_exact_outcome(
+@pytest.mark.parametrize("admission_enabled", [False, True])
+async def test_fresh_stateless_accept_returns_exact_background_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    admission_enabled: bool,
+) -> None:
+    """Durable queue closure, not the current admission flag, selects 202."""
+
+    request = MagicMock()
+    body = _body()
+    database = object()
+    accepted = _accepted("fresh", queue_terminalized=True)
+    accept = AsyncMock(return_value=accepted)
+    legacy = AsyncMock(side_effect=AssertionError("stateless route must not inline"))
+    finalizer_getter = _forbid_finalizer(monkeypatch)
+
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(main, "COMPLETION_STATUS_REORDER_ENABLED", False)
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", admission_enabled)
+    monkeypatch.setattr(main, "postgres_db", database)
+    monkeypatch.setattr(main, "require_internal", AsyncMock())
+    monkeypatch.setattr(main, "_complete_job_legacy", legacy)
+    monkeypatch.setattr(commands, "accept_completion_command", accept)
+
+    response = await main.complete_job(request, JOB_ID, body)
+
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 202
+    assert _response_json(response) == {
+        "status": "accepted_pending",
+        "job_id": JOB_ID,
+        "command_id": COMMAND_ID,
+        "command_state": "pending",
+    }
+    assert "Idempotent-Replayed" not in response.headers
+    assert "Retry-After" not in response.headers
+    legacy.assert_not_awaited()
+    finalizer_getter.assert_not_called()
+    accept.assert_awaited_once_with(
+        database,
+        job_id=JOB_ID,
+        payload={
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": None,
+            "freeze_data": {
+                "freeze_type": "job_complete",
+                "summary": "done",
+            },
+        },
+        status_reorder_enabled=False,
+        lease_token=17,
+        agent_id=str(AGENT_ID),
+        client_report_id=str(REPORT_ID),
+        requested_by=f"agent:{AGENT_ID}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_fresh_pinned_admission_preserves_exact_inline_response_and_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = MagicMock()
@@ -2820,7 +2865,7 @@ async def test_fresh_admission_precedes_inline_finalization_and_returns_exact_ou
 
     async def accept(*args, **kwargs):
         events.append("accept")
-        return _accepted("fresh")
+        return _accepted("fresh", queue_terminalized=False)
 
     async def legacy(*args, **kwargs):
         events.append("legacy")
@@ -2845,6 +2890,7 @@ async def test_fresh_admission_precedes_inline_finalization_and_returns_exact_ou
     finalizer_getter = MagicMock(return_value=finalizer)
     delay = AsyncMock()
     monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
     monkeypatch.setattr(main, "COMPLETION_STATUS_REORDER_ENABLED", False)
     monkeypatch.setattr(main, "COMPLETION_FINALIZER_INLINE_DELAY_SECONDS", 0.0)
     monkeypatch.setattr(main.asyncio, "sleep", delay)
@@ -3076,7 +3122,12 @@ async def test_done_replay_returns_stored_outcome_with_idempotency_header(
         "actions": ["already finalized"],
     }
     accept = AsyncMock(
-        return_value=_accepted("replay_done", state="done", outcome=outcome)
+        return_value=_accepted(
+            "replay_done",
+            state="done",
+            outcome=outcome,
+            queue_terminalized=True,
+        )
     )
     legacy = AsyncMock()
     finalizer_getter = _forbid_finalizer(monkeypatch)
@@ -3096,10 +3147,14 @@ async def test_done_replay_returns_stored_outcome_with_idempotency_header(
 
 
 @pytest.mark.asyncio
-async def test_pending_replay_is_retryable_conflict(
+@pytest.mark.parametrize("command_state", ["pending", "finalizing"])
+async def test_pending_or_finalizing_replay_is_retryable_conflict(
     monkeypatch: pytest.MonkeyPatch,
+    command_state: str,
 ) -> None:
-    accept = AsyncMock(side_effect=commands.CompletionInProgress(COMMAND_ID, "pending"))
+    accept = AsyncMock(
+        side_effect=commands.CompletionInProgress(COMMAND_ID, command_state)
+    )
     legacy = AsyncMock()
     finalizer_getter = _forbid_finalizer(monkeypatch)
     monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
@@ -3112,7 +3167,7 @@ async def test_pending_replay_is_retryable_conflict(
 
     assert caught.value.status_code == 409
     assert caught.value.headers == {"Retry-After": "1"}
-    assert "pending" in str(caught.value.detail)
+    assert command_state in str(caught.value.detail)
     legacy.assert_not_awaited()
     finalizer_getter.assert_not_called()
 
@@ -3147,7 +3202,9 @@ async def test_divergent_replay_is_unprocessable(
 async def test_parked_replay_is_accepted_without_retry_after(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    accept = AsyncMock(return_value=_accepted("replay_parked", state="parked"))
+    accept = AsyncMock(
+        return_value=_accepted("replay_parked", state="parked", queue_terminalized=True)
+    )
     legacy = AsyncMock()
     finalizer_getter = _forbid_finalizer(monkeypatch)
     monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
@@ -3214,6 +3271,7 @@ async def test_operator_terminal_replays_return_their_durable_outcome(
             outcome=outcome,
             winning_report_seq=winning_seq,
             abandoned_effects=abandoned,
+            queue_terminalized=True,
         )
     )
     legacy = AsyncMock()

@@ -21635,6 +21635,23 @@ async def complete_job(
         accepted.job_id,
     )
 
+    # B4 closed this exact worker_batch lease in the acceptance transaction.
+    # The singleton durable drain owns every effect after accept; constructing
+    # an inline finalizer here would recreate the client-disconnect fuse that
+    # the stateless lane is designed to remove. Pinned reports retain their
+    # historical inline result because their acceptance does not terminalize a
+    # queue unit.
+    if accepted.disposition == "fresh" and accepted.queue_terminalized:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "accepted_pending",
+                "job_id": accepted.job_id,
+                "command_id": accepted.command_id,
+                "command_state": accepted.state,
+            },
+        )
+
     finalizer = _get_completion_finalizer()
     inline_error: HTTPException | None = None
 
