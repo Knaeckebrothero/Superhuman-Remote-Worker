@@ -445,3 +445,25 @@ class TestFailExpiredVmUpgradeJobs:
         with patch.object(orch_main, "postgres_db", db):
             assert await orch_main._fail_expired_vm_upgrade_jobs() == 0
         conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled", [False, True])
+    async def test_completion_route_exclusion_is_flag_gated(self, enabled):
+        db = MagicMock()
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[{"id": JOB_ID}])
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire = MagicMock(return_value=ctx)
+        with (
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", enabled),
+        ):
+            assert await orch_main._fail_expired_vm_upgrade_jobs() == 1
+
+        relation = "job_completion_sweep_exclusions"
+        select_sql = conn.fetch.await_args.args[0]
+        update_sql = conn.execute.await_args.args[0]
+        assert (relation in select_sql) is enabled
+        assert (relation in update_sql) is enabled

@@ -4026,3 +4026,67 @@ Inspect the force-deleted mid-S36 fixture (`7582ab02-…` / command
 command-keyed strict archive/manifest pair with the marker intact, and the
 captured Pod/PVC/Service UIDs absent. This is the highest-risk claim that a
 row-count-only review could accidentally overstate.
+
+# Session 15 — Gate 3 step 4, M1 routed rescuers (2026-08-13)
+
+Starting point was `develop` at `26327151`, with only the explicitly excluded
+untracked `HomeLab/`. Tilt and k3d were already up. The required non-fail-fast
+baseline produced **17,269 passed, 163 skipped, 11 failed**: one missing
+`arxiv` package case, one unavailable local-Postgres case, six MCP transport
+environment cases, two Semantic Scholar health cases, and one MCP agent-wiring
+case. Before M1 the preserved Gate-3 residue was exactly **2 parked + 1 pending
+commands and 2 pending effects**.
+
+## M1 shipped — route, do not redispatch
+
+- Extended the 0140 seed view into one report-order routing authority. It
+  exposes the oldest unfinished command for each job and classifies parked as
+  `alert_only`, a live finalizer term as `stand_down`, non-live deadline/cap
+  exhaustion as `park_alert`, and every other pending/expired term as
+  `resume_finalizer`. A live exact finalizer term wins even on its last allowed
+  attempt; retry-cap routing begins only after that lease expires.
+- Added a durable rescue-action ledger. A job-row-locked monotonic HWM allocates
+  the required `(job_id, attempt)` key; `(command_id, command_attempt)` is also
+  unique, so concurrent orphan, lease, registration, and pause rescuers share
+  one action. Exact action owners have renewable visibility leases, stale
+  owners cannot finish, and a router crash is reclaimable without allocating a
+  second action.
+- Added a flag-gated `CompletionSweepRouter`. `resume_finalizer` and
+  `park_alert` call the existing exact-ID finalizer with `inline=False`; they
+  never queue or dispatch an agent. Parked rows only raise a deduplicated
+  officer incident. If the command crosses its deadline between classification
+  and finalizer claim, that same action is promoted to `park_alert`, preserving
+  both the unique key and the required alert. Fresh pending rows respect their
+  existing `run_after` grace.
+- Every class-1 legacy mutation now consumes the shared view when
+  `COMPLETION_COMMANDS_ENABLED` is on: all four orphan-recovery arms, expired
+  jobs-row leases, same-host agent replacement, LLM/infra list-and-claim paths,
+  the LLM ceiling fail arm, and VM-upgrade expiry. An unfinished command blocks
+  those mutations regardless of lease state; the router—not the legacy
+  rescuer—handles expiry. With the flag off the injected clause is literally
+  empty, so the SQL contains no reference to any Gate-3 relation.
+- Lifespan starts and awaits the router only beside the already-enabled
+  completion drain. The default-off process does not import or construct it.
+
+Tilt applied 0141 while its first version was visible. When the final live-term
+precedence correction changed its checksum, the migration runner correctly
+refused startup. No migration row or fixture was edited: 0141 was restored
+byte-for-byte to its applied SHA-256 (`e8c8c577043d…`) and frozen, and the
+correction moved into forward-only migration 0142. The regenerated schema
+replays both files. This is why M2 begins at 0143.
+
+Live k3d proof after 0142: the router left the preserved command/effect states
+unchanged, allocated exactly one completed `alert_only` action for each of the
+two parked commands, and did not expose or execute the report-seq-2 pending
+successor behind its parked predecessor. No manual row cleanup or state
+fabrication was performed.
+
+Verification at the M1 boundary: the focused affected matrix passed **186/186**,
+including real-Postgres routing rows, oldest-report ordering, two-router
+contention, action heartbeat/takeover, exact stale-owner refusal, all legacy
+rescuer families, flag-off zero-relation SQL, and the hardest expired-command
+case (the no-command twin pauses while the command-owned job is untouched).
+The repository-wide suite produced **17,336 passed, 163 skipped, 11 failed**,
+with the exact baseline failure list and no new failure. Squawk v2.59.0 found
+zero issues in 0141+0142; schema snapshot freshness/idempotence, repository-wide
+Ruff check and format check (1,122 files), and whitespace checks pass.

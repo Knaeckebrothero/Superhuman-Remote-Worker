@@ -1741,7 +1741,10 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
 
             # 4. Propagate: jobs assigned to offline agents → paused
             recovered = await _step(
-                "orphaned_job_recovery", postgres_db.recover_orphaned_jobs()
+                "orphaned_job_recovery",
+                postgres_db.recover_orphaned_jobs(
+                    completion_commands_enabled=COMPLETION_COMMANDS_ENABLED
+                ),
             )
             if recovered:
                 logger.info(
@@ -1770,7 +1773,10 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
             # as belt-and-suspenders during the soak
             # (docs/features/job_execution_lease.md).
             expired = await _step(
-                "lease_expiry_recovery", postgres_db.recover_expired_lease_jobs()
+                "lease_expiry_recovery",
+                postgres_db.recover_expired_lease_jobs(
+                    completion_commands_enabled=COMPLETION_COMMANDS_ENABLED
+                ),
             )
             for _job_id in expired or []:
                 logger.warning(
@@ -1890,9 +1896,18 @@ async def _fail_expired_vm_upgrade_jobs() -> int:
     vm_upgrade requests are all decided/expired (none pending) is picked up
     regardless of when the window closed. Returns the number of jobs failed.
     """
+    completion_exclusion = (
+        ""
+        if not COMPLETION_COMMANDS_ENABLED
+        else (
+            " AND NOT EXISTS ("
+            "SELECT 1 FROM job_completion_sweep_exclusions AS completion_route "
+            "WHERE completion_route.job_id = j.id)"
+        )
+    )
     async with postgres_db.acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT j.id
             FROM jobs j
             WHERE j.status = 'paused'
@@ -1907,13 +1922,24 @@ async def _fail_expired_vm_upgrade_jobs() -> int:
                   WHERE s.job_id = j.id AND s.request_type = 'vm_upgrade'
                     AND s.status = 'pending'
               )
+              {completion_exclusion}
             """
         )
         for row in rows:
+            update_exclusion = (
+                ""
+                if not COMPLETION_COMMANDS_ENABLED
+                else (
+                    " AND NOT EXISTS ("
+                    "SELECT 1 FROM job_completion_sweep_exclusions "
+                    "AS completion_route "
+                    "WHERE completion_route.job_id = jobs.id)"
+                )
+            )
             await conn.execute(
-                "UPDATE jobs SET status = 'failed', freeze_data = NULL, "
+                f"UPDATE jobs SET status = 'failed', freeze_data = NULL, "
                 "error_message = $2, updated_at = CURRENT_TIMESTAMP "
-                "WHERE id = $1 AND status = 'paused'",
+                f"WHERE id = $1 AND status = 'paused'{update_exclusion}",
                 row["id"],
                 "vm_upgrade_expired: the VM-upgrade approval window (24h) "
                 "closed with no decision. Re-run or resume the job — the sudo "
@@ -9855,7 +9881,8 @@ class CustomJSONResponse(JSONResponse):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global _completion_finalizer_instance, _shutdown_event
+    global _completion_finalizer_instance, _completion_sweep_router_instance
+    global _shutdown_event
 
     # Hard-fail if the legacy LLM_BASE_URL env var is set. The env-var-driven
     # routing for self-hosted "Local" group models was removed in chunk 6 of
@@ -10967,10 +10994,16 @@ async def lifespan(app: FastAPI):
     # it must never be wrapped in the orchestrator advisory-leader helper.
     # Keep even the module import dark while the default-off gate is closed.
     completion_finalizer_task = None
+    completion_sweep_router_task = None
     if COMPLETION_COMMANDS_ENABLED:
+        completion_finalizer = _get_completion_finalizer()
         completion_finalizer_task = asyncio.create_task(
-            _get_completion_finalizer().run_drain(_shutdown_event),
+            completion_finalizer.run_drain(_shutdown_event),
             name="completion-finalizer-drain",
+        )
+        completion_sweep_router_task = asyncio.create_task(
+            _get_completion_sweep_router().run(_shutdown_event),
+            name="completion-sweep-router",
         )
     security_events_prune_task = asyncio.create_task(
         security_events_prune_sweeper(_shutdown_event)
@@ -11228,6 +11261,8 @@ async def lifespan(app: FastAPI):
     await run_queue_reaper_task
     if completion_finalizer_task is not None:
         await completion_finalizer_task
+    if completion_sweep_router_task is not None:
+        await completion_sweep_router_task
     await security_events_prune_task
     await checkpoint_retention_task
     await headless_notify_task
@@ -11292,6 +11327,7 @@ async def lifespan(app: FastAPI):
         await audit_db.disconnect()
     await postgres_db.disconnect()
     _completion_finalizer_instance = None
+    _completion_sweep_router_instance = None
 
 
 app = FastAPI(
@@ -16817,7 +16853,10 @@ async def _llm_outage_sweep_once() -> tuple[int, int]:
     """
     from services.completion import _parse_context, evaluate_llm_outage
 
-    due = await postgres_db.list_due_llm_outage_jobs(limit=50)
+    due = await postgres_db.list_due_llm_outage_jobs(
+        limit=50,
+        completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+    )
     if not due:
         return (0, 0)
 
@@ -16837,7 +16876,11 @@ async def _llm_outage_sweep_once() -> tuple[int, int]:
                 f"the outage sweeper. Check the model endpoint/provider "
                 f"(Admin → Models)."
             )
-            if await postgres_db.fail_llm_outage_job(job_id, reason):
+            if await postgres_db.fail_llm_outage_job(
+                job_id,
+                reason,
+                completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+            ):
                 failed += 1
                 logger.error(f"LLM-outage sweeper: job {job_id} FAILED — {reason}")
                 fd = job.get("freeze_data")
@@ -16873,7 +16916,10 @@ async def _llm_outage_sweep_once() -> tuple[int, int]:
                             f"sweep-fail parent unblock for {job_id} failed: {e}"
                         )
             continue
-        if await postgres_db.claim_llm_outage_redispatch(job_id):
+        if await postgres_db.claim_llm_outage_redispatch(
+            job_id,
+            completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+        ):
             redispatched += 1
 
     if redispatched:
@@ -16922,12 +16968,20 @@ async def _infra_transient_sweep_once() -> tuple[int, int]:
     time in the ``/complete`` handler (a job past it is failed there and never
     reaches 'paused'), so this sweeper only has to release due jobs.
     """
-    due = await postgres_db.list_due_backoff_jobs("infra_transient", limit=50)
+    due = await postgres_db.list_due_backoff_jobs(
+        "infra_transient",
+        limit=50,
+        completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+    )
     redispatched = 0
     for row in due:
         job_id = str(row["id"])
         try:
-            if await postgres_db.claim_backoff_redispatch(job_id, "infra_transient"):
+            if await postgres_db.claim_backoff_redispatch(
+                job_id,
+                "infra_transient",
+                completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+            ):
                 redispatched += 1
                 logger.info(
                     "Job %s: transient-infra backoff elapsed — released for "
@@ -19296,6 +19350,7 @@ async def complete_job(
 
 _DURABLE_COMPLETION_HTTP_ERROR = "_completion_http_error"
 _completion_finalizer_instance: Any | None = None
+_completion_sweep_router_instance: Any | None = None
 
 
 def _durable_completion_http_outcome(exc: HTTPException) -> dict[str, Any]:
@@ -19360,6 +19415,34 @@ def _get_completion_finalizer() -> Any:
             workflow=_run_persisted_completion_workflow,
         )
     return _completion_finalizer_instance
+
+
+async def _completion_sweep_operator_alert(message: str) -> None:
+    """Turn one deduplicated routed-sweep incident into an officer wake."""
+
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()[:32]
+    await notify_all_officers(
+        postgres_db,
+        source="completion_sweep",
+        dedup_key=f"completion_sweep:{digest}",
+        payload={"summary": message[:1000]},
+    )
+    _kick_officer_event_drain(postgres_db)
+
+
+def _get_completion_sweep_router() -> Any:
+    """Lazily build the class-1 router only while commands are enabled."""
+
+    global _completion_sweep_router_instance
+    if _completion_sweep_router_instance is None:
+        from services.completion_sweep_router import CompletionSweepRouter
+
+        _completion_sweep_router_instance = CompletionSweepRouter(
+            postgres_db,
+            _get_completion_finalizer(),
+            alert=_completion_sweep_operator_alert,
+        )
+    return _completion_sweep_router_instance
 
 
 _LEGACY_COMPLETION_EFFECT_PLAN: tuple[tuple[str, str], ...] = (
@@ -28181,6 +28264,7 @@ async def register_agent(
             build_sha=registration.build_sha,
             product_provenance=registration.product_provenance.model_dump(mode="json"),
             pod_uid=registration.pod_uid,
+            completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
         )
         if registration.agent_mode == "persistent" and registration.thread_id:
             # The lane check must precede the hostname upsert.  Its result ID

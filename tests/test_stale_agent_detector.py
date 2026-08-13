@@ -111,8 +111,12 @@ async def test_step_failure_does_not_block_downstream_recovery():
     db.reap_orphaned_session_agents.assert_awaited_once()
     db.mark_orphaned_threads_ended.assert_awaited_once()
     db.mark_orphaned_threads_suspended.assert_awaited_once()
-    db.recover_orphaned_jobs.assert_awaited_once()
-    db.recover_expired_lease_jobs.assert_awaited_once()
+    db.recover_orphaned_jobs.assert_awaited_once_with(
+        completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED
+    )
+    db.recover_expired_lease_jobs.assert_awaited_once_with(
+        completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED
+    )
     db.gc_offline_agents.assert_awaited_once()
 
 
@@ -132,7 +136,9 @@ async def test_lease_expiry_recovery_runs_and_triggers_dispatch():
     ):
         await main.stale_agent_detector(shutdown_event)
 
-    db.recover_expired_lease_jobs.assert_awaited_once()
+    db.recover_expired_lease_jobs.assert_awaited_once_with(
+        completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED
+    )
     trigger_dispatch.assert_called_once()
 
 
@@ -152,5 +158,7 @@ async def test_lease_recovery_survives_orphan_recovery_failure():
     ):
         await main.stale_agent_detector(shutdown_event)
 
-    db.recover_expired_lease_jobs.assert_awaited_once()
+    db.recover_expired_lease_jobs.assert_awaited_once_with(
+        completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED
+    )
     db.gc_offline_agents.assert_awaited_once()
