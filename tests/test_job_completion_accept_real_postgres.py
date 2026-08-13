@@ -28,6 +28,7 @@ from orchestrator.services.job_completion_commands import (
     CompletionAcceptResult,
     CompletionFenceRejected,
     CompletionInProgress,
+    CompletionNonTerminalReport,
     CompletionPayloadMismatch,
     accept_completion_command,
     canonical_completion_payload,
@@ -74,8 +75,13 @@ async def pg(pg_dsn, _schema_applied):
 
 
 def _payload(label: str = "complete") -> dict[str, object]:
+    # should_stop mirrors the real JobCompleteRequest: every genuine stop
+    # declares it, and the stateless accept arm REJECTS a falsy value
+    # (CompletionNonTerminalReport) — a continue-shaped report would
+    # B4-terminalize the queue row under a job that stays `processing`.
     return {
         "status": "completed",
+        "should_stop": True,
         "result": {"summary": label, "ok": True},
         "freeze_data": {"type": "job_complete", "reason": label},
     }
@@ -207,6 +213,63 @@ async def test_pinned_accept_requires_the_exact_assigned_agent(pg):
             rejected_job_id,
         )
     assert dict(rejected_state) == {"completion_seq_hwm": 0, "command_count": 0}
+
+
+@pytest.mark.asyncio
+async def test_stateless_accept_rejects_non_terminal_report_without_any_mutation(
+    pg,
+):
+    """The live wedge from the step-5 hand-check (job a61d9940): a
+    continue-shaped report (should_stop false) must be refused BEFORE any
+    write — accepting it B4-terminalizes the queue row under a job that
+    stays `processing`, with no rescuer route left that matches."""
+    lease_token = 57
+    async with pg.acquire() as conn:
+        job_id = await _insert_job(conn, lane="stateless")
+        await _insert_worker_lease(conn, job_id=job_id, lease_token=lease_token)
+        before_queue = await conn.fetchrow(
+            "SELECT state, lease_token FROM run_queue WHERE unit_id = $1",
+            job_id,
+        )
+
+    non_terminal = _payload("continue")
+    non_terminal["should_stop"] = False
+    with pytest.raises(CompletionNonTerminalReport):
+        await _accept(
+            pg,
+            job_id=job_id,
+            payload=non_terminal,
+            lease_token=lease_token,
+            client_report_id=uuid4(),
+        )
+
+    # Absent should_stop is equally non-terminal: fail closed, not open.
+    absent = _payload("absent")
+    del absent["should_stop"]
+    with pytest.raises(CompletionNonTerminalReport):
+        await _accept(
+            pg,
+            job_id=job_id,
+            payload=absent,
+            lease_token=lease_token,
+            client_report_id=uuid4(),
+        )
+
+    async with pg.acquire() as conn:
+        after = await conn.fetchrow(
+            "SELECT state, lease_token, "
+            "(SELECT count(*) FROM job_completion_commands "
+            " WHERE job_id = $1) AS command_count, "
+            "(SELECT completion_seq_hwm FROM jobs WHERE id = $1) AS hwm "
+            "FROM run_queue WHERE unit_id = $1",
+            job_id,
+        )
+    assert after["state"] == before_queue["state"] == "leased", (
+        "a rejected continue-report must leave the worker lease untouched"
+    )
+    assert after["lease_token"] == before_queue["lease_token"]
+    assert after["command_count"] == 0, "no command row for a rejected report"
+    assert after["hwm"] == 0, "the report_seq cursor must not advance"
 
 
 @pytest.mark.asyncio

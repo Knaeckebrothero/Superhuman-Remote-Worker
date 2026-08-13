@@ -63,6 +63,22 @@ class CompletionPayloadMismatch(CompletionCommandError):
     """An idempotency key was reused with a different operation payload."""
 
 
+class CompletionNonTerminalReport(CompletionPayloadMismatch):
+    """A stateless report whose payload is not a terminal stop.
+
+    §5.4.5 decision (6): only a TERMINAL report may close the queue row in
+    the accept transaction. Rotations and recoverable-error continues go
+    through the queue and must never reach ``/complete`` on this lane —
+    half-accepting one would terminalize the unit under a job that stays
+    ``processing``, wedging it invisibly: the done command escapes the
+    exclusion view, the lane has no assigned agent for the orphan sweep and
+    no jobs-row lease for the expiry sweep. Found live by the step-5
+    hand-check (job a61d9940, command 2b028d0c). Subclasses
+    ``CompletionPayloadMismatch`` for its 422 mapping: the client must not
+    retry this payload.
+    """
+
+
 class CompletionInProgress(CompletionCommandError):
     """An exact duplicate exists but has not reached a terminal state."""
 
@@ -382,6 +398,18 @@ async def accept_completion_command(
                         "completion report does not hold the current worker lease"
                     )
                 accepted_token = int(lease_token)
+                # Only a terminal report may pass: accept B4-terminalizes the
+                # queue row below, and doing that for a continue-shaped
+                # payload strands the job in `processing` with no rescuer
+                # route (see CompletionNonTerminalReport). Pinned keeps
+                # accepting should_stop=false — the loop-continue report is a
+                # real pinned path.
+                if not bool(canonical_payload.get("should_stop")):
+                    raise CompletionNonTerminalReport(
+                        "stateless completion accepts only terminal reports "
+                        "(should_stop must be true); rotations and continues "
+                        "release through the queue, never /complete"
+                    )
             else:
                 if lease_token is not None or agent_id is None:
                     raise CompletionFenceRejected(
