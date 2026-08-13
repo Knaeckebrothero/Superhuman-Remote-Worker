@@ -23,6 +23,7 @@ MIGRATIONS = (
     MIGRATION_DIR / "0141_job_completion_sweep_routing.sql",
     MIGRATION_DIR / "0142_job_completion_sweep_route_precedence.sql",
     MIGRATION_DIR / "0143_job_completion_accept_status.sql",
+    MIGRATION_DIR / "0144_job_completion_status_reorder.sql",
 )
 
 
@@ -313,6 +314,26 @@ async def test_accepted_job_status_is_nullable_but_never_blank(conn):
 
 
 @pytest.mark.asyncio
+async def test_status_reorder_policy_is_non_null_and_default_off(conn):
+    job_id = await _job(conn)
+    command_id = await _insert_command(conn, job_id)
+
+    assert (
+        await conn.fetchval(
+            "SELECT status_reorder_enabled FROM job_completion_commands WHERE id=$1",
+            command_id,
+        )
+        is False
+    )
+    with pytest.raises(asyncpg.NotNullViolationError):
+        await conn.execute(
+            "UPDATE job_completion_commands SET status_reorder_enabled=NULL "
+            "WHERE id=$1",
+            command_id,
+        )
+
+
+@pytest.mark.asyncio
 async def test_0143_backfills_only_completed_s1_proof_and_normalizes_superseded(
     conn,
 ):
@@ -323,7 +344,7 @@ async def test_0143_backfills_only_completed_s1_proof_and_normalizes_superseded(
     await conn.execute("DROP TABLE IF EXISTS job_completion_commands CASCADE")
     await conn.execute("DROP TABLE IF EXISTS jobs CASCADE")
     await conn.execute("CREATE TABLE jobs (id UUID PRIMARY KEY)")
-    for migration in MIGRATIONS[:-1]:
+    for migration in MIGRATIONS[:-2]:
         await conn.execute(migration.read_text())
 
     job_id = await _job(conn)
@@ -359,7 +380,7 @@ async def test_0143_backfills_only_completed_s1_proof_and_normalizes_superseded(
         ],
     )
 
-    await conn.execute(MIGRATIONS[-1].read_text())
+    await conn.execute(MIGRATIONS[-2].read_text())
 
     rows = await conn.fetch(
         "SELECT id, accepted_job_status, state, error_code, finalizing_by, "

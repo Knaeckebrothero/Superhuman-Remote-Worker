@@ -25,7 +25,16 @@ from uuid import UUID, uuid5
 
 from src.shared.run_queue import complete_unit
 
+# ``v1`` is the already-shipped status-first workflow.  A reordered command
+# must carry a version an old image will refuse rather than silently executing
+# with its v1 order.  New executors intentionally support both while rolling;
+# explicit test/incident executors may still opt into one exact version.
 COMPLETION_CODE_VERSION = "job-completion-v1"
+COMPLETION_STATUS_REORDER_CODE_VERSION = "job-completion-v2"
+COMPLETION_SUPPORTED_CODE_VERSIONS = (
+    COMPLETION_CODE_VERSION,
+    COMPLETION_STATUS_REORDER_CODE_VERSION,
+)
 COMPLETION_DEADLINE_SECONDS = 24 * 60 * 60
 # Keep a newly accepted row away from the background candidate scan long
 # enough for the request's exact-ID inline claim.  The inline claim ignores
@@ -97,6 +106,7 @@ class CompletionAcceptResult:
     client_report_id: str
     queue_terminalized: bool
     accepted_job_status: str | None
+    status_reorder_enabled: bool = False
 
     @property
     def replayed(self) -> bool:
@@ -191,6 +201,7 @@ def _result_from_row(
             if row["accepted_job_status"] is not None
             else None
         ),
+        status_reorder_enabled=bool(row.get("status_reorder_enabled", False)),
     )
 
 
@@ -257,7 +268,8 @@ async def accept_completion_command(
     agent_id: str | None,
     client_report_id: str | None,
     requested_by: str,
-    code_version: str = COMPLETION_CODE_VERSION,
+    code_version: str | None = None,
+    status_reorder_enabled: bool = False,
 ) -> CompletionAcceptResult:
     """Accept one immutable completion report in a short fenced transaction."""
 
@@ -266,6 +278,16 @@ async def accept_completion_command(
     payload_json = _canonical_json(canonical_payload)
     digest = completion_payload_digest(str(job_uuid), canonical_payload)
     supplied_report_uuid = UUID(str(client_report_id)) if client_report_id else None
+    required_code_version = (
+        COMPLETION_STATUS_REORDER_CODE_VERSION
+        if status_reorder_enabled
+        else COMPLETION_CODE_VERSION
+    )
+    if code_version is not None and str(code_version) != required_code_version:
+        raise ValueError(
+            "completion code version does not match persisted status-reorder capability"
+        )
+    selected_code_version = required_code_version
 
     async with _connection(db) as conn:
         async with conn.transaction():
@@ -302,7 +324,8 @@ async def accept_completion_command(
                     """
                     SELECT id, job_id, report_seq, client_report_id, payload,
                            payload_digest, accepted_lease_token,
-                           accepted_agent_id, accepted_job_status, state, outcome
+                           accepted_agent_id, accepted_job_status,
+                           status_reorder_enabled, state, outcome
                     FROM job_completion_commands
                     WHERE job_id = $1::uuid AND client_report_id = $2::uuid
                     """,
@@ -406,17 +429,18 @@ async def accept_completion_command(
                     job_id, report_seq, client_report_id, payload,
                     payload_digest, accepted_lease_token, accepted_agent_id,
                     accepted_job_status, origin, requested_by, deadline_at,
-                    code_version, run_after
+                    code_version, run_after, status_reorder_enabled
                 ) VALUES (
                     $1::uuid, $2::bigint, $3::uuid, $4::jsonb,
                     $5::text, $6::bigint, $7::uuid,
                     $8::text, 'agent', $9::text,
                     now() + make_interval(secs => $10::float8), $11::text,
-                    now() + make_interval(secs => $12::float8)
+                    now() + make_interval(secs => $12::float8), $13::boolean
                 )
                 RETURNING id, job_id, report_seq, client_report_id, payload,
                           payload_digest, accepted_lease_token,
-                          accepted_agent_id, accepted_job_status, state, outcome
+                          accepted_agent_id, accepted_job_status,
+                          status_reorder_enabled, state, outcome
                 """,
                 job_uuid,
                 report_seq,
@@ -428,8 +452,9 @@ async def accept_completion_command(
                 str(job["status"]),
                 requested_by,
                 float(COMPLETION_DEADLINE_SECONDS),
-                code_version,
+                selected_code_version,
                 COMPLETION_INLINE_GRACE_SECONDS,
+                bool(status_reorder_enabled),
             )
             await conn.execute(
                 """
@@ -468,6 +493,8 @@ async def accept_completion_command(
 
 __all__ = [
     "COMPLETION_CODE_VERSION",
+    "COMPLETION_STATUS_REORDER_CODE_VERSION",
+    "COMPLETION_SUPPORTED_CODE_VERSIONS",
     "COMPLETION_INLINE_GRACE_SECONDS",
     "CompletionAcceptResult",
     "CompletionCommandError",

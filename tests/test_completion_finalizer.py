@@ -12,6 +12,7 @@ import asyncio
 import json
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
@@ -29,7 +30,10 @@ from orchestrator.services.completion_finalizer import (
     EFFECT_DETAIL_LIMIT_BYTES,
     LeaderTerm,
 )
-from orchestrator.services.job_completion_commands import COMPLETION_CODE_VERSION
+from orchestrator.services.job_completion_commands import (
+    COMPLETION_CODE_VERSION,
+    COMPLETION_STATUS_REORDER_CODE_VERSION,
+)
 
 
 NOW = datetime.now(UTC)
@@ -54,6 +58,7 @@ def _command(
     finalizing_by: str | None = None,
     deadline_at: datetime | None = None,
     code_version: str = COMPLETION_CODE_VERSION,
+    status_reorder_enabled: bool = False,
 ) -> dict[str, Any]:
     return {
         "id": command_id,
@@ -76,6 +81,7 @@ def _command(
         "deadline_at": deadline_at or NOW + timedelta(hours=1),
         "finalizing_by": finalizing_by,
         "code_version": code_version,
+        "status_reorder_enabled": status_reorder_enabled,
         "outcome": None,
         "finalized_at": None,
         "error_code": None,
@@ -94,10 +100,14 @@ class _StatefulConnection:
     """Small asyncpg stand-in that enforces the finalizer's SQL predicates."""
 
     def __init__(
-        self, *commands: dict[str, Any], job_status: str = "processing"
+        self,
+        *commands: dict[str, Any],
+        job_status: str = "processing",
+        job_context: dict[str, Any] | None = None,
     ) -> None:
         self.now = NOW
         self.job_status = job_status
+        self.job_context = dict(job_context or {})
         self.commands = {UUID(str(row["id"])): dict(row) for row in commands}
         self.effects: dict[tuple[UUID, str], dict[str, Any]] = {}
         self.leader: dict[str, Any] | None = None
@@ -150,8 +160,35 @@ class _StatefulConnection:
         if normalized.startswith("select * from job_completion_commands"):
             return self._row(args[0])
 
-        if normalized.startswith("select status::text as status from jobs"):
-            return {"status": self.job_status}
+        if normalized.startswith("select status::text as status"):
+            return {
+                "status": self.job_status,
+                "execution_lane": "pinned",
+                "context": dict(self.job_context),
+                "db_now_epoch": self.now.timestamp(),
+            }
+
+        if normalized.startswith("select min(effect.run_after) as run_after"):
+            command_id, owner = args[:2]
+            group = args[2] if len(args) == 3 else None
+            command_id = UUID(str(command_id))
+            if not self._command_term_live(command_id, owner):
+                return None
+            pending = [
+                effect
+                for (producer_id, _effect_name), effect in self.effects.items()
+                if producer_id == command_id
+                and (group is None or effect["effect_group"] == group)
+                and effect["state"] == "pending"
+            ]
+            if not pending:
+                return None
+            return {
+                "run_after": min(effect["run_after"] for effect in pending),
+                "exhausted": any(
+                    effect["attempts"] >= effect["max_attempts"] for effect in pending
+                ),
+            }
 
         if normalized.startswith(
             "select command.id, command.job_id, command.report_seq"
@@ -253,7 +290,15 @@ class _StatefulConnection:
         if normalized.startswith(
             "update job_completion_commands as command set state = 'parked'"
         ):
-            command_id, error_code, version_mismatch, code_version = args
+            (
+                command_id,
+                error_code,
+                version_mismatch,
+                code_versions,
+                capability_mismatch,
+                legacy_version,
+                reorder_version,
+            ) = args
             command = self.commands[UUID(str(command_id))]
             claimable_state = command["state"] == "pending" or (
                 command["state"] == "finalizing"
@@ -266,10 +311,21 @@ class _StatefulConnection:
                 command["deadline_at"] <= self.now
                 or command["attempts"] >= command["max_attempts"]
             )
-            version_failed = command["code_version"] != code_version
-            eligible_reason = (version_mismatch and version_failed) or (
-                not version_mismatch and exhausted
+            version_failed = command["code_version"] not in code_versions
+            pair_failed = not (
+                (
+                    command["code_version"] == legacy_version
+                    and not command["status_reorder_enabled"]
+                )
+                or (
+                    command["code_version"] == reorder_version
+                    and command["status_reorder_enabled"]
+                )
             )
+            eligible_reason = (
+                version_mismatch
+                and (version_failed or (capability_mismatch and pair_failed))
+            ) or (not version_mismatch and exhausted)
             if (
                 not claimable_state
                 or self._has_predecessor(command)
@@ -287,7 +343,15 @@ class _StatefulConnection:
         if normalized.startswith(
             "update job_completion_commands as command set state = 'finalizing'"
         ):
-            command_id, owner, code_version, lease_seconds, inline = args
+            (
+                command_id,
+                owner,
+                code_versions,
+                lease_seconds,
+                inline,
+                legacy_version,
+                reorder_version,
+            ) = args
             command_id = UUID(str(command_id))
             command = self.commands[command_id]
             claimable_state = command["state"] == "pending" or (
@@ -299,7 +363,15 @@ class _StatefulConnection:
             )
             if not all(
                 (
-                    command["code_version"] == code_version,
+                    command["code_version"] in code_versions,
+                    (
+                        command["code_version"] == legacy_version
+                        and not command["status_reorder_enabled"]
+                    )
+                    or (
+                        command["code_version"] == reorder_version
+                        and command["status_reorder_enabled"]
+                    ),
                     command["deadline_at"] > self.now,
                     command["attempts"] < command["max_attempts"],
                     claimable_state,
@@ -343,6 +415,7 @@ class _StatefulConnection:
                 "state": "pending",
                 "attempts": 1,
                 "max_attempts": 5,
+                "run_after": self.now,
                 "intent_at": self.now,
                 "complete_by": requested_complete_by,
                 "completed_at": None,
@@ -470,6 +543,28 @@ class _StatefulConnection:
             return dict(command)
 
         if normalized.startswith("update job_completion_commands set state = 'parked'"):
+            if "effect_group_attempts_exhausted" in normalized:
+                command_id, owner = args
+                command_id = UUID(str(command_id))
+                command = self.commands[command_id]
+                exhausted_effect = any(
+                    producer_id == command_id
+                    and effect["state"] == "pending"
+                    and effect["attempts"] >= effect["max_attempts"]
+                    for (producer_id, _), effect in self.effects.items()
+                )
+                if (
+                    not self._command_term_live(command_id, owner)
+                    or not exhausted_effect
+                ):
+                    return None
+                command.update(
+                    state="parked",
+                    error_code="effect_group_attempts_exhausted",
+                    finalizing_by=None,
+                    lease_expires_at=None,
+                )
+                return dict(command)
             command_id, owner, error_code = args
             command_id = UUID(str(command_id))
             command = self.commands[command_id]
@@ -489,9 +584,35 @@ class _StatefulConnection:
         if normalized.startswith(
             "update job_completion_commands set state = 'pending'"
         ):
-            command_id, owner, jitter = args
+            command_id, owner, third = args
             command_id = UUID(str(command_id))
             command = self.commands[command_id]
+            if "attempts = greatest" in normalized:
+                pending_effects = [
+                    effect
+                    for (producer_id, _), effect in self.effects.items()
+                    if producer_id == command_id and effect["state"] == "pending"
+                ]
+                if (
+                    not self._command_term_live(command_id, owner)
+                    or command["deadline_at"] <= self.now
+                    or not pending_effects
+                    or any(
+                        effect["attempts"] >= effect["max_attempts"]
+                        for effect in pending_effects
+                    )
+                ):
+                    return None
+                command.update(
+                    state="pending",
+                    attempts=max(command["attempts"] - 1, 0),
+                    run_after=third,
+                    error_code=None,
+                    finalizing_by=None,
+                    lease_expires_at=None,
+                )
+                return dict(command)
+            jitter = third
             if (
                 not self._command_term_live(command_id, owner)
                 or command["attempts"] >= command["max_attempts"]
@@ -544,6 +665,49 @@ class _StatefulConnection:
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
         normalized = self._record("fetchval", sql, args)
+
+        if normalized.startswith("update jobs set context = jsonb_set"):
+            (
+                command_id,
+                job_id,
+                owner,
+                version,
+                source,
+                expected_status,
+                expected_lane,
+                lease_seconds,
+            ) = args
+            command_id = UUID(str(command_id))
+            if (
+                UUID(str(job_id)) != JOB_ID
+                or not self._command_term_live(command_id, owner)
+                or self.job_status != expected_status
+            ):
+                return None
+            self.job_context["_completion_control_claim"] = {
+                "version": version,
+                "claim_id": str(command_id),
+                "source": source,
+                "expected_status": expected_status,
+                "expected_lane": expected_lane,
+                "fence_kind": "completion_command",
+                "fence_value": str(command_id),
+                "expires_epoch": self.now.timestamp() + float(lease_seconds),
+            }
+            return 1
+
+        if normalized.startswith("select 1 from job_completion_commands"):
+            command_id, job_id, owner = args
+            command_id = UUID(str(command_id))
+            command = self.commands.get(command_id)
+            return (
+                1
+                if command is not None
+                and command["job_id"] == UUID(str(job_id))
+                and self._command_term_live(command_id, owner)
+                and command["deadline_at"] > self.now
+                else None
+            )
 
         if normalized.startswith("select complete_by > now()"):
             command_id, name = args
@@ -843,6 +1007,149 @@ async def test_class_c_authority_guard_is_vacuous_without_s17() -> None:
     )
 
     await runner.assert_disposition_authority()
+
+
+@pytest.mark.asyncio
+async def test_pre_s17_entry_authority_requires_exact_status_and_live_term() -> None:
+    conn = _StatefulConnection(_finalizing(), job_status="processing")
+    command = conn.commands[COMMAND_ID]
+    command["resolved_entry_status"] = "processing"
+    runner = CompletionEffectRunner(conn, command=command, owner="owner-a")
+
+    await runner.assert_entry_authority()
+
+    conn.job_status = "cancelled"
+    with pytest.raises(CompletionDispositionSuperseded) as raised:
+        await runner.assert_entry_authority()
+    assert raised.value.observed_status == "cancelled"
+    assert raised.value.expected_statuses == ("processing",)
+
+    conn.job_status = "processing"
+    conn.commands[COMMAND_ID]["lease_expires_at"] = NOW - timedelta(seconds=1)
+    with pytest.raises(CompletionLeaseLost):
+        await runner.assert_entry_authority()
+
+
+@pytest.mark.asyncio
+async def test_pre_s17_entry_authority_fails_closed_on_active_control_claim() -> None:
+    conn = _StatefulConnection(
+        _finalizing(),
+        job_status="processing",
+        job_context={
+            "_completion_control_claim": {
+                "version": 1,
+                "claim_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "expires_epoch": NOW.timestamp() + 60,
+            }
+        },
+    )
+    command = conn.commands[COMMAND_ID]
+    command["resolved_entry_status"] = "processing"
+    runner = CompletionEffectRunner(conn, command=command, owner="owner-a")
+
+    with pytest.raises(CompletionDispositionSuperseded) as raised:
+        await runner.assert_entry_authority()
+
+    assert raised.value.observed_status == "processing:control_claimed"
+    assert raised.value.expected_statuses == ("processing",)
+
+
+@pytest.mark.asyncio
+async def test_delivery_control_installs_adopts_and_fences_expiry() -> None:
+    conn = _StatefulConnection(_finalizing(), job_status="processing")
+    command = conn.commands[COMMAND_ID]
+    command["resolved_entry_status"] = "processing"
+    runner = CompletionEffectRunner(conn, command=command, owner="owner-a")
+
+    assert await runner.acquire_delivery_control("processing") == str(COMMAND_ID)
+    marker = conn.job_context["_completion_control_claim"]
+    assert marker["claim_id"] == str(COMMAND_ID)
+    assert marker["source"] == "completion_delivery"
+    await runner.assert_delivery_control("processing")
+
+    # A successor term adopts the same stable command marker after a crash.
+    conn.commands[COMMAND_ID].update(
+        finalizing_by="owner-b", lease_expires_at=NOW + timedelta(minutes=2)
+    )
+    successor = CompletionEffectRunner(
+        conn, command=conn.commands[COMMAND_ID], owner="owner-b"
+    )
+    assert await successor.acquire_delivery_control("processing") == str(COMMAND_ID)
+    await successor.assert_delivery_control("processing")
+
+    conn.job_context["_completion_control_claim"]["expires_epoch"] = NOW.timestamp() - 1
+    with pytest.raises(CompletionDispositionSuperseded) as raised:
+        await successor.assert_delivery_control("processing")
+    assert raised.value.reason == "delivery_control_superseded"
+
+
+@pytest.mark.asyncio
+async def test_pending_group_query_is_exact_command_term_and_group() -> None:
+    conn = _StatefulConnection(_finalizing())
+    conn.effects[(COMMAND_ID, "graft")] = {
+        "effect_name": "graft",
+        "effect_group": "subjob_graft",
+        "state": "pending",
+        "attempts": 1,
+        "max_attempts": 5,
+        "run_after": NOW + timedelta(seconds=5),
+        "intent_at": NOW,
+        "complete_by": None,
+        "completed_at": None,
+        "detail": {},
+        "error_code": "retry",
+    }
+    runner = CompletionEffectRunner(
+        conn,
+        command=conn.commands[COMMAND_ID],
+        owner="owner-a",
+    )
+
+    assert await runner.has_pending_group("subjob_graft")
+    assert runner.requires_retry
+    assert not await runner.has_pending_group("terminal_delivery")
+
+    conn.commands[COMMAND_ID]["lease_expires_at"] = NOW - timedelta(seconds=1)
+    # Once observed, the durable block remains the release signal even if the
+    # exact term expires before CompletionFinalizer handles the workflow result.
+    assert await runner.has_pending_group("subjob_graft")
+
+
+@pytest.mark.asyncio
+async def test_preexisting_pending_group_releases_command_end_to_end() -> None:
+    conn = _StatefulConnection(_command())
+    retry_at = NOW + timedelta(seconds=5)
+    conn.effects[(COMMAND_ID, "graft")] = {
+        "effect_name": "graft",
+        "effect_group": "subjob_graft",
+        "state": "pending",
+        "attempts": 1,
+        "max_attempts": 5,
+        "run_after": retry_at,
+        "intent_at": NOW,
+        "complete_by": None,
+        "completed_at": None,
+        "detail": {"output": {"status": "retry"}},
+        "error_code": "retry",
+    }
+
+    async def workflow(runner: CompletionEffectRunner) -> dict[str, Any]:
+        assert await runner.has_pending_group("subjob_graft")
+        return {"status": "handled", "new_status": "processing"}
+
+    result = await CompletionFinalizer(
+        conn,
+        workflow=workflow,
+    ).finalize_command(str(COMMAND_ID))
+
+    assert result.disposition == "effects_pending"
+    assert result.state == "pending"
+    assert result.run_after == retry_at
+    command = conn.commands[COMMAND_ID]
+    assert command["state"] == "pending"
+    assert command["attempts"] == 0
+    assert command["finalizing_by"] is None
+    assert command["lease_expires_at"] is None
 
 
 @pytest.mark.asyncio
@@ -1555,6 +1862,98 @@ async def test_version_mismatch_parks_and_alerts_without_running_workflow() -> N
     assert conn.commands[COMMAND_ID]["state"] == "parked"
     assert workflow_called is False
     assert alerts and "stored code version" in alerts[0]
+
+
+@pytest.mark.asyncio
+async def test_new_default_accepts_reorder_v2_while_explicit_old_v1_parks_it() -> None:
+    reordered = _command(
+        code_version=COMPLETION_STATUS_REORDER_CODE_VERSION,
+        status_reorder_enabled=True,
+    )
+    new_conn = _StatefulConnection(reordered)
+
+    async def workflow(_runner: CompletionEffectRunner) -> dict[str, Any]:
+        return {"status": "handled", "new_status": "completed"}
+
+    accepted = await CompletionFinalizer(
+        new_conn,
+        workflow=workflow,
+    ).finalize_command(str(COMMAND_ID))
+    assert accepted.disposition == "done"
+
+    old_conn = _StatefulConnection(reordered)
+    refused = await CompletionFinalizer(
+        old_conn,
+        workflow=workflow,
+        code_version=COMPLETION_CODE_VERSION,
+    ).finalize_command(str(COMMAND_ID), inline=False)
+    assert refused.state == "parked"
+    assert refused.error_code == "code_version_mismatch"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code_version", "status_reorder_enabled"),
+    [
+        (COMPLETION_CODE_VERSION, True),
+        (COMPLETION_STATUS_REORDER_CODE_VERSION, False),
+    ],
+)
+async def test_malformed_persisted_version_capability_pair_parks(
+    code_version: str,
+    status_reorder_enabled: bool,
+) -> None:
+    conn = _StatefulConnection(
+        _command(
+            code_version=code_version,
+            status_reorder_enabled=status_reorder_enabled,
+        )
+    )
+
+    async def must_not_run(_runner: CompletionEffectRunner) -> dict[str, Any]:
+        raise AssertionError("malformed capability pair reached the workflow")
+
+    result = await CompletionFinalizer(
+        conn,
+        workflow=must_not_run,
+    ).finalize_command(str(COMMAND_ID), inline=False)
+
+    assert result.state == "parked"
+    assert result.error_code == "code_version_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_preclaim_supersede_refetches_terminal_without_claiming() -> None:
+    conn = _StatefulConnection(_command())
+    workflow_called = False
+
+    async def preclaim(command_id: str) -> SimpleNamespace:
+        assert command_id == str(COMMAND_ID)
+        command = conn.commands[COMMAND_ID]
+        command.update(
+            state="superseded",
+            outcome={"status": "superseded", "reason": "safety_net"},
+            error_code="safety_net_superseded",
+            finalized_at=NOW,
+        )
+        return SimpleNamespace(disposition="superseded")
+
+    async def workflow(_runner: CompletionEffectRunner) -> dict[str, Any]:
+        nonlocal workflow_called
+        workflow_called = True
+        return {"status": "handled"}
+
+    result = await CompletionFinalizer(
+        conn,
+        workflow=workflow,
+        preclaim=preclaim,
+    ).finalize_command(str(COMMAND_ID))
+
+    assert result.state == "superseded"
+    assert result.disposition == "terminal"
+    assert result.error_code == "safety_net_superseded"
+    assert workflow_called is False
+    assert conn.commands[COMMAND_ID]["attempts"] == 0
 
 
 @pytest.mark.asyncio

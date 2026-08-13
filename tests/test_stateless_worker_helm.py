@@ -57,6 +57,7 @@ def test_stateless_worker_gate_is_independent_and_default_off() -> None:
     assert config_map["data"]["STATELESS_SESSION_ENABLED"] == "false"
     assert config_map["data"]["STATELESS_WORKER_ENABLED"] == "false"
     assert config_map["data"]["COMPLETION_COMMANDS_ENABLED"] == "false"
+    assert config_map["data"]["COMPLETION_STATUS_REORDER_ENABLED"] == "false"
     assert config_map["data"]["COMPLETION_FINALIZER_INLINE_DELAY_SECONDS"] == "0"
     assert config_map["data"]["WORKER_BATCH_MIN_WALL_SECONDS"] == "300"
     assert config_map["data"]["LANGGRAPH_STRICT_MSGPACK"] == "true"
@@ -83,6 +84,30 @@ def test_worker_gate_requires_a_stateless_executor_pool() -> None:
     assert (
         "agent.stateless.worker.enabled requires agent.stateless.enabled"
         in rendered.stderr
+    )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_completion_status_reorder_requires_completion_commands() -> None:
+    command = [
+        "helm",
+        "template",
+        "stateless-worker-config-test",
+        str(CHART),
+        "-f",
+        str(CHART / "ci/test-values.yaml"),
+        "--set",
+        "orchestrator.completionCommandsEnabled=false",
+        "--set",
+        "orchestrator.completionStatusReorderEnabled=true",
+    ]
+
+    rendered = subprocess.run(command, capture_output=True, text=True)
+
+    assert rendered.returncode != 0
+    assert (
+        "orchestrator.completionStatusReorderEnabled requires "
+        "orchestrator.completionCommandsEnabled" in rendered.stderr
     )
 
 
@@ -270,6 +295,7 @@ def test_completion_command_gate_true_reaches_control_and_execution_planes() -> 
     documents = _render(
         "agent.stateless.enabled=true",
         "orchestrator.completionCommandsEnabled=true",
+        "orchestrator.completionStatusReorderEnabled=true",
         "orchestrator.completionFinalizerInlineDelaySeconds=15",
     )
     config_map = next(
@@ -280,6 +306,7 @@ def test_completion_command_gate_true_reaches_control_and_execution_planes() -> 
     )
     config_map_name = config_map["metadata"]["name"]
     assert config_map["data"]["COMPLETION_COMMANDS_ENABLED"] == "true"
+    assert config_map["data"]["COMPLETION_STATUS_REORDER_ENABLED"] == "true"
     assert config_map["data"]["COMPLETION_FINALIZER_INLINE_DELAY_SECONDS"] == "15"
 
     deployments = {
@@ -302,6 +329,12 @@ def test_completion_command_gate_true_reaches_control_and_execution_planes() -> 
     ] == {
         "name": config_map_name,
         "key": "COMPLETION_COMMANDS_ENABLED",
+    }
+    assert orchestrator_env["COMPLETION_STATUS_REORDER_ENABLED"]["valueFrom"][
+        "configMapKeyRef"
+    ] == {
+        "name": config_map_name,
+        "key": "COMPLETION_STATUS_REORDER_ENABLED",
     }
     assert orchestrator_env["COMPLETION_FINALIZER_INLINE_DELAY_SECONDS"]["valueFrom"][
         "configMapKeyRef"

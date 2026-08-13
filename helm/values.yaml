@@ -140,6 +140,10 @@ orchestrator:
   # -- Enable durable completion-command admission/finalization. Ships dark;
   # open only after the Gate-3 parity and crash-recovery proof is complete.
   completionCommandsEnabled: false
+  # -- Move terminal status behind Class B and delivery-gated completion
+  # effects. Independently revertible and invalid unless completion commands
+  # are also enabled.
+  completionStatusReorderEnabled: false
   # -- Local crash-recovery proof hook: pause after durable command acceptance
   # and before inline finalization. Keep at zero outside an intentional test.
   completionFinalizerInlineDelaySeconds: 0

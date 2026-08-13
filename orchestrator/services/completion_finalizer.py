@@ -27,7 +27,19 @@ from datetime import datetime
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from uuid import UUID, uuid4
 
-from services.job_completion_commands import COMPLETION_CODE_VERSION
+from services.completion_control import (
+    COMPLETION_CONTROL_CLAIM_KEY,
+    COMPLETION_CONTROL_CLAIM_SECONDS,
+    COMPLETION_CONTROL_CLAIM_VERSION,
+    COMPLETION_DELIVERY_CONTROL_SOURCE,
+    completion_control_claim_active,
+    completion_delivery_control_claim_owned_active,
+)
+from services.job_completion_commands import (
+    COMPLETION_CODE_VERSION,
+    COMPLETION_STATUS_REORDER_CODE_VERSION,
+    COMPLETION_SUPPORTED_CODE_VERSIONS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +56,7 @@ EFFECT_WRITE_MARGIN_SECONDS = 1.0
 EFFECT_COMMAND_LEASE_GAP_SECONDS = 5.0
 RETRY_BUCKET_CAPACITY = 10.0
 RETRY_BUCKET_REFILL_PER_SECOND = 1.0
+DELIVERY_CONTROL_SOURCE = COMPLETION_DELIVERY_CONTROL_SOURCE
 _RETRY_BUCKET_TOKENS = RETRY_BUCKET_CAPACITY
 _RETRY_BUCKET_UPDATED = time.monotonic()
 _RETRY_BUCKET_LOCKS: dict[int, asyncio.Lock] = {}
@@ -54,6 +67,7 @@ EffectErrorOutput = Callable[[BaseException], Any]
 EffectRetryPredicate = Callable[[Any], bool]
 EffectSupersedePredicate = Callable[[Any], bool]
 AlertCallback = Callable[[str], Any]
+PreclaimCallback = Callable[[str], Awaitable[Any]]
 
 
 class CompletionFinalizerError(RuntimeError):
@@ -607,6 +621,271 @@ class CompletionEffectRunner:
             before_report_seq=int(self.command["report_seq"]),
         )
 
+    async def assert_entry_authority(self) -> None:
+        """Fence pre-S17 Class B/delivery against a concurrent control writer.
+
+        Reordered product delivery necessarily runs before the command-owned
+        disposition marker exists.  The jobs row remains the serialization
+        point: require the exact entry status resolved by the finalizer and no
+        live out-of-band control claim before any of those effects can begin.
+        S17 repeats the same checks in its own transaction after delivery.
+        """
+
+        expected_status = str(self.command.get("resolved_entry_status") or "").strip()
+        if not expected_status:
+            raise CompletionFinalizerError(
+                f"completion command {self.command_id} has no resolved entry status"
+            )
+        async with _connection(self._db) as conn:
+            async with conn.transaction():
+                job = await conn.fetchrow(
+                    """
+                    SELECT status::text AS status, context,
+                           extract(epoch FROM clock_timestamp())::float8
+                               AS db_now_epoch
+                    FROM jobs
+                    WHERE id = $1::uuid
+                    FOR UPDATE
+                    """,
+                    UUID(str(self.command["job_id"])),
+                )
+                if job is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {self.command_id} lost its jobs row"
+                    )
+                exact = await conn.fetchval(
+                    """
+                    SELECT 1
+                    FROM job_completion_commands
+                    WHERE id = $1::uuid
+                      AND job_id = $2::uuid
+                      AND state = 'finalizing'
+                      AND finalizing_by = $3::text
+                      AND lease_expires_at > now()
+                      AND deadline_at > now()
+                    """,
+                    UUID(self.command_id),
+                    UUID(str(self.command["job_id"])),
+                    self.owner,
+                )
+                if exact is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {self.command_id} lost its entry-authority term"
+                    )
+
+                current_status = str(job["status"] or "")
+                from services.completion_control import completion_control_claim_active
+
+                control_claimed = completion_control_claim_active(
+                    _row_value(job, "context"),
+                    now_epoch=float(_row_value(job, "db_now_epoch", 0.0)),
+                )
+                if current_status != expected_status or control_claimed:
+                    observed = (
+                        f"{current_status}:control_claimed"
+                        if control_claimed
+                        else current_status
+                    )
+                    raise CompletionDispositionSuperseded(
+                        observed_status=observed,
+                        expected_statuses=(expected_status,),
+                    )
+
+    async def acquire_delivery_control(self, expected_status: str) -> str:
+        """Install or renew this command's durable pre-S17 delivery barrier.
+
+        Product delivery cannot share one transaction with WebDAV/Gitea I/O.
+        The jobs row therefore carries the same reserved control marker used by
+        human verbs.  Its stable owner is the command id (so a crash can adopt
+        it), while every read/write also requires this runner's exact ephemeral
+        command lease (so a stale process cannot use the adopted marker).
+        """
+
+        expected = str(expected_status or "").strip()
+        if not expected:
+            raise CompletionFinalizerError(
+                f"completion command {self.command_id} has no delivery entry status"
+            )
+        command_uuid = UUID(self.command_id)
+        job_uuid = UUID(str(self.command["job_id"]))
+        async with _connection(self._db) as conn:
+            async with conn.transaction():
+                job = await conn.fetchrow(
+                    """
+                    SELECT status::text AS status, execution_lane, context,
+                           extract(epoch FROM clock_timestamp())::float8
+                               AS db_now_epoch
+                    FROM jobs
+                    WHERE id = $1::uuid
+                    FOR UPDATE
+                    """,
+                    job_uuid,
+                )
+                if job is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {self.command_id} lost its jobs row"
+                    )
+                exact = await conn.fetchval(
+                    """
+                    SELECT 1
+                    FROM job_completion_commands
+                    WHERE id = $1::uuid
+                      AND job_id = $2::uuid
+                      AND state = 'finalizing'
+                      AND finalizing_by = $3::text
+                      AND lease_expires_at > now()
+                      AND deadline_at > now()
+                    """,
+                    command_uuid,
+                    job_uuid,
+                    self.owner,
+                )
+                if exact is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {self.command_id} lost its delivery-control term"
+                    )
+
+                current_status = str(job["status"] or "")
+                context = _row_value(job, "context")
+                now_epoch = float(_row_value(job, "db_now_epoch", 0.0))
+                owned = completion_delivery_control_claim_owned_active(
+                    context,
+                    self.command_id,
+                    now_epoch=now_epoch,
+                )
+                if current_status != expected or (
+                    completion_control_claim_active(context, now_epoch=now_epoch)
+                    and not owned
+                ):
+                    observed = (
+                        f"{current_status}:control_claimed"
+                        if current_status == expected
+                        else current_status
+                    )
+                    raise CompletionDispositionSuperseded(
+                        observed_status=observed,
+                        expected_statuses=(expected,),
+                        reason="delivery_control_superseded",
+                    )
+
+                installed = await conn.fetchval(
+                    f"""
+                    UPDATE jobs
+                    SET context = jsonb_set(
+                            COALESCE(context, '{{}}'::jsonb),
+                            '{{{COMPLETION_CONTROL_CLAIM_KEY}}}',
+                            jsonb_build_object(
+                                'version', $4::int,
+                                'claim_id', $1::text,
+                                'source', $5::text,
+                                'expected_status', $6::text,
+                                'expected_lane', $7::text,
+                                'fence_kind', 'completion_command',
+                                'fence_value', $1::text,
+                                'claimed_at', to_jsonb(now()),
+                                'expires_epoch', to_jsonb(
+                                    extract(epoch FROM clock_timestamp())
+                                    + $8::float8
+                                )
+                            ),
+                            true
+                        ),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $2::uuid
+                      AND status::text = $6::text
+                      AND EXISTS (
+                          SELECT 1
+                          FROM job_completion_commands AS command
+                          WHERE command.id = $1::uuid
+                            AND command.job_id = jobs.id
+                            AND command.state = 'finalizing'
+                            AND command.finalizing_by = $3::text
+                            AND command.lease_expires_at > now()
+                            AND command.deadline_at > now()
+                      )
+                    RETURNING 1
+                    """,
+                    command_uuid,
+                    job_uuid,
+                    self.owner,
+                    COMPLETION_CONTROL_CLAIM_VERSION,
+                    DELIVERY_CONTROL_SOURCE,
+                    expected,
+                    str(_row_value(job, "execution_lane", "pinned") or "pinned"),
+                    float(COMPLETION_CONTROL_CLAIM_SECONDS),
+                )
+                if installed is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {self.command_id} lost its delivery-control install term"
+                    )
+        return self.command_id
+
+    async def assert_delivery_control(self, expected_status: str) -> None:
+        """Fence one delivery callback to the exact live command + marker."""
+
+        expected = str(expected_status or "").strip()
+        if not expected:
+            raise CompletionFinalizerError(
+                f"completion command {self.command_id} has no delivery entry status"
+            )
+        command_uuid = UUID(self.command_id)
+        job_uuid = UUID(str(self.command["job_id"]))
+        async with _connection(self._db) as conn:
+            async with conn.transaction():
+                job = await conn.fetchrow(
+                    """
+                    SELECT status::text AS status, context,
+                           extract(epoch FROM clock_timestamp())::float8
+                               AS db_now_epoch
+                    FROM jobs
+                    WHERE id = $1::uuid
+                    FOR UPDATE
+                    """,
+                    job_uuid,
+                )
+                if job is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {self.command_id} lost its jobs row"
+                    )
+                exact = await conn.fetchval(
+                    """
+                    SELECT 1
+                    FROM job_completion_commands
+                    WHERE id = $1::uuid
+                      AND job_id = $2::uuid
+                      AND state = 'finalizing'
+                      AND finalizing_by = $3::text
+                      AND lease_expires_at > now()
+                      AND deadline_at > now()
+                    """,
+                    command_uuid,
+                    job_uuid,
+                    self.owner,
+                )
+                if exact is None:
+                    raise CompletionLeaseLost(
+                        f"completion command {self.command_id} lost its delivery-control term"
+                    )
+
+                current_status = str(job["status"] or "")
+                context = _row_value(job, "context")
+                owned = completion_delivery_control_claim_owned_active(
+                    context,
+                    self.command_id,
+                    now_epoch=float(_row_value(job, "db_now_epoch", 0.0)),
+                )
+                if current_status != expected or not owned:
+                    observed = (
+                        f"{current_status}:delivery_control_lost"
+                        if current_status == expected
+                        else current_status
+                    )
+                    raise CompletionDispositionSuperseded(
+                        observed_status=observed,
+                        expected_statuses=(expected,),
+                        reason="delivery_control_superseded",
+                    )
+
     async def assert_disposition_authority(self) -> None:
         """Fence Class C against a jobs-row writer that won after S17.
 
@@ -1051,6 +1330,23 @@ class CompletionEffectRunner:
             exhausted=bool(_row_value(row, "exhausted", False)),
         )
 
+    async def has_pending_group(self, group: str) -> bool:
+        """Whether this exact command term still has a pending group member.
+
+        Step 4 uses this after attempting every independently runnable product
+        delivery.  Returning to the finalizer while any gated group is pending
+        lets its existing release/park machinery own the retry; the workflow
+        must not cross S17 first.
+        """
+
+        if group in self._blocked_groups:
+            return True
+        durable = await self._pending_dependency(group)
+        if durable is None:
+            return False
+        self._blocked_groups[group] = durable
+        return True
+
     async def _dependency_block(
         self, group: str, depends_on_groups: Sequence[str]
     ) -> _GroupBlock | None:
@@ -1280,6 +1576,14 @@ class CompletionEffectRunner:
             # error marker.
             if not _record_error_on_failure:
                 raise
+            # An authority loss is a whole-command disposition signal, never
+            # a retryable product-delivery error.  Converting it into a group
+            # retry would retain a stale marker/command and could publish S17
+            # after a legitimate control writer won.
+            if isinstance(exc, CompletionDispositionSuperseded):
+                with suppress(Exception):
+                    await asyncio.shield(self._record_error(name, exc))
+                raise
             # Cancellation deliberately leaves intent pending.  Recording the
             # diagnostic is exact-term best effort and never grants a retry.
             if retry_on_error and isinstance(exc, Exception):
@@ -1380,23 +1684,30 @@ class CompletionFinalizer:
         db: Any,
         *,
         workflow: Workflow | None = None,
-        code_version: str = COMPLETION_CODE_VERSION,
+        code_version: str | None = None,
         leader_id: str | None = None,
         alert: AlertCallback | None = None,
         random_source: Callable[[], float] = random.random,
         command_lease_seconds: float = COMMAND_LEASE_SECONDS,
         heartbeat_seconds: float = COMMAND_HEARTBEAT_SECONDS,
         effect_lease_seconds: float = EFFECT_LEASE_SECONDS,
+        preclaim: PreclaimCallback | None = None,
     ) -> None:
         self.db = db
         self.workflow = workflow
-        self.code_version = code_version
+        self.code_version = code_version or COMPLETION_CODE_VERSION
+        self.supported_code_versions = (
+            (str(code_version),)
+            if code_version is not None
+            else COMPLETION_SUPPORTED_CODE_VERSIONS
+        )
         self.leader_id = leader_id or f"completion-finalizer-{uuid4()}"
         self.alert = alert
         self.random_source = random_source
         self.command_lease_seconds = float(command_lease_seconds)
         self.heartbeat_seconds = float(heartbeat_seconds)
         self.effect_lease_seconds = float(effect_lease_seconds)
+        self.preclaim = preclaim
 
     async def _take_retry_token(self) -> bool:
         """Process-global admission bound for background retry work.
@@ -1443,7 +1754,12 @@ class CompletionFinalizer:
         return _command_dict(row) if row is not None else None
 
     async def _park_unclaimable(
-        self, command_id: str, *, error_code: str, version_mismatch: bool = False
+        self,
+        command_id: str,
+        *,
+        error_code: str,
+        version_mismatch: bool = False,
+        capability_mismatch: bool = False,
     ) -> dict[str, Any] | None:
         async with _connection(self.db) as conn:
             row = await conn.fetchrow(
@@ -1465,7 +1781,16 @@ class CompletionFinalizer:
                         AND predecessor.state IN ('pending', 'finalizing', 'parked')
                   )
                   AND (
-                      ($3::boolean AND command.code_version <> $4::text)
+                      ($3::boolean AND (
+                          NOT (command.code_version = ANY($4::text[]))
+                          OR ($5::boolean AND NOT (
+                              (command.code_version = $6::text
+                               AND command.status_reorder_enabled = false)
+                              OR
+                              (command.code_version = $7::text
+                               AND command.status_reorder_enabled = true)
+                          ))
+                      ))
                       OR (NOT $3::boolean AND (
                           command.deadline_at <= now()
                           OR command.attempts >= command.max_attempts
@@ -1476,7 +1801,10 @@ class CompletionFinalizer:
                 UUID(str(command_id)),
                 error_code[:128],
                 version_mismatch,
-                self.code_version,
+                list(self.supported_code_versions),
+                capability_mismatch,
+                COMPLETION_CODE_VERSION,
+                COMPLETION_STATUS_REORDER_CODE_VERSION,
             )
         return _command_dict(row) if row is not None else None
 
@@ -1490,17 +1818,23 @@ class CompletionFinalizer:
         if state in {"done", "parked", "superseded", "force_resolved"}:
             return command, None
 
-        if str(command["code_version"]) != self.code_version:
+        version_supported = str(command["code_version"]) in self.supported_code_versions
+        capability_matches = (
+            str(command["code_version"]) == COMPLETION_STATUS_REORDER_CODE_VERSION
+        ) == bool(command.get("status_reorder_enabled", False))
+        if not version_supported or not capability_matches:
             parked = await self._park_unclaimable(
                 command_id,
                 error_code="code_version_mismatch",
                 version_mismatch=True,
+                capability_mismatch=not capability_matches,
             )
             if parked is not None:
                 await self._alert(
                     "completion command "
                     f"{command_id} parked: stored code version "
-                    f"{command['code_version']!r} != {self.code_version!r}"
+                    f"{command['code_version']!r} not in "
+                    f"{self.supported_code_versions!r}"
                 )
                 return parked, None
             return await self._fetch_command(command_id), None
@@ -1526,7 +1860,14 @@ class CompletionFinalizer:
                         now() + make_interval(secs => $4::float8)
                     )
                 WHERE command.id = $1::uuid
-                  AND command.code_version = $3::text
+                  AND command.code_version = ANY($3::text[])
+                  AND (
+                      (command.code_version = $6::text
+                       AND command.status_reorder_enabled = false)
+                      OR
+                      (command.code_version = $7::text
+                       AND command.status_reorder_enabled = true)
+                  )
                   AND command.deadline_at > now()
                   AND command.attempts < command.max_attempts
                   AND (
@@ -1553,9 +1894,11 @@ class CompletionFinalizer:
                 """,
                 UUID(str(command_id)),
                 owner,
-                self.code_version,
+                list(self.supported_code_versions),
                 self.command_lease_seconds,
                 inline,
+                COMPLETION_CODE_VERSION,
+                COMPLETION_STATUS_REORDER_CODE_VERSION,
             )
         if row is None:
             return await self._fetch_command(command_id), None
@@ -2166,6 +2509,25 @@ class CompletionFinalizer:
         """Finalize an accepted command or report why it was not claimable."""
 
         command_id = str(UUID(str(command_id)))
+        if self.preclaim is not None:
+            preclaim_result = await self.preclaim(command_id)
+            if getattr(preclaim_result, "disposition", None) == "superseded":
+                command = await self._fetch_command(command_id)
+                if command is None:
+                    return FinalizationResult(
+                        command_id=command_id,
+                        state="missing",
+                        disposition="missing",
+                    )
+                state = str(command["state"])
+                return FinalizationResult(
+                    command_id=command_id,
+                    state=state,
+                    disposition="terminal",
+                    outcome=_json_object(command.get("outcome")),
+                    run_after=command.get("run_after"),
+                    error_code=command.get("error_code"),
+                )
         command, owner = await self._claim(command_id, inline=inline)
         if command is None:
             return FinalizationResult(

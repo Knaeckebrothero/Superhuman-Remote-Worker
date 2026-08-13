@@ -1311,6 +1311,22 @@ window that (6)'s liveness machinery has to defend shrinks with it.
 5. Background finalizer enabled for stateless units only.
 6. Stateless worker admission opens.
 
+**Step-4 delivery-set decision (2026-08-13).** The exact product deliveries
+that gate a canonical terminal status (`completed`, `failed` or `cancelled`)
+are S15 `loop_project_cloud_delivery`, S26 `subjob_output_graft`, and S33
+`terminal_merge_change_record`. Their stable effect groups are respectively
+`delivery`, `subjob_graft`, and `terminal_delivery`; group policy, rather than
+call-site conditionals, carries the gate. S16 `mode_a_diff_capture` remains in
+the already-shipped `delivery` group for resumable-row compatibility, but is a
+status-decision capture rather than a product delivery and already runs before
+S17. S27's transactional verdict core remains Class B and runs before a
+reordered terminal write; its external follow-up remains Class C/D. M3 moved
+S32's barrier and successor materialization into one atomic Class C effect, so
+it remains after status. `reviewing`, `pending_review`, `paused` and waiting
+states are not terminal and retain their existing order. Each accepted command
+persists whether this reorder applies so a restart or configuration flip cannot
+change the ordering of in-flight work.
+
 **Revert rules, per step — "independently revertible" was asserted, not
 demonstrated.** Step 1's image rollback cannot remove the 0132 index, and
 pre-step-1 code has no `23505` handler, so the closed race re-manifests as an
@@ -1600,6 +1616,34 @@ into it on 2026-08-12. That section is authoritative again;
 `docs/research/stateless_agents/gate3_adversarial_review.md` is retained as the
 evidence behind each change. **Its DDL is now the corrected one** — the
 pre-fold version must not be built from.
+
+**Gate 3 step-4 operations (2026-08-13).** The completion status reorder has
+its own default-off `COMPLETION_STATUS_REORDER_ENABLED` gate and hard-requires
+`COMPLETION_COMMANDS_ENABLED`; an invalid combination is a startup/config
+error, never a partial activation. The mode is copied onto each new command.
+Turning the reorder gate off therefore affects only new admissions: existing
+reordered commands must continue through their persisted effect order. For an
+image rollback, first disable new reordered admissions, then drain all
+unfinished commands that have persisted reorder mode, and only then roll back
+the image. Do not disable the command executor while those rows exist.
+
+The independent monitoring/sweep path, not the finalizer loop, reports a
+missing live finalizer leader and the **age** of the oldest unfinalized command
+(including parked rows). Its day-one safety reconciliation is intentionally
+dumb and non-executing: an old-mode command stranded on a terminal job, or a
+stale command that never advanced beyond S1, is marked `superseded`; no effect
+callback, snapshot, merge, spawn or teardown is invoked. A live command/effect
+term, routed-action owner, control owner, or active S36 authorization always
+holds. Persisted reorder-mode rows that wrote status and still have a tail are
+resumed, never safety-superseded.
+
+Operator `unpark` rearms both command and pending-effect attempt/deadline
+budgets and then lets the ordinary finalizer claim the exact row. Operator
+`force-resolve` requires an explicit terminal status and incident reason,
+abandons and records remaining effects, writes the requested terminal status,
+and refuses any active S36 authorization. These are incident operations, not
+normal completion. During a soak, rollback remains **flag-off-or-drain**; raw
+row edits are not a supported recovery path.
 
 #### Is it shared between sessions and workers? The substrate and local pool are; the production split is not built.
 

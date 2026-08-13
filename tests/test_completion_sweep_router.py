@@ -229,3 +229,35 @@ async def test_run_recovers_tick_errors_and_stops_cooperatively() -> None:
     await asyncio.wait_for(router.run(shutdown), timeout=1)
 
     assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_maintenance_runs_nonexecuting_safety_net() -> None:
+    safety = SimpleNamespace(
+        reconcile_batch=AsyncMock(return_value=SimpleNamespace(scanned=0, results=()))
+    )
+    router = CompletionSweepRouter(
+        object(),
+        SimpleNamespace(finalize_command=AsyncMock()),
+        safety_net=safety,
+    )
+
+    await router.maintenance_once()
+
+    safety.reconcile_batch.assert_awaited_once_with(limit=50)
+
+
+@pytest.mark.asyncio
+async def test_maintenance_failure_isolated_from_router_tick(caplog) -> None:
+    safety = SimpleNamespace(
+        reconcile_batch=AsyncMock(side_effect=RuntimeError("database blip"))
+    )
+    router = CompletionSweepRouter(
+        object(),
+        SimpleNamespace(finalize_command=AsyncMock()),
+        safety_net=safety,
+    )
+
+    await router.maintenance_once()
+
+    assert "completion safety-net tick failed" in caplog.text

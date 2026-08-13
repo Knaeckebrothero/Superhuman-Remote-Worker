@@ -25,6 +25,7 @@ from starlette.responses import JSONResponse
 import main
 from services import job_completion_commands as commands
 from services import completion as completion_service
+from services.completion_effect_policy import COMPLETION_EFFECT_PLAN
 from services.completion_finalizer import CompletionDispositionSuperseded
 
 
@@ -49,6 +50,11 @@ class _RecordingRunner:
         self.higher_report_seq = False
         self.teardown_authority_disposition: str | None = None
         self.teardown_handoff = False
+        self.entry_authority_checks = 0
+        self.entry_authority_hook = None
+        self.delivery_control_acquisitions = 0
+        self.delivery_control_checks = 0
+        self.delivery_control_hook = None
         self.disposition_authority_checks = 0
         self.disposition_authority_hook = None
         self.probe_order: list[str] = []
@@ -89,6 +95,8 @@ class _RecordingRunner:
         try:
             detail = await callback()
         except Exception as exc:
+            if isinstance(exc, CompletionDispositionSuperseded):
+                raise
             if not retry_on_error or error_output is None:
                 raise
             detail = error_output(exc)
@@ -128,6 +136,12 @@ class _RecordingRunner:
         detail = self.details.get(name)
         return copy.deepcopy(detail)
 
+    async def has_pending_group(self, group: str) -> bool:
+        return any(
+            effect.name in self.pending and effect.group == group
+            for effect in COMPLETION_EFFECT_PLAN
+        )
+
     async def capture_intent(self, name: str, detail=None):
         self.probe_order.append("intent_write" if detail is not None else "intent_read")
         existing = self.intents.get(name)
@@ -159,6 +173,24 @@ class _RecordingRunner:
 
     async def workspace_teardown_handoff(self):
         return SimpleNamespace(required=self.teardown_handoff)
+
+    async def assert_entry_authority(self) -> None:
+        self.entry_authority_checks += 1
+        if self.entry_authority_hook is not None:
+            await self.entry_authority_hook()
+
+    async def acquire_delivery_control(self, expected_status: str) -> str:
+        assert expected_status == self.command.get("resolved_entry_status")
+        self.delivery_control_acquisitions += 1
+        if self.delivery_control_hook is not None:
+            await self.delivery_control_hook()
+        return self.command_id
+
+    async def assert_delivery_control(self, expected_status: str) -> None:
+        assert expected_status == self.command.get("resolved_entry_status")
+        self.delivery_control_checks += 1
+        if self.delivery_control_hook is not None:
+            await self.delivery_control_hook()
 
     async def assert_disposition_authority(self) -> None:
         self.disposition_authority_checks += 1
@@ -611,6 +643,484 @@ async def test_effect_runner_reconstructs_normal_result_without_repeating_effect
     wake.assert_awaited_once_with(database, JOB_ID, "completed")
     dispatch.assert_called_once_with()
     wake_drain.assert_called_once_with(database)
+
+
+@pytest.mark.asyncio
+async def test_persisted_reorder_runs_class_b_and_product_delivery_before_s17(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _route_job()
+    job["parent_job_id"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    database = _RouteDB(job)
+    runner = _RecordingRunner()
+    runner.command.update(
+        status_reorder_enabled=True,
+        resolved_entry_status="processing",
+    )
+    terminal_effects = AsyncMock(return_value={"actions": ["terminal durable"]})
+    workspace_cleanup = AsyncMock(return_value=["workspace archived"])
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=terminal_effects,
+        workspace_cleanup=workspace_cleanup,
+    )
+    monkeypatch.setattr(
+        main,
+        "_maybe_graft_completed_subjob",
+        AsyncMock(
+            return_value={
+                "status": "grafted",
+                "output_path": "outputs/001-worker",
+            }
+        ),
+    )
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    names = [name for name, _group in runner.order]
+    assert names.index("critic_verdict") < names.index("subjob_output_graft")
+    assert names.index("subjob_output_graft") < names.index(
+        "terminal_merge_change_record"
+    )
+    assert names.index("terminal_merge_change_record") < names.index(
+        "main_status_write"
+    )
+    assert names.index("main_status_write") < names.index("scholar_parent_unblock")
+    assert result["new_status"] == "completed"
+    assert result["actions"] == [
+        "status -> completed",
+        "subjob output grafted to outputs/001-worker",
+        "terminal durable",
+        "workspace archived",
+    ]
+    assert database.job["status"] == "completed"
+    assert runner.delivery_control_acquisitions == 1
+    assert runner.delivery_control_checks == 2
+    assert runner.entry_authority_checks == 0
+    assert runner.disposition_authority_checks == 1
+
+
+@pytest.mark.asyncio
+async def test_reordered_restart_after_s17_skips_pre_status_phase_and_resumes_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _route_job(status="completed")
+    job["parent_job_id"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    database = _RouteDB(job)
+    runner = _RecordingRunner()
+    runner.command.update(
+        status_reorder_enabled=True,
+        resolved_entry_status="processing",
+    )
+    runner.details.update(
+        late_callback_guard=_journaled_entry(resolution="completed"),
+        main_status_write={
+            "new_status": "completed",
+            "had_assigned_agent": True,
+            "stash_and_clear_freeze": False,
+        },
+        critic_verdict={
+            "applicable": False,
+            "world_cas_won": False,
+            "actions": [],
+        },
+        subjob_output_graft={
+            "graft_result": {
+                "status": "grafted",
+                "output_path": "outputs/001-worker",
+            }
+        },
+        terminal_merge_change_record={"actions": ["terminal durable"]},
+    )
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=AsyncMock(
+            side_effect=AssertionError("pre-status delivery reran after S17")
+        ),
+        workspace_cleanup=AsyncMock(return_value=[]),
+    )
+    graft = AsyncMock(side_effect=AssertionError("pre-status graft reran after S17"))
+    monkeypatch.setattr(main, "_maybe_graft_completed_subjob", graft)
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    assert runner.delivery_control_acquisitions == 0
+    assert runner.delivery_control_checks == 0
+    assert database.status_write_count == 0
+    graft.assert_not_awaited()
+    assert result["actions"][:3] == [
+        "status -> completed",
+        "subjob output grafted to outputs/001-worker",
+        "terminal durable",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_persisted_false_preserves_exact_status_first_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _route_job()
+    job["parent_job_id"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    database = _RouteDB(job)
+    runner = _RecordingRunner()
+    runner.command.update(
+        status_reorder_enabled=False,
+        resolved_entry_status="processing",
+    )
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=AsyncMock(return_value={"actions": []}),
+        workspace_cleanup=AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        main,
+        "_maybe_graft_completed_subjob",
+        AsyncMock(return_value={"status": "skipped", "reason": "test"}),
+    )
+
+    await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    names = [name for name, _group in runner.order]
+    assert names.index("main_status_write") < names.index("subjob_output_graft")
+    assert names.index("subjob_output_graft") < names.index("critic_verdict")
+    assert names.index("critic_verdict") < names.index("terminal_merge_change_record")
+    assert runner.entry_authority_checks == 0
+
+
+@pytest.mark.asyncio
+async def test_persisted_true_nonterminal_path_preserves_status_first_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _route_job()
+    job["parent_job_id"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    database = _RouteDB(job)
+    runner = _RecordingRunner()
+    runner.command.update(
+        status_reorder_enabled=True,
+        resolved_entry_status="processing",
+    )
+    runner.details["late_callback_guard"] = _journaled_entry(
+        resolution="pending_review"
+    )
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=AsyncMock(return_value={"actions": []}),
+        workspace_cleanup=AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        main,
+        "_maybe_graft_completed_subjob",
+        AsyncMock(return_value={"status": "skipped", "reason": "test"}),
+    )
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    names = [name for name, _group in runner.order]
+    assert result["new_status"] == "pending_review"
+    assert names.index("main_status_write") < names.index("subjob_output_graft")
+    assert names.index("subjob_output_graft") < names.index("critic_verdict")
+    assert runner.entry_authority_checks == 0
+
+
+@pytest.mark.asyncio
+async def test_reordered_pending_delivery_withholds_s17_and_all_tail_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _route_job()
+    job["parent_job_id"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    database = _RouteDB(job)
+    runner = _RecordingRunner()
+    runner.command.update(
+        status_reorder_enabled=True,
+        resolved_entry_status="processing",
+    )
+    terminal_effects = AsyncMock(return_value={"actions": ["terminal durable"]})
+    workspace_cleanup = AsyncMock(return_value=["must not run"])
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=terminal_effects,
+        workspace_cleanup=workspace_cleanup,
+    )
+    monkeypatch.setattr(
+        main,
+        "_maybe_graft_completed_subjob",
+        AsyncMock(side_effect=RuntimeError("graft transport ambiguous")),
+    )
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    assert result["new_status"] == "processing"
+    assert database.job["status"] == "processing"
+    assert runner.pending["subjob_output_graft"] == {
+        "graft_result": {
+            "status": "error",
+            "reason": "graft transport ambiguous",
+        }
+    }
+    assert runner.details["terminal_merge_change_record"] == {
+        "actions": ["terminal durable"]
+    }
+    assert "main_status_write" not in runner.started
+    assert not runner.started.intersection(
+        {
+            "critic_verdict_followup",
+            "scholar_parent_unblock",
+            "delegation_parent_unblock",
+            "verification_critic_spawn",
+            "project_loop_advance",
+            "session_wake_enqueue",
+            "dispatch_trigger",
+            "workspace_archive_teardown",
+        }
+    )
+    assert runner.disposition_authority_checks == 0
+    workspace_cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reordered_preexisting_s15_delivery_pending_withholds_s17(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _RouteDB(_route_job())
+    runner = _RecordingRunner()
+    runner.command.update(
+        status_reorder_enabled=True,
+        resolved_entry_status="processing",
+    )
+    runner.pending["loop_project_cloud_delivery"] = {
+        "new_status": "completed",
+        "delivery_status": "cloud-applied",
+    }
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=AsyncMock(return_value={"actions": ["terminal durable"]}),
+        workspace_cleanup=AsyncMock(return_value=["must not run"]),
+    )
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    assert result["new_status"] == "processing"
+    assert database.job["status"] == "processing"
+    assert "main_status_write" not in runner.started
+    assert "terminal_merge_change_record" in runner.details
+
+
+@pytest.mark.asyncio
+async def test_reordered_s15_runs_only_after_exact_delivery_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _route_job()
+    job["context"] = {"loop_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+    job["project_id"] = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    database = _RouteDB(job)
+    database.get_project = AsyncMock(return_value={"id": job["project_id"]})
+    database.update_job_merge_status = AsyncMock(return_value=True)
+    database.merge_job_context = AsyncMock(return_value=True)
+    runner = _RecordingRunner()
+    runner.command.update(
+        status_reorder_enabled=True,
+        resolved_entry_status="processing",
+    )
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=AsyncMock(return_value={"actions": []}),
+        workspace_cleanup=AsyncMock(return_value=[]),
+    )
+
+    async def deliver(**_kwargs) -> dict[str, object]:
+        assert runner.delivery_control_acquisitions == 1
+        assert runner.delivery_control_checks == 1
+        assert database.job["status"] == "processing"
+        return {
+            "delivery_status": "cloud-applied",
+            "needs_review": False,
+            "delivery_sha": "abc123",
+            "notes": [],
+        }
+
+    from services import job_cloud_baseline
+
+    delivery = AsyncMock(side_effect=deliver)
+    monkeypatch.setattr(job_cloud_baseline, "deliver_loop_diff_to_cloud", delivery)
+    monkeypatch.setattr(
+        main,
+        "_prepare_atomic_project_loop_advance",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        main,
+        "_materialize_prepared_project_loop_advance",
+        AsyncMock(return_value={"applicable": False, "won": False, "actions": []}),
+    )
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    delivery.assert_awaited_once()
+    names = [name for name, _group in runner.order]
+    assert names.index("loop_project_cloud_delivery") < names.index("main_status_write")
+    assert result["new_status"] == "completed"
+    assert "loop cloud delivery -> cloud-applied" in result["actions"]
+
+
+@pytest.mark.asyncio
+async def test_reordered_entry_authority_loss_prevents_class_b_and_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _RouteDB(_route_job())
+    runner = _RecordingRunner()
+    runner.command.update(
+        status_reorder_enabled=True,
+        resolved_entry_status="processing",
+    )
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=AsyncMock(return_value={"actions": ["must not run"]}),
+        workspace_cleanup=AsyncMock(return_value=["must not run"]),
+    )
+
+    async def lose_entry_authority() -> None:
+        database.job["status"] = "cancelled"
+        raise CompletionDispositionSuperseded(
+            observed_status="cancelled",
+            expected_statuses=("processing",),
+        )
+
+    runner.delivery_control_hook = lose_entry_authority
+
+    with pytest.raises(CompletionDispositionSuperseded):
+        await main._complete_job_legacy(
+            MagicMock(),
+            JOB_ID,
+            _body(),
+            _authorized=True,
+            _effect_runner=runner,
+        )
+
+    assert runner.delivery_control_acquisitions == 1
+    assert runner.entry_authority_checks == 0
+    assert not runner.started.intersection(
+        {
+            "critic_verdict",
+            "subjob_output_graft",
+            "terminal_merge_change_record",
+            "main_status_write",
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_reordered_s27_uses_logical_terminal_job_but_followup_stays_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _route_job()
+    job["parent_job_id"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    job["context"] = {"verification_target": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}
+    database = _RouteDB(job)
+    runner = _RecordingRunner()
+    runner.command.update(
+        status_reorder_enabled=True,
+        resolved_entry_status="processing",
+    )
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=AsyncMock(return_value={"actions": []}),
+        workspace_cleanup=AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        main,
+        "_maybe_graft_completed_subjob",
+        AsyncMock(return_value={"status": "skipped", "reason": "critic"}),
+    )
+    observed_jobs: list[dict] = []
+
+    async def materialize(logical_job: dict) -> dict:
+        observed_jobs.append(copy.deepcopy(logical_job))
+        assert database.job["status"] == "processing"
+        return {
+            "applicable": True,
+            "world_cas_won": True,
+            "outcome": "approved",
+            "target_job_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "critic_job_id": JOB_ID,
+            "new_status": "completed",
+            "actions": [],
+        }
+
+    followup = AsyncMock(return_value={"actions": ["critic followup"]})
+    monkeypatch.setattr(
+        main,
+        "_materialize_critic_verdict_transactional",
+        AsyncMock(side_effect=materialize),
+    )
+    monkeypatch.setattr(main, "_run_critic_verdict_followups", followup)
+
+    result = await main._complete_job_legacy(
+        MagicMock(),
+        JOB_ID,
+        _body(),
+        _authorized=True,
+        _effect_runner=runner,
+    )
+
+    names = [name for name, _group in runner.order]
+    assert observed_jobs[0]["status"] == "completed"
+    assert names.index("critic_verdict") < names.index("main_status_write")
+    assert names.index("main_status_write") < names.index("critic_verdict_followup")
+    assert result["actions"].index("status -> completed") < result["actions"].index(
+        "critic followup"
+    )
+    followup.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -2335,6 +2845,7 @@ async def test_fresh_admission_precedes_inline_finalization_and_returns_exact_ou
     finalizer_getter = MagicMock(return_value=finalizer)
     delay = AsyncMock()
     monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(main, "COMPLETION_STATUS_REORDER_ENABLED", False)
     monkeypatch.setattr(main, "COMPLETION_FINALIZER_INLINE_DELAY_SECONDS", 0.0)
     monkeypatch.setattr(main.asyncio, "sleep", delay)
     monkeypatch.setattr(main, "postgres_db", database)
@@ -2369,6 +2880,7 @@ async def test_fresh_admission_precedes_inline_finalization_and_returns_exact_ou
                 "summary": "done",
             },
         },
+        status_reorder_enabled=False,
         lease_token=17,
         agent_id=str(AGENT_ID),
         client_report_id=str(REPORT_ID),

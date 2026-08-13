@@ -210,7 +210,10 @@ APP_JOB_COMPLETION_SWEEP_ROUTE_PRECEDENCE = (
 APP_JOB_COMPLETION_ACCEPT_STATUS = (
     ROOT / "orchestrator/database/migrations/app/0143_job_completion_accept_status.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_JOB_COMPLETION_ACCEPT_STATUS
+APP_JOB_COMPLETION_STATUS_REORDER = (
+    ROOT / "orchestrator/database/migrations/app/0144_job_completion_status_reorder.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_JOB_COMPLETION_STATUS_REORDER
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"

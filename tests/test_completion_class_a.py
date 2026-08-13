@@ -160,6 +160,42 @@ class TestUpdateJobStatusClassA:
         )
 
     @pytest.mark.asyncio
+    async def test_delivery_marker_is_strictly_consumed_in_the_status_cas(self):
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        db = _db_with_connection(conn)
+        command_id = "44444444-4444-4444-8444-444444444444"
+
+        assert await db.update_job_status(
+            JOB_ID,
+            status="completed",
+            expected_status="processing",
+            completion_command_id=command_id,
+            completion_finalizing_by="attempt-owner",
+            completion_control_claim_id=command_id,
+        )
+
+        args = conn.execute.await_args.args
+        sql = _normalized(args[0])
+        assert (
+            "context = (COALESCE(context, '{}'::jsonb)) - '_completion_control_claim'"
+            in sql
+        )
+        assert "->>'claim_id' = $6::text" in sql
+        assert "->>'source' = 'completion_delivery'" in sql
+        assert "->>'fence_kind' = 'completion_command'" in sql
+        assert "->>'fence_value' = $6::text" in sql
+        assert "extract(epoch FROM clock_timestamp())" in sql
+        assert args[1:] == (
+            "completed",
+            UUID(JOB_ID),
+            "processing",
+            UUID(command_id),
+            "attempt-owner",
+            command_id,
+        )
+
+    @pytest.mark.asyncio
     async def test_completion_term_arguments_must_be_paired(self):
         conn = AsyncMock()
         db = _db_with_connection(conn)
