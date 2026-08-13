@@ -43,6 +43,8 @@ def _make_manager(
     snapshot_available: bool = True,
     suspension_enabled: bool = True,
     shared_child_exists: bool = False,
+    completion_commands_enabled: bool = False,
+    completion_command_exists: bool = False,
 ):
     """Build a WorkspaceInstanceManager wrapping mocked dependencies.
 
@@ -73,7 +75,13 @@ def _make_manager(
     db.acquire = MagicMock()
     conn = AsyncMock()
     conn.fetchrow = AsyncMock(side_effect=lambda sql, tid: (thread_rows or {}).get(tid))
-    conn.fetchval = AsyncMock(return_value=shared_child_exists)
+
+    async def _fetchval(sql, *_args):
+        if "job_completion_commands" in sql:
+            return completion_command_exists
+        return shared_child_exists
+
+    conn.fetchval = AsyncMock(side_effect=_fetchval)
     ctx = AsyncMock()
     ctx.__aenter__ = AsyncMock(return_value=conn)
     ctx.__aexit__ = AsyncMock(return_value=False)
@@ -84,6 +92,7 @@ def _make_manager(
         suspension_service=suspension,
         snapshot_service=snapshot,
         db=db,
+        completion_commands_enabled=completion_commands_enabled,
     )
     return mgr, container, suspension, snapshot, db
 
@@ -593,6 +602,168 @@ class TestIsHealthy:
         mgr, *_ = _make_manager()
         inst = Instance(kind="workspace", id="x", metadata={"pod_phase": "Failed"})
         assert await mgr.is_healthy(inst) is False
+
+
+class TestCompletionFinalizerTeardownOwnership:
+    """Gate-3 S36 and the generic lifecycle reaper must never act in parallel."""
+
+    @pytest.mark.asyncio
+    async def test_flag_off_preserves_terminal_reap_without_command_table_read(self):
+        pod = _make_pod(
+            "workspace-jdone",
+            labels={"srw/job-id": "jdone"},
+            phase="Failed",
+        )
+        mgr, _, _, _, db = _make_manager(
+            pods=[pod],
+            job_rows={"jdone": {"status": "completed", "context": {}}},
+        )
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            [inst] = await mgr.list_instances()
+
+        assert "completion_finalization_owned" not in inst.metadata
+        assert await mgr.is_healthy(inst) is False
+        assert await mgr.is_reapable(inst) is True
+        conn = db.acquire.return_value.__aenter__.return_value
+        assert all(
+            "job_completion_commands" not in str(call.args[0])
+            for call in conn.fetchval.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_unfinished_command_blocks_failed_pod_and_terminal_reap(self):
+        pod = _make_pod(
+            "workspace-jdone",
+            labels={"srw/job-id": "jdone"},
+            phase="Failed",
+        )
+        mgr, *_ = _make_manager(
+            pods=[pod],
+            job_rows={"jdone": {"status": "completed", "context": {}}},
+            completion_commands_enabled=True,
+            completion_command_exists=True,
+        )
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            [inst] = await mgr.list_instances()
+
+        assert inst.metadata["completion_finalization_owned"] is True
+        assert await mgr.is_healthy(inst) is True
+        assert await mgr.is_idle(inst) is False
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_done_or_absent_command_keeps_legacy_terminal_classification(self):
+        pod = _make_pod(
+            "workspace-jdone",
+            labels={"srw/job-id": "jdone"},
+            phase="Failed",
+        )
+        mgr, *_ = _make_manager(
+            pods=[pod],
+            job_rows={"jdone": {"status": "completed", "context": {}}},
+            completion_commands_enabled=True,
+            completion_command_exists=False,
+        )
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            [inst] = await mgr.list_instances()
+
+        assert inst.metadata["completion_finalization_owned"] is False
+        assert await mgr.is_healthy(inst) is False
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_command_lookup_error_fails_closed_only_when_flag_on(self):
+        pod = _make_pod("workspace-jdone", labels={"srw/job-id": "jdone"})
+        mgr, _, _, _, db = _make_manager(
+            pods=[pod],
+            job_rows={"jdone": {"status": "completed", "context": {}}},
+            completion_commands_enabled=True,
+        )
+        conn = db.acquire.return_value.__aenter__.return_value
+
+        async def _fetchval(sql, *_args):
+            if "job_completion_commands" in sql:
+                raise RuntimeError("completion relation unavailable")
+            return False
+
+        conn.fetchval.side_effect = _fetchval
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            [inst] = await mgr.list_instances()
+
+        assert inst.metadata["completion_finalization_owned"] is True
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_action_time_recheck_blocks_snapshot_and_delete_after_list(self):
+        pod = _make_pod("workspace-jdone", labels={"srw/job-id": "jdone"})
+        job = {
+            "status": "completed",
+            "context": {"workspace_container": {"pod_ip": "10.0.0.7"}},
+        }
+        mgr, container, _, snapshot, db = _make_manager(
+            pods=[pod],
+            job_rows={"jdone": job},
+            completion_commands_enabled=True,
+        )
+        command = {"unfinished": False}
+        conn = db.acquire.return_value.__aenter__.return_value
+
+        async def _fetchval(sql, *_args):
+            if "job_completion_commands" in sql:
+                return command["unfinished"]
+            return False
+
+        conn.fetchval.side_effect = _fetchval
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            [inst] = await mgr.list_instances()
+        assert inst.metadata["completion_finalization_owned"] is False
+
+        command["unfinished"] = True
+        assert await mgr.snapshot(inst) is None
+        await mgr.delete(inst, grace_s=0)
+        container.create_workspace = AsyncMock(return_value=True)
+        give_up_inst = Instance(
+            kind="workspace",
+            id="workspace-jdone",
+            bound_to="jdone",
+            metadata={
+                "labels": {"srw/job-id": "jdone"},
+                "job_status": "paused",
+                "volume_ephemeral": False,
+            },
+        )
+        await mgr.give_up(give_up_inst, grace_s=0)
+
+        snapshot.capture_vm_snapshot.assert_not_awaited()
+        container.delete_workspace.assert_not_awaited()
+        container.create_workspace.assert_not_awaited()
+        command_queries = [
+            str(call.args[0])
+            for call in conn.fetchval.await_args_list
+            if "job_completion_commands" in str(call.args[0])
+        ]
+        assert len(command_queries) == 4  # list + snapshot + delete + give_up
+        assert "'pending', 'finalizing', 'parked'" in command_queries[0]
 
 
 # =============================================================================
@@ -1527,6 +1698,45 @@ class TestReapOrphans:
             "pvc-workspace-jdone", expected_owner=WorkspaceOwner.job("jdone")
         )
         # The orphan's stable-DNS Service is reclaimed alongside its PVC.
+        container._delete_service.assert_awaited_once_with(
+            WorkspaceOwner.job("jdone"), require_exact_owner=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_completion_owner_blocks_orphan_pvc_then_done_allows_reap(self):
+        mgr, container, _, _, db = _make_manager(
+            pods=[],
+            thread_rows={"jdone": {"status": "completed"}},
+            completion_commands_enabled=True,
+        )
+        self._wire_pvcs(container, [_make_pvc("pvc-workspace-jdone", "jdone")])
+        command = {"unfinished": True}
+        conn = db.acquire.return_value.__aenter__.return_value
+
+        async def _fetchval(sql, *_args):
+            if "job_completion_commands" in sql:
+                return command["unfinished"]
+            return False
+
+        conn.fetchval.side_effect = _fetchval
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert await mgr.reap_orphans() == 0
+        container._delete_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
+
+        command["unfinished"] = False
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert await mgr.reap_orphans() == 1
+        container._delete_pvc.assert_awaited_once_with(
+            "pvc-workspace-jdone", expected_owner=WorkspaceOwner.job("jdone")
+        )
         container._delete_service.assert_awaited_once_with(
             WorkspaceOwner.job("jdone"), require_exact_owner=True
         )

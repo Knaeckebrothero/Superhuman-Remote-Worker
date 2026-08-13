@@ -1554,6 +1554,18 @@ COMPLETION_COMMANDS_ENABLED = os.environ.get(
     "COMPLETION_COMMANDS_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
 
+# Local-only crash-recovery proof hook. Production/chart defaults keep this at
+# zero; a positive value makes the accept -> force-delete window deterministic.
+COMPLETION_FINALIZER_INLINE_DELAY_SECONDS = max(
+    0.0,
+    float(os.environ.get("COMPLETION_FINALIZER_INLINE_DELAY_SECONDS", "0")),
+)
+
+# S36 explicitly overrides the workspace Pod's ordinary 120-second grace with
+# a 10-second UID-preconditioned delete. Keep the exact-absence proof below the
+# pinned agent's 60-second report timeout while leaving room for API latency.
+_COMPLETION_S36_EXACT_ABSENCE_TIMEOUT_SECONDS = 45.0
+
 # Dispatcher lock prevents concurrent dispatch (double-assignment)
 _dispatch_lock = asyncio.Lock()
 
@@ -11124,6 +11136,7 @@ async def lifespan(app: FastAPI):
             suspension_service=workspace_suspension_service,
             snapshot_service=snapshot_service,
             db=postgres_db,
+            completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
         )
     )
     lifecycle_reconciler.register(
@@ -19185,11 +19198,25 @@ async def complete_job(
             headers={"Idempotent-Replayed": "true"},
         )
 
+    logger.info(
+        "Completion command %s accepted for job %s",
+        accepted.command_id,
+        accepted.job_id,
+    )
+
     finalizer = _get_completion_finalizer()
     inline_error: HTTPException | None = None
 
     async def _inline_workflow(effect_runner: Any) -> dict[str, Any]:
         nonlocal inline_error
+        if COMPLETION_FINALIZER_INLINE_DELAY_SECONDS > 0:
+            logger.info(
+                "Completion command %s claimed for job %s; inline delay %.3fs",
+                accepted.command_id,
+                accepted.job_id,
+                COMPLETION_FINALIZER_INLINE_DELAY_SECONDS,
+            )
+            await asyncio.sleep(COMPLETION_FINALIZER_INLINE_DELAY_SECONDS)
         try:
             return await _complete_job_legacy(
                 request,
@@ -21524,6 +21551,9 @@ async def _complete_job_legacy(
                             terminal_snapshot_generation=snapshot_generation,
                             terminal_snapshot_created_at=snapshot_created_at,
                             strict=True,
+                            exact_absence_timeout_seconds=(
+                                _COMPLETION_S36_EXACT_ABSENCE_TIMEOUT_SECONDS
+                            ),
                         )
                         if not released:
                             raise RuntimeError(

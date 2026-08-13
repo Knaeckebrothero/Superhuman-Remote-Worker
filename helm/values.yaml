@@ -137,6 +137,12 @@ orchestrator:
       cpu: "500m"
   # -- Auto-assign jobs to idle agents
   autoAssignEnabled: "true"
+  # -- Enable durable completion-command admission/finalization. Ships dark;
+  # open only after the Gate-3 parity and crash-recovery proof is complete.
+  completionCommandsEnabled: false
+  # -- Local crash-recovery proof hook: pause after durable command acceptance
+  # and before inline finalization. Keep at zero outside an intentional test.
+  completionFinalizerInlineDelaySeconds: 0
   # -- Additional exact Git host or host:port endpoints trusted for external
   # OKF KB datasources. The built-in public-provider set remains enabled.
   # Wildcards, IP literals, and localhost are rejected. Example:

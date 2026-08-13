@@ -56,6 +56,8 @@ def test_stateless_worker_gate_is_independent_and_default_off() -> None:
 
     assert config_map["data"]["STATELESS_SESSION_ENABLED"] == "false"
     assert config_map["data"]["STATELESS_WORKER_ENABLED"] == "false"
+    assert config_map["data"]["COMPLETION_COMMANDS_ENABLED"] == "false"
+    assert config_map["data"]["COMPLETION_FINALIZER_INLINE_DELAY_SECONDS"] == "0"
     assert config_map["data"]["WORKER_BATCH_MIN_WALL_SECONDS"] == "300"
     assert config_map["data"]["LANGGRAPH_STRICT_MSGPACK"] == "true"
 
@@ -261,6 +263,64 @@ def test_stateless_worker_local_budget_override_reaches_both_planes() -> None:
         for entry in executor["envFrom"]
         if "configMapRef" in entry
     } == {config_map_name}
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_completion_command_gate_true_reaches_control_and_execution_planes() -> None:
+    documents = _render(
+        "agent.stateless.enabled=true",
+        "orchestrator.completionCommandsEnabled=true",
+        "orchestrator.completionFinalizerInlineDelaySeconds=15",
+    )
+    config_map = next(
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and "COMPLETION_COMMANDS_ENABLED" in document.get("data", {})
+    )
+    config_map_name = config_map["metadata"]["name"]
+    assert config_map["data"]["COMPLETION_COMMANDS_ENABLED"] == "true"
+    assert config_map["data"]["COMPLETION_FINALIZER_INLINE_DELAY_SECONDS"] == "15"
+
+    deployments = {
+        document["metadata"]["labels"]["app.kubernetes.io/component"]: document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and "app.kubernetes.io/component"
+        in document.get("metadata", {}).get("labels", {})
+    }
+    orchestrator = next(
+        container
+        for container in deployments["orchestrator"]["spec"]["template"]["spec"][
+            "containers"
+        ]
+        if container["name"] == "orchestrator"
+    )
+    orchestrator_env = {entry["name"]: entry for entry in orchestrator["env"]}
+    assert orchestrator_env["COMPLETION_COMMANDS_ENABLED"]["valueFrom"][
+        "configMapKeyRef"
+    ] == {
+        "name": config_map_name,
+        "key": "COMPLETION_COMMANDS_ENABLED",
+    }
+    assert orchestrator_env["COMPLETION_FINALIZER_INLINE_DELAY_SECONDS"]["valueFrom"][
+        "configMapKeyRef"
+    ] == {
+        "name": config_map_name,
+        "key": "COMPLETION_FINALIZER_INLINE_DELAY_SECONDS",
+    }
+
+    executor = _stateless_agent_container(deployments["agent-stateless"])
+    assert {
+        entry["configMapRef"]["name"]
+        for entry in executor["envFrom"]
+        if "configMapRef" in entry
+    } == {config_map_name}
+    # The execution plane receives the exact shared key through envFrom; an
+    # explicit container value would override it and split the flag state.
+    assert "COMPLETION_COMMANDS_ENABLED" not in {
+        entry["name"] for entry in executor.get("env", [])
+    }
 
 
 def test_tilt_overlay_explicitly_enables_short_worker_batches() -> None:

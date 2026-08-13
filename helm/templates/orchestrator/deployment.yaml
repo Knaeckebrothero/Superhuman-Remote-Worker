@@ -418,6 +418,20 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: STATELESS_WORKER_ENABLED
+            # Durable completion admission and the finalizer/drain must flip as
+            # one gate. Stateless agents inherit this same ConfigMap key via
+            # envFrom, while the orchestrator intentionally uses an explicit
+            # reference so its independently-sized DB env stays isolated.
+            - name: COMPLETION_COMMANDS_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COMPLETION_COMMANDS_ENABLED
+            - name: COMPLETION_FINALIZER_INLINE_DELAY_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COMPLETION_FINALIZER_INLINE_DELAY_SECONDS
             - name: WORKER_BATCH_MIN_WALL_SECONDS
               valueFrom:
                 configMapKeyRef:

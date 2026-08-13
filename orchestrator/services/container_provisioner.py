@@ -1245,7 +1245,7 @@ class ContainerProvisioner:
         owner: WorkspaceOwner,
         *,
         expected_runtime_incarnation: str,
-        timeout: int,
+        timeout: float,
     ) -> bool:
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
@@ -2120,6 +2120,7 @@ class ContainerProvisioner:
         *,
         expected_runtime_incarnation: str | None = None,
         wait_for_exact_absence: bool = False,
+        exact_absence_timeout_seconds: float = 30.0,
         captured_teardown_uid: str | None = None,
     ) -> bool:
         """Delete the workspace container for a job or persistent thread.
@@ -2170,12 +2171,22 @@ class ContainerProvisioner:
                 return False
         try:
             if not already_absent:
+                delete_body: dict[str, Any] = {
+                    "preconditions": {"uid": observed_runtime_uid}
+                }
+                if captured_teardown_uid is not None:
+                    # Some apiservers do not honor the query parameter alone.
+                    # Carry the same bound in DeleteOptions for durable S36 so
+                    # it cannot inherit the Pod's ordinary 120-second grace
+                    # and outlive the pinned agent's 60-second report timeout.
+                    # Legacy/default-off callers retain their exact body.
+                    delete_body["gracePeriodSeconds"] = 10
                 await asyncio.to_thread(
                     self._core_api.delete_namespaced_pod,
                     name=pod_name,
                     namespace=self._namespace,
                     grace_period_seconds=10,
-                    body={"preconditions": {"uid": observed_runtime_uid}},
+                    body=delete_body,
                 )
                 logger.info(
                     "Workspace container deletion accepted: %s (%s %s)",
@@ -2226,7 +2237,7 @@ class ContainerProvisioner:
             if not await self._wait_for_exact_workspace_pod_absent(
                 owner,
                 expected_runtime_incarnation=str(expected_runtime_incarnation),
-                timeout=30,
+                timeout=exact_absence_timeout_seconds,
             ):
                 # DELETE acceptance is not runtime absence. Keep the immutable
                 # UID and endpoint durable so terminal retirement cannot settle
@@ -2452,6 +2463,7 @@ class ContainerProvisioner:
         terminal_snapshot_created_at: str | None = None,
         strict: bool = False,
         teardown_identity: WorkspaceTeardownIdentity | None = None,
+        exact_absence_timeout_seconds: float = 30.0,
     ) -> bool:
         """Snapshot a workspace to S3, then delete the pod (and, by default, its PVC).
 
@@ -2467,6 +2479,10 @@ class ContainerProvisioner:
                 RESUMABLE, so unconditionally deleting its volume is data
                 destruction on live state a user can legitimately reopen. Pass
                 True (the default) only when the owning work is truly terminal.
+            exact_absence_timeout_seconds: Maximum time to prove the exact Pod
+                UID absent after Kubernetes accepts a strict delete. Existing
+                callers retain the historical 30-second bound; captured S36
+                supplies 45 seconds around its explicit 10-second grace.
 
         The headless Service is dropped either way: it is 409-idempotent to
         recreate on the next ``create_workspace``, so unlike the volume it costs
@@ -2492,6 +2508,7 @@ class ContainerProvisioner:
                 terminal_snapshot_generation=terminal_snapshot_generation,
                 terminal_snapshot_created_at=terminal_snapshot_created_at,
                 strict=strict,
+                exact_absence_timeout_seconds=exact_absence_timeout_seconds,
             )
 
         if expected_runtime_incarnation is not None:
@@ -2612,7 +2629,14 @@ class ContainerProvisioner:
             return False
         delete_kwargs = {
             "expected_runtime_incarnation": effective_runtime_incarnation,
-            **({"wait_for_exact_absence": True} if strict else {}),
+            **(
+                {
+                    "wait_for_exact_absence": True,
+                    "exact_absence_timeout_seconds": exact_absence_timeout_seconds,
+                }
+                if strict
+                else {}
+            ),
         }
         deleted = await self.delete_workspace(owner, **delete_kwargs)
         if not deleted:
@@ -2646,6 +2670,7 @@ class ContainerProvisioner:
         terminal_snapshot_generation: str | None,
         terminal_snapshot_created_at: str | None,
         strict: bool,
+        exact_absence_timeout_seconds: float,
     ) -> bool:
         """Release only the Kubernetes objects captured in an S36 intent."""
 
@@ -2798,7 +2823,16 @@ class ContainerProvisioner:
                 owner,
                 expected_runtime_incarnation=identity.pod_uid,
                 captured_teardown_uid=identity.pod_uid,
-                **({"wait_for_exact_absence": True} if strict else {}),
+                **(
+                    {
+                        "wait_for_exact_absence": True,
+                        "exact_absence_timeout_seconds": (
+                            exact_absence_timeout_seconds
+                        ),
+                    }
+                    if strict
+                    else {}
+                ),
             )
         if not pod_deleted:
             return False

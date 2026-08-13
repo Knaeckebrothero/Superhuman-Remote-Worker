@@ -1023,7 +1023,7 @@ class SnapshotService:
                     "-o",
                     "pipefail",
                     "-c",
-                    f"zstd -t -- {shlex.quote(tar_path)} >/dev/null 2>&1 && "
+                    f"zstd -t -- {shlex.quote(tar_path)} >/dev/null && "
                     f"zstd -dc -- {shlex.quote(tar_path)} | tar -tf - >/dev/null",
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
