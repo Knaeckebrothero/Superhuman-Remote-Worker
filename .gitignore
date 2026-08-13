@@ -222,3 +222,9 @@ eval/app_guide/runs/
 # Superpowers brainstorm companion (local mockups)
 .superpowers/
 bench/runs/
+
+# Extracted Better Resavio client code (Hotel Rheinland) — staged locally for
+# push to a separate GitHub repo. NEVER commit client code to this public repo.
+KurortEngine/
+KurortEngine-salvage/
+BetterResavio-KB/
