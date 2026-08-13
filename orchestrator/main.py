@@ -28498,12 +28498,12 @@ async def get_job_statistics(request: Request) -> dict[str, int]:
 async def get_session_wake_statistics(request: Request) -> dict[str, int]:
     """Health of the session-wake outbox. **Admin only** (fleet-wide).
 
-    ``dead`` is the one number that matters and the whole observability story
-    for docs/features/session_wake_on_job_completion.md: each one is a session
-    waiting on a job it will never be told about — precisely the bug the feature
-    exists to remove — so a non-zero value warrants an alert, not a dashboard.
-    ``pending``/``sending`` are the in-flight depth; a steadily growing
-    ``sending`` means deliveries are timing out rather than failing fast.
+    ``dead`` is retry exhaustion: each one is a retained session waiting on a
+    job it will never be told about, so a non-zero value warrants an alert.
+    ``undeliverable`` is the distinct terminal count for wakes whose exact
+    creating thread was hard-deleted. ``pending``/``sending`` are the in-flight
+    depth; a steadily growing ``sending`` means deliveries are timing out rather
+    than failing fast.
     """
     await _require_admin(request)
     try:

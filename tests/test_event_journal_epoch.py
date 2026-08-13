@@ -425,6 +425,7 @@ class TestSharedEventJournal:
         assert args[1] == "turn.interrupted"
         assert json.loads(args[2]) == {"reason": "lease_stolen"}
         assert args[3] is None
+        assert args[4] is None
 
     @pytest.mark.asyncio
     async def test_append_system_frame_links_interrupt_receipt(self):
@@ -445,6 +446,28 @@ class TestSharedEventJournal:
         assert "interrupt_request_id" in sql
         assert "$4::uuid" in sql
         assert args[3] == request_id
+        assert args[4] is None
+
+    @pytest.mark.asyncio
+    async def test_append_system_frame_links_permission_receipt(self):
+        conn = ScriptedConn()
+        conn.fetchrow_results = [{"epoch": 9, "seq": 6}]
+        request_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+        result = await event_journal.append_system_frame(
+            conn,
+            thread_id="t-sys",
+            kind="permission.resolved",
+            payload={"decision": "expired"},
+            permission_request_id=request_id,
+        )
+
+        assert result == (9, 6)
+        _method, sql, args = conn.calls[0]
+        assert "permission_request_id" in sql
+        assert "$5::uuid" in sql
+        assert args[3] is None
+        assert args[4] == request_id
 
     @pytest.mark.asyncio
     async def test_append_system_frame_returns_none_for_missing_thread(self):

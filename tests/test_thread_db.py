@@ -672,6 +672,75 @@ class TestEndThread:
             )
 
     @pytest.mark.asyncio
+    async def test_force_end_token_zero_retires_legacy_unbound_permission(
+        self, monkeypatch
+    ):
+        from src.shared import session_permission_retirement
+
+        metadata = {
+            "config_override": {"workspace": {"backend": "virtual"}},
+            "workspace_container": {},
+            "_workspace_binding": {
+                "generation": "11111111-1111-4111-8111-111111111111",
+                "kind": "virtual",
+                "backing_id": "rclone:threads/tid-1",
+                "ssh_host_key_fingerprint": None,
+            },
+        }
+        queue = {
+            "unit_kind": "session_turn",
+            "state": "queued",
+            "lease_token": 0,
+            "leased_by": None,
+            "last_leased_by": None,
+            "leased_until": None,
+            "attempts_since_completion": 0,
+            "input_seq": None,
+            "consumed_seq": None,
+            "control_input_seq": 0,
+            "control_consumed_seq": 0,
+            "interrupt_admission_lease_token": None,
+            "interrupt_admission_turn_id": None,
+        }
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                {
+                    "id": "tid-1",
+                    "status": "active",
+                    "execution_lane": "stateless",
+                    "metadata": metadata,
+                },
+                queue,
+                {"lease_token": 1, "attempts_since_completion": 0},
+            ]
+        )
+        conn.fetchval = AsyncMock(side_effect=[False, True, 1, "tid-1"])
+        retirement = MagicMock(epoch_bumped=True, count=1)
+        retire = AsyncMock(return_value=retirement)
+        monkeypatch.setattr(
+            session_permission_retirement,
+            "retire_stale_stateless_permissions",
+            retire,
+        )
+        db = _make_db_with_conn(conn)
+
+        closed = await db.begin_stateless_thread_workspace_retirement(
+            "tid-1", force=True
+        )
+
+        assert closed["state"] == "closed"
+        assert closed["terminal_token"] == 1
+        retire.assert_awaited_once_with(
+            conn,
+            thread_id="tid-1",
+            retired_lease_token=0,
+            successor_lease_token=1,
+            reason="force_end",
+            epoch_already_bumped=False,
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("permanent", [False, True])
     async def test_never_input_physical_end_creates_terminal_queue_authority(
         self, permanent

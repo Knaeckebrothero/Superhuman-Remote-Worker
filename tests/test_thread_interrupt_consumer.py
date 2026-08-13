@@ -502,8 +502,9 @@ async def test_stale_local_handle_never_reads_or_signals(stateless_owner):
 
 
 class _ReconcileConn:
-    def __init__(self, consumed_seq=5):
+    def __init__(self, consumed_seq=5, *, stale_permissions=False):
         self.consumed_seq = consumed_seq
+        self.stale_permissions = stale_permissions
 
     def transaction(self):
         return _Transaction()
@@ -512,6 +513,77 @@ class _ReconcileConn:
         if "SELECT consumed_seq FROM run_queue" in sql:
             return {"consumed_seq": self.consumed_seq}
         raise AssertionError(sql)
+
+    async def fetchval(self, sql, *args):
+        if "thread_permission_requests" in sql:
+            return self.stale_permissions
+        raise AssertionError(sql)
+
+
+@pytest.mark.asyncio
+async def test_permission_only_successor_recovery_rotates_after_lock_release(
+    stateless_owner,
+):
+    session, handle = stateless_owner
+    handle.update(str(THREAD_ID), 10)
+    order: list[str] = []
+
+    class TrackingTxn:
+        async def __aenter__(self):
+            order.append("txn_enter")
+            return self
+
+        async def __aexit__(self, *_args):
+            order.append("txn_exit")
+            return False
+
+    conn = _ReconcileConn(consumed_seq=5, stale_permissions=True)
+    conn.transaction = TrackingTxn
+    session.postgres_conn = _pool(conn)
+
+    async def rotate(**_kwargs):
+        order.append("rotate")
+        return 4
+
+    with (
+        patch(
+            "src.shared.thread_interrupts.owner_fence_current_for_update",
+            AsyncMock(return_value=True),
+        ),
+        patch(
+            "src.shared.thread_interrupts.fetch_stale_interrupt_requests",
+            AsyncMock(return_value=[]),
+        ),
+        patch.object(pa, "_rotate_thread_interrupt_recovery_epoch", rotate),
+    ):
+        result = await asyncio.wait_for(
+            pa._reconcile_stale_thread_interrupts(lease_token=10), timeout=1
+        )
+
+    assert result == (0, 5)
+    assert order == ["txn_enter", "txn_exit", "rotate"]
+
+
+@pytest.mark.asyncio
+async def test_stale_permission_probe_includes_legacy_null(stateless_owner):
+    session, handle = stateless_owner
+    handle.update(str(THREAD_ID), 10)
+    conn = _ReconcileConn(consumed_seq=5, stale_permissions=False)
+    session.postgres_conn = _pool(conn)
+
+    with (
+        patch(
+            "src.shared.thread_interrupts.owner_fence_current_for_update",
+            AsyncMock(return_value=True),
+        ),
+        patch(
+            "src.shared.thread_interrupts.fetch_stale_interrupt_requests",
+            AsyncMock(return_value=[]),
+        ),
+    ):
+        assert await pa._reconcile_stale_thread_interrupts(lease_token=10) == (0, 5)
+
+    assert "accepted_lease_token IS NULL" in pa._STALE_PERMISSION_EXISTS_SQL
 
 
 @pytest.mark.asyncio
@@ -835,8 +907,14 @@ async def test_recovery_epoch_closes_old_writer_before_exact_fenced_bump(
     monkeypatch.setattr(pa, "_events_epoch", 3)
     monkeypatch.setattr(pa, "_next_seq", 99)
 
+    retirement = SimpleNamespace(epoch_bumped=False, receipts=(), count=0)
     with (
         patch.object(pa._event_journal, "bump_epoch", side_effect=bump),
+        patch(
+            "src.shared.session_permission_retirement."
+            "retire_stale_stateless_permissions",
+            AsyncMock(return_value=retirement),
+        ),
         patch.object(pa, "_OrderedPersistentEventWriter", return_value=new_writer),
     ):
         assert await pa._rotate_thread_interrupt_recovery_epoch(lease_token=10) == 4
@@ -845,6 +923,58 @@ async def test_recovery_epoch_closes_old_writer_before_exact_fenced_bump(
     assert pa._events_epoch == 4
     assert pa._next_seq == 0
     assert pa._event_writer is new_writer
+
+
+@pytest.mark.asyncio
+async def test_recovery_epoch_seeds_after_multiple_permission_receipts(
+    stateless_owner, monkeypatch
+):
+    session, handle = stateless_owner
+    handle.update(str(THREAD_ID), 10)
+
+    class EpochConn:
+        def transaction(self):
+            return _Transaction()
+
+        async def fetchrow(self, sql, *_args):
+            if "FROM threads" in sql or "FROM run_queue" in sql:
+                return {"one": 1}
+            raise AssertionError(sql)
+
+    async def close_old():
+        return None
+
+    receipts = (
+        SimpleNamespace(epoch=4, seq=1),
+        SimpleNamespace(epoch=4, seq=2),
+    )
+    retirement = SimpleNamespace(epoch_bumped=True, receipts=receipts, count=2)
+    old_writer = SimpleNamespace(thread_id=str(THREAD_ID), close=close_old)
+    new_writer = MagicMock()
+    new_writer.thread_id = str(THREAD_ID)
+    session.postgres_conn = _pool(EpochConn())
+    monkeypatch.setattr(pa, "_event_writer", old_writer)
+    monkeypatch.setattr(pa, "_events_epoch", 3)
+    monkeypatch.setattr(pa, "_next_seq", 99)
+
+    with (
+        patch(
+            "src.shared.session_permission_retirement."
+            "retire_stale_stateless_permissions",
+            AsyncMock(return_value=retirement),
+        ),
+        patch.object(pa._event_journal, "bump_epoch") as bump,
+        patch.object(pa, "_OrderedPersistentEventWriter", return_value=new_writer),
+    ):
+        assert await pa._rotate_thread_interrupt_recovery_epoch(lease_token=10) == 4
+
+    bump.assert_not_awaited()
+    assert pa._events_epoch == 4
+    assert pa._next_seq == 2
+    pa._broadcast_frame("turn.started", {}, durable_receipt=False)
+    assert pa._next_seq == 3
+    queued = new_writer.enqueue.call_args.args[0]
+    assert (queued.epoch, queued.seq) == (4, 3)
 
 
 class _RecordingConn:

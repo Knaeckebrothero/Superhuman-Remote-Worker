@@ -25,13 +25,13 @@ from uuid import UUID, uuid4
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
-from src.api.persistent_session import resolve_memory_extraction_prompt
 from src.core.loader import (
     LLMConfig,
     create_llm,
     load_config_from_resolved,
     resolve_model_settings,
 )
+from src.services.memory_prompts import resolve_memory_extraction_prompt
 from src.services.auxiliary import AuxiliaryLLM, ExtractMemoriesTask
 from src.services.embedding_service import EmbeddingService
 from src.services.memory.ingestion import maybe_attach_ingestion_verdict

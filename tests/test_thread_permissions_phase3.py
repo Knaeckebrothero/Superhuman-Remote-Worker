@@ -46,6 +46,10 @@ def _make_postgres_conn(
     async def _fetchval(sql, *args, **kwargs):
         if "INSERT" in sql:
             return insert_returns
+        if "SELECT id FROM threads" in sql:
+            return args[0]
+        if "SELECT unit_id FROM run_queue" in sql:
+            return args[0]
         if "SELECT status" in sql:
             return (
                 select_status_sequence.pop(0) if select_status_sequence else "pending"
@@ -197,6 +201,33 @@ class TestInsertPermissionRequest:
         _install_session(postgres_conn=postgres)
         rid = await mod._insert_permission_request("tc1", "x", {})
         assert rid is None
+
+    @pytest.mark.asyncio
+    async def test_stateless_insert_stamps_exact_accepted_lease_token(
+        self, monkeypatch
+    ):
+        import src.api.persistent_app as mod
+        from src.api.lease_context import LeaseHandle
+
+        postgres = _make_postgres_conn(insert_returns="aaaaaaaa-1111")
+        _install_session(postgres_conn=postgres)
+        mod._thread_id = "11111111-1111-4111-8111-111111111111"
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        handle = LeaseHandle()
+        handle.update(mod._thread_id, 17)
+        context_token = mod._current_lease_var.set(handle)
+        try:
+            rid = await mod._insert_permission_request("tc1", "read_file", {})
+        finally:
+            mod._current_lease_var.reset(context_token)
+
+        assert rid == "aaaaaaaa-1111"
+        calls = postgres._fake_conn.fetchval.await_args_list
+        assert "FOR UPDATE" in calls[0].args[0]
+        assert "FOR SHARE" in calls[1].args[0]
+        insert = calls[2]
+        assert "accepted_lease_token" in insert.args[0]
+        assert insert.args[-1] == 17
 
 
 # ---------------------------------------------------------------------------

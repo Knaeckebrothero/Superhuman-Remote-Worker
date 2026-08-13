@@ -90,7 +90,7 @@ class TestResolveMemoryExtractionPrompt:
     def test_load_failure_returns_empty_not_raise(self):
         cfg = AgentConfig(agent_id="t", display_name="T")
         with patch(
-            "src.api.persistent_session.load_auxiliary_prompt",
+            "src.services.memory_prompts.load_auxiliary_prompt",
             side_effect=FileNotFoundError("missing"),
         ):
             assert resolve_memory_extraction_prompt(cfg) == ""

@@ -33,6 +33,21 @@ def test_pruner_preserves_receipts_until_owner_request_is_terminal():
     assert source.count("'consumed_input_seq'") == 2
 
 
+def test_applied_session_memory_migration_checksum_is_immutable():
+    """0145 was live-applied before later milestones; its bytes are an API."""
+
+    import hashlib
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "orchestrator/database/migrations/app/0145_session_turn_memory_effects.sql"
+    )
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == (
+        "059b263a24dfa6c06f2883a560038720374e332aff34b056eca59d8b878a182a"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Section 1 — _broadcast cursor + ordered journal writer
 # ---------------------------------------------------------------------------
