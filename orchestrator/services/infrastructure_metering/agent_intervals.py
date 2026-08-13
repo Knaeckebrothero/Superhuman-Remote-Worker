@@ -62,6 +62,7 @@ class PodProductClass(StrEnum):
     IDE_WORKSPACE = "ide-session"
     DYNAMIC_AGENT = "dynamic-agent"
     PERSISTENT_AGENT = "persistent-agent"
+    STATELESS_AGENT = "stateless-agent"
     VIRT_LAUNCHER = "virt-launcher"
     OTHER = "other"
 
@@ -80,6 +81,7 @@ class PodProductClassification:
         return self.product_class in {
             PodProductClass.DYNAMIC_AGENT,
             PodProductClass.PERSISTENT_AGENT,
+            PodProductClass.STATELESS_AGENT,
         }
 
     @property
@@ -302,6 +304,28 @@ def classify_product_pod(item: InventoryItem) -> PodProductClassification:
             identity_consistent=consistent,
         )
 
+    if app == "srw-agent-stateless" and component == "agent":
+        # The shared stateless executor pool (stateless_agents.md §5.8). Pods
+        # deliberately carry NO job/thread identity — they serve many units
+        # over their lifetime, and per-tenant attribution is the lease-interval
+        # workstream (§7). Until that lands, the pool is admitted as agent
+        # capacity so it never disappears into "other"; identity labels on one
+        # of these pods contradict the class and fail toward unknown.
+        consistent = not any(
+            labels.get(key)
+            for key in ("srw/job-id", "srw/thread-id", "srw.io/thread-id")
+        )
+        return PodProductClassification(
+            product_class=PodProductClass.STATELESS_AGENT,
+            resource="agent_pod",
+            reason_code=(
+                "stateless-executor-pool"
+                if consistent
+                else "stateless-agent-identity-conflict"
+            ),
+            identity_consistent=consistent,
+        )
+
     if app == "srw-persistent-agent" and component == "persistent-agent":
         thread_id = _canonical_uuid(labels.get("srw/thread-id"))
         consistent = thread_id is not None and not labels.get("srw/job-id")
@@ -491,6 +515,23 @@ async def resolve_agent_pod_attribution(
         return _unknown("not-agent-pod")
     if not projection.classification.identity_consistent:
         return _unknown(projection.classification.reason_code)
+
+    if projection.classification.product_class == PodProductClass.STATELESS_AGENT:
+        # The stateless pool never registers per-pod agent identity, so the
+        # mutual-binding lookup below can only ever say "registration missing".
+        # The capacity is real and shared: attribute it to the platform with no
+        # binding cursor (the confirm path requires exactly that shape).
+        # Per-lease customer attribution is the §7 workstream, not this one.
+        return AgentPodAttribution(
+            scope="shared-platform",
+            owner_kind="platform",
+            owner_id=None,
+            user_id=None,
+            project_id=None,
+            source="chart-stateless-pool",
+            quality="exact",
+            reason_code="stateless-executor-pool",
+        )
 
     rows = await conn.fetch(_AGENT_IDENTITY_SQL, projection.source_uid)
     if len(rows) == 0:
