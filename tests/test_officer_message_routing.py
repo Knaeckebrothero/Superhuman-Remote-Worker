@@ -1,0 +1,1095 @@
+"""Officer-aware worker message routing (officer_message_routing.md M1–M3).
+
+Covers the M1 effective-policy resolver matrix, the M2 transactional
+blocking-send branching (officer transaction, guard-loss 409, §5.1 immediate
+fallbacks, user_direct byte-compat), the hold/decommission drains, and the M3
+officer action guard matrix + delivery flows. The M4 reconciler has its own
+file (tests/test_message_route_reconciler.py); CAS races against a real
+Postgres live in tests/test_officer_message_routing_real_postgres.py.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
+
+import pytest
+from fastapi import HTTPException
+
+import orchestrator.main as main
+from services import message_routing as routing
+
+
+OFFICER_TID = str(uuid4())
+PROJECT_ID = str(uuid4())
+
+
+def _post(policy=None, thread_id=OFFICER_TID, incarnations=None):
+    return {
+        "project_id": PROJECT_ID,
+        "thread_id": thread_id,
+        "communication_policy": policy
+        or {"worker_messages": "user_direct", "officer_response_minutes": 15},
+        "incarnations": incarnations if incarnations is not None else [],
+        "state": {},
+        "config_override": {},
+    }
+
+
+def _officer_thread(held=False):
+    metadata = {"config_override": {"officer": {"enabled": True}}}
+    if held:
+        metadata["config_override"]["officer"]["hold"] = {
+            "kind": "maintenance",
+            "since": "2026-08-14T00:00:00+00:00",
+        }
+    return {"id": OFFICER_TID, "status": "active", "metadata": metadata}
+
+
+def _job(**overrides):
+    job = {
+        "id": str(uuid4()),
+        "status": "processing",
+        "execution_lane": "pinned",
+        "assigned_agent_id": str(uuid4()),
+        "user_id": str(uuid4()),
+        "description": "test job",
+        "config_name": "worker_base",
+        "context": {},
+        "project_id": PROJECT_ID,
+    }
+    job.update(overrides)
+    return job
+
+
+# =============================================================================
+# M1 — effective-policy resolver matrix
+# =============================================================================
+
+
+class TestResolveEffectivePolicy:
+    @pytest.mark.asyncio
+    async def test_explicit_recipient_stays_direct_without_db_lookups(self):
+        db = MagicMock()
+        result = await routing.resolve_effective_policy(db, _job(), to="Alice Example")
+        assert result["applied"] == "user_direct"
+        assert result["reason"] == "explicit_recipient"
+        db.get_project_officer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_project_less_job_stays_direct(self):
+        db = MagicMock()
+        result = await routing.resolve_effective_policy(db, _job(project_id=None))
+        assert result["applied"] == "user_direct"
+        assert result["reason"] == "no_project"
+        db.get_project_officer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_post_row_stays_direct(self):
+        db = MagicMock()
+        db.get_project_officer = AsyncMock(return_value=None)
+        result = await routing.resolve_effective_policy(db, _job())
+        assert result["applied"] == "user_direct"
+        assert result["reason"] == "no_post"
+
+    @pytest.mark.asyncio
+    async def test_row_policy_user_direct_short_circuits(self):
+        db = MagicMock()
+        db.get_project_officer = AsyncMock(
+            return_value=_post(
+                {"worker_messages": "user_direct", "officer_response_minutes": 30}
+            )
+        )
+        db.get_officer_thread_for_project = AsyncMock()
+        result = await routing.resolve_effective_policy(db, _job())
+        assert result["applied"] == "user_direct"
+        assert result["reason"] == "policy_user_direct"
+        assert result["officer_response_minutes"] == 30
+        # No commissioned-officer lookup is needed for a direct policy.
+        db.get_officer_thread_for_project.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_vacant_post_collapses_officer_first_to_direct(self):
+        db = MagicMock()
+        db.get_project_officer = AsyncMock(
+            return_value=_post(
+                {"worker_messages": "officer_first", "officer_response_minutes": 15},
+                thread_id=None,
+            )
+        )
+        db.get_officer_thread_for_project = AsyncMock(return_value=None)
+        result = await routing.resolve_effective_policy(db, _job())
+        assert result["applied"] == "user_direct"
+        assert result["requested"] == "officer_first"
+        assert result["reason"] == "vacant"
+
+    @pytest.mark.asyncio
+    async def test_commissioned_officer_first_resolves_with_incarnation(self):
+        db = MagicMock()
+        db.get_project_officer = AsyncMock(
+            return_value=_post(
+                {"worker_messages": "officer_first", "officer_response_minutes": 7},
+                incarnations=[{"thread_id": "old"}, {"thread_id": "older"}],
+            )
+        )
+        db.get_officer_thread_for_project = AsyncMock(return_value=_officer_thread())
+        result = await routing.resolve_effective_policy(db, _job())
+        assert result["applied"] == "officer_first"
+        assert result["reason"] == "commissioned"
+        assert result["officer_thread_id"] == OFFICER_TID
+        assert result["officer_incarnation"] == 2
+        assert result["officer_response_minutes"] == 7
+        assert result["officer_held"] is False
+
+    @pytest.mark.asyncio
+    async def test_held_officer_is_reported_not_collapsed(self):
+        """The hold rule is mode-dependent, so the resolver only REPORTS it."""
+        db = MagicMock()
+        db.get_project_officer = AsyncMock(
+            return_value=_post({"worker_messages": "officer_first"})
+        )
+        db.get_officer_thread_for_project = AsyncMock(
+            return_value=_officer_thread(held=True)
+        )
+        result = await routing.resolve_effective_policy(db, _job())
+        assert result["applied"] == "officer_first"
+        assert result["officer_held"] is True
+
+    @pytest.mark.asyncio
+    async def test_resolver_failure_degrades_to_direct(self):
+        db = MagicMock()
+        db.get_project_officer = AsyncMock(side_effect=RuntimeError("db down"))
+        result = await routing.resolve_effective_policy(db, _job())
+        assert result["applied"] == "user_direct"
+        assert result["reason"] == "no_post"
+
+    @pytest.mark.asyncio
+    async def test_minutes_are_clamped_to_patch_bounds(self):
+        db = MagicMock()
+        db.get_project_officer = AsyncMock(
+            return_value=_post(
+                {"worker_messages": "officer_first", "officer_response_minutes": 9999}
+            )
+        )
+        db.get_officer_thread_for_project = AsyncMock(return_value=_officer_thread())
+        result = await routing.resolve_effective_policy(db, _job())
+        assert result["officer_response_minutes"] == 120
+        db.get_project_officer = AsyncMock(
+            return_value=_post(
+                {"worker_messages": "officer_first", "officer_response_minutes": "x"}
+            )
+        )
+        result = await routing.resolve_effective_policy(db, _job())
+        assert result["officer_response_minutes"] == 15
+
+    def test_snapshot_freezes_the_resolution(self):
+        """M1: the snapshot is what the route keeps — a later project-setting
+        change never retargets a waiting question because nothing re-resolves."""
+        resolution = {
+            "requested": "officer_first",
+            "reason": "commissioned",
+            "officer_response_minutes": 20,
+        }
+        snapshot = routing.snapshot_for_route(
+            resolution, applied="officer_first", purpose="blocker"
+        )
+        assert snapshot["worker_messages"] == "officer_first"
+        assert snapshot["applied"] == "officer_first"
+        assert snapshot["officer_response_minutes"] == 20
+        assert snapshot["purpose"] == "blocker"
+        # Mutating the source afterwards does not touch the snapshot.
+        resolution["officer_response_minutes"] = 5
+        assert snapshot["officer_response_minutes"] == 20
+
+
+class TestDeadlinesAndTimeout:
+    def test_blocking_timeout_prefers_resolved_config(self):
+        job = _job(
+            resolved_config={"agent": {"communication": {"blocking_timeout_hours": 2}}},
+            config_override={"communication": {"blocking_timeout_hours": 9}},
+        )
+        assert routing.blocking_timeout_hours(job) == 2.0
+
+    def test_blocking_timeout_falls_back_to_override_then_default(self):
+        assert (
+            routing.blocking_timeout_hours(
+                _job(config_override={"communication": {"blocking_timeout_hours": 9}})
+            )
+            == 9.0
+        )
+        assert routing.blocking_timeout_hours(_job()) == 24.0
+        assert (
+            routing.blocking_timeout_hours(
+                _job(
+                    resolved_config={
+                        "agent": {"communication": {"blocking_timeout_hours": 0}}
+                    }
+                )
+            )
+            == 24.0
+        )
+
+    def test_route_deadlines_only_blocking_pending_officer_gets_sla(self):
+        now = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
+        officer = routing.route_deadlines(
+            blocking=True,
+            state="pending_officer",
+            officer_response_minutes=15,
+            timeout_hours=24,
+            now=now,
+        )
+        assert officer["officer_deadline"] == now + timedelta(minutes=15)
+        assert officer["total_deadline"] == now + timedelta(hours=24)
+        both = routing.route_deadlines(
+            blocking=True,
+            state="pending_both",
+            officer_response_minutes=15,
+            timeout_hours=24,
+            now=now,
+        )
+        assert both["officer_deadline"] is None
+        assert both["total_deadline"] == now + timedelta(hours=24)
+        async_route = routing.route_deadlines(
+            blocking=False,
+            state="pending_officer",
+            officer_response_minutes=15,
+            timeout_hours=24,
+            now=now,
+        )
+        assert async_route["officer_deadline"] is None
+        assert async_route["total_deadline"] is None
+
+
+# =============================================================================
+# M2 — the send path
+# =============================================================================
+
+
+def _send_db(job, policy, *, officer=True, held=False):
+    """A MagicMock DB wired for one send_agent_message call."""
+    db = MagicMock()
+    db.get_job = AsyncMock(return_value=job)
+    db.get_user = AsyncMock(
+        return_value={"email": "owner@example.com", "display_name": "Owner"}
+    )
+    db.check_message_rate_limit = AsyncMock(
+        return_value={"job_hourly": 0, "job_daily": 0, "user_daily": 0}
+    )
+    db.get_message_sequence = AsyncMock(return_value=1)
+    db.get_project_officer = AsyncMock(return_value=_post(policy))
+    db.get_officer_thread_for_project = AsyncMock(
+        return_value=_officer_thread(held=held) if officer else None
+    )
+    db.create_routed_blocking_freeze = AsyncMock(
+        return_value={
+            "route_id": str(uuid4()),
+            "originating_message_id": str(uuid4()),
+        }
+    )
+    db.create_message_route = AsyncMock(return_value=str(uuid4()))
+    db.mark_route_user_delivery = AsyncMock(return_value=True)
+    db.set_message_email_id = AsyncMock(return_value=True)
+    db.publish_blocking_message = AsyncMock(return_value=True)
+    db.log_message = AsyncMock(
+        return_value={"id": str(uuid4()), "thread_id": "t", "status": "sent"}
+    )
+    return db
+
+
+def _notifier(email=True):
+    notifier = MagicMock()
+    notifier.dispatch = AsyncMock(
+        return_value={"email": email, "email_message_id": "<m1@x>", "queued": False}
+    )
+    return notifier
+
+
+def _body(**overrides):
+    values = {
+        "to": "user",
+        "subject": "Need input",
+        "message": "Please answer",
+        "mode": "blocking",
+    }
+    values.update(overrides)
+    return main.MessageSendRequest(**values)
+
+
+def _send_patches(db, notifier, *, flag=True):
+    return (
+        patch.object(main, "COMPLETION_COMMANDS_ENABLED", flag),
+        patch.object(main, "require_internal", AsyncMock()),
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "notification_service", notifier),
+        patch.object(main, "_kick_officer_event_drain", MagicMock()),
+    )
+
+
+class TestOfficerFirstBlockingSend:
+    @pytest.mark.asyncio
+    async def test_one_transaction_and_no_user_notification(self):
+        job = _job(execution_lane="pinned")
+        db = _send_db(
+            job,
+            {"worker_messages": "officer_first", "officer_response_minutes": 10},
+        )
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            result = await main.send_agent_message(
+                MagicMock(), job["id"], _body(agent_id=job["assigned_agent_id"])
+            )
+
+        assert result["status"] == "sent"
+        assert result["recipient"] == "project officer"
+        assert result["routing"]["applied"] == "officer_first"
+        assert result["routing"]["state"] == "pending_officer"
+
+        # Acceptance 1: no user notification for blocking officer_first.
+        notifier.dispatch.assert_not_awaited()
+        # The unit is the transaction — no separate log_message call.
+        db.log_message.assert_not_awaited()
+        db.publish_blocking_message.assert_not_awaited()
+
+        kwargs = db.create_routed_blocking_freeze.await_args.kwargs
+        args = db.create_routed_blocking_freeze.await_args.args
+        assert args[0] == job["id"]
+        freeze = args[1]
+        route = kwargs["route"]
+        wake = kwargs["wake"]
+        assert route["state"] == "pending_officer"
+        assert route["officer_thread_id"] == OFFICER_TID
+        assert route["policy_snapshot"]["worker_messages"] == "officer_first"
+        assert route["officer_deadline"] is not None
+        assert route["total_deadline"] is not None
+        # Freeze carries the route generation and the matching thread.
+        assert freeze["route_id"] == route["route_id"]
+        assert freeze["thread_id"] == route["thread_id"]
+        assert freeze["freeze_type"] == "blocking_message"
+        # Durable wake intent, high-urgency source, route-scoped dedup.
+        assert wake["source"] == "worker_message"
+        assert wake["dedup_key"] == f"route:{route['route_id']}"
+        assert wake["thread_id"] == OFFICER_TID
+        assert kwargs["message_entry"]["recipient_email"] is None
+
+    @pytest.mark.asyncio
+    async def test_guard_loss_is_409_with_zero_side_effects(self):
+        """Failure injection: the unit did not commit → the job stays
+        runnable, nothing was notified, and NO fallback may freeze it."""
+        job = _job()
+        db = _send_db(job, {"worker_messages": "officer_first"})
+        db.create_routed_blocking_freeze = AsyncMock(return_value=None)
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            with pytest.raises(HTTPException) as exc:
+                await main.send_agent_message(
+                    MagicMock(), job["id"], _body(agent_id=job["assigned_agent_id"])
+                )
+        assert exc.value.status_code == 409
+        notifier.dispatch.assert_not_awaited()
+        db.log_message.assert_not_awaited()
+        db.publish_blocking_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_falls_back_to_user_immediately(self):
+        """§5.1: wake-enqueue/transaction failure → the blocking question goes
+        to the user through the unchanged direct path."""
+        job = _job()
+        db = _send_db(job, {"worker_messages": "officer_first"})
+        db.create_routed_blocking_freeze = AsyncMock(
+            side_effect=RuntimeError("insert failed")
+        )
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            result = await main.send_agent_message(
+                MagicMock(), job["id"], _body(agent_id=job["assigned_agent_id"])
+            )
+        assert result["status"] == "sent"
+        assert result["routing"]["applied"] == "user_direct"
+        assert result["routing"]["reason"] == "officer_route_failed"
+        notifier.dispatch.assert_awaited_once()
+        db.publish_blocking_message.assert_awaited_once()
+        db.log_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_held_officer_routes_blocking_to_user_immediately(self):
+        job = _job()
+        db = _send_db(job, {"worker_messages": "officer_first"}, held=True)
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            result = await main.send_agent_message(
+                MagicMock(), job["id"], _body(agent_id=job["assigned_agent_id"])
+            )
+        assert result["routing"]["applied"] == "user_direct"
+        assert result["routing"]["reason"] == "officer_held"
+        db.create_routed_blocking_freeze.assert_not_awaited()
+        notifier.dispatch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_vacant_post_routes_blocking_to_user_immediately(self):
+        job = _job()
+        db = _send_db(job, {"worker_messages": "officer_first"}, officer=False)
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            result = await main.send_agent_message(
+                MagicMock(), job["id"], _body(agent_id=job["assigned_agent_id"])
+            )
+        assert result["routing"]["applied"] == "user_direct"
+        assert result["routing"]["reason"] == "vacant"
+        db.create_routed_blocking_freeze.assert_not_awaited()
+        notifier.dispatch.assert_awaited_once()
+
+
+class TestOfficerAndUserSend:
+    @pytest.mark.asyncio
+    async def test_blocking_delivers_to_both_and_stamps_user_delivery(self):
+        job = _job()
+        db = _send_db(job, {"worker_messages": "officer_and_user"})
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            result = await main.send_agent_message(
+                MagicMock(), job["id"], _body(agent_id=job["assigned_agent_id"])
+            )
+        assert result["routing"]["applied"] == "officer_and_user"
+        assert result["routing"]["state"] == "pending_both"
+        kwargs = db.create_routed_blocking_freeze.await_args.kwargs
+        assert kwargs["route"]["state"] == "pending_both"
+        # pending_both carries no officer SLA — the user already has it.
+        assert kwargs["route"]["officer_deadline"] is None
+        assert kwargs["wake"] is not None
+        notifier.dispatch.assert_awaited_once()
+        db.mark_route_user_delivery.assert_awaited_once()
+        db.set_message_email_id.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_async_officer_first_creates_route_without_wake_or_email(self):
+        job = _job()
+        db = _send_db(job, {"worker_messages": "officer_first"})
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            result = await main.send_agent_message(
+                MagicMock(), job["id"], _body(mode="async", purpose="update")
+            )
+        assert result["routing"]["applied"] == "officer_first"
+        # Acceptance 9: async does not freeze and coalesces into the sitrep.
+        db.create_routed_blocking_freeze.assert_not_awaited()
+        db.publish_blocking_message.assert_not_awaited()
+        notifier.dispatch.assert_not_awaited()
+        route = db.create_message_route.await_args.args[0]
+        assert route["state"] == "pending_officer"
+        assert route["blocking"] is False
+        assert route["policy_snapshot"]["purpose"] == "update"
+        db.log_message.assert_awaited_once()
+        assert db.log_message.await_args.kwargs["recipient_email"] is None
+
+
+class TestUserDirectByteCompat:
+    @pytest.mark.asyncio
+    async def test_user_direct_keeps_the_legacy_flow_plus_bookkeeping(self):
+        job = _job()
+        db = _send_db(job, {"worker_messages": "user_direct"})
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            result = await main.send_agent_message(
+                MagicMock(), job["id"], _body(agent_id=job["assigned_agent_id"])
+            )
+        assert result["status"] == "sent"
+        assert result["recipient"] == "o***@example.com"
+        # The legacy order: publish (flag on), dispatch, log — untouched.
+        db.publish_blocking_message.assert_awaited_once()
+        notifier.dispatch.assert_awaited_once()
+        db.log_message.assert_awaited_once()
+        db.create_routed_blocking_freeze.assert_not_awaited()
+        # Additive: the [A-timeout] route row and the freeze generation.
+        route = db.create_message_route.await_args.args[0]
+        assert route["state"] == "user_direct"
+        assert route["blocking"] is True
+        assert route["total_deadline"] is not None
+        publish_freeze = db.publish_blocking_message.await_args.args[1]
+        assert publish_freeze["route_id"] == route["route_id"]
+
+    @pytest.mark.asyncio
+    async def test_route_bookkeeping_failure_never_fails_the_send(self):
+        job = _job()
+        db = _send_db(job, {"worker_messages": "user_direct"})
+        db.create_message_route = AsyncMock(side_effect=RuntimeError("no table"))
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            result = await main.send_agent_message(
+                MagicMock(), job["id"], _body(agent_id=job["assigned_agent_id"])
+            )
+        assert result["status"] == "sent"
+
+    @pytest.mark.asyncio
+    async def test_async_user_direct_creates_no_route(self):
+        job = _job()
+        db = _send_db(job, {"worker_messages": "user_direct"})
+        notifier = _notifier()
+        p1, p2, p3, p4, p5 = _send_patches(db, notifier)
+        with p1, p2, p3, p4, p5:
+            result = await main.send_agent_message(
+                MagicMock(), job["id"], _body(mode="async")
+            )
+        assert result["status"] == "sent"
+        db.create_message_route.assert_not_awaited()
+
+
+# =============================================================================
+# §5.1 — hold/decommission drains
+# =============================================================================
+
+
+class TestDrains:
+    @pytest.mark.asyncio
+    async def test_drain_escalates_every_pending_blocking_route(self):
+        route_a = {"route_id": str(uuid4()), "job_id": str(uuid4()), "thread_id": "a1"}
+        route_b = {"route_id": str(uuid4()), "job_id": str(uuid4()), "thread_id": "b2"}
+        db = MagicMock()
+        db.list_pending_officer_blocking_routes = AsyncMock(
+            return_value=[route_a, route_b]
+        )
+        with patch.object(
+            routing,
+            "escalate_route",
+            AsyncMock(return_value={"escalated": True, "delivered": True}),
+        ) as escalate:
+            drained = await routing.drain_officer_blocking_routes(
+                db, PROJECT_ID, reason="officer_hold"
+            )
+        assert drained == 2
+        assert escalate.await_count == 2
+        assert escalate.await_args.kwargs["reason"] == "officer_hold"
+
+    @pytest.mark.asyncio
+    async def test_drain_survives_listing_failure(self):
+        db = MagicMock()
+        db.list_pending_officer_blocking_routes = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        assert (
+            await routing.drain_officer_blocking_routes(
+                db, PROJECT_ID, reason="officer_hold"
+            )
+            == 0
+        )
+
+    @pytest.mark.asyncio
+    async def test_escalate_route_cas_loss_reports_not_escalated(self):
+        db = MagicMock()
+        db.transition_message_route = AsyncMock(return_value=None)
+        outcome = await routing.escalate_route(
+            db,
+            {"route_id": str(uuid4()), "job_id": str(uuid4()), "thread_id": "t"},
+            reason="officer_hold",
+            actor_kind="system",
+        )
+        assert outcome == {"escalated": False, "delivered": False}
+
+    @pytest.mark.asyncio
+    async def test_hold_endpoint_drains_pending_blocking_routes(self):
+        db = MagicMock()
+        db.get_officer_thread_for_project = AsyncMock(return_value=_officer_thread())
+        db.merge_thread_config_override = AsyncMock(return_value=True)
+        with (
+            patch.object(
+                main, "require_project_owner", AsyncMock(return_value=({}, {}))
+            ),
+            patch.object(main, "postgres_db", db),
+            patch.object(main, "_inject_officer_notice", AsyncMock(return_value=True)),
+            patch(
+                "services.message_routing.drain_officer_blocking_routes",
+                AsyncMock(return_value=3),
+            ) as drain,
+        ):
+            result = await main.hold_project_officer(MagicMock(), PROJECT_ID, None)
+        assert result["status"] == "held"
+        assert result["drained_blocking_routes"] == 3
+        drain.assert_awaited_once()
+        assert drain.await_args.kwargs["reason"] == "officer_hold"
+
+
+# =============================================================================
+# M3 — officer action guards and flows
+# =============================================================================
+
+
+def _guard_request(scope: str | None = None):
+    request = MagicMock()
+    request.headers = {"X-MCP-Scope": scope} if scope else {}
+    return request
+
+
+def _action_db(job, *, officer=True, route=None):
+    db = MagicMock()
+    db.get_job = AsyncMock(return_value=job)
+    db.get_officer_thread_for_project = AsyncMock(
+        return_value=_officer_thread() if officer else None
+    )
+    db.get_project_officer = AsyncMock(return_value=_post())
+    db.find_message_route_for_thread = AsyncMock(return_value=route)
+    db.get_message_route = AsyncMock(return_value=route)
+    db.transition_message_route = AsyncMock(return_value=route)
+    return db
+
+
+def _route(**overrides):
+    route = {
+        "route_id": str(uuid4()),
+        "job_id": str(uuid4()),
+        "project_id": PROJECT_ID,
+        "thread_id": "abc123",
+        "state": "pending_officer",
+        "blocking": True,
+        "officer_thread_id": OFFICER_TID,
+        "policy_snapshot": {"worker_messages": "officer_first"},
+    }
+    route.update(overrides)
+    return route
+
+
+class TestOfficerActionGuards:
+    @pytest.mark.asyncio
+    async def test_project_less_job_is_403(self):
+        job = _job(project_id=None)
+        db = _action_db(job)
+        with (
+            patch.object(main, "require_internal", AsyncMock()),
+            patch.object(main, "postgres_db", db),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main.officer_reply_to_worker_message(
+                    _guard_request(),
+                    job["id"],
+                    "abc123",
+                    main.OfficerMessageReplyRequest(
+                        officer_thread_id=OFFICER_TID, message="hi"
+                    ),
+                )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_non_commissioned_caller_is_403(self):
+        """Cross-project / impostor: the claim does not match the post row."""
+        job = _job()
+        db = _action_db(job)
+        stranger = str(uuid4())
+        with (
+            patch.object(main, "require_internal", AsyncMock()),
+            patch.object(main, "postgres_db", db),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main.officer_reply_to_worker_message(
+                    _guard_request(),
+                    job["id"],
+                    "abc123",
+                    main.OfficerMessageReplyRequest(
+                        officer_thread_id=stranger, message="hi"
+                    ),
+                )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_vacant_post_is_403(self):
+        job = _job()
+        db = _action_db(job, officer=False)
+        with (
+            patch.object(main, "require_internal", AsyncMock()),
+            patch.object(main, "postgres_db", db),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main.officer_acknowledge_worker_message(
+                    _guard_request(),
+                    job["id"],
+                    "abc123",
+                    main.OfficerMessageAckRequest(officer_thread_id=OFFICER_TID),
+                )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_scope_mismatch_is_403(self):
+        job = _job()
+        db = _action_db(job)
+        with (
+            patch.object(main, "require_internal", AsyncMock()),
+            patch.object(main, "postgres_db", db),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main.officer_reply_to_worker_message(
+                    _guard_request(scope=f"project:{uuid4()}"),
+                    job["id"],
+                    "abc123",
+                    main.OfficerMessageReplyRequest(
+                        officer_thread_id=OFFICER_TID, message="hi"
+                    ),
+                )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_no_open_route_is_409(self):
+        job = _job()
+        db = _action_db(job, route=None)
+        with (
+            patch.object(main, "require_internal", AsyncMock()),
+            patch.object(main, "postgres_db", db),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main.officer_reply_to_worker_message(
+                    _guard_request(),
+                    job["id"],
+                    "abc123",
+                    main.OfficerMessageReplyRequest(
+                        officer_thread_id=OFFICER_TID, message="hi"
+                    ),
+                )
+        assert exc.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_previous_incarnation_route_is_not_adoptable(self):
+        """§5.1: recommission never adopts an old waiting route."""
+        job = _job()
+        old_route = _route(officer_thread_id=str(uuid4()))
+        db = _action_db(job, route=old_route)
+        with (
+            patch.object(main, "require_internal", AsyncMock()),
+            patch.object(main, "postgres_db", db),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main.officer_reply_to_worker_message(
+                    _guard_request(),
+                    job["id"],
+                    "abc123",
+                    main.OfficerMessageReplyRequest(
+                        officer_thread_id=OFFICER_TID, message="hi"
+                    ),
+                )
+        assert exc.value.status_code == 409
+        assert "incarnation" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_ack_on_blocking_route_is_400(self):
+        job = _job()
+        db = _action_db(job, route=_route(blocking=True))
+        with (
+            patch.object(main, "require_internal", AsyncMock()),
+            patch.object(main, "postgres_db", db),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main.officer_acknowledge_worker_message(
+                    _guard_request(),
+                    job["id"],
+                    "abc123",
+                    main.OfficerMessageAckRequest(officer_thread_id=OFFICER_TID),
+                )
+        assert exc.value.status_code == 400
+        assert "frozen" in exc.value.detail
+
+
+class TestOfficerActionFlows:
+    @pytest.mark.asyncio
+    async def test_reply_delivers_through_existing_lane_as_officer(self):
+        job = _job()
+        route = _route()
+        db = _action_db(job, route=route)
+        deliver = AsyncMock(return_value=("immediate_resume", 2))
+        record = AsyncMock()
+        with (
+            patch.object(main, "require_internal", AsyncMock()),
+            patch.object(main, "postgres_db", db),
+            patch.object(main, "_route_inbound_reply", deliver),
+            patch.object(main, "_record_route_reply_resolution", record),
+        ):
+            result = await main.officer_reply_to_worker_message(
+                _guard_request(scope=f"project:{PROJECT_ID}"),
+                job["id"],
+                "abc123",
+                main.OfficerMessageReplyRequest(
+                    officer_thread_id=OFFICER_TID, message="Use option B."
+                ),
+            )
+        assert result["status"] == "replied"
+        assert result["delivery_strategy"] == "immediate_resume"
+        kwargs = deliver.await_args.kwargs
+        assert kwargs["resolver_kind"] == "officer"
+        assert kwargs["resolver_id"] == OFFICER_TID
+        assert "Use option B." in kwargs["message"]
+        record.assert_awaited_once()
+        assert record.await_args.kwargs["actor_kind"] == "officer"
+
+    @pytest.mark.asyncio
+    async def test_escalate_carries_officer_context(self):
+        job = _job()
+        route = _route()
+        db = _action_db(job, route=route)
+        escalate = AsyncMock(return_value={"escalated": True, "delivered": True})
+        with (
+            patch.object(main, "require_internal", AsyncMock()),
+            patch.object(main, "postgres_db", db),
+            patch("services.message_routing.escalate_route", escalate),
+        ):
+            result = await main.officer_escalate_worker_message(
+                _guard_request(),
+                job["id"],
+                "abc123",
+                main.OfficerMessageEscalateRequest(
+                    officer_thread_id=OFFICER_TID,
+                    context="I recommend option B, but it costs money.",
+                ),
+            )
+        assert result == {
+            "status": "escalated",
+            "delivered": True,
+            "route_id": route["route_id"],
+        }
+        kwargs = escalate.await_args.kwargs
+        assert kwargs["reason"] == "officer_escalated"
+        assert kwargs["actor_kind"] == "officer"
+        assert kwargs["officer_context"].startswith("I recommend")
+
+    @pytest.mark.asyncio
+    async def test_escalate_race_with_sla_reports_already_escalated(self):
+        job = _job()
+        route = _route()
+        db = _action_db(job, route=route)
+        db.get_message_route = AsyncMock(
+            return_value={**route, "state": "escalated_to_user", "user_delivery_at": 1}
+        )
+        with (
+            patch.object(main, "require_internal", AsyncMock()),
+            patch.object(main, "postgres_db", db),
+            patch(
+                "services.message_routing.escalate_route",
+                AsyncMock(return_value={"escalated": False, "delivered": False}),
+            ),
+        ):
+            result = await main.officer_escalate_worker_message(
+                _guard_request(),
+                job["id"],
+                "abc123",
+                main.OfficerMessageEscalateRequest(officer_thread_id=OFFICER_TID),
+            )
+        assert result["status"] == "escalated"
+        assert "already escalated" in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_ack_closes_async_route(self):
+        job = _job()
+        route = _route(blocking=False)
+        resolved = {**route, "state": "resolved_by_officer"}
+        db = _action_db(job, route=route)
+        db.transition_message_route = AsyncMock(return_value=resolved)
+        with (
+            patch.object(main, "require_internal", AsyncMock()),
+            patch.object(main, "postgres_db", db),
+        ):
+            result = await main.officer_acknowledge_worker_message(
+                _guard_request(),
+                job["id"],
+                "abc123",
+                main.OfficerMessageAckRequest(
+                    officer_thread_id=OFFICER_TID, note="seen"
+                ),
+            )
+        assert result["status"] == "acknowledged"
+        kwargs = db.transition_message_route.await_args.kwargs
+        assert kwargs["to_state"] == "resolved_by_officer"
+        assert kwargs["actor_kind"] == "officer"
+        assert kwargs["officer_thread_id"] == OFFICER_TID
+        assert "acknowledged: seen" in kwargs["note"]
+
+
+# =============================================================================
+# [A-reply] — inbound reply integration (§5.3)
+# =============================================================================
+
+
+def _reply_db(job, *, route=None):
+    db = MagicMock()
+    db.get_job = AsyncMock(return_value=job)
+    db.get_message_sequence = AsyncMock(return_value=2)
+    db.log_message = AsyncMock()
+    db.find_message_route_for_thread = AsyncMock(return_value=route)
+    db.get_user_settings = AsyncMock(return_value={})
+    db.append_queued_reply = AsyncMock(return_value=True)
+    return db
+
+
+class TestInboundReplyRouteIntegration:
+    @pytest.mark.asyncio
+    async def test_blocking_resume_records_user_resolution(self):
+        job = _job(
+            status="waiting_for_reply",
+            freeze_data={"thread_id": "abc123", "route_id": "r1"},
+        )
+        db = _reply_db(job)
+        record = AsyncMock()
+        with (
+            patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
+            patch.object(main, "postgres_db", db),
+            patch.object(main, "_internal_resume_job", AsyncMock(return_value=True)),
+            patch.object(main, "_record_route_reply_resolution", record),
+        ):
+            strategy, _seq = await main._route_inbound_reply(
+                job["id"], "abc123", "the answer"
+            )
+        assert strategy == "immediate_resume"
+        record.assert_awaited_once()
+        assert record.await_args.kwargs["actor_kind"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_officer_resolver_kind_is_recorded(self):
+        job = _job(
+            status="waiting_for_reply",
+            freeze_data={"thread_id": "abc123", "route_id": "r1"},
+        )
+        db = _reply_db(job)
+        record = AsyncMock()
+        with (
+            patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
+            patch.object(main, "postgres_db", db),
+            patch.object(main, "_internal_resume_job", AsyncMock(return_value=True)),
+            patch.object(main, "_record_route_reply_resolution", record),
+        ):
+            await main._route_inbound_reply(
+                job["id"],
+                "abc123",
+                "the answer",
+                resolver_kind="officer",
+                resolver_id=OFFICER_TID,
+            )
+        assert record.await_args.kwargs["actor_kind"] == "officer"
+        assert record.await_args.kwargs["actor_id"] == OFFICER_TID
+
+    @pytest.mark.asyncio
+    async def test_late_user_reply_on_officer_resolved_route_rides_guidance(self):
+        """§5.3: the officer answered; a later user reply supersedes it via
+        the P1-A guidance lane instead of waiting for a phase boundary."""
+        job = _job(status="processing")
+        route = _route(state="resolved_by_officer")
+        db = _reply_db(job, route=route)
+        guidance = AsyncMock(return_value="guidance_next_turn")
+        with (
+            patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
+            patch.object(main, "postgres_db", db),
+            patch.object(main, "_queue_supervisor_guidance", guidance),
+        ):
+            strategy, _seq = await main._route_inbound_reply(
+                job["id"], "abc123", "Actually do C."
+            )
+        assert strategy == "guidance_next_turn"
+        text = guidance.await_args.args[2]
+        assert "supersedes" in text
+        assert "Actually do C." in text
+
+    @pytest.mark.asyncio
+    async def test_reply_after_disposition_is_recorded_and_wakes_officer(self):
+        """§5.3: after disposition it is recorded and wakes the officer
+        rather than pretending a finished job can resume."""
+        job = _job(status="completed")
+        route = _route()
+        db = _reply_db(job, route=route)
+        wake = AsyncMock(return_value=True)
+        with (
+            patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
+            patch.object(main, "postgres_db", db),
+            patch("services.session_wake.notify_officer", wake),
+            patch.object(main, "_kick_officer_event_drain", MagicMock()),
+        ):
+            strategy, _seq = await main._route_inbound_reply(
+                job["id"], "abc123", "thanks anyway"
+            )
+        assert strategy == "recorded_after_disposition"
+        wake.assert_awaited_once()
+        assert wake.await_args.kwargs["source"] == "worker_message"
+        db.append_queued_reply.assert_not_awaited()
+        db.log_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_threads_without_routes_keep_legacy_queueing(self):
+        job = _job(status="processing")
+        db = _reply_db(job, route=None)
+        with (
+            patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
+            patch.object(main, "postgres_db", db),
+        ):
+            strategy, _seq = await main._route_inbound_reply(
+                job["id"], "abc123", "noted"
+            )
+        assert strategy == "next_strategic_phase"
+        db.append_queued_reply.assert_awaited_once()
+
+
+# =============================================================================
+# Wake plumbing + worker tool compatibility
+# =============================================================================
+
+
+class TestWakeAndToolPlumbing:
+    def test_worker_message_wake_bypasses_debounce(self):
+        from services import session_wake
+
+        assert session_wake.OFFICER_DEBOUNCE_BY_SOURCE["worker_message"] == 0
+
+    def test_send_message_tool_signature_stays_compatible(self):
+        """Worker interface compatibility: purpose is optional; the old
+        five-argument call shape still binds."""
+        import inspect
+
+        from src.tools.communication.messaging import create_communication_tools
+
+        context = MagicMock()
+        context.job_id = "j"
+        context.user_id = None
+        context.has_workspace.return_value = False
+        tools = create_communication_tools(context)
+        send_message = tools[0]
+        signature = inspect.signature(send_message.coroutine)
+        parameters = list(signature.parameters)
+        assert parameters[:5] == ["to", "subject", "message", "mode", "thread_id"]
+        assert signature.parameters["purpose"].default is None
+
+    @pytest.mark.asyncio
+    async def test_sitrep_worker_messages_section_lists_open_routes(self):
+        from services.sitrep import _worker_messages_section
+
+        now = datetime.now(timezone.utc)
+        db = MagicMock()
+        db.list_open_worker_message_routes = AsyncMock(
+            return_value=[
+                {
+                    "job_id": "12345678-0000-0000-0000-000000000000",
+                    "thread_id": "abc123",
+                    "state": "pending_officer",
+                    "blocking": True,
+                    "created_at": now - timedelta(minutes=12),
+                    "subject": "Which DB?",
+                    "policy_snapshot": {"purpose": "question"},
+                }
+            ]
+        )
+        lines = await _worker_messages_section(db, PROJECT_ID, now)
+        joined = "\n".join(lines)
+        assert "Worker messages (1 open):" in joined
+        assert "BLOCKING pending_officer" in joined
+        assert "job 12345678" in joined
+        assert "Which DB?" in joined
+        assert "reply_to_job_message" in joined
+
+    @pytest.mark.asyncio
+    async def test_sitrep_section_is_silent_when_empty(self):
+        from services.sitrep import _worker_messages_section
+
+        db = MagicMock()
+        db.list_open_worker_message_routes = AsyncMock(return_value=[])
+        assert (
+            await _worker_messages_section(db, PROJECT_ID, datetime.now(timezone.utc))
+            == []
+        )

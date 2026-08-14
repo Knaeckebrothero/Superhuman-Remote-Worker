@@ -24,11 +24,13 @@ export interface GeneratedJobToolGroupMeta {
 }
 
 export const JOB_TOOL_DESCRIPTORS: readonly GeneratedJobToolDescriptor[] = [
+  {name: "acknowledge_job_message", group: "job_control", plane: "job_control", callerDefaults: ["mcp", "officer"], grant: "explicit"},
   {name: "approve_job", group: "job_control", plane: "job_control", callerDefaults: ["mcp", "officer", "session"], grant: null},
   {name: "assign_job", group: "job_control", plane: "job_control", callerDefaults: ["mcp"], grant: "explicit"},
   {name: "cancel_job", group: "job_control", plane: "job_control", callerDefaults: ["mcp", "officer", "session"], grant: null},
   {name: "create_job", group: "job_control", plane: "job_control", callerDefaults: ["mcp", "officer", "session"], grant: null},
   {name: "delete_job", group: "job_control", plane: "job_control", callerDefaults: ["mcp"], grant: "explicit"},
+  {name: "escalate_job_message", group: "job_control", plane: "job_control", callerDefaults: ["mcp", "officer"], grant: "explicit"},
   {name: "get_audit_bulk", group: "job_inspection", plane: "job_observability", callerDefaults: ["mcp"], grant: "explicit"},
   {name: "get_audit_timerange", group: "job_inspection", plane: "job_observability", callerDefaults: ["mcp"], grant: "explicit"},
   {name: "get_audit_trail", group: "job_inspection", plane: "job_observability", callerDefaults: ["mcp", "officer"], grant: "explicit"},
@@ -60,6 +62,7 @@ export const JOB_TOOL_DESCRIPTORS: readonly GeneratedJobToolDescriptor[] = [
   {name: "pause_job", group: "job_control", plane: "job_control", callerDefaults: ["mcp", "officer", "session"], grant: null},
   {name: "promote_job", group: "job_control", plane: "job_control", callerDefaults: ["mcp"], grant: "explicit"},
   {name: "read_job_evidence", group: "job_inspection", plane: "job_evidence", callerDefaults: ["mcp", "officer", "session"], grant: null},
+  {name: "reply_to_job_message", group: "job_control", plane: "job_control", callerDefaults: ["mcp", "officer"], grant: "explicit"},
   {name: "resume_job_with_feedback", group: "job_control", plane: "job_control", callerDefaults: ["mcp", "officer", "session"], grant: null},
   {name: "search_audit", group: "job_inspection", plane: "job_observability", callerDefaults: ["mcp", "officer"], grant: "explicit"},
   {name: "send_message_to_job", group: "job_control", plane: "job_control", callerDefaults: ["mcp", "officer"], grant: "explicit"},

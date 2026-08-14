@@ -429,6 +429,37 @@ _MUTATION_CAPABILITIES = (
         open_world=True,
     ),
     _mutation(
+        "reply_to_job_message",
+        "POST /api/jobs/{job_id}/messages/{thread_id}/officer-reply",
+        "answers a routed worker message as the commissioned officer and may "
+        "resume the waiting worker",
+        authorization=(
+            "commissioned officer session of the job's project; verified "
+            "server-side against the durable post row"
+        ),
+        open_world=True,
+    ),
+    _mutation(
+        "escalate_job_message",
+        "POST /api/jobs/{job_id}/messages/{thread_id}/officer-escalate",
+        "hands a routed worker message to the user with delimited officer "
+        "context on the same thread",
+        authorization=(
+            "commissioned officer session of the job's project; verified "
+            "server-side against the durable post row"
+        ),
+        open_world=True,
+    ),
+    _mutation(
+        "acknowledge_job_message",
+        "POST /api/jobs/{job_id}/messages/{thread_id}/officer-ack",
+        "closes an async routed worker message without a reply",
+        authorization=(
+            "commissioned officer session of the job's project; verified "
+            "server-side against the durable post row"
+        ),
+    ),
+    _mutation(
         "create_persistent_thread",
         "POST /api/persistent/threads",
         "creates a persistent session and provisions runtime resources",

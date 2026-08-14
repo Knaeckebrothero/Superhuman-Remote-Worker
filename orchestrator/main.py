@@ -11169,6 +11169,20 @@ async def lifespan(app: FastAPI):
     officer_watchdog_task = asyncio.create_task(
         run_when_leader(officer_watchdog, _shutdown_event)
     )
+    # Worker-message route reconciler (officer_message_routing.md §5.2):
+    # officer-SLA escalation, the total blocking timeout, and delivery repair.
+    # Leader-gated — per-route CAS gives exactly-once, the gate keeps N
+    # replicas from redundantly scanning and double-dispatching user emails.
+    from services.message_route_reconciler import message_route_reconciler_loop
+
+    message_route_reconciler_task = asyncio.create_task(
+        run_when_leader(
+            lambda ev: message_route_reconciler_loop(
+                postgres_db, ev, resume_job=_internal_resume_job
+            ),
+            _shutdown_event,
+        )
+    )
     ide_sweeper_task = asyncio.create_task(
         run_when_leader(ide_session_ttl_sweeper, _shutdown_event)
     )
@@ -11426,6 +11440,7 @@ async def lifespan(app: FastAPI):
     await headless_notify_task
     await attention_sleep_task
     await officer_watchdog_task
+    await message_route_reconciler_task
     await ide_sweeper_task
     await ws_sweeper_task
     await ide_settings_sweeper_task
@@ -13744,6 +13759,14 @@ class MessageSendRequest(BaseModel):
         None,
         description="Exact pinned agent assignment; ignored for stateless jobs",
     )
+    purpose: str | None = Field(
+        None,
+        description=(
+            "Optional self-declared label (question|blocker|update). "
+            "Presentation/coalescing only — routing never trusts it; "
+            "mode='blocking' stays the mechanical signal."
+        ),
+    )
 
 
 class MessageReplyRequest(BaseModel):
@@ -13759,6 +13782,339 @@ def _mask_email(email: str) -> str:
         return email or ""
     local, domain = email.rsplit("@", 1)
     return f"{local[0]}***@{domain}" if len(local) > 1 else f"*@{domain}"
+
+
+_VALID_MESSAGE_PURPOSES = ("question", "blocker", "update")
+
+
+async def _send_officer_routed_message(
+    *,
+    job: dict[str, Any],
+    job_id: str,
+    request: MessageSendRequest,
+    routing: dict[str, Any],
+    applied_policy: str,
+    thread_id: str,
+    sequence: int,
+    user_id: str,
+    recipient_email: str,
+    recipient_name: str,
+    purpose: str | None,
+) -> dict[str, Any] | None:
+    """Deliver one worker message through the officer chain (M2/M3).
+
+    Returns the endpoint response dict on success. Returns None when the
+    officer leg failed for infrastructure reasons — §5.1's immediate
+    fallback: the caller re-runs the plain user_direct path, the job was NOT
+    frozen (the routed transaction is all-or-nothing). Raises
+    HTTPException(409) when the job's freeze guard/CAS lost — the job is no
+    longer freezable and no fallback may freeze it either.
+    """
+    from services import message_routing as routing_svc
+
+    officer_tid = str(routing["officer_thread_id"])
+    incarnation = routing.get("officer_incarnation")
+    minutes = int(
+        routing.get("officer_response_minutes")
+        or routing_svc.DEFAULT_OFFICER_RESPONSE_MINUTES
+    )
+    project_id = routing.get("project_id")
+    now = datetime.now(timezone.utc)
+    state = "pending_officer" if applied_policy == "officer_first" else "pending_both"
+    blocking = request.mode == "blocking"
+    route_id = str(uuid4())
+    snapshot = routing_svc.snapshot_for_route(
+        routing, applied=applied_policy, purpose=purpose
+    )
+    transitions = [
+        routing_svc.build_transition(
+            None,
+            state,
+            actor_kind="system",
+            actor_id="send",
+            officer_incarnation=incarnation,
+            note=f"created ({applied_policy}, {'blocking' if blocking else 'async'})",
+        )
+    ]
+
+    def _response(
+        *,
+        recipient: str,
+        to_name: str,
+        dispatch: dict[str, Any] | None,
+        route_state: str,
+    ) -> dict[str, Any]:
+        return {
+            "status": "sent",
+            "thread_id": thread_id,
+            "sequence": sequence,
+            "file_path": f"messages/{thread_id}/{sequence:03d}_sent.md",
+            "recipient": recipient,
+            "to_name": to_name,
+            "email_delivered": bool((dispatch or {}).get("email", False)),
+            "channels": dispatch or {},
+            "routing": {
+                "policy": routing.get("requested"),
+                "applied": applied_policy,
+                "reason": routing.get("reason"),
+                "route_id": route_id,
+                "state": route_state,
+                "officer_response_minutes": minutes,
+            },
+        }
+
+    def _delivered_any(dispatch: dict[str, Any]) -> bool:
+        if dispatch.get("queued") is True:
+            # Quiet hours: queued for digest — a delivery commitment.
+            return True
+        return any(
+            value is True
+            for key, value in dispatch.items()
+            if key not in ("queued", "email_message_id", "error")
+        )
+
+    async def _dispatch_user_leg() -> dict[str, Any]:
+        return await notification_service.dispatch(
+            user_id=user_id,
+            job_id=job_id,
+            subject=request.subject,
+            message_md=request.message,
+            job_description=job.get("description", "")[:100],
+            config_name=canonical_config_name(job.get("config_name") or "worker_base"),
+            thread_id=thread_id,
+            recipient_email=recipient_email,
+            recipient_name=recipient_name,
+        )
+
+    if blocking:
+        deadlines = routing_svc.route_deadlines(
+            blocking=True,
+            state=state,
+            officer_response_minutes=minutes,
+            timeout_hours=routing_svc.blocking_timeout_hours(job),
+            now=now,
+        )
+        freeze_data = {
+            "status": "waiting_for_reply",
+            "freeze_type": "blocking_message",
+            "thread_id": thread_id,
+            "subject": request.subject,
+            "timestamp": now.isoformat(),
+            "job_id": job_id,
+            # Route/freeze generation fence: the reconciler's resume matches
+            # this against the route it timed out, so a job re-frozen by a
+            # LATER message can never be resumed against an old route.
+            "route_id": route_id,
+            "routing": applied_policy,
+        }
+        label = purpose or "question"
+        if state == "pending_officer":
+            wake_summary = (
+                f"BLOCKING worker {label} from job {job_id[:8]} (thread "
+                f"{thread_id}): {request.subject!r} — the worker is frozen "
+                f"waiting. Answer with reply_to_job_message or hand it to the "
+                f"user with escalate_job_message; unanswered it escalates "
+                f"automatically in {minutes} min."
+            )
+        else:
+            wake_summary = (
+                f"BLOCKING worker {label} from job {job_id[:8]} (thread "
+                f"{thread_id}): {request.subject!r} — the user was notified "
+                f"in parallel; the first valid answer resumes the worker."
+            )
+        route = {
+            "route_id": route_id,
+            "job_id": job_id,
+            "project_id": project_id,
+            "thread_id": thread_id,
+            "policy_snapshot": snapshot,
+            "state": state,
+            "officer_thread_id": officer_tid,
+            "officer_incarnation": incarnation,
+            "officer_deadline": deadlines["officer_deadline"],
+            "total_deadline": deadlines["total_deadline"],
+            "transitions": transitions,
+        }
+        wake = {
+            "thread_id": officer_tid,
+            "source": "worker_message",
+            "dedup_key": f"route:{route_id}",
+            "payload": {
+                "summary": wake_summary,
+                "job_id": job_id,
+                "thread_id": thread_id,
+                "subject": request.subject,
+                "blocking": True,
+                "purpose": purpose,
+                "route_id": route_id,
+            },
+        }
+        message_entry = {
+            "user_id": user_id,
+            "recipient_email": recipient_email if state == "pending_both" else None,
+            "subject": request.subject,
+            "message": request.message,
+            "status": "sent",
+        }
+        lane = str(job.get("execution_lane") or "pinned")
+        try:
+            created = await postgres_db.create_routed_blocking_freeze(
+                job_id,
+                freeze_data,
+                route=route,
+                message_entry=message_entry,
+                wake=wake,
+                expected_lane=lane,
+                lease_token=request.lease_token,
+                agent_id=request.agent_id,
+                completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+            )
+        except Exception:
+            logger.exception(
+                "Officer-routed blocking send failed for job %s — falling "
+                "back to direct user delivery (§5.1)",
+                job_id[:8],
+            )
+            return None
+        if created is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Job changed before blocking message was committed",
+            )
+        # Latency: the wake row is durable; this just delivers it now.
+        _kick_officer_event_drain(postgres_db)
+
+        dispatch: dict[str, Any] | None = None
+        if state == "pending_both":
+            try:
+                dispatch = await _dispatch_user_leg()
+                if dispatch.get("email_message_id"):
+                    await postgres_db.set_message_email_id(
+                        created["originating_message_id"],
+                        dispatch["email_message_id"],
+                    )
+                if _delivered_any(dispatch):
+                    await postgres_db.mark_route_user_delivery(route_id)
+            except Exception:
+                # user_delivery_at stays NULL — the reconciler redelivers.
+                logger.warning(
+                    "officer_and_user user leg failed for route %s "
+                    "(reconciler will redeliver)",
+                    route_id[:8],
+                    exc_info=True,
+                )
+        if state == "pending_officer":
+            return _response(
+                recipient="project officer",
+                to_name="Project officer",
+                dispatch=None,
+                route_state=state,
+            )
+        return _response(
+            recipient=_mask_email(recipient_email),
+            to_name=recipient_name,
+            dispatch=dispatch,
+            route_state=state,
+        )
+
+    # ---- async modes: no freeze; the route row IS the durable inbox item.
+    if applied_policy == "officer_first":
+        # Officer only initially (§2 policy table) — no user notification.
+        # No wake either: async items coalesce into the officer's next
+        # inbox/SITREP section instead of costing a paid wake each.
+        try:
+            log_row = await postgres_db.log_message(
+                job_id=job_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                direction="outbound",
+                recipient_email=None,
+                subject=request.subject,
+                message=request.message,
+                mode="async",
+                status="sent",
+            )
+            created_route = await postgres_db.create_message_route(
+                {
+                    "route_id": route_id,
+                    "job_id": job_id,
+                    "project_id": project_id,
+                    "thread_id": thread_id,
+                    "originating_message_id": (log_row or {}).get("id"),
+                    "policy_snapshot": snapshot,
+                    "state": "pending_officer",
+                    "blocking": False,
+                    "officer_thread_id": officer_tid,
+                    "officer_incarnation": incarnation,
+                    "transitions": transitions,
+                }
+            )
+            if not created_route:
+                return None
+        except Exception:
+            logger.exception(
+                "Async officer_first route failed for job %s — falling back "
+                "to direct user delivery",
+                job_id[:8],
+            )
+            return None
+        return _response(
+            recipient="project officer",
+            to_name="Project officer",
+            dispatch=None,
+            route_state="pending_officer",
+        )
+
+    # officer_and_user, async: immediate delivery to both (ratified) — the
+    # user leg is the unchanged notification path; the officer sees the open
+    # route in his next inbox/SITREP.
+    dispatch = await _dispatch_user_leg()
+    email_sent = dispatch.get("email", False)
+    log_row = await postgres_db.log_message(
+        job_id=job_id,
+        user_id=user_id,
+        thread_id=thread_id,
+        direction="outbound",
+        recipient_email=recipient_email,
+        subject=request.subject,
+        message=request.message,
+        mode="async",
+        status="sent",
+        error_message=None if email_sent else "Email not configured or send failed",
+        email_message_id=dispatch.get("email_message_id"),
+    )
+    try:
+        await postgres_db.create_message_route(
+            {
+                "route_id": route_id,
+                "job_id": job_id,
+                "project_id": project_id,
+                "thread_id": thread_id,
+                "originating_message_id": (log_row or {}).get("id"),
+                "policy_snapshot": snapshot,
+                "state": "pending_both",
+                "blocking": False,
+                "officer_thread_id": officer_tid,
+                "officer_incarnation": incarnation,
+                "user_delivery_at": now if _delivered_any(dispatch) else None,
+                "transitions": transitions,
+            }
+        )
+    except Exception:
+        # The user has the message — an officer-side bookkeeping failure
+        # must not fail the send.
+        logger.warning(
+            "officer_and_user async route insert failed for job %s (thread %s)",
+            job_id[:8],
+            thread_id,
+            exc_info=True,
+        )
+    return _response(
+        recipient=_mask_email(recipient_email),
+        to_name=recipient_name,
+        dispatch=dispatch,
+        route_state="pending_both",
+    )
 
 
 @app.post("/api/jobs/{job_id}/messages/send")
@@ -13938,8 +14294,70 @@ async def send_agent_message(
         # Get sequence number
         sequence = await postgres_db.get_message_sequence(job_id, thread_id)
 
+        # M1 — resolve the project's worker-message routing policy for
+        # owner-directed messages (officer_message_routing.md §2). Explicit
+        # named recipients stay direct; any resolver failure degrades to
+        # user_direct — the officer layer must never break plain messaging.
+        purpose = (
+            request.purpose if request.purpose in _VALID_MESSAGE_PURPOSES else None
+        )
+        routing: dict[str, Any] | None = None
+        if request.to == "user":
+            try:
+                from services import message_routing as _routing_svc
+
+                routing = await _routing_svc.resolve_effective_policy(postgres_db, job)
+            except Exception:
+                logger.exception(
+                    "Worker-message policy resolution failed for job %s — "
+                    "using user_direct",
+                    job_id[:8],
+                )
+                routing = None
+
+        applied_policy = routing["applied"] if routing else "user_direct"
+        applied_reason = (
+            routing["reason"]
+            if routing
+            else ("explicit_recipient" if request.to != "user" else "resolver_failed")
+        )
+        if (
+            applied_policy == "officer_first"
+            and request.mode == "blocking"
+            and routing is not None
+            and routing.get("officer_held")
+        ):
+            # §5.1: a held officer is unavailable for the blocking SLA —
+            # the question goes to the user immediately. Async officer_first
+            # keeps its route and queues behind the hold.
+            applied_policy = "user_direct"
+            applied_reason = "officer_held"
+
+        if applied_policy in ("officer_first", "officer_and_user"):
+            officer_result = await _send_officer_routed_message(
+                job=job,
+                job_id=job_id,
+                request=request,
+                routing=routing,
+                applied_policy=applied_policy,
+                thread_id=thread_id,
+                sequence=sequence,
+                user_id=user_id,
+                recipient_email=recipient_email,
+                recipient_name=recipient_name,
+                purpose=purpose,
+            )
+            if officer_result is not None:
+                return officer_result
+            # §5.1 immediate fallback: the officer leg failed without
+            # freezing the job — deliver directly to the user instead.
+            applied_policy = "user_direct"
+            applied_reason = "officer_route_failed"
+
+        route_id: str | None = None
         freeze_data: dict[str, Any] | None = None
         if request.mode == "blocking":
+            route_id = str(uuid4())
             freeze_data = {
                 "status": "waiting_for_reply",
                 "freeze_type": "blocking_message",
@@ -13947,6 +14365,8 @@ async def send_agent_message(
                 "subject": request.subject,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "job_id": job_id,
+                "route_id": route_id,
+                "routing": "user_direct",
             }
             if COMPLETION_COMMANDS_ENABLED:
                 lane = str(job.get("execution_lane") or "pinned")
@@ -14045,9 +14465,81 @@ async def send_agent_message(
                     freeze_data=freeze_data,
                 )
 
+        # Route bookkeeping for direct blocking sends — what finally gives
+        # the advertised communication.blocking_timeout_hours an
+        # implementation ([A-timeout]). Best-effort by design: user_direct
+        # delivery/freeze behavior above stayed byte-compatible, and a
+        # bookkeeping failure must not fail a send that already committed
+        # its freeze (that is exactly the pre-route status quo).
+        if request.mode == "blocking" and route_id is not None:
+            try:
+                from services import message_routing as _routing_svc
+
+                delivered_any = dispatch_results.get("queued") is True or any(
+                    value is True
+                    for key, value in dispatch_results.items()
+                    if key not in ("queued", "email_message_id", "error")
+                )
+                snapshot = (
+                    _routing_svc.snapshot_for_route(
+                        routing,
+                        applied="user_direct",
+                        reason=applied_reason,
+                        purpose=purpose,
+                    )
+                    if routing
+                    else {
+                        "worker_messages": "user_direct",
+                        "applied": "user_direct",
+                        "reason": applied_reason,
+                        "resolved_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                deadlines = _routing_svc.route_deadlines(
+                    blocking=True,
+                    state="user_direct",
+                    officer_response_minutes=0,
+                    timeout_hours=_routing_svc.blocking_timeout_hours(job),
+                )
+                await postgres_db.create_message_route(
+                    {
+                        "route_id": route_id,
+                        "job_id": job_id,
+                        "project_id": (
+                            str(job["project_id"]) if job.get("project_id") else None
+                        ),
+                        "thread_id": thread_id,
+                        "policy_snapshot": snapshot,
+                        "state": "user_direct",
+                        "blocking": True,
+                        "user_delivery_at": (
+                            datetime.now(timezone.utc) if delivered_any else None
+                        ),
+                        "total_deadline": deadlines["total_deadline"],
+                        "transitions": [
+                            _routing_svc.build_transition(
+                                None,
+                                "user_direct",
+                                actor_kind="system",
+                                actor_id="send",
+                                note=f"created (user_direct: {applied_reason})",
+                            )
+                        ],
+                    }
+                )
+            except Exception:
+                logger.warning(
+                    "user_direct route bookkeeping failed for job %s thread %s "
+                    "(send already committed; total-timeout coverage lost for "
+                    "this message)",
+                    job_id[:8],
+                    thread_id,
+                    exc_info=True,
+                )
+
         file_path = f"messages/{thread_id}/{sequence:03d}_sent.md"
 
-        return {
+        response: dict[str, Any] = {
             "status": "sent",
             "thread_id": thread_id,
             "sequence": sequence,
@@ -14057,6 +14549,15 @@ async def send_agent_message(
             "email_delivered": email_sent,
             "channels": dispatch_results,
         }
+        if request.to == "user":
+            response["routing"] = {
+                "policy": routing.get("requested") if routing else "user_direct",
+                "applied": "user_direct",
+                "reason": applied_reason,
+                "route_id": route_id,
+                "state": "user_direct" if route_id else None,
+            }
+        return response
 
     except HTTPException:
         raise
@@ -14245,6 +14746,54 @@ async def _queue_supervisor_guidance(
     return "guidance_next_turn"
 
 
+async def _find_thread_route(job_id: str, thread_id: str) -> dict[str, Any] | None:
+    """Best-effort newest route row for a (job, thread). Never raises."""
+    try:
+        return await postgres_db.find_message_route_for_thread(job_id, thread_id)
+    except Exception:
+        logger.debug(
+            "route lookup failed for job %s thread %s",
+            job_id[:8],
+            thread_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def _record_route_reply_resolution(
+    job_id: str,
+    thread_id: str,
+    *,
+    actor_kind: str,
+    actor_id: str | None = None,
+    note: str | None = None,
+) -> None:
+    """Best-effort CAS of the thread's open route to its resolved state.
+
+    The job-status CAS is what unblocks exactly once; this records WHO
+    answered on the route ledger. A lost CAS (reconciler deadline or the
+    other audience won) is a silent no-op by design.
+    """
+    try:
+        from services import message_routing as routing_svc
+
+        await routing_svc.record_reply_resolution(
+            postgres_db,
+            job_id,
+            thread_id,
+            actor_kind=actor_kind,
+            actor_id=actor_id,
+            note=note,
+        )
+    except Exception:
+        logger.debug(
+            "route resolution recording failed for job %s thread %s",
+            job_id[:8],
+            thread_id,
+            exc_info=True,
+        )
+
+
 async def _route_inbound_reply(
     job_id: str,
     thread_id: str,
@@ -14252,10 +14801,14 @@ async def _route_inbound_reply(
     sender_email: str | None = None,
     email_message_id: str | None = None,
     urgent: bool = False,
+    resolver_kind: str = "user",
+    resolver_id: str | None = None,
 ) -> tuple[str, int]:
     """Route an inbound reply to the correct job/thread.
 
-    Shared by the cockpit reply endpoint and the IMAP poller.
+    Shared by the cockpit reply endpoint, the IMAP poller, and the officer
+    reply lane (M3 — which passes ``resolver_kind='officer'`` so the route
+    ledger records the right actor).
 
     Args:
         job_id: Target job UUID
@@ -14266,6 +14819,9 @@ async def _route_inbound_reply(
         urgent: Deliver into the worker's next LLM turn via the guidance
             lane (non-destructive). Only when the job has no live run does
             urgent fall back to a resume-with-feedback.
+        resolver_kind: 'user' (default) or 'officer' — recorded on a
+            matching route's resolution transition.
+        resolver_id: Actor id for the route audit (user id / officer thread).
 
     Returns:
         Tuple of (delivery_strategy, sequence_number).
@@ -14352,7 +14908,88 @@ async def _route_inbound_reply(
                 "the reply below answers it."
             ),
         )
+        # The resume CAS won — record who answered on the route ledger
+        # (officer_message_routing.md §3). Best-effort: the worker is
+        # already unblocked either way.
+        await _record_route_reply_resolution(
+            job_id,
+            thread_id,
+            actor_kind=resolver_kind,
+            actor_id=resolver_id or user_id,
+        )
         return await _delivered("immediate_resume")
+
+    # Officer-aware follow-ups (officer_message_routing.md §5.3): consult the
+    # thread's route ONCE. Threads without a route (all pre-officer traffic)
+    # skip this entirely — behavior below stays byte-compatible for them.
+    thread_route = await _find_thread_route(job_id, thread_id)
+    if thread_route is not None:
+        route_state = str(thread_route.get("state") or "")
+        if job_status in ("completed", "failed", "cancelled"):
+            # After disposition: the reply is recorded and wakes the officer
+            # rather than pretending a finished job can resume.
+            if resolver_kind == "user" and thread_route.get("project_id"):
+                try:
+                    from services.session_wake import notify_officer
+
+                    await notify_officer(
+                        postgres_db,
+                        str(thread_route["project_id"]),
+                        source="worker_message",
+                        dedup_key=(
+                            f"late-reply:{thread_route.get('route_id')}:{sequence}"
+                        ),
+                        payload={
+                            "summary": (
+                                f"The user replied on thread {thread_id} of job "
+                                f"{job_id[:8]} after it reached {job_status}: "
+                                f"{message[:200]}"
+                            ),
+                            "job_id": job_id,
+                            "thread_id": thread_id,
+                        },
+                    )
+                    _kick_officer_event_drain(postgres_db)
+                except Exception:
+                    logger.warning(
+                        "late-reply officer wake failed for job %s",
+                        job_id[:8],
+                        exc_info=True,
+                    )
+            return await _delivered("recorded_after_disposition")
+        if (
+            resolver_kind == "user"
+            and route_state == "resolved_by_officer"
+            and job_status == "processing"
+        ):
+            # §5.3: the officer answered first; the later user reply is
+            # higher authority — deliver it as a sourced steer through the
+            # P1-A guidance lane instead of parking it for a phase boundary.
+            strategy = await _queue_supervisor_guidance(
+                job,
+                thread_id,
+                (
+                    f"[Reply from the job owner on thread {thread_id} — it "
+                    "supersedes the project officer's earlier answer on this "
+                    f"thread]\n{message}"
+                ),
+            )
+            if strategy:
+                return await _delivered(strategy)
+        elif resolver_kind == "user" and route_state in (
+            "pending_officer",
+            "pending_both",
+            "escalated_to_user",
+            "delivery_failed",
+        ):
+            # A user answer on a still-open (async) route closes it.
+            await _record_route_reply_resolution(
+                job_id,
+                thread_id,
+                actor_kind="user",
+                actor_id=resolver_id or user_id,
+                note="user replied on open route",
+            )
 
     # Look up user delivery preferences
     user_prefs = {}
@@ -14493,6 +15130,299 @@ async def reply_to_agent_message(
             f"Failed to deliver reply for job {job_id} thread {thread_id}: {e}"
         )
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Officer message actions (officer_message_routing.md §4 — M3)
+# =============================================================================
+
+
+class OfficerMessageReplyRequest(BaseModel):
+    """Body for the officer's reply on a worker message thread."""
+
+    officer_thread_id: str = Field(
+        ..., description="The calling officer session's thread UUID"
+    )
+    message: str = Field(..., max_length=5000, description="Answer for the worker")
+
+
+class OfficerMessageEscalateRequest(BaseModel):
+    """Body for escalating a worker message thread to the user."""
+
+    officer_thread_id: str = Field(
+        ..., description="The calling officer session's thread UUID"
+    )
+    context: str | None = Field(
+        None,
+        max_length=5000,
+        description="Officer context delivered (clearly delimited) with the "
+        "original worker message",
+    )
+
+
+class OfficerMessageAckRequest(BaseModel):
+    """Body for acknowledging (closing) an async worker message route."""
+
+    officer_thread_id: str = Field(
+        ..., description="The calling officer session's thread UUID"
+    )
+    note: str | None = Field(None, max_length=1000, description="Optional note")
+
+
+async def _require_officer_route_actor(
+    request: Request, job_id: str, officer_thread_id: str | None
+) -> tuple[dict[str, Any], dict[str, Any], int | None]:
+    """Server-side guard for officer message actions (spec §7).
+
+    Only the commissioned officer thread of the JOB's project may act:
+    the claim (``officer_thread_id``) is verified against the durable post
+    row — caller-supplied ids are claims to check, never authority. The
+    officer lane's ``X-MCP-Scope`` stamp, when present, must also name the
+    same project (defense in depth). Returns
+    ``(job, officer_thread, incarnation)``.
+    """
+    await require_internal(request)
+    if not officer_thread_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Officer message actions require the calling officer "
+                "session's thread id; this caller has none."
+            ),
+        )
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    project_id = str(job["project_id"]) if job.get("project_id") else None
+    if not project_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Job has no project — there is no officer chain of command.",
+        )
+    scope = (request.headers.get("X-MCP-Scope") or "").strip()
+    if scope.startswith("project:") and scope.split(":", 1)[1] != project_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Caller scope does not match this job's project.",
+        )
+    officer = await postgres_db.get_officer_thread_for_project(project_id)
+    if not officer or str(officer["id"]) != str(officer_thread_id):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only the commissioned officer thread of this job's project "
+                "may perform officer message actions."
+            ),
+        )
+    incarnation: int | None = None
+    try:
+        post = await postgres_db.get_project_officer(project_id)
+        if post is not None:
+            incarnations = post.get("incarnations") or []
+            incarnation = len(incarnations) if isinstance(incarnations, list) else None
+    except Exception:
+        incarnation = None
+    return job, officer, incarnation
+
+
+async def _officer_route_for_action(
+    job_id: str, thread_id: str, officer_thread_id: str
+) -> dict[str, Any]:
+    """The open route an officer action targets, or a 409 explaining why not.
+
+    The incarnation fence: a route addressed to a PREVIOUS officer thread is
+    never adoptable by the current one (§5.1) — the drain already handed it
+    to the user.
+    """
+    route = await postgres_db.find_message_route_for_thread(
+        job_id, thread_id, open_only=True
+    )
+    if not route:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No open worker-message route on this thread (it may already "
+                "be resolved or timed out). For plain guidance use "
+                "send_message_to_job."
+            ),
+        )
+    if str(route.get("officer_thread_id") or "") != str(officer_thread_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This route is not addressed to the current officer "
+                "incarnation (it predates this commission or is user-direct); "
+                "it is not adoptable. For plain guidance use "
+                "send_message_to_job."
+            ),
+        )
+    return route
+
+
+@app.post("/api/jobs/{job_id}/messages/{thread_id}/officer-reply")
+async def officer_reply_to_worker_message(
+    request: Request,
+    job_id: str,
+    thread_id: str,
+    body: OfficerMessageReplyRequest,
+) -> dict[str, Any]:
+    """Answer a worker message as the commissioned officer. **Internal** —
+    requires ``X-Internal-Key``; the caller must BE the project's officer.
+
+    Delivers through the existing reply lane [A-reply] — a blocking route's
+    worker resumes exactly once (job-status CAS) — and CAS-records
+    ``resolved_by_officer`` on the route. The reply is guidance, never
+    authorization: no approval/ready/claim side effects, and the original
+    message is never erased.
+    """
+    job, officer, incarnation = await _require_officer_route_actor(
+        request, job_id, body.officer_thread_id
+    )
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message must not be empty")
+    route = await _officer_route_for_action(job_id, thread_id, str(officer["id"]))
+
+    try:
+        delivery_strategy, sequence = await _route_inbound_reply(
+            job_id=job_id,
+            thread_id=thread_id,
+            message=f"[Answered by the project officer]\n\n{message}",
+            resolver_kind="officer",
+            resolver_id=str(officer["id"]),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+    # The blocking branch already recorded; this covers async routes (the
+    # reply took a queued/guidance lane). CAS — a second record is a no-op.
+    await _record_route_reply_resolution(
+        job_id,
+        thread_id,
+        actor_kind="officer",
+        actor_id=str(officer["id"]),
+        note="officer replied",
+    )
+    refreshed = await postgres_db.get_message_route(str(route["route_id"]))
+    return {
+        "status": "replied",
+        "delivery_strategy": delivery_strategy,
+        "sequence": sequence,
+        "route_id": str(route["route_id"]),
+        "route_state": (refreshed or route).get("state"),
+    }
+
+
+@app.post("/api/jobs/{job_id}/messages/{thread_id}/officer-escalate")
+async def officer_escalate_worker_message(
+    request: Request,
+    job_id: str,
+    thread_id: str,
+    body: OfficerMessageEscalateRequest,
+) -> dict[str, Any]:
+    """Escalate a worker message thread to the user with officer context.
+    **Internal** — requires ``X-Internal-Key``; caller must BE the officer.
+
+    Same ``thread_id`` keeps the reply/resume path: the user's answer
+    resumes the worker directly. The original worker text and the officer's
+    context are delivered clearly delimited (§7).
+    """
+    job, officer, incarnation = await _require_officer_route_actor(
+        request, job_id, body.officer_thread_id
+    )
+    route = await _officer_route_for_action(job_id, thread_id, str(officer["id"]))
+    if route.get("state") not in ("pending_officer", "pending_both"):
+        raise HTTPException(
+            status_code=409,
+            detail=(f"Route is already {route.get('state')} — nothing to escalate."),
+        )
+
+    from services import message_routing as routing_svc
+
+    outcome = await routing_svc.escalate_route(
+        postgres_db,
+        route,
+        reason="officer_escalated",
+        actor_kind="officer",
+        actor_id=str(officer["id"]),
+        officer_context=body.context,
+        expected_states=("pending_officer", "pending_both"),
+        notifier=notification_service,
+    )
+    if not outcome["escalated"]:
+        refreshed = await postgres_db.get_message_route(str(route["route_id"]))
+        state = (refreshed or {}).get("state")
+        if state == "escalated_to_user":
+            # The SLA reconciler won the CAS a moment earlier — the thread is
+            # with the user either way.
+            return {
+                "status": "escalated",
+                "delivered": bool((refreshed or {}).get("user_delivery_at")),
+                "route_id": str(route["route_id"]),
+                "note": "already escalated (officer SLA expired first)",
+            }
+        raise HTTPException(
+            status_code=409,
+            detail=f"Route changed before escalation (now: {state}).",
+        )
+    return {
+        "status": "escalated",
+        "delivered": outcome["delivered"],
+        "route_id": str(route["route_id"]),
+    }
+
+
+@app.post("/api/jobs/{job_id}/messages/{thread_id}/officer-ack")
+async def officer_acknowledge_worker_message(
+    request: Request,
+    job_id: str,
+    thread_id: str,
+    body: OfficerMessageAckRequest,
+) -> dict[str, Any]:
+    """Close an ASYNC worker message route without a reply. **Internal** —
+    requires ``X-Internal-Key``; caller must BE the officer.
+
+    Refused for blocking routes: a frozen worker needs an answer or an
+    escalation, never a silent ack pretending nobody waited.
+    """
+    job, officer, incarnation = await _require_officer_route_actor(
+        request, job_id, body.officer_thread_id
+    )
+    route = await _officer_route_for_action(job_id, thread_id, str(officer["id"]))
+    if route.get("blocking"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This worker is frozen waiting for an answer — use "
+                "reply_to_job_message or escalate_job_message. Acknowledge is "
+                "for async items only."
+            ),
+        )
+    note = (body.note or "").strip()
+    updated = await postgres_db.transition_message_route(
+        str(route["route_id"]),
+        to_state="resolved_by_officer",
+        expected_states=["pending_officer", "pending_both", "delivery_failed"],
+        actor_kind="officer",
+        actor_id=str(officer["id"]),
+        officer_thread_id=str(officer["id"]),
+        officer_incarnation=incarnation,
+        note=f"acknowledged{': ' + note if note else ''}",
+    )
+    if not updated:
+        refreshed = await postgres_db.get_message_route(str(route["route_id"]))
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Route changed before acknowledge "
+                f"(now: {(refreshed or {}).get('state')})."
+            ),
+        )
+    return {
+        "status": "acknowledged",
+        "route_id": str(route["route_id"]),
+        "route_state": updated.get("state"),
+    }
 
 
 class GuidanceAckRequest(BaseModel):
@@ -33419,6 +34349,16 @@ async def _hold_officer_for_conference(
             officer_tid[:8],
             str(conference_thread_id)[:8],
         )
+        # §5.1: entering a hold drains already-pending officer-first BLOCKING
+        # routes to the user — a frozen worker must not wait out a meeting.
+        try:
+            from services import message_routing as _routing_svc
+
+            await _routing_svc.drain_officer_blocking_routes(
+                postgres_db, project_id, reason="officer_hold"
+            )
+        except Exception:
+            logger.exception("conference hold: route drain failed (non-fatal)")
         from services import session_wake as _sw
 
         officer_thread = await postgres_db.get_thread(officer_tid)
@@ -34062,6 +35002,19 @@ async def _decommission_officer_post(
 
     fold = await postgres_db.fold_project_officer_wake_queue(project_id, thread_id)
 
+    # §5.1 (officer_message_routing): decommission drains already-pending
+    # officer-first BLOCKING routes to the user — and a later recommission
+    # never adopts an old waiting route (the reply/ack guards additionally
+    # fence on the route's officer_thread_id).
+    try:
+        from services import message_routing as _routing_svc
+
+        await _routing_svc.drain_officer_blocking_routes(
+            postgres_db, project_id, reason="officer_decommissioned"
+        )
+    except Exception:
+        logger.exception("officer decommission: route drain failed (non-fatal)")
+
     await postgres_db.clear_project_officer_thread(project_id)
     commissioned_at = thread.get("created_at")
     if hasattr(commissioned_at, "isoformat"):
@@ -34413,6 +35366,19 @@ async def hold_project_officer(
     await postgres_db.merge_thread_config_override(
         officer_tid, {"officer": {"hold": hold}}
     )
+    # §5.1 (officer_message_routing): a hold drains already-pending
+    # officer-first BLOCKING routes to the user immediately — the frozen
+    # workers behind them must not wait out the maintenance window. Async
+    # officer-first routes stay queued behind the hold by design.
+    drained_routes = 0
+    try:
+        from services import message_routing as _routing_svc
+
+        drained_routes = await _routing_svc.drain_officer_blocking_routes(
+            postgres_db, project_id, reason="officer_hold"
+        )
+    except Exception:
+        logger.exception("officer hold: route drain failed (non-fatal)")
     notified = await _inject_officer_notice(
         officer,
         "[maintenance hold — the Legate has stood you down. Take no "
@@ -34429,6 +35395,7 @@ async def hold_project_officer(
         "thread_id": officer_tid,
         "held": hold,
         "notified": notified,
+        "drained_blocking_routes": drained_routes,
     }
 
 

@@ -110,6 +110,11 @@ tools:
     - pause_job
     - steer_job
     - send_message_to_job
+    # Worker-message routing (officer_message_routing.md M3): answer, hand up,
+    # or close a worker's routed question — the officer's inbox actions.
+    - reply_to_job_message
+    - escalate_job_message
+    - acknowledge_job_message
   job_inspection:
     # Observability — control-plane truth (status, telemetry, recorded state).
     - list_jobs

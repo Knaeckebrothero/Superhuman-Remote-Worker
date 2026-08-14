@@ -5662,6 +5662,71 @@ COMMENT ON TABLE public.job_datasources IS 'Explicit datasource selection for a 
 
 
 --
+-- Name: job_message_routes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.job_message_routes (
+    route_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    job_id uuid NOT NULL,
+    project_id uuid,
+    thread_id character varying(64) NOT NULL,
+    originating_message_id uuid,
+    policy_snapshot jsonb DEFAULT '{}'::jsonb NOT NULL,
+    state text NOT NULL,
+    blocking boolean DEFAULT false NOT NULL,
+    officer_thread_id uuid,
+    officer_incarnation integer,
+    officer_deadline timestamp with time zone,
+    user_delivery_at timestamp with time zone,
+    resolved_by_kind text,
+    resolved_by_id text,
+    resolved_at timestamp with time zone,
+    total_deadline timestamp with time zone,
+    transitions jsonb DEFAULT '[]'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT job_message_routes_policy_is_object CHECK ((jsonb_typeof(policy_snapshot) = 'object'::text)),
+    CONSTRAINT job_message_routes_state_check CHECK ((state = ANY (ARRAY['pending_officer'::text, 'pending_both'::text, 'user_direct'::text, 'escalated_to_user'::text, 'resolved_by_officer'::text, 'resolved_by_user'::text, 'timed_out'::text, 'delivery_failed'::text]))),
+    CONSTRAINT job_message_routes_transitions_is_array CHECK ((jsonb_typeof(transitions) = 'array'::text))
+);
+
+
+--
+-- Name: TABLE job_message_routes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.job_message_routes IS 'Control state for officer-aware worker messages (officer_message_routing.md §3). message_log keeps the canonical thread; this ledger carries the per-message policy snapshot, delivery state, officer SLA + total blocking deadlines, and the CAS surface the reply lanes and the leader-gated reconciler resolve through exactly once.';
+
+
+--
+-- Name: COLUMN job_message_routes.thread_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.job_message_routes.thread_id IS 'Job message thread key (message_log.thread_id shape). One canonical thread — the route never forks the conversation.';
+
+
+--
+-- Name: COLUMN job_message_routes.policy_snapshot; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.job_message_routes.policy_snapshot IS 'Routing policy frozen at send time. Changing the project setting later never retargets a waiting question.';
+
+
+--
+-- Name: COLUMN job_message_routes.state; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.job_message_routes.state IS 'pending_officer/pending_both/user_direct -> resolved_by_officer | resolved_by_user | escalated_to_user | timed_out; pre-delivery states may pass through delivery_failed. CAS-only transitions.';
+
+
+--
+-- Name: COLUMN job_message_routes.transitions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.job_message_routes.transitions IS 'Append-only [{at, from, to, actor_kind, actor_id, officer_incarnation, note}] — actor identity on every transition (spec §7).';
+
+
+--
 -- Name: jobs; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -9125,6 +9190,14 @@ ALTER TABLE ONLY public.job_datasources
 
 
 --
+-- Name: job_message_routes job_message_routes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_message_routes
+    ADD CONSTRAINT job_message_routes_pkey PRIMARY KEY (route_id);
+
+
+--
 -- Name: jobs jobs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -10634,6 +10707,34 @@ CREATE INDEX idx_job_completion_sweep_actions_claim ON public.job_completion_swe
 --
 
 CREATE INDEX idx_job_datasources_ds ON public.job_datasources USING btree (datasource_id);
+
+
+--
+-- Name: idx_job_message_routes_job_thread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_job_message_routes_job_thread ON public.job_message_routes USING btree (job_id, thread_id, created_at DESC);
+
+
+--
+-- Name: idx_job_message_routes_officer_sla; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_job_message_routes_officer_sla ON public.job_message_routes USING btree (officer_deadline) WHERE ((state = 'pending_officer'::text) AND blocking);
+
+
+--
+-- Name: idx_job_message_routes_open_project; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_job_message_routes_open_project ON public.job_message_routes USING btree (project_id, created_at) WHERE (state = ANY (ARRAY['pending_officer'::text, 'pending_both'::text, 'escalated_to_user'::text, 'delivery_failed'::text]));
+
+
+--
+-- Name: idx_job_message_routes_total_deadline; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_job_message_routes_total_deadline ON public.job_message_routes USING btree (total_deadline) WHERE (blocking AND (state = ANY (ARRAY['pending_officer'::text, 'pending_both'::text, 'user_direct'::text, 'escalated_to_user'::text, 'delivery_failed'::text])));
 
 
 --
@@ -12289,6 +12390,13 @@ CREATE TRIGGER update_datasources_updated_at BEFORE UPDATE ON public.datasources
 
 
 --
+-- Name: job_message_routes update_job_message_routes_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER update_job_message_routes_updated_at BEFORE UPDATE ON public.job_message_routes FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+
+--
 -- Name: jobs update_jobs_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -12840,6 +12948,38 @@ ALTER TABLE ONLY public.job_datasources
 
 ALTER TABLE ONLY public.job_datasources
     ADD CONSTRAINT job_datasources_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: job_message_routes job_message_routes_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_message_routes
+    ADD CONSTRAINT job_message_routes_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: job_message_routes job_message_routes_officer_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_message_routes
+    ADD CONSTRAINT job_message_routes_officer_thread_id_fkey FOREIGN KEY (officer_thread_id) REFERENCES public.threads(id) ON DELETE SET NULL;
+
+
+--
+-- Name: job_message_routes job_message_routes_originating_message_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_message_routes
+    ADD CONSTRAINT job_message_routes_originating_message_id_fkey FOREIGN KEY (originating_message_id) REFERENCES public.message_log(id) ON DELETE SET NULL;
+
+
+--
+-- Name: job_message_routes job_message_routes_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_message_routes
+    ADD CONSTRAINT job_message_routes_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE SET NULL;
 
 
 --

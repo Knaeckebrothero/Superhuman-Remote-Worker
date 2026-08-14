@@ -177,6 +177,7 @@ async def build_wake_message(
         )
         lines += jobs_lines
         lines += await _pending_section(db, thread_id, project_id, now)
+        lines += await _worker_messages_section(db, project_id, now)
         lines += await _knowledge_section(vector_db, project_id)
         lines += await _capacity_section(db, thread, thread_id)
         lines += await _fleet_section(db)
@@ -423,6 +424,47 @@ async def _pending_section(
 
 # Bounded probe so a hung vector pool costs seconds, not the wake.
 _KNOWLEDGE_PROBE_TIMEOUT_SECONDS = 2.5
+
+
+async def _worker_messages_section(
+    db: Any, project_id: Optional[str], now: datetime
+) -> list[str]:
+    """Open worker→human message routes (officer_message_routing.md §5.1).
+
+    The durable inbox: async officer-first messages carry no wake of their
+    own — this section IS their delivery, coalesced into the next sitrep.
+    Blocking routes appear too (their high-urgency wake may have been
+    coalesced into this same turn); age + state let the officer triage.
+    """
+    if not project_id:
+        return []
+    try:
+        routes = await db.list_open_worker_message_routes(project_id, limit=8)
+    except Exception:
+        logger.warning("sitrep: worker-message routes query failed", exc_info=True)
+        return ["Worker messages: (section unavailable — routes query failed)"]
+    if not routes:
+        return []
+    lines = [f"Worker messages ({len(routes)} open):"]
+    for route in routes:
+        job_id = str(route.get("job_id") or "")[:8]
+        thread_id = str(route.get("thread_id") or "")
+        state = str(route.get("state") or "?")
+        created = route.get("created_at")
+        age = _ago(created, now) if created is not None else "unknown"
+        marker = "BLOCKING " if route.get("blocking") else ""
+        subject = _truncate(route.get("subject") or "(no subject)", 80)
+        purpose = _as_dict(route.get("policy_snapshot")).get("purpose")
+        label = f" [{purpose}]" if purpose else ""
+        lines.append(
+            f"- {marker}{state} — job {job_id} thread {thread_id}{label}, "
+            f"{age}: {subject}"
+        )
+    lines.append(
+        "Act with reply_to_job_message / escalate_job_message; close async "
+        "items with acknowledge_job_message."
+    )
+    return lines
 
 
 async def _knowledge_section(vector_db: Any, project_id: Optional[str]) -> list[str]:
