@@ -1,7 +1,8 @@
 # yaml-language-server: $schema=../../schema.json
 # Centurion — the standing officer of a project (docs/features/centurion.md).
-# An always-on session with NO workspace and NO object-level tools: his output
-# is judgment — dispatches, steering, verdicts, briefings. The officer
+# An always-on session with no local workspace. Its current legacy job-file
+# readers remain granted until the separately ratified S5 object-plane policy;
+# its output is judgment — dispatches, steering, verdicts, briefings. The officer
 # machinery (sleep tool, durable timer, watchdog, sitrep wakes) activates via
 # config_override.officer.enabled on the THREAD, not here: this same expert
 # also dresses conferences — interactive sessions wearing his identity —
@@ -25,8 +26,10 @@ tags:
   - persistent
 
 # Klug und faul, structurally: the lite tier removes every hands-on tool
-# (files, shell, git, browser, canvas) at the backend filter, so delegation
-# is not a persona preference — it is the only path to getting work done.
+# (local files, shell, git, browser, canvas) at the backend filter, so
+# delegation is not a persona preference — it is the only path to getting work
+# done. The remote job-file inspection tools below are supervision reads, not
+# an officer workspace.
 workspace:
   backend: none
 
@@ -61,21 +64,24 @@ officer:
   daily_token_ceiling: 0
 
 tools:
-  # The command surface: delegation + oversight (session_base ships this
-  # category empty). sleep + notify_user arrive via the officer flag, not
-  # this list.
+  # Non-job application context. sleep + notify_user arrive via the officer
+  # flag, not these lists.
   orchestrator:
     - get_session_context
-    - create_worker_job
-    - list_worker_jobs
-    - get_worker_job
-    - get_job_workspace_file
-    - list_job_workspace_files
-    - approve_worker_job
-    - resume_worker_job
-    - cancel_worker_job
-    - pause_worker_job
-    - steer_worker_job
+  # Preserve the officer's pre-unification effective grant exactly. The wider
+  # S5 supervision/evidence default remains pending.
+  job_control:
+    - create_job
+    - approve_job
+    - resume_job_with_feedback
+    - cancel_job
+    - pause_job
+    - steer_job
+  job_inspection:
+    - list_jobs
+    - get_job
+    - get_job_file
+    - list_job_files
     - get_stuck_jobs
   # Workers research; the officer judges. Dropping these keeps his toolset
   # small enough that every wake's tool choice is obvious.

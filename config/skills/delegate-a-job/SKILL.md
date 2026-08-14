@@ -12,7 +12,7 @@ tags:
 
 # Delegate a job
 
-`create_worker_job` starts a worker with the defaults its expert and project
+`create_job` starts a worker with the defaults its expert and project
 supply. That is the right choice most of the time — reach for this skill only
 when the work genuinely needs something else: a stronger or cheaper model, root
 access, a repo checkout, or a different set of lifecycle passes.

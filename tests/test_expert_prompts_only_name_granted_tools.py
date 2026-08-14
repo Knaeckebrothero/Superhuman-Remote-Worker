@@ -42,7 +42,7 @@ _CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 _REMOVED_TOOL_NAMES = frozenset({"browse_website", "download_from_website"})
 
 # Tools the DISPATCHER stamps into a job's config fragment rather than any
-# checked-in config: ``approve_job`` / ``return_job_with_feedback`` via
+# checked-in config: ``approve_job_verdict`` / ``return_job_with_feedback`` via
 # ``_critic_config_override`` (src/api/orchestrator_client.py:1880) and
 # ``loop_plan`` via the planner loops. ``src/tools/registry.py:160-178``
 # explains why these are deliberately NOT marked ``grant: "code"`` — that
@@ -52,7 +52,9 @@ _REMOVED_TOOL_NAMES = frozenset({"browse_website", "download_from_website"})
 # Everything else granted at runtime IS marked ``grant: "code"`` (38 tools:
 # officer, datasource, repo, product-guide, session-task …) and is skipped
 # from the registry metadata rather than by name.
-_DISPATCH_STAMPED = frozenset({"approve_job", "return_job_with_feedback", "loop_plan"})
+_DISPATCH_STAMPED = frozenset(
+    {"approve_job_verdict", "return_job_with_feedback", "loop_plan"}
+)
 
 
 def _is_runtime_granted(name: str) -> bool:

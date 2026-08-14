@@ -419,6 +419,13 @@ _MUTATION_CAPABILITIES = (
         open_world=True,
     ),
     _mutation(
+        "steer_job",
+        "POST /api/jobs/{job_id}/messages/officer/reply",
+        "delivers non-destructive guidance through the protected officer thread",
+        authorization=_EDITOR_AUTH,
+        open_world=True,
+    ),
+    _mutation(
         "create_persistent_thread",
         "POST /api/persistent/threads",
         "creates a persistent session and provisions runtime resources",

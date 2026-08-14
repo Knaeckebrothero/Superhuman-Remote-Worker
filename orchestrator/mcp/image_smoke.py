@@ -30,6 +30,7 @@ except ImportError:
 
 class _StubState:
     create_job_calls = 0
+    steer_job_calls = 0
 
 
 class _StubHandler(BaseHTTPRequestHandler):
@@ -73,8 +74,7 @@ class _StubHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         path = urlparse(self.path).path
         content_length = int(self.headers.get("Content-Length", "0"))
-        if content_length:
-            self.rfile.read(content_length)
+        body = json.loads(self.rfile.read(content_length)) if content_length else {}
         if path == "/api/jobs":
             _StubState.create_job_calls += 1
             self._json(
@@ -84,6 +84,14 @@ class _StubHandler(BaseHTTPRequestHandler):
                     "status": "created",
                     "description": "protocol smoke mutation",
                 },
+            )
+            return
+        if path == "/api/jobs/job-read-1/messages/officer/reply":
+            assert body == {"message": "continue with the current plan", "urgent": True}
+            _StubState.steer_job_calls += 1
+            self._json(
+                200,
+                {"status": "ok", "delivery_strategy": "guidance_next_turn"},
             )
             return
         if path == "/api/skills/reload":
@@ -153,6 +161,17 @@ async def _connect_and_list(api_url: str, *, exercise: bool) -> list[dict[str, A
                     assert not mutation.isError and "job-created-1" in mutation_text
                     assert "automatic workspace provisioning" in mutation_text
 
+                    steer = await session.call_tool(
+                        "steer_job",
+                        {
+                            "job_id": "job-read-1",
+                            "message": "continue with the current plan",
+                            "urgent": True,
+                        },
+                    )
+                    assert not steer.isError
+                    assert "guidance_next_turn" in _text(steer)
+
                     denied = await session.call_tool("reload_skills", {})
                     assert denied.isError
                     denied_text = _text(denied)
@@ -175,6 +194,7 @@ async def _connect_and_list(api_url: str, *, exercise: bool) -> list[dict[str, A
 
 async def _run() -> None:
     _StubState.create_job_calls = 0
+    _StubState.steer_job_calls = 0
     stub = ThreadingHTTPServer(("127.0.0.1", 0), _StubHandler)
     thread = threading.Thread(target=stub.serve_forever, daemon=True)
     thread.start()
@@ -188,6 +208,7 @@ async def _run() -> None:
         thread.join(timeout=2)
 
     assert _StubState.create_job_calls == 1
+    assert _StubState.steer_job_calls == 1
     assert first == second
     assert {tool["name"] for tool in first} == set(TOOL_CAPABILITIES)
     for tool in first:
@@ -208,6 +229,7 @@ async def _run() -> None:
                 "tool_schema_digest": artifact["digest"],
                 "fresh_connections": 2,
                 "mutation_calls": _StubState.create_job_calls,
+                "steer_calls": _StubState.steer_job_calls,
             },
             sort_keys=True,
         )

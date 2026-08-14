@@ -11,7 +11,7 @@ that rots invisibly, so these tests do two jobs:
    map plus five named runtime floors, that the legacy experts-off shim is NOT
    marked, and that every mark carries the gate that makes it auditable;
 2. prove the classification is *usable* by computing what ``tools.<cat>: true``
-   would expand to under it, and asserting that for the four closed session
+   would expand to under it, and asserting that for the closed session
    groups that is byte-for-byte ``SESSION_TOOL_OVERRIDE_NAMES``.
 
 Test 2 is the safety gate for the whole migration.  ``true`` is strictly wider
@@ -29,6 +29,7 @@ import yaml
 
 from src.core.datasource_setup import DATASOURCE_TOOL_MAP
 from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from src.shared.orch_surface.jobs import JOB_DESCRIPTORS
 from src.tools.registry import (
     CODE_GRANTED_CATEGORIES,
     TOOL_REGISTRY,
@@ -50,15 +51,16 @@ _LEGACY_SHIM_TOOLS = frozenset(
     {
         # _ORCHESTRATOR_TOOLS (:1470-1485)
         "get_session_context",
-        "create_worker_job",
-        "list_worker_jobs",
-        "get_worker_job",
-        "get_job_workspace_file",
-        "list_job_workspace_files",
-        "approve_worker_job",
-        "resume_worker_job",
-        "cancel_worker_job",
-        "pause_worker_job",
+        # Descriptor-derived job_control/job_inspection compatibility defaults
+        "create_job",
+        "list_jobs",
+        "get_job",
+        "get_job_file",
+        "list_job_files",
+        "approve_job",
+        "resume_job_with_feedback",
+        "cancel_job",
+        "pause_job",
         "get_current_project",
         "list_project_jobs",
         "list_project_repositories",
@@ -85,7 +87,7 @@ _LEGACY_SHIM_TOOLS = frozenset(
 # and ``project_loops`` stamps ``tools.loop`` onto a checkpoint critic, so
 # ``evaluation: true`` and ``loop: true`` must keep resolving to these.
 _CONFIG_OVERRIDE_STAMPED = frozenset(
-    {"approve_job", "return_job_with_feedback", "loop_plan"}
+    {"approve_job_verdict", "return_job_with_feedback", "loop_plan"}
 )
 
 # Runtime floors classified one tool at a time because they are individual
@@ -263,11 +265,13 @@ class TestNotClassified:
         )
 
     def test_the_shim_set_still_matches_the_runtime_lists(self):
-        """The shim is 26 names across three categories; drift breaks the test above."""
+        """The shim is 26 names across five categories; drift breaks this gate."""
         assert len(_LEGACY_SHIM_TOOLS) == 26
         assert _LEGACY_SHIM_TOOLS <= set(TOOL_REGISTRY)
         assert _LEGACY_SHIM_TOOLS == frozenset(
             SESSION_TOOL_OVERRIDE_NAMES["orchestrator"]
+            | SESSION_TOOL_OVERRIDE_NAMES["job_control"]
+            | SESSION_TOOL_OVERRIDE_NAMES["job_inspection"]
             | SESSION_TOOL_OVERRIDE_NAMES["agent_catalog"]
             | SESSION_TOOL_OVERRIDE_NAMES["workflows"]
         )
@@ -284,17 +288,17 @@ class TestNotClassified:
 
 class TestExplicitGrants:
     def test_explicit_set_is_pinned(self):
-        assert _classified("explicit") == {
-            # In the registry's `orchestrator` category, granted by name to
-            # config/experts/centurion, absent from the session vocabulary.
-            "steer_worker_job",
-            "get_stuck_jobs",
+        descriptor_explicit = {
+            item.name for item in JOB_DESCRIPTORS if item.grant == "explicit"
+        }
+        assert _classified("explicit") == descriptor_explicit | {
             # Heavy delegation: no config has granted these since 57430a2a and
             # whether to restore them is an open decision. `delegation: true`
             # must not be what takes it.
             "delegate_work",
             "resume_delegation_child",
         }
+        assert {"steer_job", "get_stuck_jobs"} <= descriptor_explicit
         # The six `*_bundle` tools left this tier on 2026-08-03. They did not
         # become safer — they moved to `catalog_authoring`, a category of their
         # own behind the `catalog_authoring` capability grant, so
@@ -312,7 +316,7 @@ class TestExplicitGrants:
         otherwise this classification would itself be a grant change.
         """
         named = _shipped_config_tool_names()
-        assert set(named.get("steer_worker_job", ())) == {
+        assert set(named.get("steer_job", ())) == {
             "config/experts/centurion/config.yaml"
         }
         assert set(named.get("get_stuck_jobs", ())) == {

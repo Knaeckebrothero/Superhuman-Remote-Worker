@@ -121,7 +121,7 @@ export const NOTIFY_USER_TOOL = 'notify_user';
  * counter hides work that is *waiting on the user*. Contiguous calls group into
  * a `job_batch` instead — see `groupEvents` in `core/models/turn.model.ts`.
  */
-export const JOB_TOOL = 'create_worker_job';
+export const JOB_TOOL = 'create_job';
 
 export type NotifyUrgency = 'log' | 'digest' | 'page';
 
@@ -163,7 +163,7 @@ export interface ToolCardView {
     action?: ToolCardAction;
     /**
      * Durable row this card watches, when it has one. Present only on
-     * `create_worker_job` today. Its mere presence is the subscription — the
+     * `create_job` today. Its mere presence is the subscription — the
      * card looks the id up in the live map and renders current state instead of
      * the frozen call result.
      */

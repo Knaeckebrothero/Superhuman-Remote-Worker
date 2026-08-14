@@ -367,7 +367,7 @@ class TestValidateVerdictCall:
         """The most common round-2 shape: nothing NEW, but F1 is still open.
 
         Rejecting this made ``return_job_with_feedback`` uncallable for that
-        critic and pushed it toward ``approve_job`` — the wrong pressure
+        critic and pushed it toward ``approve_job_verdict`` — the wrong pressure
         direction for a fail-closed gate.
         """
         assert validate_verdict_call("returned", [], OPEN_HIGH) == []

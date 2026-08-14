@@ -68,7 +68,7 @@
       "set_canvas": "Present in Canvas",
       "get_canvas": "Inspect Canvas",
       "clear_canvas": "Clear Canvas",
-      "create_worker_job": "Schedule job",
+      "create_job": "Schedule job",
       "notify_user": "Message the user"
     },
     "notify": {
@@ -2854,9 +2854,17 @@
         "label": "MongoDB",
         "description": "Query attached MongoDB datasources"
       },
+      "job_control": {
+        "label": "Job Control",
+        "description": "Create, steer, pause, resume, approve, and cancel SRW jobs"
+      },
+      "job_inspection": {
+        "label": "Job Inspection",
+        "description": "Inspect SRW job status and the currently granted supervision data"
+      },
       "orchestrator": {
-        "label": "Fleet Management",
-        "description": "Ability to inspect and steer SRW jobs, projects, repositories, and session workspace upgrades"
+        "label": "SRW Projects",
+        "description": "Inspect SRW projects, repositories, session context, and workspace upgrades"
       },
       "product_help": {
         "label": "Product Help",

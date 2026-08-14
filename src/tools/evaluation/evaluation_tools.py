@@ -1,7 +1,7 @@
 """Evaluation verdict tools for the Universal Agent.
 
 Provides tools for critic/reviewer agents to act on target jobs:
-- approve_job: Record approval verdict for a target job
+- approve_job_verdict: Record approval verdict for a target job
 - return_job_with_feedback: Record feedback verdict for a target job
 
 Journal-before-observe: each tool durably records its round through the
@@ -61,9 +61,9 @@ def clear_verdict_data(job_id: str) -> None:
 
 # Tool metadata for registry
 EVALUATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "approve_job": {
+    "approve_job_verdict": {
         "module": "evaluation.evaluation_tools",
-        "function": "approve_job",
+        "function": "approve_job_verdict",
         "description": "Approve a target job that is pending review",
         "category": "evaluation",
         "short_description": "Approve a pending_review job (transitions to completed).",
@@ -223,7 +223,7 @@ def create_evaluation_tools(context: ToolContext) -> List[Any]:
             )
 
     @tool
-    async def approve_job(
+    async def approve_job_verdict(
         job_id: str,
         report: str,
         dispositions: Optional[List[Dict[str, Any]]] = None,
@@ -267,4 +267,4 @@ def create_evaluation_tools(context: ToolContext) -> List[Any]:
             "returned", job_id, feedback, findings, dispositions
         )
 
-    return [approve_job, return_job_with_feedback]
+    return [approve_job_verdict, return_job_with_feedback]

@@ -110,6 +110,8 @@ describe('ToolsGroupComponent rendering', () => {
       resolved: response({
         categories: {
           canvas: cat(),
+          job_control: cat({state: 'off'}),
+          job_inspection: cat({state: 'off'}),
           orchestrator: cat({state: 'off'}),
           shell: cat({state: 'unavailable', settable: false, reason: 'requires the shell_tools capability grant'}),
           knowledge: cat({state: 'off'}),
@@ -117,10 +119,12 @@ describe('ToolsGroupComponent rendering', () => {
         },
       }),
     });
-    expect(rows(fixture)).toHaveLength(5);
+    expect(rows(fixture)).toHaveLength(7);
     const body = text(fixture);
     expect(body).toContain('Canvas');
-    expect(body).toContain('Fleet Management');
+    expect(body).toContain('Job Control');
+    expect(body).toContain('Job Inspection');
+    expect(body).toContain('SRW Projects');
     expect(body).toContain('Shell');
     expect(body).toContain('Knowledge');
     expect(body).toContain('SQL');
@@ -492,7 +496,7 @@ describe('ToolsGroupComponent rendering', () => {
     const categories: Record<string, SessionToolCategory> = {};
     for (const key of [
       'research', 'browser_direct', 'citation', 'shell', 'communication', 'delegation',
-      'canvas', 'orchestrator', 'agent_catalog', 'workflows', 'catalog_authoring',
+      'canvas', 'job_control', 'job_inspection', 'orchestrator', 'agent_catalog', 'workflows', 'catalog_authoring',
       'knowledge', 'git',
       'workspace', 'core', 'session_task', 'product_help', 'evaluation', 'loop',
       'sql', 'mongodb', 'graph', 'webdav', 'email', 'repo', 'mcp', 'unclassified',
@@ -500,7 +504,7 @@ describe('ToolsGroupComponent rendering', () => {
       categories[key] = cat({state: 'off'});
     }
     const fixture = mount({resolved: response({categories})});
-    expect(rows(fixture)).toHaveLength(27);
+    expect(rows(fixture)).toHaveLength(29);
     expect(text(fixture)).not.toContain('agentSettings.');
     expect(text(fixture)).not.toContain('grants.');
   });

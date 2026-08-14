@@ -160,7 +160,7 @@ class TestCrossCategorySmuggling:
         [
             ("canvas", "run_command"),
             ("canvas", "shell_execute"),
-            ("agent_catalog", "create_worker_job"),
+            ("agent_catalog", "create_job"),
             ("workflows", "get_skill"),
             ("orchestrator", "run_command"),
             # The eight that were not validated at all before.
@@ -285,10 +285,14 @@ class TestInheritedConstraints:
         assert validate_tool_override_fragment(
             {
                 "tools": {
-                    "orchestrator": {"only": ["steer_worker_job", "get_stuck_jobs"]}
+                    "job_control": {"only": ["steer_job"]},
+                    "job_inspection": {"only": ["get_stuck_jobs"]},
                 }
             }
-        ) == {"orchestrator": ["steer_worker_job", "get_stuck_jobs"]}
+        ) == {
+            "job_control": ["steer_job"],
+            "job_inspection": ["get_stuck_jobs"],
+        }
 
     @pytest.mark.parametrize(
         "name",
@@ -504,7 +508,7 @@ class TestJobCreateBoundary:
     @pytest.mark.asyncio
     async def test_the_internal_path_is_validated_too(self, job_db, job_request):
         """``X-Internal-Key`` is transport authentication, not authorization,
-        and ``create_worker_job`` forwards a MODEL-AUTHORED config_override
+        and ``create_job`` forwards a MODEL-AUTHORED config_override
         verbatim — which is precisely a caller that can write this fragment."""
         from fastapi import HTTPException
         from main import JobCreate
@@ -547,7 +551,7 @@ class TestJobCreateBoundary:
         persisted = job_db.create_job.await_args.kwargs["config_override"]
         assert persisted["tools"]["communication"] == []
         assert persisted["tools"]["evaluation"] == [
-            "approve_job",
+            "approve_job_verdict",
             "return_job_with_feedback",
         ]
 
@@ -568,7 +572,10 @@ class TestJobCreateBoundary:
                 config_override={
                     "autonomy": "full",
                     "tools": {
-                        "evaluation": ["approve_job", "return_job_with_feedback"]
+                        "evaluation": [
+                            "approve_job_verdict",
+                            "return_job_with_feedback",
+                        ]
                     },
                 },
             ),
@@ -628,7 +635,7 @@ class TestLiveSessionSanitiser:
 #
 # Everything above this line tests the shared validator. That is not enough,
 # and the gap was found by review: re-narrowing `create_thread` or
-# `_apply_thread_config_update` back to the four closed groups — Defect 2,
+# `_apply_thread_config_update` back to the closed groups — Defect 2,
 # verbatim — left the whole suite green, because both sites delegate to a
 # helper the tests exercised directly. A filter at the call site is invisible
 # to a validator-level test. These two classes drive the endpoints.
@@ -963,7 +970,7 @@ class TestSessionCreateBoundary:
         self, session_create_env
     ):
         """THE motivating defect, at the endpoint. Before: `tools.research` was
-        copied across only if it was one of four groups, so this key never
+        copied across only if it was one of the original groups, so this key never
         reached `threads.metadata.config_override` and the agent bound research
         tools anyway."""
         main, _, conn, _ = session_create_env
@@ -1496,14 +1503,14 @@ class TestNoModelAuthoredPathReachesSessionCreate:
             )
 
     def test_the_job_create_tool_does_expose_one_which_is_why_it_is_validated(self):
-        """The contrast that makes the point: `create_worker_job` DOES forward
+        """The contrast that makes the point: `create_job` DOES forward
         a model-authored fragment verbatim, which is exactly why the job
         boundary had to be closed rather than trusted."""
         from pathlib import Path
 
-        src = Path("src/tools/orchestrator/jobs.py").read_text()
-        assert "async def create_worker_job(" in src
-        assert "config_override: Optional[Dict[str, Any]] = None," in src
+        src = Path("src/shared/orch_surface/jobs/control.py").read_text()
+        assert "async def create_job(" in src
+        assert "config_override: dict[str, Any] | None = None," in src
 
 
 # =============================================================================

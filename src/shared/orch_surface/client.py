@@ -5,18 +5,15 @@ Provides synchronous and asynchronous methods to interact with the debug cockpit
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import contextmanager
 from contextvars import ContextVar
+import functools
 import os
 from types import MappingProxyType
-from typing import Any, Literal, Mapping
+from typing import Any, Iterator, Literal, Mapping
 
 import httpx
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
 
 FilterCategory = Literal["all", "messages", "tools", "errors"]
 DatasourceScopeMode = Literal["all", "projects"]
@@ -27,12 +24,21 @@ DatasourceAvailability = Literal["all", "projects", "unavailable"]
 
 def _create_safe_read_retry_decorator():
     """Retry transport failures only for operations known to be safe reads."""
-    return retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException)),
-        reraise=True,
-    )
+
+    def decorate(function):
+        @functools.wraps(function)
+        async def retry_safe_read(*args: Any, **kwargs: Any):
+            for attempt in range(3):
+                try:
+                    return await function(*args, **kwargs)
+                except (httpx.ConnectError, httpx.TimeoutException):
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(2**attempt)
+
+        return retry_safe_read
+
+    return decorate
 
 
 # Kept as a local spelling for the existing GET wrappers. Mutation methods are
@@ -505,17 +511,45 @@ class AsyncCockpitClient:
 
     def set_scope_headers(self, user_id: str, scope: str) -> None:
         """Bind authenticated MCP identity to the current async context."""
-        headers = {
-            "X-MCP-User-Id": user_id,
-            "X-MCP-Scope": scope,
-        }
-        if self._internal_key:
-            headers["X-Internal-Key"] = self._internal_key
-        self._scope_headers.set(MappingProxyType(headers))
+        self._scope_headers.set(self._invocation_headers(user_id=user_id, scope=scope))
 
     def clear_scope_headers(self) -> None:
         """Make requests in the current async context unauthenticated."""
         self._scope_headers.set(None)
+
+    def _invocation_headers(
+        self, *, user_id: str | None, scope: str | None
+    ) -> Mapping[str, str] | None:
+        headers: dict[str, str] = {}
+        if self._internal_key:
+            headers["X-Internal-Key"] = self._internal_key
+        if user_id:
+            headers["X-MCP-User-Id"] = user_id
+        if scope:
+            headers["X-MCP-Scope"] = scope
+        return MappingProxyType(headers) if headers else None
+
+    @contextmanager
+    def invocation_scope(
+        self,
+        *,
+        user_id: str | None = None,
+        scope: str | None = None,
+    ) -> Iterator[None]:
+        """Bind and reliably reset one invocation's identity/scope headers.
+
+        The token returned by ``ContextVar.set`` is essential: setting ``None``
+        in ``finally`` would erase an outer invocation's scope, while resetting
+        restores the exact previous context. Separate asyncio tasks retain
+        independent values even though they share this client's connection pool.
+        """
+        token = self._scope_headers.set(
+            self._invocation_headers(user_id=user_id, scope=scope)
+        )
+        try:
+            yield
+        finally:
+            self._scope_headers.reset(token)
 
     async def _mutation_request(
         self,
@@ -939,6 +973,7 @@ class AsyncCockpitClient:
         parent_job_id: str | None = None,
         project_id: str | None = None,
         user_id: str | None = None,
+        thread_id: str | None = None,
         priority: int = 5,
         required_deliverables: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -958,6 +993,7 @@ class AsyncCockpitClient:
             parent_job_id: Parent job UUID for verification/follow-up jobs
             project_id: Project UUID to associate this job with
             user_id: User UUID who created this job
+            thread_id: Persistent session origin used for server-side lineage
             priority: Dispatch priority from 0 (low) to 10 (high)
             required_deliverables: Deliverable contract (P1-C) — paths /
                 "kb:<slug>" entries validated at the seal
@@ -990,6 +1026,8 @@ class AsyncCockpitClient:
             body["project_id"] = project_id
         if user_id:
             body["user_id"] = user_id
+        if thread_id:
+            body["thread_id"] = thread_id
         if required_deliverables:
             body["required_deliverables"] = required_deliverables
         resp = await self._mutation_request("POST", "/api/jobs", json=body)

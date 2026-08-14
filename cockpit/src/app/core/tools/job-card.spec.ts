@@ -1,5 +1,9 @@
 import {describe, expect, it} from 'vitest';
-import {buildToolCardView, parseJobEntity} from './tool-descriptors';
+import {
+    buildToolCardView,
+    parseJobEntity,
+    resolveToolDescriptor,
+} from './tool-descriptors';
 import {NormalizedToolCall} from '../models/tool-card.model';
 import {
     asRecord,
@@ -20,7 +24,7 @@ const JOB_ID = '38e17406-3dbf-410e-9630-df15e49a0543';
 
 function call(over: Partial<NormalizedToolCall> = {}): NormalizedToolCall {
     return {
-        tool: 'create_worker_job',
+        tool: 'create_job',
         args: {description: 'Explore a warm-neutral theme'},
         status: 'ok',
         result: `Job created successfully.\nJob ID: ${JOB_ID}\nConfig: worker_base`,
@@ -56,7 +60,7 @@ describe('parseJobEntity', () => {
     it('parses the verbatim result a dev job actually produced', () => {
         // Captured from thread_messages on the dev cluster, 2026-07-29. Pinning
         // the real string guards the parser against a wording change in the
-        // tool's receipt — note it repeats the id inside a get_worker_job()
+        // tool's receipt — note it repeats the id inside a get_job()
         // hint, so a greedier regex would still work but a label-anchored one
         // must match the first, labelled occurrence.
         const realResult = [
@@ -67,7 +71,7 @@ describe('parseJobEntity', () => {
             'Priority: 5',
             'Description: Card live gate: write a short markdown note.',
             '',
-            `A worker agent will pick this up from the dispatch queue. Use get_worker_job('${JOB_ID}') to check progress.`,
+            `A worker agent will pick this up from the dispatch queue. Use get_job('${JOB_ID}') to check progress.`,
         ].join('\n');
         expect(parseJobEntity(call({result: realResult}))).toEqual({kind: 'job', id: JOB_ID});
     });
@@ -115,6 +119,24 @@ describe('buildToolCardView — job card', () => {
             result: `Job ID: ${JOB_ID}`,
         });
         expect(view.entity).toBeUndefined();
+    });
+});
+
+describe('canonical job-tool recognition', () => {
+    it('keeps create_job on the durable live job card', () => {
+        expect(resolveToolDescriptor('create_job').result?.kind).toBe('none');
+        expect(parseJobEntity(call())).toEqual({kind: 'job', id: JOB_ID});
+    });
+
+    it('recognises the other generated canonical job tools', () => {
+        expect(resolveToolDescriptor('cancel_job').icon).toBe('hub');
+        expect(resolveToolDescriptor('get_job_file').icon).toBe('manage_search');
+        expect(resolveToolDescriptor('steer_job').dynamicParams).toBe(true);
+    });
+
+    it('does not retain the removed runtime spelling', () => {
+        expect(resolveToolDescriptor('create_worker_job').icon).toBe('build');
+        expect(parseJobEntity(call({tool: 'create_worker_job'}))).toBeUndefined();
     });
 });
 

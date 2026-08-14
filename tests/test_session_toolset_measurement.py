@@ -179,9 +179,9 @@ class TestMeasuredAnswer:
     ):
         """THE regression this task exists for.
 
-        ``session_base`` ships ``tools.orchestrator: []``, so every
-        config-derived view says the fleet group is off. If the agent bound
-        fleet tools anyway — which the runtime injection layer does whenever
+        ``session_base`` ships ``tools.job_control: []``, so every
+        config-derived view says job control is off. If the agent bound
+        job-control tools anyway — which the runtime injection layer does whenever
         the group is enabled — the endpoint must say ON.
         """
         result, _ = await _call(
@@ -191,14 +191,14 @@ class TestMeasuredAnswer:
             fake_request,
             routes={
                 "/session/toolset": _Response(
-                    payload=_report({"orchestrator": ["create_worker_job"]})
+                    payload=_report({"job_control": ["create_job"]})
                 )
             },
         )
-        assert result["tool_groups"]["orchestrator"] is True
-        assert result["categories"]["orchestrator"]["state"] == STATE_ON
+        assert result["tool_groups"]["job_control"] is True
+        assert result["categories"]["job_control"]["state"] == STATE_ON
         # And the disagreement is visible rather than hidden.
-        assert result["categories"]["orchestrator"]["configured"] == []
+        assert result["categories"]["job_control"]["configured"] == []
 
     @pytest.mark.asyncio
     async def test_tool_groups_is_derived_from_the_measurement(
@@ -897,7 +897,7 @@ class TestEnumerateOnlyRidesBothReads:
 class TestPreviewModelsTheLegacyPathToo:
     """The creation form must predict the path a created session would take.
 
-    With experts off, the agent APPENDS the four closed groups unless an
+    With experts off, the agent APPENDS the compatibility groups unless an
     explicit ``[]`` disables them — the opposite of the resolved path for an
     unset group. A preview that always predicted ``resolved`` would tell the
     user "Fleet Management: off" and then hand them a session that has it,

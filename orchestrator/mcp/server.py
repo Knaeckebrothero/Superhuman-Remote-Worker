@@ -6,6 +6,8 @@ via the Model Context Protocol using FastMCP.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+import functools
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import json
@@ -21,6 +23,7 @@ from starlette.responses import JSONResponse
 # and in-image (/app/src/shared), so no fallback chain is needed for them.
 from src.shared.orch_surface import formatters as fmt
 from src.shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
+from src.shared.orch_surface.jobs import CallerCtx
 
 DatasourceType = Literal[
     "generic",
@@ -94,8 +97,24 @@ def mcp_tool(function):
         raise RuntimeError(
             f"MCP tool {function.__name__!r} has no capability contract entry"
         )
+
+    @functools.wraps(function)
+    async def scoped_invocation(*args: Any, **kwargs: Any):
+        client = _get_client()
+        caller = _get_mcp_caller_ctx()
+        scope_manager = (
+            client.invocation_scope(
+                user_id=caller.user_id,
+                scope=caller.scope_header,
+            )
+            if isinstance(client, AsyncCockpitClient)
+            else nullcontext()
+        )
+        with scope_manager:
+            return await function(*args, **kwargs)
+
     return mcp.tool(
-        function,
+        scoped_invocation,
         annotations=contract.annotations,
         meta={"io.srw.capability": contract.metadata()},
     )
@@ -106,31 +125,40 @@ _client: AsyncCockpitClient | None = None
 
 
 def _get_client() -> AsyncCockpitClient:
-    """Get or create the async client instance.
-
-    When running with auth, injects scope headers from the authenticated token
-    so the orchestrator can apply per-user filtering.
-    """
+    """Get or create the process-wide async client instance."""
     global _client
     if _client is None:
         _client = AsyncCockpitClient()
+    return _client
 
-    # Inject scope headers from authenticated MCP token (if present)
+
+def _get_mcp_caller_ctx() -> CallerCtx:
+    """Translate the authenticated token into trusted hidden caller context."""
     try:
         from mcp.server.auth.middleware.auth_context import get_access_token
 
         token = get_access_token()
-        if token:
-            _client.set_scope_headers(
-                user_id=token.client_id,
-                scope=token.scopes[0] if token.scopes else "user",
+        if not token:
+            return CallerCtx(kind="mcp")
+        scopes = tuple(str(scope) for scope in (token.scopes or ()) if scope)
+        project_ids = tuple(
+            dict.fromkeys(
+                scope.split(":", 1)[1]
+                for scope in scopes
+                if scope.startswith("project:") and scope.split(":", 1)[1]
             )
-        else:
-            _client.clear_scope_headers()
+        )
+        explicit_scope = scopes[0] if len(scopes) == 1 else None
+        lineage_project_id = project_ids[0] if len(project_ids) == 1 else None
+        return CallerCtx(
+            kind="mcp",
+            user_id=str(token.client_id),
+            project_ids=project_ids,
+            lineage_project_id=lineage_project_id,
+            explicit_scope=explicit_scope,
+        )
     except Exception:
-        _client.clear_scope_headers()
-
-    return _client
+        return CallerCtx(kind="mcp")
 
 
 def _format_action_error(action: str, target: str, error: Exception) -> str:
@@ -148,7 +176,7 @@ def _format_action_error(action: str, target: str, error: Exception) -> str:
 # to distinguish from a cached/deployed schema. Build provenance says which
 # source produced the pod; this small contract revision says which tool surface
 # that source promises.
-MCP_TOOL_SCHEMA_REVISION = "7"
+MCP_TOOL_SCHEMA_REVISION = "8"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 
@@ -241,217 +269,20 @@ async def health_check(request):
 # MCP Tools
 # =============================================================================
 
+# Job operations are the only descriptor-backed slice. Every other MCP tool in
+# this module remains hand-written and behaviorally unchanged.
+try:
+    from .job_adapter import register_job_tools
+except ImportError:
+    from job_adapter import register_job_tools  # type: ignore[no-redef]
 
-@mcp_tool
-async def list_jobs(
-    status: Literal[
-        "created",
-        "processing",
-        "completed",
-        "failed",
-        "cancelled",
-        "pending_review",
-        "paused",
-    ]
-    | None = None,
-    limit: int = 20,
-) -> str:
-    """List agent jobs with optional status filter.
-
-    Returns job ID, status, config name, timestamps, and audit entry count.
-    Use this to find jobs to investigate.
-
-    Args:
-        status: Filter by lifecycle status, including pending_review and paused
-        limit: Maximum jobs to return (1-100, default 20)
-
-    Returns:
-        Formatted list of jobs with ID, status, config, timestamps
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 100:
-        limit = 100
-
-    client = _get_client()
-    jobs = await client.list_jobs(status=status, limit=limit)
-    return fmt.format_jobs(jobs)
-
-
-@mcp_tool
-async def get_job(job_id: str) -> str:
-    """Get detailed information about a specific job by ID.
-
-    Returns full job details including description, config, status,
-    timestamps, and audit count.
-
-    Args:
-        job_id: Job UUID to retrieve
-
-    Returns:
-        Formatted job details
-    """
-    client = _get_client()
-    job = await client.get_job(job_id)
-    return fmt.format_job_detail(job)
-
-
-@mcp_tool
-async def get_audit_trail(
-    job_id: str,
-    page: int = 1,
-    page_size: int = 20,
-    filter: Literal["all", "messages", "tools", "errors"] = "all",
-) -> str:
-    """Get paginated audit entries for a job's execution.
-
-    Shows LLM messages, tool calls, and errors.
-    Use filter to narrow results. Page -1 returns the last page.
-
-    Args:
-        job_id: Job UUID to get audit for
-        page: Page number (1-indexed, -1 for last page)
-        page_size: Entries per page (max 200, default 20)
-        filter: Filter category (all, messages, tools, errors)
-
-    Returns:
-        Formatted audit trail entries
-    """
-    if page_size < 1:
-        page_size = 1
-    elif page_size > 200:
-        page_size = 200
-
-    client = _get_client()
-    audit = await client.get_audit_trail(
-        job_id=job_id,
-        page=page,
-        page_size=page_size,
-        filter_category=filter,
-    )
-    return fmt.format_audit(audit)
-
-
-@mcp_tool
-async def get_audit_bulk(
-    job_id: str,
-    offset: int = 0,
-    limit: int = 200,
-    filter: Literal["all", "messages", "tools", "errors"] = "all",
-) -> str:
-    """Get audit entries in chunks using offset/limit pagination.
-
-    Better than page-based audit trail for scanning large histories. Returns a
-    lean projection: LLM messages, tool calls with their results, and errors.
-    Per-call tool arguments and full tracebacks are omitted to keep large scans
-    cheap. Supports up to 200 entries per request.
-
-    Args:
-        job_id: Job UUID to get audit for
-        offset: Number of entries to skip (default: 0)
-        limit: Maximum entries to return (max 200, default 200)
-        filter: Filter category (all, messages, tools, errors)
-
-    Returns:
-        Formatted audit entries with offset metadata
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 200:
-        limit = 200
-
-    client = _get_client()
-    data = await client.get_audit_bulk(
-        job_id=job_id,
-        offset=offset,
-        limit=limit,
-        filter_category=filter,
-    )
-    return fmt.format_audit_bulk(data)
-
-
-@mcp_tool
-async def get_chat_history(
-    job_id: str,
-    page: int = 1,
-    page_size: int = 20,
-) -> str:
-    """Get paginated chat history for a job showing conversation turns.
-
-    Returns clean sequential view of input/response pairs without duplicates.
-    Use this to understand the agent's reasoning flow.
-
-    Args:
-        job_id: Job UUID to get chat history for
-        page: Page number (1-indexed, -1 for last page)
-        page_size: Entries per page (max 200, default 20)
-
-    Returns:
-        Formatted chat history
-    """
-    if page_size < 1:
-        page_size = 1
-    elif page_size > 200:
-        page_size = 200
-
-    client = _get_client()
-    chat = await client.get_chat_history(
-        job_id=job_id,
-        page=page,
-        page_size=page_size,
-    )
-    return fmt.format_chat_history(chat)
-
-
-@mcp_tool
-async def get_chat_bulk(
-    job_id: str,
-    offset: int = 0,
-    limit: int = 200,
-) -> str:
-    """Get chat history in chunks using offset/limit pagination.
-
-    Better than page-based chat history for scanning large conversations.
-    Supports up to 200 entries per request.
-
-    Args:
-        job_id: Job UUID to get chat history for
-        offset: Number of entries to skip (default: 0)
-        limit: Maximum entries to return (max 200, default 200)
-
-    Returns:
-        Formatted chat turns with offset metadata
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 200:
-        limit = 200
-
-    client = _get_client()
-    data = await client.get_chat_bulk(
-        job_id=job_id,
-        offset=offset,
-        limit=limit,
-    )
-    return fmt.format_chat_bulk(data)
-
-
-@mcp_tool
-async def get_todos(job_id: str) -> str:
-    """Get all todos for a job including current active todos and archives.
-
-    Shows task planning and execution progress across phases. Gitea-backed:
-    committed state as of the worker's last phase-boundary push.
-
-    Args:
-        job_id: Job UUID to get todos for
-
-    Returns:
-        Formatted todos with current and archived phases
-    """
-    client = _get_client()
-    todos = await client.get_todos(job_id)
-    return fmt.format_todos(todos)
+_REGISTERED_JOB_TOOLS = register_job_tools(
+    mcp,
+    client_provider=lambda: _get_client(),
+    caller_provider=lambda: _get_mcp_caller_ctx(),
+    capabilities=TOOL_CAPABILITIES,
+)
+globals().update(_REGISTERED_JOB_TOOLS)
 
 
 @mcp_tool
@@ -472,296 +303,9 @@ async def get_graph_changes(job_id: str) -> str:
     return fmt.format_graph_changes(changes)
 
 
-@mcp_tool
-async def get_llm_request(doc_id: str) -> str:
-    """Get full LLM request/response by its audit-store request ID.
-
-    Returns complete message history, model response, and token usage.
-    Use document IDs from audit trail entries.
-
-    Args:
-        doc_id: Audit-store request ID (string)
-
-    Returns:
-        Formatted LLM request with messages and response
-    """
-    client = _get_client()
-    request = await client.get_llm_request(doc_id)
-    return fmt.format_llm_request(request)
-
-
-@mcp_tool
-async def get_job_summary(job_id: str) -> str:
-    """Get a comprehensive one-shot summary of a job.
-
-    Fetches status, progress, todos, workspace overview, and recent tool
-    calls in parallel. Returns everything in a single response — ideal for
-    understanding a job's current state without multiple tool calls. The
-    todos and workspace sections are Gitea-backed: committed state as of
-    the worker's last phase-boundary push.
-
-    Args:
-        job_id: Job UUID to summarize
-
-    Returns:
-        Combined summary with status, progress, todos, workspace, and recent activity
-    """
-    import asyncio
-
-    client = _get_client()
-
-    results = await asyncio.gather(
-        client.get_job(job_id),
-        client.get_job_progress(job_id),
-        client.get_todos(job_id),
-        client.get_workspace_overview(job_id),
-        client.get_audit_trail(job_id, page=-1, page_size=10, filter_category="tools"),
-        return_exceptions=True,
-    )
-
-    return fmt.format_job_summary(*results)
-
-
-@mcp_tool
-async def search_audit(
-    job_id: str,
-    query: str,
-    limit: int = 20,
-) -> str:
-    """Search audit entries by content pattern.
-
-    Searches across message content, tool names, and arguments.
-    Returns matching entries with context.
-
-    Args:
-        job_id: Job UUID to search within
-        query: Search string (case-insensitive substring match)
-        limit: Maximum results to return (1-100, default 20)
-
-    Returns:
-        Formatted search results
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 100:
-        limit = 100
-
-    client = _get_client()
-    return await _search_audit(client, job_id=job_id, query=query, limit=limit)
-
-
 # =============================================================================
 # Action & Operations Tools (Category A)
 # =============================================================================
-
-
-@mcp_tool
-async def approve_job(job_id: str) -> str:
-    """Approve a frozen job, marking it as completed.
-
-    MUTATION: This marks the job as completed, writes job_completion.json,
-    and deletes job_frozen.json. The job must be in 'pending_review' status.
-    This action cannot be undone.
-
-    Args:
-        job_id: Job UUID to approve
-
-    Returns:
-        Approval result with completion details
-    """
-    client = _get_client()
-    try:
-        result = await client.approve_job(job_id)
-        return fmt.format_action_result("approve", job_id, result)
-    except Exception as e:
-        return _format_action_error("approve", job_id, e)
-
-
-@mcp_tool
-async def resume_job_with_feedback(
-    job_id: str,
-    feedback: str | None = None,
-) -> str:
-    """Resume a frozen/failed job from its checkpoint, optionally injecting feedback.
-
-    MUTATION — and with feedback, DESTRUCTIVE: the worker force-compacts its
-    conversation context, archives its in-flight todos, and re-plans from
-    scratch against the feedback. Use it when the plan itself is wrong; for a
-    mid-run course correction use send_message_to_job (non-destructive, lands
-    in the worker's next LLM turn with urgent=true). The job can be in any
-    status except 'completed'. If the originally assigned agent is
-    unavailable, the orchestrator auto-selects a ready agent.
-
-    Args:
-        job_id: Job UUID to resume
-        feedback: Natural language feedback to inject into the agent's context
-
-    Returns:
-        Resume result with status
-    """
-    client = _get_client()
-    try:
-        result = await client.resume_job(job_id, feedback=feedback)
-        return fmt.format_action_result("resume", job_id, result, feedback=feedback)
-    except Exception as e:
-        return _format_action_error("resume", job_id, e)
-
-
-@mcp_tool
-async def cancel_job(job_id: str) -> str:
-    """Cancel a running job.
-
-    MUTATION: This cancels the job and sends a cancel signal to the agent pod
-    if one is assigned. The job must not already be completed or cancelled.
-    In-progress work may be lost.
-
-    Args:
-        job_id: Job UUID to cancel
-
-    Returns:
-        Cancellation result
-    """
-    client = _get_client()
-    try:
-        result = await client.cancel_job(job_id)
-        return fmt.format_action_result("cancel", job_id, result)
-    except Exception as e:
-        return _format_action_error("cancel", job_id, e)
-
-
-@mcp_tool
-async def pause_job(job_id: str) -> str:
-    """Pause a running job.
-
-    MUTATION: This sends a graceful pause request to the agent. The agent
-    finishes its current node, saves a checkpoint, and becomes available
-    for other work. The job must be in 'processing' status.
-
-    Args:
-        job_id: Job UUID to pause
-
-    Returns:
-        Pause result with status
-    """
-    client = _get_client()
-    try:
-        result = await client.pause_job(job_id)
-        return fmt.format_action_result("pause", job_id, result)
-    except Exception as e:
-        return _format_action_error("pause", job_id, e)
-
-
-@mcp_tool
-async def create_job(
-    description: str,
-    config_name: str = "worker_base",
-    expert_id: str | None = None,
-    datasource_ids: list[str] = None,  # type: ignore[assignment]
-    instructions: str | None = None,
-    kickoff_message: str | None = None,
-    config_override: dict[str, Any] | None = None,
-    context: dict[str, Any] | None = None,
-    priority: int = 5,
-    required_deliverables: list[str] | None = None,
-) -> str:
-    """Create a new job for agent execution.
-
-    MUTATION: This creates a job record and a Gitea repository. The job starts
-    in 'created' status and is automatically queued for workspace provisioning
-    and assignment to a ready agent. Monitor it with get_job; do not use
-    assign_job for the normal start path. Jobs requiring input documents should
-    use the cockpit UI instead.
-
-    Args:
-        description: Natural language task description
-        config_name: Base agent config (default: "worker_base")
-        expert_id: Preferred database-backed expert UUID. When supplied, the
-            orchestrator resolves that expert over the base config.
-        datasource_ids: Connector selection. Omit to inherit from an
-            authoritative parent or use root automatic defaults; pass [] to
-            attach none; pass IDs to request exactly those connectors.
-        instructions: Additional inline markdown instructions
-        kickoff_message: Opening task brief sent to the agent
-        config_override: Per-job config overrides as JSON. To set the model,
-            use {"llm": {"model": "<model_id>"}} — e.g.
-            {"llm": {"model": "codex/gpt-5.3-codex-spark"}}.
-            Use the list_models tool to discover available model IDs.
-        context: Additional context dictionary
-        priority: Dispatch priority from 0 (low) to 10 (high), default 5
-        required_deliverables: Deliverable contract — workspace-relative
-            artifact paths (e.g. "output/report.md") or "kb:<slug>" note
-            slugs that must exist before a completion claiming success may
-            seal. Shown to the worker at dispatch; missing deliverables
-            bounce the seal back to the worker with the precise list.
-
-    Returns:
-        Created job details with ID
-    """
-    client = _get_client()
-    try:
-        result = await client.create_job(
-            description=description,
-            config_name=config_name,
-            expert_id=expert_id,
-            datasource_ids=datasource_ids,
-            instructions=instructions,
-            kickoff_message=kickoff_message,
-            config_override=config_override,
-            context=context,
-            priority=priority,
-            required_deliverables=required_deliverables,
-        )
-        return fmt.format_created_job(result, config_name)
-    except Exception as e:
-        return _format_action_error("create", "N/A", e)
-
-
-@mcp_tool
-async def delete_job(job_id: str) -> str:
-    """Delete a job and its associated data.
-
-    MUTATION: This permanently deletes the job record and its requirements.
-    Any job can be deleted regardless of status. WARNING: Deleting a job in
-    'processing' status may leave an orphaned agent. This action is irreversible.
-
-    Args:
-        job_id: Job UUID to delete
-
-    Returns:
-        Deletion result
-    """
-    client = _get_client()
-    try:
-        result = await client.delete_job(job_id)
-        return fmt.format_action_result("delete", job_id, result)
-    except Exception as e:
-        return _format_action_error("delete", job_id, e)
-
-
-@mcp_tool
-async def assign_job(job_id: str, agent_id: str) -> str:
-    """Administratively request assignment to a ready agent.
-
-    MUTATION, ADMIN OVERRIDE: Normal created jobs are provisioned and assigned
-    automatically. If this job has no live managed workspace, the request is
-    queued through normal provisioning and the requested agent is not reserved.
-    With a live workspace, it starts/resumes directly on the requested ready
-    agent. The job must be created, failed, or paused.
-
-    Args:
-        job_id: Job UUID to assign
-        agent_id: Agent UUID to assign to
-
-    Returns:
-        Assignment result
-    """
-    client = _get_client()
-    try:
-        result = await client.assign_job(job_id, agent_id)
-        extra = {"agent_id": agent_id} if result.get("status") == "assigned" else {}
-        return fmt.format_action_result("assign", job_id, result, **extra)
-    except Exception as e:
-        return _format_action_error("assign", job_id, e)
 
 
 @mcp_tool
@@ -791,139 +335,6 @@ async def test_datasource(datasource_id: str) -> str:
 
 
 @mcp_tool
-async def list_job_commits(
-    job_id: str,
-    ref: str = "main",
-    since_ref: str | None = None,
-    limit: int = 20,
-    page: int = 1,
-) -> str:
-    """List git commits for a job's repository.
-
-    Shows the agent's work history as git commits. Use since_ref to see only
-    commits after a specific phase tag (e.g., "phase_2_end").
-
-    Args:
-        job_id: Job UUID
-        ref: Branch or tag to list from (default: main)
-        since_ref: Only show commits after this ref (e.g., "phase_2_end")
-        limit: Max commits to return (default: 20)
-        page: Page number for pagination (default: 1)
-
-    Returns:
-        List of commits with hash, message, author, and timestamp
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 100:
-        limit = 100
-
-    client = _get_client()
-    try:
-        result = await client.list_job_commits(
-            job_id, sha=ref, since_ref=since_ref, page=page, limit=limit
-        )
-        return fmt.format_commits(job_id, result, ref=ref, since_ref=since_ref)
-    except Exception as e:
-        return fmt.format_git_error("list commits", job_id, e)
-
-
-@mcp_tool
-async def get_job_diff(
-    job_id: str,
-    base: str,
-    head: str = "HEAD",
-    file_path: str | None = None,
-    max_chars: int = 50000,
-) -> str:
-    """Show the diff between two git refs in a job's repository.
-
-    Use base="job-frozen" to see changes since the last freeze, or base="phase_2_end"
-    to see what changed in phase 3.
-
-    Args:
-        job_id: Job UUID
-        base: Base ref (commit SHA, tag, or branch)
-        head: Head ref (default: HEAD)
-        file_path: Filter diff to a specific file (optional)
-        max_chars: Truncate diff beyond this limit (default: 50000, 0 for unlimited)
-
-    Returns:
-        Unified diff output, truncated if exceeding max_chars
-    """
-    client = _get_client()
-    try:
-        result = await client.get_job_diff(job_id, base=base, head=head)
-        diff_text = result.get("diff", "")
-
-        # Filter to specific file if requested
-        if file_path and diff_text:
-            diff_text = fmt.filter_diff_by_file(diff_text, file_path)
-
-        return fmt.format_diff(job_id, base, head, diff_text, max_chars=max_chars)
-    except Exception as e:
-        return fmt.format_git_error("get diff", job_id, e)
-
-
-@mcp_tool
-async def get_job_file(
-    job_id: str,
-    file_path: str,
-    ref: str | None = None,
-) -> str:
-    """Read a specific file from the job's Gitea repo at any ref.
-
-    View files at different points in time using refs (branch, tag, or commit SHA).
-    For example, ref="phase_2_end" shows the file at the end of phase 2.
-
-    Args:
-        job_id: Job UUID
-        file_path: Path within the repo (e.g., "workspace.md", "output/report.md")
-        ref: Branch, tag, or commit SHA (default: HEAD)
-
-    Returns:
-        File content as text
-    """
-    client = _get_client()
-    try:
-        result = await client.get_job_file(job_id, path=file_path, ref=ref)
-        content = result.get("content", "")
-        ref_label = ref or "HEAD"
-        size = result.get("size", len(content))
-        header = f"File: {file_path} (ref: {ref_label}, {size} bytes)\n"
-        return header + "---\n" + content
-    except Exception as e:
-        return fmt.format_git_error(f"read file '{file_path}'", job_id, e)
-
-
-@mcp_tool
-async def list_job_files(
-    job_id: str,
-    path: str = "",
-    ref: str | None = None,
-) -> str:
-    """Browse the repository directory tree at any ref.
-
-    Lists files and directories at a given path. Use ref to browse
-    at a specific point in history.
-
-    Args:
-        job_id: Job UUID
-        path: Directory path (default: root)
-        ref: Branch, tag, or commit SHA (default: HEAD)
-
-    Returns:
-        Directory listing with file names, types, and sizes
-    """
-    client = _get_client()
-    try:
-        entries = await client.list_job_files(job_id, path=path, ref=ref)
-        return fmt.format_file_listing(job_id, path, entries, ref=ref)
-    except Exception as e:
-        return fmt.format_git_error(f"list files at '{path or '/'}'", job_id, e)
-
-
-@mcp_tool
 async def list_job_tags(job_id: str) -> str:
     """List phase tags to understand the job's phase history.
 
@@ -950,27 +361,6 @@ async def list_job_tags(job_id: str) -> str:
 
 
 @mcp_tool
-async def get_frozen_job(job_id: str) -> str:
-    """Get the frozen job review data including summary, confidence, and deliverables.
-
-    Returns the agent's self-assessment when it froze the job for review.
-    The job must be in 'pending_review' status (or the frozen data must still exist).
-
-    Args:
-        job_id: Job UUID
-
-    Returns:
-        Frozen job summary with confidence score, deliverables, and agent notes
-    """
-    client = _get_client()
-    try:
-        data = await client.get_frozen_job(job_id)
-        return fmt.format_frozen_job(job_id, data)
-    except Exception as e:
-        return fmt.format_workspace_error("get frozen job data", job_id, e)
-
-
-@mcp_tool
 async def get_workspace_file(job_id: str, path: str) -> str:
     """Read a file from the job's workspace repo (Gitea-backed).
 
@@ -994,50 +384,6 @@ async def get_workspace_file(job_id: str, path: str) -> str:
         return f"Workspace file: {path} (job {job_id})\n---\n{content}"
     except Exception as e:
         return fmt.format_workspace_error(f"read workspace file '{path}'", job_id, e)
-
-
-@mcp_tool
-async def get_workspace_overview(job_id: str) -> str:
-    """Get a summary of the workspace state from the job's Gitea repo.
-
-    Returns the repo-root file listing, truncated workspace.md/plan.md
-    previews when present, current todo counts, and archive count — all
-    committed state as of the worker's last phase-boundary push (mid-phase
-    edits are not visible yet).
-
-    Args:
-        job_id: Job UUID
-
-    Returns:
-        Workspace overview with file list, content previews, and statistics
-    """
-    client = _get_client()
-    try:
-        data = await client.get_workspace_overview(job_id)
-        return fmt.format_workspace_overview(job_id, data)
-    except Exception as e:
-        return fmt.format_workspace_error("get workspace overview", job_id, e)
-
-
-@mcp_tool
-async def get_job_progress(job_id: str) -> str:
-    """Get detailed job progress including phase information and ETA.
-
-    Shows current status, requirement completion stats, elapsed time,
-    and estimated time remaining.
-
-    Args:
-        job_id: Job UUID
-
-    Returns:
-        Progress data with phase info and completion statistics
-    """
-    client = _get_client()
-    try:
-        data = await client.get_job_progress(job_id)
-        return fmt.format_job_progress(job_id, data)
-    except Exception as e:
-        return fmt.format_workspace_error("get job progress", job_id, e)
 
 
 # =============================================================================
@@ -1073,32 +419,6 @@ async def get_agent_stats() -> str:
         return fmt.format_agent_stats(data)
     except Exception as e:
         return fmt.format_monitoring_error("get agent stats", e)
-
-
-@mcp_tool
-async def get_stuck_jobs(threshold_minutes: int = 30) -> str:
-    """Get jobs stuck in processing beyond a threshold.
-
-    A job is considered stuck if it's in 'processing' status but hasn't
-    been updated within the threshold period.
-
-    Args:
-        threshold_minutes: Minutes after which a job is considered stuck (default: 30)
-
-    Returns:
-        List of stuck jobs with details and last update time
-    """
-    if threshold_minutes < 1:
-        threshold_minutes = 1
-    elif threshold_minutes > 1440:
-        threshold_minutes = 1440
-
-    client = _get_client()
-    try:
-        data = await client.get_stuck_jobs(threshold_minutes)
-        return fmt.format_stuck_jobs(data, threshold_minutes)
-    except Exception as e:
-        return fmt.format_monitoring_error("get stuck jobs", e)
 
 
 @mcp_tool
@@ -1702,44 +1022,6 @@ async def deregister_agent(agent_id: str) -> str:
 
 
 @mcp_tool
-async def get_job_log(
-    job_id: str,
-    lines: int = 100,
-    grep: str | None = None,
-    level: str | None = None,
-) -> str:
-    """Read the tail of a job's log file with optional filtering.
-
-    Returns the last N lines of the log file, optionally filtered by log
-    level and/or grep pattern. Useful for diagnosing agent errors. Works
-    after the agent pod is gone too: falls back to the S3 log archive
-    written at pod deletion, scoped to this job's lines.
-
-    Args:
-        job_id: Job UUID
-        lines: Number of tail lines to return (max 1000, default 100)
-        grep: Case-insensitive substring filter
-        level: Log level filter (DEBUG, INFO, WARNING, ERROR)
-
-    Returns:
-        Formatted log output with line count and filter info
-    """
-    if lines < 1:
-        lines = 1
-    elif lines > 1000:
-        lines = 1000
-
-    client = _get_client()
-    try:
-        data = await client.get_job_logs(
-            job_id=job_id, lines=lines, grep=grep, level=level
-        )
-        return fmt.format_job_log(job_id, data)
-    except Exception as e:
-        return fmt.format_workspace_error("get job log", job_id, e)
-
-
-@mcp_tool
 async def get_thread_log(
     thread_id: str,
     lines: int = 100,
@@ -1777,151 +1059,9 @@ async def get_thread_log(
         return fmt.format_workspace_error("get thread log", thread_id, e)
 
 
-@mcp_tool
-async def list_llm_requests(
-    job_id: str,
-    limit: int = 20,
-    offset: int = 0,
-) -> str:
-    """List LLM requests for a job with token usage and tool call summaries.
-
-    Shows each request's model, timestamp, token counts, iteration number,
-    and which tools were called. Use the doc_id with get_llm_request to see
-    full message history for a specific request.
-
-    Args:
-        job_id: Job UUID
-        limit: Maximum entries to return (max 100, default 20)
-        offset: Pagination offset (default: 0)
-
-    Returns:
-        Formatted list of LLM requests with token usage and tool calls
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 100:
-        limit = 100
-
-    client = _get_client()
-    try:
-        data = await client.list_llm_requests(job_id=job_id, limit=limit, offset=offset)
-        return fmt.format_llm_requests(job_id, data)
-    except Exception as e:
-        return fmt.format_workspace_error("list LLM requests", job_id, e)
-
-
-@mcp_tool
-async def get_shell_state(job_id: str) -> str:
-    """Get shell tab state from the agent processing a job.
-
-    Returns the list of open terminal tabs with their type (ssh, repl,
-    claude-code, etc.) and recent output. Requires the job to be actively
-    processing on an agent.
-
-    Args:
-        job_id: Job UUID (must be in 'processing' status)
-
-    Returns:
-        Shell state with tab names, types, and recent output
-    """
-    client = _get_client()
-    try:
-        data = await client.get_shell_state(job_id)
-        return fmt.format_shell_state(job_id, data)
-    except Exception as e:
-        error_msg = str(e)
-        if hasattr(e, "response"):
-            try:
-                detail = e.response.json().get("detail", error_msg)
-                error_msg = detail
-            except Exception:
-                error_msg = f"HTTP {e.response.status_code}: {error_msg}"
-        return f"Failed to get shell state for job {job_id}:\n{error_msg}"
-
-
 # =============================================================================
 # Todo Archives & Current Todos
 # =============================================================================
-
-
-@mcp_tool
-async def get_current_todos(job_id: str) -> str:
-    """Get only the current active todos from todos.yaml.
-
-    Lighter than get_todos which includes all archives. Shows pending,
-    in-progress, and completed items with a progress summary.
-
-    Args:
-        job_id: Job UUID to get current todos for
-
-    Returns:
-        Formatted current todos with progress count
-    """
-    client = _get_client()
-    data = await client.get_current_todos(job_id)
-    if data is None:
-        return f"No current todos found for job {job_id}."
-    return fmt.format_current_todos(data)
-
-
-@mcp_tool
-async def list_todo_archives(job_id: str) -> str:
-    """List all archived todo files for a job.
-
-    Returns metadata for each phase archive (filename, phase name, timestamp).
-    Use get_todo_archive to read the full content of a specific archive.
-
-    Args:
-        job_id: Job UUID to list archives for
-
-    Returns:
-        List of archived todo files with metadata
-    """
-    client = _get_client()
-    archives = await client.list_archived_todos(job_id)
-    return fmt.format_todo_archives(job_id, archives)
-
-
-@mcp_tool
-async def get_todo_archive(job_id: str, filename: str) -> str:
-    """Get the full content of an archived todo file for a specific phase.
-
-    Use list_todo_archives first to get available filenames.
-
-    Args:
-        job_id: Job UUID
-        filename: Archive filename (e.g. 'todos_phase1_20260124_183618.md')
-
-    Returns:
-        Full archived todos with status and notes
-    """
-    client = _get_client()
-    data = await client.get_archived_todos(job_id, filename)
-    if data is None:
-        return f"Archive '{filename}' not found for job {job_id}."
-    return fmt.format_todo_archive_detail(job_id, filename, data)
-
-
-@mcp_tool
-async def get_audit_timerange(job_id: str) -> str:
-    """Get the first and last timestamps for a job's audit entries.
-
-    Quick way to see when a job started and when it last had activity.
-    Requires the audit store to be available.
-
-    Args:
-        job_id: Job UUID to get time range for
-
-    Returns:
-        Start and end timestamps, or error if the audit store is unavailable
-    """
-    client = _get_client()
-    data = await client.get_audit_time_range(job_id)
-    if data is None:
-        return f"No audit time range available for job {job_id} (audit store may be unavailable)."
-    start = data.get("start", "unknown")
-    end = data.get("end", "unknown")
-    return f"Audit time range for job {job_id}:\n  Start: {start}\n  End:   {end}"
 
 
 # =============================================================================
@@ -2750,121 +1890,9 @@ async def reindex_knowledge(project_id: str, full: bool = False) -> str:
 # =============================================================================
 
 
-@mcp_tool
-async def promote_job(
-    job_id: str,
-    name: str,
-    user_id: str,
-    description: str | None = None,
-    goal: str | None = None,
-) -> str:
-    """Promote a completed job into a dedicated project.
-
-    Creates a new project, seeds its repo from the job's branch
-    (preserving git history), and moves the job. The job must be
-    completed and in a default project.
-
-    Args:
-        job_id: Job UUID (must be completed)
-        name: Name for the new project
-        user_id: Owner user UUID
-        description: Project description (optional)
-        goal: Project goal (optional)
-
-    Returns:
-        Promotion summary with new project ID
-    """
-    client = _get_client()
-    result = await client.promote_job(
-        job_id=job_id,
-        name=name,
-        user_id=user_id,
-        description=description,
-        goal=goal,
-    )
-    project_id = result.get("project_id", "unknown")
-    project_name = result.get("project_name", name)
-    return (
-        f"Job {job_id} promoted to project '{project_name}'.\n"
-        f"  New project ID: {project_id}\n"
-        f"  Git history preserved from job branch."
-    )
-
-
 # =============================================================================
 # Internal Async Helpers (depend on client, not extracted to formatters)
 # =============================================================================
-
-
-async def _search_audit(
-    client: AsyncCockpitClient,
-    job_id: str,
-    query: str,
-    limit: int = 20,
-) -> str:
-    """Search audit entries for a pattern."""
-    import json as _json
-
-    query_lower = query.lower()
-    matches: list[dict] = []
-
-    # Fetch pages until we have enough matches or run out
-    page = 1
-    while len(matches) < limit:
-        audit = await client.get_audit_trail(
-            job_id=job_id,
-            page=page,
-            page_size=100,
-            filter_category="all",
-        )
-
-        if audit.get("error") or not audit.get("entries"):
-            break
-
-        for entry in audit["entries"]:
-            if fmt.entry_matches(entry, query_lower):
-                matches.append(entry)
-                if len(matches) >= limit:
-                    break
-
-        if not audit.get("hasMore"):
-            break
-        page += 1
-
-    if not matches:
-        return f"No audit entries matching '{query}' found."
-
-    lines = [f"Found {len(matches)} entries matching '{query}':\n"]
-
-    for entry in matches:
-        step_num = entry.get("step_number", "?")
-        step_type = entry.get("step_type", "unknown")
-
-        if step_type == "tool":
-            tool = entry.get("tool", {})
-            tool_name = tool.get("name", "unknown")
-            lines.append(f"[{step_num}] Tool: {tool_name}")
-            args = _json.dumps(tool.get("arguments", {}))[:150]
-            lines.append(f"    Args: {args}")
-            result_preview = tool.get("result_preview")
-            if result_preview:
-                lines.append(f"    Result: {str(result_preview)[:150]}")
-        elif step_type == "llm":
-            llm = entry.get("llm", {})
-            preview = (llm.get("response_content_preview", "") or "")[:150]
-            request_id = llm.get("request_id")
-            line = f"[{step_num}] LLM: {preview}"
-            if request_id:
-                line += f" (doc_id: {request_id})"
-            lines.append(line)
-        elif step_type == "error":
-            error = entry.get("error", "Unknown error")
-            lines.append(f"[{step_num}] ERROR: {error}")
-        else:
-            lines.append(f"[{step_num}] {step_type}")
-        lines.append("")
-
-    return "\n".join(lines)
 
 
 # =============================================================================
@@ -2989,105 +2017,6 @@ async def deny_sudo_request(
 # =============================================================================
 # Messaging Tools (Live Communication)
 # =============================================================================
-
-
-@mcp_tool
-async def list_message_threads(job_id: str) -> str:
-    """List message threads for an agent job.
-
-    Shows all communication threads between the agent and humans,
-    including thread ID, subject, message count, and status.
-
-    Args:
-        job_id: Job UUID to list threads for
-
-    Returns:
-        Formatted list of message threads
-    """
-    client = _get_client()
-    data = await client.list_message_threads(job_id)
-    return fmt.format_message_threads(data.get("threads", []))
-
-
-@mcp_tool
-async def send_message_to_job(
-    job_id: str,
-    thread_id: str,
-    message: str,
-    urgent: bool = False,
-) -> str:
-    """Send a reply to an agent's message thread (as a human).
-
-    Routes the reply to the agent. If the agent is waiting for a reply
-    on this thread (blocking mode), it resumes immediately. ``urgent``
-    delivers into the worker's next LLM turn WITHOUT destroying its
-    context (guidance lane, ~≤60s + one turn; strategy
-    ``guidance_next_turn``) — only a job with no live run gets resumed
-    to deliver an urgent message. Non-urgent replies are injected at the
-    next tactical→strategic phase boundary. To force a full re-plan
-    instead, use resume_job_with_feedback (destructive).
-
-    Args:
-        job_id: Job UUID
-        thread_id: Thread ID to reply to
-        message: Reply body text
-        urgent: If true, deliver into the worker's next LLM turn
-
-    Returns:
-        Delivery confirmation with strategy used
-    """
-    client = _get_client()
-    try:
-        result = await client.reply_to_message(
-            job_id,
-            thread_id,
-            message,
-            urgent=urgent,
-        )
-        strategy = result.get("delivery_strategy", "unknown")
-        seq = result.get("sequence", "?")
-        return (
-            f"Reply delivered to thread {thread_id} (message #{seq}).\n"
-            f"Delivery strategy: {strategy}"
-        )
-    except Exception as e:
-        return f"Failed to send reply: {e}"
-
-
-@mcp_tool
-async def get_message_thread(job_id: str, thread_id: str) -> str:
-    """Get full message history for a specific thread.
-
-    Shows all messages in chronological order with direction,
-    timestamps, and content.
-
-    Args:
-        job_id: Job UUID
-        thread_id: Thread ID to retrieve
-
-    Returns:
-        Formatted thread message history
-    """
-    client = _get_client()
-    data = await client.list_message_threads(job_id)
-    threads = data.get("threads", [])
-
-    # Find the matching thread and its messages
-    target = None
-    for t in threads:
-        if t.get("thread_id") == thread_id:
-            target = t
-            break
-
-    if not target:
-        return f"Thread {thread_id} not found in job {job_id}."
-
-    messages = target.get("messages", [])
-    if not messages:
-        # Thread found but no inline messages — format what we have
-        return fmt.format_message_threads([target])
-
-    return fmt.format_thread_messages(messages, thread_id)
 
 
 # =============================================================================

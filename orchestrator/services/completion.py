@@ -1593,7 +1593,7 @@ def determine_job_status(
         return (None, None)  # Still running — leave as processing
 
     # Critic jobs (have parent_job_id): read status from freeze_data if the
-    # agent supplied an explicit one. As of Task 8, neither approve_job nor
+    # agent supplied an explicit one. As of Task 8, neither approve_job_verdict nor
     # return_job_with_feedback writes a "status" key any more — the verdict
     # lives on the TARGET's durable ledger, not on the critic's own freeze —
     # so this branch normally falls through to "infer from goal_achieved"

@@ -269,7 +269,7 @@ workflows      on  by=request  tools=[list_automations, get_automation, list_aut
 Five names and seven names, with **all six `*_bundle` writes absent**
 (`get_`/`set_expert_bundle`, `get_`/`set_skill_bundle`,
 `get_`/`set_automation_bundle`). `orchestrator: true` likewise expanded without
-`get_stuck_jobs` / `steer_worker_job`, the other two `explicit` members.
+`get_stuck_jobs` / `steer_job`, the other two `explicit` members.
 
 Principal-independence was checked rather than assumed: neither category is in
 `GRANT_GATED_CATEGORIES`, and the preview expansion is byte-identical for admin

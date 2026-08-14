@@ -229,7 +229,7 @@ class TestFinalizeWithVerdict:
 
 # =============================================================================
 # finalize_job: no implicit approval when a critic reaches finalize_job
-# without ever calling approve_job/return_job_with_feedback (Task 8).
+# without ever calling approve_job_verdict/return_job_with_feedback (Task 8).
 # =============================================================================
 
 
@@ -238,7 +238,7 @@ class TestFinalizeJobNoImplicitApproval:
     read as an implicit approval (CWE-636: a missing verdict is not consent).
 
     Previously this synthesized ``{"_verdict": "approved", ...}`` and froze
-    the critic exactly as if it had called approve_job. The fix logs a
+    the critic exactly as if it had called approve_job_verdict. The fix logs a
     refusal and falls through to the ordinary (non-verdict) completion path
     — no 'verdict' key anywhere in freeze_data — so the orchestrator's
     ``_resolve_critic_outcome`` (a fresh ledger lookup on the TARGET, keyed
@@ -404,8 +404,10 @@ class TestHandleTransitionFreezeDataStatus:
 class TestEvaluationToolMetadata:
     """Tests for evaluation tool registry metadata."""
 
-    def test_approve_job_is_strategic_only(self):
-        assert EVALUATION_TOOLS_METADATA["approve_job"]["phases"] == ["strategic"]
+    def test_approve_job_verdict_is_strategic_only(self):
+        assert EVALUATION_TOOLS_METADATA["approve_job_verdict"]["phases"] == [
+            "strategic"
+        ]
 
     def test_return_job_is_strategic_only(self):
         assert EVALUATION_TOOLS_METADATA["return_job_with_feedback"]["phases"] == [
@@ -418,7 +420,7 @@ class TestEvaluationToolMetadata:
 # =============================================================================
 #
 # Guards against the 2026-06-03 deadlock (job 8a3fc7d1): the verdict tools
-# approve_job / return_job_with_feedback are strategic-only (asserted above),
+# approve_job_verdict / return_job_with_feedback are strategic-only (asserted above),
 # but the critic strategic prompt told the agent "Do NOT render verdicts during
 # strategic phases" — leaving no phase where the agent could both call the tool
 # AND believe it was allowed to. The agent looped forever via todo_rewind.
@@ -435,14 +437,14 @@ class TestCriticStrategicPromptVerdictTiming:
         text = (CRITIC_PROMPT_DIR / fname).read_text(encoding="utf-8")
         # The exact sentence that caused the 8a3fc7d1 deadlock.
         assert "Do NOT render verdicts during strategic phases" not in text, (
-            f"{fname} forbids strategic verdicts, but approve_job/"
+            f"{fname} forbids strategic verdicts, but approve_job_verdict/"
             "return_job_with_feedback are strategic-only — this deadlocks the critic."
         )
 
     @pytest.mark.parametrize("fname", ["strategic.txt", "strategic_minimax.txt"])
     def test_prompt_directs_verdict_into_strategic(self, fname):
         text = (CRITIC_PROMPT_DIR / fname).read_text(encoding="utf-8")
-        assert "approve_job" in text
+        assert "approve_job_verdict" in text
         # The fix tells the agent these tools are strategic-only and must not be
         # deferred to a tactical todo.
         assert "strategic-phase-only" in text, (
@@ -821,7 +823,7 @@ class TestVerdictDurability:
 
     @pytest.mark.asyncio
     async def test_approve_tool_fails_loudly_when_client_raises(self):
-        """Round 1 fix — Finding 2 (approve_job half).
+        """Round 1 fix — Finding 2 (approve_job_verdict half).
 
         Complements test_return_tool_fails_loudly_without_orchestrator_client
         (client is None — an impossible write) with the other half of the

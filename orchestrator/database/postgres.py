@@ -9358,7 +9358,7 @@ class PostgresDB:
         """Terminal/in-flight tallies over every job a thread created.
 
         Feeds the "1 of 3 finished — 1 still running, 1 failed" line in the wake
-        payload. Without it the agent must spend a list_worker_jobs round-trip
+        payload. Without it the agent must spend a list_jobs round-trip
         on EVERY wake just to decide whether this is the moment to act; with it
         the decision is free. Keys: total, running, completed, failed,
         cancelled, pending_review.

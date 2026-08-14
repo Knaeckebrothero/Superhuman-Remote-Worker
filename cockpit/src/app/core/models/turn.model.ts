@@ -380,7 +380,7 @@ export type EventGroup =
     | {kind: 'single'; id: string; event: TurnEvent}
     | {kind: 'folded'; id: string; events: FoldableEvent[]}
     /**
-     * A fan-out: contiguous `create_worker_job` calls from one turn, rendered as
+     * A fan-out: contiguous `create_job` calls from one turn, rendered as
      * one card with a row per job instead of N stacked cards. Client-side only —
      * there is no `batch_id` and no backend concept behind this.
      */
@@ -405,7 +405,7 @@ export function isFoldable(e: TurnEvent): e is FoldableEvent {
     // notify_user is a message addressed to the user, not work — like text,
     // it never disappears into a "N× tool calls" chip.
     //
-    // create_worker_job is excluded for a stronger reason: its card is a live
+    // create_job is excluded for a stronger reason: its card is a live
     // handle with Approve / Continue-with-feedback / Cancel on it, so folding
     // would hide work that is *waiting on the user* behind a counter. Before
     // this, a three-job fan-out rendered as a "2× tool calls" chip plus one
@@ -415,7 +415,7 @@ export function isFoldable(e: TurnEvent): e is FoldableEvent {
     return e.tool !== NOTIFY_USER_TOOL && e.tool !== JOB_TOOL;
 }
 
-/** A `create_worker_job` call — the only event that forms a `job_batch`. */
+/** A `create_job` call — the only event that forms a `job_batch`. */
 export function isJobCall(e: TurnEvent): e is ToolCallEvent {
     return e.kind === 'tool_call' && e.tool === JOB_TOOL;
 }

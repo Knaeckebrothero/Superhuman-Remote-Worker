@@ -329,7 +329,7 @@ class ToolContext:
     orchestrator_client: Optional[Any] = None  # OrchestratorClient for delegation
     _thread_id: Optional[str] = (
         None  # Persistent-session thread UUID. Set by persistent_session so
-        # session-spawned worker jobs (create_worker_job) can carry the
+        # session-spawned worker jobs (create_job) can carry the
         # session's thread back to the orchestrator, which derives the
         # owning user_id + project_id and applies their model preferences
         # during dispatch. Unset in worker-job mode.

@@ -140,15 +140,15 @@ def test_scheduled_work_rule_only_ships_to_sessions_that_can_create_jobs():
 def test_scheduled_work_rule_carries_the_cancel_lever():
     """The cancel clause is the design's own cost argument for per-job wake over
     a fan-in barrier, expressed as behavior: a woken agent holding
-    cancel_worker_job is the only thing that can stop a wrong-direction batch
+    cancel_job is the only thing that can stop a wrong-direction batch
     before the siblings spend their share of 10k+ requests."""
-    rule = scheduled_work_system_floor(["create_worker_job", "cancel_worker_job"])
+    rule = scheduled_work_system_floor(["create_job", "cancel_job"])
 
     assert rule.startswith("<scheduled_work>") and rule.endswith("</scheduled_work>")
-    assert "cancel_worker_job" in rule
+    assert "cancel_job" in rule
     assert "do not narrate every completion" in rule
 
 
-@pytest.mark.parametrize("names", [{"create_worker_job"}, ("create_worker_job",)])
+@pytest.mark.parametrize("names", [{"create_job"}, ("create_job",)])
 def test_scheduled_work_rule_accepts_any_tool_name_collection(names):
     assert scheduled_work_system_floor(names) != ""

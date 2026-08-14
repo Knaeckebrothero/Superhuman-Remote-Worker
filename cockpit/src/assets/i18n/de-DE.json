@@ -68,7 +68,7 @@
       "set_canvas": "In Canvas präsentieren",
       "get_canvas": "Canvas prüfen",
       "clear_canvas": "Canvas leeren",
-      "create_worker_job": "Job planen",
+      "create_job": "Job planen",
       "notify_user": "Nachricht an den Nutzer"
     },
     "notify": {
@@ -2845,9 +2845,17 @@
         "label": "MongoDB",
         "description": "Angebundene MongoDB-Datenquellen abfragen"
       },
+      "job_control": {
+        "label": "Job-Steuerung",
+        "description": "SRW-Jobs erstellen, steuern, pausieren, fortsetzen, freigeben und abbrechen"
+      },
+      "job_inspection": {
+        "label": "Job-Inspektion",
+        "description": "Status und aktuell freigegebene Überwachungsdaten von SRW-Jobs einsehen"
+      },
       "orchestrator": {
-        "label": "Flottenverwaltung",
-        "description": "Kann SRW-Aufträge, Projekte, Repositories und Workspace-Upgrades für Sessions einsehen und steuern"
+        "label": "SRW-Projekte",
+        "description": "SRW-Projekte, Repositories, Sitzungskontext und Workspace-Upgrades einsehen"
       },
       "product_help": {
         "label": "Produkthilfe",

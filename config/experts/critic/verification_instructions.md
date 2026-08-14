@@ -68,7 +68,7 @@ nothing open because your predecessors' findings were all resolved. The block
 above tells you which situation you are in.
 
 **If the work meets the requirements** — even if imperfect, as long as the core ask is satisfied:
-- Call `approve_job(job_id="{target_job_id}", report="your summary", dispositions=[{{"id": "F1", "disposition": "RESOLVED", "quote": "..."}}])`
+- Call `approve_job_verdict(job_id="{target_job_id}", report="your summary", dispositions=[{{"id": "F1", "disposition": "RESOLVED", "quote": "..."}}])`
 - `report`: a 2-5 sentence summary of the review — include strengths and any minor non-blocking notes
 - `dispositions`: required whenever findings are open (see above); omit only when there are none
 - If any open blocking finding is not dispositioned `RESOLVED`, the recorded verdict will be `returned` regardless of this call — the server computes the verdict from the open findings, not from which tool you called

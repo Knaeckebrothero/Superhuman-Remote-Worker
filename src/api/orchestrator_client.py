@@ -2056,7 +2056,10 @@ class OrchestratorClient:
             "config_override": {
                 "autonomy": "full",  # Critic must run autonomously
                 "tools": {
-                    "evaluation": ["approve_job", "return_job_with_feedback"],
+                    "evaluation": [
+                        "approve_job_verdict",
+                        "return_job_with_feedback",
+                    ],
                 },
                 **({"llm": parent_llm_override} if parent_llm_override else {}),
             },

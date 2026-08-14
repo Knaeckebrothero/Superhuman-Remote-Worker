@@ -601,15 +601,15 @@ def test_every_selectable_live_fleet_tool_has_an_explicit_guide_topic():
     coverage = {
         "fleet-and-delegation": {
             "get_session_context",
-            "create_worker_job",
-            "list_worker_jobs",
-            "get_worker_job",
-            "get_job_workspace_file",
-            "list_job_workspace_files",
-            "approve_worker_job",
-            "resume_worker_job",
-            "cancel_worker_job",
-            "pause_worker_job",
+            "create_job",
+            "list_jobs",
+            "get_job",
+            "get_job_file",
+            "list_job_files",
+            "approve_job",
+            "resume_job_with_feedback",
+            "cancel_job",
+            "pause_job",
             "get_current_project",
             "list_project_jobs",
             "list_project_repositories",
@@ -617,6 +617,8 @@ def test_every_selectable_live_fleet_tool_has_an_explicit_guide_topic():
         }
     }
 
-    assert set().union(*coverage.values()) == set(
-        SESSION_TOOL_OVERRIDE_NAMES["orchestrator"]
+    assert set().union(*coverage.values()) == set().union(
+        SESSION_TOOL_OVERRIDE_NAMES["orchestrator"],
+        SESSION_TOOL_OVERRIDE_NAMES["job_control"],
+        SESSION_TOOL_OVERRIDE_NAMES["job_inspection"],
     )

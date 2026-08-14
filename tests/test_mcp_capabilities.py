@@ -11,6 +11,7 @@ import subprocess
 import sys
 
 from orchestrator.mcp.capabilities import TOOL_CAPABILITIES, WORKFLOW_DECISIONS
+from src.shared.orch_surface.jobs import JOB_DESCRIPTORS
 
 ROOT = Path(__file__).parent.parent
 SERVER_PATH = ROOT / "orchestrator" / "mcp" / "server.py"
@@ -18,7 +19,7 @@ SERVER_PATH = ROOT / "orchestrator" / "mcp" / "server.py"
 
 def _registered_tool_names() -> set[str]:
     tree = ast.parse(SERVER_PATH.read_text(encoding="utf-8"))
-    return {
+    handwritten = {
         node.name
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -27,6 +28,7 @@ def _registered_tool_names() -> set[str]:
             for decorator in node.decorator_list
         )
     }
+    return handwritten | {item.name for item in JOB_DESCRIPTORS}
 
 
 def _source_schema() -> dict:
@@ -93,7 +95,7 @@ asyncio.run(main())
 
 def test_every_registered_tool_has_exactly_one_capability_contract() -> None:
     assert _registered_tool_names() == set(TOOL_CAPABILITIES)
-    assert len(TOOL_CAPABILITIES) == 105
+    assert len(TOOL_CAPABILITIES) == 106
 
 
 def test_capability_contract_records_required_risk_and_transport_fields() -> None:
@@ -156,11 +158,11 @@ def test_health_build_info_reports_digest_provenance_and_artifact_match(
 
     info = _build_info(artifact)
 
-    assert info["tool_schema_revision"] == "7"
+    assert info["tool_schema_revision"] == "8"
     assert info["tool_schema_digest"] == schema["digest"]
     assert info["schema_artifact_digest"] == schema["digest"]
     assert info["schema_artifact_status"] == "match"
-    assert info["tool_count"] == 105
+    assert info["tool_count"] == 106
     assert info["source_revision"] == "source-test-revision"
     assert info["release_version"] == "test-release"
     assert info["artifact_digest"] == "sha256:image-test-digest"
@@ -181,7 +183,10 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
     assert "paused" in list_status["anyOf"][0]["enum"]
 
     job_fields = tools["create_job"]["inputSchema"]["properties"]
-    assert {"expert_id", "kickoff_message", "priority", "context"} <= set(job_fields)
+    assert {"expert_id", "kickoff_message", "priority", "context", "slot"} <= set(
+        job_fields
+    )
+    assert not {"project_id", "user_id", "thread_id", "parent_job_id"} & set(job_fields)
     assert job_fields["datasource_ids"]["type"] == "array"
     assert "anyOf" not in job_fields["datasource_ids"]
 

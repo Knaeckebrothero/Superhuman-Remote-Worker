@@ -1,7 +1,7 @@
 """Evaluation toolkit - verdict tools for critic/reviewer agents.
 
 This toolkit provides tools for agents that review other jobs:
-- approve_job: Approve a target job (transitions pending_review → completed)
+- approve_job_verdict: Approve a target job (transitions pending_review → completed)
 - return_job_with_feedback: Resume a target job with feedback for the original agent
 
 Tools call the orchestrator REST API via OrchestratorClient.

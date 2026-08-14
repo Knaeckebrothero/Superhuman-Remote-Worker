@@ -125,11 +125,9 @@ class TestPopulation:
         assert "config/session_base.yaml" in files
         assert "config/worker_base.yaml" in files
         assert any("experts/centurion" in f for f in files)
-        # 144 as of 2026-08-03: session_base gained `catalog_authoring: [ ]` so
-        # the closed-group set it declares explicitly stays complete — an absent
-        # key reads as ENABLED in session_tool_group_enablement.
-        assert len(_DECLARATIONS) == 144, (
-            f"expected 144 raw declarations, got {len(_DECLARATIONS)}"
+        # 148 after job_control/job_inspection became descriptor-owned groups.
+        assert len(_DECLARATIONS) == 148, (
+            f"expected 148 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):
@@ -221,7 +219,7 @@ class TestOnlyIsNeverIntersected:
 
     ``grant: "explicit"`` restricts category-level *policy*, never an explicit
     name.  If ``only`` were intersected against the ``true`` expansion,
-    ``config/experts/centurion`` would silently lose ``steer_worker_job`` and
+    ``config/experts/centurion`` would silently lose ``steer_job`` and
     ``get_stuck_jobs`` — the only two ``explicit`` tools any shipped config
     names — and the grants snapshot would move on a commit whose entire
     acceptance criterion is that it does not.
@@ -230,22 +228,23 @@ class TestOnlyIsNeverIntersected:
     This is the *resolver* side, which did not exist then.
     """
 
-    _EXPLICIT_IN_CENTURION = ("steer_worker_job", "get_stuck_jobs")
+    _EXPLICIT_IN_CENTURION = ("steer_job", "get_stuck_jobs")
 
     def test_the_premise_still_holds(self):
         for name in self._EXPLICIT_IN_CENTURION:
             assert TOOL_REGISTRY[name].get("grant") == "explicit"
-            assert name not in expand_category_true("orchestrator")
+            category = TOOL_REGISTRY[name]["category"]
+            assert name not in expand_category_true(category)
 
     def test_only_keeps_explicit_tools(self):
-        got = expand_tool_policy(
-            {"only": list(self._EXPLICIT_IN_CENTURION)}, "orchestrator"
-        )
-        assert got == list(self._EXPLICIT_IN_CENTURION)
+        for name in self._EXPLICIT_IN_CENTURION:
+            category = TOOL_REGISTRY[name]["category"]
+            assert expand_tool_policy({"only": [name]}, category) == [name]
 
     def test_bare_list_keeps_explicit_tools(self):
-        got = expand_tool_policy(list(self._EXPLICIT_IN_CENTURION), "orchestrator")
-        assert got == list(self._EXPLICIT_IN_CENTURION)
+        for name in self._EXPLICIT_IN_CENTURION:
+            category = TOOL_REGISTRY[name]["category"]
+            assert expand_tool_policy([name], category) == [name]
 
     def test_only_keeps_code_granted_tools_too(self):
         """``grant: "code"`` has the same asymmetry — excluded from ``true``,
@@ -260,10 +259,13 @@ class TestOnlyIsNeverIntersected:
 
     def test_centurions_declaration_survives_normalisation_intact(self):
         path = _CONFIG_DIR / "experts" / "centurion" / "config.yaml"
-        raw = yaml.safe_load(path.read_text())["tools"]["orchestrator"]
-        assert set(self._EXPLICIT_IN_CENTURION) <= set(raw)
-        out = normalize_tool_policy({"tools": {"orchestrator": raw}})
-        assert out["tools"]["orchestrator"] == raw
+        tools = yaml.safe_load(path.read_text())["tools"]
+        for name in self._EXPLICIT_IN_CENTURION:
+            category = TOOL_REGISTRY[name]["category"]
+            raw = tools[category]
+            assert name in raw
+            out = normalize_tool_policy({"tools": {category: raw}})
+            assert out["tools"][category] == raw
 
 
 # ===========================================================================
@@ -753,7 +755,7 @@ class TestResolveConfigSeam:
 
 
 class TestSessionToolGroupMarkers:
-    """``false`` must reach the marker map as ``[]``, or the four closed groups
+    """``false`` must reach the marker map as ``[]``, or the closed groups
     stay on when a request turned them off."""
 
     def test_false_sets_the_disable_marker(self):

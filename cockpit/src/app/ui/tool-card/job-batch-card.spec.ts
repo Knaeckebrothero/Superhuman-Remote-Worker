@@ -23,7 +23,7 @@ vi.mock('./job-tool-card-panel.component', () => import('./job-tool-card-panel.s
 
 function view(jobId: string | null, subtitle = 'do the thing', error?: string): ToolCardView {
     return {
-        tool: 'create_worker_job',
+        tool: 'create_job',
         title: 'Schedule job',
         icon: 'rocket_launch',
         subtitle,
