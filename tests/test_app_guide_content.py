@@ -362,6 +362,47 @@ def test_fleet_guide_keeps_current_scope_and_fallback_boundaries():
     assert "non-admin users need the delegation grant" in body
 
 
+def test_fleet_guide_covers_published_evidence():
+    """E5 (officer_supervision_surface §3.3): the three bounded evidence reads
+    have explicit prose, framed as judgment material rather than file access,
+    with the availability-honesty rule (`unavailable` is never `empty`)."""
+    _, body = _focused_topic("fleet-and-delegation")
+
+    for tool_name in (
+        "get_job_completion_report",
+        "list_job_evidence",
+        "read_job_evidence",
+    ):
+        assert f"`{tool_name}`" in body, tool_name
+    assert "published completion evidence" in body
+    assert "pinned at completion" in body
+    assert "judgment material, not a live file browser" in body
+    assert "a source that could not be reached, not an empty result" in body
+
+
+def test_jobs_guide_reads_liveness_instead_of_fabricated_progress():
+    """E5 (officer_supervision_surface §5): progress is server-computed
+    liveness; no percent/ETA is fabricated; `suspected_stuck` prompts
+    investigation and `unavailable` is never presented as inactivity."""
+    _, body = _focused_topic("jobs")
+
+    assert "liveness**, not a percentage" in body
+    for state in (
+        "`active`",
+        "`waiting`",
+        "`paused`",
+        "`suspected_stuck`",
+        "`unavailable`",
+        "`terminal`",
+    ):
+        assert state in body, state
+    assert "reasons and a last-activity time" in body
+    assert "`progress_percent` field is honestly `null`" in body
+    assert "does not fabricate a percent or an eta" in body
+    assert '`suspected_stuck` means "investigate"' in body
+    assert 'never present it as "no activity"' in body
+
+
 def test_canvas_guide_keeps_renderer_handoff_and_availability_boundaries():
     _, body = _focused_topic("canvas-and-browser")
 
@@ -606,9 +647,9 @@ def test_every_selectable_live_fleet_tool_has_an_explicit_guide_topic():
             "get_job",
             "get_job_file",
             "list_job_files",
-            # E4 (officer_supervision_surface): bounded evidence reads joined
-            # the session job_inspection defaults; guide-topic prose for them
-            # is owed by E5 alongside the Cockpit inspection labels.
+            # E4/E5 (officer_supervision_surface): the bounded evidence reads'
+            # guide prose lives in fleet-and-delegation ("What Fleet Management
+            # can do"), pinned by test_fleet_guide_covers_published_evidence.
             "get_job_completion_report",
             "list_job_evidence",
             "read_job_evidence",

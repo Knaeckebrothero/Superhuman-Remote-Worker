@@ -2092,7 +2092,9 @@ export class ApiService {
   }
 
   /**
-   * Get job progress with ETA.
+   * Get honest job liveness (state/reasons/last_activity_at). The
+   * `progress_percent`/`eta_seconds` fields are kept for shape compatibility
+   * and are `null` — render the liveness state, never a fabricated percent.
    */
   getJobProgress(jobId: string): Observable<JobProgress | null> {
     return this.http.get<JobProgress>(`${this.baseUrl}/jobs/${jobId}/progress`).pipe(

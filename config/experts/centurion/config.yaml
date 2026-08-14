@@ -1,8 +1,9 @@
 # yaml-language-server: $schema=../../schema.json
 # Centurion — the standing officer of a project (docs/features/centurion.md).
-# An always-on session with no local workspace. Its current legacy job-file
-# readers remain granted until the separately ratified S5 object-plane policy;
-# its output is judgment — dispatches, steering, verdicts, briefings. The officer
+# An always-on session with no local workspace. His job surface is the
+# ratified supervision split (officer_supervision_surface.md §3): control +
+# observability + bounded evidence, never the job_workspace object plane; his
+# output is judgment — dispatches, steering, verdicts, briefings. The officer
 # machinery (sleep tool, durable timer, watchdog, sitrep wakes) activates via
 # config_override.officer.enabled on the THREAD, not here: this same expert
 # also dresses conferences — interactive sessions wearing his identity —
@@ -28,8 +29,8 @@ tags:
 # Klug und faul, structurally: the lite tier removes every hands-on tool
 # (local files, shell, git, browser, canvas) at the backend filter, so
 # delegation is not a persona preference — it is the only path to getting work
-# done. The remote job-file inspection tools below are supervision reads, not
-# an officer workspace.
+# done. The job reads below are control-plane supervision and bounded
+# evidence, not an officer workspace.
 workspace:
   backend: none
 
@@ -86,8 +87,21 @@ tools:
     - kb_contradictions
     - kb_provenance
     - kb_unanswered
-  # Preserve the officer's pre-unification effective grant exactly. The wider
-  # S5 supervision/evidence default remains pending.
+  # Officer job surface (officer_supervision_surface.md §3, E5): the reviewed
+  # grant mirrors the generated officer caller defaults exactly — 7 control +
+  # 18 observability + 3 evidence, zero job_workspace-plane reads. Arbitrary
+  # job-file/tree reads (get_job_file, list_job_files, workspace overview,
+  # shell state, unbounded diff/commit browsing) are the object plane in
+  # job-tool form: no longer claimed here, and the background-officer runtime
+  # ceiling (registry.apply_officer_tool_ceiling) refuses plane="job_workspace"
+  # even when a thread override names one. Thin published evidence means
+  # dispatching a tester/recon job, never falling back to a file browser.
+  # tests/test_centurion_supervision_grant.py pins these lists to
+  # caller_default_names("officer", ...) so a descriptor-policy change surfaces
+  # here as a reviewed diff instead of silent drift. (Explicit names, not
+  # `true`: policy expansion is lane-blind at config time — `true` resolves to
+  # the session-grantable subset, which would claim the two workspace-plane
+  # reads and could never claim the grant="explicit" officer tools.)
   job_control:
     - create_job
     - approve_job
@@ -95,12 +109,31 @@ tools:
     - cancel_job
     - pause_job
     - steer_job
+    - send_message_to_job
   job_inspection:
+    # Observability — control-plane truth (status, telemetry, recorded state).
     - list_jobs
     - get_job
-    - get_job_file
-    - list_job_files
+    - get_job_summary
+    - get_job_progress
+    - get_job_log
+    - get_frozen_job
     - get_stuck_jobs
+    - get_current_todos
+    - get_todos
+    - get_todo_archive
+    - list_todo_archives
+    - list_message_threads
+    - get_message_thread
+    - get_audit_trail
+    - search_audit
+    - get_chat_history
+    - list_llm_requests
+    - get_llm_request
+    # Evidence — bounded, immutable disposition material (E4 manifest).
+    - get_job_completion_report
+    - list_job_evidence
+    - read_job_evidence
   # Workers research; the officer judges. Dropping these keeps his toolset
   # small enough that every wake's tool choice is obvious.
   research: []
