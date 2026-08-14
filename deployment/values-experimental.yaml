@@ -67,7 +67,7 @@ image:
   agent:
     tag: sha-63ead51
   cockpit:
-    tag: sha-277c2c4
+    tag: sha-52c348c
   mcp:
     tag: sha-cf7891e
     digest: sha256:b6db10c6947d4b541598adfa1bf583b83c37adfa48ea22f806c47dc5a3232086
@@ -85,8 +85,8 @@ provenance:
       sourceRevision: 63ead51d7bf30a754d6ba1bc6ab4a358a733883d
       releaseVersion: "0.0.0-dev.sha-63ead51d7bf30a754d6ba1bc6ab4a358a733883d"
     cockpit:
-      sourceRevision: 277c2c4eeda02587ce92b2944d0a469fa315f3a6
-      releaseVersion: "0.0.0-dev.sha-277c2c4eeda02587ce92b2944d0a469fa315f3a6"
+      sourceRevision: 52c348c434fbe2ab87869948463d2cccae42c9bf
+      releaseVersion: "0.0.0-dev.sha-52c348c434fbe2ab87869948463d2cccae42c9bf"
     mcp:
       sourceRevision: cf7891e853aa79cc8e54ccc24e27c5c7b02f0c8e
       releaseVersion: "0.0.0-dev.sha-cf7891e853aa79cc8e54ccc24e27c5c7b02f0c8e"
