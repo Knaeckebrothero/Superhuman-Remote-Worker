@@ -1948,7 +1948,7 @@ class PersistentSession:
         # ``tools.agent_catalog`` and ``tools.workflows``. New resolved configs
         # carry explicit off-markers from their complete merged tool policy;
         # marker absence stays enabled only for legacy-session compatibility.
-        from ..tools.registry import get_tools_by_category
+        from ..tools.registry import get_tools_by_category, officer_ceiling_active
         from ..shared.orch_surface.jobs import caller_default_names
 
         fleet_management_enabled = _fleet_management_enabled(self.config)
@@ -1980,10 +1980,19 @@ class PersistentSession:
                 if name not in tool_names:
                     tool_names.append(name)
 
+        # officer_supervision_surface E2: a commissioned background officer
+        # resolves its job-tool defaults on the OFFICER lane — the generated
+        # observability/evidence grant — instead of the interactive-session
+        # subset. Same strict `is True` fact that stamps officer_session.
+        job_tool_lane = (
+            "officer"
+            if officer_ceiling_active(getattr(self.config, "officer", None))
+            else "session"
+        )
         if not job_control_enabled:
             tool_names = [name for name in tool_names if name not in job_control_tools]
         else:
-            for name in sorted(caller_default_names("session", "job_control")):
+            for name in sorted(caller_default_names(job_tool_lane, "job_control")):
                 if name not in tool_names:
                     tool_names.append(name)
         if not job_inspection_enabled:
@@ -1991,7 +2000,7 @@ class PersistentSession:
                 name for name in tool_names if name not in job_inspection_tools
             ]
         else:
-            for name in sorted(caller_default_names("session", "job_inspection")):
+            for name in sorted(caller_default_names(job_tool_lane, "job_inspection")):
                 if name not in tool_names:
                     tool_names.append(name)
 

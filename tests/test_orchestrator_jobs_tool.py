@@ -159,16 +159,69 @@ async def test_create_job_explicit_project_id_wins_over_lineage(
     assert body["user_id"] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 
-def test_caller_ctx_is_session_lane_without_officer_detection() -> None:
-    """No reliable runtime officer flag reaches ToolContext.config (the loader
-    parses the officer block into typed AgentConfig.officer, never extra), so
-    the lane is always 'session'; officer_supervision_surface E2 owns real
-    plane detection."""
+def test_caller_ctx_detects_officer_via_k3_runtime_fact() -> None:
+    """officer_supervision_surface E2: the lane is 'officer' iff the K3
+    runtime fact ``config["officer_session"] is True`` (stamped by the
+    persistent-session runtime from the parsed officer config). A nested
+    officer block in config never trips it — that was the pre-unification
+    dead branch — and truthy-but-not-True values stay strict."""
     context = ToolContext(
         user_id="user-1",
-        config={"officer": {"enabled": True}},  # would have hit the dead branch
+        config={"officer": {"enabled": True}},  # not the runtime fact
     )
     assert jobs_module._caller_ctx(context).kind == "session"
+
+    officer_context = ToolContext(
+        user_id="user-1",
+        config={"officer_session": True},
+    )
+    assert jobs_module._caller_ctx(officer_context).kind == "officer"
+
+    truthy_context = ToolContext(
+        user_id="user-1",
+        config={"officer_session": 1},  # strict `is True` — MagicMock safety
+    )
+    assert jobs_module._caller_ctx(truthy_context).kind == "session"
+
+
+@pytest.mark.asyncio
+async def test_officer_lane_stamps_project_scope_and_fails_closed_unbound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E2 scope split: officer calls carry X-MCP-Scope: project:<uuid>;
+    an officer bound to zero (or many) projects gets a binding error, never
+    an unscoped fleet view. The plain session lane still sends no scope."""
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    project_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    officer_ctx = ToolContext(
+        user_id="user-1",
+        _project_id=project_id,
+        _project_ids=[project_id],
+        config={"officer_session": True},
+    )
+    try:
+        await _tool(create_orchestrator_tools(officer_ctx), "list_jobs").ainvoke({})
+        scoped_request = recorder.requests[-1]
+
+        unbound_ctx = ToolContext(user_id="user-1", config={"officer_session": True})
+        refusal = await _tool(
+            create_orchestrator_tools(unbound_ctx), "list_jobs"
+        ).ainvoke({})
+
+        session_ctx = ToolContext(
+            user_id="user-1",
+            _project_id=project_id,
+            _project_ids=[project_id],
+        )
+        await _tool(create_orchestrator_tools(session_ctx), "list_jobs").ainvoke({})
+        session_request = recorder.requests[-1]
+    finally:
+        await client.close()
+
+    assert scoped_request.headers["X-MCP-Scope"] == f"project:{project_id}"
+    assert "Officer project binding error" in refusal
+    assert "X-MCP-Scope" not in session_request.headers
 
 
 @pytest.mark.asyncio

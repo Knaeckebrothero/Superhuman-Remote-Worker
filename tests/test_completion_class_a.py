@@ -612,7 +612,12 @@ class TestCompleteJobClassA:
         assert "completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)" in normalized
         assert sum("completed_at" in sql for sql, _ in db.statements) == 1
         assert handled["new_status"] == "completed"
-        assert handled["actions"] == ["status -> completed"]
+        # E4 (officer_supervision_surface §3.3): a sealed completion claim now
+        # records its evidence manifest before the status write.
+        assert handled["actions"] == [
+            "evidence manifest recorded (1 entr(y/ies))",
+            "status -> completed",
+        ]
         assert job["completed_at"] == "set"
 
     @pytest.mark.asyncio

@@ -89,7 +89,15 @@ def _get_surface_client() -> AsyncCockpitClient:
 
 
 def _caller_ctx(context: ToolContext) -> CallerCtx:
-    """Translate trusted ToolContext lineage without adding public arguments."""
+    """Translate trusted ToolContext lineage without adding public arguments.
+
+    Officer detection (officer_supervision_surface E2): the K3 runtime fact
+    ``ToolContext.config["officer_session"]`` is stamped by the persistent
+    session runtime from the parsed officer config (never from config.extra
+    or model input). Strict ``is True`` — the config dict may be a MagicMock
+    in tests. This replaces the pre-unification dead branch that keyed on a
+    flag that could never reach this dict.
+    """
     parent_job_id: str | None = None
     candidate = context._job_metadata.get("job_id")
     try:
@@ -99,13 +107,12 @@ def _caller_ctx(context: ToolContext) -> CallerCtx:
         pass
 
     project_ids = tuple(str(project_id) for project_id in context.project_ids)
-    # Always 'session' on this lane: ToolContext.config is built from
-    # config.extra, and the loader parses the officer block into typed
-    # AgentConfig.officer (never into extra), so no officer flag reaches this
-    # dict and no reliable runtime signal exists here today. Real plane
-    # detection is owned by officer_supervision_surface E2.
+    tool_cfg = getattr(context, "config", None)
+    officer_session = (
+        isinstance(tool_cfg, dict) and tool_cfg.get("officer_session") is True
+    )
     return CallerCtx(
-        kind="session",
+        kind="officer" if officer_session else "session",
         user_id=context.user_id,
         project_ids=project_ids,
         lineage_project_id=context.project_id,
@@ -115,82 +122,10 @@ def _caller_ctx(context: ToolContext) -> CallerCtx:
     )
 
 
-def _short_id(value: Any) -> str:
-    text = str(value or "")
-    return text[:8] if text else "unknown"
-
-
-def _truncate(value: Any, *, limit: int = 140) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return "N/A"
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3].rstrip() + "..."
-
-
-def _compact_dict_value(data: Dict[str, Any], *keys: str) -> Any:
-    for key in keys:
-        value = data.get(key)
-        if value not in (None, "", [], {}):
-            return value
-    return None
-
-
-def _format_freeze_data(job: Dict[str, Any]) -> List[str]:
-    freeze_data = job.get("freeze_data")
-    if not isinstance(freeze_data, dict):
-        context = job.get("context")
-        if isinstance(context, dict):
-            candidate = context.get("freeze_data")
-            if isinstance(candidate, dict):
-                freeze_data = candidate
-    if not isinstance(freeze_data, dict):
-        return []
-
-    lines: List[str] = []
-    freeze_type = _compact_dict_value(freeze_data, "freeze_type", "type")
-    reason = _compact_dict_value(
-        freeze_data,
-        "reason",
-        "message",
-        "status_message",
-        "review_reason",
-        "pause_reason",
-    )
-    if freeze_type:
-        lines.append(f"Freeze type: {freeze_type}")
-    if reason:
-        lines.append(f"Freeze reason: {_truncate(reason, limit=240)}")
-    if freeze_data.get("requires_review") is not None:
-        lines.append(f"Requires review: {freeze_data.get('requires_review')}")
-    return lines
-
-
-def _format_job_list_item(job: Dict[str, Any]) -> List[str]:
-    job_id = job.get("id", "unknown")
-    lines = [
-        f"--- {job_id} (short: {_short_id(job_id)}) ---",
-        f"  Status: {job.get('status', '?')}",
-        f"  Description: {_truncate(job.get('description'), limit=140)}",
-    ]
-    if job.get("config_name"):
-        lines.append(f"  Config: {job['config_name']}")
-    if job.get("project_id"):
-        lines.append(f"  Project ID: {job['project_id']}")
-    if job.get("parent_job_id"):
-        lines.append(f"  Parent job ID: {job['parent_job_id']}")
-    if job.get("assigned_agent_id"):
-        lines.append(f"  Agent: {job['assigned_agent_id']}")
-    if job.get("updated_at"):
-        lines.append(f"  Updated: {job['updated_at']}")
-    elif job.get("created_at"):
-        lines.append(f"  Created: {job['created_at']}")
-    for freeze_line in _format_freeze_data(job):
-        lines.append(f"  {freeze_line}")
-    if job.get("error_message"):
-        lines.append(f"  Error: {_truncate(job['error_message'], limit=180)}")
-    return lines
+# F15: the local _short_id/_truncate/_compact_dict_value/_format_freeze_data/
+# _format_job_list_item helpers were re-homed into
+# src/shared/orch_surface/formatters.py (format_jobs/format_job_detail) so
+# every lane renders the same decision-grade output.
 
 
 def _format_grants(capabilities: Dict[str, Any]) -> List[str]:

@@ -468,10 +468,17 @@ def apply_officer_tool_ceiling(tool_names: List[str], officer_cfg: Any) -> List[
     kept: List[str] = []
     dropped: List[str] = []
     for name in tool_names:
-        category = TOOL_REGISTRY.get(name, {}).get("category")
+        metadata = TOOL_REGISTRY.get(name, {})
+        category = metadata.get("category")
         denied = (
             name in _OFFICER_DENIED_TOOLS
             or category in _OFFICER_DENIED_CATEGORIES
+            # officer_supervision_surface E2/§3.4: job tools on the
+            # job_workspace plane (arbitrary repo file/tree reads, workspace
+            # overview, shell state, unbounded diff/commit browsing) are the
+            # object plane in job-tool form — the ceiling denies them even
+            # when a config override names them explicitly.
+            or metadata.get("plane") == "job_workspace"
             or (isinstance(name, str) and name.startswith(_OFFICER_DENIED_PREFIXES))
         )
         (dropped if denied else kept).append(name)

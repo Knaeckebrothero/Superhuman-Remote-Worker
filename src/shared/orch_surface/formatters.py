@@ -38,58 +38,163 @@ def _fmt_confidence(value: Any) -> str:
 # =============================================================================
 
 
-def format_jobs(jobs: list[dict[str, Any]]) -> str:
-    """Format job list for display."""
+def _short_id(value: Any) -> str:
+    text = str(value or "")
+    return text[:8] if text else "unknown"
+
+
+def truncate_text(value: Any, *, limit: int = 140) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "N/A"
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _compact_dict_value(data: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _freeze_lines(job: dict[str, Any]) -> list[str]:
+    """Freeze type/reason/requires-review lines from a job row (F4/F5).
+
+    ``freeze_data`` may live on the row or inside ``context`` (and either may
+    arrive as a JSON string from JSONB columns).
+    """
+    freeze_data = job.get("freeze_data")
+    if isinstance(freeze_data, str):
+        try:
+            freeze_data = json.loads(freeze_data)
+        except (json.JSONDecodeError, ValueError):
+            freeze_data = None
+    if not isinstance(freeze_data, dict):
+        context = job.get("context")
+        if isinstance(context, str):
+            try:
+                context = json.loads(context)
+            except (json.JSONDecodeError, ValueError):
+                context = None
+        if isinstance(context, dict):
+            candidate = context.get("freeze_data")
+            if isinstance(candidate, dict):
+                freeze_data = candidate
+    if not isinstance(freeze_data, dict):
+        return []
+
+    lines: list[str] = []
+    freeze_type = _compact_dict_value(freeze_data, "freeze_type", "type")
+    reason = _compact_dict_value(
+        freeze_data,
+        "reason",
+        "message",
+        "status_message",
+        "review_reason",
+        "pause_reason",
+    )
+    if freeze_type:
+        lines.append(f"Freeze type: {freeze_type}")
+    if reason:
+        lines.append(f"Freeze reason: {truncate_text(reason, limit=240)}")
+    if freeze_data.get("requires_review") is not None:
+        lines.append(f"Requires review: {freeze_data.get('requires_review')}")
+    return lines
+
+
+def format_job_list_item(job: dict[str, Any]) -> list[str]:
+    """Rich per-job list rendering (F5) — description, lineage, freeze, error."""
+    job_id = job.get("id", "unknown")
+    lines = [
+        f"--- {job_id} (short: {_short_id(job_id)}) ---",
+        f"  Status: {job.get('status', '?')}",
+        f"  Description: {truncate_text(job.get('description'), limit=140)}",
+    ]
+    if job.get("config_name") or job.get("config"):
+        lines.append(f"  Config: {job.get('config_name') or job.get('config')}")
+    if job.get("project_id"):
+        lines.append(f"  Project ID: {job['project_id']}")
+    if job.get("parent_job_id"):
+        lines.append(f"  Parent job ID: {job['parent_job_id']}")
+    if job.get("assigned_agent_id"):
+        lines.append(f"  Agent: {job['assigned_agent_id']}")
+    if job.get("updated_at"):
+        lines.append(f"  Updated: {job['updated_at']}")
+    elif job.get("created_at"):
+        lines.append(f"  Created: {job['created_at']}")
+    if job.get("audit_count") is not None:
+        lines.append(f"  Audit entries: {job['audit_count']}")
+    for freeze_line in _freeze_lines(job):
+        lines.append(f"  {freeze_line}")
+    if job.get("error_message"):
+        lines.append(f"  Error: {truncate_text(job['error_message'], limit=180)}")
+    return lines
+
+
+def format_jobs(jobs: list[dict[str, Any]], status: str | None = None) -> str:
+    """Format job list for display.
+
+    E1/F5: restores the decision-grade per-job rendering (description,
+    project/parent lineage, agent, freeze summaries) that the session lane
+    always had. An empty result names the filter so "no jobs with
+    status='failed'" is distinguishable from "no jobs at all".
+    """
     if not jobs:
-        return "No jobs found."
+        filter_msg = f" with status='{status}'" if status else ""
+        return f"No jobs found{filter_msg}."
 
     lines = [f"Found {len(jobs)} job(s):\n"]
     for job in jobs:
-        status_icon = {
-            "created": "📝",
-            "processing": "🔄",
-            "paused": "⏸",
-            "pending_review": "👁",
-            "completed": "✅",
-            "failed": "❌",
-            "cancelled": "⛔",
-        }.get(job.get("status", ""), "❓")
-
-        entry = (
-            f"{status_icon} {job['id']}\n"
-            f"   Config: {job.get('config', job.get('config_name', 'N/A'))}\n"
-            f"   Status: {job.get('status', 'N/A')}\n"
-            f"   Created: {job.get('created_at', 'N/A')}\n"
-            f"   Audit entries: {job.get('audit_count', 'N/A')}\n"
-        )
-        if job.get("error_message"):
-            entry += f"   Error: {job['error_message']}\n"
-        lines.append(entry)
-
+        lines.extend(format_job_list_item(job))
+        lines.append("")
     return "\n".join(lines)
 
 
 def format_job_detail(job: dict[str, Any]) -> str:
-    """Format single job details."""
+    """Format single job details.
+
+    E1/F4: decision-grade detail — the real endpoint shape uses
+    ``config_name`` (the old formatter read ``config`` and printed
+    'Config: N/A' forever), and supervision needs lineage, owner, priority,
+    agent, repo/branch, and the freeze type/reason/requires-review facts.
+    """
+    job_id = job.get("id", "unknown")
     lines = [
-        f"Job: {job['id']}",
+        f"Job: {job_id}",
+        f"Short ID: {_short_id(job_id)}",
         f"Status: {job.get('status', 'N/A')}",
-        f"Config: {job.get('config', 'N/A')}",
-        f"Created: {job.get('created_at', 'N/A')}",
-        f"Updated: {job.get('updated_at', 'N/A')}",
-        f"Audit entries: {job.get('audit_count', 'N/A')}",
     ]
-
     if job.get("description"):
-        description = job["description"]
-        if len(description) > 500:
-            description = description[:500] + "..."
-        lines.append(f"\nDescription:\n{description}")
-
+        lines.append(f"Description: {truncate_text(job.get('description'), limit=500)}")
+    if job.get("config_name") or job.get("config"):
+        lines.append(f"Config: {job.get('config_name') or job.get('config')}")
+    if job.get("project_id"):
+        lines.append(f"Project ID: {job['project_id']}")
+    if job.get("user_id"):
+        lines.append(f"Owner user ID: {job['user_id']}")
+    if job.get("parent_job_id"):
+        lines.append(f"Parent job ID: {job['parent_job_id']}")
+    if job.get("priority") is not None:
+        lines.append(f"Priority: {job['priority']}")
+    if job.get("assigned_agent_id"):
+        lines.append(f"Agent: {job['assigned_agent_id']}")
+    if job.get("created_at"):
+        lines.append(f"Created: {job['created_at']}")
+    if job.get("updated_at"):
+        lines.append(f"Updated: {job['updated_at']}")
+    if job.get("repo_name"):
+        lines.append(f"Repo: {job['repo_name']}")
+    if job.get("branch_name"):
+        lines.append(f"Branch: {job['branch_name']}")
+    if job.get("audit_count") is not None:
+        lines.append(f"Audit entries: {job['audit_count']}")
+    lines.extend(_freeze_lines(job))
     error_message = job.get("error_message") or job.get("error")
     if error_message:
-        lines.append(f"\nError: {error_message}")
-
+        lines.append(f"Error: {truncate_text(error_message, limit=300)}")
     return "\n".join(lines)
 
 
@@ -336,24 +441,56 @@ def _todo_label(todo: dict[str, Any]) -> str:
     return todo.get("subject") or todo.get("content") or "Untitled"
 
 
-def format_job_summary(
-    job: dict[str, Any] | Exception | None,
-    progress: dict[str, Any] | Exception | None,
-    todos: dict[str, Any] | Exception | None,
-    workspace: dict[str, Any] | Exception | None,
-    recent_audit: dict[str, Any] | Exception | None,
-) -> str:
-    """Format a combined job summary from multiple data sources.
+def _summary_source(envelope: dict[str, Any], name: str) -> dict[str, Any]:
+    for source in envelope.get("sources", []):
+        if source.get("name") == name:
+            return source
+    return {"name": name, "status": "fresh"}
 
-    Each argument may be the data dict, an Exception (if that call failed),
-    or None. Sections with errors show a warning instead of crashing.
+
+def _section_unavailable(source: dict[str, Any]) -> str | None:
+    if source.get("status") == "unavailable":
+        return f"  (unavailable: {source.get('reason') or 'source unreachable'})"
+    return None
+
+
+def format_job_summary(job_id: str, envelope: dict[str, Any]) -> str:
+    """Format a combined job summary from a truthful-read envelope (E1).
+
+    The envelope carries five sources (control_db, liveness, job_repo_todos,
+    job_repo, audit_db) and their data. A failed source renders as an explicit
+    ``(unavailable: …)`` section — the partial distinction — and the header
+    names the observation time. Schema repairs vs. the old formatter:
+    ``config_name`` (not ``config``), and the liveness contract instead of the
+    stubbed phase/elapsed/eta fields that never existed on the endpoint.
     """
-    lines: list[str] = []
+    data = envelope.get("data") or {}
+    job = data.get("job")
+    progress = data.get("progress")
+    todos = data.get("todos")
+    workspace = data.get("workspace")
+    recent_audit = data.get("recent_audit")
+
+    lines: list[str] = [
+        f"Job summary: {job_id} (observed {envelope.get('observed_at', 'unknown')})"
+    ]
+    unavailable_sections = [
+        source.get("name")
+        for source in envelope.get("sources", [])
+        if source.get("status") == "unavailable"
+    ]
+    if unavailable_sections:
+        lines.append(
+            "PARTIAL summary — unavailable sources: "
+            + ", ".join(str(name) for name in unavailable_sections)
+        )
+    lines.append("")
 
     # --- Status & Config ---
     lines.append("=== Status & Config ===")
-    if isinstance(job, Exception):
-        lines.append(f"  (unavailable: {job})")
+    note = _section_unavailable(_summary_source(envelope, "control_db"))
+    if note:
+        lines.append(note)
     elif job:
         status_icon = {
             "created": "📝",
@@ -365,7 +502,15 @@ def format_job_summary(
             "cancelled": "⛔",
         }.get(job.get("status", ""), "❓")
         lines.append(f"  {status_icon} Status: {job.get('status', 'N/A')}")
-        lines.append(f"  Config: {job.get('config', 'N/A')}")
+        lines.append(
+            f"  Config: {job.get('config_name') or job.get('config') or 'N/A'}"
+        )
+        if job.get("project_id"):
+            lines.append(f"  Project ID: {job['project_id']}")
+        if job.get("parent_job_id"):
+            lines.append(f"  Parent job ID: {job['parent_job_id']}")
+        if job.get("assigned_agent_id"):
+            lines.append(f"  Agent: {job['assigned_agent_id']}")
         lines.append(f"  Created: {job.get('created_at', 'N/A')}")
         lines.append(f"  Updated: {job.get('updated_at', 'N/A')}")
         desc = job.get("description", "")
@@ -373,6 +518,8 @@ def format_job_summary(
             lines.append(
                 f"  Description: {desc[:200]}{'...' if len(desc) > 200 else ''}"
             )
+        for freeze_line in _freeze_lines(job):
+            lines.append(f"  {freeze_line}")
         error_message = job.get("error_message") or job.get("error")
         if error_message:
             lines.append(f"  Error: {error_message}")
@@ -380,28 +527,22 @@ def format_job_summary(
         lines.append("  (no data)")
     lines.append("")
 
-    # --- Progress ---
-    lines.append("=== Progress ===")
-    if isinstance(progress, Exception):
-        lines.append(f"  (unavailable: {progress})")
+    # --- Liveness (shared contract; never a manufactured percentage) ---
+    lines.append("=== Liveness ===")
+    note = _section_unavailable(_summary_source(envelope, "liveness"))
+    if note:
+        lines.append(note)
     elif progress:
-        lines.append(f"  Phase: {progress.get('current_phase', 'N/A')}")
-        lines.append(f"  Elapsed: {progress.get('elapsed', 'N/A')}")
-        if progress.get("eta"):
-            lines.append(f"  ETA: {progress['eta']}")
-        reqs = progress.get("requirements", {})
-        if reqs:
-            lines.append(
-                f"  Requirements: {reqs.get('completed', 0)}/{reqs.get('total', 0)}"
-            )
+        lines.extend(f"  {line}" for line in _liveness_lines(progress))
     else:
         lines.append("  (no data)")
     lines.append("")
 
     # --- Current Todos ---
-    lines.append("=== Current Todos ===")
-    if isinstance(todos, Exception):
-        lines.append(f"  (unavailable: {todos})")
+    lines.append("=== Current Todos (Gitea-backed: as of the worker's last push) ===")
+    note = _section_unavailable(_summary_source(envelope, "job_repo_todos"))
+    if note:
+        lines.append(note)
     elif todos:
         current = todos.get("current")
         if current:
@@ -424,9 +565,10 @@ def format_job_summary(
     lines.append("")
 
     # --- Workspace ---
-    lines.append("=== Workspace ===")
-    if isinstance(workspace, Exception):
-        lines.append(f"  (unavailable: {workspace})")
+    lines.append("=== Workspace (Gitea-backed: as of the worker's last push) ===")
+    note = _section_unavailable(_summary_source(envelope, "job_repo"))
+    if note:
+        lines.append(note)
     elif workspace:
         files = workspace.get("files", [])
         if files:
@@ -451,15 +593,19 @@ def format_job_summary(
 
     # --- Recent Activity ---
     lines.append("=== Recent Activity (last 10 tool calls) ===")
-    if isinstance(recent_audit, Exception):
-        lines.append(f"  (unavailable: {recent_audit})")
+    note = _section_unavailable(_summary_source(envelope, "audit_db"))
+    if note:
+        lines.append(note)
     elif recent_audit:
-        entries = recent_audit.get("entries", [])
-        if entries:
-            for entry in entries[-10:]:
-                lines.append(f"  {_format_audit_entry(entry)}")
+        if recent_audit.get("error"):
+            lines.append(f"  (unavailable: {recent_audit['error']})")
         else:
-            lines.append("  (no entries)")
+            entries = recent_audit.get("entries", [])
+            if entries:
+                for entry in entries[-10:]:
+                    lines.append(f"  {_format_audit_entry(entry)}")
+            else:
+                lines.append("  (no entries)")
     else:
         lines.append("  (no data)")
 
@@ -1116,28 +1262,56 @@ def format_workspace_overview(job_id: str, data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_job_progress(job_id: str, data: dict[str, Any]) -> str:
-    """Format job progress data."""
-    lines = [f"Progress for job {job_id}\n"]
+def _liveness_lines(data: dict[str, Any]) -> list[str]:
+    """Render the shared liveness contract (E3) into compact lines.
 
-    lines.append(f"Status: {data.get('status', 'unknown')}")
-
-    progress_pct = data.get("progress_percent")
-    if progress_pct is not None:
-        lines.append(f"\nProgress: {progress_pct:.1f}%")
-
+    Never fabricates progress: when the state is ``unavailable`` the lines
+    say WHY the telemetry is missing instead of pretending 0% / not-stuck.
+    """
+    lines: list[str] = [f"Status: {data.get('status', 'unknown')}"]
+    state = data.get("state")
+    if state:
+        line = f"Liveness: {state}"
+        last_activity = data.get("last_activity_at")
+        if last_activity:
+            line += f" — last activity {last_activity}"
+        lines.append(line)
+    reasons = data.get("reasons")
+    if isinstance(reasons, list) and reasons:
+        lines.append("Reasons:")
+        lines.extend(f"  - {reason}" for reason in reasons)
     elapsed = data.get("elapsed_seconds")
     if elapsed is not None:
         mins = int(elapsed) // 60
         secs = int(elapsed) % 60
-        lines.append(f"Elapsed: {mins}m {secs}s")
+        lines.append(f"Elapsed since creation: {mins}m {secs}s")
+    for source in data.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        if source.get("status") in ("fresh", "empty", None):
+            continue
+        note = f"[{source.get('name')}: {source.get('status')}"
+        if source.get("reason"):
+            note += f" — {source['reason']}"
+        note += "]"
+        lines.append(note)
+    return lines
 
-    eta = data.get("eta_seconds")
-    if eta is not None:
-        eta_mins = int(eta) // 60
-        eta_secs = int(eta) % 60
-        lines.append(f"ETA: ~{eta_mins}m {eta_secs}s remaining")
 
+def format_job_progress(job_id: str, data: dict[str, Any]) -> str:
+    """Format job liveness/progress data (E1/E3).
+
+    The old endpoint stub always returned ``progress_percent=0`` /
+    ``eta_seconds=None``; rendering that as "Progress: 0.0%" manufactured a
+    fact. This renders the honest liveness contract instead and refuses to
+    invent a percentage — legacy payloads that still carry the stubbed
+    fields simply have them ignored.
+    """
+    lines = [f"Progress for job {job_id}\n"]
+    lines.extend(_liveness_lines(data))
+    observed = data.get("observed_at")
+    if observed:
+        lines.append(f"Observed at: {observed}")
     return "\n".join(lines)
 
 
@@ -1153,6 +1327,130 @@ def format_workspace_error(operation: str, job_id: str, error: Exception) -> str
             error_msg = f"HTTP {error.response.status_code}: {error_msg}"  # type: ignore[union-attr]
 
     return f"Failed to {operation} for job {job_id}:\n{error_msg}"
+
+
+# =============================================================================
+# Evidence Manifest Formatters (E4 — officer_supervision_surface §3.3)
+# =============================================================================
+
+
+def _evidence_entry_lines(entry: dict[str, Any]) -> list[str]:
+    lines = [
+        f"  {entry.get('id', '?')} · {entry.get('kind', 'unknown')} · "
+        f"{truncate_text(entry.get('label'), limit=80)}"
+    ]
+    meta: list[str] = []
+    if entry.get("media_type"):
+        meta.append(str(entry["media_type"]))
+    if entry.get("byte_size") is not None:
+        meta.append(f"{entry['byte_size']} B")
+    if entry.get("sha256"):
+        meta.append(f"sha256:{str(entry['sha256'])[:12]}…")
+    if meta:
+        lines.append(f"    {' · '.join(meta)}")
+    provenance: list[str] = []
+    source = entry.get("source")
+    if isinstance(source, dict) and source.get("revision"):
+        provenance.append(f"revision {str(source['revision'])[:12]}")
+    if entry.get("producer"):
+        provenance.append(f"producer {entry['producer']}")
+    if entry.get("captured_at"):
+        provenance.append(f"captured {entry['captured_at']}")
+    if provenance:
+        lines.append(f"    {' · '.join(provenance)}")
+    availability = entry.get("availability")
+    if availability and availability != "available":
+        note = f"    availability: {availability}"
+        if entry.get("availability_reason"):
+            note += f" — {entry['availability_reason']}"
+        lines.append(note)
+    return lines
+
+
+def format_evidence_list(job_id: str, data: dict[str, Any]) -> str:
+    """Format the evidence manifest for a job."""
+    entries = data.get("entries") or []
+    if not entries:
+        return (
+            f"No evidence recorded for job {job_id}. The manifest is written "
+            "at completion; if the worker published nothing, delegate a "
+            "tester/recon job instead of browsing its workspace."
+        )
+    lines = [f"Evidence manifest for job {job_id} ({len(entries)} entr(y/ies)):"]
+    if data.get("recorded_at"):
+        lines.append(f"Recorded at: {data['recorded_at']}")
+    lines.append("")
+    for entry in entries:
+        lines.extend(_evidence_entry_lines(entry))
+        lines.append("")
+    lines.append("Read one with read_job_evidence(job_id, evidence_id).")
+    return "\n".join(lines)
+
+
+def format_evidence_read(job_id: str, evidence_id: str, data: dict[str, Any]) -> str:
+    """Format one evidence read: bounded text page or safe binary metadata."""
+    entry = data.get("entry") or {}
+    header = [
+        f"Evidence {evidence_id} for job {job_id}:",
+        *_evidence_entry_lines(entry),
+    ]
+    if data.get("content") is not None:
+        offset = int(data.get("offset") or 0)
+        total = data.get("total_chars")
+        window = [
+            "--- content"
+            + (
+                f" (chars {offset}..{offset + len(str(data['content']))}"
+                + (f" of {total}" if total is not None else "")
+                + ")"
+            )
+            + " ---",
+            str(data["content"]),
+        ]
+        if data.get("truncated"):
+            next_offset = offset + len(str(data["content"]))
+            window.append(f"[truncated — continue with offset={next_offset}]")
+        note = data.get("note")
+        if note:
+            window.append(f"[{note}]")
+        return "\n".join(header + window)
+    # Binary / screenshot: safe metadata + the existing viewer representation.
+    lines = header
+    if data.get("note"):
+        lines.append(f"[{data['note']}]")
+    view = data.get("view")
+    if isinstance(view, dict):
+        lines.append(
+            "Binary content is not inlined; open it via the existing job-file "
+            f"viewer at path '{view.get('path')}' pinned to revision "
+            f"{str(view.get('ref'))[:12]}."
+        )
+    return "\n".join(lines)
+
+
+def format_completion_report(job_id: str, data: dict[str, Any]) -> str:
+    """Format the server-recorded completion report entry."""
+    report = data.get("report") or {}
+    lines = [f"Completion report for job {job_id}:"]
+    if data.get("recorded_at"):
+        lines.append(f"Recorded at: {data['recorded_at']}")
+    if data.get("source_revision"):
+        lines.append(f"Completion revision: {str(data['source_revision'])[:12]}")
+    lines.append("")
+    if report.get("summary"):
+        lines.append(f"Summary:\n{report['summary']}\n")
+    if report.get("confidence") is not None:
+        lines.append(f"Confidence: {_fmt_confidence(report['confidence'])}")
+    deliverables = report.get("deliverables") or []
+    if deliverables:
+        lines.append(f"Deliverables ({len(deliverables)}):")
+        for item in deliverables:
+            lines.append(f"  - {item}")
+    if report.get("notes"):
+        lines.append(f"Notes:\n{report['notes']}")
+    if not (report.get("summary") or deliverables):
+        lines.append("(report carries no summary or deliverables)")
+    return "\n".join(lines)
 
 
 # =============================================================================
@@ -1213,7 +1511,13 @@ def format_agent_stats(data: dict[str, Any]) -> str:
 
 
 def format_stuck_jobs(data: list[dict[str, Any]], threshold: int) -> str:
-    """Format stuck jobs list."""
+    """Format stuck jobs list (E3: liveness-backed rows).
+
+    Rows carry the shared liveness contract: ``state`` (suspected_stuck, or
+    ``unavailable`` when the activity evidence itself is unreachable — shown
+    honestly, never silently promoted to "stuck"), reasons, last activity,
+    and the job's description for triage.
+    """
     if not data:
         return f"No stuck jobs found (threshold: {threshold} minutes)."
 
@@ -1221,17 +1525,31 @@ def format_stuck_jobs(data: list[dict[str, Any]], threshold: int) -> str:
     for job in data:
         job_id = job.get("id", job.get("job_id", "unknown"))
         status = job.get("status", "unknown")
-        updated = job.get("updated_at", "unknown")
-        component = job.get("component", "")
-        reason = job.get("reason", "")
 
         lines.append(f"  {job_id}")
         lines.append(f"    Status: {status}")
-        lines.append(f"    Last update: {updated}")
-        if component:
-            lines.append(f"    Component: {component}")
-        if reason:
-            lines.append(f"    Reason: {reason}")
+        if job.get("state"):
+            lines.append(f"    Liveness: {job['state']}")
+        if job.get("description"):
+            lines.append(
+                f"    Description: {truncate_text(job['description'], limit=100)}"
+            )
+        last_activity = job.get("last_activity_at")
+        if last_activity:
+            lines.append(f"    Last activity: {last_activity}")
+        elif job.get("updated_at"):
+            lines.append(f"    Last update: {job['updated_at']}")
+        reasons = job.get("reasons")
+        if isinstance(reasons, list) and reasons:
+            for reason in reasons:
+                lines.append(f"    Reason: {reason}")
+        else:
+            component = job.get("stuck_component") or job.get("component") or ""
+            reason = job.get("stuck_reason") or job.get("reason") or ""
+            if component and component != "unknown":
+                lines.append(f"    Component: {component}")
+            if reason:
+                lines.append(f"    Reason: {reason}")
 
     return "\n".join(lines)
 

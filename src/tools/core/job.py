@@ -145,6 +145,7 @@ def create_job_tools(context: ToolContext) -> List[Any]:
         deliverables: List[str],
         confidence: float = 1.0,
         notes: Optional[str] = None,
+        evidence: Optional[List[Dict[str, str]]] = None,
         tool_call_id: Annotated[Optional[str], InjectedToolCallId] = None,
     ) -> str:
         """Signal that the job is complete and ready for human review.
@@ -161,6 +162,12 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             deliverables: List of ALL output files created during the job
             confidence: Overall confidence the job is truly complete (0.0-1.0, default 1.0)
             notes: Optional notes about limitations, edge cases, or recommendations
+            evidence: Optional declared evidence entries for supervision review.
+                Each entry: {"kind": "test_report"|"screenshot"|"change_summary",
+                "label": "<short label>", "media_type": "<MIME type>",
+                "source": "<workspace-relative committed file path>"}. The
+                orchestrator resolves each path at the completion commit and
+                publishes it in the job's bounded evidence manifest.
 
         Returns:
             Confirmation that phase is marked as final, or error if in tactical phase
@@ -263,6 +270,13 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             }
             if notes:
                 final_data["notes"] = notes
+            # E4: declared evidence rides the freeze into the completion
+            # contract; the ORCHESTRATOR resolves/pins/measures each entry —
+            # nothing here is trusted beyond being a declaration.
+            if evidence:
+                final_data["evidence"] = [
+                    dict(entry) for entry in evidence if isinstance(entry, dict)
+                ][:20]
 
             # Journal-before-observe: the decision must be durable BEFORE the
             # model sees success. Nothing is cached locally until the

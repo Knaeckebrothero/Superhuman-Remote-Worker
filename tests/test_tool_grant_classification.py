@@ -57,6 +57,11 @@ _LEGACY_SHIM_TOOLS = frozenset(
         "get_job",
         "get_job_file",
         "list_job_files",
+        # E4 (officer_supervision_surface): bounded evidence reads joined the
+        # session job_inspection defaults.
+        "get_job_completion_report",
+        "list_job_evidence",
+        "read_job_evidence",
         "approve_job",
         "resume_job_with_feedback",
         "cancel_job",
@@ -265,8 +270,11 @@ class TestNotClassified:
         )
 
     def test_the_shim_set_still_matches_the_runtime_lists(self):
-        """The shim is 26 names across five categories; drift breaks this gate."""
-        assert len(_LEGACY_SHIM_TOOLS) == 26
+        """The shim is 29 names across five categories; drift breaks this gate.
+
+        (26 → 29 with E4's three job_evidence reads in the session defaults.)
+        """
+        assert len(_LEGACY_SHIM_TOOLS) == 29
         assert _LEGACY_SHIM_TOOLS <= set(TOOL_REGISTRY)
         assert _LEGACY_SHIM_TOOLS == frozenset(
             SESSION_TOOL_OVERRIDE_NAMES["orchestrator"]

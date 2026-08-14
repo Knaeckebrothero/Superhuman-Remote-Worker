@@ -273,12 +273,32 @@ async def _jobs_section(
                     line += f" | error: {_truncate(error, 160)}"
                 changed.append(line)
 
+        # E3: the one shared liveness computation — the sitrep can never call
+        # a job healthy while get_stuck_jobs calls it stuck (same threshold,
+        # same audit/heartbeat authority order, updated_at never consulted).
+        liveness_by_id: dict[str, dict[str, Any]] = {}
+        if active_ids:
+            try:
+                from services.job_liveness import compute_jobs_liveness
+
+                liveness_by_id = await compute_jobs_liveness(
+                    [by_id[jid] for jid in active_ids[:_MAX_ACTIVE]],
+                    audit_reader=audit_reader,
+                    db=db,
+                    now=now,
+                )
+            except Exception:
+                logger.warning("sitrep: liveness computation failed", exc_info=True)
+
         active_lines: list[str] = []
         for jid in active_ids[:_MAX_ACTIVE]:
             job = by_id[jid]
             steps = steps_by_job.get(jid)
             prev_steps = _as_dict(prev_prints.get(jid)).get("steps")
             detail = f"- {jid[:8]} {job.get('status')}"
+            liveness = liveness_by_id.get(jid)
+            if liveness:
+                detail += f" [{liveness.get('state')}]"
             if steps is not None:
                 if isinstance(prev_steps, int):
                     detail += f" — steps {prev_steps}→{steps}"
@@ -286,15 +306,16 @@ async def _jobs_section(
                         detail += " (NO PROGRESS since last sitrep)"
                 else:
                     detail += f" — steps {steps}"
-            last_write = None
-            if audit_reader is not None:
-                try:
-                    time_range = await audit_reader.get_audit_time_range(jid)
-                    last_write = _parse_iso((time_range or {}).get("end"))
-                except Exception:
-                    last_write = None
+            last_write = _parse_iso((liveness or {}).get("last_activity_at"))
             if last_write is not None:
-                detail += f", last write {_ago(last_write, now)}"
+                detail += f", last activity {_ago(last_write, now)}"
+            if liveness and liveness.get("state") in (
+                "suspected_stuck",
+                "unavailable",
+            ):
+                reasons = liveness.get("reasons") or []
+                if reasons:
+                    detail += f" ({_truncate('; '.join(reasons), 160)})"
             detail += f" — {_truncate(job.get('description') or '', _DESC_CHARS)}"
             active_lines.append(detail)
 

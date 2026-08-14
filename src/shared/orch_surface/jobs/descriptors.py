@@ -10,7 +10,13 @@ from typing import Any, Awaitable, Callable, Literal
 from ..client import AsyncCockpitClient
 
 JobGroup = Literal["job_control", "job_inspection"]
-JobPlane = Literal["control", "observability", "object"]
+#: officer_supervision_surface §3 capability taxonomy. ``job_inspection`` stays
+#: the Cockpit umbrella/display group; caller DEFAULTS are evaluated at this
+#: finer plane boundary: bounded orchestrator actions (job_control),
+#: control-plane truth (job_observability), declared bounded disposition
+#: material (job_evidence), and the object plane (job_workspace) which the
+#: background officer never receives by default.
+JobPlane = Literal["job_control", "job_observability", "job_evidence", "job_workspace"]
 CallerKind = Literal["mcp", "session", "officer"]
 GrantKind = Literal["explicit"]
 JobHandler = Callable[..., Awaitable[str]]
@@ -22,7 +28,9 @@ class CallerCtx:
 
     ``project_ids`` contains bindings established by the session/token adapter;
     it is never populated from model arguments.  Only an exactly-one binding
-    becomes an ``X-MCP-Scope`` header, and only on the MCP lane.
+    becomes an ``X-MCP-Scope`` header, and only on the MCP and officer lanes
+    (officer_supervision_surface E2: the officer is always project-fenced; the
+    plain session lane never stamps scope).
     ``lineage_project_id`` is kept separately because an existing
     multi-project session can still have a primary project used by the
     job-create funnel without claiming that its reads are single-project
@@ -190,12 +198,24 @@ def make_bound_handler(
     async def invoke(*args: Any, **kwargs: Any) -> str:
         client = client_provider()
         caller = caller_provider()
-        # Only the MCP lane stamps X-MCP-Scope. The agent/session lane never
-        # sent it pre-unification, and stamping it activated server-side
-        # project fencing that made NULL-project jobs invisible to
-        # single-project sessions. Officer-lane scoping will be reintroduced
-        # deliberately by officer_supervision_surface E2.
-        scope = caller.scope_header if caller.kind == "mcp" else None
+        # Scope stamping is lane-deliberate (officer_supervision_surface E2):
+        # * MCP stamps its token scope (pre-unification contract).
+        # * The plain SESSION lane deliberately does NOT — stamping it
+        #   activated server-side project fencing that made NULL-project jobs
+        #   invisible to single-project sessions.
+        # * The OFFICER lane always stamps X-MCP-Scope: project:<uuid> so the
+        #   server fences every read/write to the commissioned project. A
+        #   missing or multiple project binding is an attach error, not an
+        #   unscoped fleet view — fail closed before any request is sent.
+        if caller.kind == "officer" and caller.project_scope is None:
+            bound = len(tuple(p for p in caller.project_ids if p))
+            return (
+                "Officer project binding error: this background-officer "
+                f"session is bound to {bound} project(s); exactly one is "
+                "required for scoped supervision reads. Re-attach the officer "
+                "post to a single project."
+            )
+        scope = caller.scope_header if caller.kind in ("mcp", "officer") else None
         with client.invocation_scope(
             user_id=caller.user_id,
             scope=scope,

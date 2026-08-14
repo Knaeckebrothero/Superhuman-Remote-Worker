@@ -12,7 +12,9 @@ import httpx
 from langchain_core.tools import tool
 
 from ..context import ToolContext
-from .jobs import _get_client, _get_orchestrator_url, _truncate
+from src.shared.orch_surface.formatters import truncate_text as _truncate
+
+from .jobs import _get_client, _get_orchestrator_url
 
 CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "list_experts": {

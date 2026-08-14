@@ -4,40 +4,43 @@
 
 | Name | Group | Plane | Caller defaults | Grant |
 |---|---|---|---|---|
-| `approve_job` | `job_control` | `control` | `mcp`, `officer`, `session` | category default |
-| `assign_job` | `job_control` | `control` | `mcp` | `explicit` |
-| `cancel_job` | `job_control` | `control` | `mcp`, `officer`, `session` | category default |
-| `create_job` | `job_control` | `control` | `mcp`, `officer`, `session` | category default |
-| `delete_job` | `job_control` | `control` | `mcp` | `explicit` |
-| `get_audit_bulk` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_audit_timerange` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_audit_trail` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_chat_bulk` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_chat_history` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_current_todos` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_frozen_job` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_job` | `job_inspection` | `observability` | `mcp`, `officer`, `session` | category default |
-| `get_job_diff` | `job_inspection` | `object` | `mcp` | `explicit` |
-| `get_job_file` | `job_inspection` | `object` | `mcp`, `officer`, `session` | category default |
-| `get_job_log` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_job_progress` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_job_summary` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_llm_request` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_message_thread` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_shell_state` | `job_inspection` | `object` | `mcp` | `explicit` |
-| `get_stuck_jobs` | `job_inspection` | `observability` | `mcp`, `officer` | `explicit` |
-| `get_todo_archive` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_todos` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `get_workspace_overview` | `job_inspection` | `object` | `mcp` | `explicit` |
-| `list_job_commits` | `job_inspection` | `object` | `mcp` | `explicit` |
-| `list_job_files` | `job_inspection` | `object` | `mcp`, `officer`, `session` | category default |
-| `list_jobs` | `job_inspection` | `observability` | `mcp`, `officer`, `session` | category default |
-| `list_llm_requests` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `list_message_threads` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `list_todo_archives` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `pause_job` | `job_control` | `control` | `mcp`, `officer`, `session` | category default |
-| `promote_job` | `job_control` | `control` | `mcp` | `explicit` |
-| `resume_job_with_feedback` | `job_control` | `control` | `mcp`, `officer`, `session` | category default |
-| `search_audit` | `job_inspection` | `observability` | `mcp` | `explicit` |
-| `send_message_to_job` | `job_control` | `control` | `mcp` | `explicit` |
-| `steer_job` | `job_control` | `control` | `mcp`, `officer` | `explicit` |
+| `approve_job` | `job_control` | `job_control` | `mcp`, `officer`, `session` | category default |
+| `assign_job` | `job_control` | `job_control` | `mcp` | `explicit` |
+| `cancel_job` | `job_control` | `job_control` | `mcp`, `officer`, `session` | category default |
+| `create_job` | `job_control` | `job_control` | `mcp`, `officer`, `session` | category default |
+| `delete_job` | `job_control` | `job_control` | `mcp` | `explicit` |
+| `get_audit_bulk` | `job_inspection` | `job_observability` | `mcp` | `explicit` |
+| `get_audit_timerange` | `job_inspection` | `job_observability` | `mcp` | `explicit` |
+| `get_audit_trail` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `get_chat_bulk` | `job_inspection` | `job_observability` | `mcp` | `explicit` |
+| `get_chat_history` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `get_current_todos` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `get_frozen_job` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `get_job` | `job_inspection` | `job_observability` | `mcp`, `officer`, `session` | category default |
+| `get_job_completion_report` | `job_inspection` | `job_evidence` | `mcp`, `officer`, `session` | category default |
+| `get_job_diff` | `job_inspection` | `job_workspace` | `mcp` | `explicit` |
+| `get_job_file` | `job_inspection` | `job_workspace` | `mcp`, `session` | category default |
+| `get_job_log` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `get_job_progress` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `get_job_summary` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `get_llm_request` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `get_message_thread` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `get_shell_state` | `job_inspection` | `job_workspace` | `mcp` | `explicit` |
+| `get_stuck_jobs` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `get_todo_archive` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `get_todos` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `get_workspace_overview` | `job_inspection` | `job_workspace` | `mcp` | `explicit` |
+| `list_job_commits` | `job_inspection` | `job_workspace` | `mcp` | `explicit` |
+| `list_job_evidence` | `job_inspection` | `job_evidence` | `mcp`, `officer`, `session` | category default |
+| `list_job_files` | `job_inspection` | `job_workspace` | `mcp`, `session` | category default |
+| `list_jobs` | `job_inspection` | `job_observability` | `mcp`, `officer`, `session` | category default |
+| `list_llm_requests` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `list_message_threads` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `list_todo_archives` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `pause_job` | `job_control` | `job_control` | `mcp`, `officer`, `session` | category default |
+| `promote_job` | `job_control` | `job_control` | `mcp` | `explicit` |
+| `read_job_evidence` | `job_inspection` | `job_evidence` | `mcp`, `officer`, `session` | category default |
+| `resume_job_with_feedback` | `job_control` | `job_control` | `mcp`, `officer`, `session` | category default |
+| `search_audit` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
+| `send_message_to_job` | `job_control` | `job_control` | `mcp`, `officer` | `explicit` |
+| `steer_job` | `job_control` | `job_control` | `mcp`, `officer` | `explicit` |

@@ -58,6 +58,10 @@ COMPLETION_EFFECT_PLAN: tuple[CompletionEffectSpec, ...] = (
     CompletionEffectSpec("llm_outage_retry_pause", "recovery", "S12"),
     CompletionEffectSpec("llm_give_up_operator_alert", "llm_give_up_alert", "S13"),
     CompletionEffectSpec("deliverable_contract_gate", "delivery_gate", "S14"),
+    # E4 (officer_supervision_surface §3.3): record the typed evidence
+    # manifest right after the gate so the deliverable-check stamp exists.
+    # Additive vocabulary: in-flight pre-E4 commands simply run it on resume.
+    CompletionEffectSpec("evidence_manifest_record", "delivery_gate", "S14b"),
     CompletionEffectSpec(
         "loop_project_cloud_delivery",
         "delivery",

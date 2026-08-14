@@ -6616,13 +6616,19 @@ class PostgresDB:
         return result == "UPDATE 1"
 
     async def get_job_progress(self, job_id: str) -> Dict[str, Any] | None:
-        """Get detailed progress information for a job including ETA.
+        """Get the control-row basis for a job's progress/liveness answer.
+
+        E1 (officer_supervision_surface §4): the old implementation always
+        fabricated ``progress_percent=0`` — no percentage telemetry exists,
+        so the field is now an honest ``None`` (kept for payload-shape
+        compatibility) and the ``/progress`` route composes the real
+        liveness verdict from ``services.job_liveness``.
 
         Args:
             job_id: Job UUID as string
 
         Returns:
-            Dict with progress details and ETA, or None if job not found
+            Dict with status/timestamps/elapsed, or None if job not found
         """
         try:
             uuid_val = UUID(job_id)
@@ -6652,7 +6658,8 @@ class PostgresDB:
         return {
             "job_id": str(job["id"]),
             "status": job["status"],
-            "progress_percent": 0,
+            # Honest nulls: never manufacture 0% / a fake ETA (E1).
+            "progress_percent": None,
             "elapsed_seconds": elapsed_seconds,
             "eta_seconds": None,
             "created_at": job["created_at"].isoformat() if job["created_at"] else None,
@@ -6661,6 +6668,47 @@ class PostgresDB:
             if job["completed_at"]
             else None,
         }
+
+    async def get_processing_jobs(
+        self,
+        *,
+        owner_user_id: str | None = None,
+        visible_project_ids: list[str] | None = None,
+        scope_project_id: str | None = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Every 'processing' job in the caller's visibility (E3 liveness input).
+
+        Unlike :meth:`detect_stuck_jobs` this does NOT filter on
+        ``updated_at`` — that column is display metadata poisoned by trigger
+        cascades; the liveness computation decides stuckness from audit
+        movement and heartbeats instead.
+        """
+        visibility, vis_vals, _next_idx = self._visibility_clause(
+            owner_user_id=owner_user_id,
+            visible_project_ids=visible_project_ids,
+            scope_project_id=scope_project_id,
+            table_alias="j",
+            start_idx=2,  # $1 is limit
+        )
+        where_extra = f" AND {visibility}" if visibility else ""
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT j.id, j.description, j.status, j.config_name,
+                       j.assigned_agent_id, j.project_id, j.created_at,
+                       j.updated_at, j.completed_at
+                FROM jobs j
+                WHERE j.status = 'processing'
+                {where_extra}
+                ORDER BY j.created_at ASC
+                LIMIT $1
+                """,
+                limit,
+                *vis_vals,
+            )
+        return [dict(row) for row in rows]
 
     def _visibility_clause(
         self,

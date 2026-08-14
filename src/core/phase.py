@@ -1027,6 +1027,10 @@ def finalize_job(
         }
         if "notes" in final_data:
             completion_data["notes"] = final_data["notes"]
+        if "evidence" in final_data:
+            # E4: declared evidence entries ride the completion contract to
+            # the orchestrator, which resolves and pins them server-side.
+            completion_data["evidence"] = final_data["evidence"]
 
         output_path = "output/job_completion.json"
         workspace.write_file(
@@ -1098,6 +1102,10 @@ def finalize_job(
 
     if "notes" in final_data:
         freeze_data["notes"] = final_data["notes"]
+    if "evidence" in final_data:
+        # E4: declared evidence entries ride the freeze to the orchestrator,
+        # which resolves and pins them server-side at completion.
+        freeze_data["evidence"] = final_data["evidence"]
 
     # Write to output/job_frozen.json
     output_path = "output/job_frozen.json"
