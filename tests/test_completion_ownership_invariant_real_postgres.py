@@ -1,15 +1,17 @@
 """Real-Postgres proof of the generalized completion ownership invariant.
 
 The invariant is intentionally job-status agnostic.  An unfinished completion
-command transfers through exactly one of three durable authority domains:
+command, or a stateless terminal-queue owner gap, has exactly one of four
+durable authority domains:
 
 * the accepted agent term while the command is still pending;
-* one claimed finalizer command (including that command's effect leases); or
-* one current-attempt completion-sweep action.
+* one claimed finalizer command (including that command's effect leases);
+* one current-attempt completion-sweep action; or
+* the durable operator-review marker for a rescued stateless owner gap.
 
-This test builds the M1--M3 collision families and derives the actor count from
-the persisted fences.  Scenario labels are used only to state the expected
-owner; they are not inputs to the census.
+This test builds the M1--M3 collision families plus the terminal/absent queue
+gap and derives the actor count from persisted fences.  Scenario labels are
+used only to state the expected owner; they are not inputs to the census.
 """
 
 from __future__ import annotations
@@ -28,9 +30,12 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
-from orchestrator.database.postgres import PostgresDB
+from orchestrator.database.postgres import PostgresDB, _completion_control_active_sql
 from orchestrator.services.completion_lifecycle import CompletionLifecycleOwnership
-from orchestrator.services.completion_sweep_router import CompletionSweepRouter
+from orchestrator.services.completion_sweep_router import (
+    STATELESS_OWNER_GAP_CODE,
+    CompletionSweepRouter,
+)
 from orchestrator.services.job_completion_commands import (
     COMPLETION_CODE_VERSION,
     accept_completion_command,
@@ -52,7 +57,7 @@ _UNFINISHED_STATES = ("pending", "finalizing", "parked")
 # the command.  Restricting agent terms to pending commands models that durable
 # handoff.  A finalizer command and all of its live effect rows are one actor,
 # so finalizer_terms is distinct by command rather than by effect.
-_OWNERSHIP_CENSUS_SQL = """
+_OWNERSHIP_CENSUS_SQL = f"""
 WITH unfinished AS (
     SELECT command.id AS command_id,
            command.job_id,
@@ -65,9 +70,43 @@ WITH unfinished AS (
     FROM job_completion_commands AS command
     WHERE command.state = ANY($1::text[])
 ),
-jobs_with_unfinished AS (
-    SELECT DISTINCT job_id
-    FROM unfinished
+owner_gaps AS (
+    SELECT job.id AS job_id,
+           CASE WHEN job.status='processing'
+                THEN 'active'
+                ELSE 'operator_parked'
+           END AS gap_state
+    FROM jobs AS job
+    LEFT JOIN run_queue AS queue ON queue.unit_id=job.id
+    WHERE (
+        job.status='processing'
+        AND job.execution_lane='stateless'
+        AND job.assigned_agent_id IS NULL
+        AND (
+            job.lease_expires_at IS NULL
+            OR job.lease_expires_at <= clock_timestamp()
+        )
+        AND NOT ({_completion_control_active_sql("job.context")})
+        AND (
+            queue.unit_id IS NULL
+            OR (queue.unit_kind='worker_batch' AND queue.state='done')
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM job_completion_commands AS command
+            WHERE command.job_id=job.id
+              AND command.state=ANY($1::text[])
+        )
+    ) OR (
+        job.status='pending_review'
+        AND job.execution_lane='stateless'
+        AND job.error_details->>'code'=$2::text
+    )
+),
+subject_jobs AS (
+    SELECT DISTINCT job_id FROM unfinished
+    UNION
+    SELECT job_id FROM owner_gaps
 ),
 agent_terms AS (
     SELECT DISTINCT unfinished.job_id,
@@ -125,12 +164,20 @@ sweep_terms AS (
      AND action.command_attempt = unfinished.attempts
     WHERE action.state IN ('pending', 'claimed')
 ),
+operator_terms AS (
+    SELECT owner_gaps.job_id,
+           'operator:stateless-owner-gap'::text AS term
+    FROM owner_gaps
+    WHERE owner_gaps.gap_state='operator_parked'
+),
 actor_terms AS (
     SELECT job_id, term, 'agent'::text AS actor_kind FROM agent_terms
     UNION ALL
     SELECT job_id, term, 'finalizer'::text AS actor_kind FROM finalizer_terms
     UNION ALL
     SELECT job_id, term, 'sweep'::text AS actor_kind FROM sweep_terms
+    UNION ALL
+    SELECT job_id, term, 'operator'::text AS actor_kind FROM operator_terms
 )
 SELECT job.id,
        job.description,
@@ -145,13 +192,16 @@ SELECT job.id,
        count(actor_terms.term) FILTER (
            WHERE actor_terms.actor_kind = 'sweep'
        )::int AS sweep_count,
+       count(actor_terms.term) FILTER (
+           WHERE actor_terms.actor_kind = 'operator'
+       )::int AS operator_count,
        COALESCE(
            array_agg(actor_terms.term ORDER BY actor_terms.term)
                FILTER (WHERE actor_terms.term IS NOT NULL),
            ARRAY[]::text[]
        ) AS actor_terms
-FROM jobs_with_unfinished
-JOIN jobs AS job ON job.id = jobs_with_unfinished.job_id
+FROM subject_jobs
+JOIN jobs AS job ON job.id = subject_jobs.job_id
 LEFT JOIN actor_terms ON actor_terms.job_id = job.id
 GROUP BY job.id, job.description, job.status
 ORDER BY job.description
@@ -359,7 +409,11 @@ async def _accept_stateless(pg, *, job_id: UUID, lease_token: int) -> UUID:
 
 async def _census(pg) -> list[dict]:
     async with pg.acquire() as conn:
-        rows = await conn.fetch(_OWNERSHIP_CENSUS_SQL, list(_UNFINISHED_STATES))
+        rows = await conn.fetch(
+            _OWNERSHIP_CENSUS_SQL,
+            list(_UNFINISHED_STATES),
+            STATELESS_OWNER_GAP_CODE,
+        )
     return [dict(row) for row in rows]
 
 
@@ -660,6 +714,39 @@ async def test_m1_m3_collision_matrix_has_exactly_one_owner(pg, monkeypatch):
         }
     )
 
+    # M3 owner-gap net: a terminal worker queue with no unfinished command has
+    # zero authority before the rescue.  Project-loop membership deliberately
+    # does not suppress the route: auto-completing would guess an outcome and
+    # re-enqueueing would execute the answered turn again.  The exceptional
+    # pending_review marker is instead one inert operator owner.
+    async with pg.acquire() as conn:
+        owner_gap_job = await _job(
+            conn,
+            label="m3-stateless-owner-gap-loop",
+            status="processing",
+            lane="stateless",
+            context={"loop_id": str(uuid4()), "loop_iteration": 7},
+        )
+        await conn.execute(
+            """
+            INSERT INTO run_queue (
+                unit_id, unit_kind, state, lease_token,
+                input_seq, consumed_seq
+            ) VALUES ($1, 'worker_batch', 'done', 4, 2, 2)
+            """,
+            owner_gap_job,
+        )
+
+    before_rescue = {row["description"]: row for row in await _census(pg)}
+    assert before_rescue["m3-stateless-owner-gap-loop"]["owner_count"] == 0
+    assert before_rescue["m3-stateless-owner-gap-loop"]["actor_terms"] == []
+
+    rescued = await router.park_stateless_owner_gaps_once()
+    assert [(row.job_id, row.queue_state) for row in rescued] == [
+        (str(owner_gap_job), "done")
+    ]
+    expected["m3-stateless-owner-gap-loop"] = ("pending_review", "operator")
+
     rows = await _census(pg)
     actual = {row["description"]: row for row in rows}
     assert set(actual) == set(expected)
@@ -670,6 +757,7 @@ async def test_m1_m3_collision_matrix_has_exactly_one_owner(pg, monkeypatch):
         "failed",
         "cancelled",
         "paused",
+        "pending_review",
         "waiting",
     }
 

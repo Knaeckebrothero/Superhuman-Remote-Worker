@@ -17,6 +17,8 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.services.completion_sweep_router import (
+    STATELESS_OWNER_GAP_CODE,
+    STATELESS_OWNER_GAP_MESSAGE,
     CompletionSweepRouter,
     _ClaimedAction,
 )
@@ -69,6 +71,108 @@ async def _job(pg) -> UUID:
             "VALUES ('completion router test', 'processing', 'pinned') "
             "RETURNING id"
         )
+
+
+async def _stateless_owner_gap_job(
+    pg,
+    *,
+    queue_state: str | None = "done",
+    status: str = "processing",
+    lane: str = "stateless",
+    assigned_agent_id: UUID | None = None,
+    lease_seconds: float | None = None,
+    context: dict | None = None,
+) -> UUID:
+    async with pg.acquire() as conn:
+        job_id = await conn.fetchval(
+            """
+            INSERT INTO jobs (
+                description, status, execution_lane, assigned_agent_id,
+                lease_expires_at, context
+            ) VALUES (
+                'stateless owner-gap test', $1, $2, $3,
+                CASE WHEN $4::float8 IS NULL THEN NULL
+                     ELSE now()+make_interval(secs => $4::float8) END,
+                $5::jsonb
+            )
+            RETURNING id
+            """,
+            status,
+            lane,
+            assigned_agent_id,
+            lease_seconds,
+            json.dumps(context or {}),
+        )
+        if queue_state is not None:
+            await conn.execute(
+                """
+                INSERT INTO run_queue (
+                    unit_id, unit_kind, state, lease_token, leased_by,
+                    leased_until, input_seq, consumed_seq,
+                    attempts_since_completion, last_leased_by
+                ) VALUES (
+                    $1, 'worker_batch', $2, 7,
+                    CASE WHEN $2='leased' THEN 'owner-gap-worker' END,
+                    CASE WHEN $2='leased' THEN now()+interval '5 minutes' END,
+                    3, 3, 2, 'prior-owner-gap-worker'
+                )
+                """,
+                job_id,
+                queue_state,
+            )
+        return job_id
+
+
+async def _settled_owner_gap_command(pg, job_id: UUID) -> UUID:
+    command_id = await _command(pg, job_id)
+    async with pg.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE job_completion_commands
+            SET state='done', attempts=1,
+                outcome='{\"new_status\":\"processing\"}'::jsonb,
+                finalized_at=now(), finalizing_by=NULL,
+                lease_expires_at=NULL
+            WHERE id=$1
+            """,
+            command_id,
+        )
+        await conn.execute(
+            """
+            INSERT INTO completion_effects (
+                producer_kind, producer_id, scope_id, effect_name,
+                effect_group, state, attempts, completed_at, detail
+            ) VALUES (
+                'job_completion', $1, $2, 'test_settled_effect',
+                'notification', 'done', 1, now(),
+                '{\"settled\":true}'::jsonb
+            )
+            """,
+            command_id,
+            job_id,
+        )
+        await conn.execute(
+            "UPDATE jobs SET completion_sweep_attempt_hwm=1 WHERE id=$1",
+            job_id,
+        )
+        # Match the preserved specimen exactly: its already-done historical
+        # action records command_attempt=0 while the settled command is now at
+        # attempts=1.  The rescue must preserve both rows byte-for-byte.
+        await conn.execute(
+            """
+            INSERT INTO job_completion_sweep_actions (
+                job_id, attempt, command_id, command_attempt, route,
+                source, state, claimed_at, result, completed_at
+            ) VALUES (
+                $1, 1, $2, 0, 'resume_finalizer',
+                'settled-owner-gap-fixture', 'done', now(),
+                '{\"route\":\"resume_finalizer\"}'::jsonb, now()
+            )
+            """,
+            job_id,
+            command_id,
+        )
+    return command_id
 
 
 async def _command(
@@ -378,6 +482,244 @@ async def test_missing_command_is_legacy_and_live_finalizer_stands_down(pg):
             )
             == 0
         )
+
+
+@pytest.mark.asyncio
+async def test_stateless_owner_gap_two_routers_park_once_without_protocol_mutation(pg):
+    """The preserved-specimen shape becomes inert operator-owned work once."""
+
+    job_id = await _stateless_owner_gap_job(
+        pg,
+        context={
+            # Project-loop jobs normally must never drift into pending_review.
+            # A zero-owner terminal-queue residue is the exceptional case: an
+            # operator must decide its already-executed turn, never an inferred
+            # auto-complete or a re-executing enqueue.
+            "loop_id": str(uuid4()),
+            "loop_iteration": 4,
+        },
+    )
+    command_id = await _settled_owner_gap_command(pg, job_id)
+    async with pg.acquire() as conn:
+        queue_before = dict(
+            await conn.fetchrow("SELECT * FROM run_queue WHERE unit_id=$1", job_id)
+        )
+        command_before = dict(
+            await conn.fetchrow(
+                "SELECT * FROM job_completion_commands WHERE id=$1", command_id
+            )
+        )
+        effect_before = dict(
+            await conn.fetchrow(
+                "SELECT * FROM completion_effects WHERE producer_id=$1", command_id
+            )
+        )
+        action_before = dict(
+            await conn.fetchrow(
+                "SELECT * FROM job_completion_sweep_actions WHERE job_id=$1", job_id
+            )
+        )
+
+    alerts: list[str] = []
+    finalizer = SimpleNamespace(finalize_command=AsyncMock())
+    routers = [
+        CompletionSweepRouter(
+            pg,
+            finalizer,
+            alerts.append,
+            claimant_id=f"owner-gap-router-{suffix}",
+        )
+        for suffix in ("a", "b")
+    ]
+
+    results = await asyncio.gather(
+        *(router.park_stateless_owner_gaps_once() for router in routers)
+    )
+
+    parked = [result for batch in results for result in batch]
+    assert [(result.job_id, result.queue_state) for result in parked] == [
+        (str(job_id), "done")
+    ]
+    assert len(alerts) == 1
+    assert str(job_id) in alerts[0]
+    assert f"code={STATELESS_OWNER_GAP_CODE}" in alerts[0]
+    finalizer.finalize_command.assert_not_awaited()
+
+    async with pg.acquire() as conn:
+        job = await conn.fetchrow(
+            "SELECT status::text AS status, lease_expires_at, error_message, "
+            "error_details, context FROM jobs WHERE id=$1",
+            job_id,
+        )
+        queue_after = dict(
+            await conn.fetchrow("SELECT * FROM run_queue WHERE unit_id=$1", job_id)
+        )
+        command_after = dict(
+            await conn.fetchrow(
+                "SELECT * FROM job_completion_commands WHERE id=$1", command_id
+            )
+        )
+        effect_after = dict(
+            await conn.fetchrow(
+                "SELECT * FROM completion_effects WHERE producer_id=$1", command_id
+            )
+        )
+        action_after = dict(
+            await conn.fetchrow(
+                "SELECT * FROM job_completion_sweep_actions WHERE job_id=$1", job_id
+            )
+        )
+    error_details = job["error_details"]
+    if isinstance(error_details, str):
+        error_details = json.loads(error_details)
+    context = job["context"]
+    if isinstance(context, str):
+        context = json.loads(context)
+    assert job["status"] == "pending_review"
+    assert job["lease_expires_at"] is None
+    assert job["error_message"] == STATELESS_OWNER_GAP_MESSAGE
+    assert error_details == {
+        "code": STATELESS_OWNER_GAP_CODE,
+        "route": "park_alert",
+        "queue_state": "done",
+    }
+    assert context["loop_iteration"] == 4
+    assert queue_after == queue_before
+    assert command_after == command_before
+    assert effect_after == effect_before
+    assert action_after == action_before
+
+
+@pytest.mark.asyncio
+async def test_stateless_owner_gap_absent_parity_and_fail_closed_exclusions(pg):
+    absent = await _stateless_owner_gap_job(pg, queue_state=None)
+    expired_lease = await _stateless_owner_gap_job(pg, lease_seconds=-1)
+    excluded: set[UUID] = set()
+    for queue_state in ("queued", "leased", "parked"):
+        excluded.add(await _stateless_owner_gap_job(pg, queue_state=queue_state))
+    excluded.add(
+        await _stateless_owner_gap_job(pg, status="paused", queue_state="done")
+    )
+    excluded.add(
+        await _stateless_owner_gap_job(pg, status="completed", queue_state="done")
+    )
+    excluded.add(await _stateless_owner_gap_job(pg, lane="pinned", queue_state="done"))
+    wrong_kind = await _stateless_owner_gap_job(pg)
+    async with pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE run_queue SET unit_kind='session_turn' WHERE unit_id=$1",
+            wrong_kind,
+        )
+    excluded.add(wrong_kind)
+    excluded.add(await _stateless_owner_gap_job(pg, lease_seconds=600))
+
+    async with pg.acquire() as conn:
+        agent_id = await conn.fetchval(
+            "INSERT INTO agents (config_name, hostname, status) "
+            "VALUES ('developer', $1, 'working') RETURNING id",
+            f"owner-gap-agent-{uuid4()}",
+        )
+    excluded.add(await _stateless_owner_gap_job(pg, assigned_agent_id=agent_id))
+    excluded.add(
+        await _stateless_owner_gap_job(
+            pg,
+            context={
+                "_completion_control_claim": {
+                    "version": 1,
+                    "claim_id": str(uuid4()),
+                    "expires_epoch": 4_000_000_000,
+                }
+            },
+        )
+    )
+    excluded.add(
+        await _stateless_owner_gap_job(
+            pg,
+            context={"_completion_control_claim": "malformed-fails-closed"},
+        )
+    )
+    for command_state in ("pending", "finalizing", "parked"):
+        job_id = await _stateless_owner_gap_job(pg)
+        await _command(pg, job_id, state=command_state)
+        excluded.add(job_id)
+
+    alerts: list[str] = []
+    finalizer = SimpleNamespace(finalize_command=AsyncMock())
+    router = CompletionSweepRouter(pg, finalizer, alerts.append)
+
+    parked = await router.park_stateless_owner_gaps_once(limit=100)
+
+    assert {(UUID(result.job_id), result.queue_state) for result in parked} == {
+        (absent, "absent"),
+        (expired_lease, "done"),
+    }
+    assert len(alerts) == 2
+    finalizer.finalize_command.assert_not_awaited()
+    async with pg.acquire() as conn:
+        parked_rows = await conn.fetch(
+            "SELECT id, status::text AS status, lease_expires_at, error_details "
+            "FROM jobs WHERE id=ANY($1::uuid[]) ORDER BY id",
+            [absent, expired_lease],
+        )
+        excluded_statuses = await conn.fetch(
+            "SELECT id, status::text AS status FROM jobs WHERE id=ANY($1::uuid[])",
+            list(excluded),
+        )
+    assert all(row["status"] == "pending_review" for row in parked_rows)
+    assert all(row["lease_expires_at"] is None for row in parked_rows)
+    assert {row["status"] for row in excluded_statuses} == {
+        "processing",
+        "paused",
+        "completed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_stateless_owner_gap_loses_to_concurrent_queue_reactivation(pg):
+    job_id = await _stateless_owner_gap_job(pg)
+    alerts: list[str] = []
+    router = CompletionSweepRouter(
+        pg,
+        SimpleNamespace(finalize_command=AsyncMock()),
+        alerts.append,
+    )
+    blocker = await pg.acquire()
+    transaction = blocker.transaction()
+    await transaction.start()
+    committed = False
+    rescue_task = None
+    try:
+        await blocker.fetchrow(
+            "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE", job_id
+        )
+        rescue_task = asyncio.create_task(router.park_stateless_owner_gaps_once())
+        await asyncio.sleep(0.05)
+        assert not rescue_task.done()
+        await blocker.execute(
+            "UPDATE run_queue SET state='queued', run_after=now() WHERE unit_id=$1",
+            job_id,
+        )
+        await transaction.commit()
+        committed = True
+        assert await asyncio.wait_for(rescue_task, timeout=2) == ()
+    finally:
+        if not committed:
+            await transaction.rollback()
+        if rescue_task is not None and not rescue_task.done():
+            rescue_task.cancel()
+            await asyncio.gather(rescue_task, return_exceptions=True)
+        await pg.release(blocker)
+
+    async with pg.acquire() as conn:
+        job_status = await conn.fetchval(
+            "SELECT status::text FROM jobs WHERE id=$1", job_id
+        )
+        queue_state = await conn.fetchval(
+            "SELECT state FROM run_queue WHERE unit_id=$1", job_id
+        )
+    assert job_status == "processing"
+    assert queue_state == "queued"
+    assert alerts == []
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ import pytest
 
 from orchestrator.services.completion_sweep_router import (
     ACTION_RESULT_LIMIT_BYTES,
+    STATELESS_OWNER_GAP_MESSAGE,
     CompletionSweepRouter,
     _ClaimedAction,
     _bounded_action_result,
@@ -195,6 +196,7 @@ def test_inputs_and_durable_result_are_bounded() -> None:
         CompletionSweepRouter(object(), finalizer, claimant_id="  ")
     with pytest.raises(ValueError, match="8 KiB"):
         _bounded_action_result({"detail": "x" * ACTION_RESULT_LIMIT_BYTES})
+    assert 0 < len(STATELESS_OWNER_GAP_MESSAGE) <= 256
 
 
 @pytest.mark.asyncio
@@ -241,9 +243,11 @@ async def test_maintenance_runs_nonexecuting_safety_net() -> None:
         SimpleNamespace(finalize_command=AsyncMock()),
         safety_net=safety,
     )
+    router.park_stateless_owner_gaps_once = AsyncMock(return_value=())
 
     await router.maintenance_once()
 
+    router.park_stateless_owner_gaps_once.assert_awaited_once_with(limit=50)
     safety.reconcile_batch.assert_awaited_once_with(limit=50)
 
 
@@ -257,7 +261,28 @@ async def test_maintenance_failure_isolated_from_router_tick(caplog) -> None:
         SimpleNamespace(finalize_command=AsyncMock()),
         safety_net=safety,
     )
+    router.park_stateless_owner_gaps_once = AsyncMock(return_value=())
 
     await router.maintenance_once()
 
     assert "completion safety-net tick failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_owner_gap_failure_isolated_from_existing_safety_net(caplog) -> None:
+    safety = SimpleNamespace(
+        reconcile_batch=AsyncMock(return_value=SimpleNamespace(scanned=0, results=()))
+    )
+    router = CompletionSweepRouter(
+        object(),
+        SimpleNamespace(finalize_command=AsyncMock()),
+        safety_net=safety,
+    )
+    router.park_stateless_owner_gaps_once = AsyncMock(
+        side_effect=RuntimeError("owner-gap scan unavailable")
+    )
+
+    await router.maintenance_once()
+
+    assert "stateless owner-gap rescue tick failed" in caplog.text
+    safety.reconcile_batch.assert_awaited_once_with(limit=50)
