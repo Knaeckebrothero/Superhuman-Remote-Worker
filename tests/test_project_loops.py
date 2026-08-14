@@ -608,3 +608,61 @@ class TestHistoryNamesTheDelivery:
     def test_record_without_a_pull_request_is_unchanged(self) -> None:
         rendered = project_loops_service.render_loop_job_history([self._record([])])
         assert rendered.rstrip().endswith("Shipped the theme studies.")
+
+
+class TestNextStageIndex:
+    """Rotation must not step past a turn that produced nothing.
+
+    docs/features/better_resavio_restart_status.md §6c. A turn in which every
+    member failed leaves the next role nothing new to work from. The canonical
+    case is a failed critic: the developer runs anyway and builds on the
+    previous iteration's verdict as though it were fresh, because the engine
+    deliberately cannot read verdicts (they live in KB notes).
+
+    Re-running the stage is bounded by the loop's existing
+    consecutive-failure stop, so this cannot spin.
+    """
+
+    def test_a_successful_turn_advances(self) -> None:
+        assert project_loops_service.next_stage_index(
+            seq_index_completed=0, stage_count=3, turn_all_failed=False
+        ) == (1, False)
+
+    def test_the_last_stage_wraps_the_cycle(self) -> None:
+        assert project_loops_service.next_stage_index(
+            seq_index_completed=2, stage_count=3, turn_all_failed=False
+        ) == (0, True)
+
+    def test_a_fully_failed_turn_reruns_its_own_stage(self) -> None:
+        assert project_loops_service.next_stage_index(
+            seq_index_completed=1, stage_count=3, turn_all_failed=True
+        ) == (1, False)
+
+    def test_a_failed_last_stage_does_not_wrap(self) -> None:
+        """Retrying stage 2 is not a completed cycle.
+
+        Reporting a wrap here would tick the KB convergence TTL a second
+        time for a cycle that never finished, ageing notes toward
+        re-verification on the strength of a failure.
+        """
+        assert project_loops_service.next_stage_index(
+            seq_index_completed=2, stage_count=3, turn_all_failed=True
+        ) == (2, False)
+
+    def test_single_stage_loop_wraps_on_success(self) -> None:
+        assert project_loops_service.next_stage_index(
+            seq_index_completed=0, stage_count=1, turn_all_failed=False
+        ) == (0, True)
+
+    def test_single_stage_loop_failure_is_a_retry_not_a_wrap(self) -> None:
+        assert project_loops_service.next_stage_index(
+            seq_index_completed=0, stage_count=1, turn_all_failed=True
+        ) == (0, False)
+
+    def test_degenerate_stage_count_does_not_raise(self) -> None:
+        """A malformed loop row must not take the advance down with a
+        ZeroDivisionError — the rotate is the only thing that keeps a
+        running loop moving."""
+        assert project_loops_service.next_stage_index(
+            seq_index_completed=0, stage_count=0, turn_all_failed=False
+        ) == (0, False)

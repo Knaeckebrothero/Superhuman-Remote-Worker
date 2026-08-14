@@ -607,3 +607,57 @@ class TestParkThreading:
 
             await _spawn_loop_job(loop, role="critic", iteration=2, park_until=park)
         assert create.await_args.kwargs["park_until"] == park
+
+
+class TestTurnOutcomeReachesRotation:
+    """The rotate must be told the TURN outcome, not one member's.
+
+    ``completed_failed`` is the barrier winner's own status. On a fan-out
+    turn that is whichever member happened to finish last, which says
+    nothing about whether the turn produced anything. Rotation decisions
+    need the aggregate — docs/features/better_resavio_restart_status.md §6c.
+    """
+
+    @pytest.mark.asyncio
+    async def test_all_members_failed_is_reported_to_the_rotate(self):
+        job = _job(status="failed", role="critic")
+        loop = _loop(current_job_id=job["id"], current_stage_jobs=[job["id"]])
+        db = _advance_db(loop, [job])
+        rotate = AsyncMock()
+        with ExitStack() as stack:
+            _advance_patches(stack, db, rotate=rotate)
+            from main import _advance_project_loop
+
+            await _advance_project_loop(job, {"error": "critic blew up"}, [])
+        kw = rotate.await_args.kwargs
+        assert kw["turn_all_failed"] is True
+        assert kw["consecutive"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_successful_turn_is_not_reported_as_failed(self):
+        job = _job(role="critic")
+        loop = _loop(current_job_id=job["id"], current_stage_jobs=[job["id"]])
+        db = _advance_db(loop, [job])
+        rotate = AsyncMock()
+        with ExitStack() as stack:
+            _advance_patches(stack, db, rotate=rotate)
+            from main import _advance_project_loop
+
+            await _advance_project_loop(job, {}, [])
+        assert rotate.await_args.kwargs["turn_all_failed"] is False
+
+    @pytest.mark.asyncio
+    async def test_one_surviving_member_is_not_a_failed_turn(self):
+        """Partial success means SOMETHING landed — rotation should advance."""
+        ok, bad = _job(role="scholar"), _job(status="failed", role="scholar")
+        loop = _loop(current_stage_jobs=[ok["id"], bad["id"]], current_job_id=ok["id"])
+        db = _advance_db(loop, [ok, bad])
+        rotate = AsyncMock()
+        with ExitStack() as stack:
+            _advance_patches(stack, db, rotate=rotate)
+            from main import _advance_project_loop
+
+            await _advance_project_loop(bad, {"error": "one leg died"}, [])
+        kw = rotate.await_args.kwargs
+        assert kw["turn_all_failed"] is False
+        assert kw["consecutive"] == 0

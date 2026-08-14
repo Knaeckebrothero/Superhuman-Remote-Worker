@@ -246,6 +246,48 @@ def validate_campaign_caps(overrides: dict[str, Any]) -> dict[str, int]:
     return out
 
 
+def next_stage_index(
+    *, seq_index_completed: int, stage_count: int, turn_all_failed: bool
+) -> tuple[int, bool]:
+    """Which stage runs next, and whether the cycle wrapped.
+
+    A turn in which EVERY member failed produced nothing for the next role
+    to work from, so it re-runs its own stage instead of advancing. The
+    canonical harm is a failed critic: rotation would hand the developer its
+    slot anyway, and the developer would build on the PREVIOUS iteration's
+    verdict as though it were fresh — the engine deliberately cannot read
+    verdicts to notice (they live in KB notes, see ``validate_loop_plan``).
+
+    A partly-failed turn still advances: something landed, and the next role
+    has real input.
+
+    This also un-masks the failure. ``consecutive_failures`` resets to 0 on
+    any turn that is not wholly failed, so under blind rotation a critic
+    could fail on EVERY cycle and never trip ``max_consecutive_failures`` —
+    the successful developer that followed it always reset the counter. The
+    loop would run its full budget on unjudged work and stop with
+    ``stop_reason='budget'``, reporting no failures at all. Re-running the
+    failed stage puts consecutive failures back-to-back, so the existing
+    stop (evaluated before rotation) actually trips and halts a permanently
+    broken stage instead of letting it spin invisibly.
+
+    A retry costs an iteration of budget, which is correct: it is a real
+    job that really runs.
+
+    The second element is ``cycle_wrapped``. A retry is never a wrap: the
+    KB convergence TTL must not age notes toward re-verification on the
+    strength of a cycle that failed to complete.
+    """
+    if stage_count <= 0:
+        # A malformed role_sequence must not take the advance down — the
+        # rotate is the only thing keeping a running loop moving.
+        return 0, False
+    if turn_all_failed:
+        return seq_index_completed % stage_count, False
+    next_index = (seq_index_completed + 1) % stage_count
+    return next_index, next_index == 0
+
+
 def planner_slots(role_sequence: list[Any]) -> tuple[int, int]:
     """Locate a planner loop's (critic_slot, execution_slot) in the template.
 
