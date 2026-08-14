@@ -10,6 +10,7 @@ from src.services.forge import (
     ForgeError,
     ForgeRepo,
     GitHubClient,
+    get_pull_request_status,
     open_pull_request,
     parse_owner_repo,
     resolve_api_base,
@@ -23,6 +24,7 @@ def test_parse_owner_repo_handles_url_shapes():
         "acme",
         "widget",
     )
+    assert parse_owner_repo("git@github.com:acme/widget.git") == ("acme", "widget")
 
 
 def test_resolve_api_base_per_forge():
@@ -41,6 +43,17 @@ def test_resolve_api_base_per_forge():
     assert (
         resolve_api_base("https://gitlab.com/a/b", "gitlab")
         == "https://gitlab.com/api/v4"
+    )
+    assert (
+        resolve_api_base("git@github.com:acme/widget.git", "github")
+        == "https://api.github.com"
+    )
+
+
+def test_resolve_api_base_never_carries_clone_url_credentials():
+    assert (
+        resolve_api_base("https://oauth2:sekrit@git.example.test/a/b.git", "gitea")
+        == "https://git.example.test/api/v1"
     )
 
 
@@ -65,6 +78,119 @@ def _capture(status=201, payload=None):
         return httpx.Response(status, json=payload or {})
 
     return httpx.MockTransport(handler), seen
+
+
+def _capture_get(status=200, payload=None):
+    """Return a transport recording one credential-bearing status GET."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(status, json=payload or {})
+
+    return httpx.MockTransport(handler), seen
+
+
+@pytest.mark.asyncio
+async def test_github_pr_status_distinguishes_merged_from_closed(monkeypatch):
+    transport, seen = _capture_get(
+        payload={
+            "number": 7,
+            "html_url": "https://github.com/acme/widget/pull/7",
+            "state": "closed",
+            "merged": True,
+            "draft": False,
+            "head": {"ref": "feature/review"},
+            "base": {"ref": "develop"},
+        }
+    )
+    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+
+    target = ForgeRepo("github", "https://api.github.com", "acme", "widget", "tok")
+    out = await get_pull_request_status(target, 7)
+
+    assert seen["method"] == "GET"
+    assert seen["url"] == "https://api.github.com/repos/acme/widget/pulls/7"
+    assert seen["headers"]["authorization"] == "Bearer tok"
+    assert out == {
+        "number": 7,
+        "url": "https://github.com/acme/widget/pull/7",
+        "state": "merged",
+        "head": "feature/review",
+        "base": "develop",
+        "draft": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_gitea_pr_status_normalizes_open(monkeypatch):
+    transport, seen = _capture_get(
+        payload={
+            "number": 3,
+            "html_url": "https://git.example.test/acme/widget/pulls/3",
+            "state": "open",
+            "merged": False,
+            "head": {"ref": "job/abc"},
+            "base": {"ref": "main"},
+        }
+    )
+    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+
+    target = ForgeRepo(
+        "gitea", "https://git.example.test/api/v1", "acme", "widget", "tok"
+    )
+    out = await get_pull_request_status(target, 3)
+
+    assert seen["url"] == "https://git.example.test/api/v1/repos/acme/widget/pulls/3"
+    assert seen["headers"]["authorization"] == "token tok"
+    assert out["state"] == "open"
+    assert out["draft"] is False
+
+
+@pytest.mark.asyncio
+async def test_gitlab_pr_status_uses_iid_and_normalizes_locked_as_closed(monkeypatch):
+    transport, seen = _capture_get(
+        payload={
+            "iid": 11,
+            "web_url": "https://gitlab.com/acme/widget/-/merge_requests/11",
+            "state": "locked",
+            "source_branch": "job/abc",
+            "target_branch": "main",
+            "draft": True,
+        }
+    )
+    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+
+    target = ForgeRepo("gitlab", "https://gitlab.com/api/v4", "acme", "widget", "tok")
+    out = await get_pull_request_status(target, 11)
+
+    assert seen["url"] == (
+        "https://gitlab.com/api/v4/projects/acme%2Fwidget/merge_requests/11"
+    )
+    assert seen["headers"]["private-token"] == "tok"
+    assert out == {
+        "number": 11,
+        "url": "https://gitlab.com/acme/widget/-/merge_requests/11",
+        "state": "closed",
+        "head": "job/abc",
+        "base": "main",
+        "draft": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_pr_status_errors_do_not_leak_the_token(monkeypatch):
+    transport, _ = _capture_get(status=403, payload={"message": "forbidden"})
+    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+
+    target = ForgeRepo("github", "https://api.github.com", "acme", "widget", "sekrit")
+    with pytest.raises(ForgeError) as exc:
+        await get_pull_request_status(target, 7)
+
+    assert "403" in str(exc.value)
+    assert "sekrit" not in str(exc.value)
 
 
 @pytest.mark.asyncio

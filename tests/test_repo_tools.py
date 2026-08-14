@@ -85,6 +85,32 @@ async def test_repo_pull_is_allowed_on_read_only_datasource():
 
 
 @pytest.mark.asyncio
+async def test_repo_pr_status_is_allowed_on_read_only_datasource():
+    context, _ = make_context(read_only=True)
+    tool = get_tool(create_repo_tools(context), "repo_pr_status")
+
+    with patch(
+        "src.tools.repo.repo_tools.get_pull_request_status",
+        return_value={
+            "number": 9,
+            "url": "https://github.com/acme/widget/pull/9",
+            "state": "open",
+            "head": "job/abc12345",
+            "base": "develop",
+            "draft": False,
+        },
+    ) as mock_status:
+        out = await tool.ainvoke({"repo": "widget", "number": 9})
+
+    target = mock_status.call_args.args[0]
+    assert target.forge == "github"
+    assert target.owner == "acme"
+    assert target.token == "tok"
+    assert "open" in out.lower()
+    assert "https://github.com/acme/widget/pull/9" in out
+
+
+@pytest.mark.asyncio
 async def test_repo_open_pr_calls_the_forge_adapter():
     context, _ = make_context()
     tool = get_tool(create_repo_tools(context), "repo_open_pr")
@@ -195,9 +221,9 @@ async def test_unknown_repo_name_is_a_clear_error():
 def make_context_without_metadata():
     """A clone that registered but whose forge metadata capture failed.
 
-    Real and reachable: an SSH-form ``connection_url`` (``git@host:owner/repo``)
-    makes ``resolve_api_base`` raise, the clone swallows it, and the repo lands
-    in ``source_repos`` with no ``source_repo_meta`` entry at all.
+    Real and reachable: a malformed/legacy connection URL makes metadata
+    resolution fail, the clone keeps working, and the repo lands in
+    ``source_repos`` with no ``source_repo_meta`` entry at all.
     """
     ws = MagicMock()
     git_mgr = MagicMock()

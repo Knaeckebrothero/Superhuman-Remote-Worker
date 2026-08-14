@@ -2520,6 +2520,12 @@
       "sourceRepository": "Source repository",
       "branch": "Branch {{branch}}",
       "pullRequest": "Pull request #{{number}}",
+      "pullRequestState": {
+        "open": "Open",
+        "merged": "Merged",
+        "closed": "Closed",
+        "unavailable": "Status unavailable"
+      },
       "jobWorkspace": "Job workspace",
       "startingIde": "Starting IDE...",
       "openIde": "Open in Web IDE",

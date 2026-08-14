@@ -2,7 +2,7 @@ import {Component, computed, effect, inject, signal} from '@angular/core';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {DataService} from '../../core/services/data.service';
-import {Datasource, Job, RepositoryForge} from '../../core/models/api.model';
+import {Datasource, Job, PullRequestStatus, RepositoryForge} from '../../core/models/api.model';
 import {environment} from '../../core/environment';
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
@@ -308,6 +308,11 @@ export function selectDeliveryRepository(
                 @if (pullRequest(); as pr) {
                   <app-button variant="info" size="sm" (clicked)="openExternal(pr.url)">
                     {{ 'jobReview.links.pullRequest' | transloco: { number: pr.number } }}
+                    @if (pullRequestStatus(); as live) {
+                      · {{ ('jobReview.links.pullRequestState.' + live.state) | transloco }}
+                    } @else if (pullRequestStatusUnavailable()) {
+                      · {{ 'jobReview.links.pullRequestState.unavailable' | transloco }}
+                    }
                   </app-button>
                 }
                 @if (getJobWorkspaceUrl()) {
@@ -771,6 +776,8 @@ export class JobReviewComponent {
   readonly currentJobId = this.data.currentJobId;
   readonly job = signal<Job | null>(null);
   readonly repositoryDatasources = signal<Datasource[]>([]);
+  readonly pullRequestStatus = signal<PullRequestStatus | null>(null);
+  readonly pullRequestStatusUnavailable = signal(false);
   readonly pullRequest = computed(() => pullRequestFromJob(this.job()));
   readonly sourceRepository = computed(() =>
     selectDeliveryRepository(this.repositoryDatasources(), this.pullRequest()),
@@ -815,6 +822,8 @@ export class JobReviewComponent {
       } else {
         this.job.set(null);
         this.repositoryDatasources.set([]);
+        this.pullRequestStatus.set(null);
+        this.pullRequestStatusUnavailable.set(false);
         this.frozenData.set(null);
         this.resultMessage.set(null);
       }
@@ -838,6 +847,8 @@ export class JobReviewComponent {
     this.isLoading.set(true);
     this.resultMessage.set(null);
     this.repositoryDatasources.set([]);
+    this.pullRequestStatus.set(null);
+    this.pullRequestStatusUnavailable.set(false);
 
     this.api.getJob(jobId).subscribe((job) => {
       this.job.set(job);
@@ -845,6 +856,9 @@ export class JobReviewComponent {
 
       if (job) {
         this.loadRepositoryDatasources(jobId);
+        if (this.pullRequest()) {
+          this.loadPullRequestStatus(jobId);
+        }
       }
 
       // If pending_review, also fetch workspace to get frozen job data
@@ -866,6 +880,14 @@ export class JobReviewComponent {
     this.api.getJobDatasources(jobId).subscribe((datasources) => {
       if (this.currentJobId() !== jobId) return;
       this.repositoryDatasources.set(datasources.filter((item) => item.type === 'repository'));
+    });
+  }
+
+  private loadPullRequestStatus(jobId: string): void {
+    this.api.getJobPullRequestStatus(jobId).subscribe((status) => {
+      if (this.currentJobId() !== jobId) return;
+      this.pullRequestStatus.set(status);
+      this.pullRequestStatusUnavailable.set(status === null);
     });
   }
 

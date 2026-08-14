@@ -269,7 +269,12 @@ class GitHubClient:
 
 def parse_owner_repo(url: str) -> tuple[str, str]:
     """Return ``(owner, repo)`` from a repository URL."""
-    path = urlparse(url.strip()).path.strip("/")
+    raw = url.strip()
+    prefix, separator, scp_path = raw.partition(":")
+    if "://" not in raw and separator and "/" in scp_path and "/" not in prefix:
+        path = scp_path.strip("/")
+    else:
+        path = urlparse(raw).path.strip("/")
     if path.endswith(".git"):
         path = path[:-4]
     parts = [p for p in path.split("/") if p]
@@ -286,14 +291,24 @@ def resolve_api_base(url: str, forge: str) -> str:
         raise ForgeError(
             f"Unsupported forge {forge!r}; expected one of {sorted(SUPPORTED_FORGES)}"
         )
-    parsed = urlparse(url.strip())
-    if not parsed.hostname:
+    raw = url.strip()
+    prefix, separator, scp_path = raw.partition(":")
+    scp_host = None
+    if "://" not in raw and separator and "/" in scp_path and "/" not in prefix:
+        scp_host = prefix.rsplit("@", 1)[-1]
+
+    parsed = urlparse(raw)
+    hostname = scp_host or parsed.hostname
+    if not hostname:
         raise ForgeError(f"Cannot parse host from URL: {url!r}")
-    origin = f"{parsed.scheme or 'https'}://{parsed.netloc}"
+    scheme = parsed.scheme if parsed.scheme in {"http", "https"} else "https"
+    host_for_url = f"[{hostname}]" if ":" in hostname else hostname
+    port = f":{parsed.port}" if not scp_host and parsed.port else ""
+    origin = f"{scheme}://{host_for_url}{port}"
 
     if forge == "github":
         # github.com routes to the SaaS API host; Enterprise uses /api/v3.
-        if parsed.hostname.lower() in ("github.com", "www.github.com"):
+        if hostname.lower() in ("github.com", "www.github.com"):
             return "https://api.github.com"
         return f"{origin}/api/v3"
     if forge == "gitea":
@@ -336,6 +351,119 @@ def _request_for(
     }
     payload = {"title": title, "head": head, "base": base, "body": body}
     return url, headers, payload
+
+
+def _status_request_for(target: ForgeRepo, number: int) -> tuple[str, dict[str, str]]:
+    """Return the forge-specific URL and headers for one PR status read."""
+    if target.forge == "gitlab":
+        url = (
+            f"{target.api_base}/projects/"
+            f"{_gitlab_project_path(target.owner, target.repo)}/"
+            f"merge_requests/{number}"
+        )
+        headers = {"Accept": "application/json"}
+        if target.token:
+            headers["PRIVATE-TOKEN"] = target.token
+        return url, headers
+
+    url = f"{target.api_base}/repos/{target.owner}/{target.repo}/pulls/{number}"
+    headers = {"Accept": "application/json"}
+    if target.token:
+        scheme = "token" if target.forge == "gitea" else "Bearer"
+        headers["Authorization"] = f"{scheme} {target.token}"
+    return url, headers
+
+
+def _response_error_detail(response: httpx.Response) -> str:
+    """Return a bounded forge error without ever inspecting request headers."""
+    try:
+        data = response.json()
+    except ValueError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("message") or data.get("error") or "")[:200]
+
+
+async def get_pull_request_status(target: ForgeRepo, number: int) -> dict:
+    """Read and normalize one pull/merge request across supported forges.
+
+    The stable state vocabulary is ``open | merged | closed``. GitHub and
+    Gitea both report merged PRs as closed, so their explicit ``merged`` flag
+    takes precedence over ``state``. GitLab reports merged directly and calls
+    open merge requests ``opened``.
+    """
+    if target.forge not in SUPPORTED_FORGES:
+        raise ForgeError(f"Unsupported forge {target.forge!r}")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise ForgeError("Pull request number must be a positive integer")
+
+    url, headers = _status_request_for(target, number)
+    try:
+        async with httpx.AsyncClient(timeout=30.0, transport=_transport) as client:
+            response = await client.get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        raise ForgeError(f"Could not reach {target.forge}: {exc}") from exc
+
+    if response.status_code != 200:
+        detail = _response_error_detail(response)
+        raise ForgeError(
+            f"{target.forge} refused the pull request status read "
+            f"(HTTP {response.status_code}){': ' + detail if detail else ''}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ForgeError(f"{target.forge} returned malformed PR status JSON") from exc
+    if not isinstance(data, dict):
+        raise ForgeError(f"{target.forge} returned malformed PR status data")
+
+    remote_number = data.get("number", data.get("iid"))
+    if remote_number is not None:
+        try:
+            if int(remote_number) != number:
+                raise ForgeError(
+                    f"{target.forge} returned a different pull request number"
+                )
+        except (TypeError, ValueError) as exc:
+            raise ForgeError(
+                f"{target.forge} returned a malformed pull request number"
+            ) from exc
+
+    raw_state = str(data.get("state") or "").strip().lower()
+    if target.forge == "gitlab":
+        state = {
+            "opened": "open",
+            "merged": "merged",
+            "closed": "closed",
+            "locked": "closed",
+        }.get(raw_state)
+        head = data.get("source_branch")
+        base = data.get("target_branch")
+    else:
+        if data.get("merged") is True or data.get("merged_at"):
+            state = "merged"
+        else:
+            state = {"open": "open", "closed": "closed"}.get(raw_state)
+        raw_head = data.get("head")
+        raw_base = data.get("base")
+        head = raw_head.get("ref") if isinstance(raw_head, dict) else None
+        base = raw_base.get("ref") if isinstance(raw_base, dict) else None
+    if state is None:
+        raise ForgeError(
+            f"{target.forge} returned an unknown pull request state {raw_state!r}"
+        )
+
+    link = data.get("html_url") or data.get("web_url") or ""
+    return {
+        "number": number,
+        "url": str(link),
+        "state": state,
+        "head": str(head or ""),
+        "base": str(base or ""),
+        "draft": bool(data.get("draft") or data.get("work_in_progress")),
+    }
 
 
 async def open_pull_request(

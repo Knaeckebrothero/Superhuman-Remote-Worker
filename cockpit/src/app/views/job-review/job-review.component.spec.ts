@@ -5,7 +5,7 @@ import { of } from 'rxjs';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import en from '../../../assets/i18n/en.json';
-import { Datasource, Job } from '../../core/models/api.model';
+import { Datasource, Job, PullRequestStatus } from '../../core/models/api.model';
 import { ApiService } from '../../core/services/api.service';
 import { DataService } from '../../core/services/data.service';
 import {
@@ -18,6 +18,16 @@ import {
 
 const JOB_ID = '29c28492-df7c-4eb3-847f-38892557ac4e';
 const PR_URL = 'https://github.com/Knaeckebrothero/KurortEngine/pull/1';
+const OPEN_STATUS: PullRequestStatus = {
+  forge: 'github',
+  repo: 'Knaeckebrothero/KurortEngine',
+  number: 1,
+  url: PR_URL,
+  state: 'open',
+  head: 'design/hotel-rheinland-theme',
+  base: 'main',
+  draft: false,
+};
 
 function repository(id: string, connectionUrl: string): Datasource {
   return {
@@ -175,11 +185,13 @@ describe('JobReviewComponent delivery section', () => {
         base: 'main',
       },
     }),
+    liveStatus: PullRequestStatus | null = OPEN_STATUS,
   ): Promise<HTMLElement> {
     const job = reviewJob(context);
     const api = {
       getJob: vi.fn().mockReturnValue(of(job)),
       getFrozenJobData: vi.fn().mockReturnValue(of({ summary: 'Theme delivered' })),
+      getJobPullRequestStatus: vi.fn().mockReturnValue(of(liveStatus)),
       getJobDatasources: vi
         .fn()
         .mockReturnValue(
@@ -213,17 +225,22 @@ describe('JobReviewComponent delivery section', () => {
     await fixture.whenStable();
     fixture.detectChanges();
     expect(api.getJobDatasources).toHaveBeenCalledWith(JOB_ID);
+    if (pullRequestFromJob(job)) {
+      expect(api.getJobPullRequestStatus).toHaveBeenCalledWith(JOB_ID);
+    } else {
+      expect(api.getJobPullRequestStatus).not.toHaveBeenCalled();
+    }
     return fixture.nativeElement as HTMLElement;
   }
 
   it('links the real delivery and labels the scratch repository as a job workspace', async () => {
     const root = await render();
-    const text = root.textContent ?? '';
+    const text = (root.textContent ?? '').replace(/\s+/g, ' ').trim();
 
     expect(text).toContain('Delivery');
     expect(text).toContain('Source repository');
     expect(text).toContain('Branch design/hotel-rheinland-theme');
-    expect(text).toContain('Pull request #1');
+    expect(text).toContain('Pull request #1 · Open');
     expect(text).toContain('Job workspace');
     expect(text).not.toContain('Browse workspace in Gitea');
 
@@ -237,9 +254,17 @@ describe('JobReviewComponent delivery section', () => {
     expect(fixture.componentInstance.getJobWorkspaceUrl()).toMatch(/\/job-29c28492$/);
   });
 
+  it('keeps the PR link and states when the live read is unavailable', async () => {
+    const root = await render(undefined, null);
+    const text = (root.textContent ?? '').replace(/\s+/g, ' ').trim();
+
+    expect(text).toContain('Pull request #1 · Status unavailable');
+    expect(fixture.componentInstance.pullRequest()?.url).toBe(PR_URL);
+  });
+
   it('does not mislabel the connector default as the historical job delivery branch', async () => {
     const root = await render({ cloud_baseline: { status: 'captured' } });
-    const text = root.textContent ?? '';
+    const text = (root.textContent ?? '').replace(/\s+/g, ' ').trim();
 
     expect(text).toContain('Source repository');
     expect(text).toContain('Job workspace');

@@ -28173,6 +28173,70 @@ async def get_job_datasources(request: Request, job_id: str) -> list[dict[str, A
     return redact_datasources(rows)
 
 
+@app.get("/api/jobs/{job_id}/pull-request")
+async def get_job_pull_request_status(request: Request, job_id: str) -> dict[str, Any]:
+    """Read the live state of the PR recorded by ``repo_open_pr``.
+
+    The caller supplies only a job id. The server resolves both the persisted
+    PR identity and its credential-bearing repository connector after the
+    ordinary job-access check; connector credentials never cross REST.
+    """
+    _, job = await require_job_access(request, postgres_db, job_id)
+    from services.job_delivery import (
+        find_pull_request_repository,
+        forge_repo_from_datasource,
+        parse_job_pull_request,
+    )
+    from src.services.forge import ForgeError, get_pull_request_status
+
+    pull_request = parse_job_pull_request(job.get("context"))
+    if pull_request is None:
+        raise HTTPException(
+            status_code=404, detail="This job has no recorded pull request"
+        )
+
+    try:
+        datasources = await postgres_db.resolve_datasources_for_job(job_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not resolve repository connector for job PR status: %s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=500, detail="Could not resolve this job's repository"
+        ) from exc
+    datasource = find_pull_request_repository(pull_request, datasources)
+    if datasource is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The recorded pull request's repository is no longer attached",
+        )
+
+    try:
+        target = forge_repo_from_datasource(datasource)
+        status = await get_pull_request_status(target, pull_request.number)
+    except ForgeError as exc:
+        logger.warning(
+            "Live pull request status failed for job %s: %s",
+            job_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=502, detail="Live pull request status is unavailable"
+        ) from exc
+
+    return {
+        "forge": pull_request.forge,
+        "repo": pull_request.repo,
+        **status,
+        # A forge response may omit these display fields; the record written at
+        # creation is still authoritative for the delivery identity.
+        "url": status.get("url") or pull_request.url,
+        "head": status.get("head") or pull_request.head,
+        "base": status.get("base") or pull_request.base,
+    }
+
+
 @app.get("/api/datasources/{datasource_id}/index-status")
 async def get_datasource_index_status(
     request: Request, datasource_id: str

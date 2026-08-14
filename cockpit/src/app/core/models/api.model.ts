@@ -1573,6 +1573,18 @@ export interface Agent {
  */
 export type JobStatus = 'created' | 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled' | 'pending_review' | 'paused' | 'reviewing' | 'waiting';
 
+/** Live, normalized state of the pull request persisted against a job. */
+export interface PullRequestStatus {
+  forge: RepositoryForge;
+  repo: string;
+  number: number;
+  url: string;
+  state: 'open' | 'merged' | 'closed';
+  head: string;
+  base: string;
+  draft: boolean;
+}
+
 /**
  * Job from the orchestrator.
  */
