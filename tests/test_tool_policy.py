@@ -61,11 +61,23 @@ _CONFIG_DIR = _REPO_ROOT / "config"
 # Two implementations that must agree is the whole point of ``test_expansion_*``.
 # ---------------------------------------------------------------------------
 def _reference_expand_true(category: str) -> set[str]:
-    return {
+    names = {
         name
         for name, meta in TOOL_REGISTRY.items()
         if meta.get("category") == category and "grant" not in meta
     }
+    if category == "orchestrator":
+        # ``orchestrator: true`` predates the 0156 job-group split and 0156's
+        # non-array guard skipped boolean rows whole-row, so the boolean keeps
+        # meaning the PRE-SPLIT category: today's members plus the grantable
+        # job tools that used to live in it (see expand_category_true).
+        names |= {
+            name
+            for name, meta in TOOL_REGISTRY.items()
+            if meta.get("category") in ("job_control", "job_inspection")
+            and "grant" not in meta
+        }
+    return names
 
 
 def _config_files() -> list[Path]:
@@ -451,9 +463,16 @@ class TestExpansionAgainstTheClosedVocabulary:
 
     @pytest.mark.parametrize("group", sorted(SESSION_TOOL_OVERRIDE_NAMES))
     def test_true_expands_to_exactly_the_curated_set(self, group):
-        assert set(expand_category_true(group)) == set(
-            SESSION_TOOL_OVERRIDE_NAMES[group]
-        )
+        expected = set(SESSION_TOOL_OVERRIDE_NAMES[group])
+        if group == "orchestrator":
+            # Legacy-compat exception: ``orchestrator: true`` predates the
+            # 0156 job-group split (0156 skipped boolean rows whole-row), so
+            # its expansion is the pre-split union — the curated orchestrator
+            # set plus the curated job groups. No wider: the explicit-tier
+            # job tools (delete/assign/promote/steer/...) stay out.
+            expected |= set(SESSION_TOOL_OVERRIDE_NAMES["job_control"])
+            expected |= set(SESSION_TOOL_OVERRIDE_NAMES["job_inspection"])
+        assert set(expand_category_true(group)) == expected
 
     @pytest.mark.parametrize("category", sorted(get_categories()))
     def test_production_expansion_matches_an_independent_derivation(self, category):

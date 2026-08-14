@@ -99,12 +99,13 @@ def _caller_ctx(context: ToolContext) -> CallerCtx:
         pass
 
     project_ids = tuple(str(project_id) for project_id in context.project_ids)
-    officer = context.config.get("officer") or {}
-    caller_kind = (
-        "officer" if isinstance(officer, dict) and officer.get("enabled") else "session"
-    )
+    # Always 'session' on this lane: ToolContext.config is built from
+    # config.extra, and the loader parses the officer block into typed
+    # AgentConfig.officer (never into extra), so no officer flag reaches this
+    # dict and no reliable runtime signal exists here today. Real plane
+    # detection is owned by officer_supervision_surface E2.
     return CallerCtx(
-        kind=caller_kind,
+        kind="session",
         user_id=context.user_id,
         project_ids=project_ids,
         lineage_project_id=context.project_id,

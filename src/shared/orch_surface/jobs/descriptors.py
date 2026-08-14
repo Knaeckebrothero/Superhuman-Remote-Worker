@@ -22,10 +22,19 @@ class CallerCtx:
 
     ``project_ids`` contains bindings established by the session/token adapter;
     it is never populated from model arguments.  Only an exactly-one binding
-    becomes an ``X-MCP-Scope`` header.  ``lineage_project_id`` is kept
-    separately because an existing multi-project session can still have a
-    primary project used by the job-create funnel without claiming that its
-    reads are single-project scoped.
+    becomes an ``X-MCP-Scope`` header, and only on the MCP lane.
+    ``lineage_project_id`` is kept separately because an existing
+    multi-project session can still have a primary project used by the
+    job-create funnel without claiming that its reads are single-project
+    scoped.
+
+    ``auth_failed=True`` marks a caller whose adapter tried and FAILED to
+    resolve its auth context (http-mode MCP without a resolvable token).  The
+    invocation is then bound with no identity headers at all — the internal
+    key is never attached as an error fallback — so guarded orchestrator
+    endpoints fail closed with 401, and the tool result names the auth
+    context failure.  Deliberately anonymous lanes (stdio MCP, worker-mode
+    agent tools) keep ``auth_failed=False`` with ``user_id=None``.
     """
 
     kind: CallerKind
@@ -36,6 +45,7 @@ class CallerCtx:
     parent_job_id: str | None = None
     explicit_scope: str | None = None
     resolve_job_id_prefixes: bool = False
+    auth_failed: bool = False
 
     @property
     def project_scope(self) -> str | None:
@@ -157,6 +167,17 @@ def caller_default_names(caller: CallerKind, group: JobGroup) -> frozenset[str]:
     )
 
 
+#: Prefixed onto the tool result when an adapter could not resolve its auth
+#: context.  The invocation is still sent — with NO identity headers at all —
+#: so authorization stays server-side and guarded endpoints 401 (fail closed).
+AUTH_CONTEXT_FAILURE_NOTICE = (
+    "Auth context failure: the caller identity for this invocation could not "
+    "be resolved, so it was sent without any identity headers (no internal "
+    "key, no user) and protected endpoints refuse it. Re-authenticate and "
+    "retry."
+)
+
+
 def make_bound_handler(
     item: JobDescriptor,
     *,
@@ -169,11 +190,27 @@ def make_bound_handler(
     async def invoke(*args: Any, **kwargs: Any) -> str:
         client = client_provider()
         caller = caller_provider()
+        # Only the MCP lane stamps X-MCP-Scope. The agent/session lane never
+        # sent it pre-unification, and stamping it activated server-side
+        # project fencing that made NULL-project jobs invisible to
+        # single-project sessions. Officer-lane scoping will be reintroduced
+        # deliberately by officer_supervision_surface E2.
+        scope = caller.scope_header if caller.kind == "mcp" else None
         with client.invocation_scope(
             user_id=caller.user_id,
-            scope=caller.scope_header,
+            scope=scope,
+            unauthenticated=caller.auth_failed,
         ):
-            return await item.handler(client, caller, *args, **kwargs)
+            if not caller.auth_failed:
+                return await item.handler(client, caller, *args, **kwargs)
+            # Fail closed: the request above carries no identity headers, so
+            # the orchestrator 401s; surface that as an auth-context failure
+            # rather than an anonymous-looking backend error.
+            try:
+                outcome = await item.handler(client, caller, *args, **kwargs)
+            except Exception as error:
+                outcome = f"{type(error).__name__}: {error}"
+            return f"{AUTH_CONTEXT_FAILURE_NOTICE}\n{outcome}"
 
     invoke.__name__ = item.name
     invoke.__qualname__ = item.name
@@ -182,6 +219,7 @@ def make_bound_handler(
 
 
 __all__ = [
+    "AUTH_CONTEXT_FAILURE_NOTICE",
     "CallerCtx",
     "CallerKind",
     "JobDescriptor",
