@@ -897,6 +897,34 @@ def clone_repository_datasources(
     from ..managers.git_manager import GitManager
     from ..utils.ssh_key import normalize_private_key
 
+    # The workspace root is itself a durable Git repository. Without this
+    # exclusion, its next checkpoint records each nested checkout as a
+    # contentless gitlink; a fallback restore then recreates only an empty
+    # directory. Keeping the clone root ignored means every attach can either
+    # reuse the PVC copy below or re-clone it from the connector.
+    try:
+        if backend.exists(".gitignore"):
+            content = backend.read_file(".gitignore")
+            ignored = any(
+                line.strip() == "repos/" for line in str(content).splitlines()
+            )
+            if not ignored:
+                separator = "" if str(content).endswith("\n") else "\n"
+                backend.append_file(
+                    ".gitignore",
+                    f"{separator}\n# Cloned repository datasources\nrepos/\n",
+                )
+        else:
+            backend.write_file(
+                ".gitignore", "# Cloned repository datasources\nrepos/\n"
+            )
+    except Exception as exc:
+        logger.warning(
+            "Could not exclude repository datasource clones from workspace "
+            "versioning: %s",
+            exc,
+        )
+
     clone_names = resolve_repo_clone_names(repo_datasources)
     for ds, repo_name in zip(repo_datasources, clone_names):
         # ds_name is the safe form of the user-supplied datasource label.
@@ -984,15 +1012,40 @@ def clone_repository_datasources(
 
             target = workspace_manager.path / "repos" / repo_name
             remote_cwd = f"repos/{repo_name}"
-            git_mgr = GitManager.clone(
-                repo_url,
-                target,
-                backend=backend,
-                remote_cwd=remote_cwd,
-            )
+            if backend.exists(f"{remote_cwd}/.git"):
+                # A session workspace may outlive its agent pod (PVC hot tier)
+                # or be restored from the thread repository. Re-register the
+                # managed checkout instead of attempting a second clone into
+                # the existing directory, which git correctly refuses.
+                git_mgr = GitManager(
+                    target,
+                    backend=backend,
+                    remote_cwd=remote_cwd,
+                )
+                logger.info(
+                    "Reusing repository datasource %r from repos/%s",
+                    ds_name,
+                    repo_name,
+                )
+            else:
+                git_mgr = GitManager.clone(
+                    repo_url,
+                    target,
+                    backend=backend,
+                    remote_cwd=remote_cwd,
+                )
             if git_mgr:
+                branch_ready = True
                 if branch:
-                    git_mgr.checkout_branch(branch)
+                    branch_ready = git_mgr.checkout_branch(branch)
+                if ds.get("require_default_branch") and not branch_ready:
+                    logger.error(
+                        "Repository datasource %r could not check out required "
+                        "branch %r; refusing to register the review source",
+                        ds_name,
+                        branch,
+                    )
+                    continue
                 workspace_manager.source_repos[repo_name] = git_mgr
                 try:
                     from ..services.forge import parse_owner_repo, resolve_api_base

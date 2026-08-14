@@ -1,4 +1,5 @@
 import {Component, computed, effect, inject, signal} from '@angular/core';
+import {Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {DataService} from '../../core/services/data.service';
@@ -132,17 +133,22 @@ export function selectDeliveryRepository(
   const repositories = datasources.filter((item) => item.type === 'repository');
   if (!pullRequest) return repositories.length === 1 ? repositories[0] : null;
   const wanted = pullRequest.repo.replace(/^\/+|\/+$/g, '').toLowerCase();
+  const wantedHost = new URL(pullRequest.url).hostname.toLowerCase();
   const matched = repositories.find((item) => {
     const webUrl = repositoryWebUrl(item.connection_url);
     if (!webUrl) return false;
     try {
-      const path = new URL(webUrl).pathname.replace(/^\/+|\/+$/g, '').toLowerCase();
-      return path === wanted || path.endsWith(`/${wanted}`);
+      const parsed = new URL(webUrl);
+      const path = parsed.pathname.replace(/^\/+|\/+$/g, '').toLowerCase();
+      return (
+        parsed.hostname.toLowerCase() === wantedHost &&
+        (path === wanted || path.endsWith(`/${wanted}`))
+      );
     } catch {
       return false;
     }
   });
-  return matched ?? (repositories.length === 1 ? repositories[0] : null);
+  return matched ?? null;
 }
 
 /**
@@ -315,6 +321,20 @@ export function selectDeliveryRepository(
                     }
                   </app-button>
                 }
+                @if (pullRequest() && sourceRepository()) {
+                  <app-button
+                    variant="primary"
+                    size="sm"
+                    [loading]="reviewSessionLoading()"
+                    (clicked)="reviewInSession()"
+                  >
+                    @if (reviewSessionLoading()) {
+                      {{ 'jobReview.actions.preparingReviewSession' | transloco }}
+                    } @else {
+                      {{ 'jobReview.actions.reviewInSession' | transloco }}
+                    }
+                  </app-button>
+                }
                 @if (getJobWorkspaceUrl()) {
                   <app-button variant="ghost" size="sm" (clicked)="openJobWorkspace()">
                     {{ 'jobReview.links.jobWorkspace' | transloco }}
@@ -335,6 +355,11 @@ export function selectDeliveryRepository(
                   </app-button>
                 }
               </div>
+              @if (pullRequest() && sourceRepository()) {
+                <div class="review-session-hint">
+                  {{ 'jobReview.reviewSessionHint' | transloco }}
+                </div>
+              }
             </div>
           }
 
@@ -656,6 +681,12 @@ export function selectDeliveryRepository(
         flex-wrap: wrap;
       }
 
+      .review-session-hint {
+        color: var(--text-secondary, var(--text-secondary));
+        font-size: 0.8em;
+        line-height: 1.4;
+      }
+
       .cloud-folder {
         gap: 6px;
         align-items: flex-start;
@@ -772,6 +803,7 @@ export class JobReviewComponent {
   private readonly api = inject(ApiService);
   private readonly data = inject(DataService);
   private readonly transloco = inject(TranslocoService);
+  private readonly router = inject(Router);
 
   readonly currentJobId = this.data.currentJobId;
   readonly job = signal<Job | null>(null);
@@ -806,6 +838,7 @@ export class JobReviewComponent {
   readonly confirmingApprove = signal(false);
   readonly ideLoading = signal(false);
   readonly isExportingToCloud = signal(false);
+  readonly reviewSessionLoading = signal(false);
   private readonly maxIdePollAttempts = 100;
   private idePollAttempts = 0;
   private confirmTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -915,6 +948,26 @@ export class JobReviewComponent {
   openExternal(url: string): void {
     const safeUrl = safeHttpUrl(url);
     if (safeUrl) window.open(safeUrl, '_blank', 'noopener');
+  }
+
+  reviewInSession(): void {
+    const jobId = this.currentJobId();
+    if (!jobId || this.reviewSessionLoading()) return;
+
+    this.reviewSessionLoading.set(true);
+    this.resultMessage.set(null);
+    this.resultIsError.set(false);
+    this.api.createJobReviewSession(jobId).subscribe((result) => {
+      this.reviewSessionLoading.set(false);
+      if (!result?.thread_id) {
+        this.resultMessage.set(
+          this.transloco.translate('jobReview.messages.reviewSessionFailed'),
+        );
+        this.resultIsError.set(true);
+        return;
+      }
+      void this.router.navigate(['/sessions', result.thread_id]);
+    });
   }
 
   hasSnapshot(): boolean {

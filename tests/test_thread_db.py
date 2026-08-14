@@ -196,6 +196,37 @@ class TestCreateThread:
         assert call_args[0][2] is None  # project_id
 
     @pytest.mark.asyncio
+    async def test_initial_event_is_inserted_in_the_creation_transaction(self):
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(
+            return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")}
+        )
+        db = _make_db_with_conn(conn)
+
+        metadata = {
+            "review_delivery": {
+                "datasource_id": "repo-1",
+                "branch": "feature/review",
+            }
+        }
+        await db.create_thread(
+            initial_metadata=metadata,
+            initial_event="Review job abc on branch feature/review",
+        )
+
+        stored = json.loads(conn.fetchrow.await_args.args[7])
+        assert stored["review_delivery"] == metadata["review_delivery"]
+        event_call = next(
+            call
+            for call in conn.execute.await_args_list
+            if "INSERT INTO thread_messages" in call.args[0]
+        )
+        assert "'event'" in event_call.args[0]
+        assert event_call.args[1] == UUID("aaaaaaaa-1111-2222-3333-444444444444")
+        assert event_call.args[2] == "Review job abc on branch feature/review"
+        conn.transaction.return_value.__aenter__.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_default_values(self):
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(

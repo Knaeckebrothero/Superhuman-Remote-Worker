@@ -10405,6 +10405,7 @@ class PostgresDB:
         authority_project_ids: list[str] | None = None,
         execution_lane: str = "pinned",
         initial_metadata: Dict[str, Any] | None = None,
+        initial_event: str | None = None,
     ) -> str:
         """Create a thread with its complete connector selection in one row.
 
@@ -10415,6 +10416,8 @@ class PostgresDB:
         ``execution_lane`` and ``initial_metadata`` are written in the creation
         INSERT so callers never expose a newly created stateless sandbox before
         its materialized config and one-shot Pod-create authority commit.
+        ``initial_event`` is inserted in that same transaction, making trusted
+        opening context visible before any attach can restore the thread.
         Unknown lanes or malformed creation authority fail closed before
         touching the database.
         """
@@ -10517,9 +10520,18 @@ class PostgresDB:
             raise DatasourceMaterializationAuthorizationError(
                 "Work owner is no longer authorized"
             )
+        if initial_event is not None:
+            if not isinstance(initial_event, str) or not initial_event.strip():
+                raise ValueError("initial thread event must be non-empty text")
+            if len(initial_event) > 20_000:
+                raise ValueError("initial thread event is too long")
+
         async with self.acquire() as conn:
             async with _transaction_if(
-                conn, bool(selected_uuids) or authority_user_id is not None
+                conn,
+                bool(selected_uuids)
+                or authority_user_id is not None
+                or initial_event is not None,
             ):
                 await _lock_and_compare_policy_snapshot(
                     conn, selected_uuids, policy_snapshot
@@ -10547,6 +10559,16 @@ class PostgresDB:
                     json.dumps(metadata),
                     execution_lane,
                 )
+                if initial_event is not None:
+                    await conn.execute(
+                        """
+                        INSERT INTO thread_messages
+                            (thread_id, role, content, turn_number)
+                        VALUES ($1, 'event', $2, 0)
+                        """,
+                        row["id"],
+                        initial_event,
+                    )
         return str(row["id"])
 
     @asynccontextmanager

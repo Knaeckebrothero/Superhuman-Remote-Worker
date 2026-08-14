@@ -2532,6 +2532,7 @@
       "openCloudFolder": "Cloud-Ordner öffnen"
     },
     "cloudFolderDisclaimer": "Vorschau – die Ergebnisse werden in einen geteilten Cloud-Ordner kopiert, den du durchsuchen kannst. Nutze das Feedback-Feld unten, um Änderungen anzufordern; direkte Änderungen an diesem Ordner erreichen den Agenten nicht und werden überschrieben, wenn der Job fortgesetzt wird.",
+    "reviewSessionHint": "Startet eine beaufsichtigte Sitzung in einem frischen Sandbox-Checkout des bereitgestellten Branches mit Modell, Projekt und Konnektoren dieses Jobs. Job-spezifische Arbeitsbereichs- und Tool-Einstellungen werden nicht kopiert.",
     "vmUpgrade": {
       "title": "Sudo erforderlich",
       "reason": "Der Agent hat einen privilegierten Befehl in einem gehärteten Container versucht:",
@@ -2553,7 +2554,9 @@
       "continueWithFeedback": "Mit Feedback fortsetzen",
       "exportingToCloud": "Wird exportiert …",
       "exportToCloud": "In die Cloud exportieren",
-      "resyncCloudFolder": "Cloud-Ordner neu synchronisieren"
+      "resyncCloudFolder": "Cloud-Ordner neu synchronisieren",
+      "reviewInSession": "In einer Sitzung prüfen",
+      "preparingReviewSession": "Prüfsitzung wird vorbereitet …"
     },
     "messages": {
       "approved": "Job erfolgreich genehmigt.",
@@ -2564,7 +2567,8 @@
       "continueFailed": "Job konnte nicht fortgesetzt werden. Details in der Konsole.",
       "resumedWithFeedback": "Job mit Feedback fortgesetzt. Der Agent arbeitet weiter.",
       "resumeFailed": "Job konnte nicht fortgesetzt werden. Details in der Konsole.",
-      "openCloudFolderFailed": "Cloud-Ordner konnte nicht geöffnet werden. Details in der Konsole."
+      "openCloudFolderFailed": "Cloud-Ordner konnte nicht geöffnet werden. Details in der Konsole.",
+      "reviewSessionFailed": "Prüfsitzung konnte nicht erstellt werden. Details in der Konsole."
     }
   },
   "jobDiffReview": {

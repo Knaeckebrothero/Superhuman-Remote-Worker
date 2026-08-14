@@ -1585,6 +1585,13 @@ export interface PullRequestStatus {
   draft: boolean;
 }
 
+/** A persistent session created from server-owned job review context. */
+export interface JobReviewSessionResult {
+  job_id: string;
+  thread_id: string;
+  status: string;
+}
+
 /**
  * Job from the orchestrator.
  */

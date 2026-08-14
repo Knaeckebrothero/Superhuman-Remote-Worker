@@ -28,6 +28,7 @@ def make_workspace_manager(supports_shell=True, with_backend=True):
         return ws
     backend = MagicMock()
     backend.supports_shell = supports_shell
+    backend.exists = MagicMock(return_value=False)
     backend.resolve_home_path = MagicMock(
         side_effect=lambda rel: f"/home/agent-host/{rel}"
     )
@@ -154,6 +155,66 @@ class TestBackendClone:
             clone_repository_datasources([token_ds()], ws)
         assert ws.source_repos == {}
         assert any("Failed to clone" in r.message for r in caplog.records)
+
+    def test_required_review_branch_must_checkout_before_registration(self, caplog):
+        ws = make_workspace_manager()
+        git_mgr = MagicMock()
+        git_mgr.checkout_branch.return_value = False
+        with patch("src.managers.git_manager.GitManager.clone", return_value=git_mgr):
+            clone_repository_datasources(
+                [
+                    token_ds(
+                        default_branch="design/hotel-rheinland-theme",
+                        require_default_branch=True,
+                    )
+                ],
+                ws,
+            )
+
+        assert ws.source_repos == {}
+        assert any("required branch" in r.message for r in caplog.records)
+
+    def test_existing_checkout_is_reused_and_re_registered_on_resume(self):
+        ws = make_workspace_manager()
+        ws.backend.exists = MagicMock(
+            side_effect=lambda path: path == "repos/repo/.git"
+        )
+        existing = MagicMock()
+        existing.checkout_branch.return_value = True
+
+        with patch("src.managers.git_manager.GitManager") as git_manager:
+            git_manager.return_value = existing
+            clone_repository_datasources(
+                [
+                    token_ds(
+                        default_branch="design/hotel-rheinland-theme",
+                        require_default_branch=True,
+                    )
+                ],
+                ws,
+            )
+
+        git_manager.clone.assert_not_called()
+        git_manager.assert_called_once_with(
+            Path("/tmp/ws/repos/repo"),
+            backend=ws.backend,
+            remote_cwd="repos/repo",
+        )
+        existing.checkout_branch.assert_called_once_with("design/hotel-rheinland-theme")
+        assert ws.source_repos["repo"] is existing
+
+    def test_clone_root_is_ignored_by_the_durable_session_repository(self):
+        """Fallback restore must re-clone content, not restore an empty gitlink."""
+        ws = make_workspace_manager()
+
+        with patch(
+            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            clone_repository_datasources([token_ds()], ws)
+
+        ws.backend.write_file.assert_any_call(
+            ".gitignore", "# Cloned repository datasources\nrepos/\n"
+        )
 
     def test_token_clone_records_forge_metadata_for_tools(self):
         """Tools need forge/token/owner/repo; source_repos only carries GitManager."""

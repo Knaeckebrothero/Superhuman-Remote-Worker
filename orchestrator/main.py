@@ -102,6 +102,7 @@ from pydantic import (  # noqa: E402
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SecretStr,
     field_validator,
     model_validator,
@@ -5099,6 +5100,9 @@ async def _assemble_session_attach_payload(
             _meta.get("datasource_ids"),
             target_project_ids=project_ids,
         )
+        from services.job_delivery import apply_review_delivery_branch
+
+        resolved_datasources = apply_review_delivery_branch(_meta, resolved_datasources)
         datasources = _build_datasources_payload(resolved_datasources)
         config_override = _build_datasource_tool_override(
             resolved_datasources, config_override
@@ -27028,6 +27032,8 @@ def _build_datasources_payload(
             entry["cli_hint"] = ds["cli_hint"]
         if ds.get("default_branch"):
             entry["default_branch"] = ds["default_branch"]
+        if ds_type == "repository" and ds.get("require_default_branch") is True:
+            entry["require_default_branch"] = True
 
         payload.append(entry)
 
@@ -28255,6 +28261,239 @@ async def get_job_pull_request_status(request: Request, job_id: str) -> dict[str
         "url": status.get("url") or pull_request.url,
         "head": status.get("head") or pull_request.head,
         "base": status.get("base") or pull_request.base,
+    }
+
+
+def _review_session_config_values(
+    job: dict[str, Any],
+) -> tuple[str | None, float | None, list[str]]:
+    """Extract only fields supported by the ordinary session-create surface."""
+    from services.job_delivery import parse_json_object
+
+    override = parse_json_object(job.get("config_override")) or {}
+    resolved = parse_json_object(job.get("resolved_config")) or {}
+    resolved_agent = parse_json_object(resolved.get("agent")) or {}
+    resolved_llm = parse_json_object(resolved_agent.get("llm")) or {}
+    override_llm = parse_json_object(override.get("llm")) or {}
+
+    raw_model = resolved_llm.get("model", override_llm.get("model"))
+    model = (
+        raw_model.strip() if isinstance(raw_model, str) and raw_model.strip() else None
+    )
+
+    raw_temperature = resolved_llm.get("temperature", override_llm.get("temperature"))
+    temperature = (
+        float(raw_temperature)
+        if isinstance(raw_temperature, (int, float))
+        and not isinstance(raw_temperature, bool)
+        else None
+    )
+
+    dropped: list[str] = []
+    for key, value in override.items():
+        if key == "llm" and isinstance(value, dict):
+            dropped.extend(
+                f"llm.{subkey}"
+                for subkey in value
+                if subkey not in {"model", "temperature"}
+            )
+        elif key == "interactive" and isinstance(value, dict):
+            dropped.extend(f"interactive.{subkey}" for subkey in value)
+        elif key not in {"llm", "interactive"}:
+            # State only the key, never its value: unsupported job config can
+            # contain environment/credential material that must not enter the
+            # transcript.
+            dropped.append(str(key))
+    return model, temperature, dropped
+
+
+def _review_session_config_name(job: dict[str, Any]) -> str:
+    """Keep a session profile when one is already present; map workers safely."""
+    source = canonical_config_name(str(job.get("config_name") or "worker_base"))
+    if source == "session_base":
+        return source
+    # Bundled expert type is inferred from its declared base by the existing
+    # catalogue reader. Arbitrary paths and worker experts deliberately fall
+    # back to the session base; worker/session schemas are not interchangeable.
+    bundle = _bundled_expert_bundle(source)
+    if bundle and bundle.get("expert_type") == "session":
+        return source
+    return "session_base"
+
+
+def _brief_text(value: Any, *, limit: int) -> str:
+    """Bound one untrusted job string for a plain-text opening event."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:limit]
+
+
+def _review_session_opening_event(
+    job: dict[str, Any],
+    *,
+    pull_request: Any,
+    session_config_name: str,
+    dropped_settings: list[str],
+) -> str:
+    """Render the durable, non-user-bubble context for a review thread."""
+    from services.job_delivery import parse_json_object
+
+    context = parse_json_object(job.get("context")) or {}
+    freeze = parse_json_object(job.get("freeze_data")) or {}
+    deliverables = context.get("required_deliverables")
+    if not isinstance(deliverables, list):
+        deliverables = freeze.get("deliverables")
+    safe_deliverables = [
+        text
+        for item in (deliverables if isinstance(deliverables, list) else [])[:50]
+        if (text := _brief_text(item, limit=250))
+    ]
+
+    source_config = canonical_config_name(str(job.get("config_name") or "worker_base"))
+    source_label = _brief_text(source_config, limit=200)
+    session_label = _brief_text(session_config_name, limit=200)
+    repository = _brief_text(pull_request.repo, limit=500)
+    delivered_branch = _brief_text(pull_request.head, limit=500)
+    pull_request_url = _brief_text(pull_request.url, limit=2_000)
+    base_branch = _brief_text(pull_request.base, limit=500)
+    lines = [
+        "[Server-derived job review context]",
+        f"Job: {job['id']}",
+        f"Task: {_brief_text(job.get('description'), limit=2_000)}",
+        f"Source repository: {repository}",
+        f"Delivered branch: {delivered_branch}",
+        f"Pull request: #{pull_request.number} ({pull_request_url})",
+        f"Base branch: {base_branch}",
+        (
+            "Workspace: fresh sandbox checkout through the job's repository "
+            "connector; the scratch job workspace is not reused."
+        ),
+        (
+            "Permission mode: supervised for review; the worker's automation "
+            "mode is not inherited."
+        ),
+    ]
+    summary = _brief_text(freeze.get("summary"), limit=2_000)
+    if summary:
+        lines.append(f"Completion summary: {summary}")
+    if safe_deliverables:
+        lines.append("Declared deliverables:")
+        lines.extend(f"- {item}" for item in safe_deliverables)
+    if source_config != session_config_name:
+        lines.append(
+            f"Session profile: {session_label}; worker profile "
+            f"{source_label} is not copied because worker and session "
+            "profiles have different schemas."
+        )
+    if dropped_settings:
+        safe_dropped = [
+            text
+            for setting in dropped_settings[:100]
+            if (text := _brief_text(setting, limit=200))
+        ]
+        lines.append(
+            "Job-only settings not inherited: " + ", ".join(safe_dropped) + "."
+        )
+    rendered = "\n".join(lines)
+    if len(rendered) > 19_500:
+        return rendered[:19_499].rstrip() + "…"
+    return rendered
+
+
+@app.post("/api/jobs/{job_id}/review-session")
+async def create_job_review_session(request: Request, job_id: str) -> dict[str, Any]:
+    """Create a fresh interactive review from an access-checked job id.
+
+    There is intentionally no request body. Model, scope, connectors and the
+    delivered branch are all derived from stored server state; the MCP session
+    tool remains unchanged and has no route to ``config_override``.
+    """
+    _, job = await require_job_access(request, postgres_db, job_id)
+    from services.job_delivery import (
+        find_pull_request_repository,
+        parse_job_pull_request,
+        repository_host,
+    )
+
+    pull_request = parse_job_pull_request(job.get("context"))
+    if pull_request is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This job has no recorded delivered branch to review",
+        )
+
+    try:
+        datasources = await postgres_db.resolve_datasources_for_job(job_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not resolve connectors for job review session %s: %s",
+            job_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Could not resolve this job's connectors",
+        ) from exc
+
+    source = find_pull_request_repository(pull_request, datasources)
+    if source is None or not source.get("id"):
+        raise HTTPException(
+            status_code=409,
+            detail="The delivered repository is no longer attached to this job",
+        )
+    if any(not datasource.get("id") for datasource in datasources):
+        raise HTTPException(
+            status_code=500,
+            detail="Could not resolve this job's connectors",
+        )
+
+    model, temperature, dropped = _review_session_config_values(job)
+    session_config_name = _review_session_config_name(job)
+    title_description = _brief_text(job.get("description"), limit=80)
+    title = f"Review job {str(job['id'])[:8]}"
+    if title_description:
+        title = f"{title}: {title_description}"
+
+    review_delivery = {
+        "job_id": str(job["id"]),
+        "datasource_id": str(source["id"]),
+        "forge": pull_request.forge,
+        "repository_host": repository_host(str(source["connection_url"])),
+        "repo": pull_request.repo,
+        "branch": pull_request.head,
+        "base": pull_request.base,
+        "pull_request": {
+            "number": pull_request.number,
+            "url": pull_request.url,
+        },
+    }
+    body = ThreadCreateRequest(
+        title=title,
+        config_name=session_config_name,
+        project_ids=[str(job["project_id"])] if job.get("project_id") else None,
+        datasource_ids=[str(datasource["id"]) for datasource in datasources],
+        model=model,
+        temperature=temperature,
+        permission_mode="supervised",
+        # A clone-based repository requires a shell workspace. This is a fixed
+        # property of the review workflow, not a copied or caller-supplied job
+        # override (the job's vm/virtual choice is deliberately ignored).
+        config_override={"workspace": {"backend": "sandbox"}},
+    )
+    body._trusted_seed = TrustedThreadSeed(
+        metadata={"review_delivery": review_delivery},
+        opening_event=_review_session_opening_event(
+            job,
+            pull_request=pull_request,
+            session_config_name=session_config_name,
+            dropped_settings=dropped,
+        ),
+    )
+    created = await create_thread(body, request)
+    return {
+        "job_id": str(job["id"]),
+        "thread_id": created["thread_id"],
+        "status": created.get("status", "created"),
     }
 
 
@@ -34665,6 +34904,14 @@ async def get_agent_system_info(request: Request, agent_id: str) -> dict[str, An
 # =============================================================================
 
 
+@dataclass(frozen=True)
+class TrustedThreadSeed:
+    """Server-authored context committed before a new thread can attach."""
+
+    metadata: dict[str, Any]
+    opening_event: str
+
+
 class ThreadCreateRequest(BaseModel):
     """Request body for creating a persistent thread."""
 
@@ -34738,6 +34985,12 @@ class ThreadCreateRequest(BaseModel):
             "Session checkbox that sets this lands in Slice C."
         ),
     )
+
+    # Server-only creation context. Pydantic private attributes are never
+    # populated from JSON, so neither the public thread-create endpoint nor the
+    # model-facing MCP tool can author this seed. The job review endpoint sets
+    # it only after deriving the delivery from an access-checked job id.
+    _trusted_seed: "TrustedThreadSeed | None" = PrivateAttr(default=None)
 
     @model_validator(mode="before")
     @classmethod
@@ -35437,6 +35690,14 @@ async def create_thread(
             )
         if request_body.protected_cloud:
             metadata_patch["protected_cloud"] = True
+        trusted_seed = request_body._trusted_seed
+        if trusted_seed is not None:
+            # Keep this narrow and auditable. A future server-owned seed needs
+            # an explicit design decision instead of acquiring an arbitrary
+            # metadata write channel through this private attribute.
+            if set(trusted_seed.metadata) != {"review_delivery"}:
+                raise RuntimeError("Unsupported trusted thread seed")
+            metadata_patch.update(copy.deepcopy(trusted_seed.metadata))
 
         # Decide physical actuation before the INSERT. Every stateless thread
         # commits its materialized class/tier in that transaction; a K8s thread
@@ -35480,11 +35741,18 @@ async def create_thread(
             authority_project_ids=effective_project_ids,
             execution_lane=execution_lane,
         )
-        if stateless_initial_metadata:
+        if trusted_seed is not None:
+            create_kwargs["initial_event"] = trusted_seed.opening_event
+        # A review branch is attach authority, not decorative metadata. Commit
+        # it in the thread INSERT transaction together with the opening event,
+        # even on the pinned lane, so no reconciler can observe a created review
+        # thread before its exact delivery constraint exists.
+        metadata_at_create = stateless_initial_metadata or trusted_seed is not None
+        if metadata_at_create:
             create_kwargs["initial_metadata"] = metadata_patch
         thread_id = await postgres_db.create_thread(**create_kwargs)
 
-        if metadata_patch and not stateless_initial_metadata:
+        if metadata_patch and not metadata_at_create:
             async with postgres_db.acquire() as conn:
                 await conn.execute(
                     """

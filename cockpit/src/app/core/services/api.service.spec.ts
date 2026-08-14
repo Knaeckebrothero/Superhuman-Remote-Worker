@@ -54,6 +54,22 @@ describe('ApiService.getJobPullRequestStatus', () => {
 
     await expect(pending).resolves.toMatchObject({number: 9, state: 'open'});
   });
+
+  it('creates a review session by naming only the job', async () => {
+    const pending = firstValueFrom(api.createJobReviewSession('job-1'));
+    const request = httpMock.expectOne((item) =>
+      item.url.endsWith('/jobs/job-1/review-session'),
+    );
+    expect(request.request.method).toBe('POST');
+    expect(request.request.body).toEqual({});
+    request.flush({job_id: 'job-1', thread_id: 'thread-review', status: 'created'});
+
+    await expect(pending).resolves.toEqual({
+      job_id: 'job-1',
+      thread_id: 'thread-review',
+      status: 'created',
+    });
+  });
 });
 
 describe('ApiService.transcribeVoice', () => {

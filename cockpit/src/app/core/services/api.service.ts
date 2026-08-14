@@ -51,6 +51,7 @@ import {
     JobDiffSummary,
     JobProgress,
     JobRejectResult,
+    JobReviewSessionResult,
     JobStatistics,
     KnowledgeListResponse,
     KnowledgeNoteDetail,
@@ -1030,6 +1031,24 @@ export class ApiService {
       .pipe(
         catchError((error) => {
           console.error(`Failed to fetch pull request status for job ${jobId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Create an interactive review session from an access-checked job.
+   *
+   * The empty body is deliberate: the server owns all config, scope, connector
+   * and branch derivation. Keeping those values out of this client call also
+   * keeps them out of every model-authored session-creation surface.
+   */
+  createJobReviewSession(jobId: string): Observable<JobReviewSessionResult | null> {
+    return this.http
+      .post<JobReviewSessionResult>(`${this.baseUrl}/jobs/${jobId}/review-session`, {})
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to create review session for job ${jobId}:`, error);
           return of(null);
         }),
       );

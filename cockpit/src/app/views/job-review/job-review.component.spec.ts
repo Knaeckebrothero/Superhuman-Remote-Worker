@@ -1,5 +1,6 @@
 import { CUSTOM_ELEMENTS_SCHEMA, signal, ɵresolveComponentResources } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { Router } from '@angular/router';
 import { TranslocoPipe, TranslocoTestingModule } from '@jsverse/transloco';
 import { of } from 'rxjs';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -140,6 +141,47 @@ describe('job-review delivery URL helpers', () => {
     expect(selected?.id).toBe('kurort-engine');
   });
 
+  it('does not substitute the same owner/repo from another forge host', () => {
+    const pullRequest = pullRequestFromJob(
+      reviewJob({
+        pull_request: {
+          forge: 'github',
+          repo: 'Knaeckebrothero/KurortEngine',
+          number: 1,
+          url: PR_URL,
+          head: 'design/hotel-rheinland-theme',
+          base: 'main',
+        },
+      }),
+    );
+    const selected = selectDeliveryRepository(
+      [
+        repository(
+          'enterprise-lookalike',
+          'https://github.enterprise.test/Knaeckebrothero/KurortEngine.git',
+        ),
+        repository(
+          'github-delivery',
+          'https://github.com/Knaeckebrothero/KurortEngine.git',
+        ),
+      ],
+      pullRequest,
+    );
+
+    expect(selected?.id).toBe('github-delivery');
+    expect(
+      selectDeliveryRepository(
+        [
+          repository(
+            'enterprise-lookalike',
+            'https://github.enterprise.test/Knaeckebrothero/KurortEngine.git',
+          ),
+        ],
+        pullRequest,
+      ),
+    ).toBeNull();
+  });
+
   it('does not label an unrelated connector as the source when several are attached', () => {
     const pullRequest = pullRequestFromJob(
       reviewJob({
@@ -167,6 +209,8 @@ describe('job-review delivery URL helpers', () => {
 
 describe('JobReviewComponent delivery section', () => {
   let fixture: ComponentFixture<JobReviewComponent>;
+  let api: Record<string, ReturnType<typeof vi.fn>>;
+  let router: {navigate: ReturnType<typeof vi.fn>};
 
   beforeAll(async () => {
     await ɵresolveComponentResources(() => Promise.resolve(''));
@@ -188,10 +232,15 @@ describe('JobReviewComponent delivery section', () => {
     liveStatus: PullRequestStatus | null = OPEN_STATUS,
   ): Promise<HTMLElement> {
     const job = reviewJob(context);
-    const api = {
+    api = {
       getJob: vi.fn().mockReturnValue(of(job)),
       getFrozenJobData: vi.fn().mockReturnValue(of({ summary: 'Theme delivered' })),
       getJobPullRequestStatus: vi.fn().mockReturnValue(of(liveStatus)),
+      createJobReviewSession: vi.fn().mockReturnValue(of({
+        job_id: JOB_ID,
+        thread_id: 'thread-review',
+        status: 'created',
+      })),
       getJobDatasources: vi
         .fn()
         .mockReturnValue(
@@ -199,6 +248,7 @@ describe('JobReviewComponent delivery section', () => {
         ),
       ensureWorkspaceAccess: vi.fn().mockReturnValue(of({ status: 'ready' })),
     };
+    router = {navigate: vi.fn().mockResolvedValue(true)};
 
     TestBed.configureTestingModule({
       imports: [
@@ -211,6 +261,7 @@ describe('JobReviewComponent delivery section', () => {
       providers: [
         { provide: ApiService, useValue: api },
         { provide: DataService, useValue: { currentJobId: signal(JOB_ID) } },
+        { provide: Router, useValue: router },
       ],
     });
     // Signal-input metadata on the design-system children is unavailable in
@@ -241,6 +292,9 @@ describe('JobReviewComponent delivery section', () => {
     expect(text).toContain('Source repository');
     expect(text).toContain('Branch design/hotel-rheinland-theme');
     expect(text).toContain('Pull request #1 · Open');
+    expect(text).toContain('Review in session');
+    expect(text).toContain('fresh sandbox');
+    expect(text).toContain('supervised');
     expect(text).toContain('Job workspace');
     expect(text).not.toContain('Browse workspace in Gitea');
 
@@ -252,6 +306,16 @@ describe('JobReviewComponent delivery section', () => {
     );
     expect(fixture.componentInstance.pullRequest()?.url).toBe(PR_URL);
     expect(fixture.componentInstance.getJobWorkspaceUrl()).toMatch(/\/job-29c28492$/);
+  });
+
+  it('creates the server-derived session and navigates to it', async () => {
+    await render();
+
+    fixture.componentInstance.reviewInSession();
+    await fixture.whenStable();
+
+    expect(api['createJobReviewSession']).toHaveBeenCalledWith(JOB_ID);
+    expect(router.navigate).toHaveBeenCalledWith(['/sessions', 'thread-review']);
   });
 
   it('keeps the PR link and states when the live read is unavailable', async () => {
