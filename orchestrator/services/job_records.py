@@ -19,6 +19,12 @@ Who writes what (§5.1) — the split that must survive every edit here:
   ``verified: false`` ALWAYS — recorded as claims, never silently promoted.
   v1 does not fetch external URLs to check PR links; a record that cannot
   distinguish "did it" from "said it did" is worth less than no record.
+* A PULL REQUEST opened through ``repo_open_pr`` is orchestrator knowledge,
+  not an agent claim: the tool persists ``{forge, repo, number, url, head,
+  base}`` into ``jobs.context`` itself, on success, at call time. Reading it
+  back fetches nothing, so it carries ``verified: true`` without weakening
+  the rule above — the record is the orchestrator's own, and a malformed one
+  is dropped rather than downgraded.
 
 Best-effort throughout: a record failure must never block completion
 handling or a loop advance.
@@ -33,6 +39,8 @@ from datetime import datetime
 from typing import Any
 
 import yaml
+
+from services.job_delivery import parse_job_pull_request
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +162,36 @@ def _agent_declared_changes(freeze: dict[str, Any] | None) -> list[dict[str, Any
     return entries
 
 
+def persisted_pull_request(job: dict[str, Any]) -> Any:
+    """The pull request ``repo_open_pr`` recorded against this job, if any.
+
+    JSONB-tolerant (asyncpg hands ``context`` back as text) and fails
+    closed: anything that is not a complete, well-formed record — including
+    agent prose parked under the same key — reads as *no* pull request. A
+    guard that accepts a malformed record is worse than no guard, because it
+    reports delivery that may never have happened.
+    """
+    return parse_job_pull_request(job.get("context"))
+
+
+def job_delivered_nothing(job: dict[str, Any], *, delivery_status: str | None) -> bool:
+    """True when an execution turn landed work on no known path.
+
+    Replaces "did ``main`` move?" as the loop's F29 signal. That question
+    has the wrong answer by construction under review-based delivery: a job
+    that pushes a branch and opens a pull request leaves ``main`` untouched,
+    on purpose, and would be scored as having delivered nothing.
+
+    Narrow on purpose. ``no-changes`` is the only status this treats as
+    *possibly* empty — it is also the status a source-repository project
+    reports legitimately on every code turn, because code never goes to the
+    project cloud folder. Everything else already names a real destination.
+    """
+    if delivery_status != "no-changes":
+        return False
+    return persisted_pull_request(job) is None
+
+
 def derive_changes(
     job: dict[str, Any],
     *,
@@ -171,10 +209,14 @@ def derive_changes(
        and cloud-delivery outcomes use ``action: none`` here, with a separate
        verified cloud entry when applicable.
        First-hand orchestrator knowledge → ``verified: true``.
-    2. ``kind: knowledge`` — only when ``knowledge_index`` rows exist for
+    2. ``kind: pull_request`` — only when ``repo_open_pr`` persisted one
+       against this job. This is the delivery signal for a project whose
+       code compounds into a source repository: ``main`` has deliberately
+       not moved, because the work is on a branch under review.
+    3. ``kind: knowledge`` — only when ``knowledge_index`` rows exist for
        this job id; the orchestrator checked its own store → ``verified:
        true``.
-    3. Agent-declared entries — see :func:`_agent_declared_changes`
+    4. Agent-declared entries — see :func:`_agent_declared_changes`
        (``verified: false``, declared order preserved).
     """
     changes: list[dict[str, Any]] = []
@@ -203,6 +245,22 @@ def derive_changes(
                 "action": action,
                 "ref": job.get("branch_name"),
                 "summary": summary,
+                "verified": True,
+            }
+        )
+
+    pull_request = persisted_pull_request(job)
+    if pull_request is not None:
+        changes.append(
+            {
+                "datasource": pull_request.repo,
+                "kind": "pull_request",
+                "action": "open",
+                "ref": pull_request.url,
+                "summary": (
+                    f"{pull_request.forge} PR #{pull_request.number}: "
+                    f"{pull_request.head} \u2192 {pull_request.base}"
+                ),
                 "verified": True,
             }
         )

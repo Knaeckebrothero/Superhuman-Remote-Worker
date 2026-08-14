@@ -1747,6 +1747,22 @@ class TestReindexKbReconciliation:
         assert result["reconciled"] == 0
 
 
+def _function_body(src: str, signature: str) -> str:
+    """Everything from ``signature`` to the next top-level def.
+
+    Previously a flat 3000-character window, which silently stopped covering
+    the KB trigger as soon as anything was inserted above it — the assertion
+    then failed for a function that was still perfectly correct. Slicing to
+    the real end of the function checks the whole body instead of a prefix,
+    so this guard cannot be defeated by pushing code past a byte count.
+    """
+    import re
+
+    body = src.split(signature, 1)[1]
+    end = re.search(r"\n(?=(?:async )?def )", body)
+    return body[: end.start()] if end else body
+
+
 class TestPostJobReindexTriggerResolvesItsOwnRepo:
     """Guard for docs/features/knowledge_base_repo_separation.md §10a.
 
@@ -1780,7 +1796,7 @@ class TestPostJobReindexTriggerResolvesItsOwnRepo:
             "post-job outcome hook not found — if it was renamed, move this "
             "guard with it rather than deleting it (see §10a)."
         )
-        body = src.split("async def _record_loop_job_outcome", 1)[1][:3000]
+        body = _function_body(src, "async def _record_loop_job_outcome")
         assert "_reindex_project_kb(pid)" in body, (
             "The post-job KB trigger must call _reindex_project_kb without a "
             "repo_name so it resolves the vault repo itself. Passing the job's "

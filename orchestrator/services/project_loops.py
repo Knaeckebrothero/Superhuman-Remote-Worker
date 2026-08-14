@@ -594,8 +594,41 @@ def build_loop_description(loop: dict[str, Any], *, role: str, iteration: int) -
     return f"{base} — toward: {_goal_snippet(goal)}" if goal else base
 
 
+def _record_pull_request(record: dict[str, Any]) -> dict[str, Any] | None:
+    """The orchestrator-verified pull request a past job delivered, if any.
+
+    Only ``verified: true`` entries count. An agent-declared claim carries
+    ``verified: false`` by construction (job_records §5.1), and rendering a
+    claim here would let a job talk the loop into believing it delivered.
+    """
+    changes = record.get("changes")
+    if isinstance(changes, str):  # asyncpg hands JSONB back as text
+        try:
+            changes = json.loads(changes)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if not isinstance(changes, list):
+        return None
+    for entry in changes:
+        if (
+            isinstance(entry, dict)
+            and entry.get("kind") == "pull_request"
+            and entry.get("verified") is True
+        ):
+            return entry
+    return None
+
+
 def render_loop_job_history(records: list[dict[str, Any]]) -> str:
-    """Compact, orchestrator-owned history block for the next loop kickoff."""
+    """Compact, orchestrator-owned history block for the next loop kickoff.
+
+    This block is the loop's memory of itself, so a delivery it cannot see
+    is a delivery that never happened as far as the next iteration is
+    concerned. When code compounds into a source repository every record
+    reads ``delivery=no-changes`` — truthfully, because nothing goes to the
+    project cloud folder — so the pull request is named alongside it. Left
+    unexplained, that field alone testifies that the loop has never shipped.
+    """
     lines = ["PROJECT JOB HISTORY (structured database records, newest first):"]
     if not records:
         lines.append("- No prior loop job records.")
@@ -611,6 +644,12 @@ def render_loop_job_history(records: list[dict[str, Any]]) -> str:
             f"- {iteration_label} · {role} · {job_id}: "
             f"status={status}, delivery={delivery}"
         )
+        pull_request = _record_pull_request(record)
+        if pull_request is not None:
+            detail = " ".join(str(pull_request.get("summary") or "").split())
+            ref = str(pull_request.get("ref") or "").strip()
+            inner = ", ".join(bit for bit in (detail, ref) if bit)
+            line += f" (source repo: {inner})"
         summary = " ".join(str(record.get("completion_notes") or "").split())
         if summary and summary != "(none recorded)":
             line += f" — {summary[:240]}"

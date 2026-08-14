@@ -19631,6 +19631,7 @@ async def _record_loop_job_outcome(
 
     See docs/features/project_jobs_repo_retirement.md.
     """
+    from services.job_records import job_delivered_nothing, persisted_pull_request
     from services.project_loops import is_loop_execution_role, write_loop_retro
 
     delivery = (ctx or {}).get("loop_cloud_delivery") or {}
@@ -19644,21 +19645,41 @@ async def _record_loop_job_outcome(
     delivery_sha = delivery.get("delivery_sha")
     delivery_notes = [str(note) for note in (delivery.get("notes") or [])]
 
+    # Delivery guard. "Did the project cloud folder change?" is the wrong
+    # question for a project whose code compounds into a source repository:
+    # `no-changes` is the honest, permanent answer there, and the delivered
+    # artefact is a pushed branch with a pull request open against it. Asking
+    # only the cloud question flags every successful code turn as empty;
+    # asking whether `main` moved is worse still, since review-based delivery
+    # deliberately leaves `main` alone. So the alarm fires only when NO path
+    # delivered. Reads the orchestrator's own persisted record — never the
+    # agent's prose — and a stale or malformed record fails loud rather than
+    # silently reporting a delivery that may not exist.
+    # docs/features/better_resavio_restart_status.md §6a.
     completed_role = (ctx or {}).get("loop_role")
-    if (
-        not failed
-        and delivery_status == "no-changes"
-        and is_loop_execution_role(completed_role)
-    ):
-        logger.warning(
-            "project loop %s: execution job %s completed without project-cloud changes",
-            loop_id,
-            str(job["id"])[:8],
-        )
-        actions.append(
-            f"project loop {str(loop_id)[:8]}: execution job "
-            f"{str(job['id'])[:8]} produced no project-cloud changes"
-        )
+    if not failed and is_loop_execution_role(completed_role):
+        pull_request = persisted_pull_request(job)
+        if job_delivered_nothing(job, delivery_status=delivery_status):
+            logger.warning(
+                "project loop %s: execution job %s completed without "
+                "project-cloud changes and without a pull request",
+                loop_id,
+                str(job["id"])[:8],
+            )
+            actions.append(
+                f"project loop {str(loop_id)[:8]}: execution job "
+                f"{str(job['id'])[:8]} delivered nothing "
+                f"(no project-cloud changes, no pull request)"
+            )
+        elif pull_request is not None:
+            # The positive case is worth an action line too: without it the
+            # only loop-visible trace of a source-repo delivery is silence,
+            # which reads exactly like the failure it replaced.
+            actions.append(
+                f"project loop {str(loop_id)[:8]}: execution job "
+                f"{str(job['id'])[:8]} delivered {pull_request.repo} "
+                f"PR #{pull_request.number} ({pull_request.head})"
+            )
 
     # Knowledge is independent of the job execution repo. Refresh the dedicated
     # project vault after every successful member; the up-to-date short-circuit

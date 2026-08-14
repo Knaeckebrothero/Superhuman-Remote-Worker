@@ -551,3 +551,60 @@ class TestBornParkedCreation:
             "attempt": 0,
             "next_retry_at": PARK_UNTIL.isoformat(),
         }
+
+
+class TestHistoryNamesTheDelivery:
+    """What the *next* iteration is told about the last one.
+
+    The kickoff history is the loop's memory. When code compounds into a
+    source repository, every record legitimately reads
+    ``delivery=no-changes``; if that is all the next developer sees, the
+    loop's own history testifies that nothing has ever been delivered — the
+    exact false signal that made the 08-06 run compound nothing.
+    """
+
+    def _record(self, changes: object) -> dict:
+        return {
+            "iteration": 3,
+            "role": "developer",
+            "job_id": "29c28492-1111-2222-3333-444444444444",
+            "status": "completed",
+            "delivery_status": "no-changes",
+            "completion_notes": "Shipped the theme studies.",
+            "changes": changes,
+        }
+
+    _PR_CHANGE = {
+        "datasource": "Knaeckebrothero/KurortEngine",
+        "kind": "pull_request",
+        "action": "open",
+        "ref": "https://github.com/Knaeckebrothero/KurortEngine/pull/1",
+        "summary": "github PR #1: design/hotel-rheinland-theme → main",
+        "verified": True,
+    }
+
+    def test_pull_request_is_named_in_the_history_line(self) -> None:
+        rendered = project_loops_service.render_loop_job_history(
+            [self._record([self._PR_CHANGE])]
+        )
+        assert "#1" in rendered
+        assert "design/hotel-rheinland-theme" in rendered
+
+    def test_jsonb_string_changes_are_parsed(self) -> None:
+        import json
+
+        rendered = project_loops_service.render_loop_job_history(
+            [self._record(json.dumps([self._PR_CHANGE]))]
+        )
+        assert "#1" in rendered
+
+    def test_unverified_claim_is_not_rendered_as_delivery(self) -> None:
+        claim = {**self._PR_CHANGE, "verified": False}
+        rendered = project_loops_service.render_loop_job_history(
+            [self._record([claim])]
+        )
+        assert "#1" not in rendered
+
+    def test_record_without_a_pull_request_is_unchanged(self) -> None:
+        rendered = project_loops_service.render_loop_job_history([self._record([])])
+        assert rendered.rstrip().endswith("Shipped the theme studies.")
