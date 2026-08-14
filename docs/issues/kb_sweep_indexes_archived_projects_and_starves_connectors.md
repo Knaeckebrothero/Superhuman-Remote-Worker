@@ -1,16 +1,33 @@
 # KB sweep reindexes archived projects, and a slow native KB starves external connectors
 
-**Status:** **Open, observed live on dev 2026-08-13.** Worked around for one project by deleting
-its `project_repositories` row; no code fix yet.
-**Severity:** **Medium-high** — an archived project consumes embedding calls indefinitely, and
-because native KBs are swept before external ones in the same tick, one slow native KB can
-block every external KB connector from ever indexing.
+**Status:** **Fixed on `develop` 2026-08-14 by `d215e727`.** The production incident was
+worked around by deleting one `project_repositories` row; see the reversal note below.
+**Original severity:** **Medium-high** — an archived project consumed embedding calls
+indefinitely, and because native KBs were swept before external ones in the same tick, one slow
+native KB could block every external KB connector from indexing.
+
+## Resolution (2026-08-14)
+
+`kb_sweep_tick` now joins `projects` and positively selects only
+`projects.status = 'active'`. Paused, completed, and archived projects retain their existing
+index but are no longer refreshed. External KB datasources now run before native project KBs,
+so a long native rebuild cannot delay an external connector's first attempt. Both enumeration
+phases and every individual row remain best-effort: a failed query or malformed/broken source is
+logged and does not abort the other phase or the remainder of the tick.
+
+Regression coverage pins the active-only SQL, an external attempt while native work is blocked,
+both enumeration-failure directions, record-like database rows, and the existing per-source
+failure isolation (`tests/test_kb_reindex.py::TestKbSweepTick`).
+
+[GitHub Actions run 31797720541](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/actions/runs/31797720541)
+passed the Python 3.12, Ruff, dependency, CodeQL, image-build, and GitOps deploy gates. No live
+cluster verification was attempted during the server-room ISP outage.
 
 ## Two defects, one symptom
 
 ### 1. Archiving a project does not stop its KB being reindexed
 
-`kb_sweep_tick` (`orchestrator/services/kb_reindex.py:974`) picks its work with:
+`kb_sweep_tick` (`orchestrator/services/kb_reindex.py`) originally picked its work with:
 
 ```sql
 SELECT DISTINCT project_id
@@ -28,9 +45,9 @@ never considered.
 
 ### 2. Natives are swept before externals, with no time budget
 
-The same tick body handles native project KBs first and only then iterates external `kb`
-datasources (`:1035`). Both share the tick. Nothing bounds how long the native phase may take,
-so a native KB that cannot finish within a tick indefinitely delays everything behind it.
+The same tick body originally handled native project KBs first and only then iterated external
+`kb` datasources. Both share the tick. Nothing bounded how long the native phase could take, so
+a native KB that could not finish within a tick delayed everything behind it.
 
 ## Observed
 
@@ -86,14 +103,19 @@ the only thing that kept the archived project in the sweep set. Verified afterwa
 
 Reversible by re-inserting the row. This is a per-project workaround, not a fix.
 
+**Workaround reversal:** row `4e7c6a46` can be restored after a deployment containing
+`d215e727`. Because project `68137e29` is archived, the new positive status predicate excludes
+it even when its `jobs` repository association exists. Restoring the association does not
+require rebuilding or deleting the retained KB index.
+
 ## Suggested fix
 
-1. **Exclude non-active projects from the sweep.** Join `projects` and filter on `status`, or
-   check status per project inside the loop. An archived project's KB should keep its existing
-   index and simply stop being refreshed.
-2. **Do not let the native phase starve the external phase.** Options, roughly in order of
-   preference: give each phase its own budget within a tick; alternate phases across ticks; or
-   sweep externals first when any native KB is mid-`indexing`.
+1. ✅ **Implemented in `d215e727`: exclude non-active projects from the sweep.** Join `projects`
+   and filter on `status`, or check status per project inside the loop. An archived project's KB
+   should keep its existing index and simply stop being refreshed.
+2. ✅ **Implemented in `d215e727`: do not let the native phase starve the external phase.**
+   Options, roughly in order of preference: give each phase its own budget within a tick;
+   alternate phases across ticks; or sweep externals first when any native KB is mid-`indexing`.
 3. **Investigate why a 3,137-note reindex never completes.** `last_success_at` a month stale
    with `status='indexing'` suggests the run is being cut short (next tick, pod roll, or an
    unhandled error near the end) rather than genuinely needing 47 minutes every time. The
