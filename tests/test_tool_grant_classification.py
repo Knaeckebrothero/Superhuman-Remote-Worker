@@ -220,8 +220,8 @@ class TestCodeGrants:
                 assert TOOL_REGISTRY[name].get("grant") == "code", name
 
     def test_code_granted_count_is_pinned(self):
-        """38 is the number the design doc committed to. Moving it is a review."""
-        assert len(_classified("code")) == 38
+        """39 includes the reviewed repo_pr_status connector read."""
+        assert len(_classified("code")) == 39
 
     def test_no_shipped_config_names_a_code_granted_tool(self):
         """A config naming one is either dead text or a misunderstanding.
