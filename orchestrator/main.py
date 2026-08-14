@@ -21588,6 +21588,7 @@ async def complete_job(
         CompletionControlInProgress,
         CompletionFenceRejected,
         CompletionInProgress,
+        CompletionNonTerminalReport,
         CompletionPayloadMismatch,
         CompletionTeardownInProgress,
         accept_completion_command,
@@ -21618,6 +21619,14 @@ async def complete_job(
         )
     except CompletionCommandNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CompletionNonTerminalReport as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "completion_non_terminal_report",
+                "message": str(exc),
+            },
+        ) from exc
     except CompletionPayloadMismatch as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except CompletionInProgress as exc:

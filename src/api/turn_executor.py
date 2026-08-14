@@ -70,7 +70,7 @@ from uuid import UUID
 
 from .lease_context import LeaseHandle, LeaseLostError, current_lease
 from .models import JobStartRequest
-from .orchestrator_client import ClaimBundleError
+from .orchestrator_client import ClaimBundleError, CompletionNonTerminalReportError
 from ..shared.job_freeze_types import (
     AUTO_CONTINUE_FREEZE_TYPES,
     FREEZE_TYPE_BATCH_BOUNDARY,
@@ -1007,15 +1007,49 @@ class StatelessTurnExecutor:
             raise RuntimeError("worker terminal report requires orchestrator client")
 
         # Genuine terminal/human-facing stop: report exactly once while the
-        # queue lease and renewal task remain alive.  Only a 2xx lets us close
-        # the queue unit.  A timeout/non-2xx preserves tmux and error-releases
-        # so a successor re-enters the END checkpoint and retries the report.
+        # queue lease and renewal task remain alive. Only success or exact B4
+        # acceptance proof permits finalization hold/queue closure. Ambiguous
+        # failures preserve tmux and re-report; the exact coded pre-write 422
+        # below instead follows ordinary bounded retry/parking semantics.
         self._worker_terminal_report_generation = (job_id, int(token))
-        reported = await client.report_completion(
-            job_id,
-            final_state,
-            lease_token=token,
-        )
+        try:
+            reported = await client.report_completion(
+                job_id,
+                final_state,
+                lease_token=token,
+            )
+        except CompletionNonTerminalReportError as exc:
+            # This exact coded 422 is a definitive pre-write refusal. Clear
+            # the report-started marker before cleanup so even a cleanup fault
+            # follows ordinary retry/parking semantics rather than the
+            # ambiguous-HTTP no-park path.
+            self._worker_terminal_report_generation = None
+            logger.error(
+                "worker completion definitively refused: unit=%s token=%d code=%s",
+                job_id,
+                token,
+                exc.code,
+            )
+            try:
+                await self._cleanup_worker_runtime(preserve_shell=True)
+            except Exception:
+                # Cleanup is best-effort but the definitive pre-write result
+                # must remain definitive. Letting this escape could enter the
+                # driver-exhaustion handler and issue a second /complete at
+                # the retry cap. Keep the diagnostic bounded and continue to
+                # the exact token-fenced ordinary release.
+                logger.error(
+                    "worker completion refusal cleanup failed: "
+                    "unit=%s token=%d code=%s",
+                    job_id,
+                    token,
+                    exc.code,
+                )
+            await self._release_worker_claim(
+                claim,
+                reason=exc.code,
+            )
+            return
         if not reported:
             # A pause/cancel may win after the handler's thin entry fence.  The
             # handler's jobs-row disposition CAS then rejects the report. Read

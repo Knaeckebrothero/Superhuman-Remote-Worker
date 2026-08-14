@@ -82,6 +82,21 @@ class ClaimBundleError(Exception):
         super().__init__(f"claim-bundle {status_code}: {detail[:200]}")
 
 
+class CompletionNonTerminalReportError(Exception):
+    """The orchestrator definitively refused a continue-shaped completion.
+
+    This exact machine-coded HTTP 422 is a pre-write refusal, not an ambiguous
+    transport failure.  Stateless workers must release through their ordinary
+    retry/parking path without probing for durable completion acceptance.
+    """
+
+    code = "completion_non_terminal_report"
+
+    def __init__(self, message: str = "") -> None:
+        self.message = message
+        super().__init__(message or self.code)
+
+
 class VerdictRecordingError(Exception):
     """The verdict could not be durably recorded.
 
@@ -1703,6 +1718,10 @@ class OrchestratorClient:
 
         Returns:
             True if the orchestrator handled completion successfully.
+
+        Raises:
+            CompletionNonTerminalReportError: The exact machine-coded 422
+                proves the stateless payload was refused before any write.
         """
         if not self._client:
             await self.connect()
@@ -1760,6 +1779,29 @@ class OrchestratorClient:
                     f"status={resp_data.get('new_status')}, actions={actions}"
                 )
                 return True
+            elif response.status_code == 422:
+                try:
+                    response_payload = response.json()
+                except (TypeError, ValueError):
+                    response_payload = None
+                detail = (
+                    response_payload.get("detail")
+                    if isinstance(response_payload, dict)
+                    else None
+                )
+                if (
+                    isinstance(detail, dict)
+                    and detail.get("code") == CompletionNonTerminalReportError.code
+                ):
+                    message = detail.get("message")
+                    raise CompletionNonTerminalReportError(
+                        message if isinstance(message, str) else ""
+                    )
+                logger.warning(
+                    f"Completion report failed for job {job_id}: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return False
             elif response.status_code == 404:
                 logger.info(
                     "Orchestrator does not support /complete endpoint — "
@@ -1773,6 +1815,8 @@ class OrchestratorClient:
                 )
                 return False
 
+        except CompletionNonTerminalReportError:
+            raise
         except httpx.RequestError as e:
             logger.warning(f"Failed to report completion for job {job_id}: {e}")
             return False

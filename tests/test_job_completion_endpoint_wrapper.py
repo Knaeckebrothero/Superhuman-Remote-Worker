@@ -3199,6 +3199,32 @@ async def test_divergent_replay_is_unprocessable(
 
 
 @pytest.mark.asyncio
+async def test_nonterminal_stateless_report_has_machine_coded_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = "stateless completion requires should_stop=true"
+    accept = AsyncMock(side_effect=commands.CompletionNonTerminalReport(message))
+    legacy = AsyncMock()
+    finalizer_getter = _forbid_finalizer(monkeypatch)
+    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(main, "require_internal", AsyncMock())
+    monkeypatch.setattr(main, "_complete_job_legacy", legacy)
+    monkeypatch.setattr(commands, "accept_completion_command", accept)
+
+    with pytest.raises(HTTPException) as caught:
+        await main.complete_job(MagicMock(), JOB_ID, _body())
+
+    assert caught.value.status_code == 422
+    assert caught.value.detail == {
+        "code": "completion_non_terminal_report",
+        "message": message,
+    }
+    assert caught.value.headers is None
+    legacy.assert_not_awaited()
+    finalizer_getter.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_parked_replay_is_accepted_without_retry_after(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
