@@ -10,6 +10,7 @@ boundary — the agent has a shell and can run git directly.
 
 import logging
 from typing import Any, List, Optional
+from uuid import UUID
 
 from langchain_core.tools import tool
 
@@ -191,6 +192,35 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
             )
         except ForgeError as exc:
             return f"Could not open the pull request: {exc}"
-        return f"Opened #{result['number']} ({source} → {base}): {result['url']}"
+
+        pull_request = {
+            "forge": target.forge,
+            "repo": f"{target.owner}/{target.repo}",
+            "number": result["number"],
+            "url": result["url"],
+            "head": source,
+            "base": base,
+        }
+        recorded = False
+        try:
+            if context.postgres_db is not None and context.job_id:
+                recorded = await context.postgres_db.jobs.merge_context(
+                    UUID(str(context.job_id)), {"pull_request": pull_request}
+                )
+        except Exception:  # noqa: BLE001 - the PR already exists; preserve its URL
+            logger.exception(
+                "Opened pull request %s for %s but could not persist it against job %s",
+                result["number"],
+                repo,
+                context.job_id,
+            )
+
+        opened = f"Opened #{result['number']} ({source} → {base}): {result['url']}"
+        if recorded:
+            return opened
+        return (
+            f"{opened}\nWarning: the pull request could not be recorded against "
+            "this job. Keep the URL above and do not open a duplicate."
+        )
 
     return [repo_commit, repo_push, repo_pull, repo_open_pr]

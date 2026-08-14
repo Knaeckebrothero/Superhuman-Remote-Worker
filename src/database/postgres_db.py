@@ -1711,6 +1711,20 @@ class JobsNamespace:
         row = await self.db.fetchrow("SELECT * FROM jobs WHERE id = $1", job_id)
         return self.db._row_to_dict(row)
 
+    async def merge_context(self, job_id: uuid.UUID, updates: Dict[str, Any]) -> bool:
+        """Atomically merge top-level keys into a job's JSONB context."""
+        result = await self.db.execute(
+            """
+            UPDATE jobs
+            SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb,
+                updated_at = NOW()
+            WHERE id = $2
+            """,
+            json.dumps(updates),
+            job_id,
+        )
+        return result == "UPDATE 1"
+
     async def update_status(
         self,
         job_id: uuid.UUID,
