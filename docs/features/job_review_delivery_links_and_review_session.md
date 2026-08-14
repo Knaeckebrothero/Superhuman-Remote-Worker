@@ -211,7 +211,7 @@ opened rather than at seal.
 | 3b | Persist opened pull requests on jobs | **Shipped** `63ead51d`, deployed `sha-63ead51` |
 | 3a | Cockpit links job reviews to delivered changes | **Shipped** `52c348c4`, deployed `sha-52c348c` |
 | 3c | Read live pull request status | **Shipped** `23bbf28a` (+ grant test `6b15c93d`), deployed `sha-6b15c93` |
-| 4 | Review in session | **In progress** — `tests/test_job_review_session.py` (274 lines) uncommitted |
+| 4 | Review in session | **Shipped** `e0fa518f` (+ endpoint inventory `a021f4f2`), deployed `sha-e0fa518` |
 
 ### How §3b stores it
 
@@ -234,21 +234,27 @@ So the first job that motivated this feature is the one job the feature cannot h
 backfill is wanted, that prose is the only source, and parsing it is exactly the fragility
 §2b describes. Recommend **not** backfilling; let it stand as the before-picture.
 
-### Remaining work for §4
+### How §4 creates the review session
 
-The security constraint in §4b is unchanged and still binding — re-read it before touching
-`create_persistent_thread`. Beyond that, the open questions are:
+The Cockpit calls `POST /api/jobs/{job_id}/review-session` with an empty body. The
+orchestrator access-checks that job, requires its structured PR record, and resolves the
+exact repository connector by forge, host, and owner/repository. It never guesses from
+model prose or substitutes a same-named repository on another host.
 
-1. **Workspace strategy** (§4c). A fresh checkout of the source repo at the delivered branch,
-   via the ordinary repository-connector path. Must survive a session resume — see
-   `srw-session-restore-drops-repo-checkouts`. If it cannot, say the session is
-   single-sitting rather than shipping something that silently loses the checkout.
-2. **Backend inheritance.** `config_override.workspace.backend` is not expressible through
-   session parameters. Map to a `config_name`, or drop it and say so in the UI. Do **not**
-   widen the tool.
-3. **Opening brief.** The session should start knowing which job it is reviewing, the
-   deliverable paths, and the PR — not require the reviewer to re-explain it.
-4. **Permission mode.** `supervised` is the safe default for a review session; auto-accept in
-   a session holding a live PAT-bearing checkout deserves a deliberate decision.
-5. **Lifetime.** Review sessions accumulate. Decide whether they idle-reap like other
-   sessions or are explicitly closed on approve/reject.
+The endpoint inherits only the existing session-safe fields: model, temperature, project,
+and connector IDs. Worker profiles map to `session_base`; permission mode is always
+`supervised`. The fresh checkout uses a fixed, server-owned sandbox backend. The job's VM,
+tool, and auto-accept overrides are not copied, and the Cockpit states that explicitly.
+
+The delivery metadata and bounded opening brief are committed atomically with the thread.
+At attach, that trusted metadata selects the persisted delivery branch and refuses to
+register the review source if its required branch cannot be checked out. Hot PVC resumes
+reuse the nested checkout; fallback restores ignore `repos/` in the workspace repository
+and re-clone it, avoiding the empty gitlink defect described in §4c. Review sessions
+otherwise use the ordinary session lifecycle and idle handling.
+
+The §4b boundary remains intact: `create_persistent_thread` has no `config_override` and
+the browser cannot populate the private trusted seed. The unchanged
+`TestNoModelAuthoredPathReachesSessionCreate` suite passes. Full Python 3.12, Cockpit,
+browser-conformance, security, and deployment gates passed in forced develop run
+`31793059319` for `a021f4f2`.
