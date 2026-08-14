@@ -342,12 +342,16 @@ class TestOfficerSummaryEndpoint:
             main, "_find_open_conference_thread", AsyncMock(return_value=None)
         )
         out = await main.get_project_officer_summary(MagicMock(), PROJECT_ID)
-        # The enable prompt still keys off officer: null…
-        assert out["officer"] is None
-        assert out["conference"] is None
-        # …and the post is now always present around it.
+        # Vacancy keys off commissioned: false (O5 card contract); the officer
+        # block is still present so the vacant editor seeds from the row —
+        # live-only fields are null.
         assert out["commissioned"] is False
+        assert out["officer"]["thread_id"] is None
+        assert out["officer"]["status"] is None
+        assert out["officer"]["slots"] == {"line": {"count": 2}}
+        assert out["conference"] is None
         assert out["held"] is None
         assert out["kit"] == {"line": {"count": 2, "in_flight": 0}}
         assert out["incarnations"] == []
         assert out["communication_policy"]["officer_response_minutes"] == 15
+        assert out["while_vacant"] == {"entries": [], "dropped": 0}

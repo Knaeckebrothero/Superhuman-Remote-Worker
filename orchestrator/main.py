@@ -33325,11 +33325,11 @@ async def get_project_officer_summary(
     """The project's post at a glance — the cockpit's officer card.
 
     officer_post.md §4/§8: always returns the post. ``commissioned`` /
-    ``held`` / ``kit`` / ``incarnations`` / ``communication_policy`` come
-    from the durable ``project_officers`` row (partial §8 shape — the O3/O4
-    lifecycle and PATCH slices finish it); the live ``officer`` block keeps
-    its pre-post shape so the existing card renders unchanged, and stays
-    ``null`` while the post is vacant. Kit utilization is lineage-aware:
+    ``held`` / ``kit`` / ``incarnations`` / ``communication_policy`` /
+    ``while_vacant`` come from the durable ``project_officers`` row; the
+    ``officer`` block is ALWAYS present so the card's editor seeds from one
+    place — live thread metadata when commissioned, the row's config when
+    vacant (live-only fields null there). Kit utilization is lineage-aware:
     in-flight counts follow every incarnation on the post, not just the
     current thread.
     """
@@ -33380,22 +33380,39 @@ async def get_project_officer_summary(
     row_officer_cfg = (post.get("config_override") or {}).get("officer") or {}
     if not isinstance(row_officer_cfg, dict):
         row_officer_cfg = {}
+    row_llm_cfg = (post.get("config_override") or {}).get("llm") or {}
+    if not isinstance(row_llm_cfg, dict):
+        row_llm_cfg = {}
     post_block: dict[str, Any] = {
         "commissioned": bool(post.get("thread_id")),
         "held": None,
         "kit": None,
         "communication_policy": post.get("communication_policy") or {},
         "incarnations": post.get("incarnations") or [],
+        "while_vacant": _while_vacant_view(post.get("state")),
     }
 
     if not officer:
         # Vacant (or a stale ended-thread link, which reads as vacant): the
-        # kit seeds from the row — the last real kit a decommission or the
-        # backfill harvested there.
+        # editor seeds from the row — the last real kit a decommission or
+        # the backfill harvested there. The officer block is present but
+        # live-only fields (thread_id, status, hold) are null.
         post_block["kit"] = _kit_view(row_officer_cfg.get("slots"))
+        try:
+            row_ceiling = int(row_officer_cfg.get("daily_token_ceiling") or 0)
+        except (TypeError, ValueError):
+            row_ceiling = 0
         return {
-            "officer": None,
+            "officer": {
+                "thread_id": None,
+                "status": None,
+                "title": None,
+                "created_at": None,
+                "hold": None,
+                **_officer_editor_block(row_officer_cfg, row_llm_cfg),
+            },
             "conference": conference_block,
+            "spend_today": await _officer_spend_today(None, row_ceiling),
             **post_block,
         }
 
@@ -33449,20 +33466,14 @@ async def get_project_officer_summary(
             "title": officer.get("title"),
             "created_at": officer.get("created_at"),
             "hold": officer_meta.get("hold") or None,
-            "slots": officer_meta.get("slots") or None,
             # The brain HIS judgment runs on (explicit override only — a null
             # means he's on the resolved session default, which the card
-            # renders as exactly that).
-            "model": ((metadata.get("config_override") or {}).get("llm") or {}).get(
-                "model"
+            # renders as exactly that) + the full editor numerics, live from
+            # the thread's runtime projection.
+            **_officer_editor_block(
+                officer_meta,
+                (metadata.get("config_override") or {}).get("llm") or {},
             ),
-            "reasoning_level": (
-                (metadata.get("config_override") or {}).get("llm") or {}
-            ).get("reasoning_level"),
-            "sleep_minutes": {
-                "min": officer_meta.get("sleep_min_minutes") or 5,
-                "max": officer_meta.get("sleep_max_minutes") or 60,
-            },
         },
         "next_wake_at": (timer or {}).get("fire_at"),
         "pending_events": int(pending_events or 0),
@@ -33471,8 +33482,864 @@ async def get_project_officer_summary(
             "daily": token_ceiling,
             "deferred_today": officer_state.get("ceiling_notice") == today,
         },
+        "spend_today": await _officer_spend_today(officer_tid, token_ceiling),
         "digest": digest[-10:],
         "conference": conference_block,
+    }
+
+
+async def _officer_spend_today(thread_id: str | None, ceiling: int) -> dict[str, Any]:
+    """Today's session-token spend against the officer's daily ceiling (§8).
+
+    The exact call the ceiling brake makes per wake
+    (``session_wake._officer_ceiling_deferral``), reused for the card:
+    ``usage_ledger.query_usage`` over today's UTC window, ``ref_id`` =
+    officer thread, tokens-unit categories summed. ``tokens`` is 0 for a
+    vacant post (nothing metered), None when metering is unavailable — the
+    card can render an honest dash instead of a fake zero.
+    """
+    tokens: int | None = 0
+    if thread_id:
+        tokens = None
+        try:
+            if usage_ledger is not None and usage_ledger.is_available:
+                now = datetime.now(timezone.utc)
+                day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                usage = await usage_ledger.query_usage(
+                    from_ts=day_start, to_ts=now, ref_id=str(thread_id)
+                )
+                tokens = sum(
+                    item.get("quantity") or 0
+                    for item in usage.get("by_category") or []
+                    if item.get("unit") == "tokens"
+                )
+        except Exception:
+            logger.warning(
+                "officer spend: usage query failed (non-fatal)", exc_info=True
+            )
+            tokens = None
+    try:
+        ceiling_int = max(0, int(ceiling or 0))
+    except (TypeError, ValueError):
+        ceiling_int = 0
+    return {"tokens": tokens, "ceiling": ceiling_int}
+
+
+def _officer_editor_block(
+    officer_cfg: dict[str, Any], llm_cfg: dict[str, Any]
+) -> dict[str, Any]:
+    """The kit fields the card's editor seeds from, one shape for both card
+    states (officer_post.md §8): live thread metadata when commissioned, the
+    durable row config when vacant. Unset numerics stay null so the editor
+    shows the true default provenance instead of a materialized fake."""
+
+    def _num(key: str) -> int | None:
+        value = officer_cfg.get(key)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "model": llm_cfg.get("model"),
+        "reasoning_level": llm_cfg.get("reasoning_level"),
+        "slots": officer_cfg.get("slots") or None,
+        "sleep_minutes": {
+            "min": _num("sleep_min_minutes") or 5,
+            "max": _num("sleep_max_minutes") or 60,
+        },
+        "sleep_min_minutes": _num("sleep_min_minutes"),
+        "sleep_max_minutes": _num("sleep_max_minutes"),
+        "daily_token_ceiling": _num("daily_token_ceiling"),
+        "max_pages_per_day": _num("max_pages_per_day"),
+        "max_actions_per_wake": _num("max_actions_per_wake"),
+        "max_concurrent_workers": _num("max_concurrent_workers"),
+    }
+
+
+def _while_vacant_view(state: Any) -> dict[str, Any]:
+    """The row's while-vacant ledger in the card's shape:
+    ``{entries: [{at?, job_id?, status?, title?}], dropped: n}``. ``title``
+    is derived from the stored ``description`` so the storage shape (shared
+    with the wake payloads) stays stable."""
+    if not isinstance(state, dict):
+        state = {}
+    raw = state.get("while_vacant")
+    entries = []
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            view = dict(entry)
+            if view.get("title") is None and view.get("description"):
+                view["title"] = view["description"]
+            entries.append(view)
+    try:
+        dropped = max(0, int(state.get("while_vacant_dropped") or 0))
+    except (TypeError, ValueError):
+        dropped = 0
+    return {"entries": entries, "dropped": dropped}
+
+
+# =============================================================================
+# The officer's post — lifecycle + editing (officer_post.md §5/§7, O3/O4)
+# =============================================================================
+
+# §7's per-field honesty table, shown in the UI. Sleep bounds act at the next
+# filing AND immediately at the watchdog (it re-reads the thread row per
+# tick); max_actions/brain are baked into config.officer at attach, so the
+# only honest label is the next respawn.
+_OFFICER_POST_EFFECTS: dict[str, str] = {
+    "slots": "next dispatch",
+    "max_concurrent_workers": "next dispatch",
+    "daily_token_ceiling": "next delivery",
+    "max_pages_per_day": "next delivery",
+    "sleep_min_minutes": "next sleep filing + watchdog immediately",
+    "sleep_max_minutes": "next sleep filing + watchdog immediately",
+    "max_actions_per_wake": "next respawn",
+    "brain": "next respawn",
+    "communication_policy": "next worker message",
+}
+
+_OFFICER_POST_INT_FIELDS = frozenset(
+    {
+        "max_concurrent_workers",
+        "max_pages_per_day",
+        "max_actions_per_wake",
+        "daily_token_ceiling",
+        "sleep_min_minutes",
+        "sleep_max_minutes",
+    }
+)
+
+# Row-only worker-message routing policy (officer_post.md §7): the server
+# resolves it per message, the officer thread can never rewrite it, and it is
+# deliberately NEVER mirrored into thread metadata.
+_COMMUNICATION_WORKER_MESSAGES = frozenset(
+    {"user_direct", "officer_and_user", "officer_first"}
+)
+_COMMUNICATION_RESPONSE_MINUTES_BOUNDS = (5, 120)
+
+
+def _validated_officer_post_patch(
+    body: Any,
+) -> tuple[dict[str, Any], Optional[dict[str, Any]], dict[str, str]]:
+    """Validate a partial post edit (PATCH body, commission body — same shape).
+
+    Returns ``(config_fragment, communication_policy_patch, effects)`` where
+    the fragment is row/thread-mergeable (``{"officer": {...}, "llm":
+    {...}}``), the policy patch stays row-only, and ``effects`` carries §7's
+    per-field labels for exactly the keys the caller sent. Raises
+    HTTPException(400) on unknown fields or bad values — a typo'd kit fails
+    HERE, the same hard line the create funnel draws
+    (``_validated_session_officer_override``).
+
+    Null-as-clear (the card's revert affordance): an explicit ``null`` on
+    ``slots`` (→ flat cap), ``brain`` (→ session default), or any numeric
+    field (→ platform default) writes a JSON null through the deep merge —
+    every reader treats null as unset. ``communication_policy: null`` is
+    refused with an explanation; the policy always has explicit values.
+    """
+    if body is None:
+        return {}, None, {}
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    unknown = set(body) - set(_OFFICER_POST_EFFECTS)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown officer post fields: {sorted(unknown)}",
+        )
+
+    officer_patch: dict[str, Any] = {}
+    llm_patch: dict[str, Any] = {}
+    comm_patch: Optional[dict[str, Any]] = None
+
+    if "slots" in body:
+        if body["slots"] is None:
+            officer_patch["slots"] = None  # revert to flat cap
+        else:
+            # The same hard validation provision gets — a typo'd kit 400s.
+            from services.officer_slots import validate_slots_spec
+
+            try:
+                officer_patch["slots"] = validate_slots_spec(body["slots"])
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    for key in sorted(_OFFICER_POST_INT_FIELDS):
+        if key in body:
+            if body[key] is None:
+                officer_patch[key] = None  # revert to the platform default
+                continue
+            try:
+                officer_patch[key] = max(0, int(body[key]))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"{key} must be an integer"
+                ) from exc
+
+    if "brain" in body:
+        brain = body["brain"]
+        if brain is None:
+            # Clear the whole override — he thinks on the session default.
+            llm_patch["model"] = None
+            llm_patch["reasoning_level"] = None
+            brain = {}
+        if not isinstance(brain, dict) or (not brain and body["brain"] is not None):
+            raise HTTPException(
+                status_code=400,
+                detail="brain must be an object of model and/or reasoning_level",
+            )
+        unknown_brain = set(brain) - {"model", "reasoning_level"}
+        if unknown_brain:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown brain keys: {sorted(unknown_brain)}",
+            )
+        if "model" in brain:
+            model = brain["model"]
+            if model is None:
+                llm_patch["model"] = None
+            elif not isinstance(model, str) or not model.strip() or len(model) > 128:
+                raise HTTPException(
+                    status_code=400, detail="brain.model must be a short string"
+                )
+            else:
+                llm_patch["model"] = model.strip()
+        if "reasoning_level" in brain:
+            # Same vocabulary gate as the create bridge — garbage fails loud,
+            # the family capability still clamps at attach.
+            llm_patch["reasoning_level"] = (
+                None
+                if brain["reasoning_level"] is None
+                else _validated_reasoning_level(brain["reasoning_level"])
+            )
+
+    if "communication_policy" in body:
+        policy = body["communication_policy"]
+        if policy is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "communication_policy cannot be cleared — send explicit "
+                    "values for worker_messages and/or officer_response_minutes"
+                ),
+            )
+        if not isinstance(policy, dict) or not policy:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "communication_policy must be an object of worker_messages "
+                    "and/or officer_response_minutes"
+                ),
+            )
+        unknown_policy = set(policy) - {
+            "worker_messages",
+            "officer_response_minutes",
+        }
+        if unknown_policy:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown communication_policy keys: {sorted(unknown_policy)}",
+            )
+        cleaned_policy: dict[str, Any] = {}
+        if "worker_messages" in policy:
+            if policy["worker_messages"] not in _COMMUNICATION_WORKER_MESSAGES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "worker_messages must be one of "
+                        f"{sorted(_COMMUNICATION_WORKER_MESSAGES)}"
+                    ),
+                )
+            cleaned_policy["worker_messages"] = policy["worker_messages"]
+        if "officer_response_minutes" in policy:
+            lo, hi = _COMMUNICATION_RESPONSE_MINUTES_BOUNDS
+            try:
+                minutes = int(policy["officer_response_minutes"])
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="officer_response_minutes must be an integer",
+                ) from exc
+            if not lo <= minutes <= hi:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"officer_response_minutes must be between {lo} and {hi}",
+                )
+            cleaned_policy["officer_response_minutes"] = minutes
+        comm_patch = cleaned_policy
+
+    fragment: dict[str, Any] = {}
+    if officer_patch:
+        fragment["officer"] = officer_patch
+    if llm_patch:
+        fragment["llm"] = llm_patch
+    effects = {key: _OFFICER_POST_EFFECTS[key] for key in body}
+    return fragment, comm_patch, effects
+
+
+def _check_officer_sleep_bounds(
+    current_officer_cfg: dict[str, Any], officer_patch: dict[str, Any]
+) -> None:
+    """min ≤ max over the MERGED view (§7) — a patch of one bound is checked
+    against the standing other bound, defaults 5/60 where nothing is set."""
+    if not officer_patch or not (
+        {"sleep_min_minutes", "sleep_max_minutes"} & set(officer_patch)
+    ):
+        return
+
+    def _bound(key: str, default: int) -> int:
+        if key in officer_patch:
+            # A null patch value clears the bound — it reverts to the default.
+            if officer_patch[key] is None:
+                return default
+            return int(officer_patch[key])
+        try:
+            return int(current_officer_cfg.get(key) or default)
+        except (TypeError, ValueError):
+            return default
+
+    new_min = _bound("sleep_min_minutes", 5)
+    new_max = _bound("sleep_max_minutes", 60)
+    if new_min > new_max:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"sleep_min_minutes ({new_min}) must not exceed "
+                f"sleep_max_minutes ({new_max})"
+            ),
+        )
+
+
+async def _inject_officer_notice(officer_thread: dict[str, Any], text: str) -> bool:
+    """Best-effort one-liner via the agent's /api/input (bypasses holds by
+    design — Legate input always reaches him). Never raises."""
+    try:
+        from services import session_wake as _sw
+
+        agent = await _sw._resolve_live_agent(postgres_db, officer_thread)
+        if agent is None:
+            return False
+        return await _sw._inject_live(agent, text)
+    except Exception:
+        logger.debug("officer notice: inject failed (non-fatal)", exc_info=True)
+        return False
+
+
+async def _officer_in_flight_jobs(project_id: str) -> list[dict[str, Any]]:
+    """In-flight jobs across the post's thread lineage (§4 counting rules)."""
+    lineage = await postgres_db.get_project_officer_lineage(project_id)
+    if not lineage:
+        return []
+    async with postgres_db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, status, context->>'officer_slot' AS slot, description
+              FROM jobs
+             WHERE created_by_thread_id = ANY($1::uuid[])
+               AND status IN ('created', 'processing')
+             ORDER BY created_at
+            """,
+            lineage,
+        )
+    return [
+        {
+            "job_id": str(r["id"]),
+            "status": r["status"],
+            "slot": r["slot"],
+            "title": (r["description"] or "")[:200],
+        }
+        for r in rows
+    ]
+
+
+async def _decommission_officer_post(
+    thread: dict[str, Any], *, reason: str
+) -> Optional[dict[str, Any]]:
+    """Decommission hygiene on the post (officer_post.md §5, steps 2/3/5).
+
+    Runs only when ``thread`` IS its project's registered officer — a legacy
+    enabled thread that never claimed the post must not harvest over another
+    incarnation's state. Order: harvest ``metadata.officer_state`` → row
+    (whole — the fingerprints are the point), fold + clear the wake queue
+    (job events → while-vacant ring, timers/fleet deleted), unlink, append
+    the incarnation entry. Called from ``end_thread``'s stand-down, so a
+    direct DELETE on an officer thread and the decommission endpoint are one
+    funnel. Returns a summary dict, or None when the thread holds no post.
+    """
+    project_id = thread.get("project_id")
+    if not project_id:
+        return None
+    project_id = str(project_id)
+    thread_id = str(thread["id"])
+    post = await postgres_db.get_project_officer(project_id)
+    if not post or str(post.get("thread_id") or "") != thread_id:
+        return None
+
+    metadata = thread_metadata_object(thread)
+    officer_state = metadata.get("officer_state")
+    harvested = False
+    if isinstance(officer_state, dict) and officer_state:
+        harvested = (
+            await postgres_db.merge_project_officer_state(project_id, officer_state)
+            is not None
+        )
+
+    fold = await postgres_db.fold_project_officer_wake_queue(project_id, thread_id)
+
+    await postgres_db.clear_project_officer_thread(project_id)
+    commissioned_at = thread.get("created_at")
+    if hasattr(commissioned_at, "isoformat"):
+        commissioned_at = commissioned_at.isoformat()
+    entry = {
+        "thread_id": thread_id,
+        "commissioned_at": commissioned_at,
+        "decommissioned_at": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+    }
+    await postgres_db.append_project_officer_incarnation(project_id, entry)
+    logger.info(
+        "officer post %s: decommissioned thread %s (reason=%s, harvested=%s, "
+        "queue folded=%d deleted=%d)",
+        project_id[:8],
+        thread_id[:8],
+        reason,
+        harvested,
+        fold.get("folded", 0),
+        fold.get("deleted", 0),
+    )
+    return {"harvested": harvested, "incarnation": entry, **fold}
+
+
+class OfficerDecommissionRequest(BaseModel):
+    """Body for POST .../officer/decommission."""
+
+    force: bool = Field(
+        False,
+        description=(
+            "Acknowledge the in-flight-jobs warning (jobs keep running — force "
+            "never cancels them) and end a mid-turn session."
+        ),
+    )
+    reason: str | None = Field(
+        None, description="Recorded on the incarnation entry (default 'decommissioned')"
+    )
+
+
+class OfficerHoldRequest(BaseModel):
+    """Body for POST .../officer/hold."""
+
+    note: str | None = Field(None, description="Shown on the card's held badge")
+
+
+@app.post("/api/projects/{project_id}/officer/commission")
+async def commission_project_officer(
+    request: Request,
+    project_id: str,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Raise an officer onto the project's post (officer_post.md §5).
+
+    Auth: project admin (owner or platform admin) — the kit belongs to the
+    century, not to whoever clicked provision (§11 Q1, decided). Optional
+    body: the same partial kit as PATCH; validated and merged into the row
+    FIRST, so the thread is created from the durable record. The thread goes
+    through the one create funnel — registration links it and 409s rivals;
+    a stale ended-thread link is folded there (harvest + incarnation) before
+    the claim. The continuity brief is his first wake: vacant-since/until, a
+    pointer at his restored state + charter, and the while-vacant ledger.
+    """
+    _user, project = await require_project_owner(request, postgres_db, project_id)
+
+    standing = await postgres_db.get_officer_thread_for_project(project_id)
+    if standing:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "already commissioned: this project's post is held by thread "
+                f"{standing['id']} — decommission him before raising another "
+                "officer."
+            ),
+        )
+
+    fragment, comm_patch, _effects = _validated_officer_post_patch(body)
+    post = await postgres_db.get_or_create_project_officer(project_id)
+    if post is None:
+        raise HTTPException(status_code=404, detail="Project post not found")
+    _check_officer_sleep_bounds(
+        (post.get("config_override") or {}).get("officer") or {},
+        fragment.get("officer") or {},
+    )
+    if fragment:
+        post = (
+            await postgres_db.merge_project_officer_config(project_id, fragment) or post
+        )
+    if comm_patch:
+        post = (
+            await postgres_db.merge_project_officer_communication_policy(
+                project_id, comm_patch
+            )
+            or post
+        )
+
+    # Build the funnel request from the row. llm/interactive ride the
+    # request's own bridges (the funnel rebuilds config_override from
+    # validated fragments only); the officer block is sanitized to the
+    # create-time vocabulary with enabled forced on — commission is the one
+    # legitimate writer of a live officer class.
+    row_cfg = post.get("config_override") or {}
+    row_officer = row_cfg.get("officer") or {}
+    officer_fragment = {
+        k: v
+        for k, v in row_officer.items()
+        # Nulls are cleared fields (PATCH null-as-clear) — an omitted key is
+        # how the funnel spells "default", so they must not travel.
+        if k in _SESSION_OFFICER_OVERRIDE_KEYS and k != "conference" and v is not None
+    }
+    officer_fragment["enabled"] = True
+    create_override: dict[str, Any] = {"officer": officer_fragment}
+    for passthrough in ("workspace", "tools"):
+        sub = row_cfg.get(passthrough)
+        if isinstance(sub, dict) and sub:
+            create_override[passthrough] = sub
+    row_llm = row_cfg.get("llm") or {}
+    row_interactive = row_cfg.get("interactive") or {}
+    create_request = ThreadCreateRequest(
+        project_id=project_id,
+        title=f"Centurion — {project.get('name') or project_id[:8]}",
+        config_override=create_override,
+        model=row_llm.get("model"),
+        reasoning_level=row_llm.get("reasoning_level"),
+        temperature=row_llm.get("temperature"),
+        permission_mode=row_interactive.get("permission_mode"),
+    )
+    created = await create_thread(create_request, request)
+    thread_id = str(created["thread_id"])
+
+    # Continuity restore (§2 row→thread, §5): the harvested officer_state —
+    # digest ring, page counter, and above all the sitrep fingerprints — is
+    # stamped onto the new incarnation so his first watch reports deltas,
+    # not 242 jobs of news. The while-vacant ledger is drained into the
+    # brief instead (atomically, so a racing completion lands in exactly one
+    # of the two).
+    post = await postgres_db.get_project_officer(project_id) or post
+    state_restore = {
+        k: v
+        for k, v in (post.get("state") or {}).items()
+        if k not in ("while_vacant", "while_vacant_dropped")
+    }
+    if state_restore:
+        await postgres_db.merge_thread_officer_state(thread_id, state_restore)
+
+    ledger = await postgres_db.drain_project_officer_while_vacant(project_id)
+    incarnations = post.get("incarnations") or []
+    vacant_since = (
+        incarnations[-1].get("decommissioned_at")
+        if incarnations and isinstance(incarnations[-1], dict)
+        else None
+    )
+    brief_payload = {
+        "summary": (
+            "commissioned — you hold this project's post. Your durable state "
+            "(digest, page counter, sitrep fingerprints) was restored to this "
+            "session; re-read your charter and the project stores before your "
+            "first scheduling decision."
+        ),
+        "vacant_since": vacant_since,
+        "vacant_until": datetime.now(timezone.utc).isoformat(),
+        "while_vacant": ledger.get("entries") or [],
+        "while_vacant_dropped": int(ledger.get("dropped") or 0),
+        "last_state_restored": bool(state_restore),
+    }
+    brief_enqueued = await postgres_db.enqueue_session_wake_event(
+        thread_id,
+        source="commission",
+        dedup_key=thread_id,
+        payload=brief_payload,
+        project_id=project_id,
+    )
+    if brief_enqueued:
+        _kick_officer_event_drain(postgres_db)
+    else:
+        logger.warning(
+            "officer commission: brief wake did not enqueue for thread %s",
+            thread_id[:8],
+        )
+
+    return {
+        "status": "commissioned",
+        "thread_id": thread_id,
+        "title": create_request.title,
+        "brief_enqueued": bool(brief_enqueued),
+        "while_vacant": len(ledger.get("entries") or []),
+        "while_vacant_dropped": int(ledger.get("dropped") or 0),
+        "state_restored": bool(state_restore),
+    }
+
+
+@app.post("/api/projects/{project_id}/officer/decommission")
+async def decommission_project_officer(
+    request: Request,
+    project_id: str,
+    body: OfficerDecommissionRequest | None = None,
+) -> dict[str, Any]:
+    """Stand the officer down and keep everything he had (officer_post.md §5).
+
+    Auth: project admin. Warns (409, listing them) on in-flight jobs unless
+    ``force`` — and force only acknowledges the warning: jobs are LEFT
+    RUNNING either way; their completions land on the vacant post's ledger.
+    The actual hygiene (harvest → queue fold → unlink → incarnation) runs
+    inside the shared ``end_thread`` stand-down, so this endpoint and a
+    direct thread DELETE are one funnel.
+    """
+    await require_project_owner(request, postgres_db, project_id)
+    body = body or OfficerDecommissionRequest()
+    reason = (body.reason or "").strip() or "decommissioned"
+
+    post = await postgres_db.get_or_create_project_officer(project_id)
+    if post is None:
+        raise HTTPException(status_code=404, detail="Project post not found")
+    linked_tid = post.get("thread_id")
+    if not linked_tid:
+        raise HTTPException(
+            status_code=400, detail="The post is vacant — nothing to decommission"
+        )
+    linked_tid = str(linked_tid)
+
+    thread = await postgres_db.get_thread(linked_tid)
+    if thread is None:
+        # Hard-deleted thread behind a stale link: nothing to harvest, just
+        # record the incarnation and vacate.
+        await postgres_db.clear_project_officer_thread(project_id)
+        await postgres_db.append_project_officer_incarnation(
+            project_id,
+            {
+                "thread_id": linked_tid,
+                "commissioned_at": None,
+                "decommissioned_at": datetime.now(timezone.utc).isoformat(),
+                "reason": reason,
+            },
+        )
+        return {
+            "status": "decommissioned",
+            "thread_id": linked_tid,
+            "note": "thread row was already gone; link cleared",
+        }
+
+    if thread.get("status") == "ended":
+        # Crash-ended incarnation under the page-and-wait policy: the thread
+        # is already down — run the post hygiene directly, no end flow.
+        summary = await _decommission_officer_post(thread, reason=reason) or {}
+        return {
+            "status": "decommissioned",
+            "thread_id": linked_tid,
+            "already_ended": True,
+            **{k: v for k, v in summary.items() if k != "incarnation"},
+        }
+
+    in_flight = await _officer_in_flight_jobs(project_id)
+    if in_flight and not body.force:
+        # The warning is a 200, not an error (the card routes error statuses
+        # to its failure path, not the leave-running confirmation flow). The
+        # post is untouched; the caller re-sends with force to proceed.
+        return {
+            "status": "in_flight",
+            "warning": (
+                f"{len(in_flight)} job(s) in flight on this post. "
+                "Decommission leaves them running; retry with force=true to "
+                "proceed."
+            ),
+            "in_flight_jobs": in_flight,
+        }
+
+    await _end_thread_flow(
+        linked_tid,
+        thread,
+        permanent=False,
+        force=body.force,
+        officer_retire_reason=reason,
+    )
+
+    fresh_post = await postgres_db.get_project_officer(project_id) or {}
+    return {
+        "status": "decommissioned",
+        "thread_id": linked_tid,
+        "in_flight_jobs": in_flight,
+        "harvested": bool(
+            {
+                k: v
+                for k, v in (fresh_post.get("state") or {}).items()
+                if k not in ("while_vacant", "while_vacant_dropped")
+            }
+        ),
+        "incarnations": fresh_post.get("incarnations") or [],
+    }
+
+
+@app.post("/api/projects/{project_id}/officer/hold")
+async def hold_project_officer(
+    request: Request,
+    project_id: str,
+    body: OfficerHoldRequest | None = None,
+) -> dict[str, Any]:
+    """Maintenance hold — pause ≠ retire (officer_post.md §5, decided 08-01).
+
+    Auth: project admin. Stamps ``officer.hold = {kind, since, note}`` on the
+    THREAD (hold is runtime state; a vacant post 400s) with — critically —
+    NO ``thread_id`` key: that absence is what keeps the watchdog's
+    stale-conference-hold self-heal from ever releasing it. One key, four
+    effects, all pre-wired by the conference machinery: drain skips him,
+    dispatches 409, watchdog stands down, nothing self-heals.
+    """
+    await require_project_owner(request, postgres_db, project_id)
+    officer = await postgres_db.get_officer_thread_for_project(project_id)
+    if not officer:
+        raise HTTPException(
+            status_code=400, detail="The post is vacant — nothing to hold"
+        )
+    officer_tid = str(officer["id"])
+    existing = _thread_officer_meta(officer).get("hold")
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "already held "
+                f"(kind={existing.get('kind') if isinstance(existing, dict) else '?'})"
+                " — release before holding again"
+            ),
+        )
+    hold = {
+        "kind": "maintenance",
+        "since": datetime.now(timezone.utc).isoformat(),
+        "note": ((body.note if body else None) or "").strip(),
+    }
+    await postgres_db.merge_thread_config_override(
+        officer_tid, {"officer": {"hold": hold}}
+    )
+    notified = await _inject_officer_notice(
+        officer,
+        "[maintenance hold — the Legate has stood you down. Take no "
+        "scheduling actions; your timers and events queue durably and arrive "
+        "when the hold is released. Legate messages still reach you.]",
+    )
+    logger.info(
+        "officer %s: maintenance hold stamped (project %s)",
+        officer_tid[:8],
+        project_id[:8],
+    )
+    return {
+        "status": "held",
+        "thread_id": officer_tid,
+        "held": hold,
+        "notified": notified,
+    }
+
+
+@app.post("/api/projects/{project_id}/officer/release")
+async def release_project_officer(request: Request, project_id: str) -> dict[str, Any]:
+    """Release the officer's hold (officer_post.md §5). Auth: project admin.
+
+    Clears via the established lever — deep-merge ``{"officer": {"hold":
+    None}}`` → JSON null, which every reader (watchdog, wake claim, dispatch
+    fence) treats as unheld. Queued events drain within one ~20s tick; the
+    kick below just makes it immediate.
+    """
+    await require_project_owner(request, postgres_db, project_id)
+    officer = await postgres_db.get_officer_thread_for_project(project_id)
+    if not officer:
+        raise HTTPException(
+            status_code=400, detail="The post is vacant — nothing to release"
+        )
+    officer_tid = str(officer["id"])
+    hold = _thread_officer_meta(officer).get("hold")
+    if not hold:
+        raise HTTPException(status_code=400, detail="The officer is not held")
+    await postgres_db.merge_thread_config_override(
+        officer_tid, {"officer": {"hold": None}}
+    )
+    _kick_officer_event_drain(postgres_db)
+    notified = await _inject_officer_notice(
+        officer,
+        "[hold released — resume your duties. Events queued during the hold "
+        "arrive with your next wake.]",
+    )
+    logger.info(
+        "officer %s: hold released (project %s, was kind=%s)",
+        officer_tid[:8],
+        project_id[:8],
+        hold.get("kind") if isinstance(hold, dict) else "?",
+    )
+    return {"status": "released", "thread_id": officer_tid, "notified": notified}
+
+
+@app.patch("/api/projects/{project_id}/officer")
+async def patch_project_officer(
+    request: Request, project_id: str, body: dict[str, Any]
+) -> dict[str, Any]:
+    """Edit the post — the missing form (officer_post.md §7). Auth: project
+    admin (the kit belongs to the century, §11 Q1).
+
+    Writes the durable row always; when commissioned, deep-merges the kit
+    fragment into thread metadata and injects a one-line notice —
+    deliberately NOT a wake (the next sitrep's capacity line carries the
+    truth). Shrinking below in-flight is drain semantics, decided: the 409
+    lives at the next dispatch, running jobs are untouched.
+    ``communication_policy`` is row-only and never touches the thread.
+    """
+    await require_project_owner(request, postgres_db, project_id)
+    fragment, comm_patch, effects = _validated_officer_post_patch(body)
+    if not fragment and comm_patch is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Nothing to update — send at least one of "
+                f"{sorted(_OFFICER_POST_EFFECTS)}"
+            ),
+        )
+    post = await postgres_db.get_or_create_project_officer(project_id)
+    if post is None:
+        raise HTTPException(status_code=404, detail="Project post not found")
+    _check_officer_sleep_bounds(
+        (post.get("config_override") or {}).get("officer") or {},
+        fragment.get("officer") or {},
+    )
+
+    if fragment:
+        post = (
+            await postgres_db.merge_project_officer_config(project_id, fragment) or post
+        )
+    if comm_patch is not None:
+        post = (
+            await postgres_db.merge_project_officer_communication_policy(
+                project_id, comm_patch
+            )
+            or post
+        )
+
+    officer = await postgres_db.get_officer_thread_for_project(project_id)
+    applied_to_thread = False
+    if officer and fragment:
+        applied_to_thread = await postgres_db.merge_thread_config_override(
+            str(officer["id"]), fragment
+        )
+        changed = ", ".join(sorted(k for k in effects if k != "communication_policy"))
+        await _inject_officer_notice(
+            officer,
+            f"[post updated — {changed}. No action needed; your next sitrep "
+            "reflects the change.]",
+        )
+
+    return {
+        "status": "updated",
+        "commissioned": bool(officer),
+        "applied_to_thread": bool(applied_to_thread),
+        "effects": effects,
+        "config_override": post.get("config_override") or {},
+        "communication_policy": post.get("communication_policy") or {},
     }
 
 
@@ -38545,6 +39412,26 @@ async def end_thread(
                input queue (docs/issues/session_silent_failure_audit.md #11).
     """
     _user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    return await _end_thread_flow(thread_id, thread, permanent=permanent, force=force)
+
+
+async def _end_thread_flow(
+    thread_id: str,
+    thread: dict[str, Any],
+    *,
+    permanent: bool,
+    force: bool,
+    officer_retire_reason: str = "retired",
+) -> dict[str, str]:
+    """The End funnel body — everything ``end_thread`` does after auth.
+
+    Shared by the owner-facing DELETE and the project-admin officer
+    decommission endpoint (officer_post.md §5): both must run the same
+    stand-down, resource release, and status write, so there is exactly one
+    way a thread leaves service. ``officer_retire_reason`` is recorded on
+    the post's incarnation entry when the thread holds one ('retired' for a
+    direct DELETE, 'decommissioned' via the endpoint).
+    """
     stateless = thread.get("execution_lane") == "stateless"
     initial_status = thread.get("status")
     initial_stateless_authority: dict[str, Any] | None = None
@@ -38569,6 +39456,21 @@ async def end_thread(
             except Exception:
                 logger.warning(
                     "Officer stand-down merge failed for thread %s", thread_id
+                )
+            # O3 rerouting (officer_post.md §5): ending the project's
+            # registered officer IS a decommission — harvest his state onto
+            # the post, fold the wake queue into the while-vacant ledger,
+            # unlink, and append the incarnation entry. One funnel whether
+            # the caller was the decommission endpoint or a direct DELETE.
+            try:
+                await _decommission_officer_post(
+                    authoritative_thread, reason=officer_retire_reason
+                )
+            except Exception:
+                logger.exception(
+                    "Officer post decommission hygiene failed for thread %s "
+                    "(non-fatal — the next registration folds the stale link)",
+                    thread_id,
                 )
         await _conclude_conference_if_any(authoritative_thread)
 
