@@ -36,7 +36,15 @@ Companion docs: `database_architecture.md` (the tier rules this must respect),
 `persistent_session_source_of_truth.md` (why `thread_messages` is shaped the
 way it is), `../issues/persistent_session_midturn_message_loss.md` (the
 message-granular persistence work that made `thread_messages` the rich store it
-is today).
+is today), and [[officer_message_routing]].
+
+**Relationship to officer routing (2026-08-14):**
+[[officer_message_routing]] does not create a fourth LLM-conversation store. It keeps the
+worker's outbound message and replies on the existing job message path and adds only a
+small control-plane route ledger: chosen project policy, current audience/state, officer
+SLA, total timeout, and resolver. `message_log` remains delivery/audit. If this document
+later establishes a canonical message identity, the route can reference it; conversation
+model convergence and officer/user delivery policy are independent seams.
 
 ## The idea in one sentence
 

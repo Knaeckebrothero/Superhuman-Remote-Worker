@@ -23,7 +23,9 @@ stay related background — deferral is what would make a large shared catalogue
 affordable per-caller.
 Related: `officer_blind_reads_and_worker_bureaucracy.md` (F1–F3 are symptoms of this
 issue), `agent_tool_fixed_vocabularies_invisible_to_model.md`,
-`docs/features/centurion.md` §4.
+`docs/features/centurion.md` §4, and
+`docs/features/officer_supervision_surface.md` (2026-08-14 caller-boundary amendment:
+shared implementation does not imply identical default capabilities).
 
 ---
 

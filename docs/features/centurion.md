@@ -17,6 +17,11 @@ aliases:
   - manager agent
 related:
   - "[[centurion_implementation_notes]]"
+  - "[[officer_post]]"
+  - "[[officer_knowledge_plane]]"
+  - "[[officer_supervision_surface]]"
+  - "[[officer_message_routing]]"
+  - "[[officer_backlog_pools]]"
   - "[[agent_lifecycle]]"
   - "[[headless_persistent_sessions]]"
   - "[[automations]]"
@@ -33,6 +38,13 @@ related:
 
 **Status:** Design v2 (research-hardened). Filed 2026-07-28 from the consolidated officer notes (`Officers.md`); hardened the same day by a five-agent research fan-out — three codebase planners/verifiers, two web researchers (prior art: Letta sleep-time agents, LangGraph ambient agents, Devin/Cursor/Factory, OpenClaw heartbeat, SRE/PagerDuty, Vending-Bench and governance-decay literature). No core decision was refuted; the research added a guardrail layer and corrected several mechanism-level assumptions. Interaction surface (the conference model, §2) settled 2026-07-29. Anchored build plan: [[centurion_implementation_notes]].
 **Scope:** v1 = exactly one centurion on one project, full backlog + job-creation authority, sleep-loop architecture. The wider legion (Tesserarius/Optio as separate agents, centuries, model tiering) and the Primus Pilus command extension are explicitly parked — see [Deferred](#9-deferred--the-legion).
+
+**2026-08-14 operating-surface follow-on (proposed):** [[officer_knowledge_plane]] makes
+the background officer's memory and no-object-work boundary explicit;
+[[officer_supervision_surface]] gives him trustworthy scoped reads and bounded evidence;
+[[officer_message_routing]] lets worker blockers enter his chain before interrupting the
+Legate. These extend the shipped v1 substrate without turning conferences into background
+officers or granting the background thread a workspace.
 
 ---
 
@@ -66,7 +78,7 @@ Time is first-class state: deadlines ("presentation next Thursday") live in the 
 
 The centurion must be **clever and lazy**. He never does object-level work — no coding, no research, no file editing. He observes, judges, delegates, escalates. This keeps his context clean over weeks, keeps his turns cheap, and keeps a bright line between supervision and execution.
 
-The constraint is *structural*, not prompt-hoped: officer sessions run the `none` lite workspace backend — file tools aren't exposed, shell hard-refuses. His hands are the delegation tools, the KB tools, `sleep`, and `notify_user` — nothing else. Validation from the field: Claude Code's own agent-teams docs record team leads doing object-level work despite prompt-level "delegate only" instructions; the structural version cannot fail that way. When the centurion needs information that requires object-level work, he **schedules a recon job** — a worker whose deliverable is a `report` note into the KB. The manager pays for information.
+The constraint is *structural*, not prompt-hoped: officer sessions run the `none` lite workspace backend — file tools aren't exposed, shell hard-refuses. His hands are the delegation tools, the KB tools, `sleep`, and `notify_user` — nothing else. Validation from the field: Claude Code's own agent-teams docs record team leads doing object-level work despite prompt-level "delegate only" instructions; the structural version cannot fail that way. When the centurion needs information that requires object-level work, he **schedules a recon job** — a worker whose deliverable is a `report` note into the KB. The manager pays for information. The proposed [[officer_supervision_surface]] adds a narrow exception for immutable, worker-declared completion evidence; it is not arbitrary file/repository access and cannot be used to perform the work himself.
 
 The dumb-and-lazy tier below him stays mechanical: heartbeats, orphan sweeps, stale detection, the loop-advance sweeper remain code, not LLM. The centurion consumes their signals; a dumb watchdog watches the centurion (§4). And because long-horizon meltdowns are caused by *misinterpreting state*, not by context exhaustion (Vending-Bench), the DB stays the single source of truth: the sitrep is a computed view of it, and every officer action is validated orchestrator-side against DB state — a deluded officer gets loud tool errors in his next sitrep, not compounding fantasy.
 
@@ -77,6 +89,12 @@ Three distinct outputs, in the ambient-agent triad vocabulary, each with a diffe
 - **Log (talk).** Writing in the thread. Free. All routine narration, decisions, and the **micro-standup**: every substantive wake ends with ≤3 bullets — did / next / blocked. The officer's log thereby becomes a searchable async-standup archive.
 - **Question (ask).** A thread message plus a parked assumption with a **response window and a default**: "Assuming A unless you answer by tomorrow 09:00." Unanswered questions convert to recorded assumptions mechanically — asks never block the loop. Questions surface in the daily digest (the *no-surprises rule*: the Legate never learns of a material assumption only when it detonates).
 - **Page (notify).** The explicit `notify_user` tool. Reserved for "action needed from you, now." Governed by the notify contract in §6.
+
+This contract describes the officer's own communication. Worker-originated questions use
+the separate project policy in [[officer_message_routing]]: direct to the Legate, delivered
+to both, or officer-first with an availability/SLA fallback. An escalated worker question
+keeps its job message thread; `notify_user` remains the officer's distinct inform/page
+channel.
 
 ### Ask or assume — with confidence and stakes
 
@@ -206,6 +224,11 @@ Dumb code, not LLM (new leader-gated `officer_watchdog` sweeper, ~60s):
 
 A 24/7 session compacts hundreds of times; everything that *is* him must survive that. No new storage system — route by state type. (The routing reproduces the Zep/Graphiti three-tier shape: DB rows = episodes/ground truth, KB notes = semantic layer, charter = the standing summary — which is the argument that no new store is needed.)
 
+[[officer_knowledge_plane]] is the normative follow-on for this routing: transcript =
+timeline, `officer_state` = operational watch state, RecallStore = ambient non-authoritative
+project memory, and KB = charter/backlog/decision truth. In particular, a recalled memory
+alone may never authorize dispatch, approval, closure, or escalation.
+
 ### The charter — pinned intent, split write authority
 
 A pinned KB note (`note_type='charter'`, one per project), injected **unconditionally** every turn as its own block — *not* via relevance-ranked retrieval, where a small note can simply lose the top-5 ranking (verified: both existing KB injection routes are ranked retrieval; the charter needs a dedicated fetch by `(project_id, note_type='charter')`). This pinning is a **safety property, not a convenience**: governance-decay research measured constraints silently dropped by compaction going from 0% to 30–59% violation rates, and ~47 pinned tokens restoring 0%. The pinned content therefore includes the *governance* — authority bounds, ask-first list, capacity rules — not only identity.
@@ -236,7 +259,7 @@ The centurion is the KB's **gardener** — which repairs the Resavio audit's "ph
 | State | Store | Notes |
 |---|---|---|
 | **Assumptions ledger** | KB notes (bi-temporal per §2) | Evidence refs; response windows; Legate reviews low-confidence first |
-| **Backlog** | Existing typed backlog notes (`feature`/`issue`/`idea`, `status='active'`) — already rows, already indexed, already what loop kickoffs inject | The centurion curates and prioritizes; **"completed" is a claim, not a fact** — he verifies (critic verdict, recon check, or artifact presence) before closing a ticket. Today's only close-caller is the campaign disposition; officer mode gives closing judgment an owner. An officer-project "in progress" convention replaces the campaign-derived one |
+| **Backlog** | Existing typed backlog notes (`feature`/`issue`/`idea`, `status='active'`) — already rows, already indexed, already what loop kickoffs inject | The centurion curates and prioritizes; **"completed" is a claim, not a fact** — he verifies via tester/recon report or bounded declared evidence ([[officer_supervision_surface]]) before closing a ticket. Today's only close-caller is the campaign disposition; officer mode gives closing judgment an owner. An officer-project "in progress" convention replaces the campaign-derived one |
 | **Episodic memory** | RecallStore, project-scoped — extraction already runs in sessions (every 5 turns + pre-compaction + teardown) | Add an **importance score at extraction time** (generative-agents' load-bearing variable — it keeps "the demo is Thursday" retrievable over 300 routine wake summaries). Scored on the aux-LLM side, not officer turns. Overturned assumptions and Legate overrides are explicit extraction triggers |
 | **Jobs / fleet** | The `jobs` and `agents` tables, read through sitreps and tools | Never mirrored into notes — the DB is the truth, the sitrep is the view |
 
@@ -306,6 +329,9 @@ Sequencing: S1+S2 first (agent-side substrate), S3 before S4 (call sites need th
 6. **Quiet operation.** Nothing wrong → timer wakes conclude in "sleep(max)" at warm-cache cost, no pages, and the daily digest still arrives ("all quiet").
 7. **Hollow completion.** A worker reports `completed` but the deliverable is absent or wrong. The centurion treats the status as a claim — verifies via critic/recon/artifact before closing the backlog ticket, and reopens or re-dispatches on failure.
 8. **Conference.** The Legate opens a conference, walks the centurion through a pivot in the shared workspace, and ends the session. The background officer's next wake carries the session brief; his subsequent scheduling reflects the new direction with no re-explanation — and no event that arrived mid-conference is lost.
+9. **Worker blocker.** Under officer-first routing, a blocking worker question wakes the
+   commissioned officer; he either answers it or escalates the same thread. Vacancy, hold,
+   silence, and total timeout cannot strand the job.
 
 ### Prerequisite (Phase 0) — resolved
 
@@ -353,6 +379,11 @@ Parked deliberately, revisited when scale demands (the notes' own staffing rule 
 - **2026-07-30:** **v1 completed in one overnight session** (Legate directive: "implement and test all of them; the order is yours"). S7: `charter`/`report` note types with the charter as an unconditionally injected, per-turn-re-pinned block; workers refused charter writes (trust boundary); one active charter per project enforced at the write path; lite-session KB writes now fail loud when pgvector is the sole store (risk 11). S8: officer scheduling per §7 with a one-way live-conversion endpoint; a failing turn never stops an officer loop — judgment does. Loop-guard layer 3: `daily_token_ceiling` enforced at the drain (defer to UTC reset + one digest notice; fail-open; Legate input unaffected). §6 completed: pages cross quiet hours. S9: conference embodiment with a uniform hold (claim-query skip + watchdog stand-down + dispatch fence), brief wake on end with watchdog self-heal (incl. idle-suspended conferences — the officer is never held all night), `GET /api/projects/{id}/officer`, and the cockpit Centurion tab (provision with slot-roster builder, status/next-wake/pages/digest, conference + retire) + officer/conference badges on session rows.
 - **2026-07-29:** **First command**: Better Resavio — the century whose month under the mechanical loop motivated this feature — placed under centurion `d67ee261` with kit `line: 2×MiniMax-M3/vm` + `heavy: 1×gpt-5.6-sol/vm`, bounds 10/45. His first watch, unprompted: an honest change-of-command state note (7/7 probes and 145/145 tests stand; the Demo Gap; doc drift; "the loop's shipped claims are unverified"), a queued digest, zero dispatches, and **the Demo Definition question** — the exact failure the feature was designed around, surfaced as a question to the Legate rather than a guess. The Legate's answer (delivered 2026-07-29): web UI **required** — 2–3 real front-desk flows over `kurort_engine`, one-command start with demo data, standing one-week demo readiness; truth-first sequencing (hygiene + claims-to-facts verification before construction) approved; heavy slot for the UI architecture choice, line for build-out.
 - **2026-08-01:** The user's title is **Legate**, not *Legatus* — same rank, modern spelling: easier to read, write and remember for anyone who isn't reaching for the Latin declension. Renamed everywhere (docs, persona, tool descriptions, cockpit copy); the rest of the hierarchy from the 07-28 entry is unchanged. One verbatim artifact name in the live-fire findings (`legatus-directive-2026-07-30-…`) keeps the old spelling because the KB note it records does. (User decision.)
+- **2026-08-14 (proposed follow-on):** formalize three background planes: project KB and
+  backlog are writable knowledge; scoped jobs/messages are control; repositories,
+  workspaces, cloud folders, shell, browser, and arbitrary files are denied object state.
+  Add bounded completion evidence rather than filesystem access, and make worker-to-user
+  message routing a separate project policy with officer-first escalation and timeouts.
 - **2026-07-28 (research hardening):** Five-agent fan-out integrated. Added: event-outbox table (the existing session-wake outbox is job-keyed and cannot carry officer wakes), reflection wakes, charter block structure with split write authority and governance pinning, KB provenance boundary, officer loop guard, three-output notify contract with page budget, job-spec template, completed-is-a-claim verification, DB-authoritative sleep deadline, cache-aligned cadence, retirement semantics. Corrected: lazy loop start (respawn wake = bootstrap), `updated_at`/progress/token data sources (audit DB), sweeper-heal conflict, double-wake suppression, Phase 0 already fixed. No core decision refuted.
 
 ## 12. Prior art (compact)

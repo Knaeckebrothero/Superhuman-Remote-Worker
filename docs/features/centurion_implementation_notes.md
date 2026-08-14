@@ -9,11 +9,21 @@ aliases:
   - officer implementation plan
 related:
   - "[[centurion]]"
+  - "[[officer_knowledge_plane]]"
+  - "[[officer_supervision_surface]]"
+  - "[[officer_message_routing]]"
 ---
 
 # Centurion — anchored implementation notes
 
 Companion to [[centurion]]. Distilled from the 2026-07-28 code-planner research (three agents; all anchors verified against the working tree at `95ee3011` that day — re-verify on pickup, they will drift). This is the build plan; the design rationale lives in the feature doc.
+
+> **2026-08-14 follow-on:** this file remains the as-built v1 record. Do not extend its
+> historical S5/S6 tool list ad hoc. The next operating-surface work is split into
+> [[officer_knowledge_plane]] (authoritative memory + no-object ceiling),
+> [[officer_supervision_surface]] (truthful scoped reads + bounded evidence), and
+> [[officer_message_routing]] (worker/officer/user routing + timeout liveness), all through
+> [[unified_orchestrator_tool_surface]].
 
 > **First live conference + the notify channel made two-way (2026-07-30→31,
 > `0ccc5038` + `99223c6d`).** S9 got its first production exercise on Better Resavio:

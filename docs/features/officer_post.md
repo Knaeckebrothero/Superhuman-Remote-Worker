@@ -15,6 +15,9 @@ aliases:
 related:
   - "[[centurion]]"
   - "[[centurion_implementation_notes]]"
+  - "[[officer_knowledge_plane]]"
+  - "[[officer_supervision_surface]]"
+  - "[[officer_message_routing]]"
   - "[[db_migration]]"
   - "[[loop_unified_engine]]"
 ---
@@ -25,12 +28,19 @@ related:
 > moves the officer's durable identity out of thread metadata and into a
 > `project_officers` row — one per project, always present, `thread_id IS NULL` when the
 > post is vacant. **Commission** raises an officer onto the post; **decommission** ends
-> his thread but keeps everything he had — kit, budgets, brain, digest, page counter,
+> his thread but keeps everything he had — kit, budgets, brain, communication policy,
+> digest, page counter,
 > sitrep fingerprints; **recommission** brings him back with all of it via a continuity
 > brief. The thread stays the *runtime projection*; the row becomes the *durable record*.
 > Along the way this ships the two things the Legate has asked for since the first live
 > command: seeing how much of his kit is actually in use, and adjusting it while he is
 > on duty.
+
+**2026-08-14 follow-on:** [[officer_knowledge_plane]] defines what the commissioned
+background officer may know and write; [[officer_supervision_surface]] defines his scoped
+job reads; [[officer_message_routing]] adds a user-owned worker-question policy to this
+durable post. These are proposed additions. They do not change the row/thread lifecycle
+model below.
 
 ## 1. Motivation — four defects with one root
 
@@ -85,7 +95,7 @@ project_officers (one row per project, created with the project)
 
 Division of authority, one line each:
 
-- **The row is the durable record.** Kit, budgets, brain, sleep bounds, harvested
+- **The row is the durable record.** Kit, budgets, brain, communication policy, sleep bounds, harvested
   `officer_state`, incarnation log. Survives everything short of project deletion.
 - **The thread stays the runtime projection.** `officer.enabled` is load-bearing in ~10
   places — the wake-claim and watchdog JSONB predicates (`postgres.py`), the drain, the
@@ -95,15 +105,19 @@ Division of authority, one line each:
 - **Writers per direction, transitions only.** Row → thread at commission and on a
   PATCH (§7). Thread → row at decommission (state harvest). While commissioned, live
   `officer_state` writes (`merge_thread_officer_state`, `postgres.py:6301`) keep
-  targeting the thread; the row is not double-written.
+  targeting the thread; the row is not double-written. `communication_policy` is the one
+  row-only policy: the server resolves it for each new worker message, and the officer
+  thread cannot mutate it.
 
 The metaphor earns its keep in the UI: the Centurion tab stops flip-flopping between a
 provision form and a read-only card. There is one card — the post — with one state.
 
-## 3. Schema — migration `0087_project_officers.sql`
+## 3. Schema — next free app migration at implementation time
 
 New table, so the squawk three-file split does not apply; one transactional migration
 (backfill included), then **regenerate `schema_current.sql`** (`scripts/schema-snapshot.sh`).
+The original draft named migration `0087`; app migrations now exceed `0140`, so the
+implementation must resolve the next free ID instead of reusing the stale placeholder.
 
 ```sql
 CREATE TABLE project_officers (
@@ -118,6 +132,12 @@ CREATE TABLE project_officers (
     -- reasoning_level}, workspace: {backend}, interactive: {permission_mode}}.
     -- Runtime keys (officer.hold, officer.last_respawn_at) are stripped on write.
     config_override JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- User-owned routing policy for worker messages. Kept on the post so it
+    -- exists while vacant and cannot be rewritten by the officer runtime.
+    -- Existing/backfilled projects remain direct until explicitly changed;
+    -- 15 minutes is the proposed default pending message-routing Q2.
+    communication_policy JSONB NOT NULL DEFAULT
+      '{"worker_messages":"user_direct","officer_response_minutes":15}'::jsonb,
     -- Harvested officer_state (digest ring, pages, sitrep fingerprints) from the
     -- last decommission, plus the while-vacant ledger (§5). Empty while
     -- commissioned — the live copy is on the thread.
@@ -128,6 +148,8 @@ CREATE TABLE project_officers (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT project_officer_config_is_object CHECK (jsonb_typeof(config_override) = 'object'),
+    CONSTRAINT project_officer_communication_is_object
+      CHECK (jsonb_typeof(communication_policy) = 'object'),
     CONSTRAINT project_officer_state_is_object  CHECK (jsonb_typeof(state) = 'object'),
     CONSTRAINT project_officer_incarnations_is_array CHECK (jsonb_typeof(incarnations) = 'array')
 );
@@ -277,6 +299,13 @@ commissioned, deep-merges the fragment into thread metadata
 wake** — burning a turn on "you have one fewer line slot" is the bureaucracy the P1
 wave removed; the next sitrep's capacity line carries the truth.
 
+The same endpoint accepts `communication_policy`, but handles it as a separate row-only,
+project-admin field. Valid `worker_messages` values are `user_direct`,
+`officer_and_user`, and `officer_first`; `officer_response_minutes` is bounded by server
+policy. It is never mirrored into thread metadata or editable by the officer. The
+message-send endpoint snapshots the effective value per route as specified in
+[[officer_message_routing]].
+
 Why not the existing thread-config PATCH: `_apply_thread_config_update` validates only
 tools + datasources (a kit would bypass `validate_slots_spec` entirely), 409s whenever
 an agent is bound — a live officer's permanent state — and its auth is thread-owner,
@@ -313,6 +342,8 @@ save would be indefensible. The card shows "2 in flight — drains to 1".
                      "in_flight": 1 } },        // ← utilization, lineage-aware (§4)
   "spend_today": {"tokens": 1200000, "ceiling": 5000000},  // usage_ledger.query_usage,
                                                  // the ceiling brake's own call, reused
+  "communication_policy": {"worker_messages": "officer_first",
+                             "officer_response_minutes": 15},
   "incarnations": [ {"thread_id": "…", "commissioned_at": "…",
                      "decommissioned_at": "…", "reason": "…"} ]
 }
@@ -325,7 +356,8 @@ save would be indefensible. The card shows "2 in flight — drains to 1".
   links. Button: **Commission**.
 - **Commissioned:** the *same* editor, populated live, with per-slot `1/2` utilization
   chips and today's spend against the ceiling; digest; Open log / Conference /
-  **Hold** / Decommission (armed, warning on in-flight jobs).
+  **Hold** / Decommission (armed, warning on in-flight jobs); and the user-owned worker
+  question routing control from [[officer_message_routing]].
 - **Held:** badge with `hold.kind` + note — fixing the current hardcoded
   "held — conference in progress" label, which is wrong for maintenance holds.
 
@@ -343,6 +375,8 @@ save would be indefensible. The card shows "2 in flight — drains to 1".
   unchanged).
 - A "respawn now" affordance for brain edits (the live re-brain recipe — stamp + pod
   delete → watchdog respawn — exists but stays manual; §11 Q3).
+- Worker-message routing and its route ledger/reconciler. This post stores the policy;
+  [[officer_message_routing]] owns delivery behavior and acceptance.
 - The legion (multi-century command): the schema leaves the door open (no UNIQUE on
   `thread_id`), nothing more.
 
@@ -363,7 +397,9 @@ save would be indefensible. The card shows "2 in flight — drains to 1".
 6. **Decommission/recommission:** decommission with a job in flight (warns; leave it) →
    completion lands in the ledger → recommission → brief lists it, fingerprints
    restored (sitrep reports *deltas*, not 242 jobs of news), zero replayed events.
-7. **Regression:** plain sessions, conferences, worker dispatch, officer loops
+7. **Policy persistence:** set worker questions to `officer_first`, decommission and
+   recommission; the row retains it while the new thread receives no mutable copy.
+8. **Regression:** plain sessions, conferences, worker dispatch, officer loops
    (`scheduling='officer'` start/convert guards now read the row) all green.
 
 ## 11. Open questions (Legate)
@@ -381,11 +417,11 @@ save would be indefensible. The card shows "2 in flight — drains to 1".
 
 | Slice | Contents | Gate |
 |---|---|---|
-| O1 | migration 0087 (table + backfill) + row helpers + `create_project` hook + snapshot regen | migration idempotent on re-run; adoption facts (§10.1) via psql |
+| O1 | next-free migration (table + backfill, including row-only communication policy) + row helpers + `create_project` hook + snapshot regen | migration idempotent on re-run; adoption facts (§10.1) via psql |
 | O2 | read flips (§4) + create-funnel registration + lineage-aware capacity | pytest on lookup/409/capacity; officer-loop guards green |
 | O3 | commission / decommission / hold / release + ledger + brief + `end_thread` rerouting | §10.2/4/6 on k3d |
-| O4 | PATCH + validation reuse + live merge + notice | §10.3 on k3d |
-| O5 | cockpit card (one state machine, utilization, spend, incarnations, hold-kind label) | vitest + walk the card through all three states |
+| O4 | PATCH + validation reuse + live merge + notice; row-only communication policy validation | §10.3/7 on k3d |
+| O5 | cockpit card (one state machine, utilization, spend, incarnations, hold-kind label, routing-policy field) | vitest + walk the card through all three states |
 | O6 | dev acceptance: release the Resavio officer through the front door | §10.5 — he judges `bbce4bed` |
 
 **Risks:** double-authority drift (mitigated by §2's writers-per-direction and
@@ -411,3 +447,7 @@ mandatory and part of O1's definition of done.
   per direction; recommission = new incarnation + continuity brief (wake-replay
   landmine + identity-outside-the-window); shrink-below-in-flight = drain semantics;
   kit edits don't wake him; capacity counts follow the post's thread lineage.
+- **2026-08-14 (proposed amendment):** the post owns the Legate-controlled worker-message
+  routing policy because it exists even while vacant. Existing/backfilled posts default to
+  `user_direct`; the commissioning UI may recommend `officer_first`. Delivery, escalation,
+  and timeout mechanics live in [[officer_message_routing]].
