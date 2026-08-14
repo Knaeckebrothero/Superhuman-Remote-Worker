@@ -449,9 +449,26 @@ databases:
     # To externalize later, add externalUrl to THIS block — a second
     # `postgres:` key further down would silently shadow the storageSize
     # above and re-arm the shrink failure.
-# Other DBs stay internal (chart defaults). Externalize here if needed:
-#   vector:
-#     externalUrl: ""
+  # Vector store (srw-pgvector) — the same story a third time. The 16Gi volume
+  # filled 2026-08-14 and crashlooped pgvector on "No space left on device"
+  # writing pg_wal/xlogtemp during WAL recovery. That loop is unescapable
+  # unaided: redo completes, the WAL write fails, the postmaster shuts down,
+  # repeat. It took the whole knowledge base with it — kb_search/kb_read, the
+  # project knowledge API (500s), and every reindex logging "Connection
+  # refused" against a healthy embedding service.
+  # This is BLOAT, not data volume: ~6.2k notes' chunks and embeddings are a
+  # few hundred MB against 16Gi. The KB sweep reindexed an ARCHIVED project's
+  # 3.1k notes every tick for over a month, churning rows faster than
+  # autovacuum could reclaim them — see
+  # docs/issues/kb_sweep_indexes_archived_projects_and_starves_connectors.md.
+  # So 32Gi buys headroom to recover and to VACUUM FULL; it is not the fix.
+  # Without the sweep fix this refills, exactly as postgres did in ~4 days.
+  vector:
+    storageSize: "32Gi"
+# Other DBs stay internal (chart defaults). Externalize here if needed.
+# NOTE: `vector:` is a REAL key above — add externalUrl to that block rather
+# than uncommenting a second one here, or it silently shadows the storageSize
+# and re-arms the shrink failure (same trap as `postgres:`).
 #   mongodb:
 #     externalUrl: ""
 #   neo4j:
