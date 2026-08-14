@@ -162,7 +162,15 @@ intended direction of failure.
 
 ### 6b. Starting the loop (step 12)
 
-Unblocked by 6a; needs a dev deploy of the orchestrator image first. When it starts: `workspace_backend=container` (**not** `vm` — all six recorded
+Unblocked by 6a, and the orchestrator image carrying it (`sha-d215e72`) is deployed.
+
+**Use `workspace_backend="sandbox"`, not `"container"`.** The loop-start endpoint validates
+against `_LOOP_WORKSPACE_BACKENDS = {"sandbox", "vm", "virtual", "none"}`
+(`orchestrator/routers/project_loops.py:37`) and rejects anything else with a 400.
+`"container"` is legacy spelling, still accepted by the *job* config path
+(`main.py:6160`) but not by this one. Blank/None also resolves to the default sandbox.
+
+When it starts: `workspace_backend="sandbox"` (**not** `vm` — all six recorded
 loops used `vm`; `docs/issues/vm_reliability_assessment.md` puts VM infra-failures at 2.2×
 container, and loop `3ed022a5` died on three consecutive VM provisioning failures),
 `scheduling=standard`.
