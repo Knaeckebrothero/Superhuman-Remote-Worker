@@ -139,6 +139,61 @@ _SHAPE_NUDGE_TEXT = (
 )
 
 
+def _merge_worker_resume_updates(
+    target: Dict[str, Any], incoming: Dict[str, Any]
+) -> None:
+    """Merge staged resume state without clobbering reducer-backed messages."""
+
+    prior_messages = list(target.get("messages") or [])
+    incoming_messages = list(incoming.get("messages") or [])
+    target.update(incoming)
+    if prior_messages or incoming_messages:
+        target["messages"] = [*prior_messages, *incoming_messages]
+
+
+def _valid_worker_batch_arm(values: Dict[str, Any]) -> bool:
+    """Whether a pending update checkpoint carries a complete arm envelope."""
+
+    fields = {
+        "worker_batch_started_at",
+        "worker_batch_start_iteration",
+        "worker_batch_target_wall_seconds",
+        "worker_batch_min_wall_seconds",
+        "worker_batch_iteration_cap",
+    }
+    if not fields.issubset(values):
+        return False
+
+    started_at = values.get("worker_batch_started_at")
+    start_iteration = values.get("worker_batch_start_iteration")
+    target = values.get("worker_batch_target_wall_seconds")
+    floor = values.get("worker_batch_min_wall_seconds")
+    cap = values.get("worker_batch_iteration_cap")
+    numeric_values = (started_at, target, floor)
+    if any(isinstance(value, bool) for value in numeric_values):
+        return False
+    try:
+        started_at_value, target_value, floor_value = map(float, numeric_values)
+    except (TypeError, ValueError):
+        return False
+    finite_values = (
+        started_at_value,
+        target_value,
+        floor_value,
+    )
+    if not all(math.isfinite(value) for value in finite_values):
+        return False
+    if started_at_value <= 0 or target_value <= 0 or floor_value < 0:
+        return False
+    if isinstance(start_iteration, bool) or not isinstance(start_iteration, int):
+        return False
+    if cap is not None and (
+        isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0
+    ):
+        return False
+    return True
+
+
 class _AiosqliteConnectionWrapper:
     """Wrapper for aiosqlite.Connection that adds is_alive() method.
 
@@ -1218,10 +1273,16 @@ class UniversalAgent:
                             exc_info=True,
                         )
 
-            # Inject feedback into graph state via aupdate_state
-            # This sets resume_feedback so route_entry routes to restore_from_feedback
+            # Stateless routing and batch arming must be one durable update.
+            # A second LangGraph update can consume the pending task selected
+            # by feedback/delegation/auto-continue before any node runs.
+            worker_resume_updates: Dict[str, Any] = {}
+            worker_resume_as_node: Optional[str] = None
+
+            # Inject feedback into graph state via aupdate_state. This sets
+            # resume_feedback so route_entry routes to restore_from_feedback.
             if resume and feedback and (graph_input is None or stateless_worker):
-                await self._inject_resume_feedback(
+                selected_node = await self._inject_resume_feedback(
                     job_id=job_id,
                     stateless_worker=stateless_worker,
                     graph_input=graph_input,
@@ -1230,7 +1291,14 @@ class UniversalAgent:
                     feedback=feedback,
                     feedback_reason=feedback_reason,
                     metadata=updated_metadata,
+                    deferred_updates=(
+                        worker_resume_updates
+                        if stateless_worker and graph_input is None
+                        else None
+                    ),
                 )
+                if selected_node is not None:
+                    worker_resume_as_node = selected_node
 
             # Inject delegation results into graph state when resuming from waiting
             delegation_results = (updated_metadata or {}).get("delegation_results")
@@ -1239,7 +1307,7 @@ class UniversalAgent:
                 and delegation_results
                 and (graph_input is None or stateless_worker)
             ):
-                await self._inject_delegation_results(
+                selected_node = await self._inject_delegation_results(
                     job_id=job_id,
                     stateless_worker=stateless_worker,
                     graph_input=graph_input,
@@ -1247,7 +1315,16 @@ class UniversalAgent:
                     checkpoint_values=checkpoint_values,
                     delegation_results=delegation_results,
                     metadata=updated_metadata,
+                    deferred_updates=(
+                        worker_resume_updates
+                        if stateless_worker and graph_input is None
+                        else None
+                    ),
                 )
+                if selected_node is not None:
+                    # Retain today's ordering: delegation is applied after
+                    # feedback and therefore selects the final resume route.
+                    worker_resume_as_node = selected_node
             # Auto-continue resume (version_upgrade / llm_unavailable / memory /
             # workspace-upgrade): a graceful re-dispatch with NO feedback and NO
             # delegation. The prior in-graph freeze persisted should_stop=True +
@@ -1255,78 +1332,30 @@ class UniversalAgent:
             # on an ended thread with should_stop=True runs ZERO nodes and returns
             # the terminal frozen state — so restore_todo_state (which clears the
             # stop flags on resume) never runs and the job re-freezes forever with
-            # no progress. Clear the terminal stop flags here (mirroring the
-            # feedback/delegation paths above, as_node="__start__") so
-            # route_entry → restore_todo_state → execute re-enters and the job
-            # resumes from its checkpoint. Scoped to auto-continue freeze types so
-            # human-review stops are untouched.
-            # See docs/issues/version_upgrade_drain_livelock.md.
+            # no progress. Pinned clears the terminal envelope here. Stateless
+            # stages its clear + optional shape nudge so _arm_worker_batch can
+            # commit clear + nudge + arm in ONE START update. Scoped to
+            # auto-continue freeze types so human-review stops are untouched. See
+            # docs/issues/version_upgrade_drain_livelock.md.
             if (
                 resume
                 and graph_input is None
                 and not feedback
                 and not delegation_results
             ):
-                try:
-                    snapshot = await self._graph.aget_state(thread_config)
-                    values = snapshot.values or {}
-                    frozen = values.get("freeze_data") or {}
-                    freeze_type = (
-                        frozen.get("freeze_type") if isinstance(frozen, dict) else None
-                    )
-                    if (
-                        values.get("should_stop")
-                        and freeze_type in AUTO_CONTINUE_FREEZE_TYPES
-                    ):
-                        await self._graph.aupdate_state(
-                            thread_config,
-                            {
-                                "should_stop": False,
-                                "goal_achieved": False,
-                                "is_final_phase": False,
-                                "freeze_data": None,
-                                "error": None,
-                                "client_report_id": None,
-                                "completion_report_payload": None,
-                            },
-                            as_node="__start__",
-                        )
-                        logger.info(
-                            f"[{job_id}] Auto-continue resume ({freeze_type}) — "
-                            f"cleared terminal stop flags so the graph re-enters "
-                            f"and resumes from its checkpoint"
-                        )
-                        # >>> TEMPORARY QUICKFIX — remove with the upstream fix.
-                        # docs/done/codex_stream_disconnect_shape_nudge.md
-                        # The orchestrator arms this after N byte-identical
-                        # failures. Resuming replays the SAME payload, which
-                        # upstream has already rejected every time; appending a
-                        # short turn changes it, which is the whole trick a
-                        # Codex user performs by typing "retry"
-                        # (openai/codex#10378). Cheap on purpose — it costs a
-                        # few dozen tokens and preserves context, unlike the
-                        # force-compaction fallback in restore_from_feedback.
-                        _outage_meta = (updated_metadata or {}).get("llm_outage")
-                        if isinstance(_outage_meta, dict) and _outage_meta.get(
-                            "pending_shape_nudge"
-                        ):
-                            from langchain_core.messages import HumanMessage
-
-                            await self._graph.aupdate_state(
-                                thread_config,
-                                {"messages": [HumanMessage(content=_SHAPE_NUDGE_TEXT)]},
-                                as_node="__start__",
-                            )
-                            logger.warning(
-                                f"[{job_id}] Injected request-shape nudge — the "
-                                f"previous payload was rejected upstream on "
-                                f"every retry; appending a turn to change it"
-                            )
-                except Exception as e:
-                    logger.warning(
-                        f"[{job_id}] Failed to clear stop flags on auto-continue "
-                        f"resume (job may re-freeze without progress): {e}"
-                    )
+                selected_node = await self._prepare_auto_continue_resume(
+                    job_id=job_id,
+                    thread_config=thread_config,
+                    updated_metadata=updated_metadata,
+                    stateless_worker=stateless_worker,
+                    deferred_updates=(
+                        worker_resume_updates
+                        if stateless_worker and graph_input is None
+                        else None
+                    ),
+                )
+                if selected_node is not None:
+                    worker_resume_as_node = selected_node
 
             if stateless_worker:
                 # Arm last, after feedback/delegation/auto-continue has chosen
@@ -1342,6 +1371,8 @@ class UniversalAgent:
                     iteration_cap=worker_batch_iteration_cap,
                     resume_id=worker_resume_id,
                     retry_exhausted=worker_retry_exhausted,
+                    resume_updates=worker_resume_updates,
+                    resume_as_node=worker_resume_as_node,
                 )
 
             # Durable-first resume hydration (journal-before-observe):
@@ -1436,6 +1467,111 @@ class UniversalAgent:
             values.get("instruction_read_receipts")
         )
 
+    async def _prepare_auto_continue_resume(
+        self,
+        *,
+        job_id: str,
+        thread_config: Dict[str, Any],
+        updated_metadata: Optional[Dict[str, Any]],
+        stateless_worker: bool,
+        deferred_updates: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Prepare an ended machine stop for resume.
+
+        Pinned retains its historical updates. A checkpoint-backed stateless
+        caller stages its terminal clear and optional shape nudge so batch
+        arming can join the same START update.
+        """
+
+        try:
+            snapshot = await self._graph.aget_state(thread_config)
+            values = snapshot.values or {}
+            frozen = values.get("freeze_data") or {}
+            freeze_type = (
+                frozen.get("freeze_type") if isinstance(frozen, dict) else None
+            )
+            if not (
+                values.get("should_stop") and freeze_type in AUTO_CONTINUE_FREEZE_TYPES
+            ):
+                return None
+
+            outage_meta = (updated_metadata or {}).get("llm_outage")
+            pending_shape_nudge = bool(
+                isinstance(outage_meta, dict) and outage_meta.get("pending_shape_nudge")
+            )
+            clear_updates: Dict[str, Any] = {
+                "should_stop": False,
+                "goal_achieved": False,
+                "is_final_phase": False,
+                "freeze_data": None,
+                "error": None,
+                "client_report_id": None,
+                "completion_report_payload": None,
+            }
+            if stateless_worker and pending_shape_nudge:
+                from langchain_core.messages import HumanMessage
+
+                clear_updates["messages"] = [HumanMessage(content=_SHAPE_NUDGE_TEXT)]
+            if stateless_worker and deferred_updates is not None:
+                _merge_worker_resume_updates(deferred_updates, clear_updates)
+                logger.info(
+                    "[%s] Staged auto-continue resume (%s) for atomic "
+                    "stateless resume + arm",
+                    job_id,
+                    freeze_type,
+                )
+                if pending_shape_nudge:
+                    logger.warning(
+                        "[%s] Staged request-shape nudge for the stateless "
+                        "auto-continue + arm update",
+                        job_id,
+                    )
+                return "__start__"
+
+            await self._graph.aupdate_state(
+                thread_config,
+                clear_updates,
+                as_node="__start__",
+            )
+            logger.info(
+                "[%s] Auto-continue resume (%s) — cleared terminal stop "
+                "flags so the graph re-enters and resumes from its checkpoint",
+                job_id,
+                freeze_type,
+            )
+            if stateless_worker:
+                if pending_shape_nudge:
+                    logger.warning(
+                        "[%s] Injected request-shape nudge in the stateless "
+                        "auto-continue START update",
+                        job_id,
+                    )
+                return None
+            # >>> TEMPORARY QUICKFIX — remove with the upstream fix.
+            # docs/done/codex_stream_disconnect_shape_nudge.md
+            if pending_shape_nudge:
+                from langchain_core.messages import HumanMessage
+
+                await self._graph.aupdate_state(
+                    thread_config,
+                    {"messages": [HumanMessage(content=_SHAPE_NUDGE_TEXT)]},
+                    as_node="__start__",
+                )
+                logger.warning(
+                    "[%s] Injected request-shape nudge — the previous payload "
+                    "was rejected upstream on every retry; appending a turn "
+                    "to change it",
+                    job_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to clear stop flags on auto-continue resume "
+                "(job may re-freeze without progress): %s",
+                job_id,
+                exc,
+            )
+        return None
+
     async def _inject_resume_feedback(
         self,
         *,
@@ -1447,7 +1583,8 @@ class UniversalAgent:
         feedback: str,
         feedback_reason: Optional[str],
         metadata: Optional[Dict[str, Any]],
-    ) -> None:
+        deferred_updates: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """Inject one exact feedback generation before resumed graph work.
 
         A stateless resume may legitimately have no checkpoint yet (for
@@ -1474,7 +1611,7 @@ class UniversalAgent:
                 job_id,
                 feedback_key,
             )
-            return
+            return None
 
         feedback_update: Dict[str, Any] = {
             "should_stop": False,
@@ -1498,12 +1635,19 @@ class UniversalAgent:
                     "resume_reason": feedback_reason,
                 }
             )
-            await self._graph.aupdate_state(
-                thread_config,
-                feedback_update,
-                as_node="__start__",
-            )
-            logger.info("Injected feedback into graph state via aupdate_state")
+            if deferred_updates is not None:
+                _merge_worker_resume_updates(deferred_updates, feedback_update)
+                logger.info(
+                    "[%s] Staged feedback for atomic stateless resume + arm",
+                    job_id,
+                )
+            else:
+                await self._graph.aupdate_state(
+                    thread_config,
+                    feedback_update,
+                    as_node="__start__",
+                )
+                logger.info("Injected feedback into graph state via aupdate_state")
         else:
             # A no-checkpoint resume is still the job's first initialization.
             # Setting resume_feedback would route around init_workspace and
@@ -1531,6 +1675,11 @@ class UniversalAgent:
                 job_id,
             )
         checkpoint_values.update(feedback_update)
+        return (
+            "__start__"
+            if graph_input is None and deferred_updates is not None
+            else None
+        )
 
     async def _inject_delegation_results(
         self,
@@ -1542,7 +1691,8 @@ class UniversalAgent:
         checkpoint_values: Dict[str, Any],
         delegation_results: list,
         metadata: Optional[Dict[str, Any]],
-    ) -> None:
+        deferred_updates: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """Inject one exact delegation generation on checkpoint or fresh input."""
         from langchain_core.messages import HumanMessage
         from src.shared.job_steering import context_delivery_key
@@ -1563,7 +1713,7 @@ class UniversalAgent:
                 job_id,
                 delegation_key,
             )
-            return
+            return None
 
         result_message = HumanMessage(
             content=_format_delegation_results(delegation_results)
@@ -1580,11 +1730,18 @@ class UniversalAgent:
                 delivered_delegation_keys | {delegation_key}
             )
         if graph_input is None:
-            await self._graph.aupdate_state(
-                thread_config,
-                delegation_update,
-                as_node="restore_todo_state",
-            )
+            if deferred_updates is not None:
+                _merge_worker_resume_updates(deferred_updates, delegation_update)
+                logger.info(
+                    "[%s] Staged delegation results for atomic stateless resume + arm",
+                    job_id,
+                )
+            else:
+                await self._graph.aupdate_state(
+                    thread_config,
+                    delegation_update,
+                    as_node="restore_todo_state",
+                )
         else:
             existing_messages = list(graph_input.get("messages") or [])
             graph_input.update(delegation_update)
@@ -1593,6 +1750,11 @@ class UniversalAgent:
         logger.info(
             "Injected delegation results into graph state (%d children)",
             len(delegation_results),
+        )
+        return (
+            "restore_todo_state"
+            if graph_input is None and deferred_updates is not None
+            else None
         )
 
     async def _arm_worker_batch(
@@ -1606,8 +1768,10 @@ class UniversalAgent:
         iteration_cap: Optional[int],
         resume_id: Optional[str] = None,
         retry_exhausted: bool = False,
+        resume_updates: Optional[Dict[str, Any]] = None,
+        resume_as_node: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Arm a claim, or return durable values for an already-ended stop."""
+        """Atomically route and arm a claim, or adopt a durable prior arm."""
 
         target = float(target_wall_seconds or 0)
         if not math.isfinite(target) or target <= 0:
@@ -1646,6 +1810,9 @@ class UniversalAgent:
             "worker_batch_min_wall_seconds": floor,
             "worker_batch_iteration_cap": cap,
         }
+        if resume_updates:
+            _merge_worker_resume_updates(updates, resume_updates)
+        resume_route_pending = bool(resume_updates and resume_as_node)
         applied_resume_id = values.get("worker_resume_id")
         resume_intent_pending = bool(
             resume_id and str(resume_id) != str(applied_resume_id or "")
@@ -1658,7 +1825,14 @@ class UniversalAgent:
         recoverable_error = bool(
             isinstance(error, dict) and error.get("recoverable") is True
         )
-        ended = bool(snapshot is not None and not tuple(snapshot.next or ()))
+        pending_frontier = bool(snapshot is not None and tuple(snapshot.next or ()))
+        ended = bool(snapshot is not None and not pending_frontier)
+        snapshot_metadata = getattr(snapshot, "metadata", None)
+        checkpoint_source = (
+            snapshot_metadata.get("source")
+            if isinstance(snapshot_metadata, dict)
+            else None
+        )
         human_freeze = bool(
             freeze_type and freeze_type not in AUTO_CONTINUE_FREEZE_TYPES
         )
@@ -1694,19 +1868,42 @@ class UniversalAgent:
                     "message": "worker queue retry budget exhausted",
                 },
             }
+
+        if (
+            pending_frontier
+            and checkpoint_source == "update"
+            and _valid_worker_batch_arm(values)
+            and not resume_updates
+            and not resume_intent_pending
+        ):
+            # A predecessor durably committed route + arm and died before the
+            # graph consumed the selected task. Reuse that exact envelope.
+            # Any second update here can erase the frontier; a Command(update)
+            # is also unsafe if a prior invocation already wrote this step.
+            logger.info(
+                "[%s] Adopted pending stateless resume frontier with durable "
+                "worker arm; checkpoint update skipped",
+                job_id,
+            )
+            return None
         clean_end_reentry = bool(
             ended
-            and values.get("should_stop")
             and (
-                freeze_type in AUTO_CONTINUE_FREEZE_TYPES
-                or recoverable_error
-                or resume_intent_pending
+                resume_route_pending
+                or (
+                    values.get("should_stop")
+                    and (
+                        freeze_type in AUTO_CONTINUE_FREEZE_TYPES
+                        or recoverable_error
+                        or resume_intent_pending
+                    )
+                )
             )
         )
         if clean_end_reentry:
             # Batch/outage/recoverable stops are machine continuations on this
-            # lane.  Clear their END envelope and route through START exactly
-            # once.  Human-facing and terminal END checkpoints are untouched;
+            # lane. Clear their END envelope and route through START exactly
+            # once. Human-facing and terminal END checkpoints are untouched;
             # the driver re-reports them rather than re-running the graph.
             updates.update(
                 {
@@ -1722,25 +1919,45 @@ class UniversalAgent:
 
         if graph_input is not None:
             graph_input.update(updates)
-        elif ended and not clean_end_reentry:
+        elif ended and not clean_end_reentry and not resume_route_pending:
             logger.info(
                 "[%s] Worker checkpoint is a terminal/human END; leaving it "
                 "unchanged for report retry",
                 job_id,
             )
             return values
+        elif resume_route_pending or clean_end_reentry or resume_intent_pending:
+            selected_node = resume_as_node if resume_route_pending else "__start__"
+            await self._graph.aupdate_state(
+                thread_config,
+                updates,
+                as_node=selected_node,
+            )
+        elif pending_frontier and checkpoint_source == "loop":
+            # A loop checkpoint records the node that produced this frontier,
+            # so LangGraph can infer the same node for this single arm update.
+            await self._graph.aupdate_state(thread_config, updates)
+        elif pending_frontier:
+            logger.error(
+                "[%s] Refusing to arm an unadoptable pending update frontier "
+                "(source=%s); releasing without mutating its selected task",
+                job_id,
+                checkpoint_source,
+            )
+            return {
+                "job_id": job_id,
+                "should_stop": True,
+                "goal_achieved": False,
+                "error": {
+                    "type": "worker_resume_frontier_unarmed",
+                    "recoverable": True,
+                    "message": (
+                        "pending worker resume frontier has no valid durable batch arm"
+                    ),
+                },
+            }
         else:
-            if clean_end_reentry:
-                await self._graph.aupdate_state(
-                    thread_config,
-                    updates,
-                    as_node="__start__",
-                )
-            else:
-                # No as_node: retain a mid-loop checkpoint's pending next-node
-                # frontier.  Forcing __start__ here silently replays route entry
-                # instead of continuing the interrupted superstep.
-                await self._graph.aupdate_state(thread_config, updates)
+            await self._graph.aupdate_state(thread_config, updates)
         logger.info(
             "[%s] Armed worker batch: target=%.3fs floor=%.3fs "
             "start_iteration=%d iteration_cap=%s",
