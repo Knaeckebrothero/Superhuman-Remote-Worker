@@ -89,7 +89,7 @@ def _json_body(request: httpx.Request) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_create_job_uses_hidden_trusted_lineage_and_scope(
+async def test_create_job_uses_hidden_trusted_lineage_without_scope_header(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MCP_INTERNAL_KEY", "internal-test-key")
@@ -107,7 +107,6 @@ async def test_create_job_uses_hidden_trusted_lineage_and_scope(
             {
                 "description": "trusted child",
                 # Extra model input must not override the hidden binding.
-                "project_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
                 "user_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
             }
         )
@@ -118,12 +117,58 @@ async def test_create_job_uses_hidden_trusted_lineage_and_scope(
     body = _json_body(request)
     assert body["thread_id"] == "thread-1"
     assert body["parent_job_id"] == PARENT_ID
+    # Omitted project_id falls back to the trusted lineage default.
     assert body["project_id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     assert body["user_id"] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
     assert request.headers["X-MCP-User-Id"] == body["user_id"]
-    assert request.headers["X-MCP-Scope"] == f"project:{body['project_id']}"
+    # The session/agent lane never sends X-MCP-Scope: stamping it activated
+    # server-side project fencing this lane never had (NULL-project jobs
+    # vanished from list_jobs and 403'd on get_job). Officer-lane scoping is
+    # reintroduced deliberately by officer_supervision_surface E2.
+    assert "X-MCP-Scope" not in request.headers
     assert request.headers["X-Internal-Key"] == "internal-test-key"
     assert "Job created successfully" in result
+
+
+@pytest.mark.asyncio
+async def test_create_job_explicit_project_id_wins_over_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    context = ToolContext(
+        _thread_id="thread-1",
+        _project_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        user_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    )
+
+    try:
+        await _tool(create_orchestrator_tools(context), "create_job").ainvoke(
+            {
+                "description": "explicit project target",
+                "project_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            }
+        )
+    finally:
+        await client.close()
+
+    body = _json_body(recorder.requests[-1])
+    # Explicit project_id reaches the API body; server-side membership
+    # validation decides whether it is accepted.
+    assert body["project_id"] == "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    assert body["user_id"] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+
+def test_caller_ctx_is_session_lane_without_officer_detection() -> None:
+    """No reliable runtime officer flag reaches ToolContext.config (the loader
+    parses the officer block into typed AgentConfig.officer, never extra), so
+    the lane is always 'session'; officer_supervision_surface E2 owns real
+    plane detection."""
+    context = ToolContext(
+        user_id="user-1",
+        config={"officer": {"enabled": True}},  # would have hit the dead branch
+    )
+    assert jobs_module._caller_ctx(context).kind == "session"
 
 
 @pytest.mark.asyncio
@@ -316,11 +361,14 @@ def test_create_job_schema_has_no_model_selectable_lineage() -> None:
         "kickoff_message",
         "config_override",
         "context",
+        # project_id is deliberately model-visible (the old agent-lane
+        # create_worker_job had it); explicit wins over the lineage default.
+        "project_id",
         "priority",
         "required_deliverables",
         "slot",
     }
-    assert not {"project_id", "user_id", "thread_id", "parent_job_id"} & fields
+    assert not {"user_id", "thread_id", "parent_job_id"} & fields
 
 
 @pytest.mark.asyncio

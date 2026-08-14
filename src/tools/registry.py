@@ -919,6 +919,23 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                     f"{factory.__name__}: {e}"
                 )
 
+    # Requested-vs-loaded skew must be visible: a name can pass the registry
+    # check above and still not bind because its category factory never
+    # produced it (a renamed/retired tool restored from an old checkpoint or
+    # chat history, a degraded datasource toolkit, a mode mismatch inside a
+    # factory). One aggregated WARNING per load — not one line per name — so
+    # post-rename skew shows up in the log instead of silently shrinking the
+    # toolset.
+    loaded_names = {tool.name for tool in all_tools}
+    unloaded = [name for name in dict.fromkeys(tool_names) if name not in loaded_names]
+    if unloaded:
+        logger.warning(
+            "load_tools: %d requested tool(s) did not load (unknown to their "
+            "category factories or degraded): %s",
+            len(unloaded),
+            ", ".join(unloaded),
+        )
+
     logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
     return all_tools
 

@@ -518,8 +518,21 @@ class AsyncCockpitClient:
         self._scope_headers.set(None)
 
     def _invocation_headers(
-        self, *, user_id: str | None, scope: str | None
+        self,
+        *,
+        user_id: str | None,
+        scope: str | None,
+        unauthenticated: bool = False,
     ) -> Mapping[str, str] | None:
+        # ``unauthenticated`` is the explicit fail-closed binding for an
+        # adapter whose auth context could not be resolved: NONE of the three
+        # identity headers are attached — the internal key is deliberately
+        # withheld, never an error fallback — so guarded orchestrator
+        # endpoints 401. Anonymous callers WITHOUT the flag (stdio MCP,
+        # worker-mode agent tools) keep their deliberate internal-key-only
+        # contract below.
+        if unauthenticated:
+            return None
         headers: dict[str, str] = {}
         if self._internal_key:
             headers["X-Internal-Key"] = self._internal_key
@@ -535,6 +548,7 @@ class AsyncCockpitClient:
         *,
         user_id: str | None = None,
         scope: str | None = None,
+        unauthenticated: bool = False,
     ) -> Iterator[None]:
         """Bind and reliably reset one invocation's identity/scope headers.
 
@@ -542,9 +556,15 @@ class AsyncCockpitClient:
         in ``finally`` would erase an outer invocation's scope, while resetting
         restores the exact previous context. Separate asyncio tasks retain
         independent values even though they share this client's connection pool.
+
+        ``unauthenticated=True`` binds the invocation with NO identity headers
+        at all (no internal key, no user, no scope): the fail-closed shape for
+        a caller whose auth context could not be resolved.
         """
         token = self._scope_headers.set(
-            self._invocation_headers(user_id=user_id, scope=scope)
+            self._invocation_headers(
+                user_id=user_id, scope=scope, unauthenticated=unauthenticated
+            )
         )
         try:
             yield

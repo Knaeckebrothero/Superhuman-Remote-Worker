@@ -129,6 +129,7 @@ async def create_job(
     kickoff_message: str | None = None,
     config_override: dict[str, Any] | None = None,
     context: dict[str, Any] | None = None,
+    project_id: str | None = None,
     priority: int = 5,
     required_deliverables: list[str] | None = None,
     slot: str | None = None,
@@ -156,6 +157,9 @@ async def create_job(
             {"llm": {"model": "codex/gpt-5.3-codex-spark"}}.
             Use the list_models tool to discover available model IDs.
         context: Additional context dictionary
+        project_id: Project UUID to file the job under. Omit to use the
+            caller's own project lineage. Membership is validated
+            server-side, so only projects the caller can access are accepted.
         priority: Dispatch priority from 0 (low) to 10 (high), default 5
         required_deliverables: Deliverable contract — workspace-relative
             artifact paths (e.g. "output/report.md") or "kb:<slug>" note
@@ -199,7 +203,10 @@ async def create_job(
             config_override=config_override,
             context=merged_context,
             parent_job_id=caller.parent_job_id,
-            project_id=caller.lineage_project_id,
+            # An explicitly passed project wins over the hidden lineage
+            # default (the pre-unification agent-lane create tool accepted it
+            # too); the orchestrator validates membership server-side.
+            project_id=project_id or caller.lineage_project_id,
             user_id=caller.user_id,
             thread_id=caller.thread_id,
             priority=priority,

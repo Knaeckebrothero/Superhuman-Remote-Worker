@@ -38,23 +38,29 @@ async def test_bound_invocations_isolate_project_scope_and_reset_context(
         transport=httpx.MockTransport(handler),
     )
     descriptor = get_descriptor("list_jobs")
-    project_call = make_bound_handler(
+    # Only the MCP lane stamps X-MCP-Scope; a session caller with an identical
+    # single-project binding must NOT (see make_bound_handler).
+    mcp_call = make_bound_handler(
+        descriptor,
+        client_provider=lambda: client,
+        caller_provider=lambda: CallerCtx(
+            kind="mcp",
+            user_id="user-mcp",
+            project_ids=("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",),
+        ),
+    )
+    session_call = make_bound_handler(
         descriptor,
         client_provider=lambda: client,
         caller_provider=lambda: CallerCtx(
             kind="session",
-            user_id="user-project",
+            user_id="user-session",
             project_ids=("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",),
         ),
     )
-    unbound_call = make_bound_handler(
-        descriptor,
-        client_provider=lambda: client,
-        caller_provider=lambda: CallerCtx(kind="session", user_id="user-unbound"),
-    )
 
     try:
-        await asyncio.gather(project_call(), unbound_call())
+        await asyncio.gather(mcp_call(), session_call())
         # The descriptor wrapper has reset its ContextVar token. A direct read
         # therefore carries only the client's internal credential.
         direct = await client.list_jobs()
@@ -63,10 +69,10 @@ async def test_bound_invocations_isolate_project_scope_and_reset_context(
 
     assert set(observed[:2]) == {
         (
-            "user-project",
+            "user-mcp",
             "project:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         ),
-        ("user-unbound", ""),
+        ("user-session", ""),
     }
     assert observed[2] == ("", "")
     assert direct == []

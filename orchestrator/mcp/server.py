@@ -23,7 +23,7 @@ from starlette.responses import JSONResponse
 # and in-image (/app/src/shared), so no fallback chain is needed for them.
 from src.shared.orch_surface import formatters as fmt
 from src.shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
-from src.shared.orch_surface.jobs import CallerCtx
+from src.shared.orch_surface.jobs import AUTH_CONTEXT_FAILURE_NOTICE, CallerCtx
 
 DatasourceType = Literal[
     "generic",
@@ -106,12 +106,22 @@ def mcp_tool(function):
             client.invocation_scope(
                 user_id=caller.user_id,
                 scope=caller.scope_header,
+                unauthenticated=caller.auth_failed,
             )
             if isinstance(client, AsyncCockpitClient)
             else nullcontext()
         )
         with scope_manager:
-            return await function(*args, **kwargs)
+            if not caller.auth_failed:
+                return await function(*args, **kwargs)
+            # http-mode auth context failed: the binding above carries no
+            # identity headers at all (never the internal key), so guarded
+            # endpoints 401. Lead the tool result with the real cause.
+            try:
+                outcome = await function(*args, **kwargs)
+            except Exception as error:
+                outcome = f"{type(error).__name__}: {error}"
+            return f"{AUTH_CONTEXT_FAILURE_NOTICE}\n{outcome}"
 
     return mcp.tool(
         scoped_invocation,
@@ -133,13 +143,28 @@ def _get_client() -> AsyncCockpitClient:
 
 
 def _get_mcp_caller_ctx() -> CallerCtx:
-    """Translate the authenticated token into trusted hidden caller context."""
+    """Translate the authenticated token into trusted hidden caller context.
+
+    Two deliberately different anonymous shapes:
+
+    * stdio transport is the documented internal mode (docker/Dockerfile.mcp):
+      there is no token middleware, and requests authenticate with
+      ``MCP_INTERNAL_KEY`` alone. That is its contract and it stays.
+    * http transport has exactly one identity source — the verified bearer
+      token. Any failure to resolve it (middleware error OR missing token)
+      yields ``auth_failed=True``: the invocation is bound with NO identity
+      headers (the internal key is never an error fallback), guarded
+      orchestrator endpoints 401 — the pre-unification fail-closed
+      behavior — and the tool result names the auth context failure.
+    """
+    if _transport != "http":
+        return CallerCtx(kind="mcp")
     try:
         from mcp.server.auth.middleware.auth_context import get_access_token
 
         token = get_access_token()
         if not token:
-            return CallerCtx(kind="mcp")
+            return CallerCtx(kind="mcp", auth_failed=True)
         scopes = tuple(str(scope) for scope in (token.scopes or ()) if scope)
         project_ids = tuple(
             dict.fromkeys(
@@ -158,7 +183,7 @@ def _get_mcp_caller_ctx() -> CallerCtx:
             explicit_scope=explicit_scope,
         )
     except Exception:
-        return CallerCtx(kind="mcp")
+        return CallerCtx(kind="mcp", auth_failed=True)
 
 
 def _format_action_error(action: str, target: str, error: Exception) -> str:

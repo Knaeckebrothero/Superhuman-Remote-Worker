@@ -186,7 +186,11 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
     assert {"expert_id", "kickoff_message", "priority", "context", "slot"} <= set(
         job_fields
     )
-    assert not {"project_id", "user_id", "thread_id", "parent_job_id"} & set(job_fields)
+    # project_id is deliberately model-visible on both lanes (explicit value
+    # wins over the hidden lineage default); the rest of the lineage stays
+    # server-bound.
+    assert "project_id" in job_fields
+    assert not {"user_id", "thread_id", "parent_job_id"} & set(job_fields)
     assert job_fields["datasource_ids"]["type"] == "array"
     assert "anyOf" not in job_fields["datasource_ids"]
 

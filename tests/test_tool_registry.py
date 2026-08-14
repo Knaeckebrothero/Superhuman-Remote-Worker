@@ -326,6 +326,44 @@ class TestLoadToolsValidation:
         result = load_tools([], ctx)
         assert result == []
 
+    def test_unloaded_requested_tools_warn_once_aggregated(self, caplog):
+        """A registry-known name a factory did not produce must be visible.
+
+        Post-rename checkpoints/history can request names that pass the
+        registry check but never bind (here: graph tools without a neo4j
+        datasource). load_tools must emit ONE aggregated WARNING listing
+        every such name — not one line per name, and not silence.
+        """
+        ctx = ToolContext()  # no neo4j datasource -> graph tools cannot bind
+        with caplog.at_level("WARNING", logger="src.tools.registry"):
+            result = load_tools(["cypher_query", "cypher_execute"], ctx)
+
+        assert result == []
+        skew_records = [
+            record
+            for record in caplog.records
+            if "requested tool(s) did not load" in record.getMessage()
+        ]
+        assert len(skew_records) == 1
+        message = skew_records[0].getMessage()
+        assert "cypher_query" in message
+        assert "cypher_execute" in message
+
+    def test_fully_loaded_request_emits_no_skew_warning(self, caplog):
+        """The aggregated warning must stay silent when every name binds."""
+        ws = MagicMock()
+        ws.is_initialized = True
+        ctx = ToolContext(workspace_manager=ws)
+        with caplog.at_level("WARNING", logger="src.tools.registry"):
+            result = load_tools(["read_file"], ctx)
+
+        assert [tool.name for tool in result] == ["read_file"]
+        assert not [
+            record
+            for record in caplog.records
+            if "requested tool(s) did not load" in record.getMessage()
+        ]
+
     def test_workspace_tools_require_workspace_manager(self):
         """Requesting workspace tools without workspace_manager raises ValueError."""
         ctx = ToolContext()  # no workspace_manager

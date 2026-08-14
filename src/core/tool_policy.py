@@ -191,6 +191,18 @@ def expand_category_true(category: str) -> list[str]:
         raise _enumerate_only_error(category, "true")
 
     names = _grantable(category)
+    if category == "orchestrator":
+        # ``tools.orchestrator: true`` predates the 0156 job-group split, and
+        # 0156's non-array guard skipped boolean policy values whole-row — so
+        # stored boolean rows still mean the PRE-SPLIT category, which
+        # included the job tools. Expand the boolean to that pre-split union
+        # (today's orchestrator members plus the grantable
+        # job_control/job_inspection members) so legacy rows do not silently
+        # lose their job surface. Explicit lists are untouched: a written
+        # ``orchestrator: [...]`` stays exactly as written.
+        names = sorted(
+            {*names, *_grantable("job_control"), *_grantable("job_inspection")}
+        )
     if not names:
         # Whole-category ``grant: "code"``.  The expansion is correct — config
         # grants nothing here — but it reads backwards (``sql: true`` resolving
@@ -406,7 +418,16 @@ def validate_tool_override_fragment(config_override: Any) -> dict[str, list[str]
                 f"decides), so config cannot enable it. Drop the key; write "
                 f"false only if you meant to assert it is off."
             )
-        foreign = _foreign_tool_names(names, category)
+        # The foreign-name gate closes the smuggle where a caller NAMES a
+        # tool under the wrong key. Affirmative forms (``true`` and
+        # ``{except: ...}``) derive their names from our own registry
+        # expansion — ``except``'s named exclusions are already validated
+        # inside ``_expand_mapping`` — so the result-level check is vacuous
+        # for them, and it must not fire on the one deliberate exception:
+        # ``orchestrator: true`` expanding to the pre-split union that
+        # includes job_control/job_inspection members (see
+        # ``expand_category_true``).
+        foreign = () if _is_affirmative(value) else _foreign_tool_names(names, category)
         if foreign:
             raise ToolPolicyError(
                 f"tools.{key}: {', '.join(foreign)}. A tool list may only name "

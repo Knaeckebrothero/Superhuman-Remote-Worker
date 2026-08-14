@@ -315,10 +315,20 @@ class TestInheritedConstraints:
     def test_a_closed_group_true_still_expands_to_the_curated_vocabulary(self, group):
         """The registry's ``explicit`` tier is what holds this, not a name
         list — so a user ticking "Experts & Skills" cannot acquire
-        ``set_expert_bundle`` through a category-level ``true``."""
+        ``set_expert_bundle`` through a category-level ``true``.
+
+        ``orchestrator`` carries a legacy-compat exception: its boolean
+        predates the 0156 job-group split (0156 skipped boolean rows
+        whole-row), so ``true`` expands to the pre-split union — the curated
+        orchestrator set plus the curated job groups, never the explicit-tier
+        job tools (delete/assign/promote/steer/...)."""
+        expected = set(SESSION_TOOL_OVERRIDE_NAMES[group])
+        if group == "orchestrator":
+            expected |= set(SESSION_TOOL_OVERRIDE_NAMES["job_control"])
+            expected |= set(SESSION_TOOL_OVERRIDE_NAMES["job_inspection"])
         assert validate_tool_override_fragment({"tools": {group: True}})[
             group
-        ] == sorted(SESSION_TOOL_OVERRIDE_NAMES[group])
+        ] == sorted(expected)
 
     def test_shell_accepts_only_and_false_and_nothing_else(self):
         assert validate_tool_override_fragment({"tools": {"shell": []}}) == {
