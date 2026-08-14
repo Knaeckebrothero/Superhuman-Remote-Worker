@@ -709,3 +709,122 @@ describe('uploadOneToThread', () => {
     req.flush({thread_id: 't1', path: 'uploads/bundle/sub/re#port ?.txt', deleted: true});
   });
 });
+
+describe('ApiService officer post endpoints (docs/features/officer_post.md)', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('reads the post and degrades to null only on transport failure', async () => {
+    const pending = firstValueFrom(api.getOfficerPost('p-1'));
+    const request = httpMock.expectOne((r) => r.url.endsWith('/projects/p-1/officer'));
+    expect(request.request.method).toBe('GET');
+    request.flush('boom', {status: 500, statusText: 'Server Error'});
+    await expect(pending).resolves.toBeNull();
+  });
+
+  it('commissions with the optional partial config body', async () => {
+    const body = {slots: {line: {count: 2, backend: 'sandbox'}}};
+    const pending = firstValueFrom(api.commissionOfficer('p-1', body));
+    const request = httpMock.expectOne((r) =>
+      r.url.endsWith('/projects/p-1/officer/commission'),
+    );
+    expect(request.request.method).toBe('POST');
+    expect(request.request.body).toEqual(body);
+    request.flush({thread_id: 't-1', status: 'commissioned'});
+    await expect(pending).resolves.toMatchObject({thread_id: 't-1'});
+  });
+
+  it('decommission sends {} by default and {force: true} only when forced', async () => {
+    const first = firstValueFrom(api.decommissionOfficer('p-1'));
+    const warn = httpMock.expectOne((r) =>
+      r.url.endsWith('/projects/p-1/officer/decommission'),
+    );
+    expect(warn.request.body).toEqual({});
+    warn.flush({warning: 'jobs in flight', in_flight_jobs: [{job_id: 'j-1'}]});
+    await expect(first).resolves.toMatchObject({warning: 'jobs in flight'});
+
+    const second = firstValueFrom(api.decommissionOfficer('p-1', true));
+    const forced = httpMock.expectOne((r) =>
+      r.url.endsWith('/projects/p-1/officer/decommission'),
+    );
+    expect(forced.request.body).toEqual({force: true});
+    forced.flush({status: 'decommissioned'});
+    await expect(second).resolves.toMatchObject({status: 'decommissioned'});
+  });
+
+  it('hold sends the trimmed note, or an empty body without one', async () => {
+    const noted = firstValueFrom(api.holdOfficer('p-1', '  migration window  '));
+    const withNote = httpMock.expectOne((r) =>
+      r.url.endsWith('/projects/p-1/officer/hold'),
+    );
+    expect(withNote.request.body).toEqual({note: 'migration window'});
+    withNote.flush({status: 'held'});
+    await noted;
+
+    const bare = firstValueFrom(api.holdOfficer('p-1'));
+    const blank = httpMock.expectOne((r) =>
+      r.url.endsWith('/projects/p-1/officer/hold'),
+    );
+    expect(blank.request.body).toEqual({});
+    blank.flush({status: 'held'});
+    await bare;
+  });
+
+  it('release POSTs an empty body', async () => {
+    const pending = firstValueFrom(api.releaseOfficer('p-1'));
+    const request = httpMock.expectOne((r) =>
+      r.url.endsWith('/projects/p-1/officer/release'),
+    );
+    expect(request.request.method).toBe('POST');
+    expect(request.request.body).toEqual({});
+    request.flush({status: 'released'});
+    await pending;
+  });
+
+  it('PATCHes partial kit fields and the row-only communication_policy', async () => {
+    const body = {
+      daily_token_ceiling: null,
+      sleep_min_minutes: 10,
+      communication_policy: {worker_messages: 'officer_first' as const},
+    };
+    const pending = firstValueFrom(api.updateOfficerPost('p-1', body));
+    const request = httpMock.expectOne((r) => r.url.endsWith('/projects/p-1/officer'));
+    expect(request.request.method).toBe('PATCH');
+    expect(request.request.body).toEqual(body);
+    request.flush({status: 'updated'});
+    await pending;
+  });
+
+  it('lifecycle errors propagate their FastAPI detail — the card owns messaging', async () => {
+    const pending = firstValueFrom(api.commissionOfficer('p-1'));
+    const request = httpMock.expectOne((r) =>
+      r.url.endsWith('/projects/p-1/officer/commission'),
+    );
+    request.flush(
+      {detail: 'post already commissioned'},
+      {status: 409, statusText: 'Conflict'},
+    );
+    await expect(pending).rejects.toMatchObject({
+      status: 409,
+      error: {detail: 'post already commissioned'},
+    });
+  });
+});

@@ -59,6 +59,10 @@ import {
     KnowledgeSummary,
     MemoryListResponse,
     MemoryStats,
+    OfficerCommissionResult,
+    OfficerDecommissionResult,
+    OfficerPost,
+    OfficerPostPatch,
     Project,
     ProjectBacklog,
     ProjectLoop,
@@ -2306,6 +2310,81 @@ export class ApiService {
     return this.http
       .get<ProjectBacklog>(`${this.baseUrl}/projects/${projectId}/backlog`)
       .pipe(catchError(() => of(null)));
+  }
+
+  // ===== Officer post (docs/features/officer_post.md) =====
+  // The GET always returns the post — vacant or commissioned. The lifecycle
+  // POSTs and the PATCH deliberately do NOT swallow errors: their FastAPI
+  // `detail` strings (rival-commission 409s, hold fences, kit validation
+  // 400s) are the card's messaging, so the component owns the catch.
+
+  /** The post, always present; null only on transport failure. */
+  getOfficerPost(projectId: string): Observable<OfficerPost | null> {
+    return this.http
+      .get<OfficerPost>(`${this.baseUrl}/projects/${projectId}/officer`)
+      .pipe(catchError(() => of(null)));
+  }
+
+  /**
+   * Raise an officer onto the post. `body` is an optional partial config
+   * (same fields as the PATCH) merged into the row before the thread boots;
+   * his first wake carries the continuity brief.
+   */
+  commissionOfficer(
+    projectId: string,
+    body: OfficerPostPatch = {},
+  ): Observable<OfficerCommissionResult> {
+    return this.http.post<OfficerCommissionResult>(
+      `${this.baseUrl}/projects/${projectId}/officer/commission`,
+      body,
+    );
+  }
+
+  /**
+   * End the incarnation, harvesting his state onto the row. Non-forced with
+   * jobs in flight returns the warning + list instead of decommissioning;
+   * `force` proceeds (jobs are left running either way).
+   */
+  decommissionOfficer(
+    projectId: string,
+    force = false,
+  ): Observable<OfficerDecommissionResult> {
+    return this.http.post<OfficerDecommissionResult>(
+      `${this.baseUrl}/projects/${projectId}/officer/decommission`,
+      force ? {force: true} : {},
+    );
+  }
+
+  /** Stand him down in place (maintenance hold) — commissioned, not retired. */
+  holdOfficer(projectId: string, note = ''): Observable<{status?: string}> {
+    const trimmed = note.trim();
+    return this.http.post<{status?: string}>(
+      `${this.baseUrl}/projects/${projectId}/officer/hold`,
+      trimmed ? {note: trimmed} : {},
+    );
+  }
+
+  /** Lift the hold; queued events drain within one ~20s tick. */
+  releaseOfficer(projectId: string): Observable<{status?: string}> {
+    return this.http.post<{status?: string}>(
+      `${this.baseUrl}/projects/${projectId}/officer/release`,
+      {},
+    );
+  }
+
+  /**
+   * Edit the post — partial kit/budget/brain fields, and the row-only
+   * `communication_policy`. When commissioned the server live-merges the
+   * fragment into thread metadata; per-field immediacy is the card's job.
+   */
+  updateOfficerPost(
+    projectId: string,
+    body: OfficerPostPatch,
+  ): Observable<{status?: string}> {
+    return this.http.patch<{status?: string}>(
+      `${this.baseUrl}/projects/${projectId}/officer`,
+      body,
+    );
   }
 
   getProjectMembers(id: string): Observable<ProjectMember[]> {
