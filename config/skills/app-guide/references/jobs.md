@@ -70,6 +70,14 @@ pauses.
   the cause.
 - **Completed**, **Failed**, or **Cancelled** — terminal outcomes.
 
+Progress is reported as **liveness**, not a percentage: a server-computed
+state (`active`, `waiting`, `paused`, `suspected_stuck`, `unavailable`,
+`terminal`) with reasons and a last-activity time. Any `progress_percent`
+field is honestly `null` — SRW does not fabricate a percent or an ETA.
+`suspected_stuck` means "investigate" (open the job, its log, or its audit
+trail), not "failed"; and `unavailable` means a telemetry source could not
+be reached — never present it as "no activity".
+
 ## Watch the work
 
 Workspace-backed worker jobs normally alternate strategic planning and

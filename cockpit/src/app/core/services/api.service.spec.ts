@@ -828,3 +828,73 @@ describe('ApiService officer post endpoints (docs/features/officer_post.md)', ()
     });
   });
 });
+
+describe('ApiService.getJobProgress (honest liveness, officer_supervision_surface E1/E3)', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('surfaces state/reasons/last_activity_at and tolerates the honest null percent', async () => {
+    const pending = firstValueFrom(api.getJobProgress('job-1'));
+    const request = httpMock.expectOne((r) => r.url.endsWith('/jobs/job-1/progress'));
+    expect(request.request.method).toBe('GET');
+    // The exact producer payload: liveness verdict plus null-percent shape
+    // compatibility fields. No consumer may re-fabricate a percent from it.
+    request.flush({
+      job_id: 'job-1',
+      status: 'processing',
+      state: 'suspected_stuck',
+      reasons: ['no audit movement for 41 minutes'],
+      last_activity_at: '2026-08-14T11:19:00+00:00',
+      observed_at: '2026-08-14T12:00:00+00:00',
+      threshold_minutes: 30,
+      sources: [
+        {name: 'control_db', status: 'fresh', as_of: '2026-08-14T12:00:00+00:00'},
+        {name: 'audit_db', status: 'unavailable', reason: 'timeout'},
+      ],
+      progress_percent: null,
+      elapsed_seconds: 512.5,
+      eta_seconds: null,
+      created_at: '2026-08-14T11:00:00+00:00',
+      updated_at: '2026-08-14T11:50:00+00:00',
+      completed_at: null,
+    });
+
+    const progress = await pending;
+    expect(progress).not.toBeNull();
+    expect(progress!.state).toBe('suspected_stuck');
+    expect(progress!.reasons).toEqual(['no audit movement for 41 minutes']);
+    expect(progress!.last_activity_at).toBe('2026-08-14T11:19:00+00:00');
+    expect(progress!.progress_percent).toBeNull();
+    expect(progress!.eta_seconds).toBeNull();
+  });
+
+  it('resolves null on transport failure instead of throwing into the view', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const pending = firstValueFrom(api.getJobProgress('job-1'));
+      const request = httpMock.expectOne((r) => r.url.endsWith('/jobs/job-1/progress'));
+      request.flush({detail: 'boom'}, {status: 500, statusText: 'Server Error'});
+      await expect(pending).resolves.toBeNull();
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+});

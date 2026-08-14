@@ -61,6 +61,13 @@ When the corresponding tools are actually loaded, a session can:
 - create a worker job and list or inspect visible jobs;
 - list and read files a worker job has pushed to its workspace repo (state
   as of the worker's last checkpoint push, not live mid-phase edits);
+- read a job's published completion evidence: `get_job_completion_report`
+  returns the recorded completion report, `list_job_evidence` the typed
+  manifest (test reports, screenshots, deliverable checks), and
+  `read_job_evidence` one bounded entry by its ID. Evidence is pinned at
+  completion and paginated — judgment material, not a live file browser, and
+  an entry marked unavailable is a source that could not be reached, not an
+  empty result;
 - approve a job that is pending review;
 - resume a paused or frozen job with feedback;
 - request a safe-point pause or cancel a job; and

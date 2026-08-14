@@ -1980,14 +1980,56 @@ export interface ThreadCloudApplyResult {
 }
 
 /**
- * Job progress with ETA calculation.
+ * Server-computed job liveness states (officer_supervision_surface E3).
+ * Computed from control status, audit movement, and agent heartbeat —
+ * `jobs.updated_at` is never consulted. `suspected_stuck` is a prompt to
+ * investigate, not a verdict; `unavailable` means telemetry could not be
+ * reached and must never render as "no activity".
+ */
+export type JobLivenessState =
+  | 'active'
+  | 'waiting'
+  | 'paused'
+  | 'suspected_stuck'
+  | 'unavailable'
+  | 'terminal';
+
+/** Per-source availability in a truthful supervision read (E1). */
+export interface JobLivenessSource {
+  name: string;
+  status: 'fresh' | 'degraded' | 'stale' | 'unavailable';
+  as_of?: string | null;
+  reason?: string;
+}
+
+/**
+ * Honest job liveness from GET /jobs/:id/progress.
+ *
+ * `state`/`reasons`/`last_activity_at` are the signal — render the liveness
+ * state (badge/text), not a percent. `progress_percent`/`eta_seconds` are
+ * retained for payload-shape compatibility and are honest `null` from this
+ * producer: no percentage telemetry exists and none is fabricated.
  */
 export interface JobProgress {
   job_id: string;
   status: JobStatus;
-  progress_percent: number;
+  /** Liveness verdict; prefer this over any numeric field. */
+  state: JobLivenessState;
+  /** Human-readable reasons behind `state` (may be empty, never invented). */
+  reasons: string[];
+  /** Last observed real activity (audit/heartbeat), or null when unknown. */
+  last_activity_at: string | null;
+  /** When the server computed this verdict. */
+  observed_at: string;
+  /** Stall threshold (minutes) the verdict was computed against. */
+  threshold_minutes?: number;
+  /** Which sources were consulted and whether each was reachable. */
+  sources?: JobLivenessSource[];
+  /** Always null from the current producer; kept for shape compatibility. */
+  progress_percent: number | null;
   elapsed_seconds: number;
-  eta_seconds?: number;
+  /** Always null from the current producer; kept for shape compatibility. */
+  eta_seconds?: number | null;
   created_at?: string;
   updated_at?: string;
   completed_at?: string;
