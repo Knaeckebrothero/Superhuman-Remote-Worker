@@ -57,16 +57,24 @@ def _without_framework_schema_decoration(schema: dict[str, Any]) -> dict[str, An
     normalized.pop("description", None)
     normalized.pop("additionalProperties", None)
 
-    def strip_titles(value: Any) -> None:
+    def strip_decoration(value: Any) -> None:
         if isinstance(value, dict):
             value.pop("title", None)
+            # Per-property descriptions are docstring-derived decoration and
+            # SDK-version-dependent: some mcp releases parse Google-style
+            # `Args:` blocks into property descriptions, others don't (first
+            # bitten by the M3 routing tools — the only descriptors with
+            # parseable Args sections). Parity here is about STRUCTURE —
+            # names, types, required, defaults — so strip descriptions at
+            # every level, like titles.
+            value.pop("description", None)
             for nested in value.values():
-                strip_titles(nested)
+                strip_decoration(nested)
         elif isinstance(value, list):
             for nested in value:
-                strip_titles(nested)
+                strip_decoration(nested)
 
-    strip_titles(normalized)
+    strip_decoration(normalized)
     return normalized
 
 
