@@ -18,9 +18,16 @@ related:
   - "[[workspace_warm_pool_and_async_sessions]]"
   - "[[ephemeral_workspaces]]"
   - "[[tool_permission_tiers]]"
+  - "[[officer_knowledge_plane]]"
 ---
 
 # Workspace Tier Upgrade — `virtual`/`none` → `sandbox`/`vm` on demand
+
+> **Background-officer exception (proposed 2026-08-14):** S5 remains the default for
+> ordinary lite sessions, but a commissioned background officer is a structural no-object
+> principal and must not receive `request_workspace_upgrade`. Conferences are ordinary
+> sessions and retain the user-selected tier/upgrade policy. See
+> [[officer_knowledge_plane]].
 
 **Status (LATEST — session `sandbox → vm` FULLY VERIFIED end-to-end incl. sudo, cloud mount + clean teardown — 2026-06-21):**
 The lite→sandbox tiers + Q7/Q8 are done (see prior status below). The **VM tier had

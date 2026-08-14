@@ -18,6 +18,8 @@ related:
   - "[[officer_blind_reads_and_worker_bureaucracy]]"
   - "[[phase_model_overhead_amnesia_loop]]"
   - "[[centurion]]"
+  - "[[officer_supervision_surface]]"
+  - "[[officer_message_routing]]"
   - "[[agent_lifecycle]]"
 ---
 
@@ -396,6 +398,11 @@ substantially less blocked than the first draft assumed.
    clients, rather than the officer's private tool set. This is the real
    deliverable, and [[worker_runtime_strategy]] §7 raised its priority by
    making steering the compensating control for the loosening path.
+   [[unified_orchestrator_tool_surface]] is the shared implementation;
+   [[officer_supervision_surface]] defines truthful reads and the background
+   officer's no-object boundary; [[officer_message_routing]] defines the
+   durable worker/officer/user thread and escalation lane. Voice consumes
+   those APIs and does not invent a parallel control plane.
 3. **Voice client**: ephemeral-token endpoint + WebRTC in cockpit + the
    three-tool schema. Near-zero new backend — jobs use the existing P1-A
    lane on `graph.py`, sessions use the existing `/input` front door.

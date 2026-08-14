@@ -14,11 +14,19 @@ related:
   - "[[project_knowledge_base]]"
   - "[[sso_and_cloud_storage]]"
   - "[[datasources]]"
+  - "[[officer_knowledge_plane]]"
 ---
 
 # Project & Session Cloud Folders — Automatic Nextcloud Integration
 
 > **⚠️ Partly superseded (2026-06-07).** The **project folder** is now **cloned into the agent's workspace** (Mode-A baseline for jobs; the `projects/` sync mount for sessions) rather than reached through per-folder agent tools. Project provisioning **no longer** auto-attaches the folder as a `webdav` datasource, so jobs/sessions do **not** receive `webdav_*` tools for the project folder — they read and write it as ordinary workspace files. The `webdav_*` tools (renamed from `cloud_*`) are retained only for clouds that are **not** cloned: the user's personal home cloud and externally-attached WebDAV datasources. Passages below describing "the agent gets `webdav_*` tools for the project folder" reflect the original design. See [[webdav_datasource_tools]] and [[main_cloud]] (Issue 1 / Issue 8).
+
+> **Background-officer boundary (proposed 2026-08-14):** a commissioned passive officer
+> does not mount, browse, poll, or write this folder. File arrival is not implicit user
+> intent. [[officer_knowledge_plane]] defers an explicit **Send to officer / Create ticket
+> from file** bridge that would create a provenance-stamped KB inbox item and delegate file
+> inspection to a worker. Conferences remain ordinary sessions and may use their selected
+> project workspace normally.
 
 Automatically provision Nextcloud folders at two scopes:
 

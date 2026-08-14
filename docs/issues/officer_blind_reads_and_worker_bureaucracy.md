@@ -41,6 +41,13 @@ the findings and fix plan. Companion doc for the phase-guardrail arc:
 here; this doc adds the route mismatch, the officer consequences, and the steering
 mechanics.
 
+**2026-08-14 scope correction:** the incident proved that the officer needs trustworthy
+evidence, not that a passive manager should browse arbitrary job/project files forever.
+[[officer_supervision_surface]] keeps the repaired readers for sessions/MCP, gives the
+background officer status/audit/messages plus bounded immutable completion evidence, and
+denies its object-plane file/shell/repository subset. Missing evidence now triggers a
+tester/recon job. [[officer_knowledge_plane]] holds the structural boundary.
+
 ---
 
 ## 1. The night in brief
