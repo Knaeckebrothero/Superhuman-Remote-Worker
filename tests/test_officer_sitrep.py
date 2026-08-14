@@ -49,6 +49,9 @@ def _fake_db(jobs=None, conn=None):
     db = SimpleNamespace()
     db.get_jobs = AsyncMock(return_value=jobs or [])
     db.acquire = lambda: _FakeAcquire(conn)
+    # officer_post.md §4: the capacity section resolves the post's thread
+    # lineage before counting; a lone thread's lineage is itself.
+    db.get_officer_capacity_lineage = AsyncMock(return_value=[THREAD_ID])
     return db
 
 

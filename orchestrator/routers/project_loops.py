@@ -170,16 +170,17 @@ async def start_project_loop(
 
         await _check_vm_permission(caller, job_needs_vm=True)
 
-    # Officer scheduling needs someone to wake: an enabled centurion thread
-    # on the project. Fail loud at start — an officer loop with no officer
-    # would conclude turns into a void.
+    # Officer scheduling needs someone to wake: a commissioned post
+    # (officer_post.md §4 — the lookup reads project_officers.thread_id, and
+    # requires the linked thread live). Fail loud at start — an officer loop
+    # with a vacant post would conclude turns into a void.
     if body.scheduling == "officer":
         officer = await postgres_db.get_officer_thread_for_project(project_id)
         if not officer:
             raise HTTPException(
                 status_code=400,
-                detail="scheduling='officer' requires an enabled centurion on "
-                "this project — provision one first.",
+                detail="scheduling='officer' requires a commissioned officer "
+                "on this project's post — provision one first.",
             )
 
     if await postgres_db.get_active_project_loop(project_id):
@@ -356,12 +357,14 @@ async def convert_project_loop_scheduling(
     await require_approved_user(request, postgres_db)
     await require_project_member(request, postgres_db, project_id, min_role="editor")
 
+    # Post commissioned? (officer_post.md §4 — row-backed via the flipped
+    # lookup, which also requires the linked thread live.)
     officer = await postgres_db.get_officer_thread_for_project(project_id)
     if not officer:
         raise HTTPException(
             status_code=400,
-            detail="scheduling='officer' requires an enabled centurion on "
-            "this project — provision one first.",
+            detail="scheduling='officer' requires a commissioned officer "
+            "on this project's post — provision one first.",
         )
 
     loop = await postgres_db.get_active_project_loop(project_id)

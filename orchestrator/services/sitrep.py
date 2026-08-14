@@ -395,16 +395,22 @@ async def _capacity_section(
         officer_meta = _as_dict(
             _as_dict(metadata.get("config_override")).get("officer")
         )
+        # Lineage-aware count (officer_post.md §4): jobs dispatched by a
+        # prior incarnation on this post still occupy their slots, so the
+        # officer's own capacity line matches what admission will enforce.
+        lineage = await db.get_officer_capacity_lineage(thread_id)
+        if not lineage:
+            lineage = [thread_id]
         async with db.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT context->>'officer_slot' AS slot, COUNT(*) AS n
                   FROM jobs
-                 WHERE created_by_thread_id = $1
+                 WHERE created_by_thread_id = ANY($1::uuid[])
                    AND status IN ('created', 'processing')
                  GROUP BY 1
                 """,
-                UUID(thread_id),
+                lineage,
             )
         in_flight_by_slot = {r["slot"]: int(r["n"]) for r in rows}
         return [capacity_lines(officer_meta, in_flight_by_slot)]
