@@ -1287,9 +1287,11 @@ class TestUpdateThreadStatus:
         await db.update_thread_status("tid-1", "idle")
 
         sql = " ".join(conn.execute.call_args[0][0].split())
-        assert "status = $2" in sql
+        assert "status = $2::text" in sql
         assert "last_activity = CURRENT_TIMESTAMP" in sql
-        assert "WHEN $2 IN ('ended', 'suspended') THEN NULL" in sql
+        # $2 is cast in every comparison: an uncast $2 next to the ::text one
+        # made asyncpg's prepare refuse the statement (AmbiguousParameterError).
+        assert "WHEN $2::text IN ('ended', 'suspended') THEN NULL" in sql
         assert conn.execute.call_args[0][1] == "tid-1"
         assert conn.execute.call_args[0][2] == "idle"
 
