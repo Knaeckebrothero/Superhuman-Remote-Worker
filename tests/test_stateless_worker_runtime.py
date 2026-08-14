@@ -19,6 +19,7 @@ from typing_extensions import TypedDict
 
 import src.api.persistent_app as pa
 import src.api.turn_executor as turn_executor
+from src.api.orchestrator_client import CompletionNonTerminalReportError
 from src.agent import UniversalAgent, _stateless_worker_remote_authority
 from src.core.workspace_backend import WorkspaceUnavailableError
 from src.core.backends.remote import RemoteBackend
@@ -544,6 +545,136 @@ async def test_terminal_checkpoint_envelope_is_wire_authority_over_live_false(
     rotate.assert_not_awaited()
     release.assert_not_awaited()
     assert agent.cleanup_calls == [False]
+
+
+@pytest.mark.asyncio
+async def test_coded_nonterminal_422_releases_normally_then_successor_reclaims(
+    worker_runtime,
+    monkeypatch,
+    caplog,
+):
+    first = _claim(token=41, input_seq=34, prior="processing")
+    final = {
+        "should_stop": True,
+        "goal_achieved": True,
+        "freeze_data": None,
+        "error": None,
+    }
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch, first, final
+    )
+    client.report_completion.side_effect = [
+        CompletionNonTerminalReportError(
+            "stateless completion requires should_stop=true"
+        ),
+        True,
+    ]
+    accepted_lookup = AsyncMock()
+    monkeypatch.setattr(
+        turn_executor,
+        "get_worker_completion_acceptance",
+        accepted_lookup,
+    )
+
+    with caplog.at_level("ERROR"):
+        await executor._serve_worker_claim(first)
+
+    client.report_completion.assert_awaited_once_with(
+        str(first.unit_id), final, lease_token=41
+    )
+    assert renew.await_count == 1  # pre-graph fence only; no ambiguity lookup
+    accepted_lookup.assert_not_awaited()
+    complete.assert_not_awaited()
+    rotate.assert_not_awaited()
+    release.assert_awaited_once_with(
+        executor._db,
+        unit_id=first.unit_id,
+        lease_token=41,
+        park_on_exhaustion=True,
+    )
+    assert agent.cleanup_calls == [True]
+    assert agent.hold_calls == 0
+    assert executor._worker_terminal_report_generation is None
+    assert executor._worker_completion_accepted_generation is None
+    assert (
+        "unit=" + str(first.unit_id) + " token=41 code=completion_non_terminal_report"
+    ) in caplog.text
+    assert "stateless completion requires should_stop=true" not in caplog.text
+
+    successor = WorkerClaim(
+        unit=replace(first.unit, lease_token=42, attempts_since_completion=2),
+        prior_job_status="processing",
+        resume=True,
+        max_attempts=first.max_attempts,
+    )
+    client.claim = successor
+    await executor._serve_worker_claim(successor)
+
+    assert [
+        call.kwargs["lease_token"] for call in client.report_completion.await_args_list
+    ] == [41, 42]
+    complete.assert_awaited_once_with(
+        executor._db,
+        unit_id=successor.unit_id,
+        lease_token=42,
+        consumed_seq=34,
+    )
+    assert agent.cleanup_calls == [True, False]
+    assert agent.hold_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_coded_nonterminal_422_cleanup_fault_at_cap_never_rereports(
+    worker_runtime,
+    monkeypatch,
+    caplog,
+):
+    claim = _claim(
+        token=43,
+        input_seq=35,
+        prior="processing",
+        attempts=5,
+        max_attempts=5,
+    )
+    final = {"should_stop": True, "goal_achieved": True, "error": None}
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch, claim, final
+    )
+    client.report_completion.side_effect = CompletionNonTerminalReportError(
+        "body must not be logged"
+    )
+    cleanup = AsyncMock(side_effect=RuntimeError("cleanup detail must not leak"))
+    agent.cleanup_worker_claim = cleanup
+    accepted_lookup = AsyncMock()
+    monkeypatch.setattr(
+        turn_executor,
+        "get_worker_completion_acceptance",
+        accepted_lookup,
+    )
+
+    with caplog.at_level("ERROR"):
+        await executor._serve_worker_claim(claim)
+
+    client.report_completion.assert_awaited_once_with(
+        str(claim.unit_id), final, lease_token=43
+    )
+    cleanup.assert_awaited_once_with(preserve_shell=True)
+    assert renew.await_count == 1  # pre-graph fence only
+    accepted_lookup.assert_not_awaited()
+    complete.assert_not_awaited()
+    rotate.assert_not_awaited()
+    release.assert_awaited_once_with(
+        executor._db,
+        unit_id=claim.unit_id,
+        lease_token=43,
+        park_on_exhaustion=True,
+    )
+    assert agent.hold_calls == 0
+    assert executor._worker_terminal_report_generation is None
+    assert executor._worker_completion_accepted_generation is None
+    assert "worker completion refusal cleanup failed" in caplog.text
+    assert "body must not be logged" not in caplog.text
+    assert "cleanup detail must not leak" not in caplog.text
 
 
 @pytest.mark.asyncio

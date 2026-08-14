@@ -972,6 +972,54 @@ class TestOrchestratorClientReportCompletion:
 
         assert success is True
 
+    @pytest.mark.asyncio
+    async def test_machine_coded_nonterminal_422_is_definitive(self, client):
+        from src.api.orchestrator_client import CompletionNonTerminalReportError
+
+        mock_response = MagicMock()
+        mock_response.status_code = 422
+        mock_response.json.return_value = {
+            "detail": {
+                "code": "completion_non_terminal_report",
+                "message": "stateless completion requires should_stop=true",
+            }
+        }
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            with pytest.raises(CompletionNonTerminalReportError) as caught:
+                await client.report_completion(
+                    "job-123", {"should_stop": True}, lease_token=17
+                )
+
+        assert caught.value.code == "completion_non_terminal_report"
+        assert caught.value.message == (
+            "stateless completion requires should_stop=true"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "client_report_id was reused",
+            {"code": "different_422", "message": "not this contract"},
+            {"message": "missing machine code"},
+        ],
+    )
+    async def test_other_422_remains_ambiguous_false(self, client, detail):
+        mock_response = MagicMock()
+        mock_response.status_code = 422
+        mock_response.json.return_value = {"detail": detail}
+        mock_response.text = "unprocessable"
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            success = await client.report_completion(
+                "job-123", {"should_stop": True}, lease_token=17
+            )
+
+        assert success is False
+
 
 # =============================================================================
 # Structured cooldown fail-fast error (docs/issues/loop_advances_into_active_model_cooldown.md)

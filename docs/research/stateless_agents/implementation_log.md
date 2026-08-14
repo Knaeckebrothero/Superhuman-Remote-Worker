@@ -5048,3 +5048,41 @@ selection passed **300/300**. Ruff lint, format-check, `py_compile`, and
 whitespace checks are clean. No migration or schema change was needed, and the
 preserved stateless specimen, its command/queue/workspace, the pinned probe,
 and the three protected untracked paths were not mutated.
+
+## M2 — definitive nonterminal-422 release contract
+
+The accept wrapper now distinguishes the stateless pre-write refusal from a
+divergent idempotency replay. `CompletionNonTerminalReport` maps to HTTP 422
+with the stable nested detail code `completion_non_terminal_report`; the
+generic payload-mismatch 422 remains unchanged. The agent client recognizes
+only that exact status/code pair and raises a typed exception past its broad
+transport catch. A malformed, differently coded or ordinary 422 remains an
+ambiguous `false` result, so it still takes the renewal and exact-B4 lookup
+path. HTTP 200/202 and pinned behavior are unchanged.
+
+**M2 contract.** An exact machine-coded `completion_non_terminal_report` HTTP
+422 is a definitive pre-write refusal: the worker treats the report as never
+accepted, emits an ERROR keyed only by job and lease token, never records an
+accepted generation or enters `hold_worker_finalization`, retires token N's
+local runtime with `cleanup_worker_claim(preserve_shell=True)` while preserving
+durable tmux, and fence-releases that same `worker_batch` generation with
+ordinary linear error backoff so a successor can claim and re-establish shell
+admission under token N+1. Other failures remain ambiguous and retain the
+renew/exact-B4-acceptance lookup; only a successful response or exact durable
+acceptance proof may enter the finalization hold.
+
+The driver clears its report-started marker as soon as it observes the typed
+refusal, then bypasses renewal, acceptance lookup, hold, queue completion and
+rotation. Cleanup diagnostics are bounded and never include the response body
+or exception text. Even a cleanup exception at the retry cap cannot escape
+into the generic exhaustion branch and issue a second `/complete`; the exact
+generation still takes the normal fenced release with default exhaustion
+parking. A successor-token regression proves token 41 releases and token 42
+reclaims before its one accepted terminal closure.
+
+The endpoint/client/worker selection passed **195/195**. The independent
+contract audit exercised the subtype and generic endpoint mappings, exact and
+other client 422s, 200/202, the ordinary coded refusal, its cleanup-fault cap
+edge and the ambiguous B4 branches (**12/12**) and found no P0/P1. Ruff lint,
+format-check, `py_compile`, and whitespace checks are clean. No migration,
+schema, live-resource or specimen change was made.
