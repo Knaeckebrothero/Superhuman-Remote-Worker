@@ -101,6 +101,13 @@ from ..shared.worker_queue import (
 
 logger = logging.getLogger(__name__)
 
+_COMPLETION_REPORT_PAYLOAD_FIELDS = (
+    "should_stop",
+    "goal_achieved",
+    "error",
+    "freeze_data",
+)
+
 # --- Tunables (env-overridable where deployment cares) -----------------------
 
 IDLE_POLL_SECONDS = 0.5
@@ -974,6 +981,26 @@ class StatelessTurnExecutor:
         unit = claim.unit
         job_id = str(unit.unit_id)
         token = unit.lease_token
+        wire_payload, payload_source = self._worker_completion_wire_payload(final_state)
+        if wire_payload.get("should_stop") is not True:
+            # Fail closed before marking this generation as report-started.
+            # A continue-shaped stateless payload is a driver bug, not a
+            # completion attempt: preserve the remote shell and return the
+            # claim through ordinary queue backoff/default exhaustion parking.
+            logger.error(
+                "worker terminal report blocked locally: unit=%s token=%d "
+                "payload_source=%s effective_should_stop_not_true — preserving "
+                "shell and releasing without /complete",
+                job_id,
+                token,
+                payload_source,
+            )
+            await self._cleanup_worker_runtime(preserve_shell=True)
+            await self._release_worker_claim(
+                claim,
+                reason="nonterminal_completion_report_blocked",
+            )
+            return
         if client is None:
             client = _pa()._orchestrator_client
         if client is None:
@@ -1116,6 +1143,19 @@ class StatelessTurnExecutor:
             token,
             state,
         )
+
+    @staticmethod
+    def _worker_completion_wire_payload(
+        final_state: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], str]:
+        """Return the exact payload source ``report_completion`` will use."""
+
+        checkpointed = final_state.get("completion_report_payload")
+        if isinstance(checkpointed, dict) and set(checkpointed) == set(
+            _COMPLETION_REPORT_PAYLOAD_FIELDS
+        ):
+            return checkpointed, "checkpoint_envelope"
+        return final_state, "live_state"
 
     @staticmethod
     def _parse_worker_bundle(

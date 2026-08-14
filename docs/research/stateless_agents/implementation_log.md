@@ -4994,3 +4994,57 @@ warnings in 129.23 seconds**. Its initial pass exposed two stale test fakes;
 the root-directed test-only M4 amendment passed the exact nodes **2/2** and
 their full file **27/27**, after which the suite returned to the exact baseline.
 That executable correction belongs to M4; M5 itself remains documentation-only.
+
+# Session 22 — worker wedge follow-ups (2026-08-14)
+
+## M1 — atomic continue routing and the pre-report source guard
+
+The preserved hand-check supplied an exact checkpoint-level reproduction. Its
+step 31 was a `source=loop` terminal `batch_boundary` at
+`18:53:41.715001Z`, with `should_stop=true`, a 302.55-second wall-clock
+observation and a 300-second target. Step 32 at `18:53:45.351213Z` cleared the
+terminal envelope with an `as_node=__start__` update and selected
+`restore_todo_state`; step 33 at `18:53:45.406989Z` was a second inferred-node
+update that added only the worker arm. That second update left no pending
+frontier, and the nonterminal completion command was reported at
+`18:53:45.436977Z`, only about 30 milliseconds later.
+
+The root cause is two sentences. Stateless auto-continue selected a real
+successor task with one LangGraph state update, then `_arm_worker_batch`
+performed a second state update which LangGraph interpreted as consuming that
+pending task. The graph consequently ran no successor node, returned the
+armed `should_stop=false` state, and the executor fell through to `/complete`.
+
+Stateless checkpoint-backed feedback, delegation and automatic continuation
+now stage their routing changes and join them with batch arming in one durable
+update; reducer-backed messages are concatenated rather than overwritten. A
+normal `source=loop` frontier receives its one arming update. If that update
+commits and the claimant dies before graph execution, a successor recognizes
+the complete valid arm on the `source=update` checkpoint and adopts it with
+zero writes, preserving the exact pending task. An update-sourced pending
+frontier without a valid arm fails closed as a recoverable driver error and is
+released without mutating its task. Retry exhaustion remains authoritative,
+and pinned/fresh-input behavior is unchanged.
+
+The executor also resolves the exact payload source used by the HTTP client:
+a structurally valid frozen four-field completion envelope wins, otherwise the
+live graph state is used. Unless that effective `should_stop` is the boolean
+`true`, it logs an ERROR before publishing a report-generation marker, keeps
+the shell, and fence-releases the worker generation with ordinary backoff and
+exhaustion parking. It makes zero `/complete`, finalization-hold, queue-complete
+or rotation calls on that refusal. The orchestrator's existing pre-write 422
+remains defense in depth.
+
+The exact LangGraph 1.2.10 executor image independently reproduced the defect:
+the second state update changed `next=(restore,)` to empty and ran zero nodes.
+It also proved why the repair uses a committed update plus adoption rather than
+a retryable `Command(update=...)`: cancellation after a command input write
+left same-step pending writes and a second command raised
+`InvalidConcurrentGraphUpdate`. The real-graph regression now covers atomic
+END re-entry, crash-before-stream adoption, feedback, delegation, combined
+steering-message retention, and the unarmed rolling-skew refusal. The focused
+worker file passed **77/77**; the broader worker/graph/helper/delegation
+selection passed **300/300**. Ruff lint, format-check, `py_compile`, and
+whitespace checks are clean. No migration or schema change was needed, and the
+preserved stateless specimen, its command/queue/workspace, the pinned probe,
+and the three protected untracked paths were not mutated.
