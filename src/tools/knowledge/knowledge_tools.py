@@ -266,6 +266,62 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 }
 
 
+#: Fail-closed message every degraded KB tool returns during a vector/KB
+#: outage on a background-officer session (officer_knowledge_plane.md §3.1).
+#: The wake sitrep carries the matching `project knowledge unavailable` line.
+KB_UNAVAILABLE_ERROR = (
+    "Error: project knowledge unavailable — the knowledge base backing this "
+    "project cannot be reached. Knowledge reads and writes fail closed; job "
+    "supervision, paging, and messaging continue to work. Do NOT reconstruct "
+    "the backlog or project truth from memory or conversation — retry the "
+    "knowledge tool once the outage clears."
+)
+
+
+def create_degraded_knowledge_tools(names: List[str]) -> List[Any]:
+    """Fail-closed stand-ins for KB tools during a knowledge outage.
+
+    A background officer must survive a vector/KB outage with supervision
+    intact (officer_knowledge_plane.md §3.1): instead of silently dropping the
+    knowledge grant (which would surface as baffling unknown-tool failures),
+    each granted name binds to a stub that accepts any arguments and returns
+    :data:`KB_UNAVAILABLE_ERROR`. Only names from the knowledge registry are
+    honored. Backlog-derived dispatch (``auto_pull``, officer_backlog_pools)
+    does not exist yet — when it ships it must consult the same availability
+    state and fail closed rather than dispatch from a reconstructed queue.
+    """
+    from langchain_core.tools import StructuredTool
+    from pydantic import BaseModel, ConfigDict
+
+    class _AnyKbArgs(BaseModel):
+        """Accepts whatever the model sends; the stub ignores it anyway."""
+
+        model_config = ConfigDict(extra="allow")
+
+    def _unavailable(**_kwargs: Any) -> str:
+        return KB_UNAVAILABLE_ERROR
+
+    tools: List[Any] = []
+    for name in names:
+        meta = KNOWLEDGE_TOOLS_METADATA.get(name)
+        if meta is None:
+            continue
+        description = (
+            f"{meta.get('short_description') or name} "
+            "(currently DEGRADED: project knowledge unavailable — calls fail "
+            "closed until the outage clears)"
+        )
+        tools.append(
+            StructuredTool.from_function(
+                func=_unavailable,
+                name=name,
+                description=description,
+                args_schema=_AnyKbArgs,
+            )
+        )
+    return tools
+
+
 def _get_project_id(context: ToolContext) -> Optional[str]:
     """Get the sole writable native KB id, preserving legacy contexts."""
     bindings = _explicit_bindings(context)

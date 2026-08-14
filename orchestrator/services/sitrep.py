@@ -31,6 +31,7 @@ back to the minimal renderer — a wake must never be lost to its formatter.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -117,6 +118,16 @@ def _resolve_handles() -> tuple[Any, Any]:
         return None, None
 
 
+def _resolve_vector_db() -> Any:
+    """Late-bind the vector DB pool (KB index home) off the main module."""
+    try:
+        import main as orchestrator_main
+
+        return getattr(orchestrator_main, "vector_db", None)
+    except Exception:
+        return None
+
+
 def prior_state(thread: dict[str, Any]) -> dict[str, Any]:
     """The stored sitrep state on an officer thread ({} when none)."""
     metadata = _as_dict(thread.get("metadata"))
@@ -131,6 +142,7 @@ async def build_wake_message(
     *,
     audit_reader: Any = _UNSET,
     usage_ledger: Any = _UNSET,
+    vector_db: Any = _UNSET,
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Render the full sitrep for one coalesced officer wake.
 
@@ -146,6 +158,8 @@ async def build_wake_message(
                 audit_reader = resolved_audit
             if usage_ledger is _UNSET:
                 usage_ledger = resolved_ledger
+        if vector_db is _UNSET:
+            vector_db = _resolve_vector_db()
 
         now = datetime.now(timezone.utc)
         thread_id = str(thread["id"])
@@ -163,6 +177,7 @@ async def build_wake_message(
         )
         lines += jobs_lines
         lines += await _pending_section(db, thread_id, project_id, now)
+        lines += await _knowledge_section(vector_db, project_id)
         lines += await _capacity_section(db, thread, thread_id)
         lines += await _fleet_section(db)
         lines += await _budget_section(usage_ledger, project_id, now)
@@ -383,6 +398,52 @@ async def _pending_section(
     if not lines:
         return []
     return ["Pending on you:"] + lines
+
+
+# Bounded probe so a hung vector pool costs seconds, not the wake.
+_KNOWLEDGE_PROBE_TIMEOUT_SECONDS = 2.5
+
+
+async def _knowledge_section(vector_db: Any, project_id: Optional[str]) -> list[str]:
+    """Knowledge-plane availability for the wake (officer_knowledge_plane.md
+    §3.1, K1).
+
+    A vector/KB outage must not kill the officer, but the degradation must be
+    VISIBLE: the wake says `project knowledge unavailable` so the officer
+    knows KB reads/writes fail closed and does not reconstruct a shadow
+    backlog in memory or thread prose. Healthy probes emit nothing — the
+    richer knowledge-health surface (note counts, write/materialization
+    provenance) is slice K4. When backlog-derived dispatch (`auto_pull`,
+    officer_backlog_pools) ships, it must consult this same probe and fail
+    closed during an outage instead of dispatching from a reconstructed
+    queue.
+    """
+    if not project_id or vector_db is None:
+        # No project (nothing to bind) or a deployment/test process without a
+        # vector pool handle — absence of the handle is not evidence of an
+        # outage, so stay silent rather than cry wolf on every wake.
+        return []
+    try:
+
+        async def _probe() -> None:
+            async with vector_db.acquire() as conn:
+                # knowledge_index is the KB's pgvector home; an empty project
+                # returns no row, which is still a healthy probe.
+                await conn.fetchval(
+                    "SELECT 1 FROM knowledge_index WHERE project_id = $1 LIMIT 1",
+                    UUID(project_id),
+                )
+
+        await asyncio.wait_for(_probe(), timeout=_KNOWLEDGE_PROBE_TIMEOUT_SECONDS)
+        return []
+    except Exception:
+        logger.warning("sitrep: knowledge availability probe failed", exc_info=True)
+        return [
+            "Knowledge: project knowledge unavailable — KB reads/writes and "
+            "backlog-derived dispatch fail closed. Keep supervising jobs and "
+            "page if urgent; do NOT reconstruct the backlog from memory or "
+            "conversation."
+        ]
 
 
 async def _capacity_section(

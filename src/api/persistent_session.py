@@ -76,6 +76,19 @@ class MemoryUnavailableError(RuntimeError):
     """
 
 
+class OfficerKnowledgeBindingError(RuntimeError):
+    """A background-officer attach violates the project-binding invariant.
+
+    officer_knowledge_plane.md §3.1: a commissioned background officer has
+    exactly one project and exactly one matching native writable
+    KnowledgeBinding; every other KB is read-only. A session that fails this
+    is a mis-bound officer — booting it would let his notes/backlog land in
+    the wrong (or no) project truth, so the attach fails loudly instead.
+    Distinct from a KB *outage*, which is survivable (degraded) and must NOT
+    kill the officer.
+    """
+
+
 class CloudOverlayUnavailable(Exception):
     """Precondition signal for ``POST /cloud-overlay/reset``: no session, no
     overlay manager, or an inactive overlay — the reset target simply isn't
@@ -376,6 +389,11 @@ class PersistentSession:
         Split out only so ``setup`` can wrap the whole sequence in the
         scoped-index try/finally without indenting every step.
         """
+        # 0. Background-officer project-binding invariant
+        #    (officer_knowledge_plane.md §3.1, K1). Runs before any resource
+        #    is created so a mis-bound officer fails the attach outright.
+        self._enforce_officer_knowledge_invariant()
+
         # 1. Create workspace (with optional remote backend + git)
         await self._setup_workspace(
             workspace_override=workspace_override, git_remote_url=git_remote_url
@@ -876,6 +894,19 @@ class PersistentSession:
         claims so :meth:`setup` stops before shell/tool construction.
         """
         if not cloud_mount_cfg:
+            return
+        # Background officer (officer_knowledge_plane.md §4): the project/cloud
+        # folder is object plane — never mounted for a commissioned officer,
+        # even when a provisioning payload carries a mount config. Without a
+        # manager, the srw_cloud_status append never fires either (and the
+        # officer capability ceiling would drop the tool regardless).
+        from ..tools.registry import officer_ceiling_active
+
+        if officer_ceiling_active(getattr(self.config, "officer", None)):
+            logger.info(
+                "Background officer session: refusing project cloud mount "
+                "(object plane; officer_knowledge_plane.md §4)"
+            )
             return
         if not self.workspace_manager:
             if self.shell_owner_token is not None:
@@ -1431,6 +1462,73 @@ class PersistentSession:
             except Exception as e:
                 logger.warning(f"Failed to deploy instruction file {entry.file}: {e}")
 
+    def _enforce_officer_knowledge_invariant(self) -> None:
+        """Fail the attach when a background officer is mis-bound (K1, §3.1).
+
+        The invariant for a commissioned background officer
+        (``officer.enabled is True`` — the runtime fact, never agent_id):
+
+        1. exactly one ``project_id``;
+        2. exactly one writable KnowledgeBinding, native, and keyed to that
+           project — the sole write target no request/config override can
+           replace (``build_knowledge_bindings`` constructs externals
+           read-only; this guard refuses anything that got past it);
+        3. every other binding is read-only.
+
+        Sessions without explicit bindings (legacy/direct construction) are
+        judged on ``project_ids`` alone: the knowledge tools synthesize the
+        same first-native-writable binding from them. Conferences
+        (``officer.conference`` with enabled False) and ordinary sessions are
+        untouched. This is a *binding shape* check only — a KB outage keeps
+        bindings intact and must stay survivable (degraded), never an attach
+        failure.
+        """
+        from ..tools.registry import officer_ceiling_active
+
+        if not officer_ceiling_active(getattr(self.config, "officer", None)):
+            return
+
+        project_ids = [str(p) for p in (self.project_ids or []) if p]
+        if len(project_ids) != 1:
+            raise OfficerKnowledgeBindingError(
+                "Background officer attach refused: expected exactly one "
+                f"project binding, got {len(project_ids)} "
+                f"({project_ids or 'none'}). Commission an officer onto one "
+                "project post (officer_knowledge_plane.md §3.1)."
+            )
+
+        from ..services.knowledge.bindings import KnowledgeBinding
+
+        bindings = [
+            b
+            for b in (self.knowledge_bindings or [])
+            if isinstance(b, KnowledgeBinding)
+        ]
+        if not bindings:
+            # No explicit bindings travelled with this construction path; the
+            # single project id above synthesizes the sole native writable KB.
+            return
+
+        writable = [b for b in bindings if b.writable]
+        if len(writable) != 1 or not writable[0].is_native:
+            shape = [
+                f"{b.alias}({b.kind},{'rw' if b.writable else 'ro'})" for b in bindings
+            ]
+            raise OfficerKnowledgeBindingError(
+                "Background officer attach refused: expected exactly one "
+                "native writable knowledge binding, got "
+                f"[{', '.join(shape)}]. External knowledge bases must be "
+                "read-only and no override may replace the project write "
+                "target (officer_knowledge_plane.md §3.1)."
+            )
+        if str(writable[0].kb_id) != project_ids[0]:
+            raise OfficerKnowledgeBindingError(
+                "Background officer attach refused: the writable knowledge "
+                f"binding targets KB {writable[0].kb_id}, not the officer's "
+                f"project {project_ids[0]} — the write target cannot be "
+                "replaced (officer_knowledge_plane.md §3.1)."
+            )
+
     def _setup_knowledge(self, vector_conn: Optional[Any]) -> None:
         """Initialize the pgvector store and optional Neo4j Graph tier.
 
@@ -1504,8 +1602,17 @@ class PersistentSession:
 
     def _setup_tools(self, postgres_conn: Optional[Any]) -> None:
         """Load tools from config, excluding phase-specific ones."""
+        from ..tools.registry import officer_ceiling_active
+
         tool_config = {
             **self.config.extra,
+            # Background-officer runtime fact (officer_knowledge_plane.md §4):
+            # lets tools that survive the capability ceiling trim object-plane
+            # affordances from their OUTPUT too (get_current_project keeps
+            # identity metadata but drops the cloud-folder link).
+            "officer_session": officer_ceiling_active(
+                getattr(self.config, "officer", None)
+            ),
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,
             # Lets bulk readers cap a single tool result relative to the main
@@ -1968,6 +2075,25 @@ class PersistentSession:
             tool_names, getattr(self.workspace_manager, "backend", None)
         )
 
+        # Background-officer capability ceiling
+        # (docs/features/officer_knowledge_plane.md §4, K3): a commissioned
+        # background officer (officer.enabled is True — the runtime fact, not
+        # agent_id) never sees object-plane tools, no matter what the config
+        # override or the backend filter admitted. Applied LAST so the runtime
+        # appends above (request_workspace_upgrade, checkout_project_repository,
+        # srw_cloud_status, repository discovery) and any override-granted
+        # shell/file/git/browser/canvas/repo/kb_export names are all subject to
+        # it. Conferences (officer.conference with enabled False) are ordinary
+        # sessions and pass through unchanged.
+        from ..tools.registry import apply_officer_tool_ceiling, officer_ceiling_active
+
+        _officer_session_active = officer_ceiling_active(
+            getattr(self.config, "officer", None)
+        )
+        tool_names = apply_officer_tool_ceiling(
+            tool_names, getattr(self.config, "officer", None)
+        )
+
         try:
             self.tools = load_tools(tool_names, self.tool_context)
         except ValueError as e:
@@ -2013,6 +2139,37 @@ class PersistentSession:
             self.tools = load_tools(
                 ["task_add", "task_complete", "task_list"], self.tool_context
             )
+
+        # Degraded knowledge availability (officer_knowledge_plane.md §3.1,
+        # K1): when a background officer's granted KB tools could not bind
+        # because the knowledge store is unavailable (vector/KB outage), bind
+        # fail-closed stand-ins instead of silently shrinking the grant. The
+        # officer keeps supervising and paging; every KB call answers with a
+        # clear `project knowledge unavailable` error. Guarded on a REAL
+        # missing store (`has_knowledge()` strictly False) so mocked contexts
+        # in tests never grow stub tools.
+        if _officer_session_active and self.tool_context is not None:
+            _has_knowledge = getattr(self.tool_context, "has_knowledge", None)
+            if callable(_has_knowledge) and _has_knowledge() is False:
+                _knowledge_names = set(get_tools_by_category("knowledge"))
+                _bound = {getattr(t, "name", None) for t in self.tools or []}
+                _missing_kb = [
+                    n
+                    for n in dict.fromkeys(tool_names)
+                    if n in _knowledge_names and n not in _bound
+                ]
+                if _missing_kb:
+                    from ..tools.knowledge.knowledge_tools import (
+                        create_degraded_knowledge_tools,
+                    )
+
+                    self.tools.extend(create_degraded_knowledge_tools(_missing_kb))
+                    logger.error(
+                        "Background officer session: project knowledge "
+                        "unavailable — bound %d fail-closed KB tool(s): %s",
+                        len(_missing_kb),
+                        _missing_kb,
+                    )
 
         # The model-facing skill menu follows tools that actually instantiated,
         # not merely configured candidates. This fails closed if a Canvas
@@ -2601,20 +2758,46 @@ class PersistentSession:
                 or getattr(_pipeline, "retrievers", None)
             )
         )
+        # Background officer (officer_knowledge_plane.md §3.1, K1): a
+        # vector/KB outage must NOT kill the officer — sitrep, job
+        # supervision, and paging continue while KB mutations fail closed and
+        # the wake carries `project knowledge unavailable`. So the
+        # configured⇒required gates below downgrade to a loud log for a
+        # commissioned officer instead of failing the attach. Mis-BINDING (the
+        # invariant) still fails the attach; only store *outages* degrade.
+        from ..tools.registry import officer_ceiling_active as _officer_active
+
+        _officer_session = _officer_active(getattr(self.config, "officer", None))
         if _memory_required and self._memory_degraded:
-            raise MemoryUnavailableError(
-                "memory is required for this session but the embedding-backed "
-                "RecallStore failed to initialize "
-                f"(EMBEDDING_BASE_URL={os.environ.get('EMBEDDING_BASE_URL', 'unset')}, "
-                f"EMBEDDING_MODEL={os.environ.get('EMBEDDING_MODEL', 'unset')}). "
-                "Check the embedding model/endpoint (Admin → Models)."
-            )
+            if _officer_session:
+                logger.error(
+                    "Background officer session: required RecallStore failed "
+                    "to initialize — continuing DEGRADED (officer availability "
+                    "outranks memory; recollection is unavailable, project "
+                    "truth stays in the KB/control plane)."
+                )
+            else:
+                raise MemoryUnavailableError(
+                    "memory is required for this session but the embedding-backed "
+                    "RecallStore failed to initialize "
+                    f"(EMBEDDING_BASE_URL={os.environ.get('EMBEDDING_BASE_URL', 'unset')}, "
+                    f"EMBEDDING_MODEL={os.environ.get('EMBEDDING_MODEL', 'unset')}). "
+                    "Check the embedding model/endpoint (Admin → Models)."
+                )
         if _memory_required and self.knowledge_bindings and self._kb_degraded:
-            raise MemoryUnavailableError(
-                "memory is required for this session but the KnowledgeStore "
-                "failed to initialize — the embedding endpoint is unavailable "
-                f"(EMBEDDING_BASE_URL={os.environ.get('EMBEDDING_BASE_URL', 'unset')})."
-            )
+            if _officer_session:
+                logger.error(
+                    "Background officer session: KnowledgeStore failed to "
+                    "initialize — continuing DEGRADED. KB tools fail closed "
+                    "with 'project knowledge unavailable'; supervision and "
+                    "paging continue."
+                )
+            else:
+                raise MemoryUnavailableError(
+                    "memory is required for this session but the KnowledgeStore "
+                    "failed to initialize — the embedding endpoint is unavailable "
+                    f"(EMBEDDING_BASE_URL={os.environ.get('EMBEDDING_BASE_URL', 'unset')})."
+                )
 
         # MemoryManager seam (memory overhaul Phase 1, behind
         # memory.manager.enabled). Constructed after both stores so the
@@ -2664,12 +2847,26 @@ class PersistentSession:
                     ),
                 )
             except Exception as e:
-                raise MemoryUnavailableError(
-                    "memory pipeline failed to bind: "
-                    f"{type(e).__name__}: {e}. A configured memory plugin could "
-                    "not resolve its transport (e.g. the reranker endpoint). Fix "
-                    "the config or drop the plugin from memory.pipeline."
-                ) from e
+                if _officer_session:
+                    # Same officer availability rule as the store gates above:
+                    # a transport that won't resolve (reranker endpoint down)
+                    # is outage-shaped. memory_service stays None, so the
+                    # legacy direct-store paths (or nothing) carry the session.
+                    self.memory_service = None
+                    logger.error(
+                        "Background officer session: memory pipeline failed to "
+                        "bind (%s: %s) — continuing DEGRADED without the "
+                        "manager seam.",
+                        type(e).__name__,
+                        e,
+                    )
+                else:
+                    raise MemoryUnavailableError(
+                        "memory pipeline failed to bind: "
+                        f"{type(e).__name__}: {e}. A configured memory plugin could "
+                        "not resolve its transport (e.g. the reranker endpoint). Fix "
+                        "the config or drop the plugin from memory.pipeline."
+                    ) from e
 
         # Ingestion verdicts + bi-temporal supersede (overhaul Phase 4). Wired
         # onto the store independently of the manager cutover — a write-path

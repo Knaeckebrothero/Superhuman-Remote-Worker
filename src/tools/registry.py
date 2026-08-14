@@ -385,6 +385,105 @@ def filter_tools_by_backend(tool_names: List[str], backend: Any) -> List[str]:
     return kept
 
 
+# ---------------------------------------------------------------------------
+# Background-officer capability ceiling (docs/features/officer_knowledge_plane.md §4)
+# ---------------------------------------------------------------------------
+# A commissioned background officer owns the project's knowledge plane and its
+# control plane, but never the object plane. These sets deny every
+# object-plane affordance — regardless of what the expert config, project
+# override, or request override asked for. This is a runtime CEILING applied
+# after override resolution, not a default the officer (or a config) can edit.
+#
+# Denied whole categories: local file tools, shell, git, direct browser,
+# canvas presentation, repo remote-ops, and WebDAV (a file surface over the
+# project/cloud folders — the object plane in API form).
+_OFFICER_DENIED_CATEGORIES = frozenset(
+    {
+        "workspace",
+        "shell",
+        "git",
+        "browser_direct",
+        "canvas",
+        "repo",
+        "webdav",
+    }
+)
+
+# Denied individual names:
+# - request_workspace_upgrade: the lite-session escape hatch into a sandbox —
+#   the one workspace-acquisition path a shell-less session has.
+# - checkout_project_repository: acquires a repo checkout in the workspace.
+# - list_project_repositories / get_default_project_repository: repository
+#   discovery (clone URLs); the officer delegates object inspection instead.
+# - srw_cloud_status: project cloud mounts are never attached to a background
+#   officer; the status tool must not resurface them via an override.
+# - kb_export: workspace-oriented KB migration/export — deliberately outside
+#   the officer's explicit knowledge grant (§3), so an override cannot
+#   restore it either.
+_OFFICER_DENIED_TOOLS = frozenset(
+    {
+        "request_workspace_upgrade",
+        "checkout_project_repository",
+        "list_project_repositories",
+        "get_default_project_repository",
+        "srw_cloud_status",
+        "kb_export",
+    }
+)
+
+# Belt-and-suspenders for names that are not in TOOL_REGISTRY (datasource- or
+# runtime-injected variants): anything shaped like a browser/git/repo/webdav
+# tool is object plane.
+_OFFICER_DENIED_PREFIXES = ("browser_", "git_", "repo_", "webdav_")
+
+
+def officer_ceiling_active(officer_cfg: Any) -> bool:
+    """Whether ``officer_cfg`` describes a commissioned BACKGROUND officer.
+
+    Keys on the runtime fact ``officer.enabled is True`` — never on agent_id:
+    a conference is the same Centurion expert with ``enabled: False`` and must
+    stay an ordinary interactive session (user-selected workspace included).
+    Strict ``is True`` so MagicMock configs in tests can never trip the
+    ceiling; accepts the parsed ``OfficerConfig`` dataclass or a plain dict.
+    """
+    if isinstance(officer_cfg, dict):
+        return officer_cfg.get("enabled") is True
+    return getattr(officer_cfg, "enabled", False) is True
+
+
+def apply_officer_tool_ceiling(tool_names: List[str], officer_cfg: Any) -> List[str]:
+    """Drop object-plane tools for a commissioned background officer.
+
+    Called AFTER the full override merge, the runtime extras appends, and
+    ``filter_tools_by_backend`` — so a project/session override that granted
+    (or a backend that would support) shell/file/git/browser/canvas/repo
+    tools, ``request_workspace_upgrade``, repository discovery, cloud status,
+    or ``kb_export`` still cannot put them in front of a background officer.
+    Control-plane job tools, knowledge gardening, delegation, communication,
+    and research pass through untouched. No-op for conferences and every
+    non-officer session (see :func:`officer_ceiling_active`).
+    """
+    if not officer_ceiling_active(officer_cfg):
+        return tool_names
+    kept: List[str] = []
+    dropped: List[str] = []
+    for name in tool_names:
+        category = TOOL_REGISTRY.get(name, {}).get("category")
+        denied = (
+            name in _OFFICER_DENIED_TOOLS
+            or category in _OFFICER_DENIED_CATEGORIES
+            or (isinstance(name, str) and name.startswith(_OFFICER_DENIED_PREFIXES))
+        )
+        (dropped if denied else kept).append(name)
+    if dropped:
+        logger.info(
+            "Background-officer capability ceiling dropped %d tool(s): %s",
+            len(dropped),
+            sorted(set(dropped)),
+        )
+    return kept
+
+
 def get_tools_for_phase(phase: str) -> List[str]:
     """Get all tool names available in a given phase.
 

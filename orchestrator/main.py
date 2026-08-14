@@ -33952,7 +33952,29 @@ async def commission_project_officer(
     a stale ended-thread link is folded there (harvest + incarnation) before
     the claim. The continuity brief is his first wake: vacant-since/until, a
     pointer at his restored state + charter, and the while-vacant ledger.
+
+    Project-binding invariant (officer_knowledge_plane.md §3.1, K1): a
+    commissioned background officer has exactly one project — the sole native
+    writable KB — and no override may replace that write target. This
+    endpoint satisfies most of it by construction: the project comes from the
+    URL, ``ThreadCreateRequest`` carries a single ``project_id``, and the kit
+    patch vocabulary (``_SESSION_OFFICER_OVERRIDE_KEYS`` + workspace/tools/
+    llm/interactive passthrough) has no project or datasource channel. The
+    guard below rejects an unparseable project id (fail-closed 422 instead of
+    a DB-layer 500); the agent-side attach re-checks the resolved bindings
+    and refuses to boot a mis-bound officer.
     """
+    try:
+        UUID(str(project_id))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "officer commission requires one valid project id — got "
+                f"'{project_id}'. The officer's post binds exactly one "
+                "project knowledge base (officer_knowledge_plane.md §3.1)."
+            ),
+        )
     _user, project = await require_project_owner(request, postgres_db, project_id)
 
     standing = await postgres_db.get_officer_thread_for_project(project_id)

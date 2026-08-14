@@ -68,6 +68,24 @@ tools:
   # flag, not these lists.
   orchestrator:
     - get_session_context
+  # Explicit knowledge grant (officer_knowledge_plane.md §3, K2): the officer
+  # owns the project's knowledge plane, so the grant is reviewed here rather
+  # than inherited from whatever session_base happens to carry. Exactly these
+  # nine — kb_export is deliberately ABSENT: it is a workspace-oriented
+  # migration/export tool (needs a destination directory) and unrelated to
+  # knowledge gardening; index/lint/rebuild administration stays operator-side.
+  # The background-officer runtime ceiling (registry.apply_officer_tool_ceiling)
+  # additionally refuses kb_export even if a thread override re-grants it.
+  knowledge:
+    - kb_write
+    - kb_update
+    - kb_read
+    - kb_list
+    - kb_search
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
   # Preserve the officer's pre-unification effective grant exactly. The wider
   # S5 supervision/evidence default remains pending.
   job_control:
