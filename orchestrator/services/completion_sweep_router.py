@@ -21,9 +21,16 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Mapping
 from uuid import UUID, uuid4
 
+from database.postgres import _completion_control_active_sql
+
 logger = logging.getLogger(__name__)
 
 ACTION_RESULT_LIMIT_BYTES = 8 * 1024
+STATELESS_OWNER_GAP_CODE = "stateless_terminal_queue_unowned"
+STATELESS_OWNER_GAP_MESSAGE = (
+    "Stateless execution lost its queue owner after work was reported; "
+    "operator review is required."
+)
 
 CompletionSweepRoute = Literal[
     "resume_finalizer",
@@ -69,6 +76,14 @@ class CompletionSweepBatchResult:
 
     count: int
     results: tuple[CompletionSweepResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StatelessOwnerGapPark:
+    """One ownerless stateless job moved to the operator worklist."""
+
+    job_id: str
+    queue_state: Literal["done", "absent"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -621,6 +636,227 @@ class CompletionSweepRouter:
         )
         return CompletionSweepBatchResult(count=len(results), results=results)
 
+    async def _park_stateless_owner_gap(
+        self, job_id: Any
+    ) -> StatelessOwnerGapPark | None:
+        """Park one exact terminal/absent-queue owner gap, if it still exists.
+
+        A terminal completion command cannot own this shape: its finalizer and
+        sweep action are already finished.  Re-enqueueing is unsafe because the
+        worker may have produced an answer before filing the malformed report.
+        The only automatic action is therefore a jobs-row CAS into the existing
+        human-review worklist.  Queue and completion-protocol rows stay immutable.
+
+        The global worker lock order is queue then jobs.  An absent queue row
+        cannot be locked, so that branch re-reads after taking the jobs lock and
+        the final UPDATE repeats the queue predicate.  A concurrent inserter
+        that was still invisible must subsequently acquire the jobs lock and
+        fail its own admission CAS against ``pending_review``.
+        """
+
+        canonical = _canonical_uuid(job_id, label="job_id")
+        control_active = _completion_control_active_sql("context")
+        async with _connection(self.db) as conn:
+            async with conn.transaction():
+                queue = await conn.fetchrow(
+                    """
+                    SELECT unit_kind, state
+                    FROM run_queue
+                    WHERE unit_id=$1::uuid
+                    FOR UPDATE
+                    """,
+                    UUID(canonical),
+                )
+                if queue is not None and (
+                    str(queue["unit_kind"]) != "worker_batch"
+                    or str(queue["state"]) != "done"
+                ):
+                    return None
+
+                job = await conn.fetchrow(
+                    f"""
+                    SELECT status::text AS status, execution_lane,
+                           assigned_agent_id, lease_expires_at,
+                           (lease_expires_at > clock_timestamp()) AS lease_live,
+                           ({control_active}) AS control_active
+                    FROM jobs
+                    WHERE id=$1::uuid
+                    FOR UPDATE
+                    """,
+                    UUID(canonical),
+                )
+                if job is None:
+                    return None
+
+                # A missing row has no queue lock to serialize an insert.  Read
+                # it again after the jobs lock so any committed enqueue is seen;
+                # the UPDATE below repeats this predicate for the remaining
+                # uncommitted-insert boundary.
+                if queue is None:
+                    queue = await conn.fetchrow(
+                        """
+                        SELECT unit_kind, state
+                        FROM run_queue
+                        WHERE unit_id=$1::uuid
+                        """,
+                        UUID(canonical),
+                    )
+                    if queue is not None and (
+                        str(queue["unit_kind"]) != "worker_batch"
+                        or str(queue["state"]) != "done"
+                    ):
+                        return None
+
+                if (
+                    str(job["status"]) != "processing"
+                    or str(job["execution_lane"] or "pinned") != "stateless"
+                    or job["assigned_agent_id"] is not None
+                    or bool(job["control_active"])
+                ):
+                    return None
+                if bool(job["lease_live"]):
+                    return None
+
+                unfinished = await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM job_completion_commands AS command
+                        WHERE command.job_id=$1::uuid
+                          AND command.state IN ('pending','finalizing','parked')
+                    )
+                    """,
+                    UUID(canonical),
+                )
+                if unfinished:
+                    return None
+
+                queue_state = "absent" if queue is None else "done"
+                parked = await conn.fetchrow(
+                    f"""
+                    UPDATE jobs
+                    SET status='pending_review',
+                        assigned_agent_id=NULL,
+                        lease_expires_at=NULL,
+                        error_message=$2::text,
+                        error_details=(
+                            CASE WHEN jsonb_typeof(error_details)='object'
+                                 THEN error_details
+                                 ELSE '{{}}'::jsonb
+                            END
+                            || jsonb_build_object(
+                                'code', $3::text,
+                                'route', 'park_alert',
+                                'queue_state', $4::text
+                            )
+                        ),
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=$1::uuid
+                      AND status='processing'
+                      AND execution_lane='stateless'
+                      AND assigned_agent_id IS NULL
+                      AND (
+                          lease_expires_at IS NULL
+                          OR lease_expires_at <= clock_timestamp()
+                      )
+                      AND NOT ({control_active})
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM job_completion_commands AS command
+                          WHERE command.job_id=jobs.id
+                            AND command.state IN (
+                                'pending','finalizing','parked'
+                            )
+                      )
+                      AND (
+                          (
+                              $4::text='absent'
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM run_queue AS queue
+                                  WHERE queue.unit_id=jobs.id
+                              )
+                          )
+                          OR EXISTS (
+                              SELECT 1 FROM run_queue AS queue
+                              WHERE $4::text='done'
+                                AND queue.unit_id=jobs.id
+                                AND queue.unit_kind='worker_batch'
+                                AND queue.state='done'
+                          )
+                      )
+                    RETURNING id
+                    """,
+                    UUID(canonical),
+                    STATELESS_OWNER_GAP_MESSAGE,
+                    STATELESS_OWNER_GAP_CODE,
+                    queue_state,
+                )
+                if parked is None:
+                    return None
+        return StatelessOwnerGapPark(job_id=canonical, queue_state=queue_state)
+
+    async def park_stateless_owner_gaps_once(
+        self, limit: int = 50
+    ) -> tuple[StatelessOwnerGapPark, ...]:
+        """Move a bounded set of ownerless stateless jobs to operator review.
+
+        ``pending_review`` plus the stable ``error_details.code`` is the
+        durable operator owner.  The callback is an attention signal: `_alert`
+        always emits at ERROR level even when a deployment has no officer
+        threads to receive a wake.
+        """
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("stateless owner-gap limit must be a positive integer")
+        control_active = _completion_control_active_sql("job.context")
+        async with _connection(self.db) as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT job.id
+                FROM jobs AS job
+                LEFT JOIN run_queue AS queue ON queue.unit_id=job.id
+                WHERE job.status='processing'
+                  AND job.execution_lane='stateless'
+                  AND job.assigned_agent_id IS NULL
+                  AND (
+                      job.lease_expires_at IS NULL
+                      OR job.lease_expires_at <= clock_timestamp()
+                  )
+                  AND NOT ({control_active})
+                  AND (
+                      queue.unit_id IS NULL
+                      OR (
+                          queue.unit_kind='worker_batch'
+                          AND queue.state='done'
+                      )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM job_completion_commands AS command
+                      WHERE command.job_id=job.id
+                        AND command.state IN ('pending','finalizing','parked')
+                  )
+                ORDER BY job.updated_at, job.id
+                LIMIT $1::int
+                """,
+                limit,
+            )
+
+        parked: list[StatelessOwnerGapPark] = []
+        for row in rows:
+            result = await self._park_stateless_owner_gap(row["id"])
+            if result is None:
+                continue
+            parked.append(result)
+            # Only the winning jobs-row CAS alerts.  The durable status/error
+            # marker remains the worklist if this best-effort wake has no sink.
+            await self._alert(
+                "completion sweep parked unowned stateless job="
+                f"{result.job_id} route=park_alert "
+                f"code={STATELESS_OWNER_GAP_CODE} queue={result.queue_state}"
+            )
+        return tuple(parked)
+
     async def maintenance_once(self) -> None:
         """Run non-executing reconciliation before independent alarm sampling.
 
@@ -628,6 +864,13 @@ class CompletionSweepRouter:
         Liveness monitoring owns its independent 30-second task and is not
         coupled to this router's one-second recovery cadence.
         """
+
+        try:
+            await self.park_stateless_owner_gaps_once(limit=50)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("stateless owner-gap rescue tick failed")
 
         if self.safety_net is not None:
             try:
@@ -665,4 +908,7 @@ __all__ = [
     "CompletionSweepBatchResult",
     "CompletionSweepResult",
     "CompletionSweepRouter",
+    "STATELESS_OWNER_GAP_CODE",
+    "STATELESS_OWNER_GAP_MESSAGE",
+    "StatelessOwnerGapPark",
 ]

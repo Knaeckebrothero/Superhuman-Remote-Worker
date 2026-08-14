@@ -5086,3 +5086,45 @@ other client 422s, 200/202, the ordinary coded refusal, its cleanup-fault cap
 edge and the ambiguous B4 branches (**12/12**) and found no P0/P1. Ruff lint,
 format-check, `py_compile`, and whitespace checks are clean. No migration,
 schema, live-resource or specimen change was made.
+
+## M3 — terminal-queue owner-gap rescue and invariant census
+
+The rescue route is deliberately **park plus alert**, never re-enqueue. A
+bounded commands-on scan selects only `processing` stateless jobs that have no
+assigned agent or live jobs lease, no live or malformed completion-control
+claim, no unfinished `pending|finalizing|parked` completion command, and either
+an exact `worker_batch/done` queue row or no queue row. The winner takes the
+worker lock order (`run_queue` then `jobs`) where a queue row exists and uses
+the jobs-status CAS as the execution fence for the absent-row case. A
+concurrent queue reactivation wins and suppresses rescue.
+
+The winning CAS moves only the job to `pending_review`, clears its jobs lease,
+and records the fixed operator marker
+`error_details.code=stateless_terminal_queue_unowned` with route and observed
+queue state. Queue, terminal command, completion-effect and historical sweep-
+action bytes are not changed; the finalizer is not invoked. Only the CAS winner
+emits the fixed-cardinality ERROR/officer signal. The durable
+`pending_review` marker remains the operator worklist if no officer thread is
+configured or the post-commit wake is lost. This exceptional route also
+applies to project-loop residue: it stops auto-advance without guessing a
+terminal outcome or executing the answered turn again. An operator resolves
+it from evidence by resume, cancel or delete rather than assuming a synthetic
+approval/freeze payload exists.
+
+The generalized ownership census now includes this shape as a subject. It is
+explicitly red before rescue (`owner_count=0`) and green afterward with exactly
+one `operator:stateless-owner-gap` term; all prior agent, finalizer and sweep
+collision families remain exactly-one. Real-PostgreSQL byte snapshots cover
+done and absent parity, assigned/live/control/unfinished-command exclusions,
+two-router contention, and a concurrent done-to-queued winner. The focused
+router plus ownership selection passed **27/27**; the adjacent router SQL,
+wiring, lifecycle and control selection passed **53/53**. Ruff lint,
+format-check, `py_compile`, whitespace checks and an independent P0/P1 audit
+are clean. No migration was needed.
+
+The preserved `a61d9940-…` specimen was intentionally **not consumed by this
+implementation commit**. Tilt was paused before production bytes existed, and
+the exact job, terminal queue generation, command, held workspace and pinned
+probe stayed unchanged while M1–M3 landed. The committed route will be rolled
+out and the one-shot row/workspace evidence captured as M4 soak case 3, which
+keeps the required source-guard and 422 contracts ahead of specimen cleanup.
