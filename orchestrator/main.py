@@ -2907,7 +2907,7 @@ def _merged_session_tool_groups(
     project_overrides: dict[str, Any] | None,
     request_override: dict[str, Any] | None,
 ) -> dict[str, bool]:
-    """The four closed session tool groups as the RESOLVED path will bind them.
+    """The closed session tool groups as the RESOLVED path will bind them.
 
     SYNCHRONOUS — ``resolve_config`` parses YAML off disk and reads prompt
     files. Call it from ``asyncio.to_thread`` so it cannot block the loop.
@@ -2934,7 +2934,7 @@ def _merged_session_tool_groups(
     - The attach-time ``config_override`` (warm-pool) differs from the stored
       one only by ``workspace.*`` and datasource categories
       (``graph``/``sql``/``mongodb``/``webdav``/``email``/``mcp``) — disjoint
-      from these four groups.
+      from these groups.
     - ``grant_strip`` — the acknowledged-grant-downgrade hook
       ``_resolve_session_config`` passes to ``resolve_config`` — is skipped
       HERE too, and it does NOT belong on the "safe to skip" side of this
@@ -3042,7 +3042,7 @@ def _legacy_session_tool_groups(
     base_config_name: str,
     request_override: dict[str, Any] | None,
 ) -> dict[str, bool]:
-    """The four groups as the LEGACY (experts-off) agent path will bind them.
+    """The closed groups as the LEGACY (experts-off) agent path will bind them.
 
     SYNCHRONOUS — loads the base YAML. Call via ``asyncio.to_thread``.
 
@@ -3050,8 +3050,8 @@ def _legacy_session_tool_groups(
     ``persistent_app._apply_session_tool_group_markers`` sets a disable marker
     only on an explicit ``config_override.tools.<group> == []``, and
     ``persistent_session._setup_tools`` then APPENDS the canonical lists for
-    ``orchestrator``/``agent_catalog``/``workflows`` whenever the marker is
-    absent — so an unset group is ENABLED regardless of the base YAML's ``[]``.
+    every group in ``LEGACY_APPENDED_GROUPS`` whenever the marker is absent —
+    so an unset group is ENABLED regardless of the base YAML's ``[]``.
 
     ``canvas`` is asymmetric: its branch is strip-only with no append, so it
     additionally requires a non-empty ``tools.canvas`` in the loaded base.
@@ -3097,7 +3097,7 @@ def _legacy_session_tool_policy(
     SYNCHRONOUS — loads the base YAML. Call via ``asyncio.to_thread``.
 
     Same prediction status as :func:`_merged_session_tool_policy`, plus the
-    legacy path's own asymmetry: the four closed groups are APPENDED by
+    legacy path's own asymmetry: the compatibility groups are APPENDED by
     ``persistent_session._load_tools_for_backend`` whenever no explicit ``[]``
     disable marker is present, so an unset group is ENABLED here and DISABLED
     on the resolved path. :func:`_legacy_session_tool_groups` is the pinned
@@ -5597,6 +5597,8 @@ def _validated_session_officer_override(
 
 _SESSION_TOOL_DISABLED_MARKERS = {
     "orchestrator": "_fleet_management_disabled",
+    "job_control": "_job_control_disabled",
+    "job_inspection": "_job_inspection_disabled",
     "agent_catalog": "_agent_catalog_disabled",
     "workflows": "_workflows_disabled",
     "canvas": "_canvas_disabled",
@@ -12239,7 +12241,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
     # so it never sees the smuggled one.
     #
     # Applies to the internal path too: X-Internal-Key is transport
-    # authentication, not authorization, and create_worker_job forwards a
+    # authentication, not authorization, and create_job forwards a
     # model-authored config_override verbatim. The server's own fragments are
     # unaffected — _critic_config_override and the loop's `{"loop":
     # ["loop_plan"]}` go through postgres_db.create_job directly, and the
@@ -12644,7 +12646,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         # simply never pass the kwarg.)
         #
         # wake_on_complete is set here, server-side, rather than being a
-        # create_worker_job parameter: an opt-in flag the model must remember
+        # create_job parameter: an opt-in flag the model must remember
         # fails SILENTLY — it forgets, then never learns the job finished, which
         # is indistinguishable from having no wake feature at all. A surplus
         # wake costs one cheap turn the agent can go straight back to sleep
@@ -13275,7 +13277,7 @@ async def _wait_for_stateless_cancel_settle(
 async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
     """Cancel a running job. **Dual-callable** (P4b): cockpit user with job
     access (``require_job_access``) OR agent with valid ``X-Internal-Key``
-    (agent's `cancel_worker_job` tool path).
+    (agent's `cancel_job` tool path).
 
     If the job is assigned to an agent, this will also send a cancel request
     to the agent pod.
@@ -13488,7 +13490,7 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
 @app.put("/api/jobs/{job_id}/pause")
 async def pause_job(request: Request, job_id: str) -> dict[str, str]:
     """Pause a running job. **Dual-callable** (P4b): cockpit user with
-    job access OR agent with ``X-Internal-Key`` (`pause_worker_job` tool).
+    job access OR agent with ``X-Internal-Key`` (`pause_job` tool).
 
     If the job is assigned to an agent, sends a graceful pause request
     to the agent pod. The agent finishes its current graph node, saves
@@ -15421,7 +15423,7 @@ async def resume_job(
 ) -> dict[str, str]:
     """Resume a failed or paused job from its checkpoint. **Dual-callable**
     (P4b): cockpit user with job access OR agent with ``X-Internal-Key``
-    (autoresume + ``resume_worker_job`` tool). The Pydantic body keeps the
+    (autoresume + ``resume_job_with_feedback`` tool). The Pydantic body keeps the
     historical ``request`` name; the FastAPI Request handle is ``req``.
 
     This endpoint:
@@ -15899,7 +15901,7 @@ async def approve_job(
 ) -> dict[str, Any]:
     """Approve a frozen job, marking it as completed. **Dual-callable** (P4b):
     cockpit user with job access OR agent with ``X-Internal-Key`` (autonomous
-    approve flow + ``approve_worker_job`` tool). Body keeps the historical
+    approve flow + ``approve_job`` tool). Body keeps the historical
     ``request`` name; FastAPI Request handle is ``req``.
 
     This endpoint mirrors the logic from agent.py:approve_frozen_job but runs
@@ -18369,7 +18371,7 @@ def _critic_config_override(parent_llm: dict[str, Any] | None) -> dict[str, Any]
     override: dict[str, Any] = {
         "autonomy": "full",
         "tools": {
-            "evaluation": ["approve_job", "return_job_with_feedback"],
+            "evaluation": ["approve_job_verdict", "return_job_with_feedback"],
             "core": ["next_phase_todos", "todo_complete", "todo_list", "todo_rewind"],
             "communication": [],
         },
@@ -31017,7 +31019,7 @@ async def _record_verification_round_impl(
         raise HTTPException(status_code=404, detail=f"Job {target_job_id} not found")
 
     # The target comes from the URL but is chosen by the MODEL —
-    # ``approve_job(job_id=...)`` flows straight through to it, and the route
+    # ``approve_job_verdict(job_id=...)`` flows straight through to it, and the route
     # is authenticated only by the shared internal key, which every agent pod
     # holds. A confused critic writing to the wrong job's ledger is fail-closed
     # for its REAL target (which then escalates for lack of a verdict), but it
@@ -37148,7 +37150,7 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
     ``resolved`` / ``legacy`` / ``error``. It says nothing about ``origin``:
     a measured answer is a measured answer whichever path the config took.
 
-    ``tool_groups`` (the four closed groups, booleans) is retained for the
+    ``tool_groups`` (the closed groups, booleans) is retained for the
     cockpit and is now DERIVED from ``categories`` rather than computed beside
     it, so the endpoint cannot disagree with itself.
 
@@ -37288,7 +37290,7 @@ async def preview_tool_groups(
 
     ``source`` models the same three agent paths as the thread endpoint and is
     NOT hardcoded: with the experts feature or the per-user kill switch off, a
-    created session takes the legacy path, where the four closed groups are
+    created session takes the legacy path, where the compatibility groups are
     APPENDED unless explicitly disabled — the opposite of the resolved path for
     an unset group. Predicting "off" and labelling it ``resolved`` on such a
     deployment would be this series' own defect, rebuilt in the form that

@@ -206,7 +206,7 @@ in `conftest.py` or at the top of each test file:
 - `ToolContext` created with `todo_manager=None`, `_job_id=self.thread_id`
 - All config tool names retrieved via `get_all_tool_names(config)`
 - Phase-specific tools filtered out via `_EXCLUDED_TOOLS` frozenset
-- 8 orchestrator delegation tools always appended (if not already present): `create_worker_job`, `list_worker_jobs`, `get_worker_job`, `get_job_workspace_file`, `approve_worker_job`, `resume_worker_job`, `cancel_worker_job`, `pause_worker_job`
+- 8 orchestrator delegation tools always appended (if not already present): `create_job`, `list_jobs`, `get_job`, `get_job_file`, `approve_job`, `resume_job_with_feedback`, `cancel_job`, `pause_job`
 - Duplicate orchestrator tools not added (checked with `if name not in tool_names`)
 - `load_tools(tool_names, tool_context)` called; on `ValueError`, falls back to loading each tool individually (skips unimplemented tools)
 - `apply_description_overrides` and `apply_instruction_enforcement` called on the final tool list

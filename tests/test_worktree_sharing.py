@@ -754,7 +754,7 @@ def test_critic_config_override_removes_self_closing_tools():
     assert "job_complete" not in core
     assert "mark_complete" not in core
     assert set(override["tools"]["evaluation"]) == {
-        "approve_job",
+        "approve_job_verdict",
         "return_job_with_feedback",
     }
 

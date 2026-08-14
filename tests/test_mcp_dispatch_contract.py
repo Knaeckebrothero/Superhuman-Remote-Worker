@@ -4,6 +4,7 @@ import ast
 from pathlib import Path
 
 from src.shared.orch_surface.formatters import format_created_job
+from src.shared.orch_surface.jobs import get_descriptor
 
 
 SERVER_PATH = Path(__file__).parent.parent / "orchestrator" / "mcp" / "server.py"
@@ -29,10 +30,13 @@ def test_created_job_response_describes_automatic_dispatch():
 def test_mcp_creation_signatures_expose_deliverable_contract():
     tree = ast.parse(SERVER_PATH.read_text(encoding="utf-8"))
 
-    for function_name in ("create_job", "create_project_job"):
-        function = _async_function(tree, function_name)
-        argument_names = {argument.arg for argument in function.args.args}
-        assert "required_deliverables" in argument_names
+    assert (
+        "required_deliverables"
+        in get_descriptor("create_job").public_signature.parameters
+    )
+    function = _async_function(tree, "create_project_job")
+    argument_names = {argument.arg for argument in function.args.args}
+    assert "required_deliverables" in argument_names
 
 
 def test_workspace_reader_promises_committed_gitea_state():

@@ -3,6 +3,7 @@
  */
 
 import type {EffectiveModels} from '../../core/models/api.model';
+import {JOB_TOOL_GROUP_CATEGORIES} from '../../core/tools/job-surface.generated';
 
 /**
  * - `job` / `session`: creation forms — overrides collected at submit time.
@@ -34,7 +35,8 @@ export const JOB_TOOL_CATEGORIES: ToolCategoryMeta[] = [
 export const SESSION_TOOL_CATEGORIES: ToolCategoryMeta[] = [
   ...JOB_TOOL_CATEGORIES,
   { key: 'canvas', label: 'Canvas', icon: 'dashboard_customize', description: 'Ability to present workspace files in the shared session Canvas' },
-  { key: 'orchestrator', label: 'Fleet Management', icon: 'hub', description: 'Ability to inspect and steer SRW jobs, projects, repositories, and session workspace upgrades' },
+  ...JOB_TOOL_GROUP_CATEGORIES,
+  { key: 'orchestrator', label: 'SRW Projects', icon: 'hub', description: 'Ability to inspect SRW projects, repositories, session context, and workspace upgrades' },
   { key: 'agent_catalog', label: 'Experts & Skills', icon: 'extension', description: 'Ability to look up experts and skills. Read-only — the row below is what creates them' },
   { key: 'workflows', label: 'Automations & Loops', icon: 'auto_mode', description: 'Ability to inspect automations and project loops, and draft disabled automations' },
   { key: 'catalog_authoring', label: 'Author Experts & Automations', icon: 'edit_note', description: 'Ability to create and update your own experts, skills and automations on your behalf. New automations are created switched off for you to review' },

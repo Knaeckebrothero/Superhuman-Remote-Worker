@@ -1587,6 +1587,10 @@ class ToolsConfig:
     mcp: List[str] = field(default_factory=list)
     communication: List[str] = field(default_factory=list)
     delegation: List[str] = field(default_factory=list)
+    # Descriptor-backed orchestrator job surface. The flat ``orchestrator``
+    # category below remains for non-job application tools.
+    job_control: List[str] = field(default_factory=list)
+    job_inspection: List[str] = field(default_factory=list)
     orchestrator: List[str] = field(default_factory=list)
     canvas: List[str] = field(default_factory=list)
     agent_catalog: List[str] = field(default_factory=list)
@@ -2500,6 +2504,8 @@ def load_agent_config(
         mcp=tools_data.get("mcp", []),
         communication=tools_data.get("communication", []),
         delegation=tools_data.get("delegation", []),
+        job_control=tools_data.get("job_control", []),
+        job_inspection=tools_data.get("job_inspection", []),
         orchestrator=tools_data.get("orchestrator", []),
         canvas=tools_data.get("canvas", []),
         agent_catalog=tools_data.get("agent_catalog", []),
@@ -2762,6 +2768,8 @@ def load_agent_config_from_dict(
         mcp=tools_data.get("mcp", []),
         communication=tools_data.get("communication", []),
         delegation=tools_data.get("delegation", []),
+        job_control=tools_data.get("job_control", []),
+        job_inspection=tools_data.get("job_inspection", []),
         orchestrator=tools_data.get("orchestrator", []),
         canvas=tools_data.get("canvas", []),
         agent_catalog=tools_data.get("agent_catalog", []),
@@ -4234,22 +4242,22 @@ def scheduled_work_system_floor(
     ``systemprompt_interactive`` is excluded from both the overlay and expert
     prompt allow-lists.
 
-    Gated on ``create_worker_job`` so it costs exactly nothing for the (default)
+    Gated on ``create_job`` so it costs exactly nothing for the (default)
     sessions without the Fleet Management tool group.
     """
-    if "create_worker_job" not in set(tool_names or ()):
+    if "create_job" not in set(tool_names or ()):
         return ""
     return (
         "<scheduled_work>\n"
-        "Jobs you create with create_worker_job run asynchronously; you are told "
+        "Jobs you create with create_job run asynchronously; you are told "
         "when each one finishes. On each notice, decide: inspect the result now "
-        "(get_worker_job for the summary; list_job_workspace_files / "
-        "get_job_workspace_file for files the worker pushed — committed state "
+        "(get_job for the summary; list_job_files / "
+        "get_job_file for files the worker pushed — committed state "
         "as of its last phase-boundary push) or note it and continue. Speak "
         "to the user only when a result changes the plan or a job failed — do "
         "not narrate every completion of a fan-out. If an early result shows the "
         "batch is heading the wrong way, cancel the siblings with "
-        "cancel_worker_job rather than letting them spend.\n"
+        "cancel_job rather than letting them spend.\n"
         "</scheduled_work>"
     )
 

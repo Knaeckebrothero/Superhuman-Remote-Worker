@@ -139,7 +139,7 @@ TOOL_REGISTRY.update(get_delegation_metadata())
 #                construction* — no mark required.  Prefer that fix: a category
 #                whose name matches its blast radius needs no exception list.
 #                What remains marked is the residue where a category genuinely
-#                mixes tiers (``delegate_work``, ``steer_worker_job``).
+#                mixes tiers (``delegate_work``, ``steer_job``).
 #
 # ``gate``
 #   A short string, present on every classified entry: what actually decides
@@ -165,7 +165,7 @@ TOOL_REGISTRY.update(get_delegation_metadata())
 #     when no disable marker is present.  On the resolved path config still
 #     decides, so marking them would make those groups permanently
 #     un-enableable: the current bug, re-introduced by its own fix.
-#   * ``approve_job`` / ``return_job_with_feedback`` (stamped as
+#   * ``approve_job_verdict`` / ``return_job_with_feedback`` (stamped as
 #     ``tools.evaluation`` by ``_critic_config_override``) and ``loop_plan``
 #     (stamped as ``tools.loop`` by the planner loops).  Those are code writing
 #     a *config fragment*, which is a config grant; ``evaluation: true`` and
@@ -831,15 +831,26 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
         except Exception as e:
             logger.warning(f"Could not load delegation tools: {e}")
 
-    # Orchestrator tools (job delegation for persistent agents)
-    if "orchestrator" in tools_by_category:
+    # Orchestrator application tools. Job operations have descriptor-owned
+    # control/inspection categories; the flat orchestrator category remains
+    # for projects, repositories, catalog/workflows, and session context.
+    orchestrator_categories = {
+        "orchestrator",
+        "job_control",
+        "job_inspection",
+    } & tools_by_category.keys()
+    if orchestrator_categories:
         try:
             orch_tools = create_orchestrator_tools(context)
-            requested = set(tools_by_category["orchestrator"])
+            requested = {
+                name
+                for category in orchestrator_categories
+                for name in tools_by_category[category]
+            }
             for tool in orch_tools:
                 if tool.name in requested:
                     all_tools.append(tool)
-                    logger.debug(f"Loaded orchestrator tool: {tool.name}")
+                    logger.debug("Loaded orchestrator application tool: %s", tool.name)
         except Exception as e:
             logger.warning(f"Could not load orchestrator tools: {e}")
 

@@ -890,7 +890,7 @@ async def test_output_is_deterministic_bounded_and_tail_truncated(monkeypatch):
         protected=True,
         tools=(
             "browser_navigate",
-            "create_worker_job",
+            "create_job",
             "email_read",
             "email_send",
             "kb_search",

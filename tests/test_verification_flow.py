@@ -495,7 +495,7 @@ class TestReturnWithNoNewFindingsButPriorOpen:
 class TestCriticMustBelongToTheTarget:
     """The endpoint takes ``target_job_id`` from the URL and ``critic_job_id``
     from the body, authenticated only by ``X-Internal-Key`` — and the target is
-    chosen by the MODEL (``approve_job(job_id=...)`` flows straight through).
+    chosen by the MODEL (``approve_job_verdict(job_id=...)`` flows straight through).
 
     A confused critic writing to the wrong job's ledger is fail-closed for its
     REAL target (which then escalates for lack of a verdict), but it pollutes

@@ -504,7 +504,7 @@ async def test_payload_carries_pointers_not_the_result():
 
     text = db.save_thread_message.await_args.kwargs["content"]
     assert "4 deliverables" in text
-    assert "get_worker_job" in text
+    assert "get_job" in text
     assert "a.md" not in text  # names of the files are output, not a pointer
     assert "Confidence: 85" in text
     assert "Three theme directions explored." in text
@@ -533,7 +533,7 @@ async def test_payload_parses_freeze_data_delivered_as_a_json_string():
 
 @pytest.mark.asyncio
 async def test_payload_carries_the_sibling_set():
-    """Saves the agent a list_worker_jobs round-trip on every wake."""
+    """Saves the agent a list_jobs round-trip on every wake."""
     db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
     db.get_thread_job_counts = AsyncMock(
         return_value={

@@ -501,26 +501,26 @@ _TOOL_RULES: Mapping[CapabilityResolverKey, _ToolRule] = {
         readiness=frozenset({"get_expert", "list_experts"}),
     ),
     CapabilityResolverKey.JOBS_CREATE: _ToolRule(
-        readiness=frozenset({"create_worker_job"}),
-        execute=frozenset({"create_worker_job"}),
+        readiness=frozenset({"create_job"}),
+        execute=frozenset({"create_job"}),
     ),
     CapabilityResolverKey.JOBS_REVIEW: _ToolRule(
         readiness=frozenset(
             {
-                "approve_worker_job",
-                "cancel_worker_job",
-                "get_worker_job",
-                "pause_worker_job",
-                "resume_worker_job",
+                "approve_job",
+                "cancel_job",
+                "get_job",
+                "pause_job",
+                "resume_job_with_feedback",
             }
         ),
         execute=frozenset(
             {
-                "approve_worker_job",
-                "cancel_worker_job",
-                "get_worker_job",
-                "pause_worker_job",
-                "resume_worker_job",
+                "approve_job",
+                "cancel_job",
+                "get_job",
+                "pause_job",
+                "resume_job_with_feedback",
             }
         ),
     ),
@@ -542,8 +542,8 @@ _TOOL_RULES: Mapping[CapabilityResolverKey, _ToolRule] = {
         ),
     ),
     CapabilityResolverKey.SESSION_DELEGATE: _ToolRule(
-        readiness=frozenset({"create_worker_job", "delegate_work", "spawn_subagent"}),
-        execute=frozenset({"create_worker_job", "delegate_work", "spawn_subagent"}),
+        readiness=frozenset({"create_job", "delegate_work", "spawn_subagent"}),
+        execute=frozenset({"create_job", "delegate_work", "spawn_subagent"}),
     ),
     CapabilityResolverKey.WORKSPACE_SELECT: _ToolRule(
         readiness=frozenset({"request_workspace_upgrade"}),

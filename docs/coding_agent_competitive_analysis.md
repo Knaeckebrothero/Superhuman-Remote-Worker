@@ -48,7 +48,7 @@ Can we "plug in Claude Opus 4.6 and have it work like Claude Code"? **Architectu
 | **Graph** | 2 | execute_cypher_query, get_database_schema |
 | **Knowledge** | 10 | kb_write, kb_read, kb_update, kb_search, kb_list, kb_related, kb_provenance, kb_contradictions, kb_unanswered, kb_export |
 | **WebDAV** | 5 | webdav_read, webdav_write, webdav_list, webdav_delete, webdav_info |
-| **Orchestrator** | 8 | create_worker_job, list_worker_jobs, get_worker_job, get_job_workspace_file, approve_worker_job, resume_worker_job, pause_worker_job, cancel_worker_job |
+| **Orchestrator** | 8 | create_job, list_jobs, get_job, get_job_file, approve_job, resume_job_with_feedback, pause_job, cancel_job |
 
 ### 2b. Competitor Core Tools
 
@@ -65,7 +65,7 @@ Can we "plug in Claude Opus 4.6 and have it work like Claude Code"? **Architectu
 | Git operations | 5 dedicated tools | via Bash | via shell | via shell |
 | Image/vision input | read_file (multimodal) | Read (paste/drag) | -i flag | @file.png |
 | PDF reading | read_file (rendered) | Read | — | read_file |
-| Sub-agent spawn | create_worker_job | Agent | subagents (6 concurrent) | codebase_investigator |
+| Sub-agent spawn | create_job | Agent | subagents (6 concurrent) | codebase_investigator |
 | Task/todo tracking | — (excluded from persistent) | TaskCreate/Update/List | write_todos | write_todos |
 | Memory save | workspace.md (manual) | Auto-memory | — | save_memory |
 | Plan mode | — | EnterPlanMode | enter_plan_mode | enter_plan_mode |
@@ -200,10 +200,10 @@ Can we "plug in Claude Opus 4.6 and have it work like Claude Code"? **Architectu
 | Feature | SRW | Claude Code | Codex CLI | Gemini CLI |
 |---|---|---|---|---|
 | **Sub-agent type** | Worker jobs (full autonomous agents) | Isolated context subagents | Up to 6 concurrent threads | Isolated subagents |
-| **Spawning** | create_worker_job (REST to orchestrator) | Agent tool (in-process) | Subagent tool | Sub-agent tools |
+| **Spawning** | create_job (REST to orchestrator) | Agent tool (in-process) | Subagent tool | Sub-agent tools |
 | **Isolation** | Separate container/VM | Own context window | Own context + sandbox | Own context |
 | **Startup latency** | High (container boot + registration) | Low (in-process fork) | Low (thread spawn) | Low (in-process) |
-| **Real-time progress** | Poll via get_worker_job | Background notification | Task list updates | — |
+| **Real-time progress** | Poll via get_job | Background notification | Task list updates | — |
 | **Multi-agent teams** | Worker orchestration via tools | Agent Teams (experimental, 1M ctx each) | Worktrees + A2A | Cloud VMs (8 parallel) |
 | **Nesting depth** | Workers can't spawn workers | 1 level (no nesting) | Max depth 1 by default | No nesting |
 
@@ -213,7 +213,7 @@ Worker job delegation is strictly more powerful than subagents. Our workers are 
 - Phase alternation (strategic planning + tactical execution + retrospectives)
 - Their own workspace, git versioning, and tool set
 - Configurable autonomy levels
-- Mid-execution steering via `resume_worker_job` with feedback
+- Mid-execution steering via `resume_job_with_feedback` with feedback
 - Different expert configs per worker (developer, scholar, critic)
 
 The trade-off is startup latency (container boot vs in-process fork). For quick tasks, subagents win. For heavy tasks (multi-hour research, document generation, code projects), workers win.

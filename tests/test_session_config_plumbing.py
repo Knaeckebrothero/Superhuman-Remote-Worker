@@ -377,7 +377,7 @@ class TestSessionWorkspaceBackendDefaultChain:
         ("group", "injected"),
         [
             ("orchestrator", "run_command"),
-            ("agent_catalog", "create_worker_job"),
+            ("agent_catalog", "create_job"),
             ("workflows", "get_skill"),
             ("canvas", "run_command"),
         ],

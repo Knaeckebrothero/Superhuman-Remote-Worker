@@ -76,6 +76,8 @@ class TestResolvedPath:
         assert result["source"] == "resolved"
         assert result["tool_groups"] == {
             "orchestrator": False,
+            "job_control": False,
+            "job_inspection": False,
             "agent_catalog": False,
             "workflows": False,
             "canvas": True,
@@ -194,7 +196,7 @@ class TestLeanResolveFidelity:
         "expert_row,project_overrides,request_override",
         [
             (None, None, None),
-            (None, None, {"tools": {"orchestrator": ["create_worker_job"]}}),
+            (None, None, {"tools": {"job_control": ["create_job"]}}),
             ({"config": {"tools": {"canvas": []}}}, None, None),
             (None, {"tools": {"workflows": ["get_project_loop"]}}, None),
             (
@@ -270,7 +272,7 @@ class TestLeanResolveFidelity:
                     "temperature": 0.4,
                     "permission_mode": "autonomous",
                     "workspace_backend": "sandbox",
-                    "tools": {"orchestrator": ["create_worker_job"]},
+                    "tools": {"job_control": ["create_job"]},
                 }
             }
         )
@@ -300,6 +302,8 @@ class TestLegacyPath:
         assert result["source"] == "legacy"
         assert result["tool_groups"] == {
             "orchestrator": True,
+            "job_control": True,
+            "job_inspection": True,
             "agent_catalog": True,
             "workflows": True,
             "canvas": True,

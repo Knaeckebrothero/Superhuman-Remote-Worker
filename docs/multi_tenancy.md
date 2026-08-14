@@ -811,8 +811,8 @@ This is the canonical defense and works for **every** deployment regardless of e
 | Endpoint | Agent call site |
 |---|---|
 | `POST /api/jobs` | `src/api/orchestrator_client.py:862` (delegation child job creation) |
-| `PUT /api/jobs/{job_id}/cancel` | `src/tools/orchestrator/jobs.py:370` (`cancel_worker_job` tool) |
-| `PUT /api/jobs/{job_id}/pause` | `src/tools/orchestrator/jobs.py:390` (`pause_worker_job` tool) |
+| `PUT /api/jobs/{job_id}/cancel` | `src/tools/orchestrator/jobs.py:370` (`cancel_job` tool) |
+| `PUT /api/jobs/{job_id}/pause` | `src/tools/orchestrator/jobs.py:390` (`pause_job` tool) |
 | `PUT /api/jobs/{job_id}/agent-release` | `src/api/orchestrator_client.py:755` (agent shutdown) |
 | `POST /api/jobs/{job_id}/resume` | `src/api/orchestrator_client.py:664` + `src/tools/orchestrator/jobs.py:345` |
 | `POST /api/jobs/{job_id}/approve` | `src/api/orchestrator_client.py:914` + `src/tools/orchestrator/jobs.py:316` |

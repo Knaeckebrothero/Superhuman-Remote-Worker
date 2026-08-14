@@ -925,7 +925,7 @@ def finalize_job(
         return _finalize_with_verdict(state, workspace, todo_manager, verdict, job_id)
 
     # Edge case: critic job reached finalize_job without verdict data. This
-    # means the critic called job_complete instead of approve_job /
+    # means the critic called job_complete instead of approve_job_verdict /
     # return_job_with_feedback. A missing verdict must NEVER be read as
     # approval (CWE-636 — the exact defect this fail-closed design removes).
     # Log a refusal and fall through to the NORMAL (non-verdict) completion

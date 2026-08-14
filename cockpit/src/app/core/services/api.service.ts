@@ -161,7 +161,7 @@ export interface IdeSessionStatus {
 }
 
 /**
- * Server-resolved enablement of the four closed session tool groups.
+ * Server-resolved enablement of the closed session tool groups.
  *
  * `source` names the agent path the answer models: `resolved` (the
  * orchestrator-resolved blob the agent hydrates), `legacy` (experts off — an

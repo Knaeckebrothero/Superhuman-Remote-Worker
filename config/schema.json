@@ -763,7 +763,7 @@
           "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/tools/evaluation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
-              "approve_job",
+              "approve_job_verdict",
               "return_job_with_feedback"
             ]
           ],
@@ -1143,15 +1143,128 @@
             }
           ]
         },
-        "orchestrator": {
-          "description": "Orchestrator tools: create/monitor/manage worker jobs via the orchestrator REST API. Primarily for persistent agents (src/tools/orchestrator/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+        "job_control": {
+          "description": "Canonical job-control writes generated from src/shared/orch_surface/jobs descriptors. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
-              "create_worker_job",
-              "list_worker_jobs",
-              "get_worker_job",
-              "approve_worker_job",
-              "resume_worker_job"
+              "create_job",
+              "approve_job",
+              "resume_job_with_feedback",
+              "cancel_job",
+              "pause_job"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "job_inspection": {
+          "description": "Canonical job inspection reads generated from src/shared/orch_surface/jobs descriptors. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "list_jobs",
+              "get_job",
+              "get_job_file",
+              "list_job_files"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "orchestrator": {
+          "description": "Non-job orchestrator application tools for projects, repositories, catalog/workflows, and session context. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "get_session_context",
+              "get_current_project",
+              "list_project_jobs"
             ]
           ],
           "oneOf": [

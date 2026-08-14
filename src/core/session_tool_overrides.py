@@ -1,4 +1,4 @@
-"""The four user-selectable persistent-session tool groups.
+"""The user-selectable persistent-session application tool groups.
 
 These are the closed groups the New Session / Settings→Tools UI has always
 rendered as independent switches, and the set the
@@ -28,26 +28,21 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.shared.orch_surface.jobs import caller_default_names
+
 
 SESSION_TOOL_OVERRIDE_NAMES: dict[str, frozenset[str]] = {
     "orchestrator": frozenset(
         {
             "get_session_context",
-            "create_worker_job",
-            "list_worker_jobs",
-            "get_worker_job",
-            "get_job_workspace_file",
-            "list_job_workspace_files",
-            "approve_worker_job",
-            "resume_worker_job",
-            "cancel_worker_job",
-            "pause_worker_job",
             "get_current_project",
             "list_project_jobs",
             "list_project_repositories",
             "get_default_project_repository",
         }
     ),
+    "job_control": caller_default_names("session", "job_control"),
+    "job_inspection": caller_default_names("session", "job_inspection"),
     "agent_catalog": frozenset(
         {
             "list_experts",
@@ -85,9 +80,9 @@ SESSION_TOOL_OVERRIDE_NAMES: dict[str, frozenset[str]] = {
 }
 
 #: The groups the LEGACY (experts-off) agent path re-adds when no ``[]`` disable
-#: marker is present — ``persistent_session._setup_tools`` hardcodes exactly
-#: these three name lists, which is why an unset group reads as ENABLED there and
-#: DISABLED on the resolved path.
+#: marker is present. Job names are descriptor-derived; the three older app
+#: groups retain their narrow compatibility lists. This is why an unset group
+#: reads as ENABLED there and DISABLED on the resolved path.
 #:
 #: This is a HISTORICAL FACT about deployed agent code, not a property of "how
 #: many checkboxes the product offers", and the two must not be conflated: a
@@ -98,7 +93,13 @@ SESSION_TOOL_OVERRIDE_NAMES: dict[str, frozenset[str]] = {
 #:
 #: ``canvas`` is absent because its legacy branch is strip-only with no append.
 LEGACY_APPENDED_GROUPS: frozenset[str] = frozenset(
-    {"orchestrator", "agent_catalog", "workflows"}
+    {
+        "orchestrator",
+        "job_control",
+        "job_inspection",
+        "agent_catalog",
+        "workflows",
+    }
 )
 
 

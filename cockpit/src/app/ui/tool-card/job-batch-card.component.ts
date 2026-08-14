@@ -7,7 +7,7 @@ import {isTerminalJobStatus} from '../../core/util/job-status';
 import {JobToolCardPanelComponent} from './job-tool-card-panel.component';
 
 /**
- * A fan-out of `create_worker_job` calls, rendered as one card with a row per
+ * A fan-out of `create_job` calls, rendered as one card with a row per
  * job instead of N stacked cards.
  *
  * ## What this actually fixes

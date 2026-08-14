@@ -58,7 +58,7 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # Orchestrator HTTP — delegation (create_worker_job), lifecycle calls,
+    # Orchestrator HTTP — delegation (create_job), lifecycle calls,
     # config/prompt fetches, MCP-over-HTTP for orchestrator tools.
     - to:
         - podSelector:

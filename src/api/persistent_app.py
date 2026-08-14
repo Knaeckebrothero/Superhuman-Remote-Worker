@@ -1728,6 +1728,8 @@ def _session_backend_is_vm(config: Optional[Dict[str, Any]]) -> bool:
 
 
 _FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
+_JOB_CONTROL_DISABLED_KEY = "_job_control_disabled"
+_JOB_INSPECTION_DISABLED_KEY = "_job_inspection_disabled"
 _AGENT_CATALOG_DISABLED_KEY = "_agent_catalog_disabled"
 _WORKFLOWS_DISABLED_KEY = "_workflows_disabled"
 _CANVAS_DISABLED_KEY = "_canvas_disabled"
@@ -1743,6 +1745,8 @@ def _apply_session_tool_group_markers(
         return
     group_markers = {
         "orchestrator": _FLEET_MANAGEMENT_DISABLED_KEY,
+        "job_control": _JOB_CONTROL_DISABLED_KEY,
+        "job_inspection": _JOB_INSPECTION_DISABLED_KEY,
         "agent_catalog": _AGENT_CATALOG_DISABLED_KEY,
         "workflows": _WORKFLOWS_DISABLED_KEY,
         "canvas": _CANVAS_DISABLED_KEY,

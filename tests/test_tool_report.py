@@ -299,31 +299,33 @@ class TestLayerProvenance:
 # =============================================================================
 class TestMeasurementWins:
     def test_agent_answer_overrides_a_disagreeing_config(self):
-        """The config says orchestrator is empty; the agent bound two of its tools.
+        """The config says two app groups are empty; the agent bound one in each.
 
         This is the runtime-injection layer, and the whole reason D6 says ask
         the agent. A view that reported ``off`` here would be the original bug
         wearing a new endpoint.
 
         These two names are deliberately NOT ``grant: "code"``: they are
-        re-appended by ``_load_tools_for_backend`` and unticking the category
-        really does drop them (it writes ``tools.orchestrator: []``, which the
-        session reads as the ``_fleet_management_disabled`` marker). So this
-        stays an ordinary settable row, and ``decided_by`` is ``runtime`` —
+        re-appended by ``_load_tools_for_backend`` and unticking each category
+        really does drop it. These stay ordinary settable rows, and
+        ``decided_by`` is ``runtime`` —
         contrast ``TestOnIsRevocable``, where an all-code-granted bind reads as
         ``registry`` and cannot be unticked at all.
         """
         view = compose_tool_view(
-            measured={"orchestrator": ["get_session_context", "create_worker_job"]},
-            configured={"orchestrator": []},
+            measured={
+                "orchestrator": ["get_session_context"],
+                "job_control": ["create_job"],
+            },
+            configured={"orchestrator": [], "job_control": []},
         )
         assert view["orchestrator"]["state"] == STATE_ON
-        assert view["orchestrator"]["tools"] == [
-            "get_session_context",
-            "create_worker_job",
-        ]
+        assert view["orchestrator"]["tools"] == ["get_session_context"]
+        assert view["job_control"]["tools"] == ["create_job"]
         assert view["orchestrator"]["decided_by"] == DECIDED_BY_RUNTIME
+        assert view["job_control"]["decided_by"] == DECIDED_BY_RUNTIME
         assert view["orchestrator"]["settable"] is True
+        assert view["job_control"]["settable"] is True
 
     def test_agent_answer_overrides_a_config_that_promised_tools(self):
         """And the shortfall reads UNAVAILABLE, not off — see TestOffIsAPromise."""
@@ -677,14 +679,15 @@ class TestProvenanceInTheView:
 
 
 class TestToolGroupsProjection:
-    def test_derives_the_four_booleans_from_the_view(self):
+    def test_derives_the_closed_group_booleans_from_the_view(self):
         view = compose_tool_view(
-            measured={"orchestrator": ["create_worker_job"], "canvas": []},
+            measured={"job_control": ["create_job"], "canvas": []},
             configured={},
         )
         groups = tool_groups_from_view(view)
         assert set(groups) == set(SESSION_TOOL_OVERRIDE_NAMES)
-        assert groups["orchestrator"] is True
+        assert groups["job_control"] is True
+        assert groups["orchestrator"] is False
         assert groups["canvas"] is False
 
     def test_a_group_absent_from_the_view_reads_false(self):

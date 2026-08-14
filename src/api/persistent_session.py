@@ -102,6 +102,8 @@ _EXCLUDED_TOOLS = frozenset(
 )
 
 _FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
+_JOB_CONTROL_DISABLED_KEY = "_job_control_disabled"
+_JOB_INSPECTION_DISABLED_KEY = "_job_inspection_disabled"
 _AGENT_CATALOG_DISABLED_KEY = "_agent_catalog_disabled"
 _WORKFLOWS_DISABLED_KEY = "_workflows_disabled"
 _CANVAS_DISABLED_KEY = "_canvas_disabled"
@@ -132,6 +134,18 @@ def _fleet_management_enabled(config: Any) -> bool:
     """
     extra = getattr(config, "extra", {}) or {}
     return extra.get(_FLEET_MANAGEMENT_DISABLED_KEY) is not True
+
+
+def _job_control_enabled(config: Any) -> bool:
+    """Return whether the descriptor-backed job-control group is enabled."""
+    extra = getattr(config, "extra", {}) or {}
+    return extra.get(_JOB_CONTROL_DISABLED_KEY) is not True
+
+
+def _job_inspection_enabled(config: Any) -> bool:
+    """Return whether the descriptor-backed job-inspection group is enabled."""
+    extra = getattr(config, "extra", {}) or {}
+    return extra.get(_JOB_INSPECTION_DISABLED_KEY) is not True
 
 
 def _agent_catalog_enabled(config: Any) -> bool:
@@ -1828,12 +1842,17 @@ class PersistentSession:
         # carry explicit off-markers from their complete merged tool policy;
         # marker absence stays enabled only for legacy-session compatibility.
         from ..tools.registry import get_tools_by_category
+        from ..shared.orch_surface.jobs import caller_default_names
 
         fleet_management_enabled = _fleet_management_enabled(self.config)
+        job_control_enabled = _job_control_enabled(self.config)
+        job_inspection_enabled = _job_inspection_enabled(self.config)
         agent_catalog_enabled = _agent_catalog_enabled(self.config)
         workflows_enabled = _workflows_enabled(self.config)
         fleet_management_tools = set(get_tools_by_category("orchestrator"))
         fleet_management_tools.update(_FLEET_MANAGEMENT_CONTROL_TOOLS)
+        job_control_tools = set(get_tools_by_category("job_control"))
+        job_inspection_tools = set(get_tools_by_category("job_inspection"))
         agent_catalog_tools = set(get_tools_by_category("agent_catalog"))
         workflow_tools = set(get_tools_by_category("workflows"))
         canvas_tools = set(get_tools_by_category("canvas"))
@@ -1845,21 +1864,27 @@ class PersistentSession:
         else:
             _ORCHESTRATOR_TOOLS = [
                 "get_session_context",
-                "create_worker_job",
-                "list_worker_jobs",
-                "get_worker_job",
-                "get_job_workspace_file",
-                "list_job_workspace_files",
-                "approve_worker_job",
-                "resume_worker_job",
-                "cancel_worker_job",
-                "pause_worker_job",
                 "get_current_project",
                 "list_project_jobs",
                 "list_project_repositories",
                 "get_default_project_repository",
             ]
             for name in _ORCHESTRATOR_TOOLS:
+                if name not in tool_names:
+                    tool_names.append(name)
+
+        if not job_control_enabled:
+            tool_names = [name for name in tool_names if name not in job_control_tools]
+        else:
+            for name in sorted(caller_default_names("session", "job_control")):
+                if name not in tool_names:
+                    tool_names.append(name)
+        if not job_inspection_enabled:
+            tool_names = [
+                name for name in tool_names if name not in job_inspection_tools
+            ]
+        else:
+            for name in sorted(caller_default_names("session", "job_inspection")):
                 if name not in tool_names:
                     tool_names.append(name)
 

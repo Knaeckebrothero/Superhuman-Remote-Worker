@@ -296,9 +296,7 @@ async def _jobs_section(
             lines.append("Transitions since last sitrep:")
             lines += changed[:_MAX_TRANSITIONS]
             if len(changed) > _MAX_TRANSITIONS:
-                lines.append(
-                    f"- (+{len(changed) - _MAX_TRANSITIONS} more — list_worker_jobs)"
-                )
+                lines.append(f"- (+{len(changed) - _MAX_TRANSITIONS} more — list_jobs)")
         if new:
             lines += new[:_MAX_NEW]
             if len(new) > _MAX_NEW:

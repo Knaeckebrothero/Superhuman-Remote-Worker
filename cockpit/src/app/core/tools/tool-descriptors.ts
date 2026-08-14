@@ -1,4 +1,5 @@
 import {lineDiff} from '../util/line-diff';
+import {JOB_TOOL_DESCRIPTORS} from './job-surface.generated';
 import {
     NormalizedToolCall,
     CanvasPresentationKind,
@@ -189,12 +190,12 @@ export const TOOL_DESCRIPTORS: Record<string, ToolDescriptor> = {
     // on ToolCardView); this descriptor is the fallback surface only.
     notify_user: {title: 'Message the user', icon: 'campaign', category: 'communication', params: [{key: 'subject', label: 'Subject', kind: 'text'}, {key: 'message', label: 'Message', kind: 'text'}, {key: 'urgency', label: 'Urgency', kind: 'text'}], result: {kind: 'text'}, subtitle: (a) => pickArg(a, ['subject', 'message'])},
 
-    // Fleet management. create_worker_job is the only card that outlives its
+    // Fleet management. create_job is the only card that outlives its
     // own tool call: the call returns "job created, id=…" immediately and the
     // job then runs for minutes. The result is a receipt, not content worth
     // echoing — the live state comes from `entity` + JobWatchService — so it
     // renders as 'none' and the card body shows status instead.
-    create_worker_job: {
+    create_job: {
         title: 'Schedule job',
         icon: 'rocket_launch',
         category: 'delegation',
@@ -244,6 +245,17 @@ function fallbackIcon(name: string): string {
 export function resolveToolDescriptor(tool: string): ToolDescriptor {
     const known = TOOL_DESCRIPTORS[tool];
     if (known) return known;
+    const job = JOB_TOOL_DESCRIPTORS.find(descriptor => descriptor.name === tool);
+    if (job) {
+        return {
+            title: prettifyToolName(tool),
+            icon: job.group === 'job_control' ? 'hub' : 'manage_search',
+            category: 'delegation',
+            params: [],
+            result: {kind: 'text'},
+            dynamicParams: true,
+        };
+    }
     return {
         title: prettifyToolName(tool),
         icon: fallbackIcon(tool),
@@ -382,7 +394,7 @@ const UUID_RE =
     /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i;
 
 /**
- * Recover the job id a successful `create_worker_job` returned.
+ * Recover the job id a successful `create_job` returned.
  *
  * Parsed out of the result rather than carried alongside it because that is the
  * only channel that survives history replay: `tc.result` is repopulated from

@@ -107,7 +107,7 @@ CLAIM_BATCH = int(os.getenv("SESSION_WAKE_CLAIM_BATCH", "20"))
 _DELIVER_CONCURRENCY = int(os.getenv("SESSION_WAKE_DELIVER_CONCURRENCY", "5"))
 
 # Summary text is a pointer to the result, not the result. Anything longer
-# belongs behind get_worker_job.
+# belongs behind get_job.
 _SUMMARY_CHARS = 500
 
 _TERMINAL_FOR_COUNTS = ("completed", "failed", "cancelled")
@@ -604,8 +604,8 @@ async def _format_wake_message(db: Any, row: dict[str, Any], thread_id: str) -> 
         lines.append(f"- Confidence: {confidence}")
     deliverables = freeze.get("deliverables")
     read_hint = (
-        "get_worker_job for the summary; list_job_workspace_files / "
-        "get_job_workspace_file for the job repo's files (committed state as "
+        "get_job for the summary; list_job_files / "
+        "get_job_file for the job repo's files (committed state as "
         "of the worker's last push — mid-phase work is not visible; pass ref "
         "for a phase tag)"
     )
@@ -645,7 +645,7 @@ async def _sibling_line(db: Any, thread_id: str) -> str:
     """ "1 of 3 finished — 1 still running, 1 failed".
 
     Free once created_by_thread_id exists, and it saves the agent a
-    list_worker_jobs round-trip on EVERY wake just to decide whether this is the
+    list_jobs round-trip on EVERY wake just to decide whether this is the
     moment to act.
     """
     try:

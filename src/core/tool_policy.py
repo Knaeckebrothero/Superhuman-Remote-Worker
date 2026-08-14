@@ -154,7 +154,7 @@ def _grantable(category: str) -> list[str]:
     * ``grant: "explicit"`` — config may grant it, but only by naming it.
       Holds a closed session group's ``true`` expansion at exactly
       ``SESSION_TOOL_OVERRIDE_NAMES`` where the category mixes tiers
-      (``orchestrator``, which holds ``steer_worker_job``). The ``*_bundle``
+      (``job_control``, which holds ``steer_job``). The ``*_bundle``
       writes no longer need it: they live in ``catalog_authoring``, so
       ``agent_catalog: true`` cannot reach them structurally rather than by
       exception.
@@ -239,7 +239,7 @@ def expand_tool_policy(value: Any, category: str) -> list[str]:
     ``only`` and a bare list are returned **as written** — never intersected
     with the ``true`` expansion.  That asymmetry is the entire point of the
     ``explicit`` tier, and it is load-bearing: ``config/experts/centurion``
-    names ``steer_worker_job`` and ``get_stuck_jobs``, both ``explicit``, and
+    names ``steer_job`` and ``get_stuck_jobs``, both ``explicit``, and
     an intersection would silently revoke them.
     """
     _require_known_category(category)
@@ -338,7 +338,7 @@ def validate_tool_override_fragment(config_override: Any) -> dict[str, list[str]
     Membership is the **whole** category, not
     :func:`expand_category_true`'s grantable subset.  ``grant: "code"`` and
     ``grant: "explicit"`` restrict *category-level policy*, not an explicit
-    name — ``config/experts/centurion`` names ``steer_worker_job`` and
+    name — ``config/experts/centurion`` names ``steer_job`` and
     ``get_stuck_jobs`` — so treating "not in ``true``'s expansion" as "not
     allowed" would make this validator a second, stricter grant system.  It is
     not one: capability grants (``src/core/capability_grants.py``) remain the
@@ -515,7 +515,7 @@ def _expand_mapping(value: dict, category: str) -> list[str]:
         # AS WRITTEN.  Never intersected with expand_category_true — an
         # explicit name is an explicit name, for both `code` and `explicit`
         # marks.  Intersecting would silently revoke centurion's
-        # steer_worker_job / get_stuck_jobs.
+        # steer_job / get_stuck_jobs.
         return names
 
     # Checked before the empty-list case so `{except: []}` on an

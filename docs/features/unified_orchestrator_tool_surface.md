@@ -27,16 +27,15 @@ related:
 # One Job-Management Toolset
 
 **Date:** 2026-08-06 (re-scoped same day from a full-catalogue unification draft, per Legate)
-**Status:** DECIDED — all four §6 decisions ratified by the Legate 2026-08-06.
-**S1 DONE 2026-08-06**, live-verified on k3d: tools/list schema digest identical
-before/after (`sha256:f9593213…`), 105 tools, prod image builds with in-image
-schema bake + double-client smoke, 125 affected tests green, Tilt loop rebuilt
-and rolled the new layout. Next: S2 (job descriptors + MCP adapter).
-**2026-08-14 proposed officer-boundary amendment:** the shared implementation and four
-ratified §6 decisions stand, but the background officer no longer defaults to arbitrary
-workspace/file/shell/repository reads. [[officer_supervision_surface]] splits
-observability, bounded evidence, and object-plane reads. Its two evidence-default questions
-must be settled before S5; sessions and MCP lose nothing.
+**Status:** IMPLEMENTED THROUGH S4 + S6 — all four §6 decisions ratified by the
+Legate 2026-08-06; S1 completed 2026-08-06 and S2/S3/S4/S6 completed
+2026-08-14. S5 remains pending.
+**2026-08-14 officer-boundary amendment:** descriptor plane metadata is live,
+but this change deliberately does not activate the proposed background-officer
+object-plane ceiling or expand the officer's effective defaults. Existing
+effective grants were migrated to canonical names. Evidence tools and the
+knowledge-boundary policy remain pending with S5 in
+[[officer_supervision_surface]]; sessions and MCP lose nothing.
 **Findings authority:** `docs/issues/orchestrator_tool_surface_fragmentation.md`
 (F1–F9, verified 2026-08-03).
 **Supersedes:** `shared_application_action_layer.md` (2026-07-08) for the job
@@ -260,9 +259,9 @@ this is finishing the client half. Fixes the officer's fleet-wide job lists
 | S1 | Move client + formatters to `src/shared/orch_surface/`; all imports switch; `Dockerfile.mcp` graft → `COPY src/shared`; Tiltfile sync line | — | MCP `tools/list` byte-identical (`schema_artifact.py` bake); three images build; MCP restarts on a `src/shared` touch in Tilt |
 | S2 | Job descriptors + MCP adapter for the toolset rows; `steer_job` lands on MCP | S1 | Existing MCP job tools name/schema/output-identical (artifact + recorded sample-call diff); steer_job smoke on k3d |
 | S3 | LangChain adapter replaces the 12 agent job tools + in-repo rename sweep (centurion YAML, session append list, sitrep text, tests) | S2 | Canonical names resolve; `grep -r` finds no legacy spelling in-repo; updated `tests/test_orchestrator_jobs_tool.py` + session tool tests green; officer k3d turn works on new names |
-| S4 | Generated group lists + cockpit mirror for `job_control`/`job_inspection`; descriptor plane metadata and caller defaults | S3 | generated-file CI check; session toolset selectable; resolved officer grant contains no object-plane descriptors; cockpit Vitest green |
-| S5 | Config flips: centurion + session groups per the §3 defaults; officer evidence only if its open decisions are ratified | S4 | k3d: officer reads log/audit/chat/todos/messages and bounded evidence on a live worker job without file/shell/repo tools; session switch retains the full inspection set |
-| S6 | Scope header in the shared client | S1 | k3d: officer `list_jobs` returns only century jobs; unscoped sessions unchanged |
+| S4 | Generated group lists + cockpit mirror for `job_control`/`job_inspection`; descriptor plane metadata and caller defaults | S3 | generated-file CI check; session toolset selectable; current officer grant snapshot is canonical and unchanged; cockpit Vitest green. The proposed object-plane ceiling is an S5 policy activation, not part of this implementation slice. |
+| S5 | Activate any ratified expanded background-officer defaults, the object-plane ceiling, and bounded evidence policy | S4 | Pending: officer reads the ratified observability/evidence subset on a live worker job without arbitrary file/shell/repository readers; session switch retains the full inspection set |
+| S6 | Scope header in the shared client | S1 | concurrency tests prove header isolation/reset; k3d: project-bound `list_jobs` returns only that project's jobs; unscoped callers remain unscoped |
 
 The officer stopgap (hand-writing ~8 readers into today's `jobs.py`) stays
 rejected: the Resavio officer is held pending the `project_officers` migration,
@@ -300,6 +299,77 @@ That amendment and its initial bounds remain **PROPOSED** in
   README smoke path.
 - **Tilt discipline:** MCP resource must visibly restart on a `src/shared/`
   edit (the known partial-edits trap).
+
+### 7.1 Implementation record — 2026-08-14
+
+S2/S3/S4/S6 now use 37 shared descriptors (10 control, 27 inspection) under
+`src/shared/orch_surface/jobs/`. Each descriptor owns its async handler and
+rendering; thin FastMCP and LangChain adapters register the same signature,
+docstring, metadata, and handler. `job_control` / `job_inspection` registry
+membership, session defaults, the Cockpit mirror, and the committed markdown
+catalogue are generated or derived from those descriptors. The generator is
+checked with `python scripts/generate-job-surface.py --check`.
+
+The reviewed MCP schema changes are exactly:
+
+- add `steer_job`;
+- add optional `slot` to `create_job`. It is hidden-context-safe and maps to
+  `context.officer_slot`, with the explicit argument winning. No
+  `project_id`, `user_id`, `thread_id`, or `parent_job_id` public argument was
+  added.
+
+A by-name pre/post comparison of the complete MCP artefact found 105 → 106
+tools: added `steer_job`, removed none, and changed only `create_job`. Its only
+property delta was optional `slot`; its required set was unchanged. The
+baseline digest was
+`sha256:7f15e6d90b6b00b88cfd5c1f743ef13e3c4684ca764bafae60ea85519840f18f`;
+the implemented digest is
+`sha256:f78367df43c93988cbf5590e0ace6d60929969ec2c78dfdd00e839b3963e3046`.
+`python -m orchestrator.mcp.image_smoke` passed with 106 tools, two fresh
+clients, one create mutation, and one urgent steer call. Directly executing
+`python orchestrator/mcp/schema_artifact.py` had a pre-edit import-path failure
+(`ModuleNotFoundError: src`); the supported module invocation was used for both
+artefacts.
+
+Repository verification run:
+
+- focused descriptor/job/MCP/migration gate: 77 passed;
+- MCP suite: 146 passed;
+- session/policy/config/critic regression set: 962 passed, 1 skipped;
+- full Cockpit Vitest: 2,105 passed across 129 files;
+- Cockpit i18n parity/hardcoded-copy check and production build passed (the
+  build retained its pre-existing bundle/CommonJS budget warnings);
+- Ruff check and format check, generated-artifact drift check, `git diff
+  --check`, and both Helm CI lint value sets passed.
+
+The broad Python run reached 17,972 passed and 163 skipped after three known
+environment-dependent tests were deselected, then reported eight failures.
+Across the run and deselections, the local environment limitations were seven
+unchanged MCP test-server transport failures, three missing-`arxiv` contract
+failures under the system Python, and one absent localhost PostgreSQL test
+database. The three research-client tests passed under the repository
+virtualenv; the seven MCP transport tests still reproduced there in untouched
+MCP-manager code. CI's supported Python is 3.12; the host interpreters used for
+those broad runs were 3.14 and 3.13 respectively.
+
+The running local `k3d-srw` cluster applied migration 0156 successfully after
+the missing-`tools` SQL NULL case was found and corrected; the final ledger had
+zero dirty rows and expert configs had zero SQL NULLs. Live protocol checks
+then confirmed 106 tools, optional `create_job.slot`, canonical agent
+`create_job`, project-scoped agent and MCP `list_jobs`, non-urgent `steer_job`,
+and cancellation of the test job. Temporary project-scoped MCP tokens were
+revoked. An earlier urgent steer attempt hit the existing 409 inbound-reply
+guard after its tiny test job had already transitioned to `paused`; the image
+smoke and unit contracts cover urgent forwarding, and this slice does not
+change that unrelated routing/transition behavior.
+
+Migration 0156 hard-renames stored list-form tool policies and splits the old
+orchestrator job members into the two new groups. Unexpected historical raw
+policy shapes are left untouched rather than guessed or silently narrowed; a
+pre-rollout scan remains prudent for databases that predate canonical
+save-boundary normalization. The existing critic verdict tool was renamed to
+`approve_job_verdict` so the canonical lifecycle `approve_job` has one
+unambiguous active schema.
 
 ## 8. Risks
 

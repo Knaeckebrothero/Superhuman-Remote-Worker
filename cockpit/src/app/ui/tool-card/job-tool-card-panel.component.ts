@@ -25,7 +25,7 @@ import {
 } from '../../core/util/job-status';
 
 /**
- * Live status + review actions for the job a `create_worker_job` card points at.
+ * Live status + review actions for the job a `create_job` card points at.
  *
  * Kept out of `<app-tool-card>` so that component stays what its docstring
  * promises — source-agnostic and presentational — and so the job dependency

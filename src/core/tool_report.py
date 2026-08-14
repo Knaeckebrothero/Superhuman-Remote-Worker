@@ -508,7 +508,7 @@ def compose_tool_view(
 
 
 def tool_groups_from_view(view: Mapping[str, Mapping[str, Any]]) -> dict[str, bool]:
-    """The four closed session groups as booleans, for the existing consumers.
+    """The closed session groups as booleans, for the existing consumers.
 
     The cockpit reads ``tool_groups`` and nothing else today
     (``api.service.ts::getSessionToolGroups``).  Deriving it FROM the composed

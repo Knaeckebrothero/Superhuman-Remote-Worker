@@ -262,7 +262,7 @@ def validate_verdict_call(
     rounds. Rejecting on empty ``opened`` alone blocked the most common round-2
     shape — no new problems, but a predecessor's F1 still unaddressed — which
     made ``return_job_with_feedback`` uncallable for that critic and pushed it
-    toward ``approve_job`` instead. Wrong pressure direction for a gate whose
+    toward ``approve_job_verdict`` instead. Wrong pressure direction for a gate whose
     whole point is failing closed.
     """
     if str(asserted).lower() == "returned" and not opened and not open_before:

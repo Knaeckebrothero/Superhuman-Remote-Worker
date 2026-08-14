@@ -126,6 +126,8 @@ describe('ToolsGroupComponent live mode', () => {
     expect(component.rows().map((r) => r.key)).toEqual(
       SESSION_TOOL_CATEGORIES.map((c) => c.key),
     );
+    expect(SESSION_TOOL_CATEGORIES.map((c) => c.key)).toContain('job_control');
+    expect(SESSION_TOOL_CATEGORIES.map((c) => c.key)).toContain('job_inspection');
   });
 
   it('re-enable payload is a POLICY, never names copied out of another layer', () => {

@@ -29,7 +29,7 @@ const tool = (id: string, status: ToolCallStatus = 'completed', category?: strin
 const notify = (id: string): ToolCallEvent =>
     ({kind: 'tool_call', id, tool: 'notify_user', args: {message: 'm', urgency: 'log'}, status: 'completed', startedAt: 0});
 const job = (id: string, status: ToolCallStatus = 'completed'): ToolCallEvent =>
-    ({kind: 'tool_call', id, tool: 'create_worker_job', args: {description: 'd'}, status, startedAt: 0});
+    ({kind: 'tool_call', id, tool: 'create_job', args: {description: 'd'}, status, startedAt: 0});
 const comp = (id: string): CompactionEvent => ({kind: 'compaction', id, summary: 'compacted', startedAt: 0});
 
 /** Ids in a group, folded / batched / single — keeps the assertions readable. */
@@ -300,7 +300,7 @@ describe('groupEvents', () => {
             // turn's LAST tool call, so this rendered as 'folded(b0,b1)' plus
             // 'single(b2)' — two actionable cards buried in a "2× tool calls"
             // chip that gave no hint they were there. The regression this guards
-            // is re-adding create_worker_job to isFoldable().
+            // is re-adding create_job to isFoldable().
             const g = groupEvents([job('b0'), job('b1'), job('b2')]);
             expect(g.map(x => x.kind)).not.toContain('folded');
             expect(g).toHaveLength(1);

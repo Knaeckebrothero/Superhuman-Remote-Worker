@@ -10,7 +10,7 @@ Legate assigns a kit at provision time::
         line:  {count: 2, model: "MiniMax-M3", backend: "sandbox"}
         heavy: {count: 1, model: "gpt-5.6-sol", backend: "vm"}
 
-and the officer names a slot per dispatch (``create_worker_job(...,
+and the officer names a slot per dispatch (``create_job(...,
 slot="heavy")``). The job-creation funnel stamps the slot's model/backend
 onto the job config server-side — the officer chooses WHICH troops to send,
 never what they are made of — and enforces the per-slot count with the same

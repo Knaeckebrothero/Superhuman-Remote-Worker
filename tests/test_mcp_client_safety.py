@@ -9,6 +9,67 @@ import httpx
 import pytest
 
 from src.shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
+from src.shared.orch_surface.jobs import CallerCtx, get_descriptor, make_bound_handler
+
+
+@pytest.mark.asyncio
+async def test_bound_invocations_isolate_project_scope_and_reset_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One pooled client must never leak identity between concurrent tools."""
+    monkeypatch.setenv("MCP_INTERNAL_KEY", "test-internal-key")
+    observed: list[tuple[str, str]] = []
+    both_arrived = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(
+            (
+                request.headers.get("X-MCP-User-Id", ""),
+                request.headers.get("X-MCP-Scope", ""),
+            )
+        )
+        if len(observed) == 2:
+            both_arrived.set()
+        await asyncio.wait_for(both_arrived.wait(), timeout=1)
+        return httpx.Response(200, json=[])
+
+    client = AsyncCockpitClient(
+        base_url="http://orchestrator.test",
+        transport=httpx.MockTransport(handler),
+    )
+    descriptor = get_descriptor("list_jobs")
+    project_call = make_bound_handler(
+        descriptor,
+        client_provider=lambda: client,
+        caller_provider=lambda: CallerCtx(
+            kind="session",
+            user_id="user-project",
+            project_ids=("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",),
+        ),
+    )
+    unbound_call = make_bound_handler(
+        descriptor,
+        client_provider=lambda: client,
+        caller_provider=lambda: CallerCtx(kind="session", user_id="user-unbound"),
+    )
+
+    try:
+        await asyncio.gather(project_call(), unbound_call())
+        # The descriptor wrapper has reset its ContextVar token. A direct read
+        # therefore carries only the client's internal credential.
+        direct = await client.list_jobs()
+    finally:
+        await client.close()
+
+    assert set(observed[:2]) == {
+        (
+            "user-project",
+            "project:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        ),
+        ("user-unbound", ""),
+    }
+    assert observed[2] == ("", "")
+    assert direct == []
 
 
 @pytest.mark.asyncio
