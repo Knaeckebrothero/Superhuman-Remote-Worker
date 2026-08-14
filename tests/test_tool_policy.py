@@ -137,9 +137,11 @@ class TestPopulation:
         assert "config/session_base.yaml" in files
         assert "config/worker_base.yaml" in files
         assert any("experts/centurion" in f for f in files)
-        # 148 after job_control/job_inspection became descriptor-owned groups.
-        assert len(_DECLARATIONS) == 148, (
-            f"expected 148 raw declarations, got {len(_DECLARATIONS)}"
+        # 148 after job_control/job_inspection became descriptor-owned groups;
+        # 149 with the Centurion's explicit knowledge grant
+        # (officer_knowledge_plane.md §3, K2).
+        assert len(_DECLARATIONS) == 149, (
+            f"expected 149 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):

@@ -52,7 +52,7 @@ def _current_project_id(context: ToolContext) -> Optional[str]:
     )
 
 
-def _format_project(project: Dict[str, Any]) -> str:
+def _format_project(project: Dict[str, Any], *, include_cloud_link: bool = True) -> str:
     project_id = project.get("id", "unknown")
     lines = [
         f"Project ID: {project_id}",
@@ -76,7 +76,7 @@ def _format_project(project: Dict[str, Any]) -> str:
         lines.append(f"Connectors: {project['datasource_count']}")
     if project.get("job_count") is not None:
         lines.append(f"Jobs: {project['job_count']}")
-    if project.get("cloud_storage_url"):
+    if include_cloud_link and project.get("cloud_storage_url"):
         lines.append(f"Cloud storage: {project['cloud_storage_url']}")
     if project.get("created_at"):
         lines.append(f"Created: {project['created_at']}")
@@ -88,6 +88,14 @@ def _format_project(project: Dict[str, Any]) -> str:
 def create_project_tools(context: ToolContext) -> List[Any]:
     """Create project tools with injected session context."""
     base_url = _get_orchestrator_url()
+    # Background officer (officer_knowledge_plane.md §4): get_current_project
+    # stays as identity metadata, but must not carry an object-plane pointer —
+    # the project cloud-folder link is trimmed. Strict `is True`: the config
+    # dict may be a MagicMock in tests.
+    tool_cfg = getattr(context, "config", None)
+    officer_session = (
+        isinstance(tool_cfg, dict) and tool_cfg.get("officer_session") is True
+    )
 
     @tool
     async def get_current_project() -> str:
@@ -107,7 +115,9 @@ def create_project_tools(context: ToolContext) -> List[Any]:
             try:
                 resp = await client.get(f"{base_url}/api/projects/{project_id}")
                 resp.raise_for_status()
-                return _format_project(resp.json())
+                return _format_project(
+                    resp.json(), include_cloud_link=not officer_session
+                )
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
                     return f"Project '{project_id}' not found or not visible."
