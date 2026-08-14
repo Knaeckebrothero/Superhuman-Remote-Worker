@@ -5,7 +5,7 @@ tags:
   - orchestration
   - sessions
   - database
-status: proposed
+status: implemented-O1-O5
 created: 2026-08-06
 aliases:
   - officer post
@@ -35,6 +35,16 @@ related:
 > Along the way this ships the two things the Legate has asked for since the first live
 > command: seeing how much of his kit is actually in use, and adjusting it while he is
 > on duty.
+
+**IMPLEMENTED 2026-08-14 (O1–O5)** on develop: migration 0157 + row helpers + adoption
+backfill and read flips/lineage capacity (`fa497666`), commission/decommission/hold/
+release + PATCH + finished GET (`9a3c3934`), the one-state cockpit card (`d7cfd716`).
+Locked decisions applied: project-admin authority, `line ×2 · sandbox` starter draft,
+brain-edit deferred with the "applies on next respawn" label; `communication_policy`
+shipped on the row (default `user_direct`) and is now live via [[officer_message_routing]]
+M1–M4. **O6 (releasing the held Resavio officer through the new endpoint) deliberately
+not performed** — sequenced behind the knowledge-plane/supervision/routing landings, all
+of which shipped the same day; the release is the next live-fire step.
 
 **2026-08-14 follow-on:** [[officer_knowledge_plane]] defines what the commissioned
 background officer may know and write; [[officer_supervision_surface]] defines his scoped

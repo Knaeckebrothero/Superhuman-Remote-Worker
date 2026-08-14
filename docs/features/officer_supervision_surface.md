@@ -34,7 +34,14 @@ related:
 
 ## Status
 
-**PROPOSED (2026-08-14).** This refines, rather than replaces, the ratified shared
+**E1–E5 IMPLEMENTED 2026-08-14** on develop: truthful-read envelope + plane metadata +
+officer lane/scoping + liveness contract + evidence manifest and tools (`4d501a8f`),
+centurion grant/persona/app-guide/cockpit activation (`7bb1d331`). Officer caller
+defaults as shipped: 28 tools (7 control, 18 observability, 3 evidence, zero
+workspace-plane). Liveness gained a sixth state `terminal`; evidence reads also default
+to MCP/session lanes (schema parity, differing defaults per §7). The E5 live-fire
+acceptance (an officer dispositioning a real job) rides O6's Resavio release.
+Original status for the record: **PROPOSED (2026-08-14).** This refines, rather than replaces, the ratified shared
 job-management implementation in [[unified_orchestrator_tool_surface]]. Its shared client,
 descriptors, formatters, adapters, and project scope are still the correct substrate. This
 feature changes the officer's default grant from "all job inspection" to a deliberate

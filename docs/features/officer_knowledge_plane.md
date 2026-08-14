@@ -36,8 +36,14 @@ related:
 
 ## Status
 
-**PROPOSED (2026-08-14). Nothing in this document is implemented as a coherent
-boundary yet.** The underlying stores and most KB tools already exist. The feature is
+**K1–K3 IMPLEMENTED 2026-08-14** on develop (`0c0c5607`): attach-time binding invariant
+with loud failure + degraded-KB survival (`project knowledge unavailable` on both tool
+errors and the wake), the explicit nine-tool knowledge grant (kb_export absent), and the
+runtime capability ceiling (`registry.apply_officer_tool_ceiling`, strict
+`officer.enabled is True`, denies workspace/shell/git/browser/canvas/repo/webdav/cloud +
+`request_workspace_upgrade` under any override; conferences untouched). K5's doctrine
+line shipped inside the E5 persona section (`7bb1d331`). K4 remains open — the sitrep
+`_knowledge_section` probe is its hook. Original status for the record: The underlying stores and most KB tools already exist. The feature is
 primarily an explicit capability contract, a fail-closed project binding, and removal of
 generic session affordances that accidentally undermine the officer's no-workspace role.
 
