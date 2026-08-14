@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable, Optional
 
 from .kb_git_source import RemoteKnowledgeGitSource, validate_git_remote_url
-from .kb_reindex import knowledge_blob_map, reindex_kb
+from .kb_reindex import knowledge_blob_map, record_reindex_source_failure, reindex_kb
 
 
 # Server-owned marker inside a ``kb`` datasource's non-secret ``config``: this
@@ -102,8 +102,19 @@ async def reindex_kb_datasource(
     # queued/pending sources remain recoverable by the periodic sweep.
     async with _external_reindex_semaphore:
         runner = reindex_fn or reindex_kb
+        try:
+            source = kb_source_from_datasource(datasource)
+        except Exception as exc:
+            return await record_reindex_source_failure(
+                store=store,
+                kb_id=kb_id,
+                source_label=f"datasource:{kb_id}",
+                branch=datasource.get("default_branch") or None,
+                error=exc,
+                is_active=is_active,
+            )
         return await runner(
-            source=kb_source_from_datasource(datasource),
+            source=source,
             store=store,
             embedding_service=embedding_service,
             kb_id=kb_id,

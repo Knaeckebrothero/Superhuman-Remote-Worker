@@ -426,6 +426,36 @@ async def test_update_validates_preserved_token_against_changed_transport():
 
 
 @pytest.mark.asyncio
+async def test_update_validates_new_token_against_preserved_plain_http_url():
+    datasource_id = "11111111-2222-3333-4444-555555555555"
+    existing = {
+        "id": UUID(datasource_id),
+        "type": "kb",
+        "name": "Knowledge",
+        "connection_url": "http://git.example.test/knowledge.git",
+        "credentials": {},
+        "config": {"root_path": ""},
+    }
+    db = MagicMock()
+    db.update_datasource = AsyncMock()
+
+    with (
+        patch("main.require_datasource_owner", AsyncMock(return_value=({}, existing))),
+        patch("main.postgres_db", db),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await update_datasource(
+            object(),
+            datasource_id,
+            DatasourceUpdate(credentials={"auth_method": "token", "token": "secret"}),
+        )
+
+    assert exc.value.status_code == 400
+    assert "HTTPS" in str(exc.value.detail)
+    db.update_datasource.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_delete_uses_coordinated_kb_index_and_app_row_cleanup():
     datasource_id = "11111111-2222-3333-4444-555555555555"
     actor_id = "99999999-8888-7777-6666-555555555555"
@@ -545,6 +575,115 @@ async def test_external_reindex_concurrency_is_bounded_across_distinct_kbs(monke
 
     assert second_started.is_set()
     assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_source_construction_failure_is_recorded_on_watermark():
+    datasource_id = UUID("11111111-2222-3333-4444-555555555555")
+    datasource = {
+        "id": datasource_id,
+        "type": "kb",
+        "connection_url": "http://git.example.test/knowledge.git",
+        "credentials": {"auth_method": "token", "token": "secret"},
+        "default_branch": "main",
+        "config": {},
+    }
+    watermark = KbWatermark(kb_id=datasource_id, indexed_commit="last-good")
+    store = AsyncMock()
+    store.get_watermark.return_value = watermark
+    runner = AsyncMock()
+
+    with patch(
+        "orchestrator.services.kb_datasources.kb_source_from_datasource",
+        side_effect=ValueError("Token/password authentication requires an HTTPS URL"),
+    ):
+        result = await reindex_kb_datasource(
+            datasource,
+            store=store,
+            embedding_service=object(),
+            is_active=AsyncMock(return_value=True),
+            reindex_fn=runner,
+        )
+
+    assert result == {
+        "status": "source-failed",
+        "indexed_commit": "last-good",
+        "full": False,
+        "upserted": 0,
+        "deleted": 0,
+        "skipped": 0,
+        "errors": 1,
+    }
+    runner.assert_not_awaited()
+    store.set_watermark_status.assert_awaited_once_with(
+        datasource_id,
+        "failed",
+        source_head=None,
+        last_error="Token/password authentication requires an HTTPS URL",
+        repo_name=f"datasource:{datasource_id}",
+        branch="main",
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_construction_failure_status_write_is_best_effort():
+    datasource_id = UUID("11111111-2222-3333-4444-555555555555")
+    datasource = {
+        "id": datasource_id,
+        "type": "kb",
+        "connection_url": "https://example.test/knowledge.git",
+        "credentials": {},
+        "config": {},
+    }
+    store = AsyncMock()
+    store.get_watermark.return_value = None
+    store.set_watermark_status.side_effect = RuntimeError("vector db unavailable")
+
+    with patch(
+        "orchestrator.services.kb_datasources.kb_source_from_datasource",
+        side_effect=ValueError("invalid source configuration"),
+    ):
+        result = await reindex_kb_datasource(
+            datasource,
+            store=store,
+            embedding_service=object(),
+            is_active=AsyncMock(return_value=True),
+            reindex_fn=AsyncMock(),
+        )
+
+    assert result["status"] == "source-failed"
+    assert result["errors"] == 1
+
+
+@pytest.mark.asyncio
+async def test_source_construction_failure_does_not_resurrect_deleted_source():
+    datasource_id = UUID("11111111-2222-3333-4444-555555555555")
+    datasource = {
+        "id": datasource_id,
+        "type": "kb",
+        "connection_url": "https://example.test/knowledge.git",
+        "credentials": {},
+        "config": {},
+    }
+    store = AsyncMock()
+    is_active = AsyncMock(return_value=False)
+
+    with patch(
+        "orchestrator.services.kb_datasources.kb_source_from_datasource",
+        side_effect=ValueError("invalid source configuration"),
+    ):
+        result = await reindex_kb_datasource(
+            datasource,
+            store=store,
+            embedding_service=object(),
+            is_active=is_active,
+            reindex_fn=AsyncMock(),
+        )
+
+    assert result["status"] == "source-deleted"
+    is_active.assert_awaited_once()
+    store.get_watermark.assert_not_awaited()
+    store.set_watermark_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
