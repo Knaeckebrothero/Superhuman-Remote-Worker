@@ -18,12 +18,28 @@ related:
 
 Companion to [[centurion]]. Distilled from the 2026-07-28 code-planner research (three agents; all anchors verified against the working tree at `95ee3011` that day — re-verify on pickup, they will drift). This is the build plan; the design rationale lives in the feature doc.
 
-> **2026-08-14 follow-on:** this file remains the as-built v1 record. Do not extend its
-> historical S5/S6 tool list ad hoc. The next operating-surface work is split into
-> [[officer_knowledge_plane]] (authoritative memory + no-object ceiling),
-> [[officer_supervision_surface]] (truthful scoped reads + bounded evidence), and
-> [[officer_message_routing]] (worker/officer/user routing + timeout liveness), all through
-> [[unified_orchestrator_tool_surface]].
+> **2026-08-14 follow-on — ALL FOUR SHIPPED THAT DAY.** This file remains the as-built v1
+> record. Do not extend its historical S5/S6 tool list ad hoc; the officer's operating
+> surface is now owned by four sibling docs, each carrying its own as-built status:
+> [[officer_post]] (O1–O5 — `project_officers` row, commission/decommission/hold/release,
+> PATCH, one-state card; migration 0157), [[officer_knowledge_plane]] (K1–K3 — single
+> writable project-KB binding enforced at attach, degraded-KB survival, explicit nine-tool
+> grant, and `registry.apply_officer_tool_ceiling` denying the object plane under any
+> override), [[officer_supervision_surface]] (E1–E5 — truthful-read envelope, descriptor
+> `plane` metadata, the officer's 28-tool reviewed grant with zero workspace reads, one
+> `compute_job_liveness` contract, evidence manifest + three bounded tools), and
+> [[officer_message_routing]] (M1–M4 — `job_message_routes` ledger in migration 0159,
+> one-transaction blocking send, officer inbox reply/escalate/acknowledge, 15-min SLA and
+> 24 h total-timeout reconciler), all through [[unified_orchestrator_tool_surface]] (43
+> descriptors; S5 activated via the supervision surface rather than a bare grant flip).
+>
+> **What this means for pickup:** the officer's tool list, memory rules, and message
+> behavior are no longer inferable from S5/S6 below — read the four docs. Two v1 items in
+> this file are now obsolete: the flat `max_concurrent_workers`-only capacity story (slot
+> rosters plus lineage-aware counting supersede it) and "officer file reads" of any kind
+> (the ceiling denies them; he judges on published evidence). **Still open from v1:** the
+> digest email sender, charter authoring UI, suspended-conference re-hold, and K4
+> knowledge-health surfacing.
 
 > **First live conference + the notify channel made two-way (2026-07-30→31,
 > `0ccc5038` + `99223c6d`).** S9 got its first production exercise on Better Resavio:

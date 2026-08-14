@@ -1,5 +1,15 @@
 # Loop campaign scheduling — the Critic as planner
 
+**2026-08-15 — superseded on officer-commanded projects.** This machinery stays live and
+supported for `standard`/`campaign` loops, but the planning role it gives the Critic is
+replaced on `scheduling='officer'` projects by [[officer_backlog_pools]]: the officer
+plans multi-job arcs by queueing ticket chains, so no critic needs to emit a structured
+`loop_plan`. That closes the P3 blocker recorded below by removing the requirement rather
+than fixing the model — MiniMax critics narrated plans in prose and hallucinated "tool
+blocked"; a capable officer brain now does the planning instead. Do not invest further in
+campaign-mode planner prompting for officer projects; do keep the machinery working for
+loops that never get an officer.
+
 **Status**: P0 (dark machinery) + P1 (agent surface + notifications) BUILT
 2026-07-09, uncommitted — migration 0050, plan intake endpoint, planner
 advance path, router opt-in, `loop_plan` tool with checkpoint-only injection,

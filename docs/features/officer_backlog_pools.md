@@ -39,7 +39,14 @@ related:
 
 ## Status
 
-**PROPOSED (2026-08-13). Nothing implemented.** Designed in session with the Legate;
+**PREREQUISITES COMPLETE (2026-08-14) — B1+ READY TO BUILD (2026-08-15).** Nothing in
+*this* document is implemented; everything it depends on is. The blocking item is no
+longer engineering: it is the six §13 defaults awaiting the Legate. See
+[Implementation start-here](#implementation-start-here--the-as-built-substrate-2026-08-14)
+for the substrate as actually built, with anchors — that section exists so a cold session
+can begin B1 without re-deriving yesterday's landings.
+
+**Design provenance: PROPOSED (2026-08-13).** Designed in session with the Legate;
 **refined same day by a six-agent research round** — three codebase audits (**[A1]**
 dispatch/claim/tick seams, **[A2]** ticket/tag/KB plumbing, **[A3]** kickoff/config/cockpit
 blast radius), two external surveys (**[R-fw]** agent frameworks & fleet products, **[R-org]**
@@ -591,6 +598,98 @@ ticket edits, not more gates.
   descriptor/formatter implementation. The officer receives its control and observability
   subset, not MCP's operator/object catalogue.
 
+## Implementation start-here — the as-built substrate (2026-08-14)
+
+Everything below was verified against the tree on 2026-08-15. File anchors are given as
+symbol names, not line numbers (line numbers drift; grep the symbol).
+
+**Migrations.** Next free app migration is **0160** (0157 `project_officers`, 0158 tool-group
+marker repair, 0159 `job_message_routes` are applied). v1 of this feature needs **no
+migration** — category/expert/ready ride `knowledge_index.tags` (§4) and `auto_pull` rides
+the post row's `config_override`. If B3 adds the partial unique index on the ticket stamp
+(§5.3), that is 0160. Regenerate `schema_current.sql` and bump `APP_CURRENT_MIGRATION_HEAD`
+(`tests/test_infrastructure_metering_migrations.py`) whenever a migration lands.
+
+**The post row (B3's home for `auto_pull` + breaker state).** `project_officers` per
+[[officer_post]] §3, with helpers in `orchestrator/database/postgres.py`:
+`get_project_officer`, `get_or_create_project_officer` (self-heals a missing post),
+`merge_project_officer_config` (deep merge, runtime keys stripped — the PATCH substrate,
+so `auto_pull` and `worker_spend_ceiling_daily` land here), `merge_project_officer_state`,
+`get_project_officer_lineage` / `get_officer_capacity_lineage` (**the O2 lineage the tick's
+capacity count must use** — jobs from prior incarnations otherwise stop counting),
+`append_project_officer_while_vacant` / `drain_project_officer_while_vacant` (the ring
+pattern to copy for breaker/ramp state), `merge_project_officer_communication_policy`.
+Config-vs-runtime split per §10 is already enforced by these helpers' shapes: kit/policy on
+the row, live counters in the thread's `officer_state`.
+
+**Dispatch admission is still inline — B3 extracts it.** The officer hold fence, the
+advisory-locked in-flight count, `officer_slots.admit()`, and the slot config patch live
+inside the `POST /api/jobs` handler in `orchestrator/main.py` (grep `officer_slot_admit`).
+There is still no callable funnel: the tick must reuse the extracted helper plus the
+loop-style internal spawn (`_spawn_loop_job` → `db.create_job` + `provision_job_repo` +
+`_trigger_dispatch`), exactly as §5.4 specifies. The advisory lock still does not span the
+INSERT, so §5.3's single-transaction claim+create (or the partial unique index backstop)
+remains required.
+
+**Liveness (§5's stale-claim ages, free).** `orchestrator/services/job_liveness.py`:
+`compute_job_liveness(...)` and the batch `compute_jobs_liveness(...)` — the batch form was
+built project-scoped specifically for this feature. States: `active | waiting | paused |
+suspected_stuck | unavailable | terminal` (a sixth, `terminal`, was added during E3),
+each with `reasons[]` and `last_activity_at`. Thresholds: `JOB_LIVENESS_STALL_MINUTES`
+(default 30), heartbeat freshness 180 s. **`jobs.updated_at` is display-only** — never use
+it for claim age. Consumers already wired: sitrep, `/api/jobs/{id}/progress`,
+`/api/stats/stuck`. §5.3's "claimed-but-stalled" line should be one more consumer, not a
+second computation.
+
+**Evidence (§3's close-checklists, free).** `orchestrator/services/job_evidence.py`:
+manifest recorded at completion into `jobs.context.evidence_manifest` (server entries for
+the completion report + deliverable-check, worker-declared entries resolved in the job's
+Gitea repo, pinned to the completion head sha, measured, published under opaque `ev_*`
+ids); `parse_manifest`, `public_manifest`, `read_evidence_entry`. Officer-facing tools:
+`get_job_completion_report`, `list_job_evidence`, `read_job_evidence`. Kinds v1:
+completion_report, deliverable_check, test_report, screenshot, change_summary. Bounds:
+256 KiB paginated text, 5 images/job, 2000 diff lines, 8 MiB binary. **This is what an
+executor close-checklist reads** — the officer never browses files (K3 ceiling).
+
+**Claim interactions with waiting jobs (changed for the better).** `job_message_routes`
+(0159) means a job in `waiting_for_reply` now has a *bounded* wait: the officer SLA
+(default 15 min) escalates to the user and the total blocking timeout (24 h default)
+resumes the job with an explicit no-answer system reply. §5.3's stale-claim worry is
+therefore mechanically bounded for the message case; the remaining unbounded cases are
+`paused` (orphan/human) and `pending_review`. Claim predicate stays all-non-terminal, and
+`waiting_for_reply` is one of those states — a waiting executor still holds its singleton,
+which is correct.
+
+**Tool surface (if B adds any officer tool).** Descriptors live in
+`src/shared/orch_surface/jobs/{control,inspection}.py` (43 today); each carries `group`,
+`plane` (`job_control | job_observability | job_evidence | job_workspace`),
+`caller_defaults`, `grant`, `phases`. Adding one means: descriptor + `orchestrator/mcp/
+capabilities.py` contract + MCP schema revision bump + regenerate
+`tests/fixtures/job_surface_caller_defaults.json` (`UPDATE_JOB_SURFACE_POLICY_SNAPSHOT=1`)
++ `scripts/generate-job-surface.py` (TS + `docs/generated/job_tool_catalogue.md`) + add the
+name to `config/experts/centurion/config.yaml` (the drift pin
+`tests/test_centurion_supervision_grant.py` fails otherwise) + regenerate
+`tests/fixtures/config_tool_grants.json`. **Most of B needs no new tool** — the tick is
+server-side and the officer curates through existing `kb_*` tools.
+
+**Two ceilings B must respect.** (1) `registry.apply_officer_tool_ceiling` (K3) strips the
+whole `job_workspace` plane and every object-plane category for `officer.enabled is True`
+sessions, under any override — a backlog tool that needed file access would be stripped,
+which is the intended answer, not a bug to work around. (2) The officer lane stamps
+`X-MCP-Scope: project:<uuid>` and the plain session lane deliberately does not
+(`make_bound_handler`) — server-side fencing is `_scope_permits_project`.
+
+**B2's known gaps, unchanged and confirmed still open.** `kb_update` exposes only
+`add_tags` — no removal path exists anywhere (`src/tools/knowledge/knowledge_tools.py`),
+so `ready`/category assignments remain one-way doors until B2 adds `remove_tags`/`set_tags`.
+Machine tags still feed `search_doc` on the agent write path but not the reindex path.
+Officer close instrument is `kb_update(status='resolved'|'archived')`.
+
+**Live-fire preconditions (unchanged, both still owed).** O6 — release the Resavio officer
+through `POST /api/projects/{id}/officer/release`; and the KB hygiene pair — retire the
+0.92-confidence "No renderer available" RecallStore belief on project `68137e29`, and run
+`docker/assert-browser-stack.sh` once on a live workspace.
+
 ## 11. Build delta (slices)
 
 **Pre-B3 gates outside this document:** officer_post O2; officer knowledge K1–K3;
@@ -691,14 +790,20 @@ In order:
 
 ## 13. Open questions (Legate)
 
+**These six are the only thing between here and B1.** Every engineering prerequisite
+landed 2026-08-14; each answer below parameterizes a specific slice, and each carries a
+recommendation that can simply be confirmed. B1/B2 can be built before they are answered
+(the category module and ticket plumbing take no numbers); B3 needs 1–5, B7 needs 6.
+
 1. `auto_pull` default at ship: **off, flipped per-century during acceptance** (rec) — or
    on for every new commission?
 2. Ready-depth floor default 2 per pool (rec)? Floor-breach wake debounce (rec: once per
    pool per 6h)?
 3. `worker_spend_ceiling_daily` default (rec: set per-century at commission, no global
    default — cost profiles differ too much between MiniMax and sol pools).
-4. Per-ticket budget-cap defaults per category (rec: researcher < executor; concrete
-   numbers at implementation after measuring current job costs).
+4. Per-ticket budget-cap defaults per category (rec: researcher < executor; derive the
+   concrete numbers at implementation from `usage_ledger.query_usage` over recent loop
+   jobs rather than guessing — the per-job cost history is already queryable).
 5. Stale-claim threshold T (rec: 4h) and whether `pending_review` claims page after 24h.
 6. `writer` expert in the first wave or after the first acceptance week?
 
