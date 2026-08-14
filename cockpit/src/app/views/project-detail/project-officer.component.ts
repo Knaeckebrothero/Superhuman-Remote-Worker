@@ -9,46 +9,29 @@ import {
 } from '@angular/core';
 import {DatePipe, DecimalPipe} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
-import {Router} from '@angular/router';
+import {Router, RouterLink} from '@angular/router';
 import {firstValueFrom} from 'rxjs';
 
 import {environment} from '../../core/environment';
+import {ApiService} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
+import type {
+  OfficerBrainSpec,
+  OfficerDecommissionResult,
+  OfficerHold,
+  OfficerKitSlot,
+  OfficerPost,
+  OfficerPostPatch,
+  OfficerVacantLedger,
+  WorkerMessagesPolicy,
+} from '../../core/models/api.model';
 import {AppButtonComponent} from '../../ui/button';
 import {AppInputComponent} from '../../ui/input';
 import {AppSelectComponent} from '../../ui/select';
 import {AppFormFieldComponent} from '../../ui/form-field';
 import {AppSpinnerComponent} from '../../ui/spinner';
 
-/** One typed worker allocation of the officer's kit (S5b slot roster). */
-export interface OfficerSlotSpec {
-  count: number;
-  model?: string;
-  backend?: string;
-}
-
-/** `GET /api/projects/{id}/officer` — the officer card's data shape. */
-export interface OfficerSummary {
-  officer: {
-    thread_id: string;
-    status: string;
-    title?: string | null;
-    created_at?: string | null;
-    hold?: {kind?: string; thread_id?: string; since?: string} | null;
-    slots?: Record<string, OfficerSlotSpec> | null;
-    model?: string | null;
-    reasoning_level?: string | null;
-    sleep_minutes?: {min: number; max: number};
-  } | null;
-  next_wake_at?: string | null;
-  pending_events?: number;
-  pages_today?: {used: number; budget: number};
-  token_ceiling?: {daily: number; deferred_today: boolean};
-  digest?: {at: string; subject: string; message: string}[];
-  conference?: {thread_id: string; status: string} | null;
-}
-
-/** Editable roster row in the provision form. */
+/** Editable roster row in the kit editor. */
 export interface SlotDraft {
   name: string;
   count: number;
@@ -56,15 +39,146 @@ export interface SlotDraft {
   backend: string;
 }
 
+/** The whole kit editor as plain strings ('' = unset / server default). */
+export interface OfficerEditorDraft {
+  slots: SlotDraft[];
+  brainModel: string;
+  reasoning: string;
+  sleepMin: string;
+  sleepMax: string;
+  tokenCeiling: string;
+  maxPages: string;
+  maxActions: string;
+  maxWorkers: string;
+}
+
+/** The card's one state machine (officer_post.md §8). */
+export type OfficerPostState = 'vacant' | 'commissioned' | 'held';
+
+/** §11 Q2 (decided: keep): the draft a never-kitted vacant post starts from. */
+export const STARTER_SLOT_DRAFT: SlotDraft = {
+  name: 'line',
+  count: 2,
+  model: '',
+  backend: 'sandbox',
+};
+
+/** Vacant / commissioned / held — held is commissioned-and-standing-down. */
+export function postStateOf(post: OfficerPost | null): OfficerPostState {
+  if (!post?.commissioned) return 'vacant';
+  return post.held ? 'held' : 'commissioned';
+}
+
+/**
+ * "held — maintenance" / "held — conference" from the hold's kind — replaces
+ * the old hardcoded "held — conference in progress", which was wrong for
+ * maintenance holds. The note renders separately.
+ */
+export function holdBadgeLabel(held: OfficerHold | null | undefined): string {
+  const kind = held?.kind?.trim();
+  return kind ? `held — ${kind}` : 'held';
+}
+
+/** Editor fields grouped by when a live edit actually lands (§7's table). */
+export type OfficerEditField =
+  | 'slots'
+  | 'max_concurrent_workers'
+  | 'daily_token_ceiling'
+  | 'max_pages_per_day'
+  | 'sleep'
+  | 'max_actions_per_wake'
+  | 'brain';
+
+/** Per-field honesty: what the §7 table promises, verbatim in the UI. */
+export function immediacyLabel(field: OfficerEditField): string {
+  switch (field) {
+    case 'slots':
+    case 'max_concurrent_workers':
+      return 'applies at next dispatch';
+    case 'daily_token_ceiling':
+    case 'max_pages_per_day':
+      return 'applies at next delivery';
+    case 'sleep':
+      return 'applies at next sleep filing';
+    case 'max_actions_per_wake':
+    case 'brain':
+      return 'applies on next respawn';
+  }
+}
+
+/**
+ * Shrinking a slot below its in-flight count is drain semantics (§7, decided):
+ * new dispatches 409, running jobs are untouched. The hint says so.
+ */
+export function drainHint(
+  inFlight: number | null | undefined,
+  newCount: number,
+): string | null {
+  if (!inFlight || newCount >= inFlight) return null;
+  return `${inFlight} in flight — drains to ${newCount}`;
+}
+
+/** Utilization chip per kit slot: `line 1/2 · MiniMax-M3 · vm` (×N without live data). */
+export function kitChips(
+  kit: Record<string, OfficerKitSlot> | null | undefined,
+): {name: string; label: string}[] {
+  if (!kit) return [];
+  return Object.entries(kit).map(([name, s]) => {
+    const alloc = s.in_flight != null ? `${s.in_flight}/${s.count}` : `×${s.count}`;
+    const parts = [`${name} ${alloc}`];
+    if (s.model) parts.push(s.model);
+    if (s.backend) parts.push(s.backend);
+    return {name, label: parts.join(' · ')};
+  });
+}
+
+/**
+ * Seed the editor from the post. A never-kitted VACANT post gets the starter
+ * draft (§11 Q2: keep it); a commissioned officer without slots is genuinely
+ * flat-cap — no starter is invented for him. Vacant posts expose only `kit`
+ * in the O1–O4 contract, so the non-kit fields seed to '' until commissioned.
+ */
+export function draftFromPost(post: OfficerPost | null): OfficerEditorDraft {
+  const kit = post?.kit ?? null;
+  const kitRows: SlotDraft[] = kit
+    ? Object.entries(kit).map(([name, s]) => ({
+        name,
+        count: s.count,
+        model: s.model ?? '',
+        backend: s.backend ?? '',
+      }))
+    : [];
+  const slots = kitRows.length
+    ? kitRows
+    : post?.commissioned
+      ? []
+      : [{...STARTER_SLOT_DRAFT}];
+  const o = post?.officer ?? null;
+  const num = (v: number | null | undefined): string => (v == null ? '' : String(v));
+  return {
+    slots,
+    brainModel: o?.model ?? '',
+    reasoning: o?.reasoning_level ?? '',
+    sleepMin: num(o?.sleep_minutes?.min),
+    sleepMax: num(o?.sleep_minutes?.max),
+    tokenCeiling: num(o?.token_ceiling?.daily),
+    maxPages: num(o?.pages_today?.budget),
+    maxActions: num(o?.max_actions_per_wake),
+    maxWorkers: num(o?.max_concurrent_workers),
+  };
+}
+
 /** Assemble the `officer.slots` spec from form rows; null = no roster (flat cap). */
 export function buildSlotsSpec(
   rows: SlotDraft[],
-): Record<string, OfficerSlotSpec> | null {
-  const spec: Record<string, OfficerSlotSpec> = {};
+): Record<string, {count: number; model?: string; backend?: string}> | null {
+  const spec: Record<string, {count: number; model?: string; backend?: string}> = {};
   for (const row of rows) {
     const name = row.name.trim().toLowerCase();
     if (!name) continue;
-    const entry: OfficerSlotSpec = {count: Math.max(1, Math.floor(row.count))};
+    const entry: {count: number; model?: string; backend?: string} = {
+      count: Math.max(1, Math.floor(row.count)),
+    };
     if (row.model.trim()) entry.model = row.model.trim();
     if (row.backend.trim()) entry.backend = row.backend.trim();
     spec[name] = entry;
@@ -72,24 +186,91 @@ export function buildSlotsSpec(
   return Object.keys(spec).length ? spec : null;
 }
 
-/** Build the standing officer's trusted thread-create request. */
-export function buildOfficerThreadCreateBody(
-  projectId: string,
-  projectName: string,
-  officer: Record<string, unknown>,
-  model = '',
-  reasoningLevel = '',
-): Record<string, unknown> {
-  const body: Record<string, unknown> = {
-    title: `Centurion — ${projectName || 'project'}`,
-    config_name: 'centurion',
-    project_ids: [projectId],
-    use_datasource_defaults: true,
-    config_override: {officer},
+/**
+ * Full request body from the editor — the commission body, and the base both
+ * sides of the PATCH diff are computed from. Blank fields are omitted, not
+ * nulled: commission must not clear row state the editor never saw.
+ */
+export function buildOfficerConfig(draft: OfficerEditorDraft): OfficerPostPatch {
+  const body: OfficerPostPatch = {};
+  const slots = buildSlotsSpec(draft.slots);
+  if (slots) body.slots = slots;
+  const brain: OfficerBrainSpec = {};
+  if (draft.brainModel.trim()) brain.model = draft.brainModel.trim();
+  if (draft.reasoning) brain.reasoning_level = draft.reasoning;
+  if (Object.keys(brain).length) body.brain = brain;
+  const num = (v: string): number | undefined => {
+    const n = parseInt(v, 10);
+    return Number.isNaN(n) ? undefined : n;
   };
-  if (model.trim()) body['model'] = model.trim();
-  if (reasoningLevel) body['reasoning_level'] = reasoningLevel;
+  const sleepMin = num(draft.sleepMin);
+  if (sleepMin !== undefined) body.sleep_min_minutes = sleepMin;
+  const sleepMax = num(draft.sleepMax);
+  if (sleepMax !== undefined) body.sleep_max_minutes = sleepMax;
+  const ceiling = num(draft.tokenCeiling);
+  if (ceiling !== undefined) body.daily_token_ceiling = ceiling;
+  const pages = num(draft.maxPages);
+  if (pages !== undefined) body.max_pages_per_day = pages;
+  const actions = num(draft.maxActions);
+  if (actions !== undefined) body.max_actions_per_wake = actions;
+  const workers = num(draft.maxWorkers);
+  if (workers !== undefined) body.max_concurrent_workers = workers;
   return body;
+}
+
+const PATCH_FIELDS: (keyof OfficerPostPatch)[] = [
+  'slots',
+  'brain',
+  'sleep_min_minutes',
+  'sleep_max_minutes',
+  'daily_token_ceiling',
+  'max_pages_per_day',
+  'max_actions_per_wake',
+  'max_concurrent_workers',
+];
+
+/**
+ * Field-wise diff against the post's last known state: only what actually
+ * changed goes on the wire (the server injects a notice per edit — don't cry
+ * wolf). A field the user cleared PATCHes as explicit null. Deliberately
+ * never emits `communication_policy` — the routing control PATCHes that
+ * alone (§7: a row-only, user-owned field).
+ */
+export function buildOfficerPatch(
+  baseline: OfficerEditorDraft,
+  draft: OfficerEditorDraft,
+): OfficerPostPatch {
+  const before = buildOfficerConfig(baseline);
+  const after = buildOfficerConfig(draft);
+  const patch: OfficerPostPatch = {};
+  for (const field of PATCH_FIELDS) {
+    const a = before[field];
+    const b = after[field];
+    if (JSON.stringify(a ?? null) !== JSON.stringify(b ?? null)) {
+      (patch as Record<string, unknown>)[field] = b ?? null;
+    }
+  }
+  return patch;
+}
+
+/**
+ * Normalize the while-vacant ledger. The O3 shape is `{entries, dropped}`
+ * (ring, cap 20, drop-oldest); a bare array is tolerated so the card renders
+ * either way while the backend contract settles.
+ */
+export function vacantLedgerOf(
+  post: OfficerPost | null,
+): {entries: NonNullable<OfficerVacantLedger['entries']>; dropped: number} | null {
+  const raw = post?.while_vacant as
+    | OfficerVacantLedger
+    | OfficerVacantLedger['entries']
+    | null
+    | undefined;
+  if (!raw) return null;
+  const entries = Array.isArray(raw) ? raw : (raw.entries ?? []);
+  const dropped = Array.isArray(raw) ? 0 : (raw.dropped ?? 0);
+  if (!entries.length && !dropped) return null;
+  return {entries, dropped};
 }
 
 /** Build the officer conference's trusted thread-create request. */
@@ -117,13 +298,17 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
 }
 
 /**
- * Project Centurion tab — the officer card (centurion.md S9).
+ * Project Centurion tab — the officer's POST (officer_post.md §8).
  *
- * Shows whether the project has a standing officer, his live state (next
- * wake, queued events, page budget, digest, kit), and owns the lifecycle:
- * provision (with a slot-roster kit), open his log, open/reattach the
- * conference, retire. The log IS his session transcript — the card links
- * there rather than duplicating it.
+ * One card, one state machine: vacant / commissioned / held. The kit editor
+ * is the card body in every state — seeded from the row while vacant (last
+ * real kit, else the starter draft) and populated live once commissioned,
+ * with per-slot utilization, per-field immediacy labels (§7), spend against
+ * the ceiling, and the lifecycle: commission, hold/release, decommission
+ * (warning on in-flight jobs — they are left running, never cancelled). The
+ * log IS his session transcript — the card links there rather than
+ * duplicating it. Worker-question routing (officer_message_routing.md §6) is
+ * the one row-only policy and PATCHes alone.
  */
 @Component({
   selector: 'app-project-officer',
@@ -131,6 +316,7 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
   imports: [
     DatePipe,
     DecimalPipe,
+    RouterLink,
     AppButtonComponent,
     AppInputComponent,
     AppSelectComponent,
@@ -145,86 +331,422 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
           A standing officer for this project: he holds the charge, watches
           jobs and fleet, dispatches workers from his kit, and pages you only
           when something genuinely needs you. You talk to him in a conference;
-          his background log is the session transcript.
+          his background log is the session transcript. The post outlives him
+          — kit, budgets, and memory stay with it between incarnations.
         </p>
       </div>
 
       @if (loading()) {
         <div class="officer-loading"><app-spinner size="md" tone="accent" /></div>
-      } @else if (summary()?.officer; as o) {
-        <div class="officer-card" data-testid="officer-card">
-          <div class="officer-status-row">
-            <span class="officer-badge" [attr.data-status]="o.status">{{ o.status }}</span>
-            @if (o.hold) {
-              <span class="officer-hold" data-testid="officer-hold">held — conference in progress</span>
-            }
-            <span class="officer-title">{{ o.title || 'Centurion' }}</span>
-          </div>
+      } @else {
+        <div class="officer-card" data-testid="officer-card" [attr.data-state]="postState()">
+          @if (postState() === 'vacant') {
+            <p class="officer-hint">
+              The post is vacant — no centurion holds this century. Assign the
+              kit and commission him: he chooses which troops to send; you
+              decide what they are made of.
+            </p>
 
-          <div class="officer-meta">
-            <div>
-              <span class="k">Next wake</span>
-              <span class="v" data-testid="next-wake">{{ wakeLabel() }}</span>
-            </div>
-            <div>
-              <span class="k">Queued events</span>
-              <span class="v">{{ summary()?.pending_events ?? 0 }}</span>
-            </div>
-            <div>
-              <span class="k">Pages today</span>
-              <span class="v">{{ summary()?.pages_today?.used ?? 0 }}/{{ summary()?.pages_today?.budget ?? 3 }}</span>
-            </div>
-            @if (summary()?.token_ceiling?.daily) {
-              <div>
-                <span class="k">Token ceiling</span>
-                <span class="v">
-                  {{ summary()?.token_ceiling?.daily | number }}
-                  @if (summary()?.token_ceiling?.deferred_today) {
-                    <span class="officer-warn">— reached; sleeping until reset</span>
-                  }
-                </span>
+            @if (vacantLedger(); as ledger) {
+              <div class="officer-ledger" data-testid="officer-vacant-ledger">
+                <div class="officer-section-title">While the post was vacant</div>
+                @for (e of ledger.entries; track $index) {
+                  <div class="officer-ledger-item">
+                    @if (e.at) { <span class="dim">{{ e.at | date: 'short' }}</span> }
+                    <span>{{ e.title || e.job_id }}</span>
+                    @if (e.status) { <span class="officer-ledger-status">{{ e.status }}</span> }
+                  </div>
+                }
+                @if (ledger.dropped) {
+                  <div class="dim">… {{ ledger.dropped }} older entr{{ ledger.dropped === 1 ? 'y' : 'ies' }} dropped</div>
+                }
               </div>
             }
-            <div>
-              <span class="k">Sleep bounds</span>
-              <span class="v">{{ o.sleep_minutes?.min ?? 5 }}–{{ o.sleep_minutes?.max ?? 60 }} min</span>
+          } @else {
+            @if (post()?.officer; as o) {
+              <div class="officer-status-row">
+                <span class="officer-badge" [attr.data-status]="o.status">{{ o.status }}</span>
+                @if (post()?.held; as h) {
+                  <span class="officer-hold" data-testid="officer-hold">{{ holdLabel() }}</span>
+                  @if (h.note) {
+                    <span class="officer-hold-note" data-testid="officer-hold-note">{{ h.note }}</span>
+                  }
+                }
+                <span class="officer-title">{{ o.title || 'Centurion' }}</span>
+              </div>
+
+              <div class="officer-meta">
+                <div>
+                  <span class="k">Next wake</span>
+                  <span class="v" data-testid="next-wake">{{ wakeLabel() }}</span>
+                </div>
+                <div>
+                  <span class="k">Queued events</span>
+                  <span class="v">{{ o.pending_events ?? 0 }}</span>
+                </div>
+                <div>
+                  <span class="k">Pages today</span>
+                  <span class="v">{{ o.pages_today?.used ?? 0 }}/{{ o.pages_today?.budget ?? 3 }}</span>
+                </div>
+                @if (post()?.spend_today; as spend) {
+                  <div>
+                    <span class="k">Spend today</span>
+                    <span class="v" data-testid="officer-spend">
+                      {{ (spend.tokens ?? 0) | number }}
+                      @if (spendCeiling() != null) {
+                        / {{ spendCeiling() | number }}
+                      }
+                      tokens
+                      @if (o.token_ceiling?.deferred_today) {
+                        <span class="officer-warn">— ceiling reached; sleeping until reset</span>
+                      }
+                    </span>
+                  </div>
+                }
+                <div>
+                  <span class="k">His model</span>
+                  <span class="v" data-testid="officer-model">
+                    {{ o.model || 'session default' }}
+                    @if (o.reasoning_level) { · {{ o.reasoning_level }} }
+                  </span>
+                </div>
+              </div>
+
+              @if (kitRows().length) {
+                <div class="officer-slots" data-testid="officer-slots">
+                  <span class="k">Kit</span>
+                  @for (s of kitRows(); track s.name) {
+                    <span class="officer-slot-chip">{{ s.label }}</span>
+                  }
+                </div>
+              }
+            }
+          }
+
+          <!-- THE EDITOR — the same editor in every state (§8) -->
+          <div class="officer-editor" data-testid="officer-editor">
+            <div class="officer-editor-head">
+              <span class="officer-section-title">His brain</span>
+              @if (showImmediacy()) {
+                <span class="officer-immediacy" data-testid="immediacy-brain">{{ immediacy('brain') }}</span>
+              }
             </div>
-            <div>
-              <span class="k">His model</span>
-              <span class="v" data-testid="officer-model">
-                {{ o.model || 'session default' }}
-                @if (o.reasoning_level) { · {{ o.reasoning_level }} }
-              </span>
+            <div class="officer-slot-row">
+              <app-form-field
+                label="Officer's own model"
+                hint="The brain his judgment runs on — pick a strong one; his wakes are cheap but his decisions steer everything. Blank = your session default."
+              >
+                <app-select [value]="fBrainModel()" (changed)="fBrainModel.set($event ?? '')">
+                  <option value="">session default</option>
+                  @for (m of modelOptions(); track m) {
+                    <option [value]="m">{{ m }}</option>
+                  }
+                </app-select>
+              </app-form-field>
+              <app-form-field
+                label="Reasoning"
+                hint="Effort per wake. Clamped to what the model supports."
+              >
+                <app-select [value]="fReasoning()" (changed)="fReasoning.set($event ?? '')">
+                  <option value="">default (high)</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                  <option value="max">max</option>
+                </app-select>
+              </app-form-field>
+              <app-form-field label="Actions per wake" hint="Hard cap on tool calls each wake.">
+                <app-input
+                  type="number"
+                  [value]="fMaxActions()"
+                  (changed)="fMaxActions.set($event)"
+                  placeholder="default"
+                />
+              </app-form-field>
+            </div>
+
+            <div class="officer-editor-head">
+              <span class="officer-section-title">Kit</span>
+              @if (showImmediacy()) {
+                <span class="officer-immediacy" data-testid="immediacy-slots">{{ immediacy('slots') }}</span>
+              }
+            </div>
+            @for (row of slotDrafts(); track $index; let i = $index) {
+              <div class="officer-slot-row">
+                <app-form-field label="Slot">
+                  <app-input
+                    [value]="row.name"
+                    (changed)="patchSlot(i, {name: $event})"
+                    placeholder="line"
+                  />
+                </app-form-field>
+                <app-form-field label="Count">
+                  <app-input
+                    type="number"
+                    [value]="'' + row.count"
+                    (changed)="patchSlot(i, {count: toCount($event)})"
+                  />
+                </app-form-field>
+                <app-form-field label="Model">
+                  <app-select [value]="row.model" (changed)="patchSlot(i, {model: $event ?? ''})">
+                    <option value="">worker default</option>
+                    @for (m of modelOptions(); track m) {
+                      <option [value]="m">{{ m }}</option>
+                    }
+                  </app-select>
+                </app-form-field>
+                <app-form-field label="Workspace">
+                  <app-select [value]="row.backend" (changed)="patchSlot(i, {backend: $event ?? ''})">
+                    <option value="">default</option>
+                    <option value="sandbox">sandbox</option>
+                    <option value="virtual">virtual</option>
+                    <option value="none">none</option>
+                    <option value="vm">VM (root)</option>
+                  </app-select>
+                </app-form-field>
+                <app-button variant="secondary" size="sm" (clicked)="removeSlot(i)">✕</app-button>
+              </div>
+              @if (drainHints()[i]; as hint) {
+                <div class="officer-drain" data-testid="drain-hint">{{ hint }}</div>
+              }
+            }
+            <div class="officer-slot-row">
+              <app-form-field
+                label="Max workers"
+                hint="Flat concurrency cap. Without a kit it is the only gate (default 3)."
+              >
+                <app-input
+                  type="number"
+                  [value]="fMaxWorkers()"
+                  (changed)="fMaxWorkers.set($event)"
+                  placeholder="3"
+                />
+              </app-form-field>
+              <app-button variant="secondary" size="sm" [disabled]="busy()" (clicked)="addSlot()">
+                Add slot
+              </app-button>
+            </div>
+
+            <div class="officer-editor-head">
+              <span class="officer-section-title">Budgets</span>
+              @if (showImmediacy()) {
+                <span class="officer-immediacy" data-testid="immediacy-budgets">{{ immediacy('daily_token_ceiling') }}</span>
+              }
+            </div>
+            <div class="officer-slot-row">
+              <app-form-field
+                label="Daily token ceiling"
+                hint="Across his whole command. Blank = no ceiling."
+              >
+                <app-input
+                  type="number"
+                  [value]="fTokenCeiling()"
+                  (changed)="fTokenCeiling.set($event)"
+                  placeholder="unlimited"
+                />
+              </app-form-field>
+              <app-form-field label="Pages per day" hint="How often he may page you (default 3).">
+                <app-input
+                  type="number"
+                  [value]="fMaxPages()"
+                  (changed)="fMaxPages.set($event)"
+                  placeholder="3"
+                />
+              </app-form-field>
+            </div>
+
+            <div class="officer-editor-head">
+              <span class="officer-section-title">Sleep</span>
+              @if (showImmediacy()) {
+                <span class="officer-immediacy" data-testid="immediacy-sleep">{{ immediacy('sleep') }}</span>
+              }
+            </div>
+            <div class="officer-slot-row">
+              <app-form-field
+                label="Min (minutes)"
+                hint="He files his own sleep between wakes; the server clamps to these bounds."
+              >
+                <app-input
+                  type="number"
+                  [value]="fSleepMin()"
+                  (changed)="fSleepMin.set($event)"
+                  placeholder="5"
+                />
+              </app-form-field>
+              <app-form-field label="Max (minutes)">
+                <app-input
+                  type="number"
+                  [value]="fSleepMax()"
+                  (changed)="fSleepMax.set($event)"
+                  placeholder="60"
+                />
+              </app-form-field>
             </div>
           </div>
 
-          @if (slotRows().length) {
-            <div class="officer-slots" data-testid="officer-slots">
-              <span class="k">Kit</span>
-              @for (s of slotRows(); track s.name) {
-                <span class="officer-slot-chip">
-                  {{ s.name }} ×{{ s.count }}
-                  @if (s.model) { · {{ s.model }} }
-                  @if (s.backend) { · {{ s.backend }} }
-                </span>
+          @if (postState() === 'vacant') {
+            <div class="officer-actions">
+              <app-button
+                variant="primary"
+                size="sm"
+                [disabled]="busy()"
+                (clicked)="commission()"
+                data-testid="officer-commission"
+              >
+                Commission centurion
+              </app-button>
+            </div>
+            <p class="officer-hint dim">
+              No slots = a flat cap of 3 concurrent workers. The officer runs
+              headless; his first wake carries the continuity brief — and the
+              while-vacant ledger, if jobs finished without him.
+            </p>
+          } @else {
+            <div class="officer-actions">
+              <app-button
+                variant="primary"
+                size="sm"
+                [disabled]="busy() || !dirty()"
+                (clicked)="saveEdits()"
+                data-testid="officer-save"
+              >
+                Save changes
+              </app-button>
+              <app-button variant="secondary" size="sm" (clicked)="openLog()">Open log</app-button>
+              <app-button variant="secondary" size="sm" [disabled]="busy()" (clicked)="openConference()">
+                {{ post()?.officer?.conference ? 'Rejoin conference' : 'Conference' }}
+              </app-button>
+              @if (postState() === 'held') {
+                <app-button
+                  variant="secondary"
+                  size="sm"
+                  [disabled]="busy()"
+                  (clicked)="release()"
+                  data-testid="officer-release"
+                >
+                  Release
+                </app-button>
+              } @else if (!holdArmed()) {
+                <app-button variant="secondary" size="sm" [disabled]="busy()" (clicked)="holdArmed.set(true)">
+                  Hold
+                </app-button>
+              }
+              @if (!decommissionArmed()) {
+                <app-button
+                  variant="danger"
+                  size="sm"
+                  [disabled]="busy()"
+                  (clicked)="decommissionArmed.set(true)"
+                >
+                  Decommission
+                </app-button>
+              }
+            </div>
+
+            @if (holdArmed()) {
+              <div class="officer-confirm" data-testid="officer-hold-confirm">
+                <app-form-field
+                  label="Hold note"
+                  hint="Shown on the badge — why he is standing down. Legate input still reaches him while held."
+                >
+                  <app-input
+                    [value]="holdNote()"
+                    (changed)="holdNote.set($event)"
+                    placeholder="maintenance"
+                  />
+                </app-form-field>
+                <div class="officer-actions">
+                  <app-button variant="primary" size="sm" [disabled]="busy()" (clicked)="hold()">
+                    Confirm hold
+                  </app-button>
+                  <app-button variant="secondary" size="sm" (clicked)="holdArmed.set(false)">Cancel</app-button>
+                </div>
+              </div>
+            }
+
+            @if (decommissionArmed()) {
+              <div class="officer-confirm" data-testid="officer-decommission-confirm">
+                @if (decommissionWarning(); as warn) {
+                  <p class="officer-hint" data-testid="officer-decommission-warning">
+                    He has {{ warn.in_flight_jobs?.length ?? 0 }} job(s) in flight.
+                    Decommissioning leaves them running — their completions land on
+                    the post's ledger for his successor.
+                  </p>
+                  @for (j of warn.in_flight_jobs ?? []; track j.job_id) {
+                    <div class="officer-ledger-item">
+                      <span>{{ j.title || shortId(j.job_id) }}</span>
+                      @if (j.slot) { <span class="officer-slot-chip">{{ j.slot }}</span> }
+                      @if (j.status) { <span class="dim">{{ j.status }}</span> }
+                    </div>
+                  }
+                  <div class="officer-actions">
+                    <app-button
+                      variant="danger"
+                      size="sm"
+                      [disabled]="busy()"
+                      (clicked)="decommission(true)"
+                      data-testid="officer-decommission-force"
+                    >
+                      Decommission — leave them running
+                    </app-button>
+                    <app-button variant="secondary" size="sm" (clicked)="cancelDecommission()">Keep him</app-button>
+                  </div>
+                } @else {
+                  <p class="officer-hint">
+                    His kit, budgets, digest, and sitrep fingerprints stay on the
+                    post; recommissioning restores them with a continuity brief.
+                  </p>
+                  <div class="officer-actions">
+                    <app-button
+                      variant="danger"
+                      size="sm"
+                      [disabled]="busy()"
+                      (clicked)="decommission(false)"
+                      data-testid="officer-decommission"
+                    >
+                      Confirm decommission
+                    </app-button>
+                    <app-button variant="secondary" size="sm" (clicked)="cancelDecommission()">Keep him</app-button>
+                  </div>
+                }
+              </div>
+            }
+          }
+
+          <!-- Worker questions — the row-only routing policy; exists in every state -->
+          <div class="officer-policy" data-testid="officer-policy">
+            <div class="officer-editor-head">
+              <span class="officer-section-title">Worker questions</span>
+            </div>
+            <app-form-field label="When a worker asks a question" [hint]="policyHint()">
+              <app-select [value]="policyValue()" (changed)="setPolicy($event)">
+                <option value="user_direct">Direct to me</option>
+                <option value="officer_and_user">Officer and me</option>
+                <option value="officer_first">{{ officerFirstLabel() }}</option>
+              </app-select>
+            </app-form-field>
+          </div>
+
+          @if (postState() === 'vacant' && incarnations().length) {
+            <div class="officer-incarnations" data-testid="officer-incarnations">
+              <div class="officer-section-title">Past incarnations</div>
+              @for (inc of incarnations(); track inc.thread_id) {
+                <div class="officer-ledger-item">
+                  <a class="officer-incarnation-link" [routerLink]="['/sessions', inc.thread_id]">
+                    {{ shortId(inc.thread_id) }}
+                  </a>
+                  <span class="dim">
+                    {{ inc.commissioned_at | date: 'mediumDate' }} →
+                    {{ inc.decommissioned_at | date: 'mediumDate' }}
+                  </span>
+                  @if (inc.reason) { <span>{{ inc.reason }}</span> }
+                </div>
               }
             </div>
           }
 
-          <div class="officer-actions">
-            <app-button variant="primary" size="sm" (clicked)="openLog()">Open log</app-button>
-            <app-button variant="secondary" size="sm" [disabled]="busy()" (clicked)="openConference()">
-              {{ summary()?.conference ? 'Rejoin conference' : 'Conference' }}
-            </app-button>
-            @if (!retireArmed()) {
-              <app-button variant="danger" size="sm" [disabled]="busy()" (clicked)="retireArmed.set(true)">Retire</app-button>
-            } @else {
-              <app-button variant="danger" size="sm" [disabled]="busy()" (clicked)="retire()">Confirm retire</app-button>
-              <app-button variant="secondary" size="sm" (clicked)="retireArmed.set(false)">Keep him</app-button>
-            }
-          </div>
-
-          @if (digest().length) {
+          @if (postState() !== 'vacant' && digest().length) {
             <div class="officer-digest" data-testid="officer-digest">
               <div class="officer-digest-title">Digest — what he queued for you</div>
               @for (d of digest(); track $index) {
@@ -236,88 +758,6 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
               }
             </div>
           }
-        </div>
-      } @else {
-        <!-- PROVISION FORM -->
-        <div class="officer-card" data-testid="provision-form">
-          <p class="officer-hint">
-            No centurion holds this century yet. Assign the kit — he chooses
-            which troops to send; you decide what they are made of.
-          </p>
-
-          <div class="officer-slot-row">
-            <app-form-field
-              label="Officer's own model"
-              hint="The brain his judgment runs on — pick a strong one; his wakes are cheap but his decisions steer everything. Blank = your session default."
-            >
-              <app-select [value]="fBrainModel()" (changed)="fBrainModel.set($event ?? '')">
-                <option value="">session default</option>
-                @for (m of modelOptions(); track m) {
-                  <option [value]="m">{{ m }}</option>
-                }
-              </app-select>
-            </app-form-field>
-            <app-form-field
-              label="Reasoning"
-              hint="Effort per wake. Clamped to what the model supports."
-            >
-              <app-select [value]="fReasoning()" (changed)="fReasoning.set($event ?? '')">
-                <option value="">default (high)</option>
-                <option value="low">low</option>
-                <option value="medium">medium</option>
-                <option value="high">high</option>
-                <option value="xhigh">xhigh</option>
-                <option value="max">max</option>
-              </app-select>
-            </app-form-field>
-          </div>
-
-          @for (row of slotDrafts(); track $index; let i = $index) {
-            <div class="officer-slot-row">
-              <app-form-field label="Slot">
-                <app-input
-                  [value]="row.name"
-                  (changed)="patchSlot(i, {name: $event})"
-                  placeholder="line"
-                />
-              </app-form-field>
-              <app-form-field label="Count">
-                <app-input
-                  type="number"
-                  [value]="'' + row.count"
-                  (changed)="patchSlot(i, {count: toCount($event)})"
-                />
-              </app-form-field>
-              <app-form-field label="Model">
-                <app-select [value]="row.model" (changed)="patchSlot(i, {model: $event ?? ''})">
-                  <option value="">worker default</option>
-                  @for (m of modelOptions(); track m) {
-                    <option [value]="m">{{ m }}</option>
-                  }
-                </app-select>
-              </app-form-field>
-              <app-form-field label="Workspace">
-                <app-select [value]="row.backend" (changed)="patchSlot(i, {backend: $event ?? ''})">
-                  <option value="">default</option>
-                  <option value="sandbox">sandbox</option>
-                  <option value="virtual">virtual</option>
-                  <option value="none">none</option>
-                  <option value="vm">VM (root)</option>
-                </app-select>
-              </app-form-field>
-              <app-button variant="secondary" size="sm" (clicked)="removeSlot(i)">✕</app-button>
-            </div>
-          }
-          <div class="officer-actions">
-            <app-button variant="secondary" size="sm" (clicked)="addSlot()">Add slot</app-button>
-            <app-button variant="primary" size="sm" [disabled]="busy()" (clicked)="provision()">
-              Provision centurion
-            </app-button>
-          </div>
-          <p class="officer-hint dim">
-            No slots = a flat cap of 3 concurrent workers. The officer runs
-            headless; opening his session after provisioning boots him.
-          </p>
         </div>
       }
 
@@ -354,6 +794,7 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
       .officer-badge[data-status='active'] { background: color-mix(in srgb, var(--success, #22c55e) 18%, transparent); color: var(--success, #22c55e); }
       .officer-badge[data-status='suspended'] { background: color-mix(in srgb, var(--warning, #eab308) 18%, transparent); color: var(--warning, #eab308); }
       .officer-hold { font-size: 12px; color: var(--warning, #eab308); }
+      .officer-hold-note { font-size: 12px; color: var(--text-secondary); font-style: italic; }
       .officer-title { font-weight: 600; font-size: 13px; }
       .officer-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px 16px; }
       .officer-meta .k, .officer-slots .k { display: block; font-size: 11px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.4px; }
@@ -367,7 +808,33 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
         border: 1px solid var(--border-color);
         background: var(--bg-tertiary);
       }
+      .officer-editor { display: flex; flex-direction: column; gap: 10px; }
+      .officer-editor-head { display: flex; align-items: baseline; gap: 10px; margin-top: 4px; }
+      .officer-section-title { font-size: 12px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.4px; }
+      .officer-immediacy {
+        font-size: 11px;
+        color: var(--text-tertiary);
+        font-style: italic;
+        padding: 1px 8px;
+        border-radius: 999px;
+        border: 1px dashed var(--border-color);
+      }
+      .officer-drain { font-size: 12px; color: var(--warning, #eab308); padding-left: 2px; }
       .officer-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .officer-confirm {
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 10px 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        background: var(--bg-tertiary);
+      }
+      .officer-policy { display: flex; flex-direction: column; gap: 6px; }
+      .officer-ledger, .officer-incarnations { display: flex; flex-direction: column; gap: 6px; }
+      .officer-ledger-item { display: flex; gap: 8px; font-size: 13px; flex-wrap: wrap; align-items: baseline; }
+      .officer-ledger-status { font-size: 12px; color: var(--text-secondary); }
+      .officer-incarnation-link { font-family: var(--font-mono, monospace); font-size: 12px; }
       .officer-digest { display: flex; flex-direction: column; gap: 6px; }
       .officer-digest-title { font-size: 12px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.4px; }
       .officer-digest-item { display: flex; gap: 8px; font-size: 13px; flex-wrap: wrap; }
@@ -384,47 +851,106 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   readonly projectName = input<string>('');
 
   private readonly http = inject(HttpClient);
+  private readonly api = inject(ApiService);
   private readonly router = inject(Router);
   private readonly modelService = inject(ModelService);
 
-  readonly summary = signal<OfficerSummary | null>(null);
+  readonly post = signal<OfficerPost | null>(null);
   readonly loading = signal(true);
   readonly busy = signal(false);
   readonly message = signal('');
-  readonly retireArmed = signal(false);
+  readonly decommissionArmed = signal(false);
+  readonly decommissionWarning = signal<OfficerDecommissionResult | null>(null);
+  readonly holdArmed = signal(false);
+  readonly holdNote = signal('');
 
-  // Provision form: one suggested line slot to start from.
-  readonly slotDrafts = signal<SlotDraft[]>([
-    {name: 'line', count: 2, model: '', backend: 'sandbox'},
-  ]);
-  // The officer's OWN brain (create_thread bridges top-level `model` into
-  // config_override.llm.model). Distinct from the slot models, which are what
+  // The kit editor — one set of drafts, every state. Seeded from the post on
+  // state transitions only (editorSeedKey), so the 15s poll never clobbers
+  // in-progress edits.
+  readonly slotDrafts = signal<SlotDraft[]>([{...STARTER_SLOT_DRAFT}]);
+  // The officer's OWN brain (distinct from the slot models, which are what
   // his workers run on — the classic mistake is arming the troops and leaving
-  // the commander on the account default.
+  // the commander on the account default).
   readonly fBrainModel = signal('');
-  // His reasoning effort per wake ('' = family default, which is high).
   readonly fReasoning = signal('');
+  readonly fSleepMin = signal('');
+  readonly fSleepMax = signal('');
+  readonly fTokenCeiling = signal('');
+  readonly fMaxPages = signal('');
+  readonly fMaxActions = signal('');
+  readonly fMaxWorkers = signal('');
 
+  private editorSeedKey: string | null = null;
   private pollHandle: ReturnType<typeof setInterval> | null = null;
+
+  /** §7's per-field honesty, exposed to the template. */
+  readonly immediacy = immediacyLabel;
 
   readonly modelOptions = computed(() =>
     this.modelService.models().flatMap((g) => g.models),
   );
+  readonly postState = computed<OfficerPostState>(() => postStateOf(this.post()));
+  readonly showImmediacy = computed(() => this.postState() !== 'vacant');
+  readonly holdLabel = computed(() => holdBadgeLabel(this.post()?.held));
   readonly wakeLabel = computed(() =>
-    nextWakeLabel(this.summary()?.next_wake_at ?? null),
+    nextWakeLabel(this.post()?.officer?.next_wake_at ?? null),
   );
   readonly digest = computed(() =>
-    [...(this.summary()?.digest ?? [])].reverse(),
+    [...(this.post()?.officer?.digest ?? [])].reverse(),
   );
-  readonly slotRows = computed(() => {
-    const slots = this.summary()?.officer?.slots ?? null;
-    if (!slots) return [];
-    return Object.entries(slots).map(([name, s]) => ({
-      name,
-      count: s.count,
-      model: s.model ?? '',
-      backend: s.backend ?? '',
-    }));
+  readonly kitRows = computed(() => kitChips(this.post()?.kit));
+  readonly spendCeiling = computed(
+    () =>
+      this.post()?.spend_today?.ceiling ??
+      this.post()?.officer?.token_ceiling?.daily ??
+      null,
+  );
+  readonly incarnations = computed(() =>
+    [...(this.post()?.incarnations ?? [])].reverse(),
+  );
+  readonly vacantLedger = computed(() => vacantLedgerOf(this.post()));
+
+  private readonly currentDraft = computed<OfficerEditorDraft>(() => ({
+    slots: this.slotDrafts(),
+    brainModel: this.fBrainModel(),
+    reasoning: this.fReasoning(),
+    sleepMin: this.fSleepMin(),
+    sleepMax: this.fSleepMax(),
+    tokenCeiling: this.fTokenCeiling(),
+    maxPages: this.fMaxPages(),
+    maxActions: this.fMaxActions(),
+    maxWorkers: this.fMaxWorkers(),
+  }));
+  /** What Save would send — diffed against the post's last known state. */
+  readonly pendingPatch = computed(() =>
+    buildOfficerPatch(draftFromPost(this.post()), this.currentDraft()),
+  );
+  readonly dirty = computed(() => Object.keys(this.pendingPatch()).length > 0);
+  /** Per-draft-row drain hint when shrinking a slot below its in-flight count. */
+  readonly drainHints = computed<(string | null)[]>(() => {
+    const kit = this.post()?.kit ?? null;
+    const vacant = this.postState() === 'vacant';
+    return this.slotDrafts().map((row) => {
+      if (vacant || !kit) return null;
+      const live = kit[row.name.trim().toLowerCase()];
+      return drainHint(live?.in_flight, Math.max(1, Math.floor(row.count)));
+    });
+  });
+
+  readonly policyValue = computed<WorkerMessagesPolicy>(
+    () => this.post()?.communication_policy?.worker_messages ?? 'user_direct',
+  );
+  readonly officerFirstLabel = computed(() =>
+    this.postState() === 'vacant' ? 'Officer first' : 'Officer first (recommended)',
+  );
+  readonly policyHint = computed(() => {
+    const mins = this.post()?.communication_policy?.officer_response_minutes ?? 15;
+    const base =
+      `Officer first falls back to you if the officer is unavailable, ` +
+      `and escalates to you if he stays silent past ${mins} min.`;
+    return this.postState() === 'vacant'
+      ? `${base} While the post is vacant, questions come direct to you regardless.`
+      : base;
   });
 
   ngOnInit(): void {
@@ -445,18 +971,38 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
       return;
     }
     if (!silent) this.loading.set(true);
-    this.http
-      .get<OfficerSummary>(`${environment.apiUrl}/projects/${pid}/officer`)
-      .subscribe({
-        next: (s) => {
-          this.summary.set(s);
-          this.loading.set(false);
-        },
-        error: () => {
-          this.summary.set(null);
-          this.loading.set(false);
-        },
-      });
+    this.api.getOfficerPost(pid).subscribe((p) => this.applyPost(p));
+  }
+
+  /**
+   * A transport failure (null) never flips a commissioned card back to the
+   * vacant editor — stale beats wrong-state; the next poll heals it.
+   */
+  private applyPost(p: OfficerPost | null): void {
+    if (p) {
+      this.post.set(p);
+      const key = p.commissioned ? `c:${p.officer?.thread_id ?? ''}` : 'vacant';
+      if (this.editorSeedKey !== key) {
+        this.seedEditor(draftFromPost(p));
+        this.editorSeedKey = key;
+      }
+    } else if (!this.post() && this.editorSeedKey === null) {
+      this.seedEditor(draftFromPost(null));
+      this.editorSeedKey = 'none';
+    }
+    this.loading.set(false);
+  }
+
+  private seedEditor(draft: OfficerEditorDraft): void {
+    this.slotDrafts.set(draft.slots);
+    this.fBrainModel.set(draft.brainModel);
+    this.fReasoning.set(draft.reasoning);
+    this.fSleepMin.set(draft.sleepMin);
+    this.fSleepMax.set(draft.sleepMax);
+    this.fTokenCeiling.set(draft.tokenCeiling);
+    this.fMaxPages.set(draft.maxPages);
+    this.fMaxActions.set(draft.maxActions);
+    this.fMaxWorkers.set(draft.maxWorkers);
   }
 
   patchSlot(index: number, patch: Partial<SlotDraft>): void {
@@ -481,46 +1027,174 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     this.slotDrafts.update((rows) => rows.filter((_, i) => i !== index));
   }
 
-  async provision(): Promise<void> {
+  shortId(id: string): string {
+    return id.length > 8 ? id.slice(0, 8) : id;
+  }
+
+  /** Raise an officer onto the post with the editor's config (§5). */
+  async commission(): Promise<void> {
     const pid = this.projectId();
     if (!pid || this.busy()) return;
     this.busy.set(true);
     this.message.set('');
-    const officer: Record<string, unknown> = {enabled: true};
-    const slots = buildSlotsSpec(this.slotDrafts());
-    if (slots) officer['slots'] = slots;
-    const body = buildOfficerThreadCreateBody(
-      pid,
-      this.projectName(),
-      officer,
-      this.fBrainModel(),
-      this.fReasoning(),
-    );
     try {
       const resp = await firstValueFrom(
-        this.http.post<{thread_id: string}>(
-          `${environment.apiUrl}/persistent/threads`,
-          body,
-        ),
+        this.api.commissionOfficer(pid, buildOfficerConfig(this.currentDraft())),
       );
-      // Opening the session boots the headless officer (attach = the loop
-      // bootstrap); the Legate lands on the log and can leave anytime.
-      await this.router.navigate(['/sessions', resp.thread_id]);
+      this.message.set(
+        resp?.thread_id
+          ? 'Commissioned — his first wake carries the continuity brief. Open log to watch him take the post.'
+          : 'Commissioned.',
+      );
+      this.editorSeedKey = null;
+      this.refresh(true);
     } catch (err) {
-      this.message.set(this.errText(err, 'Provisioning failed'));
+      this.message.set(this.errText(err, 'Commission failed'));
+    } finally {
       this.busy.set(false);
     }
   }
 
+  /** PATCH only what changed; the sitrep's capacity line carries the truth. */
+  async saveEdits(): Promise<void> {
+    const pid = this.projectId();
+    const patch = this.pendingPatch();
+    if (!pid || this.busy() || !Object.keys(patch).length) return;
+    this.busy.set(true);
+    this.message.set('');
+    try {
+      await firstValueFrom(this.api.updateOfficerPost(pid, patch));
+      this.message.set(
+        "Post updated — the next sitrep's capacity line carries the truth.",
+      );
+      this.editorSeedKey = null;
+      this.refresh(true);
+    } catch (err) {
+      this.message.set(this.errText(err, 'Update failed'));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  /**
+   * Non-forced first: with jobs in flight the server answers with the warning
+   * + list instead of decommissioning; the forced retry proceeds, leaving
+   * them running (their completions land on the post's ledger).
+   */
+  async decommission(force: boolean): Promise<void> {
+    const pid = this.projectId();
+    if (!pid || this.busy()) return;
+    this.busy.set(true);
+    this.message.set('');
+    try {
+      const resp = await firstValueFrom(this.api.decommissionOfficer(pid, force));
+      if (
+        !force &&
+        ((resp?.in_flight_jobs?.length ?? 0) > 0 || resp?.warning)
+      ) {
+        this.decommissionWarning.set(resp);
+        return;
+      }
+      this.decommissionArmed.set(false);
+      this.decommissionWarning.set(null);
+      this.message.set(
+        'Post decommissioned — kit, budgets, and fingerprints stay on the post for his successor.',
+      );
+      this.editorSeedKey = null;
+      this.refresh(true);
+    } catch (err) {
+      this.message.set(this.errText(err, 'Decommission failed'));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  cancelDecommission(): void {
+    this.decommissionArmed.set(false);
+    this.decommissionWarning.set(null);
+  }
+
+  /** Maintenance hold — commissioned, standing down; never self-healed away. */
+  async hold(): Promise<void> {
+    const pid = this.projectId();
+    if (!pid || this.busy()) return;
+    this.busy.set(true);
+    this.message.set('');
+    try {
+      await firstValueFrom(this.api.holdOfficer(pid, this.holdNote()));
+      this.holdArmed.set(false);
+      this.holdNote.set('');
+      this.message.set(
+        'Held — dispatches pause and the watchdog stands down; your input still reaches him.',
+      );
+      this.refresh(true);
+    } catch (err) {
+      this.message.set(this.errText(err, 'Hold failed'));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  async release(): Promise<void> {
+    const pid = this.projectId();
+    if (!pid || this.busy()) return;
+    this.busy.set(true);
+    this.message.set('');
+    try {
+      await firstValueFrom(this.api.releaseOfficer(pid));
+      this.message.set('Released — queued events drain within a tick.');
+      this.refresh(true);
+    } catch (err) {
+      this.message.set(this.errText(err, 'Release failed'));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  /**
+   * The one row-only field: PATCHes `communication_policy` alone, optimistic
+   * so the select doesn't snap back while the write is in flight.
+   */
+  async setPolicy(value: string | null): Promise<void> {
+    const pid = this.projectId();
+    const v = value as WorkerMessagesPolicy | null;
+    if (!pid || !v || v === this.policyValue() || this.busy()) return;
+    const prev = this.post();
+    this.post.update((p) =>
+      p
+        ? {
+            ...p,
+            communication_policy: {
+              ...(p.communication_policy ?? {}),
+              worker_messages: v,
+            },
+          }
+        : p,
+    );
+    try {
+      await firstValueFrom(
+        this.api.updateOfficerPost(pid, {
+          communication_policy: {worker_messages: v},
+        }),
+      );
+      this.refresh(true);
+    } catch (err) {
+      this.post.set(prev);
+      this.message.set(
+        this.errText(err, 'Could not change worker-question routing'),
+      );
+    }
+  }
+
   openLog(): void {
-    const tid = this.summary()?.officer?.thread_id;
+    const tid = this.post()?.officer?.thread_id;
     if (tid) void this.router.navigate(['/sessions', tid]);
   }
 
   async openConference(): Promise<void> {
     const pid = this.projectId();
     if (!pid || this.busy()) return;
-    const existing = this.summary()?.conference;
+    const existing = this.post()?.officer?.conference;
     if (existing) {
       await this.router.navigate(['/sessions', existing.thread_id]);
       return;
@@ -538,27 +1212,6 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     } catch (err) {
       // conference_open 409 → someone beat us; refresh finds it.
       this.message.set(this.errText(err, 'Could not open the conference'));
-      this.busy.set(false);
-      this.refresh(true);
-    }
-  }
-
-  async retire(): Promise<void> {
-    const tid = this.summary()?.officer?.thread_id;
-    if (!tid || this.busy()) return;
-    this.busy.set(true);
-    this.message.set('');
-    try {
-      await firstValueFrom(
-        this.http.delete(`${environment.apiUrl}/persistent/threads/${tid}`),
-      );
-      this.message.set(
-        'Centurion retired — the watchdog stands down; his log is preserved.',
-      );
-    } catch (err) {
-      this.message.set(this.errText(err, 'Retirement failed'));
-    } finally {
-      this.retireArmed.set(false);
       this.busy.set(false);
       this.refresh(true);
     }

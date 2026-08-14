@@ -1228,6 +1228,144 @@ export interface ProjectBacklog {
   items: BacklogItem[];
 }
 
+// =============================================================================
+// Officer post (docs/features/officer_post.md §8) — `project_officers` row +
+// runtime projection. GET /projects/{id}/officer ALWAYS returns the post,
+// vacant or commissioned; the card never infers existence from a 404.
+// =============================================================================
+
+/** One typed worker allocation of the officer's kit (request shape). */
+export interface OfficerSlotSpec {
+  count: number;
+  model?: string;
+  backend?: string;
+}
+
+/**
+ * A kit slot as the GET reports it: allocation plus live utilization.
+ * `in_flight` is lineage-aware (counts jobs of prior incarnations too, §4).
+ */
+export interface OfficerKitSlot extends OfficerSlotSpec {
+  in_flight?: number;
+}
+
+/** Standing-down marker on a commissioned post (maintenance or conference). */
+export interface OfficerHold {
+  kind?: string | null;
+  since?: string | null;
+  note?: string | null;
+}
+
+/** Live runtime projection — non-null only while the post is commissioned. */
+export interface OfficerLive {
+  thread_id: string;
+  status: string;
+  title?: string | null;
+  created_at?: string | null;
+  model?: string | null;
+  reasoning_level?: string | null;
+  sleep_minutes?: {min: number; max: number} | null;
+  next_wake_at?: string | null;
+  pending_events?: number;
+  pages_today?: {used: number; budget: number} | null;
+  token_ceiling?: {daily: number; deferred_today?: boolean} | null;
+  digest?: {at: string; subject: string; message: string}[] | null;
+  conference?: {thread_id: string; status: string} | null;
+  /** Not yet in the O1–O4 contract; optional so the editor seeds them when the backend adds them. */
+  max_actions_per_wake?: number | null;
+  max_concurrent_workers?: number | null;
+}
+
+/** One entry of the append-only incarnation log (old logs stay readable as ended sessions). */
+export interface OfficerIncarnation {
+  thread_id: string;
+  commissioned_at?: string | null;
+  decommissioned_at?: string | null;
+  reason?: string | null;
+}
+
+/** User-owned routing for worker questions (officer_message_routing.md §6). */
+export type WorkerMessagesPolicy =
+  | 'user_direct'
+  | 'officer_and_user'
+  | 'officer_first';
+
+export interface OfficerCommunicationPolicy {
+  worker_messages?: WorkerMessagesPolicy;
+  officer_response_minutes?: number;
+}
+
+/** Terminal-status entries recorded while the post was vacant (ring, cap 20). */
+export interface OfficerVacantLedger {
+  entries?: {
+    at?: string | null;
+    job_id?: string | null;
+    status?: string | null;
+    title?: string | null;
+  }[];
+  dropped?: number;
+}
+
+/** `GET /api/projects/{id}/officer` — the post, always present. */
+export interface OfficerPost {
+  commissioned: boolean;
+  held?: OfficerHold | null;
+  officer?: OfficerLive | null;
+  kit?: Record<string, OfficerKitSlot> | null;
+  spend_today?: {tokens?: number; ceiling?: number | null} | null;
+  communication_policy?: OfficerCommunicationPolicy | null;
+  incarnations?: OfficerIncarnation[] | null;
+  while_vacant?: OfficerVacantLedger | null;
+}
+
+/** The officer's own brain (distinct from the slot models his workers run on). */
+export interface OfficerBrainSpec {
+  model?: string | null;
+  reasoning_level?: string | null;
+}
+
+/**
+ * PATCH /api/projects/{id}/officer — partial edit of the post; commission
+ * accepts the same fields as its optional config body. `null` clears a field
+ * (e.g. `slots: null` = flat cap). `communication_policy` is the row-only,
+ * user-owned field — never mirrored into thread metadata.
+ */
+export interface OfficerPostPatch {
+  slots?: Record<string, OfficerSlotSpec> | null;
+  max_concurrent_workers?: number | null;
+  max_pages_per_day?: number | null;
+  max_actions_per_wake?: number | null;
+  daily_token_ceiling?: number | null;
+  sleep_min_minutes?: number | null;
+  sleep_max_minutes?: number | null;
+  brain?: OfficerBrainSpec | null;
+  communication_policy?: OfficerCommunicationPolicy;
+}
+
+export interface OfficerCommissionResult {
+  thread_id?: string;
+  status?: string;
+}
+
+/** A job still running under the officer's command at decommission time. */
+export interface OfficerInFlightJob {
+  job_id: string;
+  slot?: string | null;
+  status?: string | null;
+  title?: string | null;
+}
+
+/**
+ * POST .../officer/decommission result. A non-forced call with jobs in flight
+ * returns the warning + list INSTEAD of decommissioning; `force: true`
+ * proceeds — jobs are left running either way (decommission never cancels).
+ */
+export interface OfficerDecommissionResult {
+  status?: string;
+  warning?: string | null;
+  in_flight_jobs?: OfficerInFlightJob[] | null;
+}
+
 /**
  * Workspace egress tier for a project. The set must stay in sync with
  * the CHECK constraint in 0016_project_network_tier.sql and the
