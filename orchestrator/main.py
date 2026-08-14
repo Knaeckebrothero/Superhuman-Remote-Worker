@@ -20191,6 +20191,7 @@ async def _rotate_loop_to_next_stage(
     completed_job: dict[str, Any] | None = None,
     completed_ctx: dict[str, Any] | None = None,
     completed_failed: bool = False,
+    turn_all_failed: bool = False,
     park_until: datetime | None = None,
 ) -> None:
     """Rotate a loop past the just-finished stage and spawn the next one.
@@ -20208,7 +20209,7 @@ async def _rotate_loop_to_next_stage(
     (no plan / queue drained / abort), rotation proceeds as always — with any
     campaign status mutation riding the same write-back as the pointer.
     """
-    from services.project_loops import normalize_stage
+    from services.project_loops import next_stage_index, normalize_stage
 
     loop_id = str(loop["id"])
     roles = loop.get("role_sequence") or ["scholar", "critic", "developer"]
@@ -20230,16 +20231,40 @@ async def _rotate_loop_to_next_stage(
         if handled:
             return
 
-    next_index = (int(seq_index_completed) + 1) % len(roles)
+    # A turn whose every member failed re-runs its own stage rather than
+    # handing the next role nothing to work from — the failed-critic case,
+    # where the developer would otherwise build on a stale verdict the engine
+    # cannot see. Bounded by the consecutive-failure stop evaluated above.
+    # docs/features/better_resavio_restart_status.md §6c.
+    next_index, cycle_wrapped = next_stage_index(
+        seq_index_completed=int(seq_index_completed),
+        stage_count=len(roles),
+        turn_all_failed=turn_all_failed,
+    )
+    if turn_all_failed:
+        logger.warning(
+            "project loop %s: every member of stage %s failed — re-running "
+            "that stage instead of advancing (attempt %s)",
+            loop_id[:8],
+            next_index,
+            consecutive + 1,
+        )
+        actions.append(
+            f"project loop {loop_id[:8]}: stage {next_index} "
+            f"({'/'.join(normalize_stage(roles[next_index])) if roles else '?'}) "
+            f"produced nothing — re-running it rather than advancing "
+            f"(attempt {consecutive + 1})"
+        )
 
     # KB convergence (docs/features/kb_convergence_ttl_reverification.md, F13): a
     # full cycle completed when the rotation wraps back to the first stage. Tick
     # the per-note cycle TTL down once; notes that reach <= 0 become the stale
     # queue the next job's knowledge-assembler pass re-verifies. Mirrors
     # KnowledgeStore.decrement_ttl (run inline — the orchestrator can't import
-    # src/). Non-fatal.
+    # src/). Non-fatal. A retried stage is NOT a wrap: ageing notes on the
+    # strength of a cycle that never completed would re-verify them early.
     project_id_for_ttl = loop.get("project_id")
-    if next_index == 0 and project_id_for_ttl:
+    if cycle_wrapped and project_id_for_ttl:
         try:
             async with vector_db.acquire() as conn:
                 await conn.execute(
@@ -21313,6 +21338,7 @@ async def _advance_loop_member(
         completed_job=job,
         completed_ctx=ctx,
         completed_failed=failed,
+        turn_all_failed=all_failed,
         park_until=park_until,
     )
 
