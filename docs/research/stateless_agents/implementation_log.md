@@ -5131,8 +5131,9 @@ keeps the required source-guard and 422 contracts ahead of specimen cleanup.
 
 ## M4 — MiniMax k3d soak and preserved-specimen convergence
 
-All soak jobs explicitly resolved their main/phase and auxiliary models to
-`MiniMax-M3`. The final live audit found no P0/P1, the normal stateless
+Both newly created soak jobs explicitly resolved their main/phase and auxiliary
+models to `MiniMax-M3`; the preserved specimen's M3 rescue invoked no model.
+The final live audit found no P0/P1, the normal stateless
 Deployment returned to **2/2 Ready**, no nonterminal stateless job or leased
 worker unit remained, and the protected pinned `ee33e63f-…` workspace stayed
 Running/Ready at exact Pod UID `f7090b7c-011f-43e7-878d-83a6d81d9923`.
@@ -5174,3 +5175,136 @@ accepted case. Case 2's explicitly bounded test isolation scaled the normal
 executor Deployment to zero and created one standalone exact-image harness
 Pod, with a preinstalled restore trap returning the Deployment to 2/2; it did
 not patch a workload or image in place. No soak artifact was pushed.
+
+## M5 — claimant-quiescence receipt (recon only; no build)
+
+**Decision.** Do not widen today's `pod_absent` path, and do not treat elapsed
+time as process-zero proof. The old `e4bb35f8-…` residue and the later virtual
+fixture have the same failure mode: the Kubernetes Pod object can disappear
+before a claimant acknowledgement, while an already-admitted process or remote
+operation may still exist. The disposable fixture was recoverable only because
+an operator bound the exact token and Pod UID to one node incarnation, proved
+absence across Kubernetes, CRI, containerd tasks, host processes/cgroups and
+cgroup directories, then used the existing exact CAS. That was valid incident
+evidence, not a general protocol: it was not durably retained and legacy rows
+have no immutable node/runtime binding.
+
+The proposed contract is a normalized cross-kind claimant and receipt ledger.
+An exact queue generation must first be fenced by the ordinary session or
+worker lock order, with a durable challenge for `(unit_kind, unit_id,
+lease_token, pod_name, pod_uid)`. Fencing revokes future durable writes but is
+not itself quiescence. One of four positive proofs may then settle the
+challenge:
+
+1. the exact claimant's cooperative acknowledgement after closing admission,
+   joining local/background work and closing its backend;
+2. a post-challenge, still-observable exact Pod UID in terminal Pod phase
+   `Succeeded|Failed`, whose complete terminal status covers every declared or
+   observed app, sidecar, init and ephemeral container and whose resource
+   version is revalidated at acceptance (or the same exact UID is already
+   protected by the start-path tombstone below);
+3. a trusted node-attestor receipt for the pre-registered node incarnation; or
+4. a trusted infrastructure receipt that the immutable machine/provider
+   instance was destroyed.
+
+A node receipt is a post-challenge, per-Pod-UID observation. It requires API
+absence/replacement or exact terminal state, no UID in the local kubelet
+inventory, zero matching CRI sandboxes/containers, zero runtime-native
+containers/tasks/shims, zero host processes whose cgroup/runtime identity maps
+to the UID or registered container ids, and absent Pod cgroup directories. The
+attestor first asks a node-local **enforcement** component—an authenticated CRI
+admission proxy/runtime supervisor, not a passive marker file—to install a
+durable tombstone for the exact `(node UID, boot id, Pod UID, challenge)`.
+Installation is serialized in that component, returns a monotone fence id,
+rejects every later sandbox/container create or start for the fenced UID, and
+precedes termination plus the zero scan. The database accepts the scan only
+with that fence id. Database receipt acceptance never garbage-collects the
+runtime tombstone: it remains for the node incarnation unless a monotone,
+node-local kubelet desired-state/relist watermark proves that the exact Pod UID
+has been removed, after which a fresh scan still precedes release. If a node
+has no such start-path enforcement, node attestation is not a sufficient proof
+class there; the protocol must wait for claimant, exact-terminal or provider-
+destroy evidence. A changed trusted boot id proves old-boot processes died but
+still requires a current enforced no-recreated-UID scan.
+
+Conversely, Kubernetes GET 404, a DELETED watch event, deletion timestamp,
+Unknown phase, same-name replacement, CRI NotFound or an empty CRI list alone,
+runtime garbage collection, expired database/Kubernetes-node leases, two
+unchanged observations, and any grace interval remain **signals only**. They
+may create a challenge or alert; they never acknowledge quiescence. Claimant
+quiescence also does not replace the separately bound workspace resident,
+remote-shell, snapshot or credential-retirement proofs.
+
+**Prospective durable shape.** A future app migration would start at **0156**;
+this recon creates none. `run_claimants`, keyed by `(unit_kind, unit_id,
+lease_token)`, would record immutable Pod, node/provider-instance, boot,
+runtime/container/cgroup and credential-boundary identity plus monotone fence
+and one-use challenge fields. Append-only
+`claimant_quiescence_receipts`, unique and foreign-keyed to that claim, would
+record proof kind/version, exact nonce, observer identity/incarnation,
+observation and database-acceptance times, and bounded canonical evidence plus
+its digest. Evidence contains identifiers, counts and resource versions—never
+process command lines, environments, credentials or secret-bearing Pod bodies.
+`run_queue` is insufficient because it retains only the current generation;
+session JSON loses entries on acknowledgement; `completion_effects` is an
+execution outbox rather than an evidence ledger.
+
+The orchestrator remains the only PostgreSQL writer. At the last claim-bundle
+credential boundary it must register the claimant before returning secrets.
+Reaper, End or cancel records the fence/challenge in the same token-transition
+transaction. Claimant, terminal-Pod watcher, node attestor or infrastructure
+controller submits authenticated evidence but never writes the database
+directly. Evidence collection happens outside a database transaction;
+acceptance then re-locks and validates exact identity, nonce, fence token and
+absence of a live target lease. Session order is `threads -> run_queue ->
+run_claimants`; worker order is `run_queue -> jobs -> run_claimants`. Receipt
+insert and exact loss/hold settlement commit together. Response-loss retries
+return the same receipt, while stale token/UID/nonce/node incarnations are
+no-ops. No path locks `run_claimants` first.
+
+**Public 404 and rollout.** Rename the conceptual `exact_absent` observation to
+`api_absent`: Pod 404 or same-name replacement can request attestation but can
+never call `acknowledge_session_claim_quiesced`. While the user resource exists
+without a receipt, End/Delete remains retryable 503 with a stable
+`claimant_quiescence_pending` code and `Retry-After`; public 404 means only that
+the authorized job/thread was actually deleted. Ambiguous observer errors
+retain the challenge and fail closed.
+
+Rollout is additive and staged: schema/snapshot, shadow claim writers/readers,
+the node-local start-path fence plus attestor health/capability, protocol-v1
+executor registration, then receipt consumption only for registered v1 claims
+on nodes that advertise both enforcement and observation. Existing JSON
+authority is dual-written until old claims/loss rows drain; missing normalized
+identity is never interpreted as absence. Feature-off preserves today's
+behavior. Before removing the start-path gate, disable receipt consumption,
+drain its challenges, and require both unresolved challenges **and retained
+tombstones** to reach zero through the safe watermark-plus-rescan release rule
+or termination of their bound node incarnations. Gate rollback is blocked
+while either class remains. Legacy debt with no registered incarnation remains
+claimant/self/exact-terminal or audited break-glass work and is not guessed
+into v1.
+
+The attestor is an explicit privileged trust boundary: exact Pod UID, node UID
+or provider instance, boot id and one-use challenge prevent ordinary replay or
+name reuse, but a compromised host attestor could forge absence. It therefore
+needs executor-node-only host access, workload identity/mTLS, narrow submit
+RBAC and NetworkPolicy, and no credential exposed to a workspace. Privileged
+or host-PID workloads outside the sandbox-v1 threat model must be refused, not
+silently attested.
+
+Verification must cover canonical proof shapes; every insufficient 404/age
+case; all container families; CRI-GC with a remaining task/process/cgroup;
+node/boot/provider mismatch; stale nonce/token/replay; and legacy missing-
+registration refusal. Real PostgreSQL tests must prove atomic registration,
+fence/challenge, receipt plus loss/hold settlement, response-loss idempotence,
+claimant-versus-attestor races, both lock orders and rollback at each boundary.
+The live k3d gate should delete a v1 claimant before self-ack, prove Pod 404 and
+public 503 first, obtain one node receipt, then prove one public convergence,
+independent resident/shell retirement and zero residue; same-name replacement
+and mixed-version rollout are required adversarial cases. Metrics expose the
+oldest unresolved challenge and failures by evidence layer with bounded ids,
+never raw evidence.
+
+M5 changed documentation only. It made no schema, source, live-resource,
+specimen or protected-path mutation; app head remains 0155 and vector head
+0019, so the next allocated migrations remain app 0156 and vector 0020.
