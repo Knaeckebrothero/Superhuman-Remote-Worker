@@ -174,8 +174,16 @@ container, and loop `3ed022a5` died on three consecutive VM provisioning failure
   segregates.
 - **Iteration numbering.** Agents self-labelled `iter-27`/`loop-16`/`iter 2` in one run;
   `retros/` numbering was the only ground truth, and `retros/` is retired under the new flow.
-- **Outcome-aware rotation.** A failed critic is skipped and the developer proceeds on a
-  stale verdict.
+- ~~**Outcome-aware rotation.**~~ **Fixed** `d616caa9`. Rotation advanced unconditionally, so
+  a failed critic handed the developer its slot and the developer built on the previous
+  iteration's verdict as if it were fresh. Worse, the failure was *invisible*:
+  `consecutive_failures` resets on any turn that is not wholly failed, so a critic could fail
+  every cycle and never trip `max_consecutive_failures` — the successful developer behind it
+  always reset the counter, and the loop would spend its whole budget on unjudged work and
+  stop reporting `budget`, no failures. A wholly-failed turn now re-runs its own stage, which
+  puts failures back-to-back so the existing stop trips. Also fixed a latent TTL bug it
+  exposed: the KB convergence tick fired on `next_index == 0`, which a *retry* of stage 0
+  satisfies without completing a cycle.
 
 ## 7. Defects found and filed
 
