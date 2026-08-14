@@ -214,8 +214,7 @@ APP_JOB_COMPLETION_STATUS_REORDER = (
     ROOT / "orchestrator/database/migrations/app/0144_job_completion_status_reorder.sql"
 )
 APP_CURRENT_MIGRATION_HEAD = (
-    ROOT
-    / "orchestrator/database/migrations/app/0158_repair_unified_tool_group_markers.sql"
+    ROOT / "orchestrator/database/migrations/app/0159_job_message_routes.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

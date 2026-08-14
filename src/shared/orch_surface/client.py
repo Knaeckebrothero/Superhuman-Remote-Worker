@@ -2835,6 +2835,58 @@ class AsyncCockpitClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def officer_reply_to_job_message(
+        self,
+        job_id: str,
+        thread_id: str,
+        message: str,
+        officer_thread_id: str,
+    ) -> dict[str, Any]:
+        """Answer a routed worker message as the commissioned officer.
+
+        The server verifies ``officer_thread_id`` against the project's
+        durable post row — it is a claim to check, never authority.
+        """
+        resp = await self._mutation_request(
+            "POST",
+            f"/api/jobs/{job_id}/messages/{thread_id}/officer-reply",
+            json={"message": message, "officer_thread_id": officer_thread_id},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def officer_escalate_job_message(
+        self,
+        job_id: str,
+        thread_id: str,
+        officer_thread_id: str,
+        context: str | None = None,
+    ) -> dict[str, Any]:
+        """Escalate a routed worker message to the user with officer context."""
+        resp = await self._mutation_request(
+            "POST",
+            f"/api/jobs/{job_id}/messages/{thread_id}/officer-escalate",
+            json={"context": context, "officer_thread_id": officer_thread_id},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def officer_acknowledge_job_message(
+        self,
+        job_id: str,
+        thread_id: str,
+        officer_thread_id: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Close an async routed worker message without a reply."""
+        resp = await self._mutation_request(
+            "POST",
+            f"/api/jobs/{job_id}/messages/{thread_id}/officer-ack",
+            json={"note": note, "officer_thread_id": officer_thread_id},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     # =========================================================================
     # Persistent Threads
     # =========================================================================

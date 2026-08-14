@@ -109,6 +109,7 @@
     "write_file"
   ],
   "centurion": [
+    "acknowledge_job_message",
     "approve_job",
     "browser_back",
     "browser_click",
@@ -127,6 +128,7 @@
     "delete_directory",
     "delete_file",
     "edit_file",
+    "escalate_job_message",
     "file_exists",
     "get_audit_trail",
     "get_canvas",
@@ -170,6 +172,7 @@
     "read_file",
     "read_job_evidence",
     "rename_file",
+    "reply_to_job_message",
     "resume_job_with_feedback",
     "search_audit",
     "search_files",

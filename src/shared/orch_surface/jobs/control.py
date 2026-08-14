@@ -385,6 +385,180 @@ async def send_message_to_job(
         return f"Failed to send reply: {friendly_reason(error)}"
 
 
+_OFFICER_IDENTITY_ERROR = (
+    "This caller carries no session thread identity, so it cannot act as a "
+    "commissioned officer. Officer message actions (reply/escalate/"
+    "acknowledge) run only from the project's commissioned officer session; "
+    "use send_message_to_job for a plain human-side reply."
+)
+
+
+@descriptor(
+    group="job_control",
+    plane="job_control",
+    # officer_message_routing.md §4: bounded officer inbox actions. Officer +
+    # MCP lanes by default; the plain session lane stays out — the server
+    # verifies the caller IS the commissioned officer thread, which an
+    # ordinary session never is.
+    caller_defaults=_MCP_OFFICER,
+    grant="explicit",
+    gate=_EXPLICIT_GATE,
+)
+async def reply_to_job_message(
+    client: AsyncCockpitClient,
+    caller: CallerCtx,
+    job_id: str,
+    thread_id: str,
+    message: str,
+) -> str:
+    """Answer a worker's routed message as the project's officer.
+
+    For a blocking route the waiting worker resumes exactly once with your
+    answer; the route is recorded ``resolved_by_officer``. Your reply is
+    guidance, never authorization — it cannot approve jobs, add backlog
+    ready-marks, or waive deliverables, and the worker's original message is
+    never erased. Only the commissioned officer session of the job's project
+    may use this (verified server-side against the durable post row).
+
+    Args:
+        job_id: Job UUID (or unique visible prefix)
+        thread_id: Worker message thread ID (from your wake/sitrep inbox)
+        message: Your answer, delivered verbatim to the worker
+
+    Returns:
+        Delivery confirmation with the route's resulting state
+    """
+    if not caller.thread_id:
+        return _OFFICER_IDENTITY_ERROR
+    try:
+        resolved = await resolve_job_id(client, caller, job_id)
+        result = await client.officer_reply_to_job_message(
+            resolved, thread_id, message, officer_thread_id=caller.thread_id
+        )
+        return (
+            f"Reply delivered to worker thread {thread_id} of job "
+            f"{short_id(resolved)} (strategy: "
+            f"{result.get('delivery_strategy', 'queued')}; route now "
+            f"{result.get('route_state', 'unknown')})."
+        )
+    except Exception as error:
+        status = http_status_of(error)
+        if status is not None:
+            detail = response_detail(error)
+            return (
+                f"Officer reply failed ({status}): {detail}"
+                if detail
+                else f"Officer reply failed ({status})."
+            )
+        return f"Officer reply failed: {friendly_reason(error)}"
+
+
+@descriptor(
+    group="job_control",
+    plane="job_control",
+    caller_defaults=_MCP_OFFICER,
+    grant="explicit",
+    gate=_EXPLICIT_GATE,
+)
+async def escalate_job_message(
+    client: AsyncCockpitClient,
+    caller: CallerCtx,
+    job_id: str,
+    thread_id: str,
+    context: str | None = None,
+) -> str:
+    """Hand a worker's routed message to the user, with your context attached.
+
+    The user receives the ORIGINAL worker message plus your clearly
+    delimited context on the SAME thread — their reply resumes the worker
+    directly. Use this when the question needs the user's authority or
+    knowledge; to inform the user in your own voice instead, use notify_user.
+
+    Args:
+        job_id: Job UUID (or unique visible prefix)
+        thread_id: Worker message thread ID
+        context: Optional context for the user (why you escalated, what you
+            recommend). Delivered clearly separated from the worker's text.
+
+    Returns:
+        Escalation confirmation with delivery status
+    """
+    if not caller.thread_id:
+        return _OFFICER_IDENTITY_ERROR
+    try:
+        resolved = await resolve_job_id(client, caller, job_id)
+        result = await client.officer_escalate_job_message(
+            resolved, thread_id, officer_thread_id=caller.thread_id, context=context
+        )
+        note = result.get("note")
+        return (
+            f"Thread {thread_id} of job {short_id(resolved)} escalated to the "
+            f"user (delivered={result.get('delivered')})."
+            + (f" Note: {note}" if note else "")
+        )
+    except Exception as error:
+        status = http_status_of(error)
+        if status is not None:
+            detail = response_detail(error)
+            return (
+                f"Escalation failed ({status}): {detail}"
+                if detail
+                else f"Escalation failed ({status})."
+            )
+        return f"Escalation failed: {friendly_reason(error)}"
+
+
+@descriptor(
+    group="job_control",
+    plane="job_control",
+    caller_defaults=_MCP_OFFICER,
+    grant="explicit",
+    gate=_EXPLICIT_GATE,
+)
+async def acknowledge_job_message(
+    client: AsyncCockpitClient,
+    caller: CallerCtx,
+    job_id: str,
+    thread_id: str,
+    note: str | None = None,
+) -> str:
+    """Close an ASYNC worker message from your inbox without replying.
+
+    For status updates that need no answer. Refused for blocking routes — a
+    frozen worker needs reply_to_job_message or escalate_job_message, never
+    a silent ack pretending nobody waited.
+
+    Args:
+        job_id: Job UUID (or unique visible prefix)
+        thread_id: Worker message thread ID
+        note: Optional note recorded on the route's audit trail
+
+    Returns:
+        Acknowledge confirmation
+    """
+    if not caller.thread_id:
+        return _OFFICER_IDENTITY_ERROR
+    try:
+        resolved = await resolve_job_id(client, caller, job_id)
+        result = await client.officer_acknowledge_job_message(
+            resolved, thread_id, officer_thread_id=caller.thread_id, note=note
+        )
+        return (
+            f"Thread {thread_id} of job {short_id(resolved)} acknowledged "
+            f"(route now {result.get('route_state', 'resolved_by_officer')})."
+        )
+    except Exception as error:
+        status = http_status_of(error)
+        if status is not None:
+            detail = response_detail(error)
+            return (
+                f"Acknowledge failed ({status}): {detail}"
+                if detail
+                else f"Acknowledge failed ({status})."
+            )
+        return f"Acknowledge failed: {friendly_reason(error)}"
+
+
 @descriptor(
     group="job_control",
     plane="job_control",

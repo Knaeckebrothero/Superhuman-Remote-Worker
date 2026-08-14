@@ -786,6 +786,10 @@ OFFICER_DEBOUNCE_BY_SOURCE: dict[str, int] = {
     "respawn": 0,
     "conference": 0,
     "commission": 0,  # the continuity brief is one-shot — never debounced
+    # Blocking worker questions (officer_message_routing.md §5.1): a frozen
+    # worker is waiting on this wake — it may coalesce with already-claimed
+    # events into one turn but must never wait for the routine timer.
+    "worker_message": 0,
     "job_transition": 300,
     "sudo_request": 300,
     "loop": 300,

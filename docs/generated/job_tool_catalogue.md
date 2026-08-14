@@ -4,11 +4,13 @@
 
 | Name | Group | Plane | Caller defaults | Grant |
 |---|---|---|---|---|
+| `acknowledge_job_message` | `job_control` | `job_control` | `mcp`, `officer` | `explicit` |
 | `approve_job` | `job_control` | `job_control` | `mcp`, `officer`, `session` | category default |
 | `assign_job` | `job_control` | `job_control` | `mcp` | `explicit` |
 | `cancel_job` | `job_control` | `job_control` | `mcp`, `officer`, `session` | category default |
 | `create_job` | `job_control` | `job_control` | `mcp`, `officer`, `session` | category default |
 | `delete_job` | `job_control` | `job_control` | `mcp` | `explicit` |
+| `escalate_job_message` | `job_control` | `job_control` | `mcp`, `officer` | `explicit` |
 | `get_audit_bulk` | `job_inspection` | `job_observability` | `mcp` | `explicit` |
 | `get_audit_timerange` | `job_inspection` | `job_observability` | `mcp` | `explicit` |
 | `get_audit_trail` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
@@ -40,6 +42,7 @@
 | `pause_job` | `job_control` | `job_control` | `mcp`, `officer`, `session` | category default |
 | `promote_job` | `job_control` | `job_control` | `mcp` | `explicit` |
 | `read_job_evidence` | `job_inspection` | `job_evidence` | `mcp`, `officer`, `session` | category default |
+| `reply_to_job_message` | `job_control` | `job_control` | `mcp`, `officer` | `explicit` |
 | `resume_job_with_feedback` | `job_control` | `job_control` | `mcp`, `officer`, `session` | category default |
 | `search_audit` | `job_inspection` | `job_observability` | `mcp`, `officer` | `explicit` |
 | `send_message_to_job` | `job_control` | `job_control` | `mcp`, `officer` | `explicit` |

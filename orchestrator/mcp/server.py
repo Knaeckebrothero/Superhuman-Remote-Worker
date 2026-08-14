@@ -203,7 +203,9 @@ def _format_action_error(action: str, target: str, error: Exception) -> str:
 # that source promises.
 # "9": officer_supervision_surface E1-E4 — three job_evidence tools,
 # caller-aware get_stuck_jobs threshold, liveness-backed progress output.
-MCP_TOOL_SCHEMA_REVISION = "9"
+# "10": officer_message_routing M3 — reply_to_job_message,
+# escalate_job_message, acknowledge_job_message (officer inbox actions).
+MCP_TOOL_SCHEMA_REVISION = "10"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 

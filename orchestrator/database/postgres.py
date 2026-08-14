@@ -10089,6 +10089,719 @@ class PostgresDB:
             )
         return self._project_officer_row_to_dict(row)
 
+    # =========================================================================
+    # Worker message routes (officer_message_routing.md §3)
+    # =========================================================================
+    #
+    # ``job_message_routes`` (migration 0159) is the control ledger for
+    # officer-aware worker messages. message_log stays the canonical thread;
+    # these rows carry the frozen policy snapshot, the delivery state machine,
+    # both §5.2 deadlines, and the CAS surface every resolver (officer reply,
+    # user reply, reconciler) transitions exactly once.
+
+    _ROUTE_TERMINAL_STATES = ("resolved_by_officer", "resolved_by_user", "timed_out")
+    _ROUTE_OPEN_STATES = (
+        "pending_officer",
+        "pending_both",
+        "user_direct",
+        "escalated_to_user",
+        "delivery_failed",
+    )
+
+    def _message_route_row_to_dict(self, row: Any) -> Optional[Dict[str, Any]]:
+        """Normalize a job_message_routes row: parse JSONB, stringify ids."""
+        if row is None:
+            return None
+        result = dict(row)
+        for key in (
+            "route_id",
+            "job_id",
+            "project_id",
+            "officer_thread_id",
+            "originating_message_id",
+        ):
+            if result.get(key) is not None:
+                result[key] = str(result[key])
+        for key in ("policy_snapshot", "transitions"):
+            value = result.get(key)
+            if isinstance(value, str):
+                try:
+                    result[key] = json.loads(value)
+                except (TypeError, ValueError):
+                    result[key] = {} if key == "policy_snapshot" else []
+        return result
+
+    async def create_message_route(self, route: Dict[str, Any]) -> Optional[str]:
+        """Insert one route row (async routes / legacy user_direct bookkeeping).
+
+        The blocking officer path uses :meth:`create_routed_blocking_freeze`
+        instead — this plain insert is for routes that do NOT freeze the job
+        in the same unit. Returns the route_id, or None on a bad id.
+        """
+        try:
+            job_uuid = UUID(str(route["job_id"]))
+        except (KeyError, ValueError, TypeError):
+            return None
+        project_uuid: Optional[UUID] = None
+        if route.get("project_id"):
+            try:
+                project_uuid = UUID(str(route["project_id"]))
+            except (ValueError, TypeError):
+                project_uuid = None
+        officer_uuid: Optional[UUID] = None
+        if route.get("officer_thread_id"):
+            try:
+                officer_uuid = UUID(str(route["officer_thread_id"]))
+            except (ValueError, TypeError):
+                officer_uuid = None
+        origin_uuid: Optional[UUID] = None
+        if route.get("originating_message_id"):
+            try:
+                origin_uuid = UUID(str(route["originating_message_id"]))
+            except (ValueError, TypeError):
+                origin_uuid = None
+        route_uuid = UUID(str(route["route_id"])) if route.get("route_id") else uuid4()
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO job_message_routes (
+                    route_id, job_id, project_id, thread_id,
+                    originating_message_id, policy_snapshot, state, blocking,
+                    officer_thread_id, officer_incarnation, officer_deadline,
+                    user_delivery_at, total_deadline, transitions
+                ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10,
+                          $11, $12, $13, $14::jsonb)
+                RETURNING route_id
+                """,
+                route_uuid,
+                job_uuid,
+                project_uuid,
+                str(route["thread_id"]),
+                origin_uuid,
+                json.dumps(route.get("policy_snapshot") or {}),
+                str(route["state"]),
+                bool(route.get("blocking", False)),
+                officer_uuid,
+                route.get("officer_incarnation"),
+                route.get("officer_deadline"),
+                route.get("user_delivery_at"),
+                route.get("total_deadline"),
+                json.dumps(route.get("transitions") or []),
+            )
+        return str(row["route_id"]) if row else None
+
+    async def create_routed_blocking_freeze(
+        self,
+        job_id: str,
+        freeze_data: Dict[str, Any],
+        *,
+        route: Dict[str, Any],
+        message_entry: Dict[str, Any],
+        wake: Optional[Dict[str, Any]] = None,
+        expected_lane: str,
+        lease_token: int | None = None,
+        agent_id: str | None = None,
+        completion_commands_enabled: bool = False,
+    ) -> Optional[str]:
+        """The M2 unit: message + route + wake intent + freeze, one transaction.
+
+        officer_message_routing.md §3: for a blocking officer-routed send, one
+        database transaction persists (1) the logical message (message_log),
+        (2) the route row with its policy snapshot, (3) the durable officer
+        wake intent, and (4) the job's ``waiting_for_reply`` flip with the
+        matching freeze metadata. If any part cannot commit the whole unit
+        rolls back — the job stays runnable and the caller reports failure.
+        Never freeze first and hope delivery succeeds afterward.
+
+        Guards mirror :meth:`publish_blocking_message`: stateless lanes prove
+        the exact lease under the canonical queue→jobs lock order; pinned
+        lanes prove the assigned agent when one is supplied (required when
+        completion commands are enabled — legacy parity otherwise); the
+        completion-command barrier and control marker are re-read under the
+        row lock.
+
+        Returns ``{"route_id", "originating_message_id"}`` on success; None
+        when a guard/CAS lost (the caller maps that to 409). Real database
+        errors propagate.
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return None
+        if expected_lane not in {"pinned", "stateless"}:
+            return None
+        agent_uuid: UUID | None = None
+        if agent_id is not None:
+            try:
+                agent_uuid = UUID(agent_id)
+            except ValueError:
+                return None
+        if expected_lane == "stateless" and lease_token is None:
+            return None
+        if (
+            expected_lane == "pinned"
+            and completion_commands_enabled
+            and agent_uuid is None
+        ):
+            return None
+        route_uuid = UUID(str(route["route_id"])) if route.get("route_id") else uuid4()
+        officer_uuid: Optional[UUID] = None
+        if route.get("officer_thread_id"):
+            try:
+                officer_uuid = UUID(str(route["officer_thread_id"]))
+            except (ValueError, TypeError):
+                officer_uuid = None
+        project_uuid: Optional[UUID] = None
+        if route.get("project_id"):
+            try:
+                project_uuid = UUID(str(route["project_id"]))
+            except (ValueError, TypeError):
+                project_uuid = None
+
+        class _Abort(Exception):
+            pass
+
+        try:
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    queue = None
+                    if expected_lane == "stateless":
+                        queue = await conn.fetchrow(
+                            "SELECT state, lease_token FROM run_queue "
+                            "WHERE unit_id=$1::uuid "
+                            "AND unit_kind='worker_batch' FOR UPDATE",
+                            job_uuid,
+                        )
+                    job = await conn.fetchrow(
+                        f"SELECT status::text AS status, execution_lane, "
+                        "assigned_agent_id, user_id, "
+                        f"({_completion_control_active_sql('context')}) "
+                        "AS control_active FROM jobs WHERE id=$1::uuid FOR UPDATE",
+                        job_uuid,
+                    )
+                    if job is None:
+                        raise _Abort()
+                    if completion_commands_enabled:
+                        command_blocked = await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 "
+                            "FROM job_completion_sweep_exclusions "
+                            "WHERE job_id=$1::uuid)",
+                            job_uuid,
+                        )
+                        if command_blocked or bool(job["control_active"]):
+                            raise _Abort()
+                    if (
+                        job["status"] != "processing"
+                        or job["execution_lane"] != expected_lane
+                    ):
+                        raise _Abort()
+                    if expected_lane == "stateless":
+                        if (
+                            queue is None
+                            or queue["state"] != "leased"
+                            or int(queue["lease_token"]) != int(lease_token)
+                        ):
+                            raise _Abort()
+                    elif agent_uuid is not None and str(
+                        job["assigned_agent_id"] or ""
+                    ) != str(agent_uuid):
+                        raise _Abort()
+
+                    message_row = await conn.fetchrow(
+                        """
+                        INSERT INTO message_log (
+                            job_id, user_id, thread_id, direction,
+                            recipient_email, subject, message, mode, status
+                        ) VALUES ($1, $2, $3, 'outbound', $4, $5, $6,
+                                  'blocking', $7)
+                        RETURNING id
+                        """,
+                        job_uuid,
+                        (
+                            UUID(str(message_entry["user_id"]))
+                            if message_entry.get("user_id")
+                            else job["user_id"]
+                        ),
+                        str(route["thread_id"]),
+                        message_entry.get("recipient_email"),
+                        str(message_entry["subject"]),
+                        str(message_entry["message"]),
+                        str(message_entry.get("status") or "sent"),
+                    )
+
+                    await conn.execute(
+                        """
+                        INSERT INTO job_message_routes (
+                            route_id, job_id, project_id, thread_id,
+                            originating_message_id, policy_snapshot, state,
+                            blocking, officer_thread_id, officer_incarnation,
+                            officer_deadline, user_delivery_at, total_deadline,
+                            transitions
+                        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, TRUE,
+                                  $8, $9, $10, $11, $12, $13::jsonb)
+                        """,
+                        route_uuid,
+                        job_uuid,
+                        project_uuid,
+                        str(route["thread_id"]),
+                        message_row["id"],
+                        json.dumps(route.get("policy_snapshot") or {}),
+                        str(route["state"]),
+                        officer_uuid,
+                        route.get("officer_incarnation"),
+                        route.get("officer_deadline"),
+                        route.get("user_delivery_at"),
+                        route.get("total_deadline"),
+                        json.dumps(route.get("transitions") or []),
+                    )
+
+                    if wake is not None:
+                        wake_row = await conn.fetchrow(
+                            """
+                            INSERT INTO session_wake_events
+                                (thread_id, project_id, source, dedup_key,
+                                 payload, fire_at)
+                            VALUES ($1, $2, $3, $4, $5::jsonb, NULL)
+                            ON CONFLICT (thread_id, source, dedup_key)
+                                WHERE state = 'pending'
+                            DO NOTHING
+                            RETURNING id
+                            """,
+                            UUID(str(wake["thread_id"])),
+                            project_uuid,
+                            str(wake.get("source") or "worker_message"),
+                            str(wake["dedup_key"]),
+                            json.dumps(wake.get("payload") or {}),
+                        )
+                        if wake_row is None:
+                            # A pending duplicate coalesced — acceptable only
+                            # when it exists; verify so a silent conflict
+                            # cannot masquerade as durable intent.
+                            existing = await conn.fetchval(
+                                "SELECT 1 FROM session_wake_events "
+                                "WHERE thread_id=$1 AND source=$2 "
+                                "AND dedup_key=$3 AND state='pending'",
+                                UUID(str(wake["thread_id"])),
+                                str(wake.get("source") or "worker_message"),
+                                str(wake["dedup_key"]),
+                            )
+                            if not existing:
+                                raise _Abort()
+
+                    updated = await conn.fetchrow(
+                        "UPDATE jobs SET status='waiting_for_reply', "
+                        "freeze_data=$2::jsonb, updated_at=CURRENT_TIMESTAMP "
+                        "WHERE id=$1::uuid AND status='processing' "
+                        "AND execution_lane=$3::text "
+                        "RETURNING id",
+                        job_uuid,
+                        json.dumps(freeze_data),
+                        expected_lane,
+                    )
+                    if updated is None:
+                        raise _Abort()
+        except _Abort:
+            return None
+        return {
+            "route_id": str(route_uuid),
+            "originating_message_id": str(message_row["id"]),
+        }
+
+    async def set_message_email_id(
+        self, message_id: str, email_message_id: str
+    ) -> bool:
+        """Backfill the RFC822 Message-ID onto a pre-logged outbound row.
+
+        The routed blocking send logs its message inside the freeze
+        transaction, BEFORE the (post-commit) email dispatch mints the
+        Message-ID — this keeps In-Reply-To threading working for those rows.
+        """
+        try:
+            message_uuid = UUID(str(message_id))
+        except (ValueError, TypeError):
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE message_log SET email_message_id = $2 "
+                "WHERE id = $1 AND email_message_id IS NULL",
+                message_uuid,
+                str(email_message_id),
+            )
+        return result == "UPDATE 1"
+
+    async def get_message_log_entry(self, message_id: str) -> Optional[Dict[str, Any]]:
+        """One message_log row by id (escalation needs the original body)."""
+        try:
+            message_uuid = UUID(str(message_id))
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, job_id, thread_id, direction, subject, message, "
+                "mode, status, created_at FROM message_log WHERE id = $1",
+                message_uuid,
+            )
+        if row is None:
+            return None
+        result = dict(row)
+        result["id"] = str(result["id"])
+        if result.get("job_id") is not None:
+            result["job_id"] = str(result["job_id"])
+        return result
+
+    async def get_message_route(self, route_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            route_uuid = UUID(str(route_id))
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM job_message_routes WHERE route_id = $1",
+                route_uuid,
+            )
+        return self._message_route_row_to_dict(row)
+
+    async def find_message_route_for_thread(
+        self, job_id: str, thread_id: str, *, open_only: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Newest route for a (job, thread) — the reply lane's lookup."""
+        try:
+            job_uuid = UUID(str(job_id))
+        except (ValueError, TypeError):
+            return None
+        state_filter = "AND state = ANY($3::text[])" if open_only else ""
+        args: list[Any] = [job_uuid, str(thread_id)]
+        if open_only:
+            args.append(list(self._ROUTE_OPEN_STATES))
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT * FROM job_message_routes
+                 WHERE job_id = $1 AND thread_id = $2 {state_filter}
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                *args,
+            )
+        return self._message_route_row_to_dict(row)
+
+    async def transition_message_route(
+        self,
+        route_id: str,
+        *,
+        to_state: str,
+        expected_states: List[str],
+        actor_kind: str,
+        actor_id: Optional[str] = None,
+        officer_thread_id: Optional[str] = None,
+        officer_incarnation: Optional[int] = None,
+        note: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Compare-and-set one route transition, appending the actor audit.
+
+        The CAS (``state = ANY(expected_states)``) is what makes racing
+        resolvers (officer reply, user reply, both reconciler deadlines)
+        settle a route exactly once — the loser's UPDATE matches zero rows
+        and returns None. ``officer_thread_id`` additionally fences officer
+        actions to the incarnation the route was addressed to (§5.1: a
+        recommission never adopts an old waiting route). Terminal states set
+        the resolved_* triple in the same statement.
+        """
+        try:
+            route_uuid = UUID(str(route_id))
+        except (ValueError, TypeError):
+            return None
+        transition = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "to": to_state,
+            "actor_kind": actor_kind,
+        }
+        if actor_id is not None:
+            transition["actor_id"] = str(actor_id)
+        if officer_incarnation is not None:
+            transition["officer_incarnation"] = int(officer_incarnation)
+        if note:
+            transition["note"] = note
+        is_terminal = to_state in self._ROUTE_TERMINAL_STATES
+        args: list[Any] = [
+            route_uuid,
+            to_state,
+            list(expected_states),
+            json.dumps([transition]),
+        ]
+        officer_guard = ""
+        if officer_thread_id is not None:
+            try:
+                args.append(UUID(str(officer_thread_id)))
+            except (ValueError, TypeError):
+                return None
+            officer_guard = f" AND officer_thread_id = ${len(args)}"
+        resolved_sets = ""
+        if is_terminal:
+            args.append(actor_kind)
+            kind_arg = len(args)
+            args.append(str(actor_id) if actor_id is not None else None)
+            id_arg = len(args)
+            resolved_sets = (
+                f", resolved_by_kind = ${kind_arg}"
+                f", resolved_by_id = ${id_arg}"
+                ", resolved_at = now()"
+            )
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE job_message_routes
+                   SET state = $2,
+                       transitions = transitions
+                           || jsonb_set($4::jsonb, '{{0,from}}', to_jsonb(state)),
+                       updated_at = now()
+                       {resolved_sets}
+                 WHERE route_id = $1
+                   AND state = ANY($3::text[])
+                   {officer_guard}
+                RETURNING *
+                """,
+                *args,
+            )
+        return self._message_route_row_to_dict(row)
+
+    async def mark_route_user_delivery(self, route_id: str) -> bool:
+        """Stamp ``user_delivery_at`` after a successful user dispatch."""
+        try:
+            route_uuid = UUID(str(route_id))
+        except (ValueError, TypeError):
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE job_message_routes SET user_delivery_at = now(), "
+                "updated_at = now() WHERE route_id = $1 "
+                "AND user_delivery_at IS NULL RETURNING route_id",
+                route_uuid,
+            )
+        return row is not None
+
+    async def list_open_worker_message_routes(
+        self, project_id: str, *, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Open routes for a project, oldest first — the officer inbox/sitrep."""
+        try:
+            project_uuid = UUID(str(project_id))
+        except (ValueError, TypeError):
+            return []
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT r.*, j.status AS job_status,
+                       m.subject AS subject
+                  FROM job_message_routes r
+                  JOIN jobs j ON j.id = r.job_id
+                  LEFT JOIN message_log m ON m.id = r.originating_message_id
+                 WHERE r.project_id = $1
+                   AND r.state IN ('pending_officer', 'pending_both',
+                                   'escalated_to_user', 'delivery_failed')
+                 ORDER BY r.created_at
+                 LIMIT $2
+                """,
+                project_uuid,
+                limit,
+            )
+        return [self._message_route_row_to_dict(row) for row in rows]
+
+    async def list_pending_officer_blocking_routes(
+        self, project_id: str
+    ) -> List[Dict[str, Any]]:
+        """Blocking routes still with the officer — the hold/decommission drain."""
+        try:
+            project_uuid = UUID(str(project_id))
+        except (ValueError, TypeError):
+            return []
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM job_message_routes
+                 WHERE project_id = $1 AND state = 'pending_officer'
+                   AND blocking
+                 ORDER BY created_at
+                """,
+                project_uuid,
+            )
+        return [self._message_route_row_to_dict(row) for row in rows]
+
+    async def claim_officer_sla_escalations(
+        self, *, now: Optional[datetime] = None, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """CAS-claim blocking routes whose officer SLA expired (§5.2 #1).
+
+        One statement: FOR UPDATE SKIP LOCKED selection + the state CAS to
+        ``escalated_to_user`` with the audit append. Two reconcilers (or a
+        racing officer reply holding the row lock) settle each route exactly
+        once; the caller then delivers the thread to the user and stamps
+        ``user_delivery_at`` (redelivery leg retries a failed dispatch).
+        """
+        now = now or datetime.now(timezone.utc)
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE job_message_routes r
+                   SET state = 'escalated_to_user',
+                       transitions = r.transitions || jsonb_build_array(
+                           jsonb_build_object(
+                               'at', now()::text,
+                               'from', r.state,
+                               'to', 'escalated_to_user',
+                               'actor_kind', 'system',
+                               'note', 'officer_sla_expired')),
+                       updated_at = now()
+                  FROM (
+                        SELECT route_id FROM job_message_routes
+                         WHERE state = 'pending_officer' AND blocking
+                           AND officer_deadline IS NOT NULL
+                           AND officer_deadline <= $1
+                         ORDER BY officer_deadline
+                         LIMIT $2
+                           FOR UPDATE SKIP LOCKED
+                       ) due
+                 WHERE r.route_id = due.route_id
+                RETURNING r.*
+                """,
+                now,
+                limit,
+            )
+        return [self._message_route_row_to_dict(row) for row in rows]
+
+    async def claim_total_timeout_routes(
+        self, *, now: Optional[datetime] = None, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """CAS-claim blocking routes past the total timeout (§5.2 #2).
+
+        Marks them ``timed_out`` (terminal, actor=system) under FOR UPDATE
+        SKIP LOCKED. The caller owns the follow-up resume, which is itself
+        CAS'd on the job's status + freeze generation — an answer racing this
+        deadline unblocks the worker exactly once whichever side wins.
+        """
+        now = now or datetime.now(timezone.utc)
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE job_message_routes r
+                   SET state = 'timed_out',
+                       resolved_by_kind = 'system',
+                       resolved_by_id = 'total_blocking_timeout',
+                       resolved_at = now(),
+                       transitions = r.transitions || jsonb_build_array(
+                           jsonb_build_object(
+                               'at', now()::text,
+                               'from', r.state,
+                               'to', 'timed_out',
+                               'actor_kind', 'system',
+                               'note', 'total_blocking_timeout')),
+                       updated_at = now()
+                  FROM (
+                        SELECT route_id FROM job_message_routes
+                         WHERE blocking
+                           AND state IN ('pending_officer', 'pending_both',
+                                         'user_direct', 'escalated_to_user',
+                                         'delivery_failed')
+                           AND total_deadline IS NOT NULL
+                           AND total_deadline <= $1
+                         ORDER BY total_deadline
+                         LIMIT $2
+                           FOR UPDATE SKIP LOCKED
+                       ) due
+                 WHERE r.route_id = due.route_id
+                RETURNING r.*
+                """,
+                now,
+                limit,
+            )
+        return [self._message_route_row_to_dict(row) for row in rows]
+
+    async def list_timed_out_routes_still_frozen(
+        self, *, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Timed-out routes whose job is STILL frozen on their generation.
+
+        The crash-repair leg: the reconciler marked ``timed_out`` but died
+        before the resume landed. Matching ``freeze_data->>'route_id'`` is
+        the generation fence — a job re-frozen by a LATER blocking message
+        never matches an old route.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT r.* FROM job_message_routes r
+                  JOIN jobs j ON j.id = r.job_id
+                 WHERE r.state = 'timed_out' AND r.blocking
+                   AND j.status = 'waiting_for_reply'
+                   AND j.freeze_data->>'route_id' = r.route_id::text
+                 ORDER BY r.resolved_at
+                 LIMIT $1
+                """,
+                limit,
+            )
+        return [self._message_route_row_to_dict(row) for row in rows]
+
+    async def list_routes_needing_user_redelivery(
+        self, *, older_than_seconds: int = 180, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Routes owing the user a delivery whose dispatch never stamped.
+
+        Covers an escalation whose post-CAS dispatch failed and a
+        pending_both/user_direct blocking send whose initial notification
+        failed. The grace window keeps the reconciler out of the in-request
+        delivery's way.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM job_message_routes
+                 WHERE user_delivery_at IS NULL
+                   AND (
+                        (state = 'escalated_to_user'
+                         AND updated_at < now() - make_interval(secs => $1))
+                     OR (state IN ('pending_both', 'user_direct') AND blocking
+                         AND created_at < now() - make_interval(secs => $1))
+                   )
+                 ORDER BY created_at
+                 LIMIT $2
+                """,
+                float(older_than_seconds),
+                limit,
+            )
+        return [self._message_route_row_to_dict(row) for row in rows]
+
+    async def list_stale_pending_officer_routes(
+        self, *, older_than_seconds: int = 180, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Blocking officer routes whose durable wake intent died (§5.1).
+
+        The send transaction guarantees a pending wake row existed at
+        commit; if the outbox buried it (attempts exhausted → 'dead') or it
+        vanished, the officer will never hear the question — fall back to
+        the user. Routes with a live pending/sending wake are healthy and
+        excluded (the outbox is still retrying them).
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT r.* FROM job_message_routes r
+                 WHERE r.state = 'pending_officer' AND r.blocking
+                   AND r.created_at < now() - make_interval(secs => $1)
+                   AND NOT EXISTS (
+                        SELECT 1 FROM session_wake_events e
+                         WHERE e.thread_id = r.officer_thread_id
+                           AND e.source = 'worker_message'
+                           AND e.dedup_key = 'route:' || r.route_id::text
+                           AND e.state IN ('pending', 'sending', 'sent')
+                   )
+                 ORDER BY r.created_at
+                 LIMIT $2
+                """,
+                float(older_than_seconds),
+                limit,
+            )
+        return [self._message_route_row_to_dict(row) for row in rows]
+
     async def _queue_job_for_resume_on_conn(
         self,
         conn,
