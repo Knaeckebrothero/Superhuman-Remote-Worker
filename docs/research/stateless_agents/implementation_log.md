@@ -5128,3 +5128,49 @@ the exact job, terminal queue generation, command, held workspace and pinned
 probe stayed unchanged while M1–M3 landed. The committed route will be rolled
 out and the one-shot row/workspace evidence captured as M4 soak case 3, which
 keeps the required source-guard and 422 contracts ahead of specimen cleanup.
+
+## M4 — MiniMax k3d soak and preserved-specimen convergence
+
+All soak jobs explicitly resolved their main/phase and auxiliary models to
+`MiniMax-M3`. The final live audit found no P0/P1, the normal stateless
+Deployment returned to **2/2 Ready**, no nonterminal stateless job or leased
+worker unit remained, and the protected pinned `ee33e63f-…` workspace stayed
+Running/Ready at exact Pod UID `f7090b7c-011f-43e7-878d-83a6d81d9923`.
+
+| Case | Wall-clock / queue evidence | Completion evidence | Disposition |
+|---|---|---|---|
+| 1. Genuine 60 s rotation, `1d73a565-…` | Public create `09:43:28.817Z`; completed `09:52:59.531Z` (**570.715 s**). Five `complete_and_requeue` rotations observed elapsed **85.948, 135.707, 117.142, 73.447 and 65.766 s**, advancing tokens 1→6. Every rotation logged `complete_calls=0 http_complete_calls=0`; before token 6 the command count and exact-ID `/complete` count were zero. One durable artifact contained 16 ordered samples from `09:48:29Z` through `09:49:44Z`, an exact **75 s** span. | Token 6 made the only `/complete`, HTTP **202** at `09:52:57.064Z`. Final rows were job `completed`, queue `done` token 6 with `input_seq=consumed_seq=5`, and one command `done`, `report_seq=1`, accepted token 6, `should_stop=true`, outcome `completed`; zero 422s. | Public DELETE **200** at `09:54:36Z`; active app/vector/workspace/snapshot/repository residue zero. Eighteen terminal no-FK completion-effect rows remain as intentional history. |
+| 2. Forced coded 422, `9b8fa27b-…` | A standalone exact-image executor owned the isolated job while the normal pool was zero. Two ordinary 300 s rotations advanced token 1→3 with zero completion calls. At `10:21:32Z`, token 3's real goal-achieved terminal state was copied only at the client boundary into one four-field nonterminal wire envelope. The exact row became `queued`, unleased, attempts 1, commands 0, with `run_after=10:21:37.490Z` (about **4.638 s** after the capture); workspace UID and tmux owner token 3 were unchanged. | Exactly one injection, one bounded `completion_non_terminal_report` ERROR, one coded release and one HTTP **422**. Token 4 reclaimed at `10:21:38Z` with `disposition=existing`, reattached both tmux tabs and advanced shell ownership 3→4. Its unchanged terminal checkpoint produced exactly one HTTP **202** at `10:21:41Z`; only then did the one finalization hold appear. The job/queue/one command settled `completed`/`done` at token 4. | Public DELETE **200** at `10:25:43Z`; active rows/resources zero, normal pool restored 2/2. Eighteen done effects and one completed change record remain as intentional history. |
+| 3. Preserved owner-gap specimen, `a61d9940-…` | Committed M3 code deployed at `09:25:58Z`. At `09:26:07Z` the exact zero-owner row moved once from `processing` to `pending_review` with code `stateless_terminal_queue_unowned`; queue, command, historical action and 11 effects remained byte-identical. | Exactly one fixed-cardinality ERROR/`park_alert`; zero officer wake rows was expected because the cluster had zero enabled officer threads. The lifecycle uploaded one **99,076,819-byte** snapshot and accepted one exact-UID workspace deletion. | Fresh-token public DELETE **200** at `09:27:29Z`; job, queue, command, action, checkpoints, vector rows and all Kubernetes resources converged to zero. The pre-existing 11 done effects and append-only audit counts `90/9/10` remain exact. |
+
+Case 1's first disposable attempt (`4bea417c-…`) exposed a harness mistake:
+the public body omitted `context.worker_batch.target_wall_seconds=60`, so the
+agent correctly armed the 300-second target over the deployed 60-second floor.
+It was excluded from evidence, publicly cancelled and deleted with zero active
+residue; a harmless wrong-method POST returned 405 before the correct PUT.
+
+Case 2 used the brief's allowed temporarily instrumented-driver seam. The
+wrapper was process-local, exact-job-only and one-shot; it altered neither
+source nor durable state and marked itself spent only on the typed refusal.
+MiniMax required two ordinary rotations and ignored one authenticated urgent
+guidance until the next checkpoint, but it ultimately reached a genuine graph
+terminal without the designed synthetic-stream fallback. The first isolated-
+pod attempt was rejected by Kubernetes before Pod creation because its object
+lacked top-level `apiVersion`/`kind`; the EXIT trap restored 2/2, and that
+unmodified disposable claim was publicly cancelled/deleted before a corrected
+client- and server-dry-run manifest was admitted. During final cleanup, a
+missing localhost forward similarly triggered the restore trap before the
+successful in-orchestrator public DELETE. These are recorded harness
+deviations, not product mutations.
+
+After the accepted case-2 report, lifecycle removed the workspace before the
+worker's terminal shell reconnect and produced one bounded `[gone] terminal
+retirement not acknowledged` warning; the definitive handoff still settled
+`shell=retired`. This occurred after the refusal proof: token 3 had already
+preserved the live workspace/tmux and token 4 had reattached it under fresh
+admission. The independent audit therefore found no P0/P1. No raw database,
+checkpoint, job/workspace-authority or protected-file mutation was used in any
+accepted case. Case 2's explicitly bounded test isolation scaled the normal
+executor Deployment to zero and created one standalone exact-image harness
+Pod, with a preinstalled restore trap returning the Deployment to 2/2; it did
+not patch a workload or image in place. No soak artifact was pushed.
