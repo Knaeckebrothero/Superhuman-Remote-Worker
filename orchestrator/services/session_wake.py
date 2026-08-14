@@ -785,6 +785,7 @@ OFFICER_DEBOUNCE_BY_SOURCE: dict[str, int] = {
     "timer": 0,
     "respawn": 0,
     "conference": 0,
+    "commission": 0,  # the continuity brief is one-shot — never debounced
     "job_transition": 300,
     "sudo_request": 300,
     "loop": 300,
@@ -913,21 +914,35 @@ async def _note_ceiling_breach(
 
 
 async def _notify_project_officer_of_job(db: Any, job_id: str, status: str) -> bool:
-    """Enqueue an officer wake for a job transition, by project. Never raises."""
+    """Enqueue an officer wake for a job transition, by project. Never raises.
+
+    While the project's post is vacant (officer_post.md §5) the transition is
+    not dropped: it lands on the post's while-vacant ledger, and the next
+    commission's continuity brief opens with it.
+    """
     try:
         job = await db.get_job(str(job_id))
         if not job or not job.get("project_id"):
             return False
-        enqueued = await notify_officer(
-            db,
-            str(job["project_id"]),
+        project_id = str(job["project_id"])
+        entry = {
+            "job_id": str(job_id),
+            "status": str(status),
+            "description": _truncate(str(job.get("description") or ""), 200),
+        }
+        officer = await db.get_officer_thread_for_project(project_id)
+        if not officer:
+            await db.append_project_officer_while_vacant(
+                project_id,
+                [{**entry, "at": datetime.now(timezone.utc).isoformat()}],
+            )
+            return False
+        enqueued = await db.enqueue_session_wake_event(
+            str(officer["id"]),
             source="job_transition",
             dedup_key=_officer_job_dedup_key(job_id, status),
-            payload={
-                "job_id": str(job_id),
-                "status": str(status),
-                "description": _truncate(str(job.get("description") or ""), 200),
-            },
+            payload=entry,
+            project_id=project_id,
         )
         if enqueued:
             kick_event_drain(db)

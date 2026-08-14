@@ -9773,6 +9773,274 @@ class PostgresDB:
         lineage = [str(r["tid"]) for r in rows]
         return lineage or [str(thread_uuid)]
 
+    # While-vacant ledger cap (officer_post.md §5): a ring, newest kept,
+    # drop-oldest with a running dropped count so the commission brief can
+    # say "…and 7 older entries were dropped" instead of lying by omission.
+    WHILE_VACANT_CAP = 20
+
+    @staticmethod
+    def _while_vacant_ring(
+        state: Any, entries: List[Dict[str, Any]], cap: int
+    ) -> tuple[Dict[str, Any], int]:
+        """Compute the new while-vacant fragment from current state + entries.
+
+        Pure function shared by the vacant-post append and the decommission
+        queue fold, so both writers keep identical ring semantics. Returns
+        ``({"while_vacant": [...], "while_vacant_dropped": total}, overflow)``
+        where ``overflow`` is how many entries THIS append pushed off the
+        ring (the fragment's counter is the running total).
+        """
+        if isinstance(state, str):
+            try:
+                state = json.loads(state)
+            except (TypeError, ValueError):
+                state = {}
+        if not isinstance(state, dict):
+            state = {}
+        ledger = state.get("while_vacant")
+        if not isinstance(ledger, list):
+            ledger = []
+        try:
+            dropped = max(0, int(state.get("while_vacant_dropped") or 0))
+        except (TypeError, ValueError):
+            dropped = 0
+        combined = ledger + list(entries)
+        overflow = max(0, len(combined) - cap)
+        return (
+            {
+                "while_vacant": combined[overflow:],
+                "while_vacant_dropped": dropped + overflow,
+            },
+            overflow,
+        )
+
+    async def append_project_officer_while_vacant(
+        self,
+        project_id: str,
+        entries: List[Dict[str, Any]],
+        *,
+        cap: int = WHILE_VACANT_CAP,
+    ) -> Optional[Dict[str, Any]]:
+        """Record job transitions on a vacant post's while-vacant ledger.
+
+        officer_post.md §5: while the post is vacant the ``maybe_wake_session``
+        officer leg appends terminal-status entries here instead of dropping
+        them — the commission brief then opens with "while the post was
+        vacant: …". Ring of ``cap`` newest entries; older ones fall off into
+        the dropped count. Read-modify-write under the post's row lock so
+        concurrent completions serialize instead of clobbering each other.
+        Self-heals a missing post row. Returns the updated row, or None on a
+        bad/nonexistent project or empty ``entries``.
+        """
+        if not entries:
+            return None
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    await conn.execute(
+                        "INSERT INTO project_officers (project_id) VALUES ($1) "
+                        "ON CONFLICT (project_id) DO NOTHING",
+                        project_uuid,
+                    )
+                except asyncpg.ForeignKeyViolationError:
+                    return None
+                row = await conn.fetchrow(
+                    "SELECT state FROM project_officers "
+                    "WHERE project_id = $1 FOR UPDATE",
+                    project_uuid,
+                )
+                if row is None:
+                    return None
+                fragment, _ = self._while_vacant_ring(row["state"], entries, cap)
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE project_officers
+                       SET state = state || $2::jsonb, updated_at = now()
+                     WHERE project_id = $1
+                    RETURNING *
+                    """,
+                    project_uuid,
+                    json.dumps(fragment),
+                )
+        return self._project_officer_row_to_dict(updated)
+
+    async def drain_project_officer_while_vacant(
+        self, project_id: str
+    ) -> Dict[str, Any]:
+        """Atomically read AND clear the post's while-vacant ledger.
+
+        The commission brief consumes the ledger exactly once: read + reset
+        in one transaction under the row lock, so an entry appended by a
+        racing completion lands either in this brief or on the (now
+        commissioned, so no-longer-appending) row — never in neither.
+        Returns ``{"entries": [...], "dropped": n}``; empty shape when the
+        post is absent or the id is garbage.
+        """
+        empty = {"entries": [], "dropped": 0}
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return empty
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT state FROM project_officers "
+                    "WHERE project_id = $1 FOR UPDATE",
+                    project_uuid,
+                )
+                if row is None:
+                    return empty
+                state = row["state"]
+                if isinstance(state, str):
+                    try:
+                        state = json.loads(state)
+                    except (TypeError, ValueError):
+                        state = {}
+                if not isinstance(state, dict):
+                    state = {}
+                entries = state.get("while_vacant")
+                if not isinstance(entries, list):
+                    entries = []
+                try:
+                    dropped = max(0, int(state.get("while_vacant_dropped") or 0))
+                except (TypeError, ValueError):
+                    dropped = 0
+                if entries or dropped:
+                    await conn.execute(
+                        """
+                        UPDATE project_officers
+                           SET state = state || $2::jsonb, updated_at = now()
+                         WHERE project_id = $1
+                        """,
+                        project_uuid,
+                        json.dumps({"while_vacant": [], "while_vacant_dropped": 0}),
+                    )
+        return {"entries": entries, "dropped": dropped}
+
+    async def fold_project_officer_wake_queue(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        cap: int = WHILE_VACANT_CAP,
+    ) -> Dict[str, Any]:
+        """Decommission step 3 (officer_post.md §5): fold + clear the queue.
+
+        Pending/claimed wake events for the outgoing incarnation: job-shaped
+        ones (``source='job_transition'``) append to the post's while-vacant
+        ring; the rest (timer, fleet, …) are deleted — a sleep timer for an
+        absent officer is meaningless. One transaction: the post row lock
+        serializes the ledger write against the vacant-append path, and the
+        event rows are locked so a racing drain claim cannot deliver what
+        this fold is deleting. Returns ``{"folded": n, "deleted": m,
+        "dropped": k}``. Never raises on bad ids.
+        """
+        result = {"folded": 0, "deleted": 0, "dropped": 0}
+        try:
+            project_uuid = UUID(project_id)
+            thread_uuid = UUID(thread_id)
+        except (ValueError, TypeError):
+            return result
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                post = await conn.fetchrow(
+                    "SELECT state FROM project_officers "
+                    "WHERE project_id = $1 FOR UPDATE",
+                    project_uuid,
+                )
+                events = await conn.fetch(
+                    """
+                    SELECT id, source, payload, created_at
+                      FROM session_wake_events
+                     WHERE thread_id = $1
+                       AND state IN ('pending', 'sending')
+                     ORDER BY created_at
+                       FOR UPDATE
+                    """,
+                    thread_uuid,
+                )
+                if not events:
+                    return result
+                entries: List[Dict[str, Any]] = []
+                for ev in events:
+                    if str(ev["source"]) != "job_transition":
+                        continue
+                    payload = ev["payload"]
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except (TypeError, ValueError):
+                            payload = {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    entry = {
+                        "job_id": payload.get("job_id"),
+                        "status": payload.get("status"),
+                        "description": payload.get("description"),
+                    }
+                    created_at = ev.get("created_at")
+                    if created_at is not None:
+                        entry["at"] = (
+                            created_at.isoformat()
+                            if hasattr(created_at, "isoformat")
+                            else str(created_at)
+                        )
+                    entries.append(entry)
+                if entries and post is not None:
+                    fragment, overflow = self._while_vacant_ring(
+                        post["state"], entries, cap
+                    )
+                    result["dropped"] = overflow
+                    await conn.execute(
+                        """
+                        UPDATE project_officers
+                           SET state = state || $2::jsonb, updated_at = now()
+                         WHERE project_id = $1
+                        """,
+                        project_uuid,
+                        json.dumps(fragment),
+                    )
+                await conn.execute(
+                    "DELETE FROM session_wake_events WHERE id = ANY($1::bigint[])",
+                    [int(ev["id"]) for ev in events],
+                )
+                result["folded"] = len(entries)
+                result["deleted"] = len(events)
+        return result
+
+    async def merge_project_officer_communication_policy(
+        self, project_id: str, patch: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Shallow-merge the row-only worker-message routing policy.
+
+        officer_post.md §7: ``communication_policy`` lives on the post so it
+        exists while vacant and the officer runtime can never rewrite it —
+        it is deliberately NEVER mirrored into thread metadata. One atomic
+        ``||`` so a partial patch updates one key without clobbering the
+        other. Returns the updated row or None when the post is absent.
+        """
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE project_officers
+                   SET communication_policy = communication_policy || $2::jsonb,
+                       updated_at = now()
+                 WHERE project_id = $1
+                RETURNING *
+                """,
+                project_uuid,
+                json.dumps(patch),
+            )
+        return self._project_officer_row_to_dict(row)
+
     async def _queue_job_for_resume_on_conn(
         self,
         conn,
