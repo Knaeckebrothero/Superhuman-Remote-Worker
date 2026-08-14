@@ -1,4 +1,4 @@
-"""Repository toolkit — write operations on attached repository datasources.
+"""Repository toolkit — operations on attached repository datasources.
 
 Distinct from the `git` toolkit, which is read-only and targets the internal
 workspace repo. See docs/features/self_development_workflow.md.

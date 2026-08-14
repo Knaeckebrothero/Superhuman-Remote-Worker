@@ -126,13 +126,13 @@ def test_repository_maps_to_repo_category_not_git():
     assert "git" not in cats
 
 
-def test_read_only_repository_gets_only_pull():
+def test_read_only_repository_gets_only_read_tools():
     from src.core.datasource_setup import datasource_tool_categories
 
     cats = datasource_tool_categories(
         [{"type": "repository", "name": "r", "project_read_only": True}]
     )
-    assert cats["repo"] == ["repo_pull"]
+    assert cats["repo"] == ["repo_pull", "repo_pr_status"]
 
 
 class TestRepoCategorySurvivesTheRealFunnel:
@@ -178,6 +178,7 @@ class TestRepoCategorySurvivesTheRealFunnel:
             "repo_push",
             "repo_pull",
             "repo_open_pr",
+            "repo_pr_status",
         ]
 
     def test_get_all_tool_names_yields_repo_tools(self):
@@ -191,14 +192,16 @@ class TestRepoCategorySurvivesTheRealFunnel:
         assert "repo_push" in names
         assert "repo_pull" in names
         assert "repo_open_pr" in names
+        assert "repo_pr_status" in names
 
-    def test_read_only_repository_yields_only_repo_pull(self):
+    def test_read_only_repository_yields_only_repo_read_tools(self):
         from src.core.loader import get_all_tool_names
 
         names = get_all_tool_names(
             self._config_for([_ds("repository", read_only=True)])
         )
         assert "repo_pull" in names
+        assert "repo_pr_status" in names
         assert "repo_commit" not in names
         assert "repo_push" not in names
         assert "repo_open_pr" not in names

@@ -14,7 +14,12 @@ from uuid import UUID
 
 from langchain_core.tools import tool
 
-from ...services.forge import ForgeError, ForgeRepo, open_pull_request
+from ...services.forge import (
+    ForgeError,
+    ForgeRepo,
+    get_pull_request_status,
+    open_pull_request,
+)
 from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,14 @@ REPO_TOOLS_METADATA = {
             "Open a pull request (merge request on GitLab) for an attached repository."
         ),
         "short_description": "Open a pull/merge request for an attached repository.",
+    },
+    "repo_pr_status": {
+        "category": "repo",
+        "description": (
+            "Read the live open, merged, or closed state of a pull request "
+            "(merge request on GitLab) in an attached repository."
+        ),
+        "short_description": "Read live pull/merge request status.",
     },
 }
 
@@ -223,4 +236,53 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
             "this job. Keep the URL above and do not open a duplicate."
         )
 
-    return [repo_commit, repo_push, repo_pull, repo_open_pr]
+    @tool
+    async def repo_pr_status(repo: str, number: int) -> str:
+        """Read a pull request's live state from its forge.
+
+        This is a read operation and remains available on read-only repository
+        connectors.
+
+        Args:
+            repo: Clone-directory name, as listed in datasources.md.
+            number: Pull/merge request number in that repository.
+        """
+        resolved = _resolve(repo)
+        if isinstance(resolved, str):
+            return resolved
+        _git_mgr, meta = resolved
+        if not meta:
+            return (
+                f"Repository {repo!r} has no recorded connector metadata, so "
+                "its pull request status cannot be read. Fix the connector's "
+                "connection URL/forge and re-attach it."
+            )
+        if not meta.get("forge"):
+            return (
+                f"Repository {repo!r} has no forge recorded, so its pull "
+                "request status cannot be read."
+            )
+
+        target = ForgeRepo(
+            forge=meta["forge"],
+            api_base=meta["api_base"],
+            owner=meta["owner"],
+            repo=meta["repo"],
+            token=meta.get("token", ""),
+        )
+        try:
+            result = await get_pull_request_status(target, number)
+        except ForgeError as exc:
+            return f"Could not read the pull request status: {exc}"
+
+        draft = " draft" if result["draft"] else ""
+        refs = ""
+        if result["head"] or result["base"]:
+            refs = f" ({result['head'] or '?'} → {result['base'] or '?'})"
+        link = f": {result['url']}" if result["url"] else ""
+        return (
+            f"Pull request #{result['number']} is{draft} "
+            f"{result['state'].upper()}{refs}{link}"
+        )
+
+    return [repo_commit, repo_push, repo_pull, repo_open_pr, repo_pr_status]

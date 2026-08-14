@@ -2520,6 +2520,12 @@
       "sourceRepository": "Quell-Repository",
       "branch": "Branch {{branch}}",
       "pullRequest": "Pull Request #{{number}}",
+      "pullRequestState": {
+        "open": "Offen",
+        "merged": "Zusammengeführt",
+        "closed": "Geschlossen",
+        "unavailable": "Status nicht verfügbar"
+      },
       "jobWorkspace": "Job-Arbeitsbereich",
       "startingIde": "IDE wird gestartet …",
       "openIde": "Im Web-IDE öffnen",

@@ -72,6 +72,7 @@ import {
     ProjectRepositoryCreateRequest,
     ProjectRepositoryUpdateRequest,
     ProjectUpdateRequest,
+    PullRequestStatus,
     PromoteRequest,
     StuckJob,
     TableDataResponse,
@@ -1020,6 +1021,18 @@ export class ApiService {
         return of([]);
       }),
     );
+  }
+
+  /** Read live state for the pull request persisted against a job. */
+  getJobPullRequestStatus(jobId: string): Observable<PullRequestStatus | null> {
+    return this.http
+      .get<PullRequestStatus>(`${this.baseUrl}/jobs/${jobId}/pull-request`)
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch pull request status for job ${jobId}:`, error);
+          return of(null);
+        }),
+      );
   }
 
   // ===== Project Datasources (N:M) =====

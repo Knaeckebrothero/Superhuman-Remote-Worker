@@ -12,6 +12,50 @@ import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
 import type {ThreadUploadedFile, ThreadUploadEvent} from '../models/file.model';
 
+describe('ApiService.getJobPullRequestStatus', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('reads the server-resolved job PR without sending connector data', async () => {
+    const pending = firstValueFrom(api.getJobPullRequestStatus('job-1'));
+    const request = httpMock.expectOne((item) =>
+      item.url.endsWith('/jobs/job-1/pull-request'),
+    );
+    expect(request.request.method).toBe('GET');
+    expect(request.request.body).toBeNull();
+    request.flush({
+      forge: 'github',
+      repo: 'acme/widget',
+      number: 9,
+      url: 'https://github.com/acme/widget/pull/9',
+      state: 'open',
+      head: 'feature/review',
+      base: 'main',
+      draft: false,
+    });
+
+    await expect(pending).resolves.toMatchObject({number: 9, state: 'open'});
+  });
+});
+
 describe('ApiService.transcribeVoice', () => {
   let api: ApiService;
   let httpMock: HttpTestingController;

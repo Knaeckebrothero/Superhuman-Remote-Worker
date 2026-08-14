@@ -344,12 +344,10 @@ class TestRealAgentPayloadCarriesForgeMetadata:
             "repo_push",
             "repo_pull",
             "repo_open_pr",
+            "repo_pr_status",
         ]
 
-    def test_unparseable_url_records_no_metadata_at_all(self):
-        """SSH-form connection_url: ``resolve_api_base`` raises, the meta
-        block is skipped. The clone still succeeds — the tool layer is what
-        must fail closed (see test_repo_tools)."""
+    def test_ssh_form_url_records_forge_metadata_for_status_reads(self):
         ws = make_workspace_manager()
         ds = token_ds(url="git@github.com:org/repo.git", config={"forge": "github"})
         with patch(
@@ -358,7 +356,15 @@ class TestRealAgentPayloadCarriesForgeMetadata:
             clone_repository_datasources([ds], ws)
 
         assert "repo" in ws.source_repos
-        assert "repo" not in ws.source_repo_meta
+        assert ws.source_repo_meta["repo"] == {
+            "forge": "github",
+            "api_base": "https://api.github.com",
+            "owner": "org",
+            "repo": "repo",
+            "token": "tok123",
+            "read_only": False,
+            "default_branch": None,
+        }
 
 
 class TestResolveRepoCloneNames:
