@@ -67,9 +67,9 @@ redacted (`oauth2:***@`).
 | 7 | Verify index counts | ✅ see §4 |
 | 8 | Link code connector to project | ✅ + `auto_attach=true` |
 | 9 | Convention note into live vault | ✅ `where-the-code-lives-repos-kurortengine` |
-| 10 | HEAD-comparison delivery guard | ❌ **not built** — see §6 |
+| 10 | Delivery guard | ✅ **built** `a040dd31` — see §6a |
 | 11 | Manual developer job, watched | ✅ **passed** — see §5 |
-| 12 | Start the loop | ❌ not started |
+| 12 | Start the loop | ❌ not started — unblocked, see §6b |
 
 ## 4. Verification results
 
@@ -119,25 +119,50 @@ mechanism works.
 
 ## 6. What remains
 
-### 6a. The delivery guard (step 10) — and a design correction
+### 6a. The delivery guard (step 10) — **built** `a040dd31`
 
 **This run changed the design.** `main` did **not** move, and that is *correct* — the work is
 on a branch under review. A guard that compares `main` before/after would have recorded this
 successful delivery as **nothing landed**, recreating the exact false signal it exists to
 prevent.
 
-The guard must treat **branch pushed + PR open** as delivery. §3c of
-`job_review_delivery_links_and_review_session.md` shipped a live PR-status read, which is the
-signal it should consume.
+Built as three changes, all under TDD with a negative control (reverting the predicate to its
+pre-change form fails exactly the four behavioural tests and leaves the rest green):
 
-Second open question, unresolved: **do not overload `delivery_status`.** For this project it
-is legitimately `no-changes` on every code turn forever, because code does not go to the
-cloud folder. One column carrying two unrelated truths is how the original failure happened.
-Give the git outcome its own field.
+| where | change |
+|---|---|
+| `job_records.derive_changes` | Emits a `kind: pull_request` entry from the record `repo_open_pr` persists into `jobs.context`. |
+| `job_records.job_delivered_nothing` | Replaces `delivery_status == "no-changes"` as the loop's F29 alarm; `main.py:_record_loop_job_outcome` consumes it and now also emits a positive action line naming the PR. |
+| `project_loops.render_loop_job_history` | Names the PR alongside `delivery=no-changes`, so the next iteration is not told the last one shipped nothing. |
+
+**Two rulings worth keeping.**
+
+*The signal is the persisted record, not a live status read.* §3c's `repo_pr_status` is the
+right tool for a **reviewer** asking "is it still open?". It is the wrong one for the guard:
+this is a best-effort audit path that must never block a loop advance, and making it depend on
+a third-party forge call would put a network dependency inside `write_loop_retro`'s
+swallow-everything `except`. The persisted record already proves the PR was created — the
+orchestrator wrote it itself, on success, at tool-call time.
+
+*The PR entry is `verified: true`, and that does not weaken §5.1.* The rule that agent claims
+are never promoted stands. This record is not an agent claim: the orchestrator persisted it,
+and reading it back fetches nothing. Prose parked under the same key is **dropped**, not
+downgraded — `parse_job_pull_request` fails closed on a malformed record, so the guard cannot
+report a delivery that may not exist.
+
+**`delivery_status` was deliberately left alone**, as the open question required. It is
+legitimately `no-changes` on every code turn here, and one column carrying two unrelated
+truths is how the original failure happened. The git outcome lives in the `changes` array,
+which already had the right shape and the verified/unverified distinction.
+
+Not covered: a job that pushes a branch **without** opening a PR still reads as no delivery.
+That is the correct default under a review-based flow — an unreviewed branch is not delivered
+— but it means an agent that pushes and forgets the PR is flagged, loudly, which is the
+intended direction of failure.
 
 ### 6b. Starting the loop (step 12)
 
-Blocked on 6a. When it starts: `workspace_backend=container` (**not** `vm` — all six recorded
+Unblocked by 6a; needs a dev deploy of the orchestrator image first. When it starts: `workspace_backend=container` (**not** `vm` — all six recorded
 loops used `vm`; `docs/issues/vm_reliability_assessment.md` puts VM infra-failures at 2.2×
 container, and loop `3ed022a5` died on three consecutive VM provisioning failures),
 `scheduling=standard`.
