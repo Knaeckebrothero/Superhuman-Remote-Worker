@@ -219,7 +219,12 @@ asyncio.run(main())
         assert _without_framework_schema_decoration(
             mcp_tools[item.name]
         ) == _without_framework_schema_decoration(langchain_schema), item.name
-        assert langchain_tools[item.name].description == item.description
+        # Whitespace-insensitive: whether the adapter takes raw ``__doc__``
+        # (indented continuation lines) or ``inspect.getdoc`` (dedented) is a
+        # dependency-version detail — the contract is the same TEXT.
+        assert " ".join(langchain_tools[item.name].description.split()) == " ".join(
+            item.description.split()
+        ), item.name
 
 
 @pytest.mark.asyncio
