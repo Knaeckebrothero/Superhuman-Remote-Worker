@@ -12436,6 +12436,15 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 from services.officer_slots import SlotAdmissionError
                 from services.officer_slots import admit as officer_slot_admit
 
+                # Lineage-aware in-flight count (officer_post.md §4): jobs
+                # created by ANY incarnation on this post keep occupying
+                # their slots across a decommission→recommission. Resolved
+                # before the lock — incarnations change only at fold
+                # transitions, and the advisory lock's job is serializing
+                # the count against parallel creates from this officer.
+                _officer_lineage = await postgres_db.get_officer_capacity_lineage(
+                    _officer_admit_thread_id
+                )
                 async with postgres_db.acquire() as conn:
                     async with conn.transaction():
                         await conn.execute(
@@ -12447,11 +12456,11 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                             SELECT context->>'officer_slot' AS slot,
                                    COUNT(*) AS n
                               FROM jobs
-                             WHERE created_by_thread_id = $1
+                             WHERE created_by_thread_id = ANY($1::uuid[])
                                AND status IN ('created', 'processing')
                              GROUP BY 1
                             """,
-                            UUID(_officer_admit_thread_id),
+                            _officer_lineage,
                         )
                 in_flight_by_slot = {r["slot"]: int(r["n"]) for r in slot_rows}
                 requested_slot = context.get("officer_slot")
@@ -33313,30 +33322,81 @@ async def _conclude_conference_if_any(thread: dict) -> None:
 async def get_project_officer_summary(
     request: Request, project_id: str
 ) -> dict[str, Any]:
-    """The project's centurion at a glance — the cockpit's officer card (S9).
+    """The project's post at a glance — the cockpit's officer card.
 
-    Everything the Legate asked "where do I see him?" about: whether one is
-    enabled, his thread (the log), the next scheduled wake, queued events,
-    today's page spend, the digest ring, a live hold, and the open conference
-    if any. ``officer: null`` when the project has none — the card renders an
-    enable prompt from that.
+    officer_post.md §4/§8: always returns the post. ``commissioned`` /
+    ``held`` / ``kit`` / ``incarnations`` / ``communication_policy`` come
+    from the durable ``project_officers`` row (partial §8 shape — the O3/O4
+    lifecycle and PATCH slices finish it); the live ``officer`` block keeps
+    its pre-post shape so the existing card renders unchanged, and stays
+    ``null`` while the post is vacant. Kit utilization is lineage-aware:
+    in-flight counts follow every incarnation on the post, not just the
+    current thread.
     """
     await require_approved_user(request, postgres_db)
     await require_project_member(request, postgres_db, project_id, min_role="viewer")
 
+    post = await postgres_db.get_or_create_project_officer(project_id) or {}
     officer = await postgres_db.get_officer_thread_for_project(project_id)
     conference = await _find_open_conference_thread(project_id)
+    conference_block = (
+        {
+            "thread_id": str(conference["id"]),
+            "status": conference.get("status"),
+        }
+        if conference
+        else None
+    )
+
+    # Lineage-aware utilization (officer_post.md §4): jobs dispatched by any
+    # incarnation keep occupying their slots across decommission→recommission.
+    lineage = await postgres_db.get_project_officer_lineage(project_id)
+    in_flight_by_slot: dict[Any, int] = {}
+    if lineage:
+        async with postgres_db.acquire() as conn:
+            _slot_rows = await conn.fetch(
+                """
+                SELECT context->>'officer_slot' AS slot, COUNT(*) AS n
+                  FROM jobs
+                 WHERE created_by_thread_id = ANY($1::uuid[])
+                   AND status IN ('created', 'processing')
+                 GROUP BY 1
+                """,
+                lineage,
+            )
+        in_flight_by_slot = {r["slot"]: int(r["n"]) for r in _slot_rows}
+
+    def _kit_view(slots: Any) -> dict[str, Any] | None:
+        """Roster spec + per-slot in-flight, or None on a flat cap."""
+        if not isinstance(slots, dict) or not slots:
+            return None
+        kit: dict[str, Any] = {}
+        for name, spec in slots.items():
+            entry = dict(spec) if isinstance(spec, dict) else {}
+            entry["in_flight"] = int(in_flight_by_slot.get(name) or 0)
+            kit[str(name)] = entry
+        return kit
+
+    row_officer_cfg = (post.get("config_override") or {}).get("officer") or {}
+    if not isinstance(row_officer_cfg, dict):
+        row_officer_cfg = {}
+    post_block: dict[str, Any] = {
+        "commissioned": bool(post.get("thread_id")),
+        "held": None,
+        "kit": None,
+        "communication_policy": post.get("communication_policy") or {},
+        "incarnations": post.get("incarnations") or [],
+    }
+
     if not officer:
+        # Vacant (or a stale ended-thread link, which reads as vacant): the
+        # kit seeds from the row — the last real kit a decommission or the
+        # backfill harvested there.
+        post_block["kit"] = _kit_view(row_officer_cfg.get("slots"))
         return {
             "officer": None,
-            "conference": (
-                {
-                    "thread_id": str(conference["id"]),
-                    "status": conference.get("status"),
-                }
-                if conference
-                else None
-            ),
+            "conference": conference_block,
+            **post_block,
         }
 
     officer_tid = str(officer["id"])
@@ -33375,7 +33435,14 @@ async def get_project_officer_summary(
     if not isinstance(digest, list):
         digest = []
 
+    # Hold is thread-scoped runtime state (officer_post.md §5) — read live.
+    post_block["held"] = officer_meta.get("hold") or None
+    post_block["kit"] = _kit_view(
+        officer_meta.get("slots") or row_officer_cfg.get("slots")
+    )
+
     return {
+        **post_block,
         "officer": {
             "thread_id": officer_tid,
             "status": officer.get("status"),
@@ -33405,14 +33472,7 @@ async def get_project_officer_summary(
             "deferred_today": officer_state.get("ceiling_notice") == today,
         },
         "digest": digest[-10:],
-        "conference": (
-            {
-                "thread_id": str(conference["id"]),
-                "status": conference.get("status"),
-            }
-            if conference
-            else None
-        ),
+        "conference": conference_block,
     }
 
 
@@ -35610,6 +35670,32 @@ async def create_thread(
                     ),
                 )
 
+        # Officer post admission (officer_post.md §4): the create funnel is
+        # the only path that raises an officer, and the post admits one
+        # incarnation at a time. Refuse BEFORE provisioning — the atomic
+        # registration claim after the INSERT below is the authority; this
+        # early check just avoids creating a thread we would immediately
+        # have to stand down. Posts are project-scoped, so an officer class
+        # materialized onto a project-less session (account/expert default)
+        # has no post to claim and keeps its pre-post behavior: it creates,
+        # unregistered — every project-keyed officer read already ignores it.
+        _officer_requested = (config_override.get("officer") or {}).get(
+            "enabled"
+        ) is True
+        if _officer_requested and primary_project_id:
+            _standing = await postgres_db.get_officer_thread_for_project(
+                primary_project_id
+            )
+            if _standing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "already commissioned: this project's post is held "
+                        f"by thread {_standing['id']} — retire him before "
+                        "raising another officer."
+                    ),
+                )
+
         # Materialize one complete selection with the thread row. Cockpit sends
         # a reviewed array (including []); omission is temporarily gated for
         # older API clients that encoded an opt-out by leaving the field out.
@@ -35799,6 +35885,35 @@ async def create_thread(
                     """,
                     thread_id,
                     json.dumps(metadata_patch),
+                )
+
+        # Officer post registration (officer_post.md §4): link the new
+        # incarnation on the project's post so the row can never disagree
+        # with the threads table about who holds it. The claim is atomic — a
+        # rival create that slipped past the pre-check loses here, and the
+        # thread it minted is stood down so the JSONB-predicate machinery
+        # (wake claim, watchdog) never sees two live officers.
+        if _officer_requested and primary_project_id:
+            _registered = await postgres_db.register_project_officer_thread(
+                primary_project_id,
+                str(thread_id),
+                config_override=redact_config_override(config_override),
+            )
+            if _registered is None:
+                try:
+                    await postgres_db.merge_thread_config_override(
+                        str(thread_id), {"officer": {"enabled": False}}
+                    )
+                    await postgres_db.update_thread_status(str(thread_id), "ended")
+                except Exception:
+                    logger.warning(
+                        "officer registration race: stand-down of thread %s failed",
+                        thread_id,
+                    )
+                raise HTTPException(
+                    status_code=409,
+                    detail="already commissioned: this project's post was "
+                    "claimed by a concurrent officer create.",
                 )
 
         # Conference open → hold the background officer (centurion.md §4):

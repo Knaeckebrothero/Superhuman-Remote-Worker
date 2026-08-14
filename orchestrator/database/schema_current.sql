@@ -6213,6 +6213,61 @@ CREATE TABLE public.project_members (
 
 
 --
+-- Name: project_officers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project_officers (
+    project_id uuid NOT NULL,
+    thread_id uuid,
+    config_override jsonb DEFAULT '{}'::jsonb NOT NULL,
+    communication_policy jsonb DEFAULT '{"worker_messages": "user_direct", "officer_response_minutes": 15}'::jsonb NOT NULL,
+    state jsonb DEFAULT '{}'::jsonb NOT NULL,
+    incarnations jsonb DEFAULT '[]'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT project_officer_communication_is_object CHECK ((jsonb_typeof(communication_policy) = 'object'::text)),
+    CONSTRAINT project_officer_config_is_object CHECK ((jsonb_typeof(config_override) = 'object'::text)),
+    CONSTRAINT project_officer_incarnations_is_array CHECK ((jsonb_typeof(incarnations) = 'array'::text)),
+    CONSTRAINT project_officer_state_is_object CHECK ((jsonb_typeof(state) = 'object'::text))
+);
+
+
+--
+-- Name: TABLE project_officers; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.project_officers IS 'The officer''s durable post — one row per project, always present. thread_id IS NULL = vacant; commission links a thread, decommission harvests its state back onto the row (officer_post.md §2). The thread stays the runtime projection; this row is the durable record.';
+
+
+--
+-- Name: COLUMN project_officers.thread_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_officers.thread_id IS 'Current incarnation (threads.id), NULL while the post is vacant. Deliberately not unique so a future legion can share one commander.';
+
+
+--
+-- Name: COLUMN project_officers.communication_policy; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_officers.communication_policy IS 'Legate-owned worker-message routing policy (officer_message_routing). Row-only: resolved server-side per message, never mirrored into thread metadata, not writable by the officer runtime.';
+
+
+--
+-- Name: COLUMN project_officers.state; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_officers.state IS 'Harvested metadata.officer_state from the last decommission (digest ring, page counters, sitrep fingerprints) plus the while-vacant ledger. Empty while commissioned — the live copy stays on the thread.';
+
+
+--
+-- Name: COLUMN project_officers.incarnations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_officers.incarnations IS 'Append-only history: [{thread_id, commissioned_at, decommissioned_at, reason}]. The index into old officer threads, which remain readable as ended sessions.';
+
+
+--
 -- Name: project_repositories; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -9246,6 +9301,14 @@ ALTER TABLE ONLY public.project_members
 
 
 --
+-- Name: project_officers project_officers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_officers
+    ADD CONSTRAINT project_officers_pkey PRIMARY KEY (project_id);
+
+
+--
 -- Name: project_repositories project_repositories_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -12240,6 +12303,13 @@ CREATE TRIGGER update_project_api_keys_updated_at BEFORE UPDATE ON public.projec
 
 
 --
+-- Name: project_officers update_project_officers_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER update_project_officers_updated_at BEFORE UPDATE ON public.project_officers FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+
+--
 -- Name: project_repositories update_project_repositories_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -13002,6 +13072,22 @@ ALTER TABLE ONLY public.project_members
 
 ALTER TABLE ONLY public.project_members
     ADD CONSTRAINT project_members_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_officers project_officers_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_officers
+    ADD CONSTRAINT project_officers_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_officers project_officers_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_officers
+    ADD CONSTRAINT project_officers_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE SET NULL;
 
 
 --

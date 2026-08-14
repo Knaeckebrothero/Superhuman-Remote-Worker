@@ -252,13 +252,36 @@ class TestOfficerSummaryEndpoint:
 
         class _Acq:
             async def __aenter__(self):
-                return SimpleNamespace(fetchval=AsyncMock(return_value=4))
+                return SimpleNamespace(
+                    fetchval=AsyncMock(return_value=4),
+                    fetch=AsyncMock(return_value=[{"slot": "line", "n": 1}]),
+                )
 
             async def __aexit__(self, *a):
                 return False
 
+        incarnation = {
+            "thread_id": str(uuid.uuid4()),
+            "commissioned_at": "2026-07-01T00:00:00Z",
+            "decommissioned_at": "2026-07-20T00:00:00Z",
+            "reason": "retired",
+        }
         db = SimpleNamespace()
         db.get_officer_thread_for_project = AsyncMock(return_value=officer)
+        db.get_or_create_project_officer = AsyncMock(
+            return_value={
+                "project_id": PROJECT_ID,
+                "thread_id": OFFICER_TID,
+                "config_override": {"officer": {"slots": {"line": {"count": 2}}}},
+                "communication_policy": {
+                    "worker_messages": "user_direct",
+                    "officer_response_minutes": 15,
+                },
+                "state": {},
+                "incarnations": [incarnation],
+            }
+        )
+        db.get_project_officer_lineage = AsyncMock(return_value=[OFFICER_TID])
         db.get_pending_officer_timer = AsyncMock(
             return_value={"fire_at": "2026-07-30T05:00:00Z"}
         )
@@ -282,11 +305,34 @@ class TestOfficerSummaryEndpoint:
         assert out["token_ceiling"]["deferred_today"] is True
         assert len(out["digest"]) == 10  # capped
         assert out["conference"]["thread_id"] == CONF_TID
+        # The post block (officer_post.md §8, partial O2 shape).
+        assert out["commissioned"] is True
+        assert out["held"] is None
+        # Kit utilization is lineage-aware; the row's roster seeds the spec.
+        assert out["kit"] == {"line": {"count": 2, "in_flight": 1}}
+        assert out["communication_policy"]["worker_messages"] == "user_direct"
+        assert out["incarnations"] == [incarnation]
 
     @pytest.mark.asyncio
     async def test_no_officer_renders_enable_prompt(self, monkeypatch):
         db = SimpleNamespace()
         db.get_officer_thread_for_project = AsyncMock(return_value=None)
+        # A vacant post whose last incarnation left a kit behind: the card's
+        # provision form seeds from it (officer_post.md §8).
+        db.get_or_create_project_officer = AsyncMock(
+            return_value={
+                "project_id": PROJECT_ID,
+                "thread_id": None,
+                "config_override": {"officer": {"slots": {"line": {"count": 2}}}},
+                "communication_policy": {
+                    "worker_messages": "user_direct",
+                    "officer_response_minutes": 15,
+                },
+                "state": {},
+                "incarnations": [],
+            }
+        )
+        db.get_project_officer_lineage = AsyncMock(return_value=[])
         monkeypatch.setattr(main, "postgres_db", db)
         monkeypatch.setattr(
             main, "require_approved_user", AsyncMock(return_value={"id": "u"})
@@ -296,4 +342,12 @@ class TestOfficerSummaryEndpoint:
             main, "_find_open_conference_thread", AsyncMock(return_value=None)
         )
         out = await main.get_project_officer_summary(MagicMock(), PROJECT_ID)
-        assert out == {"officer": None, "conference": None}
+        # The enable prompt still keys off officer: null…
+        assert out["officer"] is None
+        assert out["conference"] is None
+        # …and the post is now always present around it.
+        assert out["commissioned"] is False
+        assert out["held"] is None
+        assert out["kit"] == {"line": {"count": 2, "in_flight": 0}}
+        assert out["incarnations"] == []
+        assert out["communication_policy"]["officer_response_minutes"] == 15

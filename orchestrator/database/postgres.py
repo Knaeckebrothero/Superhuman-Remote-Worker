@@ -9208,7 +9208,16 @@ class PostgresDB:
     async def get_officer_thread_for_project(
         self, project_id: str
     ) -> Optional[Dict[str, Any]]:
-        """The newest non-ended officer thread commanding ``project_id``."""
+        """The commissioned officer thread on ``project_id``'s post, or None.
+
+        officer_post.md §4: reads the durable ``project_officers`` row instead
+        of the old newest-enabled-thread JSONB inference — ``thread_id`` IS
+        the officer; NULL = vacant post, no ambiguity. The non-ended filter
+        stays because callers act on the thread (wakes, holds, notices): a
+        link left pointing at an ended thread (a retire that predates the O3
+        decommission flow) reads as "no officer" until the next registration
+        folds it. Same THREAD row shape as before the flip.
+        """
         try:
             project_uuid = UUID(project_id)
         except (ValueError, TypeError):
@@ -9217,13 +9226,10 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT t.id, t.status, t.project_id, t.agent_id, t.metadata
-                  FROM threads t
-                 WHERE t.project_id = $1
+                  FROM project_officers po
+                  JOIN threads t ON t.id = po.thread_id
+                 WHERE po.project_id = $1
                    AND t.status != 'ended'
-                   AND COALESCE(t.metadata->'config_override'
-                                ->'officer'->>'enabled','false') = 'true'
-                 ORDER BY t.created_at DESC
-                 LIMIT 1
                 """,
                 project_uuid,
             )
@@ -9388,6 +9394,384 @@ class PostgresDB:
             "cancelled": by_status.get("cancelled", 0),
             "pending_review": by_status.get("pending_review", 0),
         }
+
+    # =========================================================================
+    # PROJECT OFFICERS — the durable post (officer_post.md §2/§3)
+    #
+    # One row per project, created with the project; thread_id NULL = vacant.
+    # The row is the durable record (kit, budgets, communication policy,
+    # harvested state, incarnation log); the thread stays the runtime
+    # projection. Writers per direction, transitions only: row → thread at
+    # commission, thread → row at decommission. Live officer_state writes
+    # keep targeting the thread (merge_thread_officer_state above).
+    # =========================================================================
+
+    @staticmethod
+    def _project_officer_row_to_dict(row) -> Dict[str, Any] | None:
+        """Normalize a project_officers asyncpg Record into a serializable dict.
+
+        Decodes the JSONB columns defensively (asyncpg returns JSONB as str on
+        some paths): ``config_override`` / ``communication_policy`` /
+        ``state`` to dicts, ``incarnations`` to a list. Returns None on a None
+        row so callers can chain.
+        """
+        if row is None:
+            return None
+        out = dict(row)
+        for jsonb_col in (
+            "config_override",
+            "communication_policy",
+            "state",
+            "incarnations",
+        ):
+            val = out.get(jsonb_col)
+            if isinstance(val, str):
+                try:
+                    out[jsonb_col] = json.loads(val)
+                except (TypeError, ValueError):
+                    pass
+        if not isinstance(out.get("incarnations"), list):
+            out["incarnations"] = []
+        for jsonb_col in ("config_override", "communication_policy", "state"):
+            if not isinstance(out.get(jsonb_col), dict):
+                out[jsonb_col] = {}
+        return out
+
+    async def get_project_officer(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """The project's post row, or None when absent (pre-heal) / bad id."""
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM project_officers WHERE project_id = $1",
+                project_uuid,
+            )
+        return self._project_officer_row_to_dict(row)
+
+    async def get_or_create_project_officer(
+        self, project_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """The post row, minting the vacant default when absent.
+
+        Every project owns exactly one post: ``create_project`` inserts it,
+        and this read self-heals rows for projects minted by any bypassing
+        path (default-project seeds, pre-0157 rows). Returns None on a bad id
+        or a nonexistent project — never raises for those.
+        """
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            try:
+                await conn.execute(
+                    "INSERT INTO project_officers (project_id) VALUES ($1) "
+                    "ON CONFLICT (project_id) DO NOTHING",
+                    project_uuid,
+                )
+            except asyncpg.ForeignKeyViolationError:
+                return None
+            row = await conn.fetchrow(
+                "SELECT * FROM project_officers WHERE project_id = $1",
+                project_uuid,
+            )
+        return self._project_officer_row_to_dict(row)
+
+    async def register_project_officer_thread(
+        self,
+        project_id: str,
+        thread_id: str,
+        config_override: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Claim the post for a newly created officer thread.
+
+        The create-thread funnel's registration step (officer_post.md §4):
+        exactly one path raises an officer, so the row can never disagree
+        with the threads table about who holds the post. Returns the updated
+        row, or None when the post is already commissioned by a live thread —
+        the funnel maps that to 409.
+
+        A link still pointing at an *ended* thread (a retire that predates
+        the O3 decommission rerouting) is folded first — officer_state
+        harvested onto ``state``, an incarnation entry appended — so the
+        stale link self-heals instead of blocking every future commission.
+        ``config_override`` (the funnel's redacted fragment) is stamped onto
+        the row minus the runtime keys (``officer.hold`` /
+        ``officer.last_respawn_at``), keeping the durable kit in sync with
+        the incarnation being raised.
+        """
+        try:
+            project_uuid = UUID(project_id)
+            thread_uuid = UUID(thread_id)
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    await conn.execute(
+                        "INSERT INTO project_officers (project_id) VALUES ($1) "
+                        "ON CONFLICT (project_id) DO NOTHING",
+                        project_uuid,
+                    )
+                except asyncpg.ForeignKeyViolationError:
+                    return None
+                await conn.execute(
+                    """
+                    UPDATE project_officers po
+                       SET state = po.state
+                             || (CASE WHEN jsonb_typeof(
+                                          t.metadata->'officer_state')
+                                          = 'object'
+                                      THEN t.metadata->'officer_state'
+                                      ELSE '{}'::jsonb END),
+                           incarnations = po.incarnations
+                             || jsonb_build_array(jsonb_build_object(
+                                    'thread_id', t.id,
+                                    'commissioned_at', t.created_at,
+                                    'decommissioned_at',
+                                    COALESCE(t.ended_at, t.last_activity,
+                                             now()),
+                                    'reason', 'retired')),
+                           thread_id = NULL,
+                           updated_at = now()
+                      FROM threads t
+                     WHERE po.project_id = $1
+                       AND po.thread_id = t.id
+                       AND t.id != $2
+                       AND t.status = 'ended'
+                    """,
+                    project_uuid,
+                    thread_uuid,
+                )
+                row = await conn.fetchrow(
+                    """
+                    UPDATE project_officers
+                       SET thread_id = $2,
+                           config_override =
+                               COALESCE($3::jsonb, config_override)
+                                   #- '{officer,hold}'
+                                   #- '{officer,last_respawn_at}',
+                           updated_at = now()
+                     WHERE project_id = $1
+                       AND (thread_id IS NULL OR thread_id = $2)
+                    RETURNING *
+                    """,
+                    project_uuid,
+                    thread_uuid,
+                    json.dumps(config_override)
+                    if config_override is not None
+                    else None,
+                )
+        return self._project_officer_row_to_dict(row)
+
+    async def clear_project_officer_thread(
+        self, project_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Unlink the post's current incarnation (decommission step).
+
+        Link-state only — harvesting and the incarnation entry are the
+        caller's explicit steps (``merge_project_officer_state`` /
+        ``append_project_officer_incarnation``), because decommission orders
+        them around queue folding (officer_post.md §5).
+        """
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE project_officers
+                   SET thread_id = NULL, updated_at = now()
+                 WHERE project_id = $1
+                RETURNING *
+                """,
+                project_uuid,
+            )
+        return self._project_officer_row_to_dict(row)
+
+    async def merge_project_officer_config(
+        self, project_id: str, config_updates: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Deep-merge a partial kit into the post's durable config_override.
+
+        Same recursive semantics as ``merge_thread_config_override`` so
+        nested keys (``officer.slots``, ``llm.model``) update independently.
+        Runtime keys (``officer.hold`` / ``officer.last_respawn_at``) never
+        enter the row (officer_post.md §3) — stripped after the merge.
+        Read-modify-write under a row lock; posts are single-row and
+        low-contention. Returns the updated row or None when absent.
+        """
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return None
+
+        def _deep_merge(base: Dict, override: Dict) -> Dict:
+            merged = dict(base)
+            for key, value in override.items():
+                if (
+                    key in merged
+                    and isinstance(merged[key], dict)
+                    and isinstance(value, dict)
+                ):
+                    merged[key] = _deep_merge(merged[key], value)
+                else:
+                    merged[key] = value
+            return merged
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT config_override FROM project_officers "
+                    "WHERE project_id = $1 FOR UPDATE",
+                    project_uuid,
+                )
+                if row is None:
+                    return None
+                current = row["config_override"]
+                if isinstance(current, str):
+                    try:
+                        current = json.loads(current)
+                    except (TypeError, ValueError):
+                        current = {}
+                if not isinstance(current, dict):
+                    current = {}
+                merged = _deep_merge(current, config_updates)
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE project_officers
+                       SET config_override = $2::jsonb
+                               #- '{officer,hold}'
+                               #- '{officer,last_respawn_at}',
+                           updated_at = now()
+                     WHERE project_id = $1
+                    RETURNING *
+                    """,
+                    project_uuid,
+                    json.dumps(merged),
+                )
+        return self._project_officer_row_to_dict(updated)
+
+    async def merge_project_officer_state(
+        self, project_id: str, patch: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Shallow-merge harvested officer state onto the post.
+
+        Mirrors ``merge_thread_officer_state``: one atomic ``||`` at the
+        state level, a patch key replaces its previous value wholesale — the
+        decommission harvest (digest ring, page counters, sitrep
+        fingerprints) wants exactly that. Returns the updated row or None.
+        """
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE project_officers
+                   SET state = state || $2::jsonb, updated_at = now()
+                 WHERE project_id = $1
+                RETURNING *
+                """,
+                project_uuid,
+                json.dumps(patch),
+            )
+        return self._project_officer_row_to_dict(row)
+
+    async def append_project_officer_incarnation(
+        self, project_id: str, entry: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Append one incarnation record to the post's append-only history.
+
+        Entry shape (officer_post.md §3): ``{thread_id, commissioned_at,
+        decommissioned_at, reason}``. Returns the updated row or None.
+        """
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE project_officers
+                   SET incarnations = incarnations
+                           || jsonb_build_array($2::jsonb),
+                       updated_at = now()
+                 WHERE project_id = $1
+                RETURNING *
+                """,
+                project_uuid,
+                json.dumps(entry),
+            )
+        return self._project_officer_row_to_dict(row)
+
+    async def get_project_officer_lineage(self, project_id: str) -> List[str]:
+        """Thread ids across the post's incarnations, current link included.
+
+        officer_post.md §4: capacity follows the post's thread lineage so a
+        job left running across a decommission→recommission keeps occupying
+        its slot. Empty list when the project has no post or the post has no
+        history. Pure SQL — no Python-side JSONB parsing.
+        """
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return []
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT po.thread_id AS tid
+                  FROM project_officers po
+                 WHERE po.project_id = $1 AND po.thread_id IS NOT NULL
+                UNION
+                SELECT (elem->>'thread_id')::uuid
+                  FROM project_officers po,
+                       jsonb_array_elements(po.incarnations) elem
+                 WHERE po.project_id = $1
+                   AND (elem->>'thread_id')
+                       ~* '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+                """,
+                project_uuid,
+            )
+        return [str(r["tid"]) for r in rows]
+
+    async def get_officer_capacity_lineage(self, thread_id: str) -> List[str]:
+        """Thread ids whose jobs count against ``thread_id``'s officer kit.
+
+        The dispatch-admission and sitrep capacity flip (officer_post.md §4):
+        when the thread is its project's registered officer, the whole post
+        lineage counts; otherwise (no project, no post, or an unregistered
+        legacy thread) the list degrades to just the thread itself —
+        exactly the pre-post counting semantics.
+        """
+        try:
+            thread_uuid = UUID(thread_id)
+        except (ValueError, TypeError):
+            return []
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH post AS (
+                    SELECT po.project_id, po.thread_id, po.incarnations
+                      FROM project_officers po
+                      JOIN threads t ON t.project_id = po.project_id
+                     WHERE t.id = $1 AND po.thread_id = $1
+                )
+                SELECT post.thread_id AS tid FROM post
+                UNION
+                SELECT (elem->>'thread_id')::uuid
+                  FROM post, jsonb_array_elements(post.incarnations) elem
+                 WHERE (elem->>'thread_id')
+                       ~* '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+                """,
+                thread_uuid,
+            )
+        lineage = [str(r["tid"]) for r in rows]
+        return lineage or [str(thread_uuid)]
 
     async def _queue_job_for_resume_on_conn(
         self,
@@ -12220,15 +12604,22 @@ class PostgresDB:
                 )
 
     async def update_thread_status(self, thread_id: str, status: str) -> None:
-        """Update thread status."""
+        """Update thread status.
+
+        Both ``$2`` references carry an explicit ``::text`` cast: the bare
+        ``SET status = $2`` deduces varchar while ``$2 IN (…)`` deduces text,
+        and the server refuses the prepare as ambiguous ("inconsistent types
+        deduced for parameter $2") — a latent fault while this helper had no
+        callers, surfaced by the officer-post registration stand-down.
+        """
         async with self.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE threads
-                SET status        = $2,
+                SET status        = $2::text,
                     last_activity = CURRENT_TIMESTAMP,
                     control_admission_agent_id = CASE
-                        WHEN $2 IN ('ended', 'suspended') THEN NULL
+                        WHEN $2::text IN ('ended', 'suspended') THEN NULL
                         ELSE control_admission_agent_id
                     END
                 WHERE id = $1
@@ -19026,26 +19417,37 @@ class PostgresDB:
             Created project dict
         """
         async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO projects (name, description, goal, is_default,
-                                      default_config_name, default_config_override)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, name, description, goal, status, is_default,
-                          default_config_name, default_config_override,
-                          nextcloud_folder_id, cloud_storage_read_only,
-                          main_cloud_backend, main_cloud_folder_handle,
-                          created_at, updated_at
-                """,
-                name,
-                description,
-                goal,
-                is_default,
-                default_config_name,
-                json.dumps(default_config_override)
-                if default_config_override
-                else None,
-            )
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO projects (name, description, goal, is_default,
+                                          default_config_name,
+                                          default_config_override)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    RETURNING id, name, description, goal, status, is_default,
+                              default_config_name, default_config_override,
+                              nextcloud_folder_id, cloud_storage_read_only,
+                              main_cloud_backend, main_cloud_folder_handle,
+                              created_at, updated_at
+                    """,
+                    name,
+                    description,
+                    goal,
+                    is_default,
+                    default_config_name,
+                    json.dumps(default_config_override)
+                    if default_config_override
+                    else None,
+                )
+                # Every century has a post, whether or not an officer holds
+                # it (officer_post.md §2): the vacant project_officers row is
+                # born with the project. Bypassing mint paths self-heal via
+                # get_or_create_project_officer.
+                await conn.execute(
+                    "INSERT INTO project_officers (project_id) VALUES ($1) "
+                    "ON CONFLICT (project_id) DO NOTHING",
+                    row["id"],
+                )
 
         return dict(row)
 
