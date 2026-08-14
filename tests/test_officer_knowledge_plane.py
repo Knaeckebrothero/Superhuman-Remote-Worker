@@ -276,6 +276,15 @@ OBJECT_PLANE_SAMPLE = [
     "get_default_project_repository",
     "srw_cloud_status",
     "kb_export",
+    # officer_supervision_surface E2/§3.4: job tools on the job_workspace
+    # plane are the object plane in job-tool form — the ceiling now denies
+    # them by registry plane metadata even when a config names them.
+    "get_job_file",
+    "list_job_files",
+    "get_workspace_overview",
+    "get_shell_state",
+    "get_job_diff",
+    "list_job_commits",
 ]
 
 CONTROL_AND_KNOWLEDGE_SAMPLE = [
@@ -288,8 +297,10 @@ CONTROL_AND_KNOWLEDGE_SAMPLE = [
     "steer_job",
     "list_jobs",
     "get_job",
-    "get_job_file",
-    "list_job_files",
+    # E4 evidence reads are the bounded replacement for file browsing.
+    "get_job_completion_report",
+    "list_job_evidence",
+    "read_job_evidence",
     "get_stuck_jobs",
     "get_session_context",
     "get_current_project",

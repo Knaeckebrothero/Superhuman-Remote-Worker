@@ -201,7 +201,9 @@ def _format_action_error(action: str, target: str, error: Exception) -> str:
 # to distinguish from a cached/deployed schema. Build provenance says which
 # source produced the pod; this small contract revision says which tool surface
 # that source promises.
-MCP_TOOL_SCHEMA_REVISION = "8"
+# "9": officer_supervision_surface E1-E4 — three job_evidence tools,
+# caller-aware get_stuck_jobs threshold, liveness-backed progress output.
+MCP_TOOL_SCHEMA_REVISION = "9"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 

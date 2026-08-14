@@ -606,6 +606,12 @@ def test_every_selectable_live_fleet_tool_has_an_explicit_guide_topic():
             "get_job",
             "get_job_file",
             "list_job_files",
+            # E4 (officer_supervision_surface): bounded evidence reads joined
+            # the session job_inspection defaults; guide-topic prose for them
+            # is owed by E5 alongside the Cockpit inspection labels.
+            "get_job_completion_report",
+            "list_job_evidence",
+            "read_job_evidence",
             "approve_job",
             "resume_job_with_feedback",
             "cancel_job",

@@ -8,16 +8,18 @@ from .. import formatters as fmt
 from ..client import AsyncCockpitClient
 from ._utils import format_action_error, resolve_job_id, short_id, transport_key_paths
 from .descriptors import CallerCtx, descriptor
+from .envelope import friendly_reason, http_status_of, response_detail
 
 _ALL = frozenset({"mcp", "session", "officer"})
 _MCP = frozenset({"mcp"})
 _MCP_OFFICER = frozenset({"mcp", "officer"})
 _EXPLICIT_GATE = (
-    "named explicitly by the caller configuration; broader S5 defaults remain pending"
+    "named explicitly by the caller configuration; lane defaults come from the "
+    "descriptor caller-default policy (officer_supervision_surface E2)"
 )
 
 
-@descriptor(group="job_control", plane="control", caller_defaults=_ALL)
+@descriptor(group="job_control", plane="job_control", caller_defaults=_ALL)
 async def approve_job(
     client: AsyncCockpitClient, caller: CallerCtx, job_id: str
 ) -> str:
@@ -41,7 +43,7 @@ async def approve_job(
         return format_action_error("approve", job_id, error)
 
 
-@descriptor(group="job_control", plane="control", caller_defaults=_ALL)
+@descriptor(group="job_control", plane="job_control", caller_defaults=_ALL)
 async def resume_job_with_feedback(
     client: AsyncCockpitClient,
     caller: CallerCtx,
@@ -73,7 +75,7 @@ async def resume_job_with_feedback(
         return format_action_error("resume", job_id, error)
 
 
-@descriptor(group="job_control", plane="control", caller_defaults=_ALL)
+@descriptor(group="job_control", plane="job_control", caller_defaults=_ALL)
 async def cancel_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str) -> str:
     """Cancel a running job.
 
@@ -95,7 +97,7 @@ async def cancel_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str)
         return format_action_error("cancel", job_id, error)
 
 
-@descriptor(group="job_control", plane="control", caller_defaults=_ALL)
+@descriptor(group="job_control", plane="job_control", caller_defaults=_ALL)
 async def pause_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str) -> str:
     """Pause a running job.
 
@@ -117,7 +119,7 @@ async def pause_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str) 
         return format_action_error("pause", job_id, error)
 
 
-@descriptor(group="job_control", plane="control", caller_defaults=_ALL)
+@descriptor(group="job_control", plane="job_control", caller_defaults=_ALL)
 async def create_job(
     client: AsyncCockpitClient,
     caller: CallerCtx,
@@ -219,7 +221,7 @@ async def create_job(
 
 @descriptor(
     group="job_control",
-    plane="control",
+    plane="job_control",
     caller_defaults=_MCP,
     grant="explicit",
     gate=_EXPLICIT_GATE,
@@ -247,7 +249,7 @@ async def delete_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str)
 
 @descriptor(
     group="job_control",
-    plane="control",
+    plane="job_control",
     caller_defaults=_MCP,
     grant="explicit",
     gate=_EXPLICIT_GATE,
@@ -284,7 +286,7 @@ async def assign_job(
 
 @descriptor(
     group="job_control",
-    plane="control",
+    plane="job_control",
     caller_defaults=_MCP,
     grant="explicit",
     gate=_EXPLICIT_GATE,
@@ -333,8 +335,10 @@ async def promote_job(
 
 @descriptor(
     group="job_control",
-    plane="control",
-    caller_defaults=_MCP,
+    plane="job_control",
+    # Officer default per officer_supervision_surface §3.1: replying on a
+    # worker's message thread is a bounded orchestrator action.
+    caller_defaults=_MCP_OFFICER,
     grant="explicit",
     gate=_EXPLICIT_GATE,
 )
@@ -378,12 +382,12 @@ async def send_message_to_job(
             f"Delivery strategy: {strategy}"
         )
     except Exception as error:
-        return f"Failed to send reply: {error}"
+        return f"Failed to send reply: {friendly_reason(error)}"
 
 
 @descriptor(
     group="job_control",
-    plane="control",
+    plane="job_control",
     caller_defaults=_MCP_OFFICER,
     grant="explicit",
     gate=_EXPLICIT_GATE,
@@ -423,4 +427,14 @@ async def steer_job(
             f"(strategy: {result.get('delivery_strategy', 'queued')})."
         )
     except Exception as error:
-        return f"Steer failed: {error}"
+        # F6: the response body (e.g. the 409 reason naming why steering was
+        # refused) must reach the caller; raw httpx text embeds internal URLs.
+        status = http_status_of(error)
+        if status is not None:
+            detail = response_detail(error)
+            return (
+                f"Steer failed ({status}): {detail}"
+                if detail
+                else f"Steer failed ({status})."
+            )
+        return f"Steer failed: {friendly_reason(error)}"

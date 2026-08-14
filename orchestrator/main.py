@@ -23784,6 +23784,52 @@ async def _complete_job_legacy(
                 "actions": actions,
             }
 
+        # 1·evidence (E4, officer_supervision_surface §3.3): a completion
+        # CLAIM that survived the gate gets its typed evidence manifest —
+        # server-created completion-report + deliverable-check entries plus
+        # resolved worker-declared entries, pinned to the completion
+        # revision — recorded in jobs.context.evidence_manifest. Best-effort:
+        # a manifest failure must never block a seal.
+        if new_status in ("completed", "pending_review", "reviewing"):
+
+            async def _record_evidence_manifest() -> dict[str, Any]:
+                from services.job_evidence import build_evidence_manifest
+
+                try:
+                    evidence_job = await postgres_db.get_job(job_id) or job
+                    manifest = await build_evidence_manifest(
+                        evidence_job,
+                        result,
+                        db=postgres_db,
+                        gitea=gitea_client,
+                    )
+                    await postgres_db.merge_job_context(
+                        job_id, {"evidence_manifest": manifest}
+                    )
+                    return {
+                        "recorded": True,
+                        "entry_count": len(manifest.get("entries") or []),
+                    }
+                except Exception as exc:  # noqa: BLE001 — never block the seal
+                    logger.warning(
+                        "Evidence manifest recording failed for job %s: %s",
+                        job_id,
+                        exc,
+                    )
+                    return {"recorded": False, "error": str(exc)[:300]}
+
+            evidence_effect = await _run_completion_effect(
+                _effect_runner,
+                "evidence_manifest_record",
+                "delivery_gate",
+                _record_evidence_manifest,
+            )
+            if evidence_effect.get("recorded"):
+                actions.append(
+                    f"evidence manifest recorded "
+                    f"({evidence_effect.get('entry_count', 0)} entr(y/ies))"
+                )
+
         # A reordered command owns one durable jobs-row control marker before
         # any product delivery starts.  Cancel/pause/resume/admission paths
         # already honor this reserved marker, so the check survives the gap
@@ -25539,15 +25585,112 @@ async def ensure_workspace_access(request: Request, job_id: str) -> dict[str, An
 
 @app.get("/api/jobs/{job_id}/progress")
 async def get_job_progress(request: Request, job_id: str) -> dict[str, Any]:
-    """Get detailed progress information for a job including ETA."""
-    await require_job_access(request, postgres_db, job_id)
+    """Get honest job liveness (E1/E3, officer_supervision_surface §4–§5).
+
+    Composes the control-row basis with the one shared liveness computation
+    (audit movement → agent heartbeat, ``updated_at`` never consulted).
+    ``progress_percent``/``eta_seconds`` are kept in the payload for shape
+    compatibility but are honest ``null`` — no percentage telemetry exists
+    and none is fabricated.
+    """
+    _, job = await require_job_access(request, postgres_db, job_id)
+    from services.job_liveness import compute_job_liveness
+
     try:
         progress = await postgres_db.get_job_progress(job_id)
         if not progress:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-        return progress
+        liveness = await compute_job_liveness(
+            job, audit_reader=audit_reader, db=postgres_db
+        )
+        return {**progress, **liveness}
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Job evidence manifest (E4 — officer_supervision_surface §3.3)
+# =============================================================================
+#
+# Access on every route goes through require_job_access, which enforces both
+# user visibility AND the MCP/officer `project:<uuid>` scope
+# (_scope_permits_project) — an opaque evidence ID alone conveys no access,
+# and a guessed ID from another project 403s before the manifest is touched.
+
+
+@app.get("/api/jobs/{job_id}/evidence")
+async def list_job_evidence_route(request: Request, job_id: str) -> dict[str, Any]:
+    """List the typed evidence manifest recorded at completion."""
+    _, job = await require_job_access(request, postgres_db, job_id)
+    from services.job_evidence import parse_manifest, public_manifest
+
+    manifest = parse_manifest(job)
+    if manifest is None:
+        return {"job_id": job_id, "recorded_at": None, "entries": []}
+    return public_manifest(manifest)
+
+
+@app.get("/api/jobs/{job_id}/completion-report")
+async def get_job_completion_report_route(
+    request: Request, job_id: str
+) -> dict[str, Any]:
+    """The server-recorded completion report entry (404 when none exists)."""
+    _, job = await require_job_access(request, postgres_db, job_id)
+    from services.job_evidence import parse_manifest
+
+    manifest = parse_manifest(job)
+    entry = next(
+        (
+            candidate
+            for candidate in (manifest or {}).get("entries") or []
+            if candidate.get("kind") == "completion_report"
+        ),
+        None,
+    )
+    if not entry:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No completion report recorded for job '{job_id}'",
+        )
+    try:
+        report = json.loads(entry.get("inline_content") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        report = {}
+    return {
+        "job_id": job_id,
+        "recorded_at": manifest.get("recorded_at"),
+        "source_revision": (entry.get("source") or {}).get("revision"),
+        "report": report,
+    }
+
+
+@app.get("/api/jobs/{job_id}/evidence/{evidence_id}")
+async def read_job_evidence_route(
+    request: Request,
+    job_id: str,
+    evidence_id: str,
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """Read one evidence entry by opaque ID, resolved at its pinned revision.
+
+    The ID is authorized against (caller project, job project, evidence job)
+    on every read; the server never accepts a model-supplied path and never
+    reads a revision other than the one pinned in the manifest.
+    """
+    _, job = await require_job_access(request, postgres_db, job_id)
+    from services.job_evidence import find_entry, parse_manifest, read_evidence_entry
+
+    manifest = parse_manifest(job)
+    entry = find_entry(manifest, evidence_id) if manifest else None
+    if not entry:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Evidence '{evidence_id}' not found for job '{job_id}'",
+        )
+    try:
+        return await read_evidence_entry(job, entry, offset=offset, gitea=gitea_client)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -28930,18 +29073,46 @@ async def get_stuck_jobs(
     request: Request,
     threshold_minutes: int = Query(default=60, ge=1, le=1440),
 ) -> list[dict[str, Any]]:
-    """Get jobs that appear to be stuck, scoped to the caller's visibility (G5).
+    """Get jobs suspected stuck, scoped to the caller's visibility (G5).
 
-    A job is considered stuck if it's in 'processing' status but hasn't
-    been updated within the threshold period. Admins see the full
-    fleet; non-admins see only jobs they own or are project members of.
+    E3 (officer_supervision_surface §5): stuckness comes from the one shared
+    liveness computation — audit movement first, then agent heartbeat —
+    never from ``jobs.updated_at`` (display metadata poisoned by trigger
+    cascades). Rows carry the liveness state and reasons. Jobs whose
+    activity evidence is unreachable are returned with
+    ``state='unavailable'`` — surfaced uncertainty, not a fabricated
+    stuck fact. Admins see the full fleet; non-admins see only jobs they
+    own or are project members of.
     """
     user = await require_approved_user(request, postgres_db)
     vis = await _visibility_kwargs_for_stats(user)
+    from services.job_liveness import compute_jobs_liveness
+
     try:
-        return await postgres_db.detect_stuck_jobs(
-            threshold_minutes=threshold_minutes, **vis
+        processing = await postgres_db.get_processing_jobs(**vis)
+        liveness_by_id = await compute_jobs_liveness(
+            processing,
+            audit_reader=audit_reader,
+            db=postgres_db,
+            threshold_minutes=threshold_minutes,
         )
+        stuck: list[dict[str, Any]] = []
+        for job in processing:
+            liveness = liveness_by_id.get(str(job["id"]))
+            if not liveness or liveness["state"] not in (
+                "suspected_stuck",
+                "unavailable",
+            ):
+                continue
+            row = dict(job)
+            row.update(liveness)
+            # Legacy shape kept for existing consumers.
+            row["stuck_reason"] = "; ".join(liveness.get("reasons") or []) or (
+                "No recent activity"
+            )
+            row["stuck_component"] = "liveness"
+            stuck.append(row)
+        return stuck
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 

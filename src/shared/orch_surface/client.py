@@ -509,13 +509,9 @@ class AsyncCockpitClient:
             transport=transport,
         )
 
-    def set_scope_headers(self, user_id: str, scope: str) -> None:
-        """Bind authenticated MCP identity to the current async context."""
-        self._scope_headers.set(self._invocation_headers(user_id=user_id, scope=scope))
-
-    def clear_scope_headers(self) -> None:
-        """Make requests in the current async context unauthenticated."""
-        self._scope_headers.set(None)
+    # F15: the imperative set_scope_headers/clear_scope_headers pair was
+    # removed — invocation_scope() below is the one binding mechanism (it
+    # restores the previous context instead of erasing an outer invocation).
 
     def _invocation_headers(
         self,
@@ -1327,15 +1323,71 @@ class AsyncCockpitClient:
 
     @_create_retry_decorator()
     async def get_job_progress(self, job_id: str) -> dict[str, Any]:
-        """Get job progress including phase info and ETA.
+        """Get job liveness/progress (E3 shared liveness contract).
 
         Args:
             job_id: Job UUID
 
         Returns:
-            Progress data dict
+            Liveness data dict: status, state, reasons, observed_at,
+            last_activity_at, elapsed_seconds, sources
         """
         resp = await self._client.get(f"/api/jobs/{job_id}/progress")
+        resp.raise_for_status()
+        return resp.json()
+
+    # =========================================================================
+    # Evidence Manifest (E4 — officer_supervision_surface §3.3)
+    # =========================================================================
+
+    @_create_retry_decorator()
+    async def list_job_evidence(self, job_id: str) -> dict[str, Any]:
+        """List the typed evidence manifest recorded at completion.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            Dict with recorded_at and entries (id, kind, label, media_type,
+            byte_size, sha256, source revision, producer, availability)
+        """
+        resp = await self._client.get(f"/api/jobs/{job_id}/evidence")
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def read_job_evidence(
+        self, job_id: str, evidence_id: str, offset: int = 0
+    ) -> dict[str, Any]:
+        """Read one evidence entry by opaque ID (server-resolved, bounded).
+
+        Args:
+            job_id: Job UUID
+            evidence_id: Opaque manifest entry ID
+            offset: Character offset for paginated text reads
+
+        Returns:
+            Dict with the entry metadata plus content page or safe binary view
+        """
+        resp = await self._client.get(
+            f"/api/jobs/{job_id}/evidence/{evidence_id}",
+            params={"offset": offset},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def get_job_completion_report(self, job_id: str) -> dict[str, Any]:
+        """Get the server-recorded completion report for a job.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            Dict with report (summary/confidence/deliverables/notes),
+            recorded_at, and source_revision
+        """
+        resp = await self._client.get(f"/api/jobs/{job_id}/completion-report")
         resp.raise_for_status()
         return resp.json()
 

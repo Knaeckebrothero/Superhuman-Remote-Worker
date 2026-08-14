@@ -726,12 +726,19 @@ class TestGatedReadEndpointsHappyPath:
     async def test_get_job_progress_admin_reaches_db(
         self, user_admin, job_a, fake_db, fake_request
     ):
+        """E1/E3: the route now composes the DB basis with the shared
+        liveness verdict — the gate still runs first and the DB payload is
+        preserved, with state/reasons/sources merged on top."""
         from main import get_job_progress
 
         fake_db.get_job_progress = AsyncMock(return_value={"status": "ok"})
         with _patch_caller_and_db(user_admin, fake_db):
             result = await get_job_progress(fake_request, str(job_a["id"]))
-        assert result == {"status": "ok"}
+        assert result["status"] == "ok"
+        # job_a is 'created' → honest waiting verdict, never a fabricated 0%.
+        assert result["state"] == "waiting"
+        assert result["reasons"] == ["awaiting workspace provisioning and dispatch"]
+        assert "progress_percent" not in result or result["progress_percent"] is None
 
 
 # =============================================================================

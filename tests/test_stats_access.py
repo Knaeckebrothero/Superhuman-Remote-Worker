@@ -153,25 +153,28 @@ class TestStatsDaily:
 
 
 class TestStatsStuck:
+    # E3 (officer_supervision_surface §5): the route now lists processing
+    # jobs (get_processing_jobs, no updated_at filter) and derives stuckness
+    # from the shared liveness computation; visibility kwargs are unchanged.
+
     @pytest.mark.asyncio
     async def test_non_admin_passes_visibility(self, user_a, fake_db, fake_request):
         from main import get_stuck_jobs
 
-        fake_db.detect_stuck_jobs = AsyncMock(return_value=[])
+        fake_db.get_processing_jobs = AsyncMock(return_value=[])
         with _patch_caller_and_db(user_a, fake_db):
             await get_stuck_jobs(fake_request, threshold_minutes=60)
-        kwargs = fake_db.detect_stuck_jobs.call_args.kwargs
-        assert kwargs["threshold_minutes"] == 60
+        kwargs = fake_db.get_processing_jobs.call_args.kwargs
         assert kwargs["owner_user_id"] == str(user_a["id"])
 
     @pytest.mark.asyncio
     async def test_admin_no_visibility_args(self, user_admin, fake_db, fake_request):
         from main import get_stuck_jobs
 
-        fake_db.detect_stuck_jobs = AsyncMock(return_value=[])
+        fake_db.get_processing_jobs = AsyncMock(return_value=[])
         with _patch_caller_and_db(user_admin, fake_db):
             await get_stuck_jobs(fake_request, threshold_minutes=60)
-        kwargs = fake_db.detect_stuck_jobs.call_args.kwargs
+        kwargs = fake_db.get_processing_jobs.call_args.kwargs
         assert "owner_user_id" not in kwargs
 
 

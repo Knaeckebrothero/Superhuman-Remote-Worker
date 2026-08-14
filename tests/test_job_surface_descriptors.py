@@ -71,22 +71,53 @@ def _without_framework_schema_decoration(schema: dict[str, Any]) -> dict[str, An
 
 
 def test_descriptor_inventory_is_unique_complete_and_classified() -> None:
+    # 40 = the 37 unified descriptors + E4's three job_evidence tools
+    # (get_job_completion_report, list_job_evidence, read_job_evidence).
     names = [item.name for item in JOB_DESCRIPTORS]
     assert names == sorted(names)
-    assert len(names) == len(set(names)) == 37
+    assert len(names) == len(set(names)) == 40
     assert {item.group for item in JOB_DESCRIPTORS} == {
         "job_control",
         "job_inspection",
     }
+    # officer_supervision_surface E2: machine-readable planes replace the
+    # coarse control/observability/object triple.
     assert {item.plane for item in JOB_DESCRIPTORS} == {
-        "control",
-        "observability",
-        "object",
+        "job_control",
+        "job_observability",
+        "job_evidence",
+        "job_workspace",
     }
     assert all(
         item.description == inspect.getdoc(item.handler) for item in JOB_DESCRIPTORS
     )
     assert all(tuple(item.public_signature.parameters) for item in JOB_DESCRIPTORS)
+
+
+def test_officer_defaults_follow_the_plane_boundary() -> None:
+    """E2 policy pins, independent of the JSON fixture: the background
+    officer never defaults into the object plane, and every job_control /
+    job_observability / job_evidence descriptor granted to the officer is
+    exactly the §3 set."""
+    for item in JOB_DESCRIPTORS:
+        if item.plane == "job_workspace":
+            assert "officer" not in item.caller_defaults, item.name
+        if item.plane == "job_evidence":
+            assert "officer" in item.caller_defaults, item.name
+    officer_control = {
+        item.name
+        for item in JOB_DESCRIPTORS
+        if item.plane == "job_control" and "officer" in item.caller_defaults
+    }
+    assert officer_control == {
+        "approve_job",
+        "cancel_job",
+        "create_job",
+        "pause_job",
+        "resume_job_with_feedback",
+        "send_message_to_job",
+        "steer_job",
+    }
 
 
 def test_caller_context_scopes_only_one_trusted_project_binding() -> None:

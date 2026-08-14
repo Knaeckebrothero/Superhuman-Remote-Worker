@@ -144,19 +144,25 @@ class TestJobErrorFormatters:
         assert "Error: workspace unavailable" in out
 
     def test_job_summary_uses_error_message(self):
+        # E1: format_job_summary now takes (job_id, envelope) — the truthful
+        # read envelope from officer_supervision_surface §4.
         out = format_job_summary(
+            "job1",
             {
-                "id": "job1",
-                "status": "failed",
-                "config_name": "critic",
-                "error_message": "grant denied",
+                "observed_at": "2026-08-14T12:00:00+00:00",
+                "sources": [{"name": "control_db", "status": "fresh"}],
+                "data": {
+                    "job": {
+                        "id": "job1",
+                        "status": "failed",
+                        "config_name": "critic",
+                        "error_message": "grant denied",
+                    }
+                },
             },
-            None,
-            None,
-            None,
-            None,
         )
         assert "Error: grant denied" in out
+        assert "Config: critic" in out
 
     def test_job_list_uses_error_message(self):
         out = format_jobs(

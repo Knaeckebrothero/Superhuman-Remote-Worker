@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from uuid import UUID
 
 from .. import formatters as fmt
 from ..client import AsyncCockpitClient, MutationOutcomeUnknown
 from .descriptors import CallerCtx
+from .envelope import friendly_reason, http_status_of
+
+logger = logging.getLogger(__name__)
 
 _TRANSPORT_DENY = frozenset({"api_key", "base_url", "env_keys"})
 _TRANSPORT_DENY_SUFFIX = "_api_key"
@@ -85,6 +89,61 @@ def format_action_error(action: str, target: str, error: Exception) -> str:
     if isinstance(error, MutationOutcomeUnknown):
         return f"Action '{action}' has an unknown outcome for {target}:\n{error}"
     return fmt.format_action_error(action, target, error)
+
+
+def job_read_error(operation: str, job_id: str, error: Exception) -> str:
+    """Friendly failure text for a job-scoped read (F6).
+
+    * 404 → the historical ``Job 'x' not found.`` form;
+    * anything else → the sanitized reason from :mod:`envelope` — the raw
+      httpx message (which embeds internal orchestrator URLs) never leaks.
+    """
+    if isinstance(error, ValueError):
+        # Ambiguous-prefix resolution errors are already user-facing text.
+        return str(error)
+    if http_status_of(error) == 404:
+        return f"Job '{job_id}' not found."
+    return f"Failed to {operation} for job {job_id}:\n{friendly_reason(error)}"
+
+
+async def repo_head_line(
+    client: AsyncCockpitClient,
+    job_id: str,
+    ref: str | None,
+) -> str:
+    """One-line staleness header for Gitea-backed workspace reads (F9).
+
+    ``[repo head: <sha7> <date> — <first commit subject>]`` — the E1 ``stale``
+    marker for repo-backed reads: it names the exact revision the answer came
+    from so "committed state as of the last push" is verifiable, not vibes.
+
+    Best-effort by contract: a repo read must still return its content when
+    the commits lookup fails, so failures degrade to naming the explicit ref
+    (or to no header at all for branch-head reads) instead of raising.
+    """
+    label = f"ref '{ref}'" if ref else "repo head"
+    try:
+        # sha="main" is the route's sentinel for "resolve the job's branch".
+        result = await client.list_job_commits(job_id, sha=ref or "main", limit=1)
+        commits = result.get("commits") if isinstance(result, dict) else None
+        head = commits[0] if commits else {}
+        sha = str(head.get("sha") or "")
+        if not sha:
+            raise ValueError("commits response carried no sha")
+        line = f"[{label}: {sha[:7]}"
+        date = str(head.get("date") or "").strip()
+        if date:
+            line += f" {date}"
+        subject = str(head.get("message") or "").strip().splitlines()
+        if subject and subject[0].strip():
+            first = subject[0].strip()
+            if len(first) > 100:
+                first = first[:97].rstrip() + "..."
+            line += f" — {first}"
+        return line + "]"
+    except Exception as error:  # noqa: BLE001 — header is best-effort
+        logger.debug("Repo head lookup failed for job %s: %s", job_id, error)
+        return f"[reading {label}]" if ref else ""
 
 
 def short_id(value: Any) -> str:

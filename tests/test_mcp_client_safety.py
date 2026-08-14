@@ -109,14 +109,17 @@ async def test_request_scope_headers_are_isolated_between_users_and_health(
         transport=httpx.MockTransport(handler),
     )
 
+    # F15: the imperative set_scope_headers/clear_scope_headers pair is gone;
+    # invocation_scope is the one binding mechanism and must isolate
+    # concurrent tasks exactly as the removed methods did.
     async def call_as(user_id: str, scope: str) -> list[dict[str, str]]:
-        client.set_scope_headers(user_id, scope)
-        return await client.list_jobs()
+        with client.invocation_scope(user_id=user_id, scope=scope):
+            return await client.list_jobs()
 
     async def run_health_probe() -> dict[str, str]:
         await asyncio.sleep(0)
-        client.clear_scope_headers()
-        return await client.health_check()
+        with client.invocation_scope(unauthenticated=True):
+            return await client.health_check()
 
     try:
         first, second, health = await asyncio.gather(
