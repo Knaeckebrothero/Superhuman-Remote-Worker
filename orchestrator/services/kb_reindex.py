@@ -515,6 +515,78 @@ async def _set_reindex_status(
         logger.warning("kb_reindex[%s]: status update skipped: %s", kb_id, exc)
 
 
+async def record_reindex_source_failure(
+    *,
+    store: Any,
+    kb_id: uuid.UUID,
+    source_label: str,
+    branch: Optional[str],
+    error: Exception,
+    is_active: Optional[Callable[[], Awaitable[bool]]] = None,
+) -> Dict[str, Any]:
+    """Record a source-construction failure without advancing the watermark.
+
+    External Git sources validate transport and credentials while they are
+    constructed, before :func:`reindex_kb` can enter its normal watermark
+    cycle. Keep that validation boundary, but give failures the same durable
+    operator-visible state as a failed HEAD read. The index/delete claim and
+    liveness recheck prevent a stale sweep row from resurrecting status after
+    its datasource was deleted.
+    """
+    detail = str(error)[-2000:] or "Git source construction failed"
+    async with kb_index_lock(store, kb_id) as claimed:
+        if not claimed:
+            return _empty_summary("already-indexing")
+        if is_active is not None:
+            try:
+                active = await is_active()
+            except Exception as exc:
+                logger.warning(
+                    "kb_reindex[%s]: source liveness check failed while "
+                    "recording construction error: %s",
+                    kb_id,
+                    exc,
+                )
+                return _empty_summary("source-failed", errors=1)
+            if not active:
+                return _empty_summary("source-deleted")
+
+        previous_indexed_commit: Optional[str] = None
+        try:
+            watermark = await store.get_watermark(kb_id)
+            if watermark is not None:
+                previous_indexed_commit = watermark.indexed_commit
+        except Exception as exc:
+            # Status is operational best effort. A failed read must not stop a
+            # subsequent upsert from replacing a stale error if writes work.
+            logger.warning(
+                "kb_reindex[%s]: previous watermark unavailable while "
+                "recording construction error: %s",
+                kb_id,
+                exc,
+            )
+
+        await _set_reindex_status(
+            store,
+            kb_id,
+            "failed",
+            source_label=source_label,
+            branch=branch,
+            last_error=detail,
+        )
+        logger.warning(
+            "kb_reindex[%s]: source construction failed for %s: %s",
+            kb_id,
+            source_label,
+            detail,
+        )
+        return _empty_summary(
+            "source-failed",
+            errors=1,
+            indexed_commit=previous_indexed_commit,
+        )
+
+
 async def reindex_kb(
     *,
     store: Any,
@@ -1041,53 +1113,22 @@ async def kb_sweep_tick(
     embedding_service: Any,
     reindex_fn: Callable[..., Awaitable[Dict[str, Any]]] = reindex_kb,
 ) -> int:
-    """One sweep: refresh native project and external datasource KBs.
+    """One sweep: refresh external datasource and active-project KBs.
 
-    The work list is every project with a KB-capable repo, one KB each; which
-    repo that is comes from ``resolve_kb_repo`` rather than a second query, so
-    the sweep cannot read a different repo than the write path targets — the
-    silent divergence behind ``kb_reindex_watermark_never_advances``. The query
-    here only enumerates candidate projects; it deliberately does not apply the
-    precedence rule itself.
+    The native work list is every *active* project with a KB-capable repo, one
+    KB each; which repo that is comes from ``resolve_kb_repo`` rather than a
+    second query, so the sweep cannot read a different repo than the write path
+    targets — the silent divergence behind
+    ``kb_reindex_watermark_never_advances``. The query only enumerates eligible
+    projects; it deliberately does not apply repository precedence itself.
 
-    Per-KB failures are logged and skipped — one broken repo must not starve
-    the rest. Returns the number of KBs that actually did work (``up-to-date``
-    checks don't count).
+    External sources run first so a long native rebuild cannot delay their
+    first attempt. Enumeration and per-KB failures are logged and skipped — one
+    broken phase or repo must not starve the rest. Returns the number of KBs
+    that actually did work (``up-to-date`` checks don't count).
     """
-    rows = await postgres_db.fetch(
-        """
-        SELECT DISTINCT project_id
-        FROM project_repositories
-        WHERE role = ANY($1::text[])
-        ORDER BY project_id
-        """,
-        list(_KB_REPO_ROLES),
-    )
     worked = 0
-    for row in rows:
-        project_id = row["project_id"]
-        try:
-            # One extra indexed lookup per project per tick (default 900s),
-            # against a reindex that costs a Gitea HEAD fetch at minimum —
-            # cheap enough to buy a single resolution rule.
-            resolved = await resolve_kb_repo(postgres_db, str(project_id))
-            if resolved is None:
-                # Raced with a repo detach between the enumeration and here.
-                continue
-            repo_name, branch = resolved.repo, resolved.branch
-            repo_client = await kb_client_for_repo(postgres_db, gitea_client, resolved)
-            result = await reindex_fn(
-                gitea_client=repo_client,
-                store=store,
-                embedding_service=embedding_service,
-                kb_id=project_id,
-                repo_name=repo_name,
-                branch=branch,
-            )
-            if result.get("status") not in ("up-to-date", "no-head"):
-                worked += 1
-        except Exception:
-            logger.exception("kb_sweep: reindex failed for project %s", project_id)
+
     # External KB datasources are indexed once under datasources.id, regardless
     # of how many projects/jobs select them. ``list_datasources`` decrypts the
     # credential field only inside this orchestrator process; the source keeps
@@ -1102,23 +1143,17 @@ async def kb_sweep_tick(
 
     from .kb_datasources import native_kb_project_id, reindex_kb_datasource
 
-    # A project's own KB datasource (auto-attached at project creation) is a
-    # management surface over notes this tick already swept above under
-    # ``kb_id = project_id``. Sweeping it again as an external source would
-    # index every note a second time under the datasource UUID, and search
-    # would return each of them twice
-    # (docs/features/knowledge_base_repo_separation.md §6, criterion 5).
-    kept = [row for row in external_rows if not native_kb_project_id(row)]
-    if len(kept) != len(external_rows):
-        logger.debug(
-            "kb_sweep: skipping %d native project KB datasource(s)",
-            len(external_rows) - len(kept),
-        )
-    external_rows = kept
-
+    native_datasources_skipped = 0
     for datasource in external_rows:
-        datasource_id = datasource.get("id")
+        datasource_id = None
         try:
+            datasource_id = datasource.get("id")
+            # A project's own KB datasource is only a management surface over
+            # notes swept below under ``kb_id = project_id``. Indexing it here
+            # would duplicate every search hit under the datasource UUID.
+            if native_kb_project_id(datasource):
+                native_datasources_skipped += 1
+                continue
 
             async def datasource_is_active(
                 datasource_id: Any = datasource_id,
@@ -1144,6 +1179,54 @@ async def kb_sweep_tick(
             logger.exception(
                 "kb_sweep: reindex failed for datasource %s", datasource_id
             )
+    if native_datasources_skipped:
+        logger.debug(
+            "kb_sweep: skipping %d native project KB datasource(s)",
+            native_datasources_skipped,
+        )
+
+    try:
+        rows = await postgres_db.fetch(
+            """
+            SELECT DISTINCT pr.project_id
+            FROM project_repositories AS pr
+            JOIN projects AS p ON p.id = pr.project_id
+            WHERE pr.role = ANY($1::text[])
+              AND p.status = 'active'
+            ORDER BY pr.project_id
+            """,
+            list(_KB_REPO_ROLES),
+        )
+    except Exception:
+        logger.exception("kb_sweep: failed to enumerate active project KBs")
+        rows = []
+    if not isinstance(rows, (list, tuple)):
+        rows = []  # compatibility with narrow/mocked DB facades
+
+    for row in rows:
+        project_id = None
+        try:
+            project_id = row["project_id"]
+            # One extra indexed lookup per project per tick (default 900s),
+            # against a reindex that costs a Git HEAD fetch at minimum — cheap
+            # enough to buy a single repository resolution rule.
+            resolved = await resolve_kb_repo(postgres_db, str(project_id))
+            if resolved is None:
+                # Raced with a repo detach between the enumeration and here.
+                continue
+            repo_client = await kb_client_for_repo(postgres_db, gitea_client, resolved)
+            result = await reindex_fn(
+                gitea_client=repo_client,
+                store=store,
+                embedding_service=embedding_service,
+                kb_id=project_id,
+                repo_name=resolved.repo,
+                branch=resolved.branch,
+            )
+            if result.get("status") not in ("up-to-date", "no-head"):
+                worked += 1
+        except Exception:
+            logger.exception("kb_sweep: reindex failed for project %s", project_id)
     return worked
 
 

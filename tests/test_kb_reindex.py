@@ -1441,6 +1441,152 @@ class TestKbSweepTick:
         assert "knowledge" in str(postgres_db.fetch.call_args[0])
 
     @pytest.mark.asyncio
+    async def test_sweep_only_enumerates_active_projects(self):
+        postgres_db = self._db()
+
+        await kb_sweep_tick(
+            postgres_db=postgres_db,
+            store=MagicMock(),
+            gitea_client=MagicMock(),
+            embedding_service=MagicMock(),
+            reindex_fn=AsyncMock(return_value={"status": "up-to-date"}),
+        )
+
+        query = " ".join(postgres_db.fetch.call_args.args[0].lower().split())
+        assert "from project_repositories as pr" in query
+        assert "join projects as p on p.id = pr.project_id" in query
+        assert "p.status = 'active'" in query
+
+    @pytest.mark.asyncio
+    async def test_sweep_accepts_asyncpg_record_like_project_rows(self):
+        class RecordLike:
+            def __init__(self, project_id):
+                self.project_id = project_id
+
+            def __getitem__(self, key):
+                if key != "project_id":
+                    raise KeyError(key)
+                return self.project_id
+
+        postgres_db = self._db()
+        postgres_db.fetch.return_value = [RecordLike(self.p1)]
+        reindex_fn = AsyncMock(return_value={"status": "up-to-date"})
+
+        await kb_sweep_tick(
+            postgres_db=postgres_db,
+            store=MagicMock(),
+            gitea_client=MagicMock(),
+            embedding_service=MagicMock(),
+            reindex_fn=reindex_fn,
+        )
+
+        reindex_fn.assert_awaited_once()
+        assert reindex_fn.await_args.kwargs["kb_id"] == self.p1
+
+    @pytest.mark.asyncio
+    async def test_blocked_native_does_not_delay_external_first_attempt(self):
+        postgres_db = self._db()
+        datasource_id = uuid.uuid4()
+        postgres_db.list_datasources.return_value = [
+            {
+                "id": datasource_id,
+                "type": "kb",
+                "connection_url": "https://example.test/team-docs.git",
+                "credentials": {},
+                "config": {},
+            }
+        ]
+        native_started = asyncio.Event()
+        release_native = asyncio.Event()
+        external_started = asyncio.Event()
+
+        async def blocked_native(**_kwargs):
+            native_started.set()
+            await release_native.wait()
+            return {"status": "up-to-date"}
+
+        async def external_indexer(*_args, **_kwargs):
+            external_started.set()
+            return {"status": "up-to-date"}
+
+        with patch(
+            "orchestrator.services.kb_datasources.reindex_kb_datasource",
+            side_effect=external_indexer,
+        ):
+            sweep = asyncio.create_task(
+                kb_sweep_tick(
+                    postgres_db=postgres_db,
+                    store=MagicMock(),
+                    gitea_client=MagicMock(),
+                    embedding_service=MagicMock(),
+                    reindex_fn=blocked_native,
+                )
+            )
+            reached_external = False
+            try:
+                await native_started.wait()
+                try:
+                    await asyncio.wait_for(external_started.wait(), timeout=0.05)
+                    reached_external = True
+                except TimeoutError:
+                    pass
+            finally:
+                release_native.set()
+                await sweep
+
+        assert reached_external, "native project work starved the external phase"
+
+    @pytest.mark.asyncio
+    async def test_native_enumeration_failure_does_not_abort_external_phase(self):
+        datasource_id = uuid.uuid4()
+        postgres_db = AsyncMock()
+        postgres_db.fetch.side_effect = RuntimeError("projects unavailable")
+        postgres_db.list_datasources.return_value = [
+            {
+                "id": datasource_id,
+                "type": "kb",
+                "connection_url": "https://example.test/team-docs.git",
+                "credentials": {},
+                "config": {},
+            }
+        ]
+        external_indexer = AsyncMock(return_value={"status": "completed"})
+
+        with patch(
+            "orchestrator.services.kb_datasources.reindex_kb_datasource",
+            external_indexer,
+        ):
+            worked = await kb_sweep_tick(
+                postgres_db=postgres_db,
+                store=MagicMock(),
+                gitea_client=MagicMock(),
+                embedding_service=MagicMock(),
+                reindex_fn=AsyncMock(),
+            )
+
+        assert worked == 1
+        external_indexer.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_external_enumeration_failure_does_not_abort_native_phase(self):
+        postgres_db = self._db()
+        postgres_db.list_datasources.side_effect = RuntimeError(
+            "datasources unavailable"
+        )
+        native_indexer = AsyncMock(return_value={"status": "completed"})
+
+        worked = await kb_sweep_tick(
+            postgres_db=postgres_db,
+            store=MagicMock(),
+            gitea_client=MagicMock(),
+            embedding_service=MagicMock(),
+            reindex_fn=native_indexer,
+        )
+
+        assert worked == 2
+        assert native_indexer.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_github_project_uses_selected_client_for_reindex(self):
         project_id = uuid.uuid4()
         datasource_id = uuid.uuid4()
