@@ -18,8 +18,10 @@ related:
 
 # Job review: link the real delivery, and review it with the agent
 
-**Status:** Proposed 2026-08-14. Motivated by a live job whose review screen pointed
-everywhere except at the work. `file:line` references verified at `81cfa654`.
+**Status:** §3a/§3b/§3c **implemented and deployed 2026-08-14**; §4 in progress. Motivated by a
+live job whose review screen pointed everywhere except at the work. `file:line` references
+were verified at `81cfa654` and describe the *pre-implementation* state — read §7 for what
+has since changed.
 
 ## 1. The problem, from a real job
 
@@ -199,3 +201,54 @@ opened rather than at seal.
   the right artefact, not re-implementing review.
 - Any change to how deliverables are contracted or gated.
 - Merging PRs from the cockpit.
+
+---
+
+## 7. Implementation status — 2026-08-14
+
+| § | what | state |
+|---|---|---|
+| 3b | Persist opened pull requests on jobs | **Shipped** `63ead51d`, deployed `sha-63ead51` |
+| 3a | Cockpit links job reviews to delivered changes | **Shipped** `52c348c4`, deployed `sha-52c348c` |
+| 3c | Read live pull request status | **Shipped** `23bbf28a` (+ grant test `6b15c93d`), deployed `sha-6b15c93` |
+| 4 | Review in session | **In progress** — `tests/test_job_review_session.py` (274 lines) uncommitted |
+
+### How §3b stores it
+
+Into `jobs.context` JSONB via a new `merge_context` helper
+(`src/database/postgres_db.py`) — an atomic `context || $1::jsonb` top-level merge. **No
+migration was needed**, which is why nothing appears in `information_schema` for `jobs`.
+
+### Not retroactive — verified
+
+Job `29c28492` opened PR #1 *before* §3b shipped. Its context keys are `snapshot`,
+`cloud_baseline`, `git_remote_url`, `kickoff_message`, `deliverable_gate`,
+`expert_selection`, `last_freeze_data`, `log_archive_keys`, `completion_decision`,
+`workspace_container`, `datasource_selection`, `required_deliverables` — **no
+`pull_requests`**. The PR URL survives only inside the agent's prose `notes`:
+
+> "PR: https://github.com/Knaeckebrothero/KurortEngine/pull/1 — open and mergeable with 2/2
+> checks passing."
+
+So the first job that motivated this feature is the one job the feature cannot help. If a
+backfill is wanted, that prose is the only source, and parsing it is exactly the fragility
+§2b describes. Recommend **not** backfilling; let it stand as the before-picture.
+
+### Remaining work for §4
+
+The security constraint in §4b is unchanged and still binding — re-read it before touching
+`create_persistent_thread`. Beyond that, the open questions are:
+
+1. **Workspace strategy** (§4c). A fresh checkout of the source repo at the delivered branch,
+   via the ordinary repository-connector path. Must survive a session resume — see
+   `srw-session-restore-drops-repo-checkouts`. If it cannot, say the session is
+   single-sitting rather than shipping something that silently loses the checkout.
+2. **Backend inheritance.** `config_override.workspace.backend` is not expressible through
+   session parameters. Map to a `config_name`, or drop it and say so in the UI. Do **not**
+   widen the tool.
+3. **Opening brief.** The session should start knowing which job it is reviewing, the
+   deliverable paths, and the PR — not require the reviewer to re-explain it.
+4. **Permission mode.** `supervised` is the safe default for a review session; auto-accept in
+   a session holding a live PAT-bearing checkout deserves a deliberate decision.
+5. **Lifetime.** Review sessions accumulate. Decide whether they idle-reap like other
+   sessions or are explicitly closed on approve/reject.
