@@ -1,6 +1,6 @@
 """repo_* tools: thin, read_only-gated wrappers over GitManager + the forge adapter."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -104,6 +104,81 @@ async def test_repo_open_pr_calls_the_forge_adapter():
     # head defaults to the branch currently checked out in that clone.
     assert mock_pr.call_args[1]["head"] == "job/abc12345"
     assert "https://gh/pr/9" in out
+
+
+@pytest.mark.asyncio
+async def test_repo_open_pr_persists_structured_delivery_against_the_job():
+    context, _ = make_context()
+    context.job_id = "11111111-1111-1111-1111-111111111111"
+    context.postgres_db = MagicMock()
+    context.postgres_db.jobs.merge_context = AsyncMock(return_value=True)
+    tool = get_tool(create_repo_tools(context), "repo_open_pr")
+
+    with patch(
+        "src.tools.repo.repo_tools.open_pull_request",
+        return_value={"number": 9, "url": "https://github.com/acme/widget/pull/9"},
+    ):
+        out = await tool.ainvoke(
+            {
+                "repo": "widget",
+                "title": "T",
+                "base": "develop",
+                "head": "feature/review-links",
+            }
+        )
+
+    context.postgres_db.jobs.merge_context.assert_awaited_once()
+    job_id, updates = context.postgres_db.jobs.merge_context.await_args.args
+    assert str(job_id) == context.job_id
+    assert updates == {
+        "pull_request": {
+            "forge": "github",
+            "repo": "acme/widget",
+            "number": 9,
+            "url": "https://github.com/acme/widget/pull/9",
+            "head": "feature/review-links",
+            "base": "develop",
+        }
+    }
+    assert "https://github.com/acme/widget/pull/9" in out
+
+
+@pytest.mark.asyncio
+async def test_repo_open_pr_reports_when_the_opened_pr_cannot_be_persisted():
+    context, _ = make_context()
+    context.job_id = "11111111-1111-1111-1111-111111111111"
+    context.postgres_db = MagicMock()
+    context.postgres_db.jobs.merge_context = AsyncMock(return_value=False)
+    tool = get_tool(create_repo_tools(context), "repo_open_pr")
+
+    with patch(
+        "src.tools.repo.repo_tools.open_pull_request",
+        return_value={"number": 9, "url": "https://github.com/acme/widget/pull/9"},
+    ):
+        out = await tool.ainvoke({"repo": "widget", "title": "T", "base": "develop"})
+
+    assert "opened" in out.lower()
+    assert "could not be recorded" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_repo_open_pr_does_not_hide_an_opened_pr_when_persistence_raises():
+    context, _ = make_context()
+    context.job_id = "11111111-1111-1111-1111-111111111111"
+    context.postgres_db = MagicMock()
+    context.postgres_db.jobs.merge_context = AsyncMock(
+        side_effect=OSError("database unavailable")
+    )
+    tool = get_tool(create_repo_tools(context), "repo_open_pr")
+
+    with patch(
+        "src.tools.repo.repo_tools.open_pull_request",
+        return_value={"number": 9, "url": "https://github.com/acme/widget/pull/9"},
+    ):
+        out = await tool.ainvoke({"repo": "widget", "title": "T", "base": "develop"})
+
+    assert "https://github.com/acme/widget/pull/9" in out
+    assert "do not open a duplicate" in out.lower()
 
 
 @pytest.mark.asyncio
