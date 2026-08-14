@@ -146,7 +146,7 @@ status.)*
 | [jsonb_isinstance_guard_without_parse_silent_dead_paths](jsonb_isinstance_guard_without_parse_silent_dead_paths.md) | 1 of 4 instances fixed (site 4 cockpit, `0ba7c754`); sites 1–3 byte-for-byte unchanged; `_get_vm_context()` helper exists but unapplied to sites 1–2 |
 | [loop_advance_nonatomic_wedges_loop](loop_advance_nonatomic_wedges_loop.md) | Superseded by Loop Unified Engine Phase 1 (07-19): atomicity achieved by the barrier rewrite; heal + age gate survive under new names; UI stalled badge still unbuilt |
 | [mcp_client_timeout_retry_false_failure_shared_auth_headers](mcp_client_timeout_retry_false_failure_shared_auth_headers.md) | Defects 2+3 FIXED via `99b87008` (client now `src/shared/orch_surface/`); defect 1 (flat 30s client timeout) open |
-| [orchestrator_tool_surface_fragmentation](orchestrator_tool_surface_fragmentation.md) | decided and in execution — S1 committed `99b87008`; next S2 (see unified_orchestrator_tool_surface.md) |
+| ~~orchestrator_tool_surface_fragmentation~~ | **DONE 08-14** — S1 `99b87008`, S2–S4+S6 `1a2bfbec`, review-fix batch `5fd63947` (2 security regressions + migration 0158 repair), S5 activated via `officer_supervision_surface` E5. 43 shared descriptors, one implementation for session/officer/MCP. |
 | [phase_model_overhead_amnesia_loop](phase_model_overhead_amnesia_loop.md) | 🟡 **IN PROGRESS** — filed 2026-07-31 after a code-side deep |
 | ~~recovery_pause_repersists_stale_freeze_invisible_job~~ | **FIXED 08-06 (batch #2)**, moved to docs/done/ — completion freeze-echo guard + `pause_job_shed_freeze` on the recovery arm. |
 | [results](results.md) | pending_review, confidence 1.0 |
@@ -776,3 +776,52 @@ inventory's line numbers marked as drifted anchors post-merge.
 
 Status of record is `docs/features/stateless_agents.md` §9.1. Session lane
 functionally complete; worker lane blocked on Gate 3 (§5.4.5).
+
+## Session log 2026-08-14 (officer operating surface — one-day pipeline)
+
+Subagent-driven implementation of the whole officer stack in dependency order,
+each stage its own reviewed commit, all pushed to develop with CI green.
+Feature docs carry the per-slice detail; this is the index.
+
+**Gate 0 — unified toolset reviewed before push.** A `/code-review high` of
+`1a2bfbec` (88 files, the S2–S4+S6 descriptor unification) returned 15 findings.
+Two were security: MCP invocations whose auth context failed fell **open** with
+`X-Internal-Key` (was fail-closed pre-unification), and the session lane had
+gained `X-MCP-Scope` stamping that silently hid users' own NULL-project jobs and
+403'd inspection routes. Two were migration data damage: 0156's explicit `[]`
+group writes read as hard-disable markers on the legacy session path (k3d: 7
+thread rows + 120 resolved worker blobs), and boolean-form policies escaped the
+guard entirely. Six were session/officer lane degradations from the
+"unification chose the MCP lane's behavior" pattern (lost freeze/lineage detail,
+lost descriptions, raw httpx errors reaching the model, halved stuck threshold,
+silent list clamp, dropped repo-head staleness headers). Fixes landed as
+`5fd63947` (security + migration 0158 repair + `project_id` restored on
+create_job + unknown-tool-name logging + an independent caller-defaults policy
+snapshot); the six degradations were repaired inside supervision E1 where that
+contract was being rebuilt anyway.
+
+**The stack, in order** — [officer_post](../features/officer_post.md) O1–O5
+(`fa497666` migration 0157 + adoption backfill, `9a3c3934` lifecycle +
+PATCH, `d7cfd716` one-state card) → [officer_knowledge_plane](../features/officer_knowledge_plane.md)
+K1–K3 (`0c0c5607`) → [officer_supervision_surface](../features/officer_supervision_surface.md)
+E1–E5 (`4d501a8f`, `7bb1d331`) → [officer_message_routing](../features/officer_message_routing.md)
+M1–M4 (`be1d972e` migration 0159). Two CI-only tails (`d0cad321`, `b9a7fd29`)
+normalized adapter-parity against SDK-version-dependent docstring handling.
+
+**Worth remembering.** The advisory lock around officer dispatch admission does
+**not** span the job INSERT — a fact that shaped both the routing transaction and
+the still-unbuilt backlog claim design. `jobs.updated_at` is now formally
+display-only: `compute_job_liveness` (control status → audit last-write →
+heartbeat) is the single contract behind sitrep, `/progress`, and
+`/stats/stuck`, and it caught a genuinely stuck dev job on its first live run.
+The advertised-but-never-implemented `blocking_timeout_hours` finally exists as
+a leader-gated reconciler. Officer file reads are gone by design — he judges on
+a pinned evidence manifest and delegates inspection.
+
+**Owed:** O6 (release the held Resavio officer through the new endpoint — the
+live-fire acceptance for E5/M and the precondition for backlog-pool acceptance),
+M5 route badges, K4 knowledge-health surfacing, and the KB hygiene pair (retire
+the stale "No renderer available" RecallStore belief; run `assert-browser-stack`
+on a live workspace). Next build:
+[officer_backlog_pools](../features/officer_backlog_pools.md) B1+, blocked only
+on its six §13 defaults.

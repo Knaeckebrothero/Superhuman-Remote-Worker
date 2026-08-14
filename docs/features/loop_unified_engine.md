@@ -41,6 +41,18 @@ Implements, in user-configurable form, the control-plane assessment's top P0 (ty
 
 **Third mode added 2026-07-30** — `scheduling='officer'` (migration 0075, centurion S8, see `docs/features/centurion.md` §7): the advance path, after winning the same stage barrier, enqueues a wake for the project's centurion instead of rotating — no iteration decrement, no stop evaluation, no cooldown park; the officer decides what runs next. Officer loops are budget-exempt (the officer's own ceilings are the brake), the sweeper's torn-advance heal skips them (empty pointers are their steady state), and a live `standard`/`campaign` loop converts one-way via `POST /api/projects/{id}/loop/scheduling` (guarded: no in-flight campaign). The "two modes" framing above describes the mechanical engine, which is unchanged — officer mode is a third *scheduling* answer on the same barrier, not a third advance path.
 
+**Where officer mode is going (2026-08-15).** `scheduling='officer'` answers "who decides
+the next turn" but not "what does he decide from" — the officer had no systematic work
+substrate, so the mode has been correct-but-idle. [[officer_backlog_pools]] supplies it: a
+curated ticket backlog plus a replica-safe auto-pull tick that fills typed capacity pools,
+with campaign scheduling superseded on officer-commanded projects (the officer plans by
+queueing ticket chains, so no critic ever needs to emit a structured `loop_plan` — which
+retires the MiniMax P3 blocker in [[loop_campaign_scheduling]]). Its prerequisites all
+landed 2026-08-14 (post, knowledge plane, supervision surface, message routing). **The
+engine below does not change**: barrier, spawn, sweeper, and the `standard`/`campaign`
+modes remain exactly as built and remain the answer for non-officer projects. What changes
+is only what officer mode hands the wake to.
+
 **Phase 1 deployed to dev and live-validated (2026-07-21 → 2026-07-25).** Migration 0063 applied cleanly on dev (CHECK swap, defaults, in-place rename of pre-migration rows). The planned k3d smoke was superseded by live validation on real dev loops, all against the deployed images:
 
 - **Standard rotation through failures** — a 4-turn width-1 loop advanced scholar→critic→scholar→critic through 3 member failures and 1 success (`consecutive_failures` reset on success), then budget-stopped with both pointer columns cleared.
