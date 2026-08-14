@@ -2507,7 +2507,8 @@
       "summary": "Zusammenfassung",
       "confidence": "Konfidenz",
       "deliverables": "Ergebnisse",
-      "agentNotes": "Agent-Notizen"
+      "agentNotes": "Agent-Notizen",
+      "delivery": "Bereitstellung"
     },
     "meta": {
       "jobId": "Job-ID",
@@ -2516,7 +2517,10 @@
     "summaryEmpty": "Keine Zusammenfassung vorhanden",
     "noFrozenData": "Keine eingefrorenen Job-Daten verfügbar",
     "links": {
-      "browseWorkspace": "Arbeitsbereich in Gitea öffnen",
+      "sourceRepository": "Quell-Repository",
+      "branch": "Branch {{branch}}",
+      "pullRequest": "Pull Request #{{number}}",
+      "jobWorkspace": "Job-Arbeitsbereich",
       "startingIde": "IDE wird gestartet …",
       "openIde": "Im Web-IDE öffnen",
       "openCloudFolder": "Cloud-Ordner öffnen"

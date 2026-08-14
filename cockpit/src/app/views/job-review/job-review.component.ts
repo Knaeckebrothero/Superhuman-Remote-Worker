@@ -1,8 +1,8 @@
-import {Component, effect, inject, signal} from '@angular/core';
+import {Component, computed, effect, inject, signal} from '@angular/core';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {DataService} from '../../core/services/data.service';
-import {Job} from '../../core/models/api.model';
+import {Datasource, Job, RepositoryForge} from '../../core/models/api.model';
 import {environment} from '../../core/environment';
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
@@ -24,6 +24,125 @@ interface FrozenJobData {
   frozen_at?: string;
   command?: string;        // sudo command that triggered vm_upgrade_required freeze
   reason?: string;         // why the freeze happened
+}
+
+export interface JobPullRequest {
+  forge: RepositoryForge;
+  repo: string;
+  number: number;
+  url: string;
+  head: string;
+  base: string;
+}
+
+const REPOSITORY_FORGES = new Set<RepositoryForge>(['github', 'gitea', 'gitlab']);
+
+function safeHttpUrl(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const parsed = new URL(value.trim());
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    parsed.username = '';
+    parsed.password = '';
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+/** Convert a credential-redacted HTTPS/SSH clone URL into its repository page. */
+export function repositoryWebUrl(connectionUrl: string | null | undefined): string | null {
+  const raw = connectionUrl?.trim();
+  if (!raw) return null;
+
+  // SCP-like Git syntax is not understood by URL, but is common for repository
+  // connectors: git@github.com:owner/repo.git.
+  const scp = raw.match(/^(?:[^@/:\s]+@)?([^/:\s]+):(.+)$/);
+  if (scp && !raw.includes('://')) {
+    return repositoryWebUrl(`https://${scp[1]}/${scp[2]}`);
+  }
+
+  try {
+    const parsed = new URL(raw);
+    if (!['http:', 'https:', 'ssh:', 'git:'].includes(parsed.protocol)) return null;
+    const protocol = parsed.protocol === 'http:' ? 'http:' : 'https:';
+    const path = parsed.pathname.replace(/\/+$/, '').replace(/\.git$/i, '');
+    if (!parsed.hostname || !path || path === '/') return null;
+    const port = parsed.port ? `:${parsed.port}` : '';
+    return `${protocol}//${parsed.hostname}${port}${path}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Build the forge's browser route for a branch in an attached repository. */
+export function repositoryBranchUrl(
+  connectionUrl: string | null | undefined,
+  branch: string | null | undefined,
+  forge: RepositoryForge | null | undefined,
+): string | null {
+  const repoUrl = repositoryWebUrl(connectionUrl);
+  const ref = branch?.trim();
+  if (!repoUrl || !ref || !forge) return null;
+  const encodedRef = ref.split('/').map(encodeURIComponent).join('/');
+  const route = forge === 'github' ? 'tree' : forge === 'gitlab' ? '-/tree' : 'src/branch';
+  return `${repoUrl}/${route}/${encodedRef}`;
+}
+
+/** Read and validate the structured record written by ``repo_open_pr``. */
+export function pullRequestFromJob(job: Job | null): JobPullRequest | null {
+  const raw = asRecord(asRecord(job?.context)?.['pull_request']);
+  const forge = raw?.['forge'];
+  const repo = raw?.['repo'];
+  const number = raw?.['number'];
+  const head = raw?.['head'];
+  const base = raw?.['base'];
+  const url = safeHttpUrl(raw?.['url']);
+  if (
+    typeof forge !== 'string' ||
+    !REPOSITORY_FORGES.has(forge as RepositoryForge) ||
+    typeof repo !== 'string' ||
+    !repo.trim() ||
+    typeof number !== 'number' ||
+    !Number.isInteger(number) ||
+    number < 1 ||
+    typeof head !== 'string' ||
+    !head.trim() ||
+    typeof base !== 'string' ||
+    !base.trim() ||
+    !url
+  ) {
+    return null;
+  }
+  return {
+    forge: forge as RepositoryForge,
+    repo: repo.trim(),
+    number,
+    url,
+    head: head.trim(),
+    base: base.trim(),
+  };
+}
+
+/** Prefer the connector named by the PR when a job attached several repos. */
+export function selectDeliveryRepository(
+  datasources: Datasource[],
+  pullRequest: JobPullRequest | null,
+): Datasource | null {
+  const repositories = datasources.filter((item) => item.type === 'repository');
+  if (!pullRequest) return repositories.length === 1 ? repositories[0] : null;
+  const wanted = pullRequest.repo.replace(/^\/+|\/+$/g, '').toLowerCase();
+  const matched = repositories.find((item) => {
+    const webUrl = repositoryWebUrl(item.connection_url);
+    if (!webUrl) return false;
+    try {
+      const path = new URL(webUrl).pathname.replace(/^\/+|\/+$/g, '').toLowerCase();
+      return path === wanted || path.endsWith(`/${wanted}`);
+    } catch {
+      return false;
+    }
+  });
+  return matched ?? (repositories.length === 1 ? repositories[0] : null);
 }
 
 /**
@@ -157,28 +276,60 @@ interface FrozenJobData {
             </div>
           }
 
-          <!-- Workspace Links -->
-          @if (getWorkspaceUrl() || hasSnapshot()) {
-            <div class="section workspace-links">
-              @if (getWorkspaceUrl()) {
-                <app-button variant="secondary" size="sm" (clicked)="openWorkspace()">
-                  {{ 'jobReview.links.browseWorkspace' | transloco }}
-                </app-button>
-              }
-              @if (hasSnapshot()) {
-                <app-button
-                  variant="info"
-                  size="sm"
-                  [loading]="ideLoading()"
-                  (clicked)="openIde()"
-                >
-                  @if (ideLoading()) {
-                    {{ 'jobReview.links.startingIde' | transloco }}
-                  } @else {
-                    {{ 'jobReview.links.openIde' | transloco }}
-                  }
-                </app-button>
-              }
+          <!-- Delivery Links -->
+          @if (
+            sourceRepositoryUrl() ||
+            deliveryBranchUrl() ||
+            pullRequest() ||
+            getJobWorkspaceUrl() ||
+            hasSnapshot()
+          ) {
+            <div class="section delivery-section">
+              <div class="section-header">{{ 'jobReview.sections.delivery' | transloco }}</div>
+              <div class="delivery-links">
+                @if (sourceRepositoryUrl()) {
+                  <app-button
+                    variant="secondary"
+                    size="sm"
+                    (clicked)="openExternal(sourceRepositoryUrl()!)"
+                  >
+                    {{ 'jobReview.links.sourceRepository' | transloco }}
+                  </app-button>
+                }
+                @if (deliveryBranchUrl()) {
+                  <app-button
+                    variant="secondary"
+                    size="sm"
+                    (clicked)="openExternal(deliveryBranchUrl()!)"
+                  >
+                    {{ 'jobReview.links.branch' | transloco: { branch: deliveryBranch() } }}
+                  </app-button>
+                }
+                @if (pullRequest(); as pr) {
+                  <app-button variant="info" size="sm" (clicked)="openExternal(pr.url)">
+                    {{ 'jobReview.links.pullRequest' | transloco: { number: pr.number } }}
+                  </app-button>
+                }
+                @if (getJobWorkspaceUrl()) {
+                  <app-button variant="ghost" size="sm" (clicked)="openJobWorkspace()">
+                    {{ 'jobReview.links.jobWorkspace' | transloco }}
+                  </app-button>
+                }
+                @if (hasSnapshot()) {
+                  <app-button
+                    variant="ghost"
+                    size="sm"
+                    [loading]="ideLoading()"
+                    (clicked)="openIde()"
+                  >
+                    @if (ideLoading()) {
+                      {{ 'jobReview.links.startingIde' | transloco }}
+                    } @else {
+                      {{ 'jobReview.links.openIde' | transloco }}
+                    }
+                  </app-button>
+                }
+              </div>
             </div>
           }
 
@@ -490,7 +641,11 @@ interface FrozenJobData {
         font-style: italic;
       }
 
-      .workspace-links {
+      .delivery-section {
+        gap: 8px;
+      }
+
+      .delivery-links {
         display: flex;
         gap: 8px;
         flex-wrap: wrap;
@@ -615,6 +770,25 @@ export class JobReviewComponent {
 
   readonly currentJobId = this.data.currentJobId;
   readonly job = signal<Job | null>(null);
+  readonly repositoryDatasources = signal<Datasource[]>([]);
+  readonly pullRequest = computed(() => pullRequestFromJob(this.job()));
+  readonly sourceRepository = computed(() =>
+    selectDeliveryRepository(this.repositoryDatasources(), this.pullRequest()),
+  );
+  readonly sourceRepositoryUrl = computed(() =>
+    repositoryWebUrl(this.sourceRepository()?.connection_url),
+  );
+  readonly deliveryBranch = computed(() => this.pullRequest()?.head || null);
+  readonly deliveryForge = computed(
+    () => this.pullRequest()?.forge || this.sourceRepository()?.config?.forge || null,
+  );
+  readonly deliveryBranchUrl = computed(() =>
+    repositoryBranchUrl(
+      this.sourceRepository()?.connection_url,
+      this.deliveryBranch(),
+      this.deliveryForge(),
+    ),
+  );
   readonly frozenData = signal<FrozenJobData | null>(null);
   readonly isLoading = signal(false);
   readonly isApproving = signal(false);
@@ -640,6 +814,7 @@ export class JobReviewComponent {
         this.loadJob();
       } else {
         this.job.set(null);
+        this.repositoryDatasources.set([]);
         this.frozenData.set(null);
         this.resultMessage.set(null);
       }
@@ -662,10 +837,15 @@ export class JobReviewComponent {
 
     this.isLoading.set(true);
     this.resultMessage.set(null);
+    this.repositoryDatasources.set([]);
 
     this.api.getJob(jobId).subscribe((job) => {
       this.job.set(job);
       this.isLoading.set(false);
+
+      if (job) {
+        this.loadRepositoryDatasources(jobId);
+      }
 
       // If pending_review, also fetch workspace to get frozen job data
       if (job?.status === 'pending_review') {
@@ -682,7 +862,14 @@ export class JobReviewComponent {
     });
   }
 
-  getWorkspaceUrl(): string | null {
+  private loadRepositoryDatasources(jobId: string): void {
+    this.api.getJobDatasources(jobId).subscribe((datasources) => {
+      if (this.currentJobId() !== jobId) return;
+      this.repositoryDatasources.set(datasources.filter((item) => item.type === 'repository'));
+    });
+  }
+
+  getJobWorkspaceUrl(): string | null {
     const currentJob = this.job();
     const giteaUrl = environment.giteaUrl;
     if (!giteaUrl || !currentJob) return null;
@@ -693,14 +880,19 @@ export class JobReviewComponent {
     return `${giteaUrl}/${repoName}`;
   }
 
-  openWorkspace(): void {
+  openJobWorkspace(): void {
     const currentJob = this.job();
     if (!currentJob) return;
-    const url = this.getWorkspaceUrl();
+    const url = this.getJobWorkspaceUrl();
     if (!url) return;
     this.api.ensureWorkspaceAccess(currentJob.id).subscribe(() => {
       window.open(url, '_blank');
     });
+  }
+
+  openExternal(url: string): void {
+    const safeUrl = safeHttpUrl(url);
+    if (safeUrl) window.open(safeUrl, '_blank', 'noopener');
   }
 
   hasSnapshot(): boolean {

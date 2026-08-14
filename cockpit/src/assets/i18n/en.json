@@ -2507,7 +2507,8 @@
       "summary": "Summary",
       "confidence": "Confidence",
       "deliverables": "Deliverables",
-      "agentNotes": "Agent Notes"
+      "agentNotes": "Agent Notes",
+      "delivery": "Delivery"
     },
     "meta": {
       "jobId": "Job ID",
@@ -2516,7 +2517,10 @@
     "summaryEmpty": "No summary provided",
     "noFrozenData": "No frozen job data available",
     "links": {
-      "browseWorkspace": "Browse workspace in Gitea",
+      "sourceRepository": "Source repository",
+      "branch": "Branch {{branch}}",
+      "pullRequest": "Pull request #{{number}}",
+      "jobWorkspace": "Job workspace",
       "startingIde": "Starting IDE...",
       "openIde": "Open in Web IDE",
       "openCloudFolder": "Open cloud folder"
