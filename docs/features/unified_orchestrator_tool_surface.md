@@ -302,7 +302,10 @@ That amendment and its initial bounds remain **PROPOSED** in
 
 ### 7.1 Implementation record — 2026-08-14
 
-S2/S3/S4/S6 now use 37 shared descriptors (10 control, 27 inspection) under
+S2/S3/S4/S6 now use 43 shared descriptors (originally 37: 10 control, 27 inspection;
++3 evidence reads from officer_supervision_surface E4 and +3 officer inbox actions from
+officer_message_routing M3, both 2026-08-14 — S5 was activated the same day via that
+supervision surface rather than a bare grant flip) under
 `src/shared/orch_surface/jobs/`. Each descriptor owns its async handler and
 rendering; thin FastMCP and LangChain adapters register the same signature,
 docstring, metadata, and handler. `job_control` / `job_inspection` registry

@@ -63,6 +63,16 @@ blocking-message liveness boundary M2–M4 in [[officer_message_routing]]. B1/B2
 independent. These additions do not change the one-shot claim model or the six §13 backlog
 defaults awaiting the Legate.
 
+**Prerequisites LANDED 2026-08-14** (one pipeline day on develop): unified toolset
+reviewed + repaired (`1a2bfbec`, `5fd63947`), officer post O1–O5 (`fa497666`,
+`9a3c3934`, `d7cfd716`), knowledge plane K1–K3 (`0c0c5607`), supervision E1–E5
+(`4d501a8f`, `7bb1d331`), message routing M1–M4 (`be1d972e`). Additional substrate this
+feature can now consume: `compute_jobs_liveness()` (batch, project-scoped) for §5's
+stale-claim ages, the evidence manifest for §3's close-checklists, and
+`job_message_routes` for the `waiting_for_reply` claim interactions. **B1+ is
+unblocked** pending the six §13 defaults and the O6 Resavio release for live
+acceptance.
+
 Decisions locked in the design session (amendments from the research round in *italics*):
 
 - **Category is a property of the work; expert is a property of the worker.** A ticket's

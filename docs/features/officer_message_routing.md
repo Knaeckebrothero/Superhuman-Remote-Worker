@@ -34,7 +34,18 @@ related:
 
 ## Status
 
-**PROPOSED (2026-08-14). Nothing implemented.** The existing worker `send_message` tool,
+**M1–M4 IMPLEMENTED 2026-08-14** on develop (`be1d972e`): migration 0159
+`job_message_routes`, effective-policy resolver with per-route snapshots, the
+one-transaction blocking send (message + route + wake intent + freeze, all-or-nothing),
+held/vacant/unreachable fallbacks with hold/decommission drains, the officer inbox
+(high-urgency `worker_message` wakes, sitrep section, reply/escalate/acknowledge tools
+with post-row actor guards), and the leader-gated SLA/total-timeout reconciler with CAS
+exactly-once semantics. Ratified defaults: DB `user_direct`, 15-min officer SLA,
+immediate-both for `officer_and_user`. M5 (route badges/thread actions) deferred — the
+O5 card already carries the policy selector. Live k3d walk proved reply-resume, SLA
+escalation, total-timeout resume, and the fail-closed guard; a real officer LLM turn
+consuming a routed question is owed to the O6 live-fire. Original status for the
+record: **PROPOSED (2026-08-14). Nothing implemented.** The existing worker `send_message` tool,
 job message endpoint, notification delivery, generic reply route, officer wake outbox, and
 message readers provide most primitives. Missing are policy resolution, an officer inbox
 route, durable route state, escalation tools, and the timeout that the current config
