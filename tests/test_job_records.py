@@ -31,6 +31,7 @@ import services.project_loops as project_loops
 from services.completion import write_job_change_record
 from services.job_records import (
     derive_changes,
+    job_delivered_nothing,
     record_exists_for_job,
     render_job_record,
     write_job_record,
@@ -612,3 +613,99 @@ class TestLoopRetroReExport:
     def test_project_loops_re_exports_the_moved_writer(self) -> None:
         assert project_loops.write_loop_retro is job_records.write_loop_retro
         assert write_loop_retro is job_records.write_loop_retro
+
+
+# =============================================================================
+# Source-repository delivery — the loop's real "did anything land?" signal
+# =============================================================================
+
+PR_RECORD = {
+    "forge": "github",
+    "repo": "Knaeckebrothero/KurortEngine",
+    "number": 1,
+    "url": "https://github.com/Knaeckebrothero/KurortEngine/pull/1",
+    "head": "design/hotel-rheinland-theme",
+    "base": "main",
+}
+
+
+class TestPersistedPullRequestIsDelivery:
+    """A pull request opened through ``repo_open_pr`` is verified delivery.
+
+    docs/features/better_resavio_restart_status.md §6a. A loop whose code
+    lives in a source repository reports ``delivery_status='no-changes'`` on
+    every code turn *legitimately* — nothing goes to the project cloud
+    folder. The delivered artefact is a pushed branch plus an open pull
+    request. The record must say so, or the loop's own history teaches the
+    next iteration that nothing was ever delivered.
+
+    Verified is correct here and does not violate §5.1: the orchestrator
+    persisted this record itself when the tool call succeeded. It is
+    first-hand knowledge, not the agent's prose, and reading it fetches
+    nothing.
+    """
+
+    def test_persisted_pull_request_becomes_a_verified_entry(self) -> None:
+        changes = derive_changes(_job(context={"pull_request": PR_RECORD}))
+        entry = next(c for c in changes if c["kind"] == "pull_request")
+        assert entry == {
+            "datasource": "Knaeckebrothero/KurortEngine",
+            "kind": "pull_request",
+            "action": "open",
+            "ref": "https://github.com/Knaeckebrothero/KurortEngine/pull/1",
+            "summary": ("github PR #1: design/hotel-rheinland-theme → main"),
+            "verified": True,
+        }
+
+    def test_entry_follows_the_git_entry(self) -> None:
+        changes = derive_changes(
+            _job(context={"pull_request": PR_RECORD}),
+            knowledge_note_ids=["note-a"],
+        )
+        assert [c["kind"] for c in changes] == ["git", "pull_request", "knowledge"]
+
+    def test_jsonb_string_context_is_parsed(self) -> None:
+        """asyncpg hands JSONB back as text; a raw string must still work."""
+        changes = derive_changes(_job(context=json.dumps({"pull_request": PR_RECORD})))
+        assert any(c["kind"] == "pull_request" for c in changes)
+
+    def test_no_entry_without_a_persisted_record(self) -> None:
+        assert all(c["kind"] != "pull_request" for c in derive_changes(_job()))
+
+    def test_agent_prose_is_never_promoted_to_a_verified_entry(self) -> None:
+        """The whole point: a claim in context must not read as a fact."""
+        changes = derive_changes(
+            _job(context={"pull_request": "I opened https://github.com/x/y/pull/9"})
+        )
+        assert all(c["kind"] != "pull_request" for c in changes)
+
+    def test_malformed_record_fails_closed(self) -> None:
+        for bad in (
+            {**PR_RECORD, "number": 0},
+            {**PR_RECORD, "number": True},
+            {**PR_RECORD, "url": "javascript:alert(1)"},
+            {**PR_RECORD, "forge": "definitely-not-a-forge"},
+            {**PR_RECORD, "repo": "no-owner"},
+            {**PR_RECORD, "head": "   "},
+        ):
+            changes = derive_changes(_job(context={"pull_request": bad}))
+            assert all(c["kind"] != "pull_request" for c in changes), bad
+
+
+class TestDeliveredNothing:
+    """The guard that replaces "did ``main`` move?".
+
+    A guard comparing ``main`` before/after would have scored job 29c28492 —
+    which shipped PR #1, 1,348 lines — as having delivered nothing, because
+    work correctly lands on a branch under review.
+    """
+
+    def test_no_cloud_changes_and_no_pull_request_is_nothing(self) -> None:
+        assert job_delivered_nothing(_job(), delivery_status="no-changes") is True
+
+    def test_a_persisted_pull_request_is_delivery(self) -> None:
+        job = _job(context={"pull_request": PR_RECORD})
+        assert job_delivered_nothing(job, delivery_status="no-changes") is False
+
+    def test_cloud_delivery_is_still_delivery(self) -> None:
+        assert job_delivered_nothing(_job(), delivery_status="cloud-applied") is False
