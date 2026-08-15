@@ -1,8 +1,18 @@
 # The deliverable gate cannot see deliverables in a cloned repo datasource
 
-**Status:** **Open.** Observed live on dev 2026-08-14 (job `29c28492`). No fix. The one
-occurrence was worked around *by the agent*, not by an operator — see below, because the
-workaround is itself the problem.
+**Status:** **FIXED on develop `997e9a58`** (2026-08-15), both halves, not yet deployed.
+Observed live on dev 2026-08-14 (job `29c28492`). The one occurrence was worked around *by the
+agent*, not by an operator — see below, because the workaround is itself the problem.
+
+What shipped, against "Suggested fix" below: creation refuses the manifest (a `JobCreate`
+validator naming the reason and the alternative), and the gate fails open per entry rather
+than bouncing — checking the tree FIRST, so a path that really is committed reports `present`
+rather than excused. Both consume one shared predicate,
+`is_cloned_repo_deliverable` / `cloned_repo_deliverables`. Of the two variants offered in (2),
+the skip-with-reason one was taken: the gate stays forge-unaware, and the loop's own delivery
+guard (`a040dd31`) remains the thing that catches a turn which genuinely delivered nothing, so
+failing open here opens no hole. The pass-path action line was also corrected — it had called
+every fail-open a "kb" entry, which would have described a check that never ran.
 **Severity:** **High for loop projects whose code lives in a source repository.** It is not an
 edge case there; it is every code turn. Two wasted resume cycles per job, then either a
 platform-invariant-defeating workaround or demotion to `pending_review` for work that shipped.
