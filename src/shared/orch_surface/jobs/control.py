@@ -135,6 +135,8 @@ async def create_job(
     priority: int = 5,
     required_deliverables: list[str] | None = None,
     slot: str | None = None,
+    ticket: str | None = None,
+    work_category: str | None = None,
 ) -> str:
     """Create a new job for agent execution.
 
@@ -170,6 +172,16 @@ async def create_job(
             bounce the seal back to the worker with the precise list.
         slot: Officer roster slot for this dispatch. Translated to
             context.officer_slot; when both are supplied, this value wins.
+        ticket: Backlog ticket this job claims — the knowledge-note slug of
+            the ready ticket being dispatched. REQUIRED when working a
+            backlog ticket: it is the one-shot claim (context.ticket_note_id)
+            that stops the auto-pull tick or a second dispatch from starting
+            duplicate work on the same ticket. A context key like
+            "backlog_ticket" is NOT read by the claim ledger.
+        work_category: Explicit category for this dispatch (researcher,
+            tester, executor). Optional — the slot's category governs the
+            worker's contract; this records your stated intent and is named
+            in the kickoff when the two disagree.
 
     Returns:
         Created job details with ID
@@ -213,6 +225,8 @@ async def create_job(
             thread_id=caller.thread_id,
             priority=priority,
             required_deliverables=required_deliverables,
+            ticket=ticket,
+            work_category=work_category,
         )
         return fmt.format_created_job(result, config_name)
     except Exception as error:

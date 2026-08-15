@@ -294,6 +294,54 @@ async def test_mcp_job_ids_remain_verbatim_without_agent_prefix_resolution() -> 
 
 
 @pytest.mark.asyncio
+async def test_create_job_forwards_ticket_and_category_to_the_funnel() -> None:
+    """The Resavio live-fire gap (2026-08-15): JobCreate.ticket existed at
+    the funnel but the descriptor never exposed it, so the officer improvised
+    a ``backlog_ticket`` context key the claim ledger cannot read — his
+    dispatch left the ticket unclaimed and a second dispatch was possible.
+    The descriptor must forward ``ticket`` and ``work_category`` as the
+    typed body fields the funnel stamps (context.ticket_note_id, the
+    precedence-law record), alongside slot's context translation."""
+    observed_bodies: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/jobs"
+        observed_bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "status": "created",
+                "config_name": "worker_base",
+            },
+        )
+
+    client = AsyncCockpitClient(
+        base_url="http://orchestrator.test",
+        transport=httpx.MockTransport(handler),
+    )
+    invoke = make_bound_handler(
+        get_descriptor("create_job"),
+        client_provider=lambda: client,
+        caller_provider=lambda: CallerCtx(kind="session", user_id="user-1"),
+    )
+    try:
+        await invoke(
+            description="verify the preserved UI candidate",
+            slot="test",
+            ticket="backlog-tester-final-runtime-acceptance",
+            work_category="tester",
+        )
+    finally:
+        await client.close()
+
+    (body,) = observed_bodies
+    assert body["ticket"] == "backlog-tester-final-runtime-acceptance"
+    assert body["work_category"] == "tester"
+    assert body["context"]["officer_slot"] == "test"
+
+
+@pytest.mark.asyncio
 async def test_assign_job_preserves_queued_output_without_claiming_an_agent() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/jobs/job-1/assign/agent-1"
