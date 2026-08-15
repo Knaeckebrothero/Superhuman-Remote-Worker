@@ -39,9 +39,11 @@ related:
 
 ## Status
 
-**PREREQUISITES COMPLETE (2026-08-14) — B1+ READY TO BUILD (2026-08-15).** Nothing in
-*this* document is implemented; everything it depends on is. The blocking item is no
-longer engineering: it is the six §13 defaults awaiting the Legate. See
+**CLEARED TO BUILD (2026-08-15).** Nothing in *this* document is implemented; everything
+it depends on is, and the six §13 defaults are now **decided** — there is no open
+question and no pending approval. Two of those decisions changed the design: the ready
+floor scales with pool capacity rather than being a constant, and there are **no
+per-ticket budget caps** (the officer is the brake; §3 records the residual gap). See
 [Implementation start-here](#implementation-start-here--the-as-built-substrate-2026-08-14)
 for the substrate as actually built, with anchors — that section exists so a cold session
 can begin B1 without re-deriving yesterday's landings.
@@ -92,10 +94,13 @@ Decisions locked in the design session (amendments from the research round in *i
   direction), `tester` (critique — issues with evidence), `executor` (converge — shipped
   artifacts under deliverable contract). Membership is many-to-many: a developer is a
   researcher when the ticket is a spike and an executor when it's a story.
-- **Floors apply to backlog health, not dispatch.** The officer must keep ≥N *ready* tickets
-  per pool; he must never manufacture tickets to keep slots busy. *A floor breach wakes the
-  officer (kanban order-point replenishment), and the digest reports the self-filed-ticket
-  ratio per pool so gaming is visible within a day* **[R-org][X]**.
+- **Floors apply to backlog health, not dispatch.** The officer must keep at least as many
+  *ready* tickets in a pool as that pool has slots (Legate, 2026-08-15: floor = pool
+  capacity, so a 1-slot pool needs ≥1 and a 10-slot pool needs ≥10 — if every agent lands
+  at once, each finds work waiting); he must never manufacture tickets to keep slots busy.
+  *A floor breach wakes the officer (kanban order-point replenishment), and the digest
+  reports the self-filed-ticket ratio per pool so gaming is visible within a day*
+  **[R-org][X]**.
 - **Liveness is a machine property.** A replica-safe tick fills free slots from the ready
   queue; the officer's wake cadence never gates dispatch. *Validated as the exact
   architecture Anthropic names as the fix for the synchronous-supervisor bottleneck; dumb
@@ -241,9 +246,17 @@ bigger discoveries become follow-up tickets, not scope creep.
   (visual-regression hygiene; unpinned captures flake on animations/fonts/dynamic content)
   **[R-org]**. UI executor tickets **must reference the researcher-produced style guide**
   they conform to — without that link, style drifts across executor runs exactly as
-  ChatDev's designer assets did **[R-fw]**. Tick-dispatched executor jobs carry a default
-  per-ticket budget/wall-clock cap (industry norm: Copilot's hard 59-minute session,
-  Devin's per-session ACU limits) via the existing budget-freeze machinery **[R-fw]**.
+  ChatDev's designer assets did **[R-fw]**. **No per-ticket budget or wall-clock cap**
+  (Legate, 2026-08-15): the industry norm is per-item caps (Copilot's hard 59-minute
+  session, Devin's per-session ACU limits **[R-fw]**), and this design deliberately
+  departs from it — *the officer is the brake*. Noticing and correcting a runaway job is
+  his job, and as of the supervision surface he can actually do it: `suspected_stuck`
+  liveness on the sitrep, audit/log reads, and steer/cancel. The residual gap, stated
+  plainly: a job burning tokens *fast but visibly active* trips no stall detector, so the
+  only mechanical backstop is the century spend ceiling (§5.1) — which is optional and
+  unset by default. A "this job has run > N hours" soft notification is a **separate,
+  deferred feature**, deliberately outside the officer/loop concept: it belongs to job
+  supervision generally, not to backlog pools.
 
 **Close-checklists** **[R-org]**: each category block ends with a short **binary**
 checklist the officer runs at ticket close — binary criteria yield the highest judge
@@ -344,13 +357,18 @@ Per commissioned officer with `auto_pull=true`:
 
 1. **Skip** if the officer is held — checked directly on the thread/officer row
    (`config_override.officer.hold`), not by bouncing off the funnel's 409 **[A1]** — or
-   decommissioned, or the century's **daily worker-spend ceiling** is exhausted: one
+   decommissioned, or an **optional** daily worker-spend ceiling is exhausted: one
    `usage_ledger.query_usage(scope_project_id=…)` call, the same query the officer card's
    `spend_today` makes; fail-open like the officer's own ceiling; exceeded → skip + digest
-   line **[A1][X]**. (Officer `daily_token_ceiling` bounds only his session turns; without
-   this, worker spend is bounded only by slot counts × time — the foraging pump is
-   doctrine-legitimate, so the brake must be mechanical.) A KB/pgvector outage → skip
-   cleanly this tick; infra failures never feed breakers **[X]**.
+   line **[A1][X]**. **Unset by default and never required** (Legate, 2026-08-15) — no
+   global default exists, because a MiniMax researcher pool and a sol executor pool differ
+   by more than an order of magnitude in burn, so any global number is either useless or a
+   footgun. Settable per century (`config_override.officer.worker_spend_ceiling_daily`)
+   and per slot (an optional `spend_ceiling_daily` on the slot spec — "per worker" in the
+   Legate's words; the slot already carries model and backend, so the cost knob belongs
+   beside them). With no ceiling set and no per-ticket caps (§3), the century has no
+   mechanical spend brake by design — the officer is the brake. A KB/pgvector outage →
+   skip cleanly this tick; infra failures never feed breakers **[X]**.
 2. **Compute free capacity** per pool. **[X]** The capacity and executor-serialization
    predicate must equal the claim predicate — **all non-terminal statuses** (`created`,
    `processing`, `waiting`, `paused`, `pending_review`) — not the funnel's
@@ -484,7 +502,8 @@ Example Resavio kit (cross-family rule visible: sol officer, MiniMax pools):
 officer:
   enabled: true
   auto_pull: true
-  worker_spend_ceiling_daily: 15.0   # per-century brake, §5.1
+  # worker_spend_ceiling_daily: 15.0   # OPTIONAL, unset by default (§5.1); a slot may
+  #                                    # carry its own spend_ceiling_daily instead
   slots:
     researchers: {count: 2, model: "MiniMax-M3",  backend: "sandbox", category: "researcher"}
     testers:     {count: 1, model: "MiniMax-M3",  backend: "sandbox", category: "tester"}
@@ -527,7 +546,9 @@ Charter posture text (officer-edited block, per centurion S7 split-write authori
   WIP limits exist to hold utilization *below* 100%. The draft's "idle slots are waste" is
   withdrawn — the congested resource is the officer's **review attention**, and §5.5's
   disposition gate is what protects it.) Your standing duty is the queue: every pool's
-  ready backlog holds ≥2 tickets.
+  ready backlog holds **at least as many tickets as that pool has slots** — a 2-slot line
+  needs 2 ready, a 10-slot pool needs 10. The floor scales with the troops you were given,
+  so a fuller pool demands a deeper queue rather than a busier officer.
 - **A floor breach wakes you** — event-driven replenishment (the kanban order-point
   pattern), not a passive card number **[R-org]**: the tick files an officer wake when a
   pool's ready depth crosses below its floor.
@@ -714,9 +735,12 @@ the tick.
   **[X]**; internal spawn path mirroring `_spawn_loop_job` (+ `provision_job_repo` +
   `_trigger_dispatch` + explicit grant check); autonomy-`full` stamp (loop-exemption
   precedent `main.py:16727`); non-terminal capacity/serialization predicate; executor
-  disposition gate; spend-ceiling check via `query_usage(scope_project_id=…)`; per-ticket
-  default budget caps by category; breaker in `officer_state` (job-failures-only,
-  per-pool); floor-breach officer wake; stale-claim detection; `run_when_leader` mount.
+  disposition gate; **optional** spend-ceiling check via
+  `query_usage(scope_project_id=…)` (century- and slot-level, skipped entirely when
+  unset — §13.3; **no per-ticket caps**, §13.4); breaker in `officer_state`
+  (job-failures-only, per-pool); capacity-scaled floor-breach officer wake (floor = the
+  pool's slot count, §13.2, debounced 6 h/pool); stale-claim detection at 4 h with a
+  24 h page for `pending_review` claims (§13.5); `run_when_leader` mount.
   Stale-claim classification reuses [[officer_supervision_surface]] E3's shared liveness
   result; the tick does not invent a second `updated_at` threshold.
   Observability: per-tick log line `officer=<id8> pool=<name> dispatched=<note>/<job8> |
@@ -750,8 +774,10 @@ blind) and run `assert-browser-stack` once on a live workspace.
 In order:
 
 1. PATCH the kit to the §6 roster + `auto_pull=true`; charter carries the Demo Definition.
-2. Officer triages the pool: categories + four-field briefs + `ready` on ≥2 tickets per
-   pool. Card shows per-pool utilization, ready depth, and policies.
+2. Officer triages the pool: categories + four-field briefs + `ready` on at least
+   slot-count tickets per pool (2 for the 2-slot researcher pool, 1 each for testers and
+   executors in the §6 kit). Card shows per-pool utilization, ready depth against the
+   capacity floor, and policies.
 3. Within one tick of a researcher slot being free, the top ready researcher ticket
    dispatches — verify `ticket_note_id`/`work_category`/`officer_slot` stamps, autonomy
    `full`, the category block in the kickoff message, and the per-tick log line.
@@ -788,30 +814,49 @@ In order:
     structurally gone, and the officer's digest reads like a staffed studio, not a test
     factory.
 
-## 13. Open questions (Legate)
+## 13. Decisions — all six settled (Legate, 2026-08-15)
 
-**These six are the only thing between here and B1.** Every engineering prerequisite
-landed 2026-08-14; each answer below parameterizes a specific slice, and each carries a
-recommendation that can simply be confirmed. B1/B2 can be built before they are answered
-(the category module and ticket plumbing take no numbers); B3 needs 1–5, B7 needs 6.
+Nothing here is open. **B1 is cleared to build.**
 
-1. `auto_pull` default at ship: **off, flipped per-century during acceptance** (rec) — or
-   on for every new commission?
-2. Ready-depth floor default 2 per pool (rec)? Floor-breach wake debounce (rec: once per
-   pool per 6h)?
-3. `worker_spend_ceiling_daily` default (rec: set per-century at commission, no global
-   default — cost profiles differ too much between MiniMax and sol pools).
-4. Per-ticket budget-cap defaults per category (rec: researcher < executor; derive the
-   concrete numbers at implementation from `usage_ledger.query_usage` over recent loop
-   jobs rather than guessing — the per-job cost history is already queryable).
-5. Stale-claim threshold T (rec: 4h) and whether `pending_review` claims page after 24h.
-6. `writer` expert in the first wave or after the first acceptance week?
+1. **`auto_pull` ships off**, flipped per century. The first century to get it is Resavio
+   during acceptance, under supervision — a century whose officer has not triaged a
+   backlog yet must not start pulling whatever happens to be tagged.
+2. **The ready floor is the pool's slot count, not a constant** — 1-slot pool ⇒ ≥1 ready,
+   10-slot pool ⇒ ≥10. The Legate's reasoning is the right one: if every agent in a pool
+   lands at once, each must find a ticket waiting. The floor therefore scales with the kit
+   and needs no separate tuning knob; floor-breach wakes stay debounced to once per pool
+   per 6 h. Note for B6: because a bigger pool now demands a deeper queue, the
+   self-filed-ticket ratio in the digest matters *more*, not less — the Goodhart pressure
+   scales with the floor.
+3. **No spend ceiling by default, never required.** Optional per century, and optionally
+   per slot ("per worker"). Unset means no mechanical spend brake — accepted deliberately
+   (§5.1).
+4. **No per-ticket budget or wall-clock caps at all** — a deliberate departure from the
+   industry norm, on the grounds that *having an officer is the reason the caps are not
+   needed*: managing workers, including runaway ones, is his job (§3 states the residual
+   gap honestly). A "job has run > N hours" soft notification was considered and ruled
+   **out of scope for this feature** — it is general job supervision, filed separately if
+   ever wanted.
+5. **Stale-claim threshold 4 h** (renders "claimed-but-stalled" on card + sitrep); a
+   `pending_review` claim **pages after 24 h** — that lane has a known dead zone, and a
+   silently stranded review is exactly the invisibility this feature exists to end.
+6. **`writer` expert ships later**, after the first acceptance week. B7 stays in the doc
+   as the recipe; the first week proves categories and the tick, not roster width.
 
-Resolved since the draft by the research round: breaker semantics (job-failures-only,
-per-pool — §5.6); category storage (tags + GIN `@>`, no column — §4); executor parallelism
-(singleton + named-write-surfaces `parallel-safe` — §5.5, evidence-backed, no longer open).
+Settled earlier by the research round: breaker semantics (job-failures-only, per-pool —
+§5.6); category storage (tags + GIN `@>`, no column — §4); executor parallelism (singleton
++ named-write-surfaces `parallel-safe` — §5.5).
 
 ## 14. Decision log
+
+- **2026-08-15 (Legate)** — all six §13 defaults settled; see §13. Two shaped the design:
+  the ready floor became **capacity-scaled** (pool slot count, so every simultaneously
+  free agent finds a ticket) rather than a flat 2, and **per-ticket budget/wall-clock caps
+  were rejected outright** — the officer's whole purpose is to notice and correct runaway
+  work, so hard caps would be redundant scaffolding; the long-running-job notification
+  that would soften that was explicitly scoped out as a separate feature. Spend ceilings
+  are optional at century and slot level, unset by default, which leaves a century with no
+  mechanical spend brake by design.
 
 - **2026-08-13** — Design session: categories researcher/tester/executor; category=work/
   expert=worker split; floors on backlog health not dispatch; auto-pull tick for machine
