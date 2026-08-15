@@ -6,7 +6,8 @@ splitting out the non-product pieces, and cleaning the history before the public
 **This file is transition scaffolding, not product documentation.** It gets deleted (or moved
 into `srw-cloud`) in Phase 6 before the announcement — see the last item.
 
-Status: drafted 2026-08-13. Nothing executed yet.
+Status: drafted 2026-08-13. **Phase 4 executed 2026-08-15** (see below); everything else
+still pending.
 
 ---
 
@@ -18,9 +19,9 @@ Recorded so they don't get relitigated mid-transition.
 
 | Repo | Visibility | Holds |
 |---|---|---|
-| `superhuman-remote-worker/<renamed>` | public, FSL-1.1-ALv2 | the product: `src/`, `orchestrator/`, `cockpit/`, `helm/`, `config/`, `docker/`, `tests/`, the installer (`configure.html` + `generator.mjs`), `values-local.yaml.example`, `values-tilt.yaml` |
+| `superhuman-remote-worker/<renamed>` | public, FSL-1.1-ALv2 | the product: `src/`, `orchestrator/`, `cockpit/`, `helm/`, `config/`, `docker/`, `tests/`, `values-local.yaml.example`, `values-tilt.yaml`. **The installer is NOT here** — see Phase 4; it moved to `srw-cloud` with the sales page. |
 | `HomeLab` (exists, private, self-hosted Gitea) | private | GitOps/deploy: `values-experimental.yaml`, `fleet.yaml`, alongside the existing `deployments_managed/srw-sales-page/` |
-| `srw-cloud` | private | SaaS layer: payments, multi-tenancy, tenant provisioning, entitlements — plus the sales page under `www/` |
+| `srw-cloud` | private | SaaS layer: payments, multi-tenancy, tenant provisioning, entitlements — plus the sales page **and the self-host installer** under `www/` |
 
 **Why not one monorepo.** A GitOps repo is read continuously by a cluster controller and
 reconciled on every commit; that is a different security and cadence domain from commercial
@@ -125,7 +126,8 @@ move them. Once the repo lives in the org, CI's `GITHUB_TOKEN` is scoped to an o
       - `docker-compose.yaml` (10)
       - `.github/workflows/develop.yml` (3)
       - `orchestrator/services/agent_provisioner.py` (2)
-      - `website/generator.mjs` — the `CHART` constant (customer-facing install command)
+      - the `CHART` constant in `www/generator.mjs` — **now in the `srw-cloud` repo**, so this
+        one is a cross-repo edit and will not show up in a grep of this tree
       - `deployment-vms/srw-vm-controller/fleet.yaml`, `helm-vm-cluster/templates/_helpers.tpl`,
         `docker/agent-vm-base/Dockerfile.containerDisk`, `vm/controller/controller.py`
       - tests asserting image refs: `test_vm_provisioner.py`, `test_vm_controller.py`,
@@ -158,26 +160,51 @@ paths, and the `srw.works` / `superhuman-remote-worker.com` domain split.
 
 ---
 
-## Phase 4 — Create `srw-cloud` and move the sales page
+## Phase 4 — Create `srw-cloud` and move the sales page — **DONE 2026-08-15**
 
-- [ ] Create the private `srw-cloud` repo in the org.
-- [ ] Move the sales page into `srw-cloud/www/`: `website/index.html`, `website/og-image.png`.
-- [ ] Split `docker/Dockerfile.website` — the sales-page build moves, anything serving the
-      installer stays.
-- [ ] Move the sales-page image build job out of `develop.yml` into `srw-cloud` CI; it needs its
-      own GHCR push credentials.
-- [ ] Update `HomeLab/deployments_managed/srw-sales-page/10-deployment.yaml` to the new image ref.
-- [ ] Move `[removed]/` (4 files: …
-      strategy) into `srw-cloud`.
+Executed, with one decision overruled: the installer moved too. The recorded plan below said
+"keep the installer public" and rename `website/` → `installer/`. That was rejected in favour of
+moving the whole marketing+installer surface, because both pages ship in ONE nginx image at one
+origin — splitting them across repos would have meant two images and a Traefik path rule to keep
+`/configure` under the apex domain.
 
-**Keep public:** `website/configure.html`, `website/generator.mjs`, `website/test/*`. This is the
-customer install wizard, not marketing — `generator.drift.test.mjs` is a CI hard-gate that renders
-generated values against the real `helm/` tree with kubeconform. It is source-coupled to the chart
-and is the best onboarding asset the public repo has.
+- [x] Create the private `srw-cloud` repo in the org.
+- [x] Move sales page AND installer into `srw-cloud/www/` — `index.html`, `og-image.png`,
+      `configure.html`, `generator.mjs`, `test/*`. Extracted with `git filter-repo`
+      (`--path-rename website/:www/`), 23 commits of history preserved.
+- [x] `docker/Dockerfile.website` moved whole to `srw-cloud/docker/Dockerfile.www`. No split
+      needed once both pages travelled together.
+- [x] Image build moved to srw-cloud's own `ci.yml`. New image
+      `ghcr.io/superhuman-remote-worker/srw-www` (a partial Phase 2 — an org repo's
+      `GITHUB_TOKEN` cannot push to the `knaeckebrothero` namespace).
+- [x] `HomeLab/deployments_managed/srw-sales-page/10-deployment.yaml` repointed; live and
+      verified (`/`, `/configure`, `/generator.mjs`, `/og-image.png` all 200).
+- [ ] Move `[removed]/` into `srw-cloud`. **Deferred** — folded into the wider `docs/`
+      decision in Phase 5, which is being handled separately.
 
-- [ ] Rename the surviving directory `website/` → `installer/` so it reads as product.
-- [ ] Update the drift-gate path references in `develop.yml` (lines ~814, ~854, ~878) and
-      `main.yml` (~154, ~182) after the rename.
+**The package is PRIVATE, and that cost more than expected.** A GitHub App with `packages:read`
+does not work: GHCR rejects App installation tokens (GitHub staff confirmation, community
+discussion #171423, still open July 2026); fine-grained PATs fail the same way. Only a classic
+PAT with `read:packages` works — `repo` scope is not needed. It is stored at
+`secret/homelab/srw-sales-page/ghcr-pull` and templated into a `dockerconfigjson` by
+`01-eso.yaml`. **That PAT expires and nothing warns you**; the symptom is `ImagePullBackOff` on a
+pod restart.
+
+**The chart↔installer contract survived the split**, in two halves:
+
+- *This repo:* `helm/ci/installer-{evaluation,production,production-vms}-values.yaml` — the
+  generator's verbatim output, rendered by the existing `chart-test` matrix in both workflows.
+  A chart change that breaks the installer now fails HERE, in the repo that caused it.
+- *srw-cloud:* the drift gate still renders generated values against the real chart, fetched
+  from this repo's `develop` by `scripts/fetch-chart.sh`, plus a weekly schedule.
+
+Neither half is sufficient alone: the fixtures cannot see a change to the generator, and the
+drift gate cannot see a chart change until it runs. Regenerate the fixtures from srw-cloud's
+`www/test/generator.drift.test.mjs` CASES whenever the generator changes.
+
+Note for Phase 6: the chart the installer targets is **stale**. Newest published is `0.0.23`
+(2026-06-08), which predates `helm/values.schema.json`; `main` is 2000+ commits behind `develop`.
+Until a fresh release is cut, the only chart a customer can install has no schema validation.
 
 ---
 
@@ -259,9 +286,11 @@ next `values-local.yaml` will not be full of `dev_` placeholders.
 - [ ] Add `gitleaks` as a pre-commit hook.
 - [ ] Confirm `SECURITY.md` has a working disclosure address.
 - [ ] Confirm `THIRD_PARTY_LICENSES.md` is current against `requirements.txt`.
-- [ ] Re-read `README.md` as a stranger: install path is the `installer/` wizard → `helm install`
-      from `oci://ghcr.io/superhuman-remote-worker/charts/...`, and it must actually work from a
-      cold clone.
+- [ ] Re-read `README.md` as a stranger. The install path is now the **hosted** wizard at
+      `https://superhuman-remote-worker.com/configure` → `helm install` from
+      `oci://ghcr.io/superhuman-remote-worker/charts/...`. There is no in-repo installer to point
+      at any more, and `README.md` currently links to neither — it must, and the published chart
+      must actually be installable (today's newest is the stale `0.0.23`).
 - [ ] Verify anonymous `helm pull` of the published chart succeeds with no credentials.
 
 ---

@@ -458,7 +458,6 @@ def test_all_release_dockerfiles_carry_standard_declared_oci_metadata():
         "docker/Dockerfile.cockpit",
         "docker/Dockerfile.mcp",
         "docker/Dockerfile.workspace",
-        "docker/Dockerfile.website",
         "vm/controller/Dockerfile",
         "docker/agent-vm-base/Dockerfile.containerDisk",
         "docker/agent-vm-base/Dockerfile.containerDisk-stage1",
@@ -512,9 +511,9 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
     )
 
     assert _count_full_revision(main, "SRW_SOURCE_REVISION") >= 6
-    assert _count_full_revision(develop, "SRW_SOURCE_REVISION") >= 7
+    assert _count_full_revision(develop, "SRW_SOURCE_REVISION") >= 6
     assert _count_full_revision(main, "org.opencontainers.image.revision") == 6
-    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 7
+    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 6
     for component in (
         "agent",
         "orchestrator",
@@ -525,7 +524,6 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
     ):
         assert f"io.srw.component={component}" in main
         assert f"io.srw.component={component}" in develop
-    assert "io.srw.component=website" in develop
     assert '--build-arg "SRW_SOURCE_REVISION=${GITHUB_SHA}"' in main
     assert '--build-arg "SRW_SOURCE_REVISION=${GITHUB_SHA}"' in develop
     assert "REF_FULL_SHA=$(git rev-parse HEAD)" in stage1
