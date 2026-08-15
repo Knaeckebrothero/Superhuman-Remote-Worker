@@ -77,6 +77,11 @@ The current grant catalog covers:
   skills, and automations. The writes are owner-scoped by the same endpoints the
   UI uses, and a new automation is created switched off; the grant exists because
   an enabled automation goes on to spawn jobs;
+- `complete_unmerged_pr` — approve or auto-complete a job whose delivered pull
+  request has not been merged. Without it, a job that opened a pull request stays
+  in review until that pull request lands: approval is refused, and a job that
+  would complete itself is routed to review instead. Merging the pull request is
+  the normal way past this, not the grant;
 - `model_selection` — restrict the selectable model set;
 - `autonomy_ceiling` — cap worker-job autonomy; and
 - `permission_mode` — cap persistent-session permission mode.
