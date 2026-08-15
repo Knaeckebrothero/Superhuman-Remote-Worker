@@ -816,6 +816,25 @@ the tick.
     the sitrep still gets its reading from `compute_jobs_liveness`.
   - **Not built:** the stale-claim list and breaker state are written to `officer_state`
     for B4/B6 to render; nothing surfaces them yet.
+  - **k3d verification (2026-08-15), and what it caught.** Migration 0160 applied and the
+    index proved out against real rows (double non-terminal claim refused; the same slug
+    in another project allowed; a terminal prior claim not blocking a re-arm). A
+    synthesized officer post — a thread row with `auto_pull` and a `researcher` pool, no
+    live agent, since the tick never talks to the officer's agent — then drove the whole
+    path end to end. Every stamp landed correctly on the created job
+    (`runner_kind=lifecycle`, owner set, `config_override.autonomy=full`, ticket claim,
+    category, slot, researcher contract in the kickoff), confirming the three
+    schema-caught fixes in the live system. **One design bug only the live run could
+    find:** the provisioning adapter passed `loop_floor=True` unconditionally, copied
+    from the loop — that flag raises unless the project's cloud baseline is provisioned,
+    so the first dispatch sealed itself with "project loop requires a provisioned cloud
+    folder". Executors deliver under `projects/<slug>/` and genuinely need the baseline;
+    a researcher's deliverable is a KB note and a tester's is issue tickets, so requiring
+    it for them would make research and critique undispatchable on any project without a
+    cloud folder — the infrastructure-shaped version of exactly the bias this feature
+    exists to remove. `loop_floor` is now executor-only. Re-arming the ticket afterwards
+    also confirmed one-shot claims live: while the failed job held the claim the tick
+    refused to re-dispatch ("claimed at …"), and a fresh `ready_at` released it.
 - **B4 — slots** (`category` in `_SPEC_KEYS`/validation landed with B3): precedence law
   in admit/kickoff;
   `capacity_lines(ready_by_category=…, oldest_claim_age=…)` + sitrep vector-db plumbing

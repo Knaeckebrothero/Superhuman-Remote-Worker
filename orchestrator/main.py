@@ -20304,23 +20304,34 @@ async def _enforce_officer_ticket_grants(
     )
 
 
-async def _provision_officer_ticket_repo(job_row: dict[str, Any]) -> None:
+async def _provision_officer_ticket_repo(
+    job_row: dict[str, Any], *, category: str | None = None
+) -> None:
     """Repo/cloud provisioning for one auto-pulled ticket job.
 
     The adapter the officer backlog tick injects, so that service never imports
-    main. ``loop_floor=True`` for the same reason the loop uses it: this job
-    runs unattended and produces files, so a missing isolated repo or an
-    incomplete project-cloud baseline must fail loudly rather than let the
-    worker write into a void.
+    main.
+
+    ``loop_floor`` is set for EXECUTORS ONLY, and the distinction is not a
+    detail: that flag raises unless the project's cloud baseline is fully
+    provisioned. Executors deliver files under ``projects/<slug>/`` and must
+    fail loudly rather than write into a void — but a researcher's deliverable
+    is a KB decision note and a tester's is issue tickets, neither of which
+    touches the project cloud folder at all. Requiring a cloud baseline for
+    them would make every research and critique ticket undispatchable on a
+    project that has no cloud folder yet, which is precisely the
+    infrastructure-shaped version of the bias this feature exists to remove.
+    Found live: the first k3d dispatch sealed itself on exactly this.
     """
     from services.job_provisioning import provision_job_repo
+    from services.work_categories import EXECUTOR
 
     await provision_job_repo(
         job_row=job_row,
         gitea_client=gitea_client,
         postgres_db=postgres_db,
         main_cloud_router=main_cloud_router,
-        loop_floor=True,
+        loop_floor=(category == EXECUTOR),
     )
 
 

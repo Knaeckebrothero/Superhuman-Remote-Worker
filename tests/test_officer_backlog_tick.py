@@ -554,10 +554,31 @@ class TestTickOfficer:
         assert seen["project_ids"] == [row["project_id"]]
 
     @pytest.mark.asyncio
+    async def test_provisioning_is_told_the_category(self):
+        # It decides loop_floor from this, and loop_floor demands a provisioned
+        # project cloud baseline. A researcher delivers a KB note and never
+        # touches the cloud folder — requiring one would make every research
+        # ticket undispatchable on a project that has no cloud folder yet.
+        # Found on the first live k3d dispatch, which sealed itself on exactly
+        # that: "project loop requires a provisioned cloud folder".
+        db = _db()
+        seen = {}
+
+        async def _provision(job, *, category=None):
+            seen["category"] = category
+
+        rows = [_row("feature-a", tags=["ready", "category:researcher"], ready_at=NOW)]
+        counts = await tick_officer(
+            db, _vector_db(rows), _officer_row(), now=NOW, provision_repo=_provision
+        )
+        assert counts["dispatched"] == 1
+        assert seen["category"] == RESEARCHER
+
+    @pytest.mark.asyncio
     async def test_a_failed_repo_provision_seals_the_job_and_does_not_count(self):
         db = _db()
 
-        async def _provision(_job):
+        async def _provision(_job, *, category=None):
             raise RuntimeError("gitea down")
 
         rows = [_row("feature-a", tags=["ready", "category:researcher"], ready_at=NOW)]
