@@ -305,7 +305,59 @@ with the design; everything found wrong was reachability.
   claim he made; precise digests; dependency-gated dispatch; honored
   every hold. gpt-5.6-sol as the brain is earning its keep.
 
-Remaining to observe (next session): tester completion → his judgment on
-the acceptance → executor release → the full chain closing. Plus the
-LF-3 deploy removing the operator-repair crutch, and decisions on
-LF-1/LF-2.
+## Addendum 19:00–19:30Z — the chain closed, unattended
+
+Written after the verdict above, and it supersedes the "remaining to
+observe" line: **the loop closed on its own while nobody was watching.**
+
+- **18:10** the researcher (`a9a468df`) completed. He judged it and
+  dispatched its *named consumer* ticket — the demo-agenda spike the
+  report itself nominated — as `05c18dc9`. Report → judgment → next
+  dispatch, no human in the path.
+- **19:14** the tester (`660a8eec`) completed NOT GREEN. Its four runtime
+  gates failed by absence: the candidate commit `0140f70` on branch
+  `job/4268052c` was not in its freshly provisioned per-job repo (LF-4,
+  now filed).
+- **19:16:42** he judged it, and did three distinct things right. He
+  **narrowed his own worker's overreach** (the report implied the UI did
+  not exist; the evidence only showed it was unreachable from that
+  workspace), superseded that note, closed the ticket on the honest
+  non-green result — then dispatched an executor,
+  `backlog-executor-publish-ui-candidate-0140f70-as-durable-verifier-input`,
+  to fix the *infrastructure cause*. He diagnosed LF-4 independently and
+  put work against it.
+- **19:16:51** — nine seconds later — the Legate's hold landed for the
+  change of command.
+- Both new tickets carried correct `category:` tags and armed `ready_at`
+  **unprompted**: he learned the machine-tag grammar from one correction
+  and applied it to work filed an hour later. Both dispatches again
+  lacked the claim (LF-3, unchanged until deploy) and were
+  operator-repaired.
+
+So the answer to "does the officer/loop unification work" is yes, on
+evidence stronger than the planned run would have produced: a worker's
+finding became a judgment became a new ticket became a dispatch, twice,
+including one aimed at a platform defect the officer found himself.
+
+## Coda — wrong century
+
+The whole run happened on **`68137e29` "Better Resavio (pre-split
+archive)"**. The live project has been `a572e4a0` since the 08-13 split;
+the two differ only by a parenthetical suffix, and the officer post,
+thread and pod were all bound to the archive from July. Nothing was lost —
+the artifacts are real and the product line is the same — but the century
+was garrisoned in a museum for the entire live-fire.
+
+Fixed the same evening: held → decommissioned with force (both in-flight
+workers left running deliberately; their completions land in the archive
+post's while-vacant ledger) → recommissioned on `a572e4a0` as thread
+`6ce5bc4c` with the identical kit and brain. One incarnation recorded on
+the archive post spanning 2026-07-29 → 2026-08-15, `harvested: true` — the
+first real exercise of the decommission path, and it held.
+
+Because KB binding is project-scoped, his findings could not follow him;
+the ranked demo workflows, the seven acceptance criteria, the open
+stakeholder questions and the LF-4 warning were carried across by hand in
+his first directive. **The class of mistake is now guarded in code**:
+`list_projects` hides archived projects by default and `get_project`
+leads with a warning naming what not to do to an archive (`5c0416b3`).
