@@ -35081,6 +35081,11 @@ def _while_vacant_view(state: Any) -> dict[str, Any]:
 # filing AND immediately at the watchdog (it re-reads the thread row per
 # tick); max_actions/brain are baked into config.officer at attach, so the
 # only honest label is the next respawn.
+# The bundled expert that defines an officer's job surface
+# (config/experts/centurion/). Commission must name it explicitly: the create
+# request's default is ``session_base``, which grants no job_control plane.
+OFFICER_CONFIG_NAME = "centurion"
+
 _OFFICER_POST_EFFECTS: dict[str, str] = {
     "slots": "next dispatch",
     "max_concurrent_workers": "next dispatch",
@@ -35575,6 +35580,19 @@ async def commission_project_officer(
     create_request = ThreadCreateRequest(
         project_id=project_id,
         title=f"Centurion — {project.get('name') or project_id[:8]}",
+        # The expert IS the officer's job surface. Without this the request
+        # falls to ThreadCreateRequest's ``session_base`` default, and a
+        # commissioned officer boots with research/citation tools and NO
+        # job_control plane — he cannot dispatch, steer, approve or read
+        # evidence, which is the whole of his charge. Found live on the
+        # Resavio change of command (2026-08-15): the endpoint-commissioned
+        # officer had 34 tools and not one could create a job, while the
+        # July officer — provisioned by hand with config_name=centurion —
+        # had the full 49. ``centurion`` also carries workspace.backend=none
+        # (klug-und-faul enforced structurally) and the reviewed nine-tool
+        # kb grant; ``officer.enabled`` stays false there and is flipped by
+        # the thread override above, which is the documented split.
+        config_name=OFFICER_CONFIG_NAME,
         config_override=create_override,
         model=row_llm.get("model"),
         reasoning_level=row_llm.get("reasoning_level"),
