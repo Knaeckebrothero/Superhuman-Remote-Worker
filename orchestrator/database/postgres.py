@@ -22534,6 +22534,43 @@ class PostgresDB:
             logger.exception("public_datasources grant read failed; denying publish")
             return False
 
+    async def user_can_complete_unmerged_pr(
+        self, user: dict, project_id: str | None
+    ) -> bool:
+        """Effective complete_unmerged_pr grant (seal a job whose PR is open).
+
+        Admins short-circuit to True — an operator who accepts the risk is the
+        reason the bypass exists, not a hole in it. Mirrors
+        user_can_publish_datasource: no legacy-column fallback (new capability,
+        deny-by-default) and the fail mode is CLOSED, because a capability whose
+        read failed is not a capability the caller has.
+
+        Unlike its siblings this one passes the job's ``project_id`` through, so
+        a project-scope grant resolves. Dropping it would silently reduce the
+        key to a user-only capability and lose the axis the design chose grants
+        for. Spec: docs/features/merged_pr_completion_grant.md.
+        """
+        if user.get("is_admin"):
+            return True
+        try:
+            scoped = await self.list_grants_for_scopes(
+                user_id=str(user["id"]),
+                project_ids=[str(project_id)] if project_id else [],
+            )
+            from src.core.capability_grants import resolve_grants
+
+            g = resolve_grants(
+                user_rows=scoped["user"],
+                project_rows=scoped["project"],
+                global_rows=scoped["global"],
+            )
+            return bool(g.get("complete_unmerged_pr"))
+        except Exception:
+            logger.exception(
+                "complete_unmerged_pr grant read failed; denying completion"
+            )
+            return False
+
     async def user_can_autonomous_send(self, user: dict) -> bool:
         """Effective email_autonomous_send grant (unattended email send).
 

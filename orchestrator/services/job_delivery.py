@@ -9,6 +9,7 @@ from src.services.forge import (
     SUPPORTED_FORGES,
     ForgeError,
     ForgeRepo,
+    get_pull_request_status,
     parse_owner_repo,
     resolve_api_base,
 )
@@ -139,6 +140,47 @@ def forge_repo_from_datasource(datasource: dict[str, Any]) -> ForgeRepo:
         repo=repo,
         token=str(credentials.get("token") or ""),
     )
+
+
+async def unmerged_pr_block_reason(
+    job: dict[str, Any], *, datasources: list[dict[str, Any]]
+) -> str | None:
+    """Why this job may not be sealed yet, or ``None`` if nothing blocks it.
+
+    Returns ``None`` in exactly two cases: the job never recorded a pull
+    request, or the recorded one is merged. Everything else is a reason string
+    naming the live state, safe to show a non-technical reviewer.
+
+    **Fail closed.** A state that cannot be read is not a merged state, so an
+    unreachable forge or a detached connector blocks. The deliverable gate's
+    fail-open precedents do not apply: those exist so a worker is never blocked
+    by infrastructure it cannot fix, whereas every caller here either has a
+    human present or is routing the job to one.
+
+    Spec: docs/features/merged_pr_completion_grant.md §4.
+    """
+    pull_request = parse_job_pull_request(job.get("context"))
+    if pull_request is None:
+        return None
+
+    label = f"pull request #{pull_request.number} ({pull_request.repo})"
+    datasource = find_pull_request_repository(pull_request, datasources)
+    if datasource is None:
+        return (
+            f"{label} cannot be checked: its repository connector is no longer "
+            "attached to this job"
+        )
+
+    try:
+        target = forge_repo_from_datasource(datasource)
+        status = await get_pull_request_status(target, pull_request.number)
+    except ForgeError as exc:
+        return f"{label} state could not be read from the forge: {exc}"
+
+    state = str((status or {}).get("state") or "").strip().lower()
+    if state == "merged":
+        return None
+    return f"{label} is {state or 'in an unknown state'}, not merged"
 
 
 def apply_review_delivery_branch(

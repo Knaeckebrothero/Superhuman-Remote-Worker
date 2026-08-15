@@ -59,6 +59,17 @@ CATALOG: dict[str, dict[str, Any]] = {
     # creates jobs on a schedule, so this grant bounds token spend as much as
     # permissions. Spec: docs/features/agent_authored_catalog_entries.md
     "catalog_authoring": {"type": "bool", "default": False, "restrict_only": True},
+    # Sealing a job whose delivered pull request is not merged. A job whose
+    # deliverable is a PR is done when that PR lands, not when the branch is
+    # pushed; without this gate a reviewer marks work complete on the strength
+    # of a green job screen. Permission polarity — the grant LIFTS the block, so
+    # default False means "the gate applies". Read directly at the enforcement
+    # points via user_can_complete_unmerged_pr, never through evaluate(): there
+    # is no config fragment involved, only live forge state. Deny-by-default and
+    # NOT backfilled — the gate can only fire on a job carrying a recorded
+    # context.pull_request, and none existed when the key was introduced.
+    # Spec: docs/features/merged_pr_completion_grant.md
+    "complete_unmerged_pr": {"type": "bool", "default": False, "restrict_only": True},
     "datasource_tools": {"type": "bool", "default": True, "restrict_only": True},
     "browser": {"type": "bool", "default": True, "restrict_only": True},
     "model_selection": {"type": "list", "default": None, "restrict_only": True},

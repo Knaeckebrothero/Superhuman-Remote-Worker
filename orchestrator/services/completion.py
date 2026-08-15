@@ -910,6 +910,36 @@ def job_has_file_contract(job: dict[str, Any]) -> bool:
     return bool(contracted_file_deliverables(job))
 
 
+def unmerged_pr_seal_status(
+    new_status: str, *, loop_id: Any, reason: str | None
+) -> tuple[str, str | None]:
+    """Pure gate: should a self-sealing completion be routed to human review?
+
+    Returns ``(status, action)``, where ``action`` is ``None`` when nothing
+    changed. The I/O that produces ``reason`` lives in
+    ``main._unmerged_pr_gate_reason``; this is only the decision, mirroring the
+    cloud-diff downgrade it sits beside.
+
+    Exclusions, in order:
+
+    * anything but a successful ``completed`` — a job already heading for review
+      or failure is not sealing itself, so there is nothing to downgrade;
+    * no reason — the pull request is merged, absent, or the caller holds
+      ``complete_unmerged_pr``;
+    * **loop jobs** — the loop owns its own delivery and advance, and a loop
+      parked in ``pending_review`` produces nothing while nobody is watching to
+      unstick it. The cloud-diff downgrade excludes them for the same reason
+      (``not _completion_loop_id``).
+
+    Spec: docs/features/merged_pr_completion_grant.md §5b.
+    """
+    if new_status != "completed" or reason is None:
+        return new_status, None
+    if loop_id:
+        return new_status, None
+    return "pending_review", f"unmerged pull request -> pending_review ({reason})"
+
+
 def should_merge_job_contribution(
     job: dict[str, Any], new_status: str
 ) -> tuple[bool, str]:
