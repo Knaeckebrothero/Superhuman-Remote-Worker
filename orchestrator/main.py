@@ -9206,9 +9206,45 @@ class JobCreate(BaseModel):
             "(or 'kb:<slug>' knowledge-note slugs) that must exist on the job "
             "branch before a completion claiming success may seal. Stored in "
             "context.required_deliverables; rendered into the worker's task "
-            "brief; enforced by services/deliverable_gate.py at /complete."
+            "brief; enforced by services/deliverable_gate.py at /complete. "
+            "Paths inside a cloned repository datasource (repos/<name>/...) "
+            "are refused — see the validator below."
         ),
     )
+
+    @field_validator("required_deliverables")
+    @classmethod
+    def _refuse_cloned_repo_deliverables(
+        cls, value: list[str] | None
+    ) -> list[str] | None:
+        """Refuse a contract the platform guarantees cannot be satisfied.
+
+        Cloned repository datasources live at ``repos/<name>/`` and are
+        gitignored at seed time on purpose, so the gate — which reads the
+        job's committed tree — can never see them. Accepting such a manifest
+        means the job runs to completion and only then discovers the contract
+        was unsatisfiable, having burned its bounces; job 29c28492 escaped
+        only by moving the nested .git aside and un-ignoring the paths by
+        hand. Refusing at creation costs one 422 instead.
+
+        docs/issues/deliverable_gate_cannot_see_cloned_repo_deliverables.md
+        """
+        if not value:
+            return value
+        from services.deliverable_gate import cloned_repo_deliverables
+
+        offenders = cloned_repo_deliverables(value)
+        if offenders:
+            raise ValueError(
+                "these deliverables are inside a cloned repository datasource "
+                f"and are never versioned, so they can never be verified: "
+                f"{', '.join(offenders)}. Work delivered to an external "
+                "repository is contracted as the pull request the agent "
+                "opens, not as files in this job's tree; declare the job's "
+                "own artifacts (e.g. output/...) instead."
+            )
+        return value
+
     datasource_ids: list[str] | None = Field(
         None, description="Connector IDs to attach to the job"
     )

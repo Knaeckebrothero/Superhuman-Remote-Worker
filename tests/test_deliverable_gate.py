@@ -32,8 +32,10 @@ if str(project_root) not in sys.path:
 
 from orchestrator.services.deliverable_gate import (  # noqa: E402
     DELIVERABLE_GATE_BOUNCE_CAP,
+    cloned_repo_deliverables,
     evaluate_deliverable_gate,
     gate_applies,
+    is_cloned_repo_deliverable,
     normalize_deliverable_path,
     parse_required_deliverables,
     run_deliverable_gate,
@@ -674,3 +676,176 @@ class TestCreatePlumbing:
             "output/a.md",
             "kb:note",
         ]
+
+
+# =============================================================================
+# Cloned repository datasources (docs/issues/
+# deliverable_gate_cannot_see_cloned_repo_deliverables.md)
+# =============================================================================
+
+
+class TestClonedRepoPredicate:
+    """``repos/<name>/`` is a working tree the platform refuses to version.
+
+    Three seed sites write ``repos/`` into .gitignore on purpose
+    (src/core/workspace.py, src/core/datasource_setup.py,
+    src/tools/orchestrator/repositories.py — "working-tree only; never
+    versioned", guarding the contentless-gitlink bug b1758f38). A gate that
+    reads the versioned tree can therefore never see anything under it.
+    """
+
+    def test_a_path_inside_a_cloned_repo_is_recognised(self) -> None:
+        assert (
+            is_cloned_repo_deliverable("repos/KurortEngine/docs/design/theme.md")
+            is True
+        )
+
+    def test_the_singular_prefix_is_a_different_thing(self) -> None:
+        """One character apart, opposite meanings.
+
+        ``repo/`` is the job's OWN tree and is normalized away by F14;
+        ``repos/`` is somebody else's repository, mounted and unversioned.
+        """
+        assert is_cloned_repo_deliverable("repo/output/x.md") is False
+        assert is_cloned_repo_deliverable("output/x.md") is False
+
+    def test_a_bare_directory_is_not_a_deliverable(self) -> None:
+        assert is_cloned_repo_deliverable("repos") is False
+        assert is_cloned_repo_deliverable("repos/") is False
+
+    def test_kb_entries_are_untouched(self) -> None:
+        assert is_cloned_repo_deliverable("kb:some-note-slug") is False
+
+    def test_manifest_collection(self) -> None:
+        assert cloned_repo_deliverables(
+            ["output/a.md", "repos/K/docs/b.md", "kb:c", "repos/K/e.html"]
+        ) == ["repos/K/docs/b.md", "repos/K/e.html"]
+
+
+class TestGateDoesNotBounceOnClonedRepoPaths:
+    @pytest.mark.asyncio
+    async def test_unverifiable_is_not_missing(self):
+        """The false negative that made an agent defeat .gitignore."""
+        job = make_job(manifest=["repos/KurortEngine/docs/design/theme.md"])
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea([])
+        )
+        assert report["missing"] == []
+        assert report["unverified"] == ["repos/KurortEngine/docs/design/theme.md"]
+        assert report["passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_fail_open_is_per_entry_not_a_blanket_amnesty(self):
+        job = make_job(manifest=["repos/K/docs/a.md", "output/b.md"])
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea([])
+        )
+        assert report["missing"] == ["output/b.md"]
+        assert report["unverified"] == ["repos/K/docs/a.md"]
+        assert report["passed"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_path_actually_in_the_tree_is_present_not_unverified(self):
+        """Truthfulness: only fail open when the gate genuinely cannot see it.
+
+        Job 29c28492 forced exactly these paths into the tree by hand. Having
+        done so, the honest report is 'present'.
+        """
+        job = make_job(manifest=["repos/K/docs/a.md"])
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea(["repos/K/docs/a.md"])
+        )
+        assert report["present"] == ["repos/K/docs/a.md"]
+        assert report["unverified"] == []
+        assert report["passed"] is True
+
+
+class TestCreationRefusesClonedRepoManifests:
+    """Fix half (1): refuse the path where it is cheap, not at seal.
+
+    A deliverable contract is a claim about the job's OWN output. For work
+    delivered to an external repository the honest deliverable is the pull
+    request, which the orchestrator persists itself. Letting a
+    ``repos/...`` entry through means the job runs to completion and only
+    then discovers the contract was unsatisfiable.
+    """
+
+    def test_a_cloned_repo_deliverable_is_rejected(self) -> None:
+        import main as orchestrator_main
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError) as exc:
+            orchestrator_main.JobCreate(
+                description="ship it",
+                required_deliverables=["repos/KurortEngine/docs/design/theme.md"],
+            )
+        message = str(exc.value)
+        assert "repos/KurortEngine/docs/design/theme.md" in message
+
+    def test_the_refusal_names_the_reason_and_the_alternative(self) -> None:
+        """A 422 that does not say WHY just moves the confusion."""
+        import main as orchestrator_main
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError) as exc:
+            orchestrator_main.JobCreate(
+                description="ship it",
+                required_deliverables=["repos/K/a.md"],
+            )
+        message = str(exc.value).lower()
+        assert "never versioned" in message or "not versioned" in message
+        assert "pull request" in message
+
+    def test_ordinary_and_kb_deliverables_still_pass(self) -> None:
+        import main as orchestrator_main
+
+        body = orchestrator_main.JobCreate(
+            description="ship it",
+            required_deliverables=["output/a.md", "repo/output/b.md", "kb:note"],
+        )
+        assert body.required_deliverables == [
+            "output/a.md",
+            "repo/output/b.md",
+            "kb:note",
+        ]
+
+
+class TestFailOpenIsReportedAccurately:
+    """A fail-open the operator cannot read is a silent pass.
+
+    The pass-path action line predated cloned-repo entries and called every
+    unverified entry a ``kb`` entry. Saying "kb" about a repos/ path tells
+    the reader the gate did something it did not do.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cloned_repo_failopen_is_not_described_as_kb(self):
+        job = make_job(manifest=["repos/K/docs/a.md"], repo_name="job-aaaaaaaa")
+        db = make_db()
+        _status, actions, _bounced = await run_deliverable_gate(
+            job,
+            completion_result(),
+            "completed",
+            db=db,
+            gitea=make_gitea([]),
+            queue_resume=AsyncMock(),
+        )
+        line = " ".join(actions).lower()
+        assert "passed" in line
+        assert "kb" not in line
+        assert "unverifiable" in line
+
+    @pytest.mark.asyncio
+    async def test_the_stamp_names_the_unverified_paths(self):
+        """The human needs the paths, not just a count."""
+        job = make_job(manifest=["repos/K/docs/a.md"], repo_name="job-aaaaaaaa")
+        db = make_db()
+        await run_deliverable_gate(
+            job,
+            completion_result(),
+            "completed",
+            db=db,
+            gitea=make_gitea([]),
+            queue_resume=AsyncMock(),
+        )
+        assert stamped(db)["unverified"] == ["repos/K/docs/a.md"]
