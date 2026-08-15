@@ -432,9 +432,7 @@ async def reply_to_job_message(
         return _OFFICER_IDENTITY_ERROR
     try:
         resolved = await resolve_job_id(client, caller, job_id)
-        result = await client.officer_reply_to_job_message(
-            resolved, thread_id, message
-        )
+        result = await client.officer_reply_to_job_message(resolved, thread_id, message)
         return (
             f"Reply delivered to worker thread {thread_id} of job "
             f"{short_id(resolved)} (strategy: "

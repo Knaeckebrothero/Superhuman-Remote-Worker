@@ -218,9 +218,7 @@ def make_bound_handler(
                 "post to a single project."
             )
         if caller.kind == "officer":
-            refreshed, reason = await client.ensure_runtime_actor(
-                caller.runtime_actor
-            )
+            refreshed, reason = await client.ensure_runtime_actor(caller.runtime_actor)
             if not refreshed:
                 return f"Officer runtime authorization failed: {reason}"
         scope = caller.scope_header if caller.kind in ("mcp", "officer") else None

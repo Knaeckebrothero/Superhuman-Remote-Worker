@@ -23,20 +23,16 @@ RUNTIME_ACTOR_BOOTSTRAP_HEADER: Final = "X-SRW-Runtime-Actor-Bootstrap"
 # use their authenticated human role through this same table.  ``editor`` is
 # intentionally denied until the Legate explicitly chooses otherwise; changing
 # that policy is one edit here, not a search across write paths.
-SENSITIVE_KNOWLEDGE_HUMAN_ROLE_POLICY: Final[Mapping[str, bool]] = (
-    MappingProxyType(
-        {
-            "admin": True,
-            "owner": True,
-            "editor": False,
-            "viewer": False,
-        }
-    )
+SENSITIVE_KNOWLEDGE_HUMAN_ROLE_POLICY: Final[Mapping[str, bool]] = MappingProxyType(
+    {
+        "admin": True,
+        "owner": True,
+        "editor": False,
+        "viewer": False,
+    }
 )
 
-RUNTIME_ACTOR_KINDS: Final = frozenset(
-    {"worker", "human", "conference", "officer"}
-)
+RUNTIME_ACTOR_KINDS: Final = frozenset({"worker", "human", "conference", "officer"})
 PROJECT_ROLES: Final = frozenset({"admin", "owner", "editor", "viewer"})
 
 
@@ -81,7 +77,9 @@ class RuntimeActorContext:
         if self.caller_kind not in RUNTIME_ACTOR_KINDS:
             raise ValueError(f"invalid runtime actor kind: {self.caller_kind!r}")
         if self.project_role is not None and self.project_role not in PROJECT_ROLES:
-            raise ValueError(f"invalid runtime actor project role: {self.project_role!r}")
+            raise ValueError(
+                f"invalid runtime actor project role: {self.project_role!r}"
+            )
         if self.officer_incarnation is not None:
             self.officer_incarnation = int(self.officer_incarnation)
             if self.officer_incarnation < 0:

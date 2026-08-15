@@ -185,9 +185,7 @@ def _request_runtime_actor_authorization(
             ):
                 refreshed = client.post(
                     f"{base_url}/api/runtime-actors/refresh",
-                    headers={
-                        RUNTIME_ACTOR_REFRESH_HEADER: actor.refresh_credential
-                    },
+                    headers={RUNTIME_ACTOR_REFRESH_HEADER: actor.refresh_credential},
                 )
                 if refreshed.status_code != 200:
                     return _authorization_result_from_response(
@@ -288,12 +286,8 @@ def _machine_tag_mutation_requested(
     """Whether the request would grant or withdraw an officer-only tag."""
 
     if replace is not None:
-        current = {
-            tag for tag in normalize_tags(existing) if is_officer_only_tag(tag)
-        }
-        requested = {
-            tag for tag in normalize_tags(replace) if is_officer_only_tag(tag)
-        }
+        current = {tag for tag in normalize_tags(existing) if is_officer_only_tag(tag)}
+        requested = {tag for tag in normalize_tags(replace) if is_officer_only_tag(tag)}
         return current != requested
     return any(
         is_officer_only_tag(tag)
