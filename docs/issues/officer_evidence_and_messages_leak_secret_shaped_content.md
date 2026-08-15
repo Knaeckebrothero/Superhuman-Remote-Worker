@@ -5,7 +5,7 @@ tags:
   - security
   - evidence
   - communication
-status: open
+status: resolved
 priority: P0
 created: 2026-08-15
 aliases:
@@ -19,7 +19,15 @@ related:
 
 # Officer evidence and routed messages leak secret-shaped worker content
 
-**Status:** OPEN SECURITY BLOCKER. Audit finding **OC-05**.
+**Status:** RESOLVED (partial coverage) 2026-08-15. Audit finding **OC-05**.
+
+`src/shared/content_redaction.py` is the shared presentation-boundary sanitizer:
+known runtime values plus anchored secret shapes, reporting a count so a surface
+can say content was withheld rather than silently shortening it. Wired into
+evidence reads (`redacted: true` + count on the page) and routed message
+subjects/bodies. **Still owed:** completion reports, officer inbox/SITREP
+excerpts and outbound notification bodies read from the same sanitizer but are
+not yet wired — do that before relying on evidence triage at volume.
 
 ## Problem
 

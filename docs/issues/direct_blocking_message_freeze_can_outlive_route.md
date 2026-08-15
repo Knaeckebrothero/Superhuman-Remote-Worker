@@ -5,7 +5,7 @@ tags:
   - communication
   - jobs
   - liveness
-status: open
+status: resolved
 priority: P0
 created: 2026-08-15
 aliases:
@@ -19,7 +19,19 @@ related:
 
 # A direct blocking message can freeze a job before its recovery route exists
 
-**Status:** OPEN — blocks unattended `auto_pull`. Audit finding **OC-01**.
+**Status:** RESOLVED 2026-08-15. Audit finding **OC-01**.
+
+Direct blocking sends now go through `create_routed_blocking_freeze` — the same
+transactional unit the officer path used — so the message, the route and the
+`waiting_for_reply` flip commit together on one route generation, with external
+delivery after commit. A lost guard writes nothing and leaves the job runnable.
+Two contracts changed deliberately: the officer→user fallback retries the same
+unit minus the wake (an officer-specific failure still reaches the user; a real
+database failure refuses rather than degrading to the unsafe write), and the
+stateless exact-worker fence moved from inline endpoint SQL into the helper.
+Kill-point acceptance is in `tests/test_officer_message_routing_real_postgres.py`
+— commit-or-neither, no orphan route or message on a lost guard, and the
+invariant query for a freeze whose `route_id` has no row.
 
 ## Problem
 
