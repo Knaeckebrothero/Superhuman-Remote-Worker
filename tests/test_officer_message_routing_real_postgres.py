@@ -604,3 +604,122 @@ async def test_an_unrouted_freeze_keeps_the_status_only_cas(db):
     assert await db.queue_job_for_resume(
         seed["job_id"], {}, expected_status="waiting_for_reply"
     )
+
+
+# =============================================================================
+# OC-01 — a direct blocking freeze can never outlive its route
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_direct_freeze_and_route_commit_or_neither_does(db):
+    """The kill-point property, stated as an invariant.
+
+    Before this, user_direct froze the job and then created its route as
+    best-effort bookkeeping. A crash in between left waiting_for_reply with no
+    route — and the timeout reconciler claims ROUTES, so nothing would ever
+    find it. The job waited forever, holding its backlog ticket claim and pool
+    capacity with it.
+    """
+    seed = await _seed(db)
+    route = _route_dict(seed)
+    route["state"] = "user_direct"
+    route["officer_thread_id"] = None
+    route["officer_deadline"] = None
+
+    created = await db.create_routed_blocking_freeze(
+        seed["job_id"],
+        _freeze(route),
+        route=route,
+        message_entry=_MESSAGE_ENTRY,
+        wake=None,
+        expected_lane="pinned",
+    )
+    assert created is not None
+
+    async with db.acquire() as conn:
+        job = await conn.fetchrow(
+            "SELECT status, freeze_data FROM jobs WHERE id=$1::uuid", seed["job_id"]
+        )
+        stored = await conn.fetchrow(
+            "SELECT state, blocking, total_deadline FROM job_message_routes "
+            "WHERE route_id=$1::uuid",
+            route["route_id"],
+        )
+    assert job["status"] == "waiting_for_reply"
+    assert stored is not None, "a freeze without its route is the OC-01 defect"
+    assert stored["state"] == "user_direct" and stored["blocking"] is True
+    assert stored["total_deadline"] is not None, "no deadline = unrecoverable"
+    assert json.loads(job["freeze_data"])["route_id"] == str(route["route_id"])
+
+
+@pytest.mark.asyncio
+async def test_a_lost_guard_leaves_the_job_runnable_and_writes_no_route(db):
+    """The other half: if the unit cannot commit, NOTHING is written.
+
+    There is deliberately no compensating 'unfreeze' — the only safe direction
+    is to refuse, leaving the job dispatchable.
+    """
+    seed = await _seed(db)
+    async with db.acquire() as conn:
+        # Not freezable: the guard the helper checks under the row lock.
+        await conn.execute(
+            "UPDATE jobs SET status='completed' WHERE id=$1::uuid", seed["job_id"]
+        )
+    route = _route_dict(seed)
+    route["state"] = "user_direct"
+
+    created = await db.create_routed_blocking_freeze(
+        seed["job_id"],
+        _freeze(route),
+        route=route,
+        message_entry=_MESSAGE_ENTRY,
+        wake=None,
+        expected_lane="pinned",
+    )
+    assert created is None
+
+    async with db.acquire() as conn:
+        job = await conn.fetchrow(
+            "SELECT status FROM jobs WHERE id=$1::uuid", seed["job_id"]
+        )
+        orphan = await conn.fetchval(
+            "SELECT COUNT(*) FROM job_message_routes WHERE route_id=$1::uuid",
+            route["route_id"],
+        )
+        stray_message = await conn.fetchval(
+            "SELECT COUNT(*) FROM message_log WHERE thread_id=$1",
+            route["thread_id"],
+        )
+    assert job["status"] == "completed"
+    assert orphan == 0
+    assert stray_message == 0, "a rolled-back unit must leave no message either"
+
+
+@pytest.mark.asyncio
+async def test_no_blocking_freeze_exists_without_a_route_row(db):
+    """The repair/invariant query OC-01 asks for: any waiting_for_reply job
+    whose freeze names a route_id that has no route row is corruption."""
+    seed = await _seed(db)
+    route = _route_dict(seed)
+    route["state"] = "user_direct"
+    assert await db.create_routed_blocking_freeze(
+        seed["job_id"],
+        _freeze(route),
+        route=route,
+        message_entry=_MESSAGE_ENTRY,
+        wake=None,
+        expected_lane="pinned",
+    )
+    async with db.acquire() as conn:
+        orphans = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM jobs j
+             WHERE j.status = 'waiting_for_reply'
+               AND j.freeze_data ? 'route_id'
+               AND NOT EXISTS (
+                     SELECT 1 FROM job_message_routes r
+                      WHERE r.route_id = (j.freeze_data->>'route_id')::uuid)
+            """
+        )
+    assert orphans == 0

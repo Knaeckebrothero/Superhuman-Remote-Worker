@@ -14503,20 +14503,84 @@ async def send_agent_message(
                 "route_id": route_id,
                 "routing": "user_direct",
             }
-            if COMPLETION_COMMANDS_ENABLED:
-                lane = str(job.get("execution_lane") or "pinned")
-                published = await postgres_db.publish_blocking_message(
-                    job_id,
-                    freeze_data,
-                    expected_lane=lane,
-                    lease_token=request.lease_token,
-                    agent_id=request.agent_id,
+            # ONE transaction: the logical message, the route, and the job's
+            # waiting_for_reply flip on the same route generation (audit
+            # OC-01). This used to be a freeze followed by best-effort route
+            # bookkeeping, so a crash between them left a job waiting forever
+            # with nothing for the total-timeout reconciler to claim —
+            # and user_direct is the DEFAULT policy, so that was the common
+            # path. Under backlog pools such a job also held its one-shot
+            # ticket claim and pool capacity indefinitely.
+            #
+            # External delivery happens AFTER this commits. If the commit
+            # fails, nothing is written and the job stays runnable; there is
+            # no compensating "unfreeze" to get wrong.
+            from services import message_routing as _routing_svc
+
+            _snapshot = (
+                _routing_svc.snapshot_for_route(
+                    routing,
+                    applied="user_direct",
+                    reason=applied_reason,
+                    purpose=purpose,
                 )
-                if not published:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Job changed before blocking message was committed",
+                if routing
+                else {
+                    "worker_messages": "user_direct",
+                    "applied": "user_direct",
+                    "reason": applied_reason,
+                    "resolved_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            _deadlines = _routing_svc.route_deadlines(
+                blocking=True,
+                state="user_direct",
+                officer_response_minutes=0,
+                timeout_hours=_routing_svc.blocking_timeout_hours(job),
+            )
+            _direct_route = {
+                "route_id": route_id,
+                "job_id": job_id,
+                "project_id": (
+                    str(job["project_id"]) if job.get("project_id") else None
+                ),
+                "thread_id": thread_id,
+                "policy_snapshot": _snapshot,
+                "state": "user_direct",
+                "blocking": True,
+                "total_deadline": _deadlines["total_deadline"],
+                "transitions": [
+                    _routing_svc.build_transition(
+                        None,
+                        "user_direct",
+                        actor_kind="system",
+                        actor_id="send",
+                        note=f"created (user_direct: {applied_reason})",
                     )
+                ],
+            }
+            direct_committed = await postgres_db.create_routed_blocking_freeze(
+                job_id,
+                freeze_data,
+                route=_direct_route,
+                message_entry={
+                    "user_id": user_id,
+                    "recipient_email": recipient_email,
+                    "subject": request.subject,
+                    "message": request.message,
+                    "status": "sent",
+                },
+                wake=None,
+                expected_lane=str(job.get("execution_lane") or "pinned"),
+                lease_token=request.lease_token,
+                agent_id=request.agent_id,
+                completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+            )
+            if direct_committed is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Job changed before blocking message was committed",
+                )
 
         # Dispatch to all configured notification channels
         dispatch_results = await notification_service.dispatch(
@@ -14536,141 +14600,32 @@ async def send_agent_message(
         status = "sent"  # Message logged even if delivery fails
         error_msg = None if email_sent else "Email not configured or send failed"
 
-        # Log to message_log
-        await postgres_db.log_message(
-            job_id=job_id,
-            user_id=user_id,
-            thread_id=thread_id,
-            direction="outbound",
-            recipient_email=recipient_email,
-            subject=request.subject,
-            message=request.message,
-            mode=request.mode,
-            status=status,
-            error_message=error_msg,
-            email_message_id=email_msg_id,
-        )
+        # Log to message_log. A BLOCKING send already logged its message
+        # inside the freeze+route transaction above, so logging again here
+        # would duplicate the thread entry.
+        if request.mode == "blocking":
+            if email_msg_id:
+                await postgres_db.set_message_email_id(
+                    direct_committed["originating_message_id"], email_msg_id
+                )
+            from services import message_routing as _rsvc
 
-        # If blocking mode, update job status and store freeze data
-        if request.mode == "blocking" and not COMPLETION_COMMANDS_ENABLED:
-            assert freeze_data is not None
-            if job.get("execution_lane") == "stateless":
-                if request.lease_token is None:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Blocking message does not hold the worker lease",
-                    )
-                async with postgres_db.acquire() as conn:
-                    async with conn.transaction():
-                        queue = await conn.fetchrow(
-                            "SELECT state, lease_token FROM run_queue "
-                            "WHERE unit_id = $1::uuid "
-                            "AND unit_kind = 'worker_batch' FOR UPDATE",
-                            job_id,
-                        )
-                        exact_lease = bool(
-                            queue
-                            and queue["state"] == "leased"
-                            and int(queue["lease_token"]) == int(request.lease_token)
-                        )
-                        if not exact_lease:
-                            raise HTTPException(
-                                status_code=409,
-                                detail="Blocking message does not hold the worker lease",
-                            )
-                        updated = await conn.fetchrow(
-                            "UPDATE jobs SET status = 'waiting_for_reply', "
-                            "freeze_data = $1::jsonb, "
-                            "updated_at = CURRENT_TIMESTAMP "
-                            "WHERE id = $2::uuid "
-                            "AND execution_lane = 'stateless' "
-                            "AND status = 'processing' RETURNING id",
-                            json.dumps(freeze_data),
-                            job_id,
-                        )
-                        if updated is None:
-                            raise HTTPException(
-                                status_code=409,
-                                detail="Job changed before blocking message was committed",
-                            )
-            else:
-                await postgres_db.update_job_status(
-                    job_id=job_id,
-                    status="waiting_for_reply",
-                    freeze_data=freeze_data,
-                )
-
-        # Route bookkeeping for direct blocking sends — what finally gives
-        # the advertised communication.blocking_timeout_hours an
-        # implementation ([A-timeout]). Best-effort by design: user_direct
-        # delivery/freeze behavior above stayed byte-compatible, and a
-        # bookkeeping failure must not fail a send that already committed
-        # its freeze (that is exactly the pre-route status quo).
-        if request.mode == "blocking" and route_id is not None:
-            try:
-                from services import message_routing as _routing_svc
-
-                delivered_any = dispatch_results.get("queued") is True or any(
-                    value is True
-                    for key, value in dispatch_results.items()
-                    if key not in ("queued", "email_message_id", "error")
-                )
-                snapshot = (
-                    _routing_svc.snapshot_for_route(
-                        routing,
-                        applied="user_direct",
-                        reason=applied_reason,
-                        purpose=purpose,
-                    )
-                    if routing
-                    else {
-                        "worker_messages": "user_direct",
-                        "applied": "user_direct",
-                        "reason": applied_reason,
-                        "resolved_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-                deadlines = _routing_svc.route_deadlines(
-                    blocking=True,
-                    state="user_direct",
-                    officer_response_minutes=0,
-                    timeout_hours=_routing_svc.blocking_timeout_hours(job),
-                )
-                await postgres_db.create_message_route(
-                    {
-                        "route_id": route_id,
-                        "job_id": job_id,
-                        "project_id": (
-                            str(job["project_id"]) if job.get("project_id") else None
-                        ),
-                        "thread_id": thread_id,
-                        "policy_snapshot": snapshot,
-                        "state": "user_direct",
-                        "blocking": True,
-                        "user_delivery_at": (
-                            datetime.now(timezone.utc) if delivered_any else None
-                        ),
-                        "total_deadline": deadlines["total_deadline"],
-                        "transitions": [
-                            _routing_svc.build_transition(
-                                None,
-                                "user_direct",
-                                actor_kind="system",
-                                actor_id="send",
-                                note=f"created (user_direct: {applied_reason})",
-                            )
-                        ],
-                    }
-                )
-            except Exception:
-                logger.warning(
-                    "user_direct route bookkeeping failed for job %s thread %s "
-                    "(send already committed; total-timeout coverage lost for "
-                    "this message)",
-                    job_id[:8],
-                    thread_id,
-                    exc_info=True,
-                )
+            if _rsvc.classify_dispatch(dispatch_results).accepted:
+                await postgres_db.mark_route_user_delivery(str(route_id))
+        else:
+            await postgres_db.log_message(
+                job_id=job_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                direction="outbound",
+                recipient_email=recipient_email,
+                subject=request.subject,
+                message=request.message,
+                mode=request.mode,
+                status=status,
+                error_message=error_msg,
+                email_message_id=email_msg_id,
+            )
 
         file_path = f"messages/{thread_id}/{sequence:03d}_sent.md"
 

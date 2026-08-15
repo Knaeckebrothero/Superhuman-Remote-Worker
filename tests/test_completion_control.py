@@ -290,6 +290,10 @@ async def test_blocking_message_loser_has_zero_notification_side_effects():
     )
     db.get_message_sequence = AsyncMock(return_value=1)
     db.publish_blocking_message = AsyncMock(return_value=False)
+    # OC-01: the blocking send is now one atomic message+route+freeze unit.
+    # None is the same "guard lost" signal publish_blocking_message's False
+    # was — the point of this test is that the loser touches nothing.
+    db.create_routed_blocking_freeze = AsyncMock(return_value=None)
     db.log_message = AsyncMock()
     notifier = MagicMock()
     notifier.dispatch = AsyncMock()
