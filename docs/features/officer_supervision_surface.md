@@ -6,7 +6,7 @@ tags:
   - tooling
   - observability
   - security
-status: proposed
+status: implemented-E1-E5-audit-blocked
 created: 2026-08-14
 aliases:
   - officer eyes and ears
@@ -20,6 +20,7 @@ related:
   - "[[officer_blind_reads_and_worker_bureaucracy]]"
   - "[[officer_backlog_pools]]"
   - "[[supervisor_control_plane_and_live_talk]]"
+  - "[[officer_control_plane_post_implementation_audit]]"
 ---
 
 # Officer supervision surface — trustworthy eyes and ears without a workspace
@@ -46,6 +47,15 @@ job-management implementation in [[unified_orchestrator_tool_surface]]. Its shar
 descriptors, formatters, adapters, and project scope are still the correct substrate. This
 feature changes the officer's default grant from "all job inspection" to a deliberate
 observability/evidence subset and adds truthfulness requirements to the reads.
+
+**2026-08-15 post-implementation audit:** the bounded surface and scope exist, but E4/E5
+are not release-accepted. Secret-shaped content is not actually redacted from evidence or
+completion reports, liveness defaults still disagree, and screenshot reads return a text
+pointer to a viewer the headless officer cannot use. Track
+[[officer_evidence_and_messages_leak_secret_shaped_content]],
+[[job_liveness_defaults_disagree_across_surfaces]], and
+[[headless_officer_cannot_read_screenshot_evidence]]; the ordered index is
+[[officer_control_plane_post_implementation_audit]].
 
 Code-audit markers:
 

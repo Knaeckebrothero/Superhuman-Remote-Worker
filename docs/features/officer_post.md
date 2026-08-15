@@ -5,7 +5,7 @@ tags:
   - orchestration
   - sessions
   - database
-status: implemented-O1-O5
+status: implemented-O1-O5-audit-blocked
 created: 2026-08-06
 aliases:
   - officer post
@@ -18,6 +18,7 @@ related:
   - "[[officer_knowledge_plane]]"
   - "[[officer_supervision_surface]]"
   - "[[officer_message_routing]]"
+  - "[[officer_control_plane_post_implementation_audit]]"
   - "[[db_migration]]"
   - "[[loop_unified_engine]]"
 ---
@@ -51,6 +52,13 @@ background officer may know and write; [[officer_supervision_surface]] defines h
 job reads; [[officer_message_routing]] adds a user-owned worker-question policy to this
 durable post. These are proposed additions. They do not change the row/thread lifecycle
 model below.
+
+**2026-08-15 post-implementation audit:** O1–O5 exist, but decommission is not one atomic
+transition and a stale ended-thread link can report a commissioned post with no live
+officer. The backlog tick also needs to lock and revalidate this durable post rather than
+trusting enabled thread metadata. Track the fixes in [[officer_decommission_is_not_atomic]]
+and [[officer_admission_does_not_lock_the_durable_post]]; the ordered index is
+[[officer_control_plane_post_implementation_audit]]. O6 remains held.
 
 ## 1. Motivation — four defects with one root
 

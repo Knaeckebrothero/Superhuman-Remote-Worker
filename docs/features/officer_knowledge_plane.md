@@ -6,7 +6,7 @@ tags:
   - knowledge
   - memory
   - security
-status: proposed
+status: implemented-K1-K3-audit-blocked
 created: 2026-08-14
 aliases:
   - officer memory
@@ -21,6 +21,7 @@ related:
   - "[[knowledge_base_repo_separation]]"
   - "[[no_workspace_agent_mode]]"
   - "[[project_cloud_folders]]"
+  - "[[officer_control_plane_post_implementation_audit]]"
 ---
 
 # Officer knowledge plane — durable memory without object-level work
@@ -46,6 +47,15 @@ line shipped inside the E5 persona section (`7bb1d331`). K4 remains open — the
 `_knowledge_section` probe is its hook. Original status for the record: The underlying stores and most KB tools already exist. The feature is
 primarily an explicit capability contract, a fail-closed project binding, and removal of
 generic session affordances that accidentally undermine the officer's no-workspace role.
+
+**2026-08-15 post-implementation audit:** the object-plane ceiling holds, but the write
+authority and truth contract do not yet. Any persistent project session (including a
+viewer) is treated as officer-authorized for `ready`, `parallel-safe`, and charter writes,
+and failed canonical-file materialization can still return success. Track
+[[backlog_machine_tags_trust_any_persistent_session]] and
+[[kb_materialization_failure_reports_ready_or_closed]]; the ordered index is
+[[officer_control_plane_post_implementation_audit]]. These block unattended dispatch even
+though K1–K3 are present.
 
 The direction came from the Legate's officer/backlog discussion: a passive background
 manager must be able to own notes and tickets, but project-folder access would invite the

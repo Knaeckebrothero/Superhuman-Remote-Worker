@@ -6,7 +6,7 @@ tags:
   - communication
   - jobs
   - autonomy
-status: proposed
+status: implemented-M1-M4-audit-blocked
 created: 2026-08-14
 aliases:
   - officer first messages
@@ -21,6 +21,7 @@ related:
   - "[[unified_message_store]]"
   - "[[supervisor_control_plane_and_live_talk]]"
   - "[[officer_backlog_pools]]"
+  - "[[officer_control_plane_post_implementation_audit]]"
 ---
 
 # Officer-aware worker messages — triage before interruption
@@ -50,6 +51,17 @@ job message endpoint, notification delivery, generic reply route, officer wake o
 message readers provide most primitives. Missing are policy resolution, an officer inbox
 route, durable route state, escalation tools, and the timeout that the current config
 already promises but does not implement.
+
+**2026-08-15 post-implementation audit:** the officer-routed blocking path has the intended
+transaction, but the default `user_direct` path can still freeze before its route exists;
+route actions lack actor-bound credentials; reply/timeout CAS does not fence the freeze
+generation; and failed notification can be stamped delivered. Track
+[[direct_blocking_message_freeze_can_outlive_route]],
+[[officer_message_actions_trust_shared_transport_identity]],
+[[message_route_resume_lacks_generation_cas]], and
+[[message_route_delivery_failure_is_stamped_delivered]]; the ordered index is
+[[officer_control_plane_post_implementation_audit]]. M1–M4 must not be treated as a
+complete liveness boundary yet.
 
 Audit markers:
 
