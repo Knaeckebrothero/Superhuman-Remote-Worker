@@ -603,9 +603,7 @@ class AsyncCockpitClient:
         if not actor.refresh_credential:
             return False, "runtime actor refresh credential is missing"
         try:
-            with self.invocation_scope(
-                runtime_actor_refresh=actor.refresh_credential
-            ):
+            with self.invocation_scope(runtime_actor_refresh=actor.refresh_credential):
                 response = await self._mutation_request(
                     "POST", "/api/runtime-actors/refresh"
                 )
