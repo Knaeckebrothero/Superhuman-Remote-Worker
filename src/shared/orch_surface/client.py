@@ -1055,6 +1055,8 @@ class AsyncCockpitClient:
         thread_id: str | None = None,
         priority: int = 5,
         required_deliverables: list[str] | None = None,
+        ticket: str | None = None,
+        work_category: str | None = None,
     ) -> dict[str, Any]:
         """Create a new job.
 
@@ -1076,6 +1078,12 @@ class AsyncCockpitClient:
             priority: Dispatch priority from 0 (low) to 10 (high)
             required_deliverables: Deliverable contract (P1-C) — paths /
                 "kb:<slug>" entries validated at the seal
+            ticket: Backlog ticket (knowledge-note slug) this job claims —
+                the funnel stamps it into ``context.ticket_note_id``, the
+                one key the one-shot claim ledger reads
+            work_category: Explicit work category for the precedence law —
+                the caller's stated intent, recorded against the slot's
+                category in the kickoff contract
 
         Returns:
             Created job record with ID
@@ -1085,6 +1093,10 @@ class AsyncCockpitClient:
             "config_name": config_name,
             "priority": priority,
         }
+        if ticket:
+            body["ticket"] = ticket
+        if work_category:
+            body["work_category"] = work_category
         if expert_id:
             body["expert_id"] = expert_id
         if datasource_ids is not None:
