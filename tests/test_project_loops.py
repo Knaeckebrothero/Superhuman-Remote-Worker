@@ -325,6 +325,94 @@ class TestProductQaLoopWiring:
         assert "genuine duplicate" in low
 
 
+class TestCategoryContractComposition:
+    """B5 of docs/features/officer_backlog_pools.md §7.
+
+    The loop's kickoff now leads with the work-category contract and follows
+    with the role's identity. This is the half of the pools feature that
+    reaches EVERY loop, officer or not — it is what stops the next month of
+    iterations from picking whatever is easiest to prove.
+    """
+
+    def test_scholar_leads_with_the_researcher_contract(self):
+        kick = build_loop_kickoff(_loop(), role="scholar", iteration=3)
+        role_section = kick.split("YOUR ROLE THIS ITERATION — SCHOLAR:")[1]
+        assert role_section.lstrip().startswith("Your deliverable is an ANSWER")
+        # Spike discipline and design anchors now reach a plain loop.
+        assert "SPIKE" in role_section
+        assert "Material 3" in role_section and "WCAG" in role_section
+        # ...and the scholar identity still follows it.
+        assert "Do NOT self-filter" in role_section
+
+    def test_product_qa_leads_with_the_tester_contract(self):
+        kick = build_loop_kickoff(_loop(), role="product-qa", iteration=4)
+        role_section = kick.split("YOUR ROLE THIS ITERATION — PRODUCT-QA:")[1]
+        assert role_section.lstrip().startswith("Your output is ISSUE TICKETS")
+        # The anchored-critique upgrade, previously officer-only.
+        assert "Nielsen" in role_section and "SC 2.5.8" in role_section
+        assert "Scholar's counterpart" in role_section
+
+    def test_developer_leads_with_the_executor_contract(self):
+        kick = build_loop_kickoff(_loop(), role="developer", iteration=6)
+        role_section = kick.split("YOUR ROLE THIS ITERATION — DEVELOPER:")[1]
+        assert role_section.lstrip().startswith("Ship it, prove it appropriately")
+        assert "regression rails, never the score" in role_section
+        assert "Implement the Critic's chosen action" in role_section
+
+    def test_the_critic_gets_no_category_contract(self):
+        # role_to_category("critic") is `tester` — right for the expert, wrong
+        # here. The loop's critic SELECTS; prepending the tester contract would
+        # tell it to file 3-7 issue tickets and contradict its duty on the same
+        # screen. Categories describe work; selection is orchestration.
+        kick = build_loop_kickoff(_loop(), role="critic", iteration=5)
+        role_section = kick.split("YOUR ROLE THIS ITERATION — CRITIC:")[1]
+        assert role_section.lstrip().startswith("You are the OVERSEER")
+        assert "3-7 findings MAXIMUM" not in role_section
+
+    def test_an_unknown_execution_role_still_gets_the_executor_contract(self):
+        # The execution slot is swappable (writer / default / anything).
+        kick = build_loop_kickoff(_loop(), role="writer", iteration=2)
+        assert "Ship it, prove it appropriately" in kick
+
+    def test_the_contract_text_is_context_free(self):
+        # The blocks are shared with the officer's ticket dispatches. A loop
+        # iteration has no ticket, so wording that says "this ticket" would be
+        # a small lie on every loop kickoff.
+        kick = build_loop_kickoff(_loop(), role="scholar", iteration=3)
+        assert "This ticket is a SPIKE" not in kick
+        assert "deliver THIS ticket" not in kick
+
+
+class TestEvidenceIncentiveWording:
+    """The two edits that repair the loop's own incentives (§7).
+
+    Neither phrase was pinned before, because neither existed — the loop asked
+    for a "verifiable" increment and scored tickets on "evidence quality",
+    which is exactly how a month of iterations produced tested Python and no
+    UI. These pins exist so the wording cannot quietly regress.
+    """
+
+    def test_the_increment_asks_for_evidence_appropriate_to_the_work(self):
+        kick = build_loop_kickoff(_loop(), role="developer", iteration=1)
+        assert "EVIDENCE APPROPRIATE TO THE WORK" in kick
+        assert "screenshots for UI" in kick
+        assert "citations for research" in kick
+        # The old wording made unverifiable work look like bad work.
+        assert "ONE solid, verifiable increment" not in kick
+
+    def test_the_increment_names_the_bias_it_is_correcting(self):
+        kick = build_loop_kickoff(_loop(), role="scholar", iteration=1)
+        assert "Do not pick the work whose evidence is easiest to produce" in kick
+
+    def test_the_critic_rubric_prices_evidence_by_the_claim(self):
+        kick = build_loop_kickoff(_loop(), role="critic", iteration=5)
+        assert "evidence APPROPRIATE TO THE CLAIM" in kick
+        assert (
+            "A ticket is not weaker because its evidence would be a screenshot" in kick
+        )
+        assert "and evidence quality." not in kick
+
+
 class TestNormalizeStage:
     """The parallel-stage grammar: a role_sequence entry is a single role name
     (one-job stage) or a list of role names (fan-out). docs/features/loop_parallel_stages.md."""
