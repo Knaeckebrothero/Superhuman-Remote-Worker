@@ -34817,7 +34817,14 @@ async def get_project_officer_summary(
     if not isinstance(row_llm_cfg, dict):
         row_llm_cfg = {}
     post_block: dict[str, Any] = {
-        "commissioned": bool(post.get("thread_id")),
+        # OC-03 read surface: commissioned means a LIVE thread holds the post,
+        # not that the link column is non-null. ``officer`` comes from the
+        # post join with the non-ended filter, so it IS the live-post proof; a
+        # stale link (a retire that predates the O3 decommission flow, or a
+        # thread ended around the endpoint) must read as vacant — the old
+        # bool(thread_id) form returned commissioned:true with an empty
+        # officer block, and the card wedged on a state it cannot render.
+        "commissioned": officer is not None,
         "held": None,
         "kit": None,
         "communication_policy": post.get("communication_policy") or {},
@@ -34837,10 +34844,11 @@ async def get_project_officer_summary(
     }
 
     if not officer:
-        # Vacant (or a stale ended-thread link, which reads as vacant): the
-        # editor seeds from the row — the last real kit a decommission or
-        # the backfill harvested there. The officer block is present but
-        # live-only fields (thread_id, status, hold) are null.
+        # Vacant — including a stale ended-thread link, which now reads as
+        # vacant on the ``commissioned`` flag too (OC-03). The editor seeds
+        # from the row — the last real kit a decommission or the backfill
+        # harvested there. The officer block is present but live-only fields
+        # (thread_id, status, hold) are null.
         post_block["kit"] = _kit_view(row_officer_cfg.get("slots"))
         try:
             row_ceiling = int(row_officer_cfg.get("daily_token_ceiling") or 0)

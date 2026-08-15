@@ -21,6 +21,17 @@ related:
 
 **Status:** OPEN — lifecycle/data-integrity blocker. Audit finding **OC-03**.
 
+**Read-surface half FIXED 2026-08-15** (pre-live-fire): `get_project_officer_summary`
+now derives `commissioned` from the live post join (`get_officer_thread_for_project`,
+which already filters ended threads) instead of link non-nullness, so a stale
+ended-thread link renders as ordinary vacancy — never `commissioned: true` over an
+empty officer block. Regression pinned in
+`tests/test_officer_conference.py::test_stale_ended_thread_link_reads_as_vacant`.
+The commission endpoint already used the live join for its already-commissioned
+guard, so a stale link does not block recommissioning. The atomicity half —
+one locked transaction for harvest/wake-fold/route-drain/unlink/incarnation —
+remains open and is this issue's remaining scope.
+
 ## Problem
 
 `orchestrator/main.py::_decommission_officer_post` performs state harvest, wake-queue fold,
