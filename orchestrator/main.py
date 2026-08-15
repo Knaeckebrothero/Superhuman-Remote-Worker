@@ -35086,6 +35086,12 @@ def _while_vacant_view(state: Any) -> dict[str, Any]:
 # request's default is ``session_base``, which grants no job_control plane.
 OFFICER_CONFIG_NAME = "centurion"
 
+# A commissioned officer runs headless — no session exists in which a human
+# could answer a permission prompt — so he must not inherit the create
+# endpoint's ``supervised`` default. A post may still pin a stricter mode
+# explicitly; this only fills the absent case.
+OFFICER_PERMISSION_MODE = "autonomous"
+
 _OFFICER_POST_EFFECTS: dict[str, str] = {
     "slots": "next dispatch",
     "max_concurrent_workers": "next dispatch",
@@ -35597,7 +35603,20 @@ async def commission_project_officer(
         model=row_llm.get("model"),
         reasoning_level=row_llm.get("reasoning_level"),
         temperature=row_llm.get("temperature"),
-        permission_mode=row_interactive.get("permission_mode"),
+        # A background officer is HEADLESS: there is no session for a human to
+        # answer a permission prompt in. Falling to the create default
+        # (``supervised``) gates every tool call on an approval that can never
+        # arrive — the officer issues his calls, the first one parks the turn
+        # ("Permission gate unanswered … parking turn; N call(s) left
+        # ungated"), and the rest are stripped as orphans on the next pass. He
+        # cycles turns forever executing NOTHING: no reads, no dispatches, no
+        # sleep filed, empty assistant text, and not one tool result persisted.
+        # Observed live 2026-08-15 alongside the config_name defect above, and
+        # far harder to see, because every symptom looks like a model problem.
+        # The row may still pin a stricter mode deliberately; only the absent
+        # case is defaulted.
+        permission_mode=row_interactive.get("permission_mode")
+        or OFFICER_PERMISSION_MODE,
     )
     create_request._officer_post_config_snapshot = copy.deepcopy(row_cfg)
     created = await create_thread(create_request, request)

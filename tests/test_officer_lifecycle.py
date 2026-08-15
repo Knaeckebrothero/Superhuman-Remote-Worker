@@ -781,6 +781,10 @@ class TestCommissionEndpoint:
         # the endpoint-commissioned officer had 34 tools, none of which could
         # create a job.
         assert req.config_name == "centurion"
+        # An officer is headless: a supervised gate can never be answered, so
+        # every tool call parks the turn and he executes nothing at all. The
+        # row pinned "autonomous" here, so it travels; the absent case is
+        # covered by test_headless_officer_defaults_to_autonomous below.
         officer_frag = req.config_override["officer"]
         assert officer_frag["enabled"] is True
         assert "conference" not in officer_frag
@@ -800,6 +804,48 @@ class TestCommissionEndpoint:
         assert out["thread_id"] == new_tid
         assert out["brief_enqueued"] is True
         assert out["while_vacant"] == 1
+
+    @pytest.mark.asyncio
+    async def test_headless_officer_defaults_to_autonomous(
+        self, db, as_project_admin, quiet_side_channels, monkeypatch
+    ):
+        """A post that pins no permission mode must NOT inherit the create
+        endpoint's ``supervised`` default.
+
+        An officer runs headless — there is no session in which a human could
+        answer a permission prompt — so a supervised gate parks every turn on
+        its first tool call and strips the rest as orphans. He then cycles
+        forever executing nothing: no reads, no dispatches, no sleep filed,
+        empty assistant text, zero tool results. Observed live on the Resavio
+        change of command 2026-08-15, where it read as a model defect rather
+        than a config one. An explicitly pinned mode still wins.
+        """
+        new_tid = str(uuid4())
+
+        async def create_with_continuity(req, _request):
+            req._officer_commission_result = {
+                "brief_enqueued": True,
+                "while_vacant": [],
+                "while_vacant_dropped": 0,
+                "state_restored": False,
+            }
+            return {"thread_id": new_tid, "status": "created"}
+
+        create = AsyncMock(side_effect=create_with_continuity)
+        monkeypatch.setattr(orch_main, "create_thread", create)
+        # No "interactive" block at all — the shape a fresh post has.
+        row = _post_row(config_override={"officer": {"enabled": True}})
+        db.get_or_create_project_officer = AsyncMock(return_value=row)
+        db.update_project_officer_post = AsyncMock(
+            return_value={"post": row, "thread": None, "applied_to_thread": False}
+        )
+        db.get_project_officer = AsyncMock(return_value=row)
+
+        await commission_project_officer(MagicMock(), PROJECT_ID, None)
+
+        req = create.await_args.args[0]
+        assert req.permission_mode == "autonomous"
+        assert req.config_name == "centurion"
 
     @pytest.mark.asyncio
     async def test_cleared_row_fields_do_not_travel_to_the_funnel(
