@@ -256,8 +256,15 @@ def _routing_db(officer=True):
             "description": "delegated work",
         }
     )
-    db.get_officer_thread_for_project = AsyncMock(
-        return_value={"id": THREAD_ID} if officer else None
+    # officer_post.md §O1: the officer leg routes through one post-locked
+    # decision — the wake row is written inside that call, not by the caller.
+    db.route_project_officer_job_transition = AsyncMock(
+        return_value={
+            "destination": "wake" if officer else "while_vacant",
+            "thread_id": THREAD_ID if officer else None,
+            "enqueued": bool(officer),
+            "appended": not bool(officer),
+        }
     )
     db.enqueue_session_wake_event = AsyncMock(return_value=True)
     db.mark_job_wake_pending = AsyncMock(return_value=True)
@@ -274,10 +281,11 @@ class TestJobTransitionChokePoint:
         result = await session_wake.maybe_wake_session(db, JOB_A, "paused")
         assert result is False  # paused never enters the jobs outbox
         db.mark_job_wake_pending.assert_not_awaited()
-        kwargs = db.enqueue_session_wake_event.await_args.kwargs
-        assert kwargs["source"] == "job_transition"
-        assert kwargs["dedup_key"] == f"{JOB_A[:8]}:paused"
-        assert db.enqueue_session_wake_event.await_args.args[0] == THREAD_ID
+        call = db.route_project_officer_job_transition.await_args
+        assert call.args[0] == PROJECT_ID
+        assert call.kwargs["job_id"] == JOB_A
+        assert call.kwargs["status"] == "paused"
+        assert call.kwargs["dedup_key"] == f"{JOB_A[:8]}:paused"
         await asyncio.sleep(0)  # let the kicked drain task settle
 
     @pytest.mark.asyncio
@@ -287,15 +295,19 @@ class TestJobTransitionChokePoint:
         assert result is True
         db.mark_job_wake_pending.assert_awaited_once()
         assert (
-            db.enqueue_session_wake_event.await_args.kwargs["dedup_key"]
+            db.route_project_officer_job_transition.await_args.kwargs["dedup_key"]
             == f"{JOB_A[:8]}:completed"
         )
         await asyncio.sleep(0)
 
     @pytest.mark.asyncio
-    async def test_no_officer_no_enqueue(self):
+    async def test_vacant_post_routes_but_wakes_nobody(self):
         db = _routing_db(officer=False)
         await session_wake.maybe_wake_session(db, JOB_A, "completed")
+        # The transition still reaches the post — it lands in the while-vacant
+        # ledger instead of a wake queue — and the jobs outbox is untouched by
+        # whether a project has an officer at all.
+        db.route_project_officer_job_transition.assert_awaited_once()
         db.enqueue_session_wake_event.assert_not_awaited()
         db.mark_job_wake_pending.assert_awaited_once()
         await asyncio.sleep(0)
@@ -305,6 +317,7 @@ class TestJobTransitionChokePoint:
         db = _routing_db()
         result = await session_wake.maybe_wake_session(db, JOB_A, "processing")
         assert result is False
+        db.route_project_officer_job_transition.assert_not_awaited()
         db.enqueue_session_wake_event.assert_not_awaited()
         db.mark_job_wake_pending.assert_not_awaited()
 
