@@ -213,6 +213,15 @@ The negative controls carry the regression risk, not the happy path:
 - a principal **holding** the grant is never blocked;
 - a **loop** job is never downgraded.
 
+### Verification run
+
+`.venv/bin/python -m pytest tests/` (Python 3.12.10, near-CI fidelity):
+**18,357 passed, 4 failed, 163 skipped**. All four failures are pre-existing and were
+confirmed by re-running them at the pre-change commit in a worktree **with the repo-root
+`.env` copied in** — without it, `tests/test_database_phase1.py` passes and the baseline
+falsely accuses the change. One real regression was found and fixed in the same series:
+`test_app_guide_content` requires every CATALOG key to appear in the permissions guide.
+
 ### Not done
 
 - **Not deployed.** No image build, no dev rollout. Verify from
