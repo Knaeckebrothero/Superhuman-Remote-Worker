@@ -266,6 +266,12 @@ the comparison is honest:
   slug. Board after: test 1/0, research 1/0, build 0/0, `below_floor`
   everywhere — the true queue-duty signal.
 
+- 17:03:18 his steady-state digest: "Research worker is away: job
+  `a9a468df…` is active on ticket `backlog-researcher-…`. The tester
+  `660a8eec` is also active; build remains undispatched behind tester
+  GREEN." — names the exact ticket slug as instructed. He settles into a
+  monitor cadence "for verifier result or researcher questions."
+
 ## Verdict (as of 17:00Z — two workers in flight, executor gated by design)
 
 **The feature holds on its home arena once its code actually reaches every
