@@ -366,6 +366,8 @@ POST   /api/projects/{project_id}/repositories                                  
 DELETE /api/projects/{project_id}/repositories/{repo_id}                                gated:require_project_owner
 PATCH  /api/projects/{project_id}/repositories/{repo_id}                                gated:require_project_owner
 GET    /api/requests/{doc_id}                                                           gated:require_job_access
+POST   /api/runtime-actors/authorize                                                    internal:require_internal
+POST   /api/runtime-actors/refresh                                                      internal:require_internal
 GET    /api/sessions/{thread_id}/connection                                             gated:require_approved_user
 POST   /api/sessions/{thread_id}/prepare                                                gated:require_approved_user
 GET    /api/settings/api-keys                                                           gated:require_approved_user

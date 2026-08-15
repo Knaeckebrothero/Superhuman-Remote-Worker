@@ -15,6 +15,12 @@ from typing import Any, Iterator, Literal, Mapping
 
 import httpx
 
+from ..runtime_actor import (
+    RUNTIME_ACTOR_HEADER,
+    RUNTIME_ACTOR_REFRESH_HEADER,
+    RuntimeActorContext,
+)
+
 FilterCategory = Literal["all", "messages", "tools", "errors"]
 DatasourceScopeMode = Literal["all", "projects"]
 DatasourceVisibility = Literal["public", "private"]
@@ -101,7 +107,13 @@ class _RequestScopeAuth(httpx.Auth):
     a fresh immutable snapshot as each request is built.
     """
 
-    _HEADER_NAMES = ("X-MCP-User-Id", "X-MCP-Scope", "X-Internal-Key")
+    _HEADER_NAMES = (
+        "X-MCP-User-Id",
+        "X-MCP-Scope",
+        "X-Internal-Key",
+        RUNTIME_ACTOR_HEADER,
+        RUNTIME_ACTOR_REFRESH_HEADER,
+    )
 
     def __init__(self, headers: ContextVar[Mapping[str, str] | None]):
         self._headers = headers
@@ -519,6 +531,8 @@ class AsyncCockpitClient:
         user_id: str | None,
         scope: str | None,
         unauthenticated: bool = False,
+        runtime_actor: RuntimeActorContext | None = None,
+        runtime_actor_refresh: str | None = None,
     ) -> Mapping[str, str] | None:
         # ``unauthenticated`` is the explicit fail-closed binding for an
         # adapter whose auth context could not be resolved: NONE of the three
@@ -536,6 +550,10 @@ class AsyncCockpitClient:
             headers["X-MCP-User-Id"] = user_id
         if scope:
             headers["X-MCP-Scope"] = scope
+        if runtime_actor and runtime_actor.access_credential:
+            headers[RUNTIME_ACTOR_HEADER] = runtime_actor.access_credential
+        if runtime_actor_refresh:
+            headers[RUNTIME_ACTOR_REFRESH_HEADER] = runtime_actor_refresh
         return MappingProxyType(headers) if headers else None
 
     @contextmanager
@@ -545,6 +563,8 @@ class AsyncCockpitClient:
         user_id: str | None = None,
         scope: str | None = None,
         unauthenticated: bool = False,
+        runtime_actor: RuntimeActorContext | None = None,
+        runtime_actor_refresh: str | None = None,
     ) -> Iterator[None]:
         """Bind and reliably reset one invocation's identity/scope headers.
 
@@ -559,13 +579,58 @@ class AsyncCockpitClient:
         """
         token = self._scope_headers.set(
             self._invocation_headers(
-                user_id=user_id, scope=scope, unauthenticated=unauthenticated
+                user_id=user_id,
+                scope=scope,
+                unauthenticated=unauthenticated,
+                runtime_actor=runtime_actor,
+                runtime_actor_refresh=runtime_actor_refresh,
             )
         )
         try:
             yield
         finally:
             self._scope_headers.reset(token)
+
+    async def ensure_runtime_actor(
+        self, actor: RuntimeActorContext | None
+    ) -> tuple[bool, str]:
+        """Refresh a near-expiry actor token without exposing it to a schema."""
+
+        if actor is None:
+            return False, "server-derived actor context is missing"
+        if not actor.access_needs_refresh():
+            return True, "authorized credential is current"
+        if not actor.refresh_credential:
+            return False, "runtime actor refresh credential is missing"
+        try:
+            with self.invocation_scope(
+                runtime_actor_refresh=actor.refresh_credential
+            ):
+                response = await self._mutation_request(
+                    "POST", "/api/runtime-actors/refresh"
+                )
+        except (
+            httpx.RequestError,
+            httpx.TimeoutException,
+            MutationOutcomeUnknown,
+        ) as exc:
+            return False, f"actor refresh unavailable ({type(exc).__name__})"
+        if response.status_code != 200:
+            code = f"http-{response.status_code}"
+            try:
+                detail = response.json().get("detail")
+                if isinstance(detail, dict) and isinstance(detail.get("code"), str):
+                    code = detail["code"]
+            except Exception:
+                pass
+            return False, f"actor refresh denied ({code})"
+        try:
+            payload = response.json().get("runtime_actor")
+        except Exception:
+            return False, "actor refresh returned malformed JSON"
+        if not actor.apply_refreshed_payload(payload):
+            return False, "actor refresh changed identity or was malformed"
+        return True, "runtime actor refreshed"
 
     async def _mutation_request(
         self,
@@ -2840,17 +2905,12 @@ class AsyncCockpitClient:
         job_id: str,
         thread_id: str,
         message: str,
-        officer_thread_id: str,
     ) -> dict[str, Any]:
-        """Answer a routed worker message as the commissioned officer.
-
-        The server verifies ``officer_thread_id`` against the project's
-        durable post row — it is a claim to check, never authority.
-        """
+        """Answer a routed worker message as the commissioned officer."""
         resp = await self._mutation_request(
             "POST",
             f"/api/jobs/{job_id}/messages/{thread_id}/officer-reply",
-            json={"message": message, "officer_thread_id": officer_thread_id},
+            json={"message": message},
         )
         resp.raise_for_status()
         return resp.json()
@@ -2859,14 +2919,13 @@ class AsyncCockpitClient:
         self,
         job_id: str,
         thread_id: str,
-        officer_thread_id: str,
         context: str | None = None,
     ) -> dict[str, Any]:
         """Escalate a routed worker message to the user with officer context."""
         resp = await self._mutation_request(
             "POST",
             f"/api/jobs/{job_id}/messages/{thread_id}/officer-escalate",
-            json={"context": context, "officer_thread_id": officer_thread_id},
+            json={"context": context},
         )
         resp.raise_for_status()
         return resp.json()
@@ -2875,14 +2934,13 @@ class AsyncCockpitClient:
         self,
         job_id: str,
         thread_id: str,
-        officer_thread_id: str,
         note: str | None = None,
     ) -> dict[str, Any]:
         """Close an async routed worker message without a reply."""
         resp = await self._mutation_request(
             "POST",
             f"/api/jobs/{job_id}/messages/{thread_id}/officer-ack",
-            json={"note": note, "officer_thread_id": officer_thread_id},
+            json={"note": note},
         )
         resp.raise_for_status()
         return resp.json()

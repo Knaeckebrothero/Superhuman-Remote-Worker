@@ -72,6 +72,7 @@ from ..shared.thread_presence import (
     mark_stateless_natural_pause,
 )
 from ..shared.session_retirement import update_stateless_claim_status
+from ..shared.runtime_actor import RuntimeActorContext
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
@@ -2162,6 +2163,7 @@ async def _attach_session(
     project_ids: Optional[List[str]] = None,
     datasources: Optional[List[Dict[str, Any]]] = None,
     config_name: Optional[str] = None,
+    runtime_actor: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Create and attach a PersistentSession for the given thread.
 
@@ -2204,6 +2206,14 @@ async def _attach_session(
         _event_writer = None
 
     _thread_id = thread_id
+
+    runtime_actor_context = RuntimeActorContext.from_payload(runtime_actor)
+    if runtime_actor is not None and runtime_actor_context is None:
+        raise RuntimeError("Malformed server-derived runtime actor context")
+    if runtime_actor_context is None and _orchestrator_client is not None:
+        # Dedicated runtime clients expose this property. Deliberately tiny
+        # dry-run/test adapters may not and therefore have no privileged actor.
+        runtime_actor_context = getattr(_orchestrator_client, "runtime_actor", None)
 
     # Determine the backend before polling: a lite (virtual/none) session has
     # NO workspace pod, so polling for one would always fail (WorkspaceNotReady).
@@ -2587,6 +2597,7 @@ async def _attach_session(
     knowledge_bindings = build_knowledge_bindings(
         project_ids=project_ids or [],
         datasources=kb_datasources,
+        runtime_actor=runtime_actor_context,
     )
 
     # Create PersistentSession
@@ -2606,6 +2617,7 @@ async def _attach_session(
         project_ids=project_ids or [],
         datasources=datasources_dict,
         knowledge_bindings=knowledge_bindings,
+        runtime_actor=runtime_actor_context,
         _datasource_clients=datasource_clients,
         # Raw payload kept as the live-change diff baseline (Slice B).
         datasource_configs=list(datasources or []),
@@ -3457,6 +3469,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 project_ids=request.get("project_ids"),
                 datasources=request.get("datasources"),
                 config_name=request.get("config_name"),
+                runtime_actor=request.get("runtime_actor"),
             )
             return JSONResponse(
                 {

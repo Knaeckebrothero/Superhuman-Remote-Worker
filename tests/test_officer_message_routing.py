@@ -19,6 +19,7 @@ from fastapi import HTTPException
 
 import orchestrator.main as main
 from services import message_routing as routing
+from src.shared.runtime_actor import RuntimeActorContext
 
 
 OFFICER_TID = str(uuid4())
@@ -628,6 +629,27 @@ def _guard_request(scope: str | None = None):
     return request
 
 
+def _runtime_officer(
+    *, project_id: str = PROJECT_ID, thread_id: str = OFFICER_TID, incarnation: int = 0
+) -> RuntimeActorContext:
+    return RuntimeActorContext(
+        caller_kind="officer",
+        project_id=project_id,
+        project_role="owner",
+        thread_id=thread_id,
+        officer_incarnation=incarnation,
+        user_id=str(uuid4()),
+    )
+
+
+def _authorized_officer():
+    return patch.object(
+        main,
+        "authorize_runtime_actor_request",
+        AsyncMock(return_value=_runtime_officer()),
+    )
+
+
 def _action_db(job, *, officer=True, route=None):
     db = MagicMock()
     db.get_job = AsyncMock(return_value=job)
@@ -638,6 +660,7 @@ def _action_db(job, *, officer=True, route=None):
     db.find_message_route_for_thread = AsyncMock(return_value=route)
     db.get_message_route = AsyncMock(return_value=route)
     db.transition_message_route = AsyncMock(return_value=route)
+    db.record_security_event = AsyncMock()
     return db
 
 
@@ -670,52 +693,14 @@ class TestOfficerActionGuards:
                     _guard_request(),
                     job["id"],
                     "abc123",
-                    main.OfficerMessageReplyRequest(
-                        officer_thread_id=OFFICER_TID, message="hi"
-                    ),
+                    main.OfficerMessageReplyRequest(message="hi"),
                 )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_non_commissioned_caller_is_403(self):
-        """Cross-project / impostor: the claim does not match the post row."""
-        job = _job()
-        db = _action_db(job)
-        stranger = str(uuid4())
-        with (
-            patch.object(main, "require_internal", AsyncMock()),
-            patch.object(main, "postgres_db", db),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await main.officer_reply_to_worker_message(
-                    _guard_request(),
-                    job["id"],
-                    "abc123",
-                    main.OfficerMessageReplyRequest(
-                        officer_thread_id=stranger, message="hi"
-                    ),
-                )
-        assert exc.value.status_code == 403
-
-    @pytest.mark.asyncio
-    async def test_vacant_post_is_403(self):
-        job = _job()
-        db = _action_db(job, officer=False)
-        with (
-            patch.object(main, "require_internal", AsyncMock()),
-            patch.object(main, "postgres_db", db),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await main.officer_acknowledge_worker_message(
-                    _guard_request(),
-                    job["id"],
-                    "abc123",
-                    main.OfficerMessageAckRequest(officer_thread_id=OFFICER_TID),
-                )
-        assert exc.value.status_code == 403
-
-    @pytest.mark.asyncio
-    async def test_scope_mismatch_is_403(self):
+    @pytest.mark.parametrize("action", ["reply", "escalate", "ack"])
+    async def test_shared_key_worker_is_denied_every_officer_action(self, action):
+        """OC-02: shared transport + correct body thread/scope is never identity."""
         job = _job()
         db = _action_db(job)
         with (
@@ -723,15 +708,45 @@ class TestOfficerActionGuards:
             patch.object(main, "postgres_db", db),
         ):
             with pytest.raises(HTTPException) as exc:
-                await main.officer_reply_to_worker_message(
-                    _guard_request(scope=f"project:{uuid4()}"),
-                    job["id"],
-                    "abc123",
-                    main.OfficerMessageReplyRequest(
-                        officer_thread_id=OFFICER_TID, message="hi"
-                    ),
-                )
+                request = _guard_request(scope=f"project:{PROJECT_ID}")
+                if action == "reply":
+                    await main.officer_reply_to_worker_message(
+                        request,
+                        job["id"],
+                        "abc123",
+                        main.OfficerMessageReplyRequest(
+                            message="hi", officer_thread_id=OFFICER_TID
+                        ),
+                    )
+                elif action == "escalate":
+                    await main.officer_escalate_worker_message(
+                        request,
+                        job["id"],
+                        "abc123",
+                        main.OfficerMessageEscalateRequest(
+                            context="help", officer_thread_id=OFFICER_TID
+                        ),
+                    )
+                else:
+                    await main.officer_acknowledge_worker_message(
+                        request,
+                        job["id"],
+                        "abc123",
+                        main.OfficerMessageAckRequest(
+                            note="seen", officer_thread_id=OFFICER_TID
+                        ),
+                    )
         assert exc.value.status_code == 403
+        assert exc.value.detail["code"] == "missing_credential"
+        db.record_security_event.assert_awaited_once()
+
+    def test_public_action_schema_contains_no_actor_identity(self):
+        assert "officer_thread_id" not in main.OfficerMessageReplyRequest.model_fields
+        assert (
+            "officer_thread_id"
+            not in main.OfficerMessageEscalateRequest.model_fields
+        )
+        assert "officer_thread_id" not in main.OfficerMessageAckRequest.model_fields
 
     @pytest.mark.asyncio
     async def test_no_open_route_is_409(self):
@@ -740,15 +755,14 @@ class TestOfficerActionGuards:
         with (
             patch.object(main, "require_internal", AsyncMock()),
             patch.object(main, "postgres_db", db),
+            _authorized_officer(),
         ):
             with pytest.raises(HTTPException) as exc:
                 await main.officer_reply_to_worker_message(
                     _guard_request(),
                     job["id"],
                     "abc123",
-                    main.OfficerMessageReplyRequest(
-                        officer_thread_id=OFFICER_TID, message="hi"
-                    ),
+                    main.OfficerMessageReplyRequest(message="hi"),
                 )
         assert exc.value.status_code == 409
 
@@ -761,15 +775,14 @@ class TestOfficerActionGuards:
         with (
             patch.object(main, "require_internal", AsyncMock()),
             patch.object(main, "postgres_db", db),
+            _authorized_officer(),
         ):
             with pytest.raises(HTTPException) as exc:
                 await main.officer_reply_to_worker_message(
                     _guard_request(),
                     job["id"],
                     "abc123",
-                    main.OfficerMessageReplyRequest(
-                        officer_thread_id=OFFICER_TID, message="hi"
-                    ),
+                    main.OfficerMessageReplyRequest(message="hi"),
                 )
         assert exc.value.status_code == 409
         assert "incarnation" in exc.value.detail
@@ -781,13 +794,14 @@ class TestOfficerActionGuards:
         with (
             patch.object(main, "require_internal", AsyncMock()),
             patch.object(main, "postgres_db", db),
+            _authorized_officer(),
         ):
             with pytest.raises(HTTPException) as exc:
                 await main.officer_acknowledge_worker_message(
                     _guard_request(),
                     job["id"],
                     "abc123",
-                    main.OfficerMessageAckRequest(officer_thread_id=OFFICER_TID),
+                    main.OfficerMessageAckRequest(),
                 )
         assert exc.value.status_code == 400
         assert "frozen" in exc.value.detail
@@ -806,14 +820,13 @@ class TestOfficerActionFlows:
             patch.object(main, "postgres_db", db),
             patch.object(main, "_route_inbound_reply", deliver),
             patch.object(main, "_record_route_reply_resolution", record),
+            _authorized_officer(),
         ):
             result = await main.officer_reply_to_worker_message(
                 _guard_request(scope=f"project:{PROJECT_ID}"),
                 job["id"],
                 "abc123",
-                main.OfficerMessageReplyRequest(
-                    officer_thread_id=OFFICER_TID, message="Use option B."
-                ),
+                main.OfficerMessageReplyRequest(message="Use option B."),
             )
         assert result["status"] == "replied"
         assert result["delivery_strategy"] == "immediate_resume"
@@ -834,13 +847,13 @@ class TestOfficerActionFlows:
             patch.object(main, "require_internal", AsyncMock()),
             patch.object(main, "postgres_db", db),
             patch("services.message_routing.escalate_route", escalate),
+            _authorized_officer(),
         ):
             result = await main.officer_escalate_worker_message(
                 _guard_request(),
                 job["id"],
                 "abc123",
                 main.OfficerMessageEscalateRequest(
-                    officer_thread_id=OFFICER_TID,
                     context="I recommend option B, but it costs money.",
                 ),
             )
@@ -869,12 +882,13 @@ class TestOfficerActionFlows:
                 "services.message_routing.escalate_route",
                 AsyncMock(return_value={"escalated": False, "delivered": False}),
             ),
+            _authorized_officer(),
         ):
             result = await main.officer_escalate_worker_message(
                 _guard_request(),
                 job["id"],
                 "abc123",
-                main.OfficerMessageEscalateRequest(officer_thread_id=OFFICER_TID),
+                main.OfficerMessageEscalateRequest(),
             )
         assert result["status"] == "escalated"
         assert "already escalated" in result["note"]
@@ -889,14 +903,13 @@ class TestOfficerActionFlows:
         with (
             patch.object(main, "require_internal", AsyncMock()),
             patch.object(main, "postgres_db", db),
+            _authorized_officer(),
         ):
             result = await main.officer_acknowledge_worker_message(
                 _guard_request(),
                 job["id"],
                 "abc123",
-                main.OfficerMessageAckRequest(
-                    officer_thread_id=OFFICER_TID, note="seen"
-                ),
+                main.OfficerMessageAckRequest(note="seen"),
             )
         assert result["status"] == "acknowledged"
         kwargs = db.transition_message_route.await_args.kwargs

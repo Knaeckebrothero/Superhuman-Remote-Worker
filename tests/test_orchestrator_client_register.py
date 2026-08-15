@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.api.orchestrator_client import OrchestratorClient
+from src.shared.runtime_actor import RUNTIME_ACTOR_BOOTSTRAP_HEADER
 
 
 @pytest.mark.asyncio
@@ -75,6 +76,81 @@ async def test_register_payload_pod_uid_empty_when_env_unset(monkeypatch):
     assert ok is True
     payload = fake_http.post.call_args.kwargs["json"]
     assert payload["pod_uid"] == ""
+
+
+@pytest.mark.asyncio
+async def test_thread_bound_registration_exchanges_hidden_runtime_bootstrap(
+    monkeypatch,
+):
+    bootstrap = "srb_" + ("A" * 43)
+    monkeypatch.setenv("SRW_RUNTIME_ACTOR_BOOTSTRAP", bootstrap)
+    client = OrchestratorClient(
+        orchestrator_url="http://test-orch:8085",
+        pod_ip="10.0.0.5",
+        pod_port=8001,
+        hostname="srw-agent-officer",
+        config_name="persistent_defaults",
+        pid=1234,
+    )
+    fake_http = AsyncMock()
+    fake_http.post = AsyncMock(
+        return_value=MagicMock(
+            status_code=200,
+            json=lambda: {
+                "agent_id": "a-1",
+                "heartbeat_interval_seconds": 60,
+                "runtime_actor": {
+                    "caller_kind": "officer",
+                    "project_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "project_role": "owner",
+                    "thread_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                    "officer_incarnation": 2,
+                    "user_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                    "access_credential": "sra_" + ("B" * 43),
+                    "refresh_credential": "srr_" + ("C" * 43),
+                    "access_expires_at": "2099-01-01T00:00:00+00:00",
+                    "refresh_expires_at": "2099-01-02T00:00:00+00:00",
+                },
+            },
+        )
+    )
+    client._client = fake_http
+
+    assert await client.register(
+        agent_mode="persistent",
+        thread_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    )
+
+    headers = fake_http.post.await_args.kwargs["headers"]
+    assert headers == {RUNTIME_ACTOR_BOOTSTRAP_HEADER: bootstrap}
+    assert client.runtime_actor is not None
+    assert client.runtime_actor.caller_kind == "officer"
+    assert client.runtime_actor.officer_incarnation == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_registration_never_sends_session_runtime_bootstrap(monkeypatch):
+    monkeypatch.setenv("SRW_RUNTIME_ACTOR_BOOTSTRAP", "srb_" + ("A" * 43))
+    client = OrchestratorClient(
+        orchestrator_url="http://test-orch:8085",
+        pod_ip="10.0.0.5",
+        pod_port=8001,
+        hostname="srw-agent-worker",
+        config_name="defaults",
+        pid=1234,
+    )
+    fake_http = AsyncMock()
+    fake_http.post = AsyncMock(
+        return_value=MagicMock(
+            status_code=200,
+            json=lambda: {"agent_id": "a-1", "heartbeat_interval_seconds": 60},
+        )
+    )
+    client._client = fake_http
+
+    assert await client.register(agent_mode="worker")
+    assert fake_http.post.await_args.kwargs["headers"] is None
+    assert client.runtime_actor is None
 
 
 @pytest.mark.asyncio

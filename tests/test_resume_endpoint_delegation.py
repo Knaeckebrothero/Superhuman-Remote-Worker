@@ -35,6 +35,7 @@ if str(_ORCH) not in sys.path:
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
 import main  # noqa: E402
+from src.shared.runtime_actor import RuntimeActorContext  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +155,21 @@ def resume_collaborators(monkeypatch, fake_conn, injector):
     monkeypatch.setattr(main.postgres_db, "delete_job_context_keys", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "update_job_status", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "heartbeat", AsyncMock())
+
+    async def _mint_worker(_db, *, project_id, user_id):
+        return RuntimeActorContext(
+            caller_kind="worker",
+            project_id=project_id,
+            user_id=user_id,
+            access_credential="sra_" + ("A" * 43),
+            refresh_credential="srr_" + ("B" * 43),
+        )
+
+    monkeypatch.setattr(
+        main,
+        "mint_worker_runtime_actor",
+        AsyncMock(side_effect=_mint_worker),
+    )
     return SimpleNamespace(conn=fake_conn, injector=injector)
 
 
@@ -229,6 +245,8 @@ class TestResumeJobOnAgentInjection:
         payload = _posted_payload()
         assert payload["config_override"]["env_keys"] == INJECTED_ENV
         assert payload["config_override"]["llm"]["api_key"] == "sk-llm"
+        assert payload["runtime_actor"]["caller_kind"] == "worker"
+        assert payload["runtime_actor"]["project_id"] == PROJECT_ID
         main.postgres_db.update_job_status.assert_awaited_once_with(
             job_id=JOB_ID, status="processing", assigned_agent_id=AGENT_ID
         )

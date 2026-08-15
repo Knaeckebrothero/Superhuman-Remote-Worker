@@ -91,12 +91,8 @@ def _get_surface_client() -> AsyncCockpitClient:
 def _caller_ctx(context: ToolContext) -> CallerCtx:
     """Translate trusted ToolContext lineage without adding public arguments.
 
-    Officer detection (officer_supervision_surface E2): the K3 runtime fact
-    ``ToolContext.config["officer_session"]`` is stamped by the persistent
-    session runtime from the parsed officer config (never from config.extra
-    or model input). Strict ``is True`` — the config dict may be a MagicMock
-    in tests. This replaces the pre-unification dead branch that keyed on a
-    flag that could never reach this dict.
+    Officer detection comes only from the server-derived runtime actor. Parsed
+    config still controls the tool ceiling, but never grants actor authority.
     """
     parent_job_id: str | None = None
     candidate = context._job_metadata.get("job_id")
@@ -107,9 +103,9 @@ def _caller_ctx(context: ToolContext) -> CallerCtx:
         pass
 
     project_ids = tuple(str(project_id) for project_id in context.project_ids)
-    tool_cfg = getattr(context, "config", None)
-    officer_session = (
-        isinstance(tool_cfg, dict) and tool_cfg.get("officer_session") is True
+    runtime_actor = getattr(context, "runtime_actor", None)
+    officer_session = bool(
+        runtime_actor is not None and runtime_actor.caller_kind == "officer"
     )
     return CallerCtx(
         kind="officer" if officer_session else "session",
@@ -119,6 +115,7 @@ def _caller_ctx(context: ToolContext) -> CallerCtx:
         thread_id=context.thread_id,
         parent_job_id=parent_job_id,
         resolve_job_id_prefixes=True,
+        runtime_actor=runtime_actor,
     )
 
 

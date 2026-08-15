@@ -7,6 +7,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Optional
 
+from src.shared.runtime_actor import RuntimeActorContext
+
 
 # Mirror of ``orchestrator.services.kb_datasources.NATIVE_PROJECT_CONFIG_KEY``
 # (the agent image has no orchestrator deps, so the constant is duplicated
@@ -38,6 +40,7 @@ class KnowledgeBinding:
     writable: bool
     root_path: str = ""
     indexed_commit: Optional[str] = None
+    runtime_actor: Optional[RuntimeActorContext] = None
 
     @property
     def is_native(self) -> bool:
@@ -70,6 +73,7 @@ def build_knowledge_bindings(
     *,
     project_ids: Iterable[str] = (),
     datasources: Iterable[dict[str, Any]] = (),
+    runtime_actor: RuntimeActorContext | None = None,
 ) -> list[KnowledgeBinding]:
     """Build deterministic native-first bindings from runtime metadata.
 
@@ -107,6 +111,13 @@ def build_knowledge_bindings(
                 kind="native",
                 writable=index == 0,
                 root_path="knowledge",
+                runtime_actor=(
+                    runtime_actor
+                    if runtime_actor is not None
+                    and index == 0
+                    and runtime_actor.project_id == str(project_id)
+                    else None
+                ),
             )
         )
 

@@ -323,7 +323,9 @@ class TestPodManifest:
         assert secret_ref == "srw"
 
     def test_env_overrides(self):
-        m = self._build(config_name="scholar")
+        m = self._build(
+            config_name="scholar", runtime_actor_bootstrap="srb_session_only"
+        )
         env = m["spec"]["containers"][0]["env"]
         env_dict = {e["name"]: e.get("value") for e in env}
         assert env_dict["AGENT_CONFIG"] == "scholar"
@@ -334,6 +336,7 @@ class TestPodManifest:
             "key": "MCP_INTERNAL_KEY",
             "optional": True,
         }
+        assert env_dict["SRW_RUNTIME_ACTOR_BOOTSTRAP"] == "srb_session_only"
 
     def test_security_context_non_root(self):
         m = self._build()

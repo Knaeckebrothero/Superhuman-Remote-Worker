@@ -320,6 +320,10 @@ class JobStartRequest(BaseModel):
         default=None,
         description="Project ID for connector scoping",
     )
+    runtime_actor: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Hidden server-derived runtime actor context",
+    )
     workspace_generation: Optional[str] = Field(
         default=None,
         description="Control-plane-attested Kubernetes backing UID",
@@ -407,6 +411,10 @@ class JobResumeRequest(BaseModel):
     project_id: Optional[str] = Field(
         default=None,
         description="Project ID for knowledge base and memory scoping (set by orchestrator)",
+    )
+    runtime_actor: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Hidden server-derived runtime actor context",
     )
     previous_status: Optional[str] = Field(
         default=None,

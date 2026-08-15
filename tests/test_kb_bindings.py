@@ -8,6 +8,7 @@ from src.services.knowledge.bindings import (
     build_knowledge_bindings,
 )
 from src.services.knowledge_store import KnowledgeRecord
+from src.shared.runtime_actor import RuntimeActorContext
 from src.tools.knowledge.knowledge_tools import create_kb_tools
 
 
@@ -97,6 +98,36 @@ def test_binding_builder_is_native_first_and_resolves_alias_collisions():
     assert bindings[1].alias == "team-docs"
     assert bindings[2].alias == f"team-docs-{ordered_ids[1].hex[:8]}"
     assert all(not binding.writable for binding in bindings[1:])
+
+
+def test_runtime_actor_binds_only_to_its_exact_writable_native_project():
+    primary = uuid.uuid4()
+    secondary = uuid.uuid4()
+    primary_actor = RuntimeActorContext(
+        caller_kind="human",
+        project_id=str(primary),
+        project_role="owner",
+        thread_id=str(uuid.uuid4()),
+    )
+
+    bindings = build_knowledge_bindings(
+        project_ids=[str(primary), str(secondary)],
+        runtime_actor=primary_actor,
+    )
+    assert bindings[0].runtime_actor is primary_actor
+    assert bindings[1].runtime_actor is None
+
+    secondary_actor = RuntimeActorContext(
+        caller_kind="human",
+        project_id=str(secondary),
+        project_role="owner",
+        thread_id=str(uuid.uuid4()),
+    )
+    bindings = build_knowledge_bindings(
+        project_ids=[str(primary), str(secondary)],
+        runtime_actor=secondary_actor,
+    )
+    assert all(binding.runtime_actor is None for binding in bindings)
 
 
 def test_qualified_external_read_uses_store_even_when_graph_is_available():

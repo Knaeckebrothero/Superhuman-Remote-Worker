@@ -476,6 +476,15 @@ from services.session_provisioner import (  # noqa: E402
 from services.docker_provisioner import docker_provisioner  # noqa: E402
 from services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from services.agent_provisioner import agent_provisioner  # noqa: E402
+from services.runtime_actor import (  # noqa: E402
+    RuntimeActorCredentialError,
+    authorize_runtime_actor_request,
+    exchange_runtime_actor_bootstrap,
+    mint_thread_runtime_actor,
+    mint_worker_runtime_actor,
+    refresh_runtime_actor_request,
+    request_bootstrap_token,
+)
 from services.config_resolver import (  # noqa: E402
     inject_blob_credentials,
     resolve_config,
@@ -4283,6 +4292,11 @@ async def _build_job_start_request(
         # send config_override=None to keep the agent from flat-merging an
         # override on top of the resolved layers (the degradation we set out to
         # fix).
+        runtime_actor = await mint_worker_runtime_actor(
+            postgres_db,
+            project_id=str(job["project_id"]) if job.get("project_id") else None,
+            user_id=str(job["user_id"]) if job.get("user_id") else None,
+        )
         job_start = JobStartRequest(
             job_id=job_id,
             description=job["description"],
@@ -4300,6 +4314,7 @@ async def _build_job_start_request(
             repositories=repositories_payload,
             branch_name=job.get("branch_name"),
             project_id=str(job["project_id"]) if job.get("project_id") else None,
+            runtime_actor=runtime_actor.to_payload(),
         )
 
         return job_start
@@ -4652,6 +4667,11 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         ):
             git_remote_url = externalize_gitea_url(git_remote_url)
 
+        runtime_actor = await mint_worker_runtime_actor(
+            postgres_db,
+            project_id=str(job["project_id"]) if job.get("project_id") else None,
+            user_id=str(job["user_id"]) if job.get("user_id") else None,
+        )
         resume_payload = {
             "job_id": job_id,
             "config_name": canonical_config_name(
@@ -4663,6 +4683,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             "project_id": str(job["project_id"]) if job.get("project_id") else None,
             "previous_status": job.get("status"),
             "git_remote_url": git_remote_url,
+            "runtime_actor": runtime_actor.to_payload(),
         }
         if queued_feedback:
             resume_payload["feedback"] = queued_feedback
@@ -5167,6 +5188,20 @@ async def _assemble_session_attach_payload(
             dict(config_override or {}), {"interactive": interactive_scalars}
         )
 
+    try:
+        runtime_actor = await mint_thread_runtime_actor(
+            postgres_db,
+            thread_id=thread_id,
+            project_ids=project_ids,
+        )
+    except Exception:
+        logger.exception(
+            "Session attach: runtime actor mint failed for thread %s; "
+            "refusing (fail closed)",
+            thread_id,
+        )
+        return None
+
     return {
         "thread_id": thread_id,
         "config_override": None if resolved_config else config_override,
@@ -5174,6 +5209,7 @@ async def _assemble_session_attach_payload(
         "project_ids": project_ids,
         "datasources": datasources,
         "config_name": config_name,
+        "runtime_actor": runtime_actor.to_payload(),
     }
 
 
@@ -9131,6 +9167,13 @@ class AgentRegistrationResponse(BaseModel):
 
     agent_id: str
     heartbeat_interval_seconds: int
+    runtime_actor: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Hidden server-derived actor context returned only after a "
+            "thread-bound pod proves its provision-time bootstrap credential"
+        ),
+    )
 
 
 class AgentHeartbeat(BaseModel):
@@ -9362,6 +9405,10 @@ class JobStartRequest(BaseModel):
     project_id: str | None = Field(
         default=None,
         description="Project ID for connector resolution",
+    )
+    runtime_actor: dict[str, Any] | None = Field(
+        default=None,
+        description="Hidden server-derived runtime actor context",
     )
     delegation_context: str | None = Field(
         default=None,
@@ -15233,21 +15280,53 @@ async def reply_to_agent_message(
 # =============================================================================
 
 
+class RuntimeActorAuthorizationRequest(BaseModel):
+    """Target of a sensitive knowledge write; identity stays in the header."""
+
+    action: Literal["machine_tags", "charter"]
+    project_id: str
+
+
+@app.post("/api/runtime-actors/authorize")
+async def authorize_runtime_actor(
+    request: Request, body: RuntimeActorAuthorizationRequest
+) -> dict[str, Any]:
+    """Authorize a hidden runtime actor against current server-side state."""
+
+    await require_internal(request)
+    actor = await authorize_runtime_actor_request(
+        postgres_db,
+        request,
+        action=body.action,
+        project_id=body.project_id,
+    )
+    return {
+        "authorized": True,
+        "code": "authorized",
+        "action": body.action,
+        "actor": actor.audit_payload(),
+        "message": "Runtime actor is authorized.",
+    }
+
+
+@app.post("/api/runtime-actors/refresh")
+async def refresh_runtime_actor(request: Request) -> dict[str, Any]:
+    """Refresh a short-lived actor access token after revalidating identity."""
+
+    await require_internal(request)
+    actor = await refresh_runtime_actor_request(postgres_db, request)
+    return {"runtime_actor": actor.to_payload()}
+
+
 class OfficerMessageReplyRequest(BaseModel):
     """Body for the officer's reply on a worker message thread."""
 
-    officer_thread_id: str = Field(
-        ..., description="The calling officer session's thread UUID"
-    )
     message: str = Field(..., max_length=5000, description="Answer for the worker")
 
 
 class OfficerMessageEscalateRequest(BaseModel):
     """Body for escalating a worker message thread to the user."""
 
-    officer_thread_id: str = Field(
-        ..., description="The calling officer session's thread UUID"
-    )
     context: str | None = Field(
         None,
         max_length=5000,
@@ -15259,33 +15338,14 @@ class OfficerMessageEscalateRequest(BaseModel):
 class OfficerMessageAckRequest(BaseModel):
     """Body for acknowledging (closing) an async worker message route."""
 
-    officer_thread_id: str = Field(
-        ..., description="The calling officer session's thread UUID"
-    )
     note: str | None = Field(None, max_length=1000, description="Optional note")
 
 
 async def _require_officer_route_actor(
-    request: Request, job_id: str, officer_thread_id: str | None
+    request: Request, job_id: str
 ) -> tuple[dict[str, Any], dict[str, Any], int | None]:
-    """Server-side guard for officer message actions (spec §7).
-
-    Only the commissioned officer thread of the JOB's project may act:
-    the claim (``officer_thread_id``) is verified against the durable post
-    row — caller-supplied ids are claims to check, never authority. The
-    officer lane's ``X-MCP-Scope`` stamp, when present, must also name the
-    same project (defense in depth). Returns
-    ``(job, officer_thread, incarnation)``.
-    """
+    """Derive and authorize the current officer from hidden runtime identity."""
     await require_internal(request)
-    if not officer_thread_id:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Officer message actions require the calling officer "
-                "session's thread id; this caller has none."
-            ),
-        )
     job = await postgres_db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
@@ -15295,30 +15355,17 @@ async def _require_officer_route_actor(
             status_code=403,
             detail="Job has no project — there is no officer chain of command.",
         )
-    scope = (request.headers.get("X-MCP-Scope") or "").strip()
-    if scope.startswith("project:") and scope.split(":", 1)[1] != project_id:
-        raise HTTPException(
-            status_code=403,
-            detail="Caller scope does not match this job's project.",
-        )
-    officer = await postgres_db.get_officer_thread_for_project(project_id)
-    if not officer or str(officer["id"]) != str(officer_thread_id):
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Only the commissioned officer thread of this job's project "
-                "may perform officer message actions."
-            ),
-        )
-    incarnation: int | None = None
-    try:
-        post = await postgres_db.get_project_officer(project_id)
-        if post is not None:
-            incarnations = post.get("incarnations") or []
-            incarnation = len(incarnations) if isinstance(incarnations, list) else None
-    except Exception:
-        incarnation = None
-    return job, officer, incarnation
+    actor = await authorize_runtime_actor_request(
+        postgres_db,
+        request,
+        action="officer_message",
+        project_id=project_id,
+    )
+    # Downstream route-transition code consumes the historical row-shaped
+    # ``{"id": thread_id}`` value.  The id now comes only from the verified
+    # runtime actor, never from a public request body.
+    officer = {"id": actor.thread_id}
+    return job, officer, actor.officer_incarnation
 
 
 async def _officer_route_for_action(
@@ -15371,9 +15418,7 @@ async def officer_reply_to_worker_message(
     authorization: no approval/ready/claim side effects, and the original
     message is never erased.
     """
-    job, officer, incarnation = await _require_officer_route_actor(
-        request, job_id, body.officer_thread_id
-    )
+    job, officer, incarnation = await _require_officer_route_actor(request, job_id)
     message = (body.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="message must not be empty")
@@ -15423,9 +15468,7 @@ async def officer_escalate_worker_message(
     resumes the worker directly. The original worker text and the officer's
     context are delivered clearly delimited (§7).
     """
-    job, officer, incarnation = await _require_officer_route_actor(
-        request, job_id, body.officer_thread_id
-    )
+    job, officer, incarnation = await _require_officer_route_actor(request, job_id)
     route = await _officer_route_for_action(job_id, thread_id, str(officer["id"]))
     if route.get("state") not in ("pending_officer", "pending_both"):
         raise HTTPException(
@@ -15481,9 +15524,7 @@ async def officer_acknowledge_worker_message(
     Refused for blocking routes: a frozen worker needs an answer or an
     escalation, never a silent ack pretending nobody waited.
     """
-    job, officer, incarnation = await _require_officer_route_actor(
-        request, job_id, body.officer_thread_id
-    )
+    job, officer, incarnation = await _require_officer_route_actor(request, job_id)
     route = await _officer_route_for_action(job_id, thread_id, str(officer["id"]))
     if route.get("blocking"):
         raise HTTPException(
@@ -33330,6 +33371,7 @@ async def register_agent(
     """
     await require_internal(request)
     try:
+        runtime_actor_payload: dict[str, Any] | None = None
         register_kwargs = dict(
             config_name=registration.config_name,
             pod_ip=registration.pod_ip,
@@ -33408,6 +33450,46 @@ async def register_agent(
                             detail="thread already bound to another live agent",
                         )
 
+                # A thread-bound pod receives actor identity only after proving
+                # the unique bootstrap injected into that pod at provision
+                # time. The shared internal key is deliberately insufficient.
+                try:
+                    bootstrap = request_bootstrap_token(request)
+                except RuntimeActorCredentialError as exc:
+                    await log_security_event(
+                        postgres_db,
+                        request=request,
+                        event_type="runtime_actor_denied",
+                        resource_type="runtime_actor_bootstrap",
+                        resource_id=registration.thread_id,
+                        detail=exc.code,
+                    )
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Runtime actor bootstrap is malformed or duplicated.",
+                    ) from exc
+                if bootstrap is not None:
+                    try:
+                        runtime_actor = await exchange_runtime_actor_bootstrap(
+                            postgres_db,
+                            thread_id=registration.thread_id,
+                            bootstrap_token=bootstrap,
+                        )
+                    except RuntimeActorCredentialError as exc:
+                        await log_security_event(
+                            postgres_db,
+                            request=request,
+                            event_type="runtime_actor_denied",
+                            resource_type="runtime_actor_bootstrap",
+                            resource_id=registration.thread_id,
+                            detail=exc.code,
+                        )
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Runtime actor bootstrap is invalid or expired.",
+                        ) from exc
+                    runtime_actor_payload = runtime_actor.to_payload()
+
                 result = await postgres_db.register_agent(
                     **register_kwargs,
                     expected_agent_id=expected_upsert_id,
@@ -33443,7 +33525,10 @@ async def register_agent(
                     )
         else:
             result = await postgres_db.register_agent(**register_kwargs)
-        return AgentRegistrationResponse(**result)
+        return AgentRegistrationResponse(
+            **result,
+            runtime_actor=runtime_actor_payload,
+        )
     except HTTPException:
         raise
     except Exception as e:

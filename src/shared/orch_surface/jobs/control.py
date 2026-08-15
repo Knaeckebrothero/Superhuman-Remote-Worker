@@ -433,7 +433,7 @@ async def reply_to_job_message(
     try:
         resolved = await resolve_job_id(client, caller, job_id)
         result = await client.officer_reply_to_job_message(
-            resolved, thread_id, message, officer_thread_id=caller.thread_id
+            resolved, thread_id, message
         )
         return (
             f"Reply delivered to worker thread {thread_id} of job "
@@ -488,7 +488,7 @@ async def escalate_job_message(
     try:
         resolved = await resolve_job_id(client, caller, job_id)
         result = await client.officer_escalate_job_message(
-            resolved, thread_id, officer_thread_id=caller.thread_id, context=context
+            resolved, thread_id, context=context
         )
         note = result.get("note")
         return (
@@ -541,7 +541,7 @@ async def acknowledge_job_message(
     try:
         resolved = await resolve_job_id(client, caller, job_id)
         result = await client.officer_acknowledge_job_message(
-            resolved, thread_id, officer_thread_id=caller.thread_id, note=note
+            resolved, thread_id, note=note
         )
         return (
             f"Thread {thread_id} of job {short_id(resolved)} acknowledged "

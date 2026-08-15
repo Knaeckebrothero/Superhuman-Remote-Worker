@@ -22,6 +22,8 @@ from typing import Any, Dict, Optional
 
 from src.core.loader import canonical_config_name
 
+from .runtime_actor import issue_runtime_actor_bootstrap
+
 logger = logging.getLogger(__name__)
 
 
@@ -217,6 +219,18 @@ class PersistentProvisioner:
             )
             return False
 
+        try:
+            runtime_actor_bootstrap = await issue_runtime_actor_bootstrap(
+                self._db, thread_id
+            )
+        except Exception:
+            logger.exception(
+                "Could not issue runtime actor bootstrap for session %s; "
+                "refusing to provision an identity-less pod",
+                thread_id,
+            )
+            return False
+
         manifest = self._build_agent_pod_manifest(
             pod_name=pod_name,
             thread_id=thread_id,
@@ -227,6 +241,7 @@ class PersistentProvisioner:
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
             pvc_name=pvc_name,
+            runtime_actor_bootstrap=runtime_actor_bootstrap,
         )
 
         try:
@@ -476,6 +491,7 @@ class PersistentProvisioner:
         memory_limit: str,
         pvc_name: Optional[str] = None,
         expert_id: Optional[str] = None,
+        runtime_actor_bootstrap: Optional[str] = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for a persistent agent.
 
@@ -584,6 +600,10 @@ class PersistentProvisioner:
                                         "optional": True,
                                     }
                                 },
+                            },
+                            {
+                                "name": "SRW_RUNTIME_ACTOR_BOOTSTRAP",
+                                "value": runtime_actor_bootstrap or "",
                             },
                         ]
                         + (

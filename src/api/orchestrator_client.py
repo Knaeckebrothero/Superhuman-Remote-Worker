@@ -15,6 +15,10 @@ from pydantic import BaseModel
 
 from src.core.product_capabilities import ProductComponent
 from src.core.runtime_provenance import component_provenance_from_environment
+from src.shared.runtime_actor import (
+    RUNTIME_ACTOR_BOOTSTRAP_HEADER,
+    RuntimeActorContext,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -342,6 +346,7 @@ class OrchestratorClient:
         self.user_id = user_id
 
         self.agent_id: Optional[str] = None
+        self.runtime_actor: RuntimeActorContext | None = None
         self.heartbeat_interval: int = 60  # Default, may be updated by orchestrator
 
         self._client: Optional[httpx.AsyncClient] = None
@@ -423,7 +428,15 @@ class OrchestratorClient:
         }
 
         try:
-            response = await self._client.post(url, json=payload)
+            registration_headers: dict[str, str] = {}
+            bootstrap = os.environ.get("SRW_RUNTIME_ACTOR_BOOTSTRAP", "").strip()
+            if thread_id and bootstrap:
+                registration_headers[RUNTIME_ACTOR_BOOTSTRAP_HEADER] = bootstrap
+            response = await self._client.post(
+                url,
+                json=payload,
+                headers=registration_headers or None,
+            )
         except httpx.RequestError as e:
             logger.error(f"Failed to connect to orchestrator for registration: {e}")
             return False
@@ -434,6 +447,9 @@ class OrchestratorClient:
         if response.status_code == 200:
             data = response.json()
             self.agent_id = data.get("agent_id")
+            self.runtime_actor = RuntimeActorContext.from_payload(
+                data.get("runtime_actor")
+            )
             self.heartbeat_interval = data.get("heartbeat_interval_seconds", 60)
             logger.info(
                 f"Registered with orchestrator as agent {self.agent_id}, "

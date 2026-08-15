@@ -8,6 +8,7 @@ import inspect
 from typing import Any, Awaitable, Callable, Literal
 
 from ..client import AsyncCockpitClient
+from ...runtime_actor import RuntimeActorContext
 
 JobGroup = Literal["job_control", "job_inspection"]
 #: officer_supervision_surface §3 capability taxonomy. ``job_inspection`` stays
@@ -54,6 +55,7 @@ class CallerCtx:
     explicit_scope: str | None = None
     resolve_job_id_prefixes: bool = False
     auth_failed: bool = False
+    runtime_actor: RuntimeActorContext | None = None
 
     @property
     def project_scope(self) -> str | None:
@@ -215,11 +217,18 @@ def make_bound_handler(
                 "required for scoped supervision reads. Re-attach the officer "
                 "post to a single project."
             )
+        if caller.kind == "officer":
+            refreshed, reason = await client.ensure_runtime_actor(
+                caller.runtime_actor
+            )
+            if not refreshed:
+                return f"Officer runtime authorization failed: {reason}"
         scope = caller.scope_header if caller.kind in ("mcp", "officer") else None
         with client.invocation_scope(
             user_id=caller.user_id,
             scope=scope,
             unauthenticated=caller.auth_failed,
+            runtime_actor=caller.runtime_actor,
         ):
             if not caller.auth_failed:
                 return await item.handler(client, caller, *args, **kwargs)

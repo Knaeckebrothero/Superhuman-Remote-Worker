@@ -537,6 +537,7 @@ async def _process_orchestrator_job(
     repositories: Optional[list] = None,
     branch_name: Optional[str] = None,
     project_id: Optional[str] = None,
+    runtime_actor: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Process a job assigned by the orchestrator.
 
@@ -593,6 +594,8 @@ async def _process_orchestrator_job(
             metadata["branch_name"] = branch_name
         if project_id:
             metadata["project_id"] = project_id
+        if runtime_actor:
+            metadata["runtime_actor"] = runtime_actor
 
         # Reset stop flags for this job
         _clear_stop()
@@ -953,6 +956,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 repositories=request.repositories,
                 branch_name=request.branch_name,
                 project_id=request.project_id,
+                runtime_actor=request.runtime_actor,
             )
         )
 
@@ -1142,6 +1146,8 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             resume_metadata["datasources"] = request.datasources
         if request.project_id:
             resume_metadata["project_id"] = request.project_id
+        if request.runtime_actor:
+            resume_metadata["runtime_actor"] = request.runtime_actor
         if request.git_remote_url:
             # Feeds the pod-handoff clone fallback in _setup_job_workspace
             # (resume_fresh_workspace_no_clone_fallback.md).

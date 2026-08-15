@@ -454,7 +454,12 @@ class TestKbUpdate:
     def test_pgvector_writethrough_failure_nonfatal(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.update_note.return_value = True
-        ctx.knowledge_graph.read_note.side_effect = Exception("read failed")
+        # The authorization boundary pre-reads the durable note type before
+        # mutation; this test targets the later projection read failure.
+        ctx.knowledge_graph.read_note.side_effect = [
+            {"type": "learning", "tags": []},
+            Exception("read failed"),
+        ]
 
         result = _invoke(
             _get_tool(tools, "kb_update"),

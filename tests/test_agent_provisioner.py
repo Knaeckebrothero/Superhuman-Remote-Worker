@@ -1330,6 +1330,7 @@ def test_pod_manifest_injects_session_bound_thread_id_env():
         memory_request="256Mi",
         cpu_limit="1",
         memory_limit="2Gi",
+        runtime_actor_bootstrap="srb_session_only",
     )
 
     env = manifest["spec"]["containers"][0].get("env", [])
@@ -1338,6 +1339,13 @@ def test_pod_manifest_injects_session_bound_thread_id_env():
     )
     assert tid_entry is not None
     assert tid_entry["value"] == "11111111-2222-3333-4444-555555555555"
+    actor_entry = next(
+        (e for e in env if e.get("name") == "SRW_RUNTIME_ACTOR_BOOTSTRAP"), None
+    )
+    assert actor_entry == {
+        "name": "SRW_RUNTIME_ACTOR_BOOTSTRAP",
+        "value": "srb_session_only",
+    }
 
 
 def test_pod_manifest_injects_session_jwt_secret_env_from_secretref(monkeypatch):
