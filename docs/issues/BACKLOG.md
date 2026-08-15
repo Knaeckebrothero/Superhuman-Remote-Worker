@@ -17,12 +17,9 @@ blocking it should be taken before the next bench campaign.
 
 | doc | why now |
 |---|---|
-| [officer_control_plane_post_implementation_audit](officer_control_plane_post_implementation_audit.md) | **INDEX — keep `auto_pull` off.** O1–B7 mechanics exist; this audit orders the individual release/security/liveness issues below. Do not close the index until its P0 live gates pass. |
+| [officer_control_plane_post_implementation_audit](officer_control_plane_post_implementation_audit.md) | **INDEX — keep `auto_pull` off.** O1–B7 mechanics exist; this audit orders the release/security/liveness issues below. **The six pre-deployment findings are closed (2026-08-15); nothing here has run on k3d yet.** Next gates are officer_admission_does_not_lock_the_durable_post + officer_decommission_is_not_atomic, before supervised officer testing. Do not close the index until its P0 live gates pass. |
 | [officer_admission_does_not_lock_the_durable_post](officer_admission_does_not_lock_the_durable_post.md) | **P0 concurrency/authority.** Manual admission releases its lock before INSERT, the tick enumerates metadata instead of posts, and lifecycle changes race stale thread-keyed locks. |
 | [officer_decommission_is_not_atomic](officer_decommission_is_not_atomic.md) | **P0 data integrity.** Harvest, wake fold, route drain, unlink, and incarnation append are independent transactions and failure is swallowed. |
-| [direct_blocking_message_freeze_can_outlive_route](direct_blocking_message_freeze_can_outlive_route.md) | **P0 liveness.** Default `user_direct` can freeze before its timeout route exists, stranding job, claim, and slot forever. |
-| [message_route_resume_lacks_generation_cas](message_route_resume_lacks_generation_cas.md) | **P0 race.** Reply/timeout CAS only `waiting_for_reply`, so a delayed route-A actor can resume route B. |
-| [officer_evidence_and_messages_leak_secret_shaped_content](officer_evidence_and_messages_leak_secret_shaped_content.md) | **P0 security.** Evidence, completion reports, and routed messages do not use the generic/known-secret presentation sanitizer. |
 | [backlog_fixed_windows_starve_eligible_tickets](backlog_fixed_windows_starve_eligible_tickets.md) | **P0 liveness.** Limits are applied before claim/validity/outcome filtering; a stable invalid head can hide eligible work forever. |
 | [officer_post_cannot_enable_auto_pull](officer_post_cannot_enable_auto_pull.md) | **P0 functional, release last.** The supported post API rejects `auto_pull`/century spend fields and Cockpit has no enable control. Build behind the other P0 gates. |
 | [gitea_admin_credential_in_every_agent_workspace](gitea_admin_credential_in_every_agent_workspace.md) | **Security.** The Gitea admin credential lands in every agent workspace. Blast radius: any job/agent can act as git admin. |
@@ -47,7 +44,8 @@ blocking it should be taken before the next bench campaign.
 
 | doc | why |
 |---|---|
-| [message_route_delivery_failure_is_stamped_delivered](message_route_delivery_failure_is_stamped_delivered.md) | A notifier error is logged as failed and then unconditionally stamped delivered, disabling retry. |
+| [message_route_delivery_failure_is_stamped_delivered](message_route_delivery_failure_is_stamped_delivered.md) | **Rescoped (OC-06 residue).** False stamp fixed; what remains is a persisted attempt count / last error for diagnosability. Needs a schema change. |
+| [officer_evidence_and_messages_leak_secret_shaped_content](officer_evidence_and_messages_leak_secret_shaped_content.md) | **Rescoped (OC-05 residue).** Sanitizer exists and covers evidence + routed messages; completion reports, SITREP excerpts and notification bodies are still unwired. |
 | [officer_internal_messages_consume_human_rate_limits](officer_internal_messages_consume_human_rate_limits.md) | Officer-only triage is counted against the user's human interruption quotas because limits run before routing. |
 | [job_liveness_defaults_disagree_across_surfaces](job_liveness_defaults_disagree_across_surfaces.md) | Shared/MCP defaults use 30 minutes while REST/officer/session defaults use 60; one job receives contradictory stale classifications. |
 | [officer_card_ignores_viewer_authority_and_i18n](officer_card_ignores_viewer_authority_and_i18n.md) | Viewers see owner-only mutations that always 403, and the entire card bypasses the required EN/DE Transloco catalogs. |

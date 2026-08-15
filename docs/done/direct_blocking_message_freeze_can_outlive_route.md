@@ -1,5 +1,6 @@
 ---
 tags:
+  - resolved
   - issue
   - officers
   - communication

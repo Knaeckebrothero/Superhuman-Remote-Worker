@@ -63,18 +63,22 @@ issue below and close only that issue's acceptance contract. The order preserves
 dependency chain; it is not a claim that every item in one priority must ship in the same
 change.
 
+**Pre-deployment tranche (orders 1, 2, 5, 6, 7, 10) closed 2026-08-15.** The
+code may go to the shared dev cluster under the constraints below. Nothing in
+that tranche has run on k3d — it is unit- and real-Postgres-green only.
+
 | Order | Priority | Issue | Audit finding(s) | Why this boundary |
 |---:|---|---|---|---|
-| 1 | P0 | [[officer_message_actions_trust_shared_transport_identity]] | OC-02 | Establish actor identity before trusting any officer mutation. |
-| 2 | P0 | [[backlog_machine_tags_trust_any_persistent_session]] | BP-09 | Put dispatch authorization on the same trusted caller substrate. |
+| 1 | P0 | [[officer_message_actions_trust_shared_transport_identity]] | OC-02 | Establish actor identity before trusting any officer mutation.  **DONE 2026-08-15.**|
+| 2 | P0 | [[backlog_machine_tags_trust_any_persistent_session]] | BP-09 | Put dispatch authorization on the same trusted caller substrate.  **DONE 2026-08-15.**|
 | 3 | P0 | [[officer_admission_does_not_lock_the_durable_post]] | BP-02/03/04 | One post lock and transaction must govern manual and automatic admission. |
 | 4 | P0 | [[officer_decommission_is_not_atomic]] | OC-03 | Reuse the stable post lock for one complete handoff. |
-| 5 | P0 | [[direct_blocking_message_freeze_can_outlive_route]] | OC-01 | Make the default blocking-send creation recoverable. |
-| 6 | P0 | [[message_route_resume_lacks_generation_cas]] | OC-04 | Fence every reply/timeout to the exact freeze generation. |
-| 7 | P0 | [[officer_evidence_and_messages_leak_secret_shaped_content]] | OC-05 | Sanitize routine officer/user presentation before live use. |
+| 5 | P0 | [[direct_blocking_message_freeze_can_outlive_route]] | OC-01 | Make the default blocking-send creation recoverable.  **DONE 2026-08-15.**|
+| 6 | P0 | [[message_route_resume_lacks_generation_cas]] | OC-04 | Fence every reply/timeout to the exact freeze generation.  **DONE 2026-08-15.**|
+| 7 | P0 | [[officer_evidence_and_messages_leak_secret_shaped_content]] | OC-05 | Sanitize routine officer/user presentation before live use.  **DONE 2026-08-15 (blocker closed; remaining surfaces rescoped P2).**|
 | 8 | P0 | [[backlog_fixed_windows_starve_eligible_tickets]] | BP-06 | Remove permanent starvation before the tick is enabled. |
 | 9 | P0 | [[officer_post_cannot_enable_auto_pull]] | BP-01 | Expose the owner control only after its downstream invariants exist. |
-| 10 | P1 | [[message_route_delivery_failure_is_stamped_delivered]] | OC-06 | Separate attempted/failed from durably accepted delivery. |
+| 10 | P1 | [[message_route_delivery_failure_is_stamped_delivered]] | OC-06 | Separate attempted/failed from durably accepted delivery.  **DONE 2026-08-15 (false stamp fixed; attempt-count rescoped P3).**|
 | 11 | P1 | [[officer_internal_messages_consume_human_rate_limits]] | OC-07 | Split internal flood control from human interruption quotas. |
 | 12 | P1 | [[job_liveness_defaults_disagree_across_surfaces]] | OC-08 | Give every supervision surface one liveness policy. |
 | 13 | P1 | [[officer_card_ignores_viewer_authority_and_i18n]] | OC-10 | Make the management surface truthful for roles and locales. |
