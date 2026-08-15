@@ -440,6 +440,8 @@ def test_create_job_schema_has_no_model_selectable_lineage() -> None:
         "priority",
         "required_deliverables",
         "slot",
+        "ticket",
+        "work_category",
     }
     assert not {"user_id", "thread_id", "parent_job_id"} & fields
 

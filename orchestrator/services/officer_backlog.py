@@ -18,9 +18,9 @@ queue for free: a failed ticket parks until someone looks at it.
 **Correctness does not rest on leadership.** The tick is mounted leader-gated
 because N replicas scanning is waste, but dual-leader windows are real and
 acknowledged in-tree, so the claim itself is what has to be safe: the ticket
-check, the capacity count and the job INSERT happen in ONE advisory-locked
-transaction, and a unique index on ``(project_id, ticket)`` over non-terminal
-jobs refuses a racing second claim outright.
+check, the capacity count and the job INSERT happen in ONE transaction holding
+the stable durable-post row lock, and a unique index on ``(project_id, ticket)``
+over non-terminal jobs refuses a racing second claim outright.
 
 **Failures and outages are different things.** The pool breaker counts job
 failures only. An honest ``goal_achieved=false`` never trips it — punishing a
@@ -38,9 +38,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from services.officer_admission import (
+    OfficerAdmissionConflict,
     SlotAdmissionError,
-    admit_in_transaction,
+    admit_and_create_job,
+    apply_prepared_slot_config,
     officer_is_held,
+    prepare_officer_admission,
 )
 from services.officer_slots import roster_from_meta
 from services.project_backlog import fetch_backlog, fetch_ticket_state
@@ -495,8 +498,6 @@ async def _dispatch_one(
     db: Any,
     *,
     officer_thread_id: str,
-    officer_meta: dict[str, Any],
-    capacity_lineage: Sequence[str],
     project_id: str,
     owner_user_id: Optional[str],
     pool: str,
@@ -543,87 +544,71 @@ async def _dispatch_one(
 
     authorized_at = _aware(ticket.get("ready_at"))
 
-    async with db.acquire() as conn:
-        async with conn.transaction():
-            try:
-                slot_name, slot_patch = await admit_in_transaction(
-                    conn,
-                    thread_id=officer_thread_id,
-                    officer_meta=officer_meta,
-                    capacity_lineage=capacity_lineage,
-                    requested_slot=pool,
-                )
-            except SlotAdmissionError as exc:
-                logger.debug(
-                    "officer backlog: pool %s full (%s)", pool, exc, exc_info=False
-                )
-                return None
-            if slot_name:
-                context["officer_slot"] = slot_name
-            if slot_patch:
-                config_override.update(slot_patch)
+    # Preparation is intentionally outside the final transaction. Slot-driven
+    # grant checks may consult policy stores and must never keep the post lock
+    # open across that work. The fingerprint makes a roster/config change a
+    # deterministic retry instead of a stale dispatch.
+    try:
+        preparation = await prepare_officer_admission(
+            db,
+            project_id=project_id,
+            thread_id=officer_thread_id,
+            requested_slot=pool,
+            require_auto_pull=True,
+            expected_category=category,
+        )
+    except (OfficerAdmissionConflict, SlotAdmissionError) as exc:
+        logger.info(
+            "officer=%s pool=%s skip=admission-preflight:%s",
+            officer_thread_id[:8],
+            pool,
+            exc,
+        )
+        return None
 
-            # Re-read the claim under the lock. The eligibility pass ran on a
-            # different connection, so a racing replica could have claimed this
-            # ticket since. uq_jobs_active_ticket_claim would refuse the INSERT
-            # anyway, but losing that race is normal contention, not an
-            # incident: catching it here makes it a quiet skip instead of a
-            # stack trace every time two replicas tick together. (Only the
-            # app-side half can be closed this way — ready_at lives in the
-            # vector DB and cannot join this transaction, which is the residual
-            # window §5 accepts and the guidance lane steers around.)
-            claimed = await conn.fetchval(
-                """
-                SELECT MAX(created_at)
-                  FROM jobs
-                 WHERE project_id = $1 AND context->>'ticket_note_id' = $2
-                """,
-                _uuid_or_none(project_id),
-                note_id,
-            )
-            claimed_at = _aware(claimed)
-            if (
-                claimed_at is not None
-                and authorized_at is not None
-                and claimed_at >= authorized_at
-            ):
-                logger.info(
-                    "officer=%s pool=%s skip=%s claimed since eligibility read",
-                    officer_thread_id[:8],
-                    pool,
-                    note_id,
-                )
-                return None
+    prepared_config = apply_prepared_slot_config(config_override, preparation)
+    effective_owner_user_id = preparation.owner_user_id or (
+        str(owner_user_id) if owner_user_id else None
+    )
+    if enforce_grants is not None:
+        await enforce_grants(
+            prepared_config,
+            user_id=effective_owner_user_id,
+            project_ids=[project_id] if project_id else [],
+        )
 
-            # Explicit grant check against the post owner — the internal spawn
-            # path bypasses the endpoint's PEP, and a slot that pins a VM
-            # backend or a restricted model must still be something this owner
-            # may actually be granted. Resolved under the SAME runner class the
-            # job will dispatch as, or the autonomy exemption stamped above
-            # would be refused here on every review-ceiling project.
-            if enforce_grants is not None:
-                await enforce_grants(
-                    config_override,
-                    user_id=owner_user_id,
-                    project_ids=[project_id] if project_id else [],
-                )
-
-            job = await db.create_job(
-                description=f"[{category}] {title}",
-                config_name=expert,
-                config_override=config_override or None,
-                context=context,
-                user_id=owner_user_id,
-                project_id=project_id,
-                created_by_thread_id=officer_thread_id,
-                wake_on_complete=True,
-                # Not a bespoke class: `lifecycle` is exactly "system subjob
-                # with the owner's capability grants and a full autonomy
-                # ceiling", which is what a tick job is. jobs_runner_kind_check
-                # accepts user | lifecycle | service and nothing else.
-                runner_kind="lifecycle",
-                conn=conn,
-            )
+    try:
+        job = await admit_and_create_job(
+            db,
+            preparation=preparation,
+            ticket_note_id=note_id,
+            ticket_ready_at=authorized_at,
+            job_kwargs={
+                "description": f"[{category}] {title}",
+                "config_name": expert,
+                # The final helper applies the authoritative slot patch again
+                # after locking/revalidating the post.
+                "config_override": config_override or None,
+                "context": context,
+                "user_id": effective_owner_user_id,
+                "wake_on_complete": True,
+                "authority_user_id": effective_owner_user_id,
+                "authority_project_ids": [project_id]
+                if effective_owner_user_id
+                else None,
+                # `lifecycle` is the established system-subjob class with the
+                # owner's grants and a full autonomy ceiling.
+                "runner_kind": "lifecycle",
+            },
+        )
+    except (OfficerAdmissionConflict, SlotAdmissionError) as exc:
+        logger.info(
+            "officer=%s pool=%s skip=admission:%s",
+            officer_thread_id[:8],
+            pool,
+            exc,
+        )
+        return None
 
     if provision_repo is not None:
         try:
@@ -855,8 +840,6 @@ async def tick_officer(
             job = await _dispatch_one(
                 db,
                 officer_thread_id=thread_id,
-                officer_meta=meta,
-                capacity_lineage=lineage,
                 project_id=project_id,
                 owner_user_id=str(owner_user_id) if owner_user_id else None,
                 pool=pool,
@@ -918,7 +901,7 @@ async def officer_backlog_tick_once(
     """One tick across every commissioned officer. Errors isolate per officer."""
     totals = {"dispatched": 0, "skipped": 0, "breakers_opened": 0, "wakes": 0}
     try:
-        officers = await db.list_officer_threads()
+        officers = await db.list_commissioned_officer_posts_for_backlog()
     except Exception:
         logger.exception("officer backlog: officer listing failed")
         return totals

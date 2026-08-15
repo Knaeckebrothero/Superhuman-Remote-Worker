@@ -44,24 +44,27 @@ with post-row actor guards), and the leader-gated SLA/total-timeout reconciler w
 exactly-once semantics. Ratified defaults: DB `user_direct`, 15-min officer SLA,
 immediate-both for `officer_and_user`. M5 (route badges/thread actions) deferred — the
 O5 card already carries the policy selector. Live k3d walk proved reply-resume, SLA
-escalation, total-timeout resume, and the fail-closed guard; a real officer LLM turn
-consuming a routed question is owed to the O6 live-fire. Original status for the
+escalation, total-timeout resume, and the fail-closed guard. O6 subsequently released the
+Resavio officer successfully with `auto_pull=false`; its committed live-fire is still in
+progress, and a real officer LLM turn consuming a routed question remains an outstanding
+observation there. Original status for the
 record: **PROPOSED (2026-08-14). Nothing implemented.** The existing worker `send_message` tool,
 job message endpoint, notification delivery, generic reply route, officer wake outbox, and
 message readers provide most primitives. Missing are policy resolution, an officer inbox
 route, durable route state, escalation tools, and the timeout that the current config
 already promises but does not implement.
 
-**2026-08-15 post-implementation audit:** the officer-routed blocking path has the intended
-transaction, but the default `user_direct` path can still freeze before its route exists;
-route actions lack actor-bound credentials; reply/timeout CAS does not fence the freeze
-generation; and failed notification can be stamped delivered. Track
-[[direct_blocking_message_freeze_can_outlive_route]],
-[[officer_message_actions_trust_shared_transport_identity]],
-[[message_route_resume_lacks_generation_cas]], and
-[[message_route_delivery_failure_is_stamped_delivered]]; the ordered index is
-[[officer_control_plane_post_implementation_audit]]. M1–M4 must not be treated as a
-complete liveness boundary yet.
+**2026-08-15 post-implementation checkpoints:** transactional direct blocking-route
+creation, runtime-actor authorization, route-generation CAS, initial message/evidence
+sanitization, and truthful retryable delivery outcomes are closed. The subsequent Officer
+Post checkpoint also stages hold/decommission fallback durably inside the post transaction,
+with external notification only after commit; stale blocking-route creation validates the
+same current incarnation under the post lock. The lifecycle follow-up additionally routes
+job completions with one post-locked exact-incarnation-or-vacant-ledger decision and folds
+an undelivered commission brief back into durable state during decommission. That follow-up
+is local and not deployed in the already-running O6 live-fire. The ordered audit remains
+[[officer_control_plane_post_implementation_audit]] because lower-priority OC-05/OC-06
+residues and unrelated unattended-backlog gates remain open.
 
 Audit markers:
 
@@ -204,9 +207,11 @@ job must wait.
 - A held officer (maintenance or conference) is unavailable for the blocking SLA. Route a
   blocking question to the user immediately; asynchronous officer-first messages may queue
   behind the hold. Never release the hold merely to deliver a worker message.
-- Entering hold or decommissioning also drains **already pending** officer-first blocking
-  routes to the user immediately. A later recommission does not adopt an old waiting route
-  merely because it now occupies the post.
+- Entering hold or decommissioning transitions **already pending** officer-first blocking
+  routes to durable user-fallback intent in the same post-locked transaction. Notification
+  delivery runs after commit and remains retryable while its acceptance stamp is null. A
+  later recommission does not adopt an old waiting route merely because it now occupies the
+  post.
 
 ### 5.2 Two deadlines
 

@@ -1,35 +1,37 @@
-"""Officer dispatch admission — the one gate every officer-created job passes.
+"""Authoritative Officer Post job admission.
 
-Before this module the admission rules (hold fence, lineage-aware in-flight
-count, slot roster check, server-side config stamp) lived inline in the
-``POST /api/jobs`` handler. That was fine while the endpoint was the only way an
-officer could start work. The auto-pull tick is a second way, and a second copy
-of these rules would drift — quietly, in the direction of dispatching more
-(docs/features/officer_backlog_pools.md §5.4).
+Every officer-created job, manual or automatic, linearizes on the durable
+``project_officers`` row.  Preparation may resolve grants, datasources and
+other expensive inputs without holding a database transaction; the final
+boundary always does this, on one connection and in this lock order::
 
-Two entry points over one body:
+    project_officers post -> current threads row -> run queue/jobs -> wake/routes
 
-* :func:`admit_in_transaction` — the caller already holds a transaction and
-  wants the advisory lock to still be held when its own INSERT lands. This is
-  what makes the tick's claim+create atomic.
-* :func:`admit` — the endpoint's shape: opens its own short transaction, then
-  hands the result back for a create that happens afterwards.
+Admission uses the post, thread and jobs stages. Lifecycle writers use the
+same ordered prefix in :mod:`orchestrator.database.postgres`. The post key is
+stable across decommission/recommission, unlike the former advisory lock keyed
+by the current thread id.
 
-**The in-flight predicate is every non-terminal status, not the funnel's old
-``('created','processing')``.** A paused or pending-review job still occupies
-its slot, because it still owns the work: the alternative lets a second executor
-start on a story the first one is halfway through and merely stalled on. The
-direction of the change is deliberate — under-use converges back down when the
-officer disposes of the stalled job, two executors on one surface do not
-converge at all. It also makes the capacity predicate equal the claim predicate,
-which is what keeps the tick and the endpoint from disagreeing about whether a
-slot is free.
+The preparation fingerprint is deliberately admission-specific.  A roster,
+durable kit, hold, enabled flag, auto-pull flag, or lineage change makes a
+prepared request retry instead of inserting with a stale slot snapshot.
+Runtime-only ``last_respawn_at`` does not affect admission and is excluded.
+
+``admit_and_create_job_in_transaction`` is connection-aware by design.  BP-05
+can add a durable ticket-claim INSERT to the same caller-owned transaction
+without replacing this funnel; this checkpoint keeps the existing job-row
+claim and partial unique-index backstop intact.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-from typing import Any, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Mapping, Sequence
+from uuid import UUID
 
 from services.officer_slots import SlotAdmissionError
 from services.officer_slots import admit as admit_slot
@@ -37,13 +39,9 @@ from services.officer_slots import admit as admit_slot
 logger = logging.getLogger(__name__)
 
 # Occupying a slot means "this job still owns its work". Mirrors
-# job_liveness.TERMINAL_STATUSES; kept as its own constant so a change here is
-# a deliberate change to capacity, not a side effect of a liveness edit.
+# job_liveness.TERMINAL_STATUSES; kept local so changing liveness presentation
+# cannot silently change capacity.
 TERMINAL_JOB_STATUSES: tuple[str, ...] = ("completed", "failed", "cancelled")
-
-# Rendered once from the constant above, never hand-typed a second time — the
-# same discipline project_backlog.py applies to its note-type list, and for the
-# same reason: a second copy drifts and the drift is invisible.
 _TERMINAL_STATUSES_SQL = "(" + ", ".join(f"'{s}'" for s in TERMINAL_JOB_STATUSES) + ")"
 
 OFFICER_HELD_MESSAGE = (
@@ -52,31 +50,288 @@ OFFICER_HELD_MESSAGE = (
 )
 
 
-def officer_is_held(officer_meta: dict[str, Any]) -> bool:
-    """True while the Legate has this officer held (conference fence).
+class OfficerAdmissionConflict(RuntimeError):
+    """A normal, retryable/refused Officer Post admission outcome."""
 
-    Read straight off the officer's own metadata rather than inferred from a
-    refused dispatch: the tick must skip a held officer silently, and bouncing
-    off the endpoint's 409 to discover that would be both wasteful and wrong
-    (it cannot tell "held" from "out of capacity").
-    """
+    def __init__(self, code: str, detail: str):
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+@dataclass(frozen=True, slots=True)
+class OfficerAdmissionPreparation:
+    """Admission-relevant snapshot used for expensive pre-transaction work."""
+
+    project_id: str
+    thread_id: str
+    requested_slot: str | None
+    slot_name: str | None
+    slot_patch: dict[str, Any]
+    category: str | None
+    config_fingerprint: str
+    incarnation: int
+    owner_user_id: str | None
+    require_auto_pull: bool
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _truthy(value: Any) -> bool:
+    return value in (True, "true", "True", 1)
+
+
+def officer_is_held(officer_meta: dict[str, Any]) -> bool:
+    """True while the current incarnation carries a runtime hold."""
+
     return bool(officer_meta.get("hold"))
+
+
+def _officer_meta(thread_metadata: Any) -> dict[str, Any]:
+    metadata = _as_dict(thread_metadata)
+    return _as_dict(_as_dict(metadata.get("config_override")).get("officer"))
+
+
+def _lineage(post: Mapping[str, Any], current_thread_id: str) -> list[str]:
+    ids = [current_thread_id]
+    for entry in _as_list(post.get("incarnations")):
+        if not isinstance(entry, dict) or not entry.get("thread_id"):
+            continue
+        try:
+            tid = str(UUID(str(entry["thread_id"])))
+        except (TypeError, ValueError):
+            continue
+        if tid not in ids:
+            ids.append(tid)
+    return ids
+
+
+def _fingerprint(
+    post: Mapping[str, Any], officer_meta: dict[str, Any], current_thread_id: str
+) -> str:
+    runtime = dict(officer_meta)
+    # A watchdog timestamp is not roster/config authority and must not force a
+    # harmless retry.  Hold stays: it is an admission fence.
+    runtime.pop("last_respawn_at", None)
+    material = {
+        "thread_id": current_thread_id,
+        "post_config_override": _as_dict(post.get("config_override")),
+        "runtime_officer": runtime,
+        "lineage": _lineage(post, current_thread_id),
+    }
+    encoded = json.dumps(
+        material, sort_keys=True, separators=(",", ":"), default=str
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _slot_category(officer_meta: dict[str, Any], slot_name: str | None) -> str | None:
+    if not slot_name:
+        return None
+    slots = officer_meta.get("slots")
+    if not isinstance(slots, dict):
+        return None
+    spec = slots.get(slot_name)
+    if not isinstance(spec, dict) or not spec.get("category"):
+        return None
+    return str(spec["category"])
+
+
+def _deep_merge(base: Any, override: Any) -> dict[str, Any]:
+    merged = dict(base) if isinstance(base, dict) else {}
+    if not isinstance(override, dict):
+        return merged
+    for key, value in override.items():
+        if isinstance(merged.get(key), dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def apply_prepared_slot_config(
+    base_config_override: dict[str, Any] | None,
+    preparation: OfficerAdmissionPreparation,
+) -> dict[str, Any]:
+    """Apply the prepared authoritative slot patch for preflight checks."""
+
+    return _deep_merge(base_config_override, preparation.slot_patch)
+
+
+def _conflict(code: str, detail: str) -> OfficerAdmissionConflict:
+    return OfficerAdmissionConflict(code, detail)
+
+
+def _validate_live_incarnation(
+    post: Mapping[str, Any],
+    thread: Mapping[str, Any] | None,
+    *,
+    expected_thread_id: str,
+    require_auto_pull: bool,
+) -> dict[str, Any]:
+    linked = str(post.get("thread_id") or "")
+    if not linked:
+        raise _conflict(
+            "post_vacant", "The Officer Post is vacant; retry after commission."
+        )
+    if linked != expected_thread_id:
+        raise _conflict(
+            "stale_incarnation",
+            "Officer Post incarnation changed while work was being prepared; retry.",
+        )
+    if thread is None or str(thread.get("id") or "") != expected_thread_id:
+        raise _conflict(
+            "missing_incarnation",
+            "The Officer Post's current thread is missing; retry after lifecycle repair.",
+        )
+    if str(thread.get("project_id") or "") != str(post.get("project_id") or ""):
+        raise _conflict(
+            "project_mismatch", "The Officer Post/thread project binding is invalid."
+        )
+    if str(thread.get("status") or "") == "ended":
+        raise _conflict("ended_incarnation", "The Officer Post incarnation has ended.")
+    officer_meta = _officer_meta(thread.get("metadata"))
+    if not _truthy(officer_meta.get("enabled")):
+        raise _conflict("officer_disabled", "The Officer Post incarnation is disabled.")
+    if officer_is_held(officer_meta):
+        raise _conflict("officer_held", OFFICER_HELD_MESSAGE)
+    if require_auto_pull and not _truthy(officer_meta.get("auto_pull")):
+        raise _conflict("auto_pull_disabled", "Officer Post auto-pull is disabled.")
+    return officer_meta
+
+
+def _preparation_from_rows(
+    post: Mapping[str, Any],
+    thread: Mapping[str, Any] | None,
+    *,
+    expected_thread_id: str,
+    requested_slot: str | None,
+    require_auto_pull: bool,
+    expected_category: str | None,
+) -> OfficerAdmissionPreparation:
+    officer_meta = _validate_live_incarnation(
+        post,
+        thread,
+        expected_thread_id=expected_thread_id,
+        require_auto_pull=require_auto_pull,
+    )
+    slot_name, slot_patch = admit_slot(officer_meta, requested_slot, {})
+    category = _slot_category(officer_meta, slot_name)
+    if expected_category is not None and category != expected_category:
+        raise _conflict(
+            "slot_category_changed",
+            "Officer Post slot category changed while the ticket was prepared; retry.",
+        )
+    incarnations = _as_list(post.get("incarnations"))
+    owner = thread.get("user_id") if thread is not None else None
+    return OfficerAdmissionPreparation(
+        project_id=str(post["project_id"]),
+        thread_id=expected_thread_id,
+        requested_slot=requested_slot,
+        slot_name=slot_name,
+        slot_patch=dict(slot_patch),
+        category=category,
+        config_fingerprint=_fingerprint(post, officer_meta, expected_thread_id),
+        incarnation=len(incarnations),
+        owner_user_id=str(owner) if owner else None,
+        require_auto_pull=require_auto_pull,
+    )
+
+
+async def prepare_officer_admission(
+    db: Any,
+    *,
+    project_id: str,
+    thread_id: str,
+    requested_slot: str | None,
+    require_auto_pull: bool = False,
+    expected_category: str | None = None,
+) -> OfficerAdmissionPreparation:
+    """Read a coherent preflight snapshot without holding a long transaction."""
+
+    try:
+        project_uuid = UUID(str(project_id))
+        expected_thread_id = str(UUID(str(thread_id)))
+    except (TypeError, ValueError) as exc:
+        raise _conflict(
+            "invalid_identity", "Officer Post identity is invalid."
+        ) from exc
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT po.project_id, po.thread_id, po.config_override,
+                   po.incarnations, po.updated_at AS post_updated_at,
+                   t.id AS current_thread_id, t.project_id AS thread_project_id,
+                   t.status AS thread_status, t.metadata AS thread_metadata,
+                   t.user_id AS thread_user_id, t.created_at AS thread_created_at
+              FROM project_officers po
+              LEFT JOIN threads t ON t.id = po.thread_id
+             WHERE po.project_id = $1
+            """,
+            project_uuid,
+        )
+    if row is None:
+        raise _conflict("post_missing", "Officer Post does not exist.")
+    post = {
+        "project_id": row["project_id"],
+        "thread_id": row["thread_id"],
+        "config_override": row["config_override"],
+        "incarnations": row["incarnations"],
+        "updated_at": row["post_updated_at"],
+    }
+    thread = None
+    if row["current_thread_id"] is not None:
+        thread = {
+            "id": row["current_thread_id"],
+            "project_id": row["thread_project_id"],
+            "status": row["thread_status"],
+            "metadata": row["thread_metadata"],
+            "user_id": row["thread_user_id"],
+            "created_at": row["thread_created_at"],
+        }
+    return _preparation_from_rows(
+        post,
+        thread,
+        expected_thread_id=expected_thread_id,
+        requested_slot=requested_slot,
+        require_auto_pull=require_auto_pull,
+        expected_category=expected_category,
+    )
 
 
 async def count_in_flight_by_slot(
     conn: Any, capacity_lineage: Sequence[Any]
 ) -> dict[str | None, int]:
-    """In-flight job count per slot name across the post's whole lineage.
+    """All-non-terminal capacity by slot over the complete post lineage."""
 
-    Lineage, not thread: jobs created by a prior incarnation of this post keep
-    occupying their slots across a decommission → recommission, or the century
-    silently doubles its capacity the moment a new officer is commissioned
-    (officer_post.md §4).
-    """
+    if not capacity_lineage:
+        return {}
     rows = await conn.fetch(
         f"""
-        SELECT context->>'officer_slot' AS slot,
-               COUNT(*) AS n
+        SELECT context->>'officer_slot' AS slot, COUNT(*) AS n
           FROM jobs
          WHERE created_by_thread_id = ANY($1::uuid[])
            AND status NOT IN {_TERMINAL_STATUSES_SQL}
@@ -84,67 +339,225 @@ async def count_in_flight_by_slot(
         """,
         list(capacity_lineage),
     )
-    return {r["slot"]: int(r["n"]) for r in rows}
+    return {row["slot"]: int(row["n"]) for row in rows}
 
 
-async def admit_in_transaction(
+def _aware(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+async def _lock_current_post(
+    conn: Any, preparation: OfficerAdmissionPreparation
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Lock post then current thread — the repository-wide Officer lock order."""
+
+    post_row = await conn.fetchrow(
+        """
+        SELECT project_id, thread_id, config_override, incarnations, updated_at
+          FROM project_officers
+         WHERE project_id = $1
+         FOR UPDATE
+        """,
+        UUID(preparation.project_id),
+    )
+    if post_row is None:
+        raise _conflict("post_missing", "Officer Post does not exist.")
+    post = dict(post_row)
+    linked = post.get("thread_id")
+    thread_row = None
+    if linked is not None:
+        thread_row = await conn.fetchrow(
+            """
+            SELECT id, project_id, status, metadata, user_id, created_at
+              FROM threads
+             WHERE id = $1
+             FOR UPDATE
+            """,
+            linked,
+        )
+    return post, dict(thread_row) if thread_row is not None else None
+
+
+async def _validate_ticket_claim(
     conn: Any,
     *,
-    thread_id: str,
-    officer_meta: dict[str, Any],
-    capacity_lineage: Sequence[Any],
-    requested_slot: str | None,
-) -> tuple[str | None, dict[str, Any]]:
-    """Lock, count, admit — inside the caller's transaction.
+    project_id: str,
+    note_id: str | None,
+    ready_at: datetime | str | None,
+) -> None:
+    if not note_id:
+        return
+    row = await conn.fetchrow(
+        f"""
+        SELECT MAX(created_at) AS newest,
+               COALESCE(bool_or(status NOT IN {_TERMINAL_STATUSES_SQL}), FALSE)
+                   AS has_non_terminal
+          FROM jobs
+         WHERE project_id = $1
+           AND context->>'ticket_note_id' = $2
+        """,
+        UUID(project_id),
+        str(note_id),
+    )
+    newest = _aware(row["newest"]) if row else None
+    generation = _aware(ready_at)
+    if generation is not None:
+        if newest is not None and newest >= generation:
+            raise _conflict(
+                "ticket_claimed",
+                f"Backlog ticket '{note_id}' is already claimed for this ready generation.",
+            )
+    elif row and bool(row["has_non_terminal"]):
+        # Manual callers historically supplied only the ticket slug. Preserve
+        # that behavior while making same-ticket contention a normal 409:
+        # terminal one-shot/re-ready comparison is used when a ready generation
+        # is supplied (the automatic tick does supply it).
+        raise _conflict(
+            "ticket_claimed",
+            f"Backlog ticket '{note_id}' already has a non-terminal job.",
+        )
 
-    Returns ``(slot_name, config_patch)``. Raises :class:`SlotAdmissionError`
-    when the roster has no room; the caller decides whether that is a 409 (the
-    endpoint) or a skipped pool this tick (the tick).
 
-    The advisory lock is keyed on the officer's thread id, so ordinary job
-    creates never contend and parallel creates from ONE officer serialize. It
-    is an xact lock: it releases when the caller's transaction closes, which is
-    precisely why the tick keeps that transaction open through its INSERT.
-    """
-    await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", thread_id)
-    in_flight = await count_in_flight_by_slot(conn, capacity_lineage)
-    return admit_slot(officer_meta, requested_slot, in_flight)
+async def admit_and_create_job_in_transaction(
+    db: Any,
+    conn: Any,
+    *,
+    preparation: OfficerAdmissionPreparation,
+    job_kwargs: dict[str, Any],
+    ticket_note_id: str | None = None,
+    ticket_ready_at: datetime | str | None = None,
+) -> dict[str, Any]:
+    """Revalidate, count, claim-check and INSERT on ``conn``'s transaction."""
+
+    post, thread = await _lock_current_post(conn, preparation)
+    current = _preparation_from_rows(
+        post,
+        thread,
+        expected_thread_id=preparation.thread_id,
+        requested_slot=preparation.requested_slot,
+        require_auto_pull=preparation.require_auto_pull,
+        expected_category=preparation.category,
+    )
+    if current.config_fingerprint != preparation.config_fingerprint:
+        raise _conflict(
+            "config_changed",
+            "Officer Post configuration or lineage changed while work was prepared; retry.",
+        )
+    if current.owner_user_id != preparation.owner_user_id:
+        raise _conflict(
+            "owner_changed",
+            "Officer Post ownership changed while work was prepared; retry.",
+        )
+    if (
+        current.slot_name != preparation.slot_name
+        or current.slot_patch != preparation.slot_patch
+    ):
+        raise _conflict(
+            "slot_changed",
+            "Officer Post slot selection changed while work was prepared; retry.",
+        )
+
+    lineage = _lineage(post, preparation.thread_id)
+    in_flight = await count_in_flight_by_slot(conn, lineage)
+    officer_meta = _officer_meta(thread.get("metadata"))
+    slot_name, slot_patch = admit_slot(
+        officer_meta, preparation.requested_slot, in_flight
+    )
+    if slot_name != preparation.slot_name or slot_patch != preparation.slot_patch:
+        raise _conflict(
+            "slot_changed",
+            "Officer Post slot selection changed while work was prepared; retry.",
+        )
+
+    await _validate_ticket_claim(
+        conn,
+        project_id=preparation.project_id,
+        note_id=ticket_note_id,
+        ready_at=ticket_ready_at,
+    )
+
+    final_kwargs = dict(job_kwargs)
+    context = dict(final_kwargs.get("context") or {})
+    if slot_name:
+        context["officer_slot"] = slot_name
+    if ticket_note_id:
+        context["ticket_note_id"] = str(ticket_note_id)
+    context["officer_admission"] = {
+        "project_id": preparation.project_id,
+        "thread_id": preparation.thread_id,
+        "incarnation": current.incarnation,
+        "slot": slot_name,
+        "category": current.category,
+        "config_fingerprint": current.config_fingerprint,
+        "lineage_size": len(lineage),
+    }
+    if ticket_ready_at is not None and _aware(ticket_ready_at) is not None:
+        context["officer_admission"]["ticket_ready_at"] = _aware(
+            ticket_ready_at
+        ).isoformat()
+    final_kwargs["context"] = context
+    final_kwargs["config_override"] = _deep_merge(
+        final_kwargs.get("config_override"), slot_patch
+    )
+    final_kwargs["project_id"] = preparation.project_id
+    final_kwargs["created_by_thread_id"] = preparation.thread_id
+    final_kwargs["conn"] = conn
+    return await db.create_job(**final_kwargs)
 
 
-async def admit(
+async def admit_and_create_job(
     db: Any,
     *,
-    thread_id: str,
-    officer_meta: dict[str, Any],
-    capacity_lineage: Sequence[Any],
-    requested_slot: str | None,
-) -> tuple[str | None, dict[str, Any]]:
-    """:func:`admit_in_transaction` with its own short transaction.
+    preparation: OfficerAdmissionPreparation,
+    job_kwargs: dict[str, Any],
+    ticket_note_id: str | None = None,
+    ticket_ready_at: datetime | str | None = None,
+) -> dict[str, Any]:
+    """Own the authoritative admission transaction and normalize contention."""
 
-    The endpoint's shape. Note what it does NOT provide: the lock is gone by
-    the time the caller inserts its job, so this path still has check-then-
-    insert daylight. That is pre-existing and bounded (one officer, one HTTP
-    request at a time in practice); the tick, which runs unattended on every
-    replica, uses the transactional form plus the ticket-claim unique index
-    instead of relying on it.
-    """
-    async with db.acquire() as conn:
-        async with conn.transaction():
-            return await admit_in_transaction(
-                conn,
-                thread_id=thread_id,
-                officer_meta=officer_meta,
-                capacity_lineage=capacity_lineage,
-                requested_slot=requested_slot,
-            )
+    try:
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                return await admit_and_create_job_in_transaction(
+                    db,
+                    conn,
+                    preparation=preparation,
+                    job_kwargs=job_kwargs,
+                    ticket_note_id=ticket_note_id,
+                    ticket_ready_at=ticket_ready_at,
+                )
+    except OfficerAdmissionConflict:
+        raise
+    except Exception as exc:
+        # The partial unique index remains a fail-closed backstop. Stable post
+        # locking makes this exceptional, but another legacy/direct writer can
+        # still race it; report ordinary ticket contention, never a 500.
+        if getattr(exc, "constraint_name", None) == "uq_jobs_active_ticket_claim":
+            raise _conflict(
+                "ticket_claimed",
+                f"Backlog ticket '{ticket_note_id}' was claimed concurrently.",
+            ) from exc
+        raise
 
 
 __all__ = [
     "OFFICER_HELD_MESSAGE",
+    "OfficerAdmissionConflict",
+    "OfficerAdmissionPreparation",
     "SlotAdmissionError",
     "TERMINAL_JOB_STATUSES",
-    "admit",
-    "admit_in_transaction",
+    "admit_and_create_job",
+    "admit_and_create_job_in_transaction",
+    "apply_prepared_slot_config",
     "count_in_flight_by_slot",
     "officer_is_held",
+    "prepare_officer_admission",
 ]

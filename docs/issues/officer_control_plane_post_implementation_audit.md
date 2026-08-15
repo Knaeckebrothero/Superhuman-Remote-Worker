@@ -36,25 +36,28 @@ B7 `fa9fe159` and the independently committed schema repair `ae736584`. The earl
 findings were rechecked against the resulting code rather than copied forward from design
 notes.
 
-The result is mixed:
+The result remains mixed, but the authority/atomicity baseline has materially advanced:
 
-- The B1–B6 mechanics solve several important design problems: category contracts,
-  officer-provenance stripping on worker writes, terminal one-shot claims, a partial unique
-  claim backstop, all-non-terminal capacity, an atomic **tick** insert, executor disposition,
-  and full-autonomy tick jobs.
-- None of the ten control-plane defects found before B1 are fully closed. Several become
-  more damaging once a waiting job also owns a one-shot ticket claim and scarce pool slot.
-- The backlog implementation adds release blockers of its own: the supported API cannot
-  enable it, manual admissions are still check-then-insert, the tick does not use the
-  durable post as its authority, fixed pre-filter limits can starve tickets forever, and
-  any persistent project session can stamp `ready`.
-- The current automated tests are broad but mostly prove happy-path mechanics. They do not
-  exercise the crash windows, actor spoofing, lifecycle races, bounded-window starvation,
-  failed materialization, or viewer-role escalation described below.
+- The six pre-deployment findings (runtime-derived actor identity, machine-tag authority,
+  direct blocking route creation, route-generation CAS, initial sanitization, and truthful
+  retryable notification outcome) are closed.
+- BP-02/BP-03/BP-04 and OC-03 are closed: manual and tick admission share one
+  durable-post transaction, tick enumeration starts from commissioned posts, and the
+  adjacent no-force, orphan-End, continuity, completion-routing and commission-CAS
+  decisions now use the same post-locked authority boundary.
+- Real-PostgreSQL tests now exercise final-slot and same-ticket contention, lifecycle/config
+  races, rollback after every decommission substep, idempotency, route fallback, and
+  decommission/recommission serialization. These are no longer inferred from AsyncMocks.
+- Unattended backlog release is still blocked by the supported enable-control gap and fixed
+  pre-filter starvation, followed by the still-open durable-claim, provisioning,
+  materialization, roster, evidence, and operational residues listed below.
 
-“Implemented” in the feature docs therefore means that the slices exist, not that the
-unattended control plane is safe to release. O6/live-fire and `auto_pull=true` are blocked
-until the P0 gates in [Release order and acceptance](#release-order-and-acceptance) pass.
+“Implemented” in the feature docs therefore still does not mean unattended backlog release
+is safe. The earlier tranche was deployed and O6 was released successfully with
+`auto_pull=false`; that live-fire was in progress before this local, not-yet-deployed
+transaction checkpoint. Nothing here authorizes `auto_pull=true` or unattended backlog
+release. The umbrella stays open until the remaining P0 live gates in
+[Release order and acceptance](#release-order-and-acceptance) pass.
 
 ## Individual issue ledger
 
@@ -63,16 +66,17 @@ issue below and close only that issue's acceptance contract. The order preserves
 dependency chain; it is not a claim that every item in one priority must ship in the same
 change.
 
-**Pre-deployment tranche (orders 1, 2, 5, 6, 7, 10) closed 2026-08-15.** The
-code may go to the shared dev cluster under the constraints below. Nothing in
-that tranche has run on k3d — it is unit- and real-Postgres-green only.
+**Pre-deployment tranche (orders 1, 2, 5, 6, 7, 10), BP-02/BP-03/BP-04 and OC-03
+closed 2026-08-15.** The earlier tranche reached dev and O6 was released successfully
+with `auto_pull=false`; this additional transaction checkpoint is local, uncommitted and
+not deployed.
 
 | Order | Priority | Issue | Audit finding(s) | Why this boundary |
 |---:|---|---|---|---|
 | 1 | P0 | [[officer_message_actions_trust_shared_transport_identity]] | OC-02 | Establish actor identity before trusting any officer mutation.  **DONE 2026-08-15.**|
 | 2 | P0 | [[backlog_machine_tags_trust_any_persistent_session]] | BP-09 | Put dispatch authorization on the same trusted caller substrate.  **DONE 2026-08-15.**|
-| 3 | P0 | [[officer_admission_does_not_lock_the_durable_post]] | BP-02/03/04 | One post lock and transaction must govern manual and automatic admission. |
-| 4 | P0 | [[officer_decommission_is_not_atomic]] | OC-03 | Reuse the stable post lock for one complete handoff. |
+| 3 | P0 | [[officer_admission_does_not_lock_the_durable_post]] | BP-02/03/04 | One post lock and transaction governs manual and automatic admission. **DONE 2026-08-15.** |
+| 4 | P0 | [[officer_decommission_is_not_atomic]] | OC-03 | The stable post lock governs the complete handoff and adjacent continuity decisions. **DONE 2026-08-15.** |
 | 5 | P0 | [[direct_blocking_message_freeze_can_outlive_route]] | OC-01 | Make the default blocking-send creation recoverable.  **DONE 2026-08-15.**|
 | 6 | P0 | [[message_route_resume_lacks_generation_cas]] | OC-04 | Fence every reply/timeout to the exact freeze generation.  **DONE 2026-08-15.**|
 | 7 | P0 | [[officer_evidence_and_messages_leak_secret_shaped_content]] | OC-05 | Sanitize routine officer/user presentation before live use.  **DONE 2026-08-15 (blocker closed; remaining surfaces rescoped P2).**|
@@ -104,8 +108,8 @@ These are real gains and should be preserved while repairing the findings:
   ticket while their job rows exist; a newer `ready_at` explicitly re-arms it.
 - Migration 0160 adds a partial unique index against concurrent non-terminal claims for the
   same ticket.
-- The auto-pull tick holds claim check, capacity check, and job INSERT in one transaction,
-  under its admission lock.
+- Manual and automatic officer creation both lock the durable post, revalidate the current
+  incarnation/config/lineage, check claim and capacity, and INSERT on one connection.
 - Capacity consistently includes every non-terminal job state, including paused and
   `waiting_for_reply` jobs.
 - Executor work is serialized and gated on prior disposition unless the ticket carries the
@@ -115,16 +119,16 @@ These are real gains and should be preserved while repairing the findings:
 - Sitrep, loop prompts, and the Cockpit card expose the new concepts. The gaps below concern
   truthfulness, authority, and operability, not absence of those surfaces.
 
-## Previously reported findings — still open
+## Previously reported findings — current status
 
 | ID | Severity | Finding and current evidence | Effect once backlog pools run |
 |---|---|---|---|
-| OC-01 | **P0** | The default `user_direct` blocking-message path publishes the job freeze before notification/log/route creation. Route creation is later and explicitly best-effort (`send_agent_message`; `publish_blocking_message`; `create_message_route`). | A crash or route-write failure leaves no `job_message_routes` row for the timeout reconciler. The job, ticket claim, and pool slot can remain held forever. |
-| OC-02 | **P0 security** | `_require_officer_route_actor` authenticates only the shared internal transport key and trusts the body’s `officer_thread_id` claim after comparing it with the post. Stateless agent pods receive the same `MCP_INTERNAL_KEY`; `X-MCP-Scope` is checked only when supplied. | A compromised worker can claim a discoverable commissioned thread ID and reply, escalate, or acknowledge as the officer. A bootstrap secret is not actor identity. |
-| OC-03 | **P0** | `_decommission_officer_post` harvests state, folds wakes, drains routes, clears the post, and appends history through separate transactions. `_stand_down` catches and swallows hygiene failure. The summary also computes `commissioned` from the post link before proving a live officer exists. | A crash can vacate the post while losing history/state or only partly draining routes. A stale ended-thread link renders `commissioned: true` with no live officer. |
-| OC-04 | **P0** | Reply and timeout paths compare `jobs.status`, but the resume write is not fenced by the expected `freeze_data.route_id`. Route resolution and job resume are separate writes (`_route_inbound_reply`, `_queue_job_for_resume_on_conn`, `claim_total_timeout_routes`). | A reply/timeout race, or an ABA refreeze into `waiting_for_reply`, can resume the wrong question generation or leave job state and route state contradictory. |
-| OC-05 | **P0 security** | Evidence reads call `redact_git_error(text)` without secret values; that helper only strips URL userinfo and explicitly supplied secrets. The generic secret-shape redactor is not used. Completion-report and message routes return/forward worker text without equivalent redaction. | Worker output, injected content, or a copied credential can be fed to the officer and/or user verbatim. Enabling evidence and routine officer triage increases the exfiltration surface. |
-| OC-06 | **P1** | `deliver_route_to_user` logs a failed notifier result but unconditionally calls `mark_route_user_delivery`. The reconciler retries only routes whose delivery stamp is null. | A failed notification can be recorded as delivered and will not be retried. |
+| OC-01 | **DONE 2026-08-15** | Direct blocking message creation persists message, route, wake intent, and freeze in one transaction. | Failure injection proves no frozen job can outlive its route. |
+| OC-02 | **DONE 2026-08-15** | Officer message actions use the server-derived runtime actor credential boundary. | Shared transport identity alone cannot claim officer authority. |
+| OC-03 | **DONE 2026-08-15** | One post-locked lifecycle transaction now includes the full-lineage no-force gate; direct orphan End, commission continuity, completion routing and commission config CAS use the same exact post/incarnation fence. | Real-PostgreSQL races prove admission and no-force decommission cannot both succeed, and continuity is delivered or retained exactly once across lifecycle changes. |
+| OC-04 | **DONE 2026-08-15** | Reply/timeout resume is fenced to the exact route/freeze generation. | ABA and concurrent resolver tests prove an old actor cannot resume a newer wait. |
+| OC-05 | **P0 blocker DONE 2026-08-15; P2 residues remain** | Initial evidence and worker/officer message presentation uses secret-shape sanitization. | The release-blocking routine surfaces are closed; separately enumerated lower-priority surfaces remain in the existing OC-05 residue scope. |
+| OC-06 | **P1 blocker DONE 2026-08-15; P3 residue remains** | Delivery stamps now derive from accepted provider outcome; failure stays retryable with a null stamp. | Attempt-count observability remains in the existing lower-priority OC-06 residue scope. |
 | OC-07 | **P1** | Human message quotas are checked before effective routing. Officer-only internal traffic is written into the same outbound message ledger counted by `check_message_rate_limit`. | Internal chain-of-command traffic consumes the human interruption quota, contrary to the routing contract. |
 | OC-08 | **P1** | The liveness implementation still has multiple defaults: the shared helper/environment and MCP descriptor use 30 minutes while the REST/officer/session surface defaults to 60. | Stale-claim alarms, tools, and UI can disagree about whether the same job is stuck. |
 | OC-09 | **P2 latent** | `allows_parallel(category)` treats an unknown or absent category as parallel-safe. No production caller currently uses this helper. | The first future caller can silently weaken executor serialization. Unknown categories must fail closed before the helper is activated. |
@@ -148,45 +152,32 @@ authority and makes “end-to-end usable” inaccurate.
 documented boundary, survive recommission, and are covered by a default-off test plus a
 deliberate enable/disable live test.
 
-### BP-02 — manual officer admission still releases its lock before INSERT (**P0**)
+### BP-02 — authoritative manual/tick admission (**DONE 2026-08-15**)
 
-`officer_admission.admit()` deliberately opens a short transaction, calls
-`admit_in_transaction()`, and returns after the transaction-scoped advisory lock is gone.
-The REST create-job handler then performs more work and inserts separately. The tick path
-is atomic; the officer’s own manual `create_job` path is not.
+Manual `POST /api/jobs` and automatic tick dispatch now call the same
+`admit_and_create_job()` transaction. It locks the durable post and current thread,
+revalidates configuration/lineage, counts all non-terminal capacity, validates the job-row
+claim, stamps provenance, and inserts with `create_job(conn=...)`. Real-PostgreSQL races
+prove one winner for both different-ticket final-slot contention and same-ticket
+manual/manual or manual/tick contention; the loser is a normal 409/skip, not a 500.
 
-Two concurrent creates for different tickets can both observe a free final slot and
-overfill it. Two creates for the same ticket fall into the database unique violation after
-the API already admitted both, producing a generic server failure instead of the promised
-409. This is the exact “one ledger, real atomicity” requirement B3 was meant to satisfy.
+### BP-03 — commissioned-post tick authority (**DONE 2026-08-15**)
 
-**Acceptance:** every officer-created job goes through one transaction that locks the
-durable post, revalidates its current incarnation/hold/config, checks ticket and capacity,
-and inserts. Concurrency tests must cover same-ticket and different-ticket races.
+`officer_backlog_tick_once()` now uses the dedicated
+`list_commissioned_officer_posts_for_backlog()` query over
+`project_officers JOIN threads`. `list_officer_threads()` remains unchanged for the
+watchdog/session-wake callers that intentionally enumerate runtime officer-shaped threads.
+An enabled orphan is excluded by the authoritative query and rejected again at final
+admission.
 
-### BP-03 — the tick enumerates officer-like threads, not commissioned posts (**P0 authority**)
+### BP-04 — stable post lock across lifecycle/config races (**DONE 2026-08-15**)
 
-`PostgresDB.list_officer_threads()` selects every non-ended thread whose metadata says
-`officer.enabled=true`; it does not join `project_officers`. `officer_backlog_tick_once()`
-uses that method despite promising “every commissioned officer.” An orphan, legacy, or
-duplicate enabled thread can therefore pull project work even though it does not hold the
-durable post. Its capacity lineage can fall back to itself.
-
-**Acceptance:** tick input is `project_officers JOIN threads` with one current, live
-incarnation per project. Legacy enabled metadata is never sufficient authority.
-
-### BP-04 — hold/decommission/recommission can race a stale tick (**P0**)
-
-`tick_officer()` snapshots thread metadata, hold, roster, and lineage before admission.
-`admit_in_transaction()` locks a key derived from that old thread ID but never re-reads the
-post, current thread, hold, `auto_pull`, or roster under the transaction. A hold,
-disable, or decommission after the scan can still be followed by a dispatch. Old and new
-incarnations use different lock keys, so recommission can admit concurrently on both sides
-of the post transition and exceed lineage-aware capacity.
-
-**Acceptance:** admission locks a stable post/project key and performs a transactional
-current-post/config/hold check. Race tests interleave hold, disable, decommission, and
-recommission immediately before INSERT.
+Admission, registration/recommission, hold/release, post roster/config writes, blocking
+route creation and decommission share the stable `project_officers` row-lock prefix. Final
+admission re-reads the exact live incarnation, enabled/hold/auto-pull state, roster,
+category, owner and full lineage. Real-PostgreSQL tests interleave hold, disable, roster
+change, decommission and recommission immediately before INSERT and prove the stale request
+never creates a job.
 
 ### BP-05 — deleting a job deletes its one-shot claim (**P1 data integrity**)
 
@@ -320,15 +311,15 @@ The three schema declarations discovered during that work landed independently a
 It remains intentionally outside the first acceptance kit; landing a wider roster does not
 relax any release gate in this audit.
 
-## How the old and new defects compound
+## Closed interactions and remaining compound risks
 
-| Earlier defect | Backlog interaction |
+| Finding | Current backlog interaction |
 |---|---|
-| OC-01 route creation lost after freeze | The waiting job now also holds a one-shot claim and pool capacity indefinitely. |
-| OC-02 officer impersonation | A compromised worker can resolve or suppress the very blocker that governs its own job and ticket. |
-| OC-03 split decommission | BP-03/BP-04 allow an orphan or stale incarnation to keep dispatching while the post is vacant or changing hands. |
-| OC-04 reply-generation race | The wrong resume changes both job liveness and the capacity/claim view used by the next tick. |
-| OC-05 ineffective redaction | Evidence and worker questions are now routine officer prompt inputs, not rare operator reads. |
+| OC-01 transactional route creation — **closed** | A blocking job cannot hold a claim/slot without the matching durable route. |
+| OC-02 runtime actor boundary — **closed** | A worker cannot claim officer authority merely by naming the commissioned thread. |
+| BP-02/03/04 post authority + OC-03 handoff — **closed** | Admission, no-force handoff, orphan retirement, commission continuity and completion routing serialize on the durable post. |
+| OC-04 route-generation CAS — **closed** | An old reply/timeout cannot change the liveness/capacity view of a newer freeze. |
+| OC-05 routine sanitization — **release blocker closed** | Lower-priority enumerated presentation residues remain, but routine officer inputs no longer carry the original release-blocking leak. |
 | OC-08 liveness drift | Stale-claim pages, officer tools, and Cockpit can disagree about the same slot. |
 | OC-10 UI authority gap | BP-01/BP-11 leave the one visible management surface both over-permissive in appearance and incomplete for real operation. |
 
@@ -337,10 +328,12 @@ relax any release gate in this audit.
 Fixing isolated symptoms in arbitrary order will keep reopening the same seams. The safe
 sequence is:
 
-1. **Identity and authority:** OC-02, BP-03, BP-04, BP-09. Establish a server-derived actor
-   identity and make the durable post/project key the one lock and dispatch authority.
-2. **Atomic state transitions:** OC-01, OC-03, OC-04, BP-02. Route+freeze, decommission,
-   reply generation, and every admission path each need one database transaction/CAS.
+1. **Identity and authority — completed 2026-08-15:** OC-02, BP-03, BP-04, BP-09.
+   Runtime actors are server-derived and the durable post is dispatch authority.
+2. **Atomic state transitions — completed 2026-08-15:** OC-01, OC-03, OC-04 and BP-02
+   now have transactional/CAS boundaries, including the full-lineage no-force gate,
+   orphan-End decision, commission continuity, completion routing and commission config
+   generation fence.
 3. **Durable eligibility and preflight:** BP-05, BP-06, BP-07, OC-08, OC-09. Claims must
    survive retention, scans must not starve, and a job must not be dispatchable until its
    prerequisites are ready.
@@ -351,15 +344,23 @@ sequence is:
 6. **Live fire:** enable one non-executor pool with disposable tickets, inject notification,
    KB, provisioning, and officer-restart faults, then graduate to the executor singleton.
 
-Minimum regression/live gates before `auto_pull` leaves its safe default:
+Completed automated transaction gates (not a substitute for live fire):
 
-- Kill the process after each step of a direct blocking send and each decommission step;
-  every restart must find one recoverable state, never an untracked freeze or vacant post
-  without history.
-- Race two manual/tick admissions, hold, disable, decommission, and recommission. Capacity
-  never exceeds the post’s current lineage-aware ceiling and no old incarnation dispatches.
-- Re-freeze one job onto route B while route A’s reply and timeout race. Neither actor may
-  resume B; route and job generations end in one consistent state.
+- Failure after every direct blocking-send/decommission database substep yields rollback
+  or one complete recoverable state; no untracked freeze or partial vacant-post handoff.
+- Manual/manual and manual/tick admission races, plus hold, disable, roster,
+  decommission/recommission interleavings, preserve lineage capacity and reject stale
+  incarnations.
+- Admission/no-force decommission cannot both succeed; direct orphan End cannot disturb a
+  commissioned successor; commission continuity and job-completion routing remain
+  exactly-once across commission/decommission races; a losing commission cannot patch the
+  winner.
+- Route A reply/timeout actors cannot resume a refrozen route B generation.
+
+Remaining minimum regression/live gates before `auto_pull` leaves its safe default:
+
+- Repeat the completed transaction gates through supervised process/pod interruption in a
+  disposable environment; no real project or held officer is in scope for this checkpoint.
 - Put more than 10 claimed/invalid tickets ahead of an eligible ticket, more than 10 mixed
   breaker outcomes in a pool, and more than 50 open claims. The correct tail item/outcome/
   oldest stale claim remains visible.
@@ -398,6 +399,60 @@ at current tip `ae736584`, including writer/category and grant-snapshot coverage
   -q --tb=short
 ```
 
-That green suite is useful evidence for the mechanics listed in “What B1–B6 genuinely
-fixed.” It does not rebut the findings: most are absent negative/race/crash tests, and the
-suite contains no live background-officer image consumption gate.
+That suite remains useful historical evidence for the mechanics listed in “What B1–B6
+genuinely fixed.” The later post-safety checkpoint added the negative, race and crash
+coverage that was absent there. At the completed checkpoint, the expanded focused command
+was:
+
+```bash
+python -m pytest \
+  tests/test_officer_lifecycle.py tests/test_officer_post.py \
+  tests/test_officer_backlog_tick.py tests/test_officer_slots.py \
+  tests/test_officer_message_routing.py \
+  tests/test_officer_message_routing_real_postgres.py \
+  tests/test_backlog_ticket_plumbing.py \
+  tests/test_runtime_actor_authorization.py \
+  tests/test_stateless_worker_control.py \
+  tests/test_officer_post_transactions_real_postgres.py \
+  tests/test_officer_conference.py tests/test_session_wake_linkage.py \
+  -q --tb=short
+# 461 passed in 199.47s
+```
+
+The real-PostgreSQL admission/routing/handoff subset produced **48 passes in 115.55
+seconds**. It uses a disposable PostgreSQL 15 testcontainer and includes final-slot and
+same-ticket races, every named decommission fault point, repeated handoff, concurrent
+handoff/recommission, the stale-route race, both admission/no-force outcomes, all
+non-terminal lineage states, occupied/vacant orphan End, commission continuity,
+completion/commission exactly-once routing, and the losing-commission CAS.
+`auto_pull=true` is synthesized only in the isolated manual/tick race fixture.
+
+Repository static gates are clean: `ruff check src/ orchestrator/ tests/`,
+`ruff format --check src/ orchestrator/ tests/` (**1201 files already formatted**), and
+`git diff --check` all exited zero.
+
+The current checkpoint also ran `./scripts/pytest-fast.sh` with its default system
+interpreter. It reached **14,772 passes and 123 skips in 120.85 seconds** before the
+script's fail-fast boundary stopped on one import-time failure:
+`tests/tools/research/test_arxiv_client.py::test_installed_arxiv_package_exposes_client_results`.
+`/usr/bin/python -c "import arxiv"` reproduces `ModuleNotFoundError`; the complete file
+passes under the project virtualenv (**22 passed in 0.12 seconds**). This proves a local
+interpreter/dependency distinction rather than an Officer assertion failure.
+
+An earlier non-fail-fast diagnostic established the rest of the known environment shape.
+The system interpreter is not the pinned CI Python and lacks two declared requirements:
+`arxiv` and `langchain-mcp-adapters`; a local
+`DATABASE_URL` also pointed at an absent `localhost:5432` service. With that database
+variable blanked and the directly affected collection files excluded, a non-fail-fast run
+reached **18,614 passes and 164 skips**; its only three failures were the two remaining
+arXiv health assertions and one MCP wiring assertion importing those same missing packages.
+The arXiv client module produced **22 passes** and both health assertions passed under the
+project venv, where `arxiv` is installed. Direct imports reproduce the MCP adapter absence
+under both available interpreters. One unrelated permission-wait file was excluded after
+the broad xdist order reused an `asyncio.Event` bound to another loop; the complete file
+passes alone (**24 passed**). These are explicit local-environment/test-isolation gaps, not
+officer checkpoint failures.
+
+The umbrella nevertheless remains open: this automated transaction evidence does not
+close BP-01/BP-05/BP-06/BP-07/BP-08/BP-11, ES-01, the remaining OC-05/OC-06 residues, or
+the live background-officer image-consumption gate.

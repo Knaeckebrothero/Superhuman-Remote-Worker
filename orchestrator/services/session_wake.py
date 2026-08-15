@@ -920,34 +920,23 @@ async def _note_ceiling_breach(
 async def _notify_project_officer_of_job(db: Any, job_id: str, status: str) -> bool:
     """Enqueue an officer wake for a job transition, by project. Never raises.
 
-    While the project's post is vacant (officer_post.md §5) the transition is
-    not dropped: it lands on the post's while-vacant ledger, and the next
-    commission's continuity brief opens with it.
+    The database makes one post-locked decision: enqueue for the exact current
+    live incarnation, or append to the while-vacant ledger. Commission cannot
+    slip between an unlocked lookup and the write.
     """
     try:
         job = await db.get_job(str(job_id))
         if not job or not job.get("project_id"):
             return False
         project_id = str(job["project_id"])
-        entry = {
-            "job_id": str(job_id),
-            "status": str(status),
-            "description": _truncate(str(job.get("description") or ""), 200),
-        }
-        officer = await db.get_officer_thread_for_project(project_id)
-        if not officer:
-            await db.append_project_officer_while_vacant(
-                project_id,
-                [{**entry, "at": datetime.now(timezone.utc).isoformat()}],
-            )
-            return False
-        enqueued = await db.enqueue_session_wake_event(
-            str(officer["id"]),
-            source="job_transition",
+        decision = await db.route_project_officer_job_transition(
+            project_id,
+            job_id=str(job_id),
+            status=str(status),
+            description=_truncate(str(job.get("description") or ""), 200),
             dedup_key=_officer_job_dedup_key(job_id, status),
-            payload=entry,
-            project_id=project_id,
         )
+        enqueued = bool(decision.get("enqueued"))
         if enqueued:
             kick_event_drain(db)
         return enqueued

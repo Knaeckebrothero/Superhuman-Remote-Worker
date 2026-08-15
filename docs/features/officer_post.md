@@ -43,22 +43,28 @@ release + PATCH + finished GET (`9a3c3934`), the one-state cockpit card (`d7cfd7
 Locked decisions applied: project-admin authority, `line ×2 · sandbox` starter draft,
 brain-edit deferred with the "applies on next respawn" label; `communication_policy`
 shipped on the row (default `user_direct`) and is now live via [[officer_message_routing]]
-M1–M4. **O6 (releasing the held Resavio officer through the new endpoint) deliberately
-not performed** — sequenced behind the knowledge-plane/supervision/routing landings, all
-of which shipped the same day; the release is the next live-fire step.
+M1–M4. **At that implementation point, O6 (releasing the held Resavio officer through the
+new endpoint) was deliberately not performed** — it was sequenced behind the
+knowledge-plane/supervision/routing landings. O6 was subsequently released successfully
+with `auto_pull=false`; its in-progress record is
+[[officer_backlog_pools_resavio_livefire]].
 
 **2026-08-14 follow-on:** [[officer_knowledge_plane]] defines what the commissioned
 background officer may know and write; [[officer_supervision_surface]] defines his scoped
 job reads; [[officer_message_routing]] adds a user-owned worker-question policy to this
-durable post. These are proposed additions. They do not change the row/thread lifecycle
+durable post. These shipped additions do not change the row/thread lifecycle
 model below.
 
-**2026-08-15 post-implementation audit:** O1–O5 exist, but decommission is not one atomic
-transition and a stale ended-thread link can report a commissioned post with no live
-officer. The backlog tick also needs to lock and revalidate this durable post rather than
-trusting enabled thread metadata. Track the fixes in [[officer_decommission_is_not_atomic]]
-and [[officer_admission_does_not_lock_the_durable_post]]; the ordered index is
-[[officer_control_plane_post_implementation_audit]]. O6 remains held.
+**2026-08-15 post-implementation transaction checkpoint:** the
+decommission/read-truth and manual/tick admission-authority findings are closed.
+Admission, registration, commission continuity, hold/release, post config, completion
+routing, blocking-route creation and decommission share the durable post lock; real
+PostgreSQL race/fault tests are recorded in
+[[officer_admission_does_not_lock_the_durable_post]] and
+[[officer_decommission_is_not_atomic]]. The earlier tranche was already deployed and O6
+was already released successfully with `auto_pull=false`; this additional checkpoint is
+local, uncommitted and not deployed. The ordered audit remains open because `auto_pull`
+and its remaining P0 gates are not released.
 
 ## 1. Motivation — four defects with one root
 
@@ -93,8 +99,9 @@ the Resavio command (`d67ee261`):
    hope. Wake events, loops (`scheduling='officer'`), conference holds and the watchdog
    all key off this inference.
 
-The 2026-08-01 maintenance hold on `d67ee261` (see §6) is the live bridge: he is paused,
-state intact, waiting for this migration so he can be the backfill's first adoption.
+The 2026-08-01 maintenance hold on `d67ee261` (see §6) was the live bridge: he remained
+paused with state intact until the backfill adopted him and the later O6 live-fire released
+him through the supported endpoint.
 
 ## 2. The model
 
@@ -216,6 +223,14 @@ funnel, so there is exactly one path that raises an officer, and the row can nev
 disagree with the threads table about who holds the post. Our own dev provisioning
 recipe (in-pod curl `POST /persistent/threads`) keeps working and lands registered.
 
+**Stable lock domain and order (2026-08-15 checkpoint):** every post-authoritative writer
+starts by locking `project_officers(project_id) FOR UPDATE`, then its current thread.
+When present, the remaining order is run-queue/job authority followed by wake/route rows;
+operations that do not touch a stage simply skip it. No transaction crosses repository
+provisioning, notification delivery, an agent call, or other network work. This stable
+project key survives decommission/recommission and replaces the old thread-keyed advisory
+admission lock.
+
 **Capacity across incarnations** — a real edge the row fixes: admission and
 `_capacity_section` count in-flight jobs by `created_by_thread_id = <current thread>`.
 A job left running across a decommission→recommission (the design *encourages* leaving
@@ -228,21 +243,27 @@ rows and their `context.officer_slot` stamps are untouched.
 
 ### Commission — `POST /api/projects/{id}/officer/commission`
 
-Body: optional partial config (same fields as §7's PATCH; validated, merged into the
-row first). Then:
+Body: optional partial config (same fields as §7's PATCH). Preparation validates the
+fragment and snapshots the vacant post generation. The commission-only row update then
+requires both vacancy and that exact `updated_at` generation, so a losing concurrent
+commission cannot patch the winner. Then:
 
-1. If `thread_id` points at an *ended* thread (crash-ended incarnation under the v1
-   page-and-wait policy), fold it first: harvest state, append the incarnation entry,
-   unlink. Commission always starts from a clean link.
+1. If `thread_id` points at an *ended/disabled* thread (crash-ended incarnation under the
+   v1 page-and-wait policy), complete the authoritative decommission transaction first:
+   harvest/fold/fallback/history/unlink/disable as one handoff. Registration never performs
+   a partial stale-link fold, so commission always starts from a clean link.
 2. Create the thread through the existing funnel with the row's `config_override` and
-   title `Centurion — <project>`; registration (§4) links it. Boot follows the normal
-   attach path — nothing new.
-3. Enqueue the **continuity brief** as his first wake:
-   `enqueue_session_wake_event(thread, source='commission', dedup_key=<thread_id>)` —
-   the source column is deliberately unconstrained (`0074` migration comment), and the
-   dedup key makes retries coalesce. Payload: vacant-since/until, a pointer at his last
-   state note and the charter (which he re-reads anyway — identity lives in the project
-   stores, centurion.md §5), and the **while-vacant ledger** below.
+   title `Centurion — <project>`; explicit-commission registration locks the post and the
+   candidate, links that exact live/enabled incarnation, restores harvested officer state,
+   drains the while-vacant ledger, and creates the deduplicated **continuity brief** wake
+   in the same transaction. Payload: vacant-since/until, a pointer at his last state note
+   and the charter (which he re-reads anyway — identity lives in the project stores,
+   centurion.md §5), and the ledger below.
+3. After external provisioning/attach work, re-lock and confirm that the exact candidate
+   remains the current live incarnation before returning `commissioned: true`. A racing
+   decommission therefore yields a retryable conflict rather than a misleading success.
+   If decommission follows the registration commit before the wake is delivered, it folds
+   the pending commission brief back into durable state before clearing the wake.
 
 **Recommission is a new incarnation, not `resume_thread` — a decided design point.**
 Resuming the old thread replays a landmine: pending `session_wake_events` are excluded
@@ -255,28 +276,37 @@ click away via `incarnations`.
 
 ### Decommission — `POST /api/projects/{id}/officer/decommission`
 
-Replaces the bare thread-DELETE with actual hygiene, in order:
+Replaces the bare thread-DELETE with actual hygiene. Steps 1–4 are one authoritative
+PostgreSQL transaction under the post → current-thread → jobs → wake/route lock order:
 
-1. **Warn on in-flight jobs** (unless `force`): the response lists them; the default is
-   *leave them running* — a pause must not kill his work. Their completions reach the
-   post regardless: `notify_officer` resolves the officer via the project, so a later
-   incarnation gets the wake, and a vacant post records it in the ledger.
+1. **Gate on in-flight jobs** (unless `force`) after locking the post/current thread. Count
+   every status other than `completed`/`failed`/`cancelled` across current + historical
+   incarnations. If any exist, return the warning without changing the post. Admission
+   holds the same post lock through INSERT, so admission and no-force decommission cannot
+   both succeed.
 2. **Harvest** `metadata.officer_state` → `row.state`, whole (digest, pages,
    fingerprints — the fingerprints are the point).
 3. **Fold + clear the queue.** Pending wake events for the thread: job-shaped ones
    append to `row.state.while_vacant` (ring, cap 20, drop-oldest with a dropped-count);
    the rest (timer, fleet) are deleted — a sleep timer for an absent officer is
    meaningless.
-4. End the thread via the existing `end_thread` flow (enabled-flip, workspace snapshot,
-   pod teardown all unchanged). The officer branch there (`main.py:26785`) *becomes*
-   this step, so a direct DELETE on an officer thread routes through decommission —
-   again one funnel.
-5. Unlink `thread_id`, append the incarnation entry `{thread_id, commissioned_at,
-   decommissioned_at, reason}`.
+4. Stage pending blocking officer routes as durable user fallback, append exactly one
+   incarnation, unlink `thread_id`, and perform the server-owned disable/end write.
+5. After commit, deliver staged route notifications and run external workspace/pod cleanup.
+   Notification failure leaves the durable delivery stamp null and is retryable; an
+   authoritative post failure is never swallowed. Direct DELETE and explicit decommission
+   enter this same transaction.
 
-While vacant, the `maybe_wake_session` officer leg appends terminal-status entries for
-the project's jobs to the same ledger instead of dropping them — the commission brief
-then opens with "while the post was vacant: …".
+Direct End of an enabled legacy/orphan thread uses an orphan-retirement branch under the
+same post lock. When another incarnation holds the post—or the post is vacant—it
+disables/ends only the target orphan. It does not harvest state, append history, drain
+wakes/routes, unlink, or touch the current incarnation; concurrent registration therefore
+serializes on the vacancy decision.
+
+Job completion uses one post-locked database decision: enqueue a transition wake for the
+exact current live incarnation, or append it to the while-vacant ledger. A concurrent
+commission therefore places the event exactly once, either in the continuity brief it
+drains or in the new current officer's wake queue.
 
 ### Hold / release — `POST .../officer/hold`, `POST .../officer/release`
 
@@ -286,24 +316,25 @@ Productizes the manual 2026-08-01 pause, verified live for five days on `d67ee26
 `thread_id`**, which is what keeps the watchdog's stale-hold self-heal
 (`main.py:28663`) from ever releasing it. One key, four effects, all pre-wired by the
 conference machinery: drain skips him, dispatches 409, watchdog stands down, nothing
-self-heals. Both endpoints inject a best-effort one-line notice via the agent's
+self-heals. The hold write and pending blocking-route fallback are one post-locked
+transaction; delivery happens after commit. Both endpoints inject a best-effort one-line notice via the agent's
 `/api/input` (which bypasses the hold *by design* — Legate input always reaches him).
 Release costs nothing standing: queued events drain within one ~20s tick.
 
 Hold is thread-scoped runtime state and never enters the row; a vacant post cannot be
 held.
 
-## 6. Migration of the live command — the standing fixture
+## 6. Migration of the live command — standing fixture and O6 history
 
-`d67ee261` (Better Resavio, project `68137e29`) has been under a manual maintenance
-hold since **2026-08-01 15:10Z** precisely so this migration can adopt him in place. As
-of 2026-08-06: thread `active`, hold intact, 7 events queued durably (1 timer, 3 fleet,
-3 job transitions), zero dispatches since the hold — and his job `bbce4bed` finished
-into **`pending_review`** on 08-05, its completion wake sitting in the queue. The
-backfill adopts him commissioned-and-held; the acceptance run (§10) releases him
-*through the new endpoint* and expects him to coalesce the backlog and judge that job.
-No state transfer step exists or is needed: adoption reads the same JSONB it leaves in
-place.
+`d67ee261` (Better Resavio, project `68137e29`) entered manual maintenance hold on
+**2026-08-01 15:10Z** precisely so this migration could adopt him in place. As of
+2026-08-06, the historical fixture was: thread `active`, hold intact, seven events queued
+durably (one timer, three fleet, three job transitions), zero dispatches since the hold,
+and job `bbce4bed` in **`pending_review`** with its completion wake queued. The backfill
+adopted that same JSONB without a transfer step. On 2026-08-15 O6 released him through the
+new endpoint with `auto_pull=false`; the committed, in-progress results belong to
+[[officer_backlog_pools_resavio_livefire]]. The later transaction checkpoint documented
+here has not been deployed into that run.
 
 ## 7. Editing the post — `PATCH /api/projects/{id}/officer`
 
@@ -333,12 +364,12 @@ Per-field honesty, shown in the UI:
 
 | Fields | Effect |
 |---|---|
-| `slots`, `max_concurrent_workers` | next dispatch (admission re-reads the thread row per create) |
+| `slots`, `max_concurrent_workers` | next dispatch (admission re-reads the locked post + current thread per create) |
 | `daily_token_ceiling`, `max_pages_per_day` | next delivery / next page (drain + notify read fresh) |
 | `sleep_min/max_minutes` | next sleep filing (server-side clamp) + watchdog immediately |
 | `max_actions_per_wake`, `brain` | **next respawn** — baked into `config.officer` at attach (`loader.py`); labeled so, not pretended live |
 
-**Shrinking below in-flight is drain semantics, decided:** `admit()` computes
+**Shrinking below in-flight is drain semantics, decided:** final admission computes
 `free = count − in_flight`; dropping `line` 2→1 with 2 running makes free −1 — new
 dispatches on the slot are refused with the existing actionable 409, running jobs are
 untouched, capacity converges as they land. Rejecting the edit would be backwards (you
@@ -440,7 +471,7 @@ save would be indefensible. The card shows "2 in flight — drains to 1".
 | O3 | commission / decommission / hold / release + ledger + brief + `end_thread` rerouting | §10.2/4/6 on k3d |
 | O4 | PATCH + validation reuse + live merge + notice; row-only communication policy validation | §10.3/7 on k3d |
 | O5 | cockpit card (one state machine, utilization, spend, incarnations, hold-kind label, routing-policy field) | vitest + walk the card through all three states |
-| O6 | dev acceptance: release the Resavio officer through the front door | §10.5 — he judges `bbce4bed` |
+| O6 | **DONE 2026-08-15:** Resavio released through the front door with `auto_pull=false`; live-fire remains in progress | [[officer_backlog_pools_resavio_livefire]] |
 
 **Risks:** double-authority drift (mitigated by §2's writers-per-direction and
 transition-only stamping — nothing double-writes steady-state); backfill JSONB edge

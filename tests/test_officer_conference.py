@@ -68,7 +68,9 @@ class TestHoldStamp:
     async def test_stamps_hold_on_project_officer(self, monkeypatch):
         db = SimpleNamespace()
         db.get_officer_thread_for_project = AsyncMock(return_value=_officer_row())
-        db.merge_thread_config_override = AsyncMock(return_value=True)
+        db.set_project_officer_hold = AsyncMock(
+            return_value={"thread": _officer_row(), "routes": []}
+        )
         db.get_thread = AsyncMock(return_value=_officer_row())
         monkeypatch.setattr(main, "postgres_db", db)
         from services import session_wake as sw
@@ -76,10 +78,12 @@ class TestHoldStamp:
         monkeypatch.setattr(sw, "_resolve_live_agent", AsyncMock(return_value=None))
 
         await main._hold_officer_for_conference(PROJECT_ID, CONF_TID)
-        db.merge_thread_config_override.assert_awaited_once()
-        tid, patch = db.merge_thread_config_override.await_args.args
-        assert tid == OFFICER_TID
-        hold = patch["officer"]["hold"]
+        db.set_project_officer_hold.assert_awaited_once()
+        args, kwargs = db.set_project_officer_hold.await_args
+        assert args == (PROJECT_ID,)
+        assert kwargs["expected_thread_id"] == OFFICER_TID
+        assert kwargs["route_reason"] == "officer_hold"
+        hold = kwargs["hold"]
         assert hold["kind"] == "conference"
         assert hold["thread_id"] == CONF_TID
 
@@ -87,10 +91,10 @@ class TestHoldStamp:
     async def test_noop_without_officer(self, monkeypatch):
         db = SimpleNamespace()
         db.get_officer_thread_for_project = AsyncMock(return_value=None)
-        db.merge_thread_config_override = AsyncMock()
+        db.set_project_officer_hold = AsyncMock()
         monkeypatch.setattr(main, "postgres_db", db)
         await main._hold_officer_for_conference(PROJECT_ID, CONF_TID)
-        db.merge_thread_config_override.assert_not_awaited()
+        db.set_project_officer_hold.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_never_holds_itself(self, monkeypatch):
@@ -98,10 +102,10 @@ class TestHoldStamp:
         db.get_officer_thread_for_project = AsyncMock(
             return_value={"id": CONF_TID, "metadata": {}}
         )
-        db.merge_thread_config_override = AsyncMock()
+        db.set_project_officer_hold = AsyncMock()
         monkeypatch.setattr(main, "postgres_db", db)
         await main._hold_officer_for_conference(PROJECT_ID, CONF_TID)
-        db.merge_thread_config_override.assert_not_awaited()
+        db.set_project_officer_hold.assert_not_awaited()
 
 
 class TestConferenceConclude:
@@ -110,7 +114,9 @@ class TestConferenceConclude:
         held = _officer_row(hold={"kind": "conference", "thread_id": CONF_TID})
         db = SimpleNamespace()
         db.get_officer_thread_for_project = AsyncMock(return_value=held)
-        db.merge_thread_config_override = AsyncMock(return_value=True)
+        db.set_project_officer_hold = AsyncMock(
+            return_value={"thread": _officer_row(), "routes": []}
+        )
         db.enqueue_session_wake_event = AsyncMock(return_value=True)
         monkeypatch.setattr(main, "postgres_db", db)
         kick = MagicMock()
@@ -118,8 +124,11 @@ class TestConferenceConclude:
 
         await main._conclude_conference_if_any(_conference_row(status="ended"))
 
-        _, patch = db.merge_thread_config_override.await_args.args
-        assert patch == {"officer": {"hold": None}}
+        db.set_project_officer_hold.assert_awaited_once_with(
+            PROJECT_ID,
+            expected_thread_id=OFFICER_TID,
+            hold=None,
+        )
         db.enqueue_session_wake_event.assert_awaited_once()
         args, kwargs = db.enqueue_session_wake_event.await_args
         assert args[0] == OFFICER_TID
@@ -134,13 +143,13 @@ class TestConferenceConclude:
         held = _officer_row(hold={"kind": "conference", "thread_id": other})
         db = SimpleNamespace()
         db.get_officer_thread_for_project = AsyncMock(return_value=held)
-        db.merge_thread_config_override = AsyncMock()
+        db.set_project_officer_hold = AsyncMock()
         db.enqueue_session_wake_event = AsyncMock(return_value=True)
         monkeypatch.setattr(main, "postgres_db", db)
         monkeypatch.setattr(main, "_kick_officer_event_drain", MagicMock())
 
         await main._conclude_conference_if_any(_conference_row(status="ended"))
-        db.merge_thread_config_override.assert_not_awaited()
+        db.set_project_officer_hold.assert_not_awaited()
         db.enqueue_session_wake_event.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -209,12 +218,17 @@ class TestWatchdogHold:
         held = _officer_row(hold={"kind": "conference", "thread_id": CONF_TID})
         db = SimpleNamespace()
         db.get_thread = AsyncMock(return_value=None)
-        db.merge_thread_config_override = AsyncMock(return_value=True)
+        db.set_project_officer_hold = AsyncMock(
+            return_value={"thread": _officer_row(), "routes": []}
+        )
         monkeypatch.setattr(main, "postgres_db", db)
 
         await main._officer_watchdog_check_one(held, SimpleNamespace())
-        _, patch = db.merge_thread_config_override.await_args.args
-        assert patch == {"officer": {"hold": None}}
+        db.set_project_officer_hold.assert_awaited_once_with(
+            PROJECT_ID,
+            expected_thread_id=OFFICER_TID,
+            hold=None,
+        )
 
 
 class TestReasoningLevelBridge:
@@ -357,19 +371,22 @@ class TestOfficerSummaryEndpoint:
         assert out["while_vacant"] == {"entries": [], "dropped": 0}
 
     @pytest.mark.asyncio
-    async def test_stale_ended_thread_link_reads_as_vacant(self, monkeypatch):
-        """OC-03 read surface: a post link pointing at an ENDED thread must
+    @pytest.mark.parametrize("stale_link_kind", ["ended", "missing"])
+    async def test_stale_ended_or_missing_thread_link_reads_as_vacant(
+        self, monkeypatch, stale_link_kind
+    ):
+        """OC-03 read surface: a link without a valid live joined thread must
         not claim ``commissioned: true`` over an empty officer block.
 
         ``get_officer_thread_for_project`` filters non-ended, so a stale link
-        (a retire predating the O3 decommission flow, or a thread ended
-        around this endpoint) yields officer=None while post.thread_id stays
-        set. The old ``bool(post['thread_id'])`` derivation reported a
+        (an ended retire or a missing legacy row) yields officer=None while
+        post.thread_id stays set in this synthetic fixture. The old
+        ``bool(post['thread_id'])`` derivation reported a
         commissioned post the card could not render; commissioned must come
         from the live join, and the stale case renders exactly like vacancy.
         """
         db = SimpleNamespace()
-        # The live join found nothing — the linked thread is ended.
+        # The live join found nothing — the linked thread is ended or missing.
         db.get_officer_thread_for_project = AsyncMock(return_value=None)
         db.get_or_create_project_officer = AsyncMock(
             return_value={

@@ -210,7 +210,22 @@ async def _seed_thread(
     *,
     status: str = "active",
     metadata: dict | None = None,
+    officer_enabled: bool = False,
 ) -> str:
+    if officer_enabled:
+        metadata = {
+            **(metadata or {}),
+            "config_override": {
+                **((metadata or {}).get("config_override") or {}),
+                "officer": {
+                    **(
+                        ((metadata or {}).get("config_override") or {}).get("officer")
+                        or {}
+                    ),
+                    "enabled": True,
+                },
+            },
+        }
     thread_id = uuid4()
     async with db.acquire() as conn:
         await conn.execute(
@@ -310,7 +325,7 @@ class TestPostRowHelpers:
         appended = await db.append_project_officer_incarnation(project_id, entry)
         assert appended["incarnations"] == [entry]
 
-        thread_id = await _seed_thread(db, project_id)
+        thread_id = await _seed_thread(db, project_id, officer_enabled=True)
         await db.register_project_officer_thread(project_id, thread_id)
         cleared = await db.clear_project_officer_thread(project_id)
         assert cleared["thread_id"] is None
@@ -353,8 +368,8 @@ class TestLookupFlip:
     @pytest.mark.asyncio
     async def test_the_row_wins_over_metadata_inference(self, db):
         project_id = await _seed_project(db)
-        # A thread with NO officer metadata at all, linked on the post…
-        linked = await _seed_thread(db, project_id, metadata={})
+        # A valid live commissioned thread linked on the post…
+        linked = await _seed_thread(db, project_id, officer_enabled=True)
         await db.register_project_officer_thread(project_id, linked)
         # …and an unlinked rival that WOULD have won the old JSONB inference.
         await _seed_thread(
@@ -365,6 +380,14 @@ class TestLookupFlip:
         officer = await db.get_officer_thread_for_project(project_id)
         assert officer is not None
         assert str(officer["id"]) == linked
+
+    @pytest.mark.asyncio
+    async def test_disabled_link_reads_as_no_officer(self, db):
+        project_id = await _seed_project(db)
+        linked = await _seed_thread(db, project_id, officer_enabled=True)
+        await db.register_project_officer_thread(project_id, linked)
+        await db.merge_thread_config_override(linked, {"officer": {"enabled": False}})
+        assert await db.get_officer_thread_for_project(project_id) is None
 
     @pytest.mark.asyncio
     async def test_vacant_post_means_no_officer(self, db):
@@ -381,7 +404,7 @@ class TestLookupFlip:
     @pytest.mark.asyncio
     async def test_ended_link_reads_as_no_officer(self, db):
         project_id = await _seed_project(db)
-        thread_id = await _seed_thread(db, project_id)
+        thread_id = await _seed_thread(db, project_id, officer_enabled=True)
         await db.register_project_officer_thread(project_id, thread_id)
         await db.update_thread_status(thread_id, "ended")
         assert await db.get_officer_thread_for_project(project_id) is None
@@ -395,7 +418,7 @@ class TestRegistration:
     @pytest.mark.asyncio
     async def test_claim_stamps_config_minus_runtime_keys(self, db):
         project_id = await _seed_project(db)
-        thread_id = await _seed_thread(db, project_id)
+        thread_id = await _seed_thread(db, project_id, officer_enabled=True)
         fragment = {
             "officer": {
                 "enabled": True,
@@ -419,8 +442,8 @@ class TestRegistration:
     @pytest.mark.asyncio
     async def test_second_commission_refused_and_first_stands(self, db):
         project_id = await _seed_project(db)
-        first = await _seed_thread(db, project_id)
-        rival = await _seed_thread(db, project_id)
+        first = await _seed_thread(db, project_id, officer_enabled=True)
+        rival = await _seed_thread(db, project_id, officer_enabled=True)
         assert await db.register_project_officer_thread(project_id, first)
         # The funnel maps this None to its 409.
         assert await db.register_project_officer_thread(project_id, rival) is None
@@ -432,12 +455,12 @@ class TestRegistration:
     @pytest.mark.asyncio
     async def test_registration_self_heals_a_missing_post_row(self, db):
         project_id = await _seed_project(db)  # bypassing mint: no post row
-        thread_id = await _seed_thread(db, project_id)
+        thread_id = await _seed_thread(db, project_id, officer_enabled=True)
         post = await db.register_project_officer_thread(project_id, thread_id)
         assert post is not None and str(post["thread_id"]) == thread_id
 
     @pytest.mark.asyncio
-    async def test_stale_ended_link_folds_then_claims(self, db):
+    async def test_stale_ended_link_requires_atomic_handoff_before_claim(self, db):
         project_id = await _seed_project(db)
         old = await _seed_thread(
             db,
@@ -448,9 +471,16 @@ class TestRegistration:
             },
         )
         assert await db.register_project_officer_thread(project_id, old)
-        # Pre-O3 retire path: the thread ends, the link stays.
+        # A crash-ended link remains lifecycle authority until the one atomic
+        # handoff completes. Registration may not perform a partial fold.
         await db.update_thread_status(old, "ended")
-        fresh = await _seed_thread(db, project_id)
+        fresh = await _seed_thread(db, project_id, officer_enabled=True)
+
+        assert await db.register_project_officer_thread(project_id, fresh) is None
+        handoff = await db.decommission_project_officer(
+            project_id, old, reason="retired"
+        )
+        assert handoff["transitioned"] is True
 
         post = await db.register_project_officer_thread(project_id, fresh)
 
@@ -468,10 +498,10 @@ class TestLineageCapacity:
     @pytest.mark.asyncio
     async def test_lineage_spans_incarnations_and_counts_their_jobs(self, db):
         project_id = await _seed_project(db)
-        prior = await _seed_thread(db, project_id)
+        prior = await _seed_thread(db, project_id, officer_enabled=True)
         assert await db.register_project_officer_thread(project_id, prior)
-        await db.update_thread_status(prior, "ended")
-        current = await _seed_thread(db, project_id)
+        await db.decommission_project_officer(project_id, prior, reason="retired")
+        current = await _seed_thread(db, project_id, officer_enabled=True)
         assert await db.register_project_officer_thread(project_id, current)
 
         # One job left running by the prior incarnation, one by the current.
@@ -511,7 +541,7 @@ class TestLineageCapacity:
     @pytest.mark.asyncio
     async def test_unregistered_thread_degrades_to_itself(self, db):
         project_id = await _seed_project(db)
-        registered = await _seed_thread(db, project_id)
+        registered = await _seed_thread(db, project_id, officer_enabled=True)
         assert await db.register_project_officer_thread(project_id, registered)
         rogue = await _seed_thread(db, project_id)
         assert await db.get_officer_capacity_lineage(rogue) == [rogue]

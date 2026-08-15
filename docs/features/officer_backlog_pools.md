@@ -47,9 +47,11 @@ off) and verified on its happy path; the sitrep and
 the cockpit card both render capacity, ready depth, open breakers and stalled claims; a
 pool can be provisioned from the UI; and **every loop carries the category doctrine whether
 or not it has an officer**, so the evidence repricing reaches the plain `standard` loops
-that produced the original failure. **B1–B7 are all built.** What remains is the
-deferred digest lines and the live-fire acceptance run (§12) — which still needs O6 and
-the KB hygiene pair. More importantly, the supported post API cannot currently enable
+that produced the original failure. **B1–B7 are all built.** O6 released the Resavio
+officer successfully with `auto_pull=false`; the committed live-fire scorecard remains in
+progress at [[officer_backlog_pools_resavio_livefire]]. What remains includes the deferred
+digest lines and completion of that acceptance run, including its outstanding hygiene and
+live observations. More importantly, the supported post API cannot currently enable
 `auto_pull`, and the authority/atomicity/liveness findings in
 [[officer_control_plane_post_implementation_audit]] block doing so out of band. Keep the
 safe database default off until that audit's release gates pass.
@@ -91,9 +93,9 @@ reviewed + repaired (`1a2bfbec`, `5fd63947`), officer post O1–O5 (`fa497666`,
 (`4d501a8f`, `7bb1d331`), message routing M1–M4 (`be1d972e`). Additional substrate this
 feature can now consume: `compute_jobs_liveness()` (batch, project-scoped) for §5's
 stale-claim ages, the evidence manifest for §3's close-checklists, and
-`job_message_routes` for the `waiting_for_reply` claim interactions. **B1+ is
-unblocked** pending the six §13 defaults and the O6 Resavio release for live
-acceptance.
+`job_message_routes` for the `waiting_for_reply` claim interactions. **B1+ was
+unblocked** after the six §13 defaults landed; the later O6 release began the live
+acceptance with `auto_pull=false`.
 
 Decisions locked in the design session (amendments from the research round in *italics*):
 
@@ -175,7 +177,7 @@ Three existing concepts, one new binding:
 
 - **Slot** (exists — `orchestrator/services/officer_slots.py`): named capacity,
   `{count, model, backend}`, stamped server-side at dispatch, enforced with an
-  advisory-locked 409. Gains an optional `category` key; slots sharing a category form a
+  post-row-locked 409. Gains an optional `category` key; slots sharing a category form a
   **pool**. Pool capacity is **non-transferable**: a free researcher slot may never be
   borrowed for executor overflow — per-class capacity allocation is the canonical
   starvation fix, and borrowing dissolves the guarantee silently **[R-org]**.
@@ -398,12 +400,12 @@ Per commissioned officer with `auto_pull=true`:
    `ready` by note_id immediately before stamping (vector-DB fetch and app-DB insert cannot
    share a transaction; the residual window is accepted — the guidance lane steers
    post-dispatch) **[X]**.
-4. **Dispatch at most one job per pool per tick** through the **extracted admission
-   helper + internal spawn path** **[A1]**: there is no callable "funnel" — `create_worker_job`
-   is an HTTP handler, and every server-side precedent (`_spawn_loop_job`, automations)
-   bypasses it and its checks. B3 extracts the officer-admission block (hold fence,
-   advisory-locked slot count, `admit()`, slot config patch — `main.py:12318-12378`) into a
-   helper shared by the endpoint and the tick; the tick then mirrors the loop spawn:
+4. **Dispatch at most one job per pool per tick** through the **authoritative Officer Post
+   admission + internal spawn path** **[A1]**. Manual REST and tick dispatch prepare
+   payload/grants outside the transaction, then call the same final helper. It locks
+   `project_officers` and the current thread, revalidates live incarnation/hold/auto-pull/
+   roster/category/lineage, checks all-non-terminal capacity and ticket generation, and
+   performs `create_job(conn=...)` before commit. The tick then mirrors the loop spawn:
    `db.create_job(created_by_thread_id=<officer thread>, user_id=<thread owner>,
    wake_on_complete=True)` + `provision_job_repo` + `_trigger_dispatch`, running
    `_enforce_job_create_grants` against the owner explicitly. Tick jobs stamp
@@ -457,12 +459,10 @@ Claims are therefore **one-shot**:
 - This single change is also the **item-level dead-letter queue** **[R-fw]**: a failed
   ticket stays parked until the officer looks — SQS's DLQ pattern without new machinery —
   and it defuses the reindex-resurrection quirk (§4).
-- **Claim+create is atomic** **[A1][X]**: the draft's "checked inside the lock" was false
-  comfort — the funnel's advisory xact lock releases at transaction close, *before* any
-  job INSERT, so check-then-insert daylight remains (the in-tree comment overstates the
-  lock; a real two-replica double-spawn is on record). The tick performs claim check +
-  capacity count + job INSERT in **one transaction holding the lock** (a conn-accepting
-  `create_job` variant), and B3 adds the fail-closed backstop: a partial unique index on
+- **Claim+create is atomic** **[A1][X]**: both the officer's manual path and the tick perform
+  claim check + lineage capacity count + job INSERT in **one transaction holding the
+  stable durable-post lock** (via connection-aware `create_job`). The fail-closed backstop
+  remains a partial unique index on
   `((context->>'ticket_note_id'))` over claim-bearing jobs, so a racing double-claim fails
   the second INSERT instead of double-working the ticket.
 - **The officer's own dispatches claim too** **[X]**: `create_worker_job` gains an optional
@@ -659,11 +659,19 @@ pattern to copy for breaker/ramp state), `merge_project_officer_communication_po
 Config-vs-runtime split per §10 is already enforced by these helpers' shapes: kit/policy on
 the row, live counters in the thread's `officer_state`.
 
-**Dispatch admission was extracted by B3 (2026-08-15).** The officer hold fence, the
-advisory-locked lineage in-flight count and `officer_slots.admit()` now live in
-`orchestrator/services/officer_admission.py` — `admit()` for the endpoint (own short
-transaction) and `admit_in_transaction()` for the tick, whose transaction stays open
-through its own INSERT via `create_job(conn=…)`. Both count **all non-terminal statuses**.
+**Dispatch admission was made authoritative by the 2026-08-15 post-safety checkpoint.**
+`orchestrator/services/officer_admission.py` exposes preparation plus one connection-aware
+final transaction used by both manual REST and tick dispatch. It locks the durable post
+and current thread, revalidates the snapshot, counts **all non-terminal statuses** over the
+complete incarnation lineage, validates the claim generation, stamps provenance and keeps
+the transaction open through `create_job(conn=…)`. The dedicated tick enumeration query is
+`project_officers JOIN threads`; watchdog/runtime enumeration remains separate.
+The follow-up lifecycle checkpoint puts the no-force decommission gate under that same
+post lock and counts the same all-non-terminal full lineage, so job insertion and
+no-force retirement cannot both succeed. Commission continuity and job-completion routing
+also make post-locked exact-incarnation decisions; a losing commission's config update is
+vacancy/generation fenced. These changes are local and not part of the already-deployed O6
+tranche.
 The internal spawn mirrors `_spawn_loop_job` (`db.create_job` + `provision_job_repo` +
 `_trigger_dispatch`), with `_provision_officer_ticket_repo` /
 `_enforce_officer_ticket_grants` in `main.py` as the injected adapters so the service
@@ -729,10 +737,12 @@ forever". Officer close instrument is still `kb_update(status='resolved'|'archiv
 re-ready action is `kb_update(add_tags=['ready'])`, which stamps a fresh `ready_at` even
 when the tag was already present.
 
-**Live-fire preconditions (unchanged, both still owed).** O6 — release the Resavio officer
-through `POST /api/projects/{id}/officer/release`; and the KB hygiene pair — retire the
-0.92-confidence "No renderer available" RecallStore belief on project `68137e29`, and run
-`docker/assert-browser-stack.sh` once on a live workspace.
+**Live-fire preconditions/status.** O6 was satisfied on 2026-08-15: the Resavio officer was
+released successfully through `POST /api/projects/{id}/officer/release` with
+`auto_pull=false`, and the run is recorded in
+[[officer_backlog_pools_resavio_livefire]]. The KB hygiene pair remains tracked by that
+in-progress run: retire the 0.92-confidence "No renderer available" RecallStore belief on
+project `68137e29`, and run `docker/assert-browser-stack.sh` once on a live workspace.
 
 ## 11. Build delta (slices)
 
@@ -782,9 +792,9 @@ the tick.
     had already been chased once by `priority`; all four are now absolute, with the
     reason recorded. New suites: `tests/test_backlog_ticket_plumbing.py` (28) plus
     filter/claim coverage in `tests/test_project_backlog.py`.
-- **B3 — claim funnel + tick — DONE (2026-08-15).** `orchestrator/services/
-  officer_admission.py` (the extracted hold fence + advisory-locked lineage count +
-  `admit()`, shared by the endpoint and the tick), `orchestrator/services/
+- **B3 — claim funnel + tick — DONE (2026-08-15), admission boundary hardened by the
+  post-safety checkpoint.** `orchestrator/services/officer_admission.py` (shared
+  post-locked preparation/finalization for manual and tick paths), `orchestrator/services/
   officer_backlog.py` (the tick), app migration **0160** (`uq_jobs_active_ticket_claim`),
   `create_job(conn=…)`, `ticket=` on `POST /api/jobs`, `run_when_leader` mount, log line
   `officer=<id8> pool=<name> dispatched=<note>/<job8> | skip=<reason>`. Tests:
@@ -942,6 +952,11 @@ the tick.
     does not change that: it stays out of the acceptance kit unless the Legate puts it in.
 
 ## 12. Acceptance — Resavio century (dev)
+
+**In progress:** O6 release itself succeeded with `auto_pull=false` on the deployed earlier
+tranche. This section remains the wider acceptance contract; see the committed live log in
+[[officer_backlog_pools_resavio_livefire]]. The subsequent Officer Post transaction
+checkpoint is local and not deployed into that run.
 
 Pre-requisites: officer_post O1–O6 done (incl. O2 lineage capacity), knowledge-plane K1–K3,
 supervision E1–E3 and the chosen disposition-evidence path, message-routing M2–M4, and the
