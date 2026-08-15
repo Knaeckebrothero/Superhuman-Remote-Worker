@@ -206,10 +206,13 @@ GET    /api/jobs/{job_id}/citations/stats                                       
 POST   /api/jobs/{job_id}/complete                                                      internal:require_internal
 GET    /api/jobs/{job_id}/completion-decision                                           internal:require_internal
 POST   /api/jobs/{job_id}/completion-decision                                           internal:require_internal
+GET    /api/jobs/{job_id}/completion-report                                             gated:require_job_access
 GET    /api/jobs/{job_id}/datasources                                                   gated:require_job_access
 GET    /api/jobs/{job_id}/diff                                                          gated:require_job_access
 GET    /api/jobs/{job_id}/diff/{file_path:path}                                         gated:require_job_access
 POST   /api/jobs/{job_id}/ensure-workspace-access                                       gated:require_approved_user
+GET    /api/jobs/{job_id}/evidence                                                      gated:require_job_access
+GET    /api/jobs/{job_id}/evidence/{evidence_id}                                        gated:require_job_access
 POST   /api/jobs/{job_id}/export-to-shared-folder                                       gated:require_job_access
 GET    /api/jobs/{job_id}/frozen                                                        gated:require_job_access
 POST   /api/jobs/{job_id}/guidance/ack                                                  internal:require_internal
@@ -224,6 +227,9 @@ GET    /api/jobs/{job_id}/memory/stats                                          
 GET    /api/jobs/{job_id}/messages                                                      gated:require_job_access
 POST   /api/jobs/{job_id}/messages/send                                                 internal:require_internal
 GET    /api/jobs/{job_id}/messages/{thread_id}                                          gated:require_job_access
+POST   /api/jobs/{job_id}/messages/{thread_id}/officer-ack                              internal:require_internal
+POST   /api/jobs/{job_id}/messages/{thread_id}/officer-escalate                         internal:require_internal
+POST   /api/jobs/{job_id}/messages/{thread_id}/officer-reply                            internal:require_internal
 POST   /api/jobs/{job_id}/messages/{thread_id}/reply                                    gated:require_job_access
 PUT    /api/jobs/{job_id}/pause                                                         gated:require_internal_or_job_access
 GET    /api/jobs/{job_id}/progress                                                      gated:require_job_access
@@ -350,6 +356,11 @@ DELETE /api/projects/{project_id}/members/{user_id}                             
 PATCH  /api/projects/{project_id}/members/{user_id}                                     gated:require_project_owner
 GET    /api/projects/{project_id}/memory/stats                                          gated:require_project_member
 GET    /api/projects/{project_id}/officer                                               gated:require_project_member
+PATCH  /api/projects/{project_id}/officer                                               gated:require_project_owner
+POST   /api/projects/{project_id}/officer/commission                                    gated:require_project_owner
+POST   /api/projects/{project_id}/officer/decommission                                  gated:require_project_owner
+POST   /api/projects/{project_id}/officer/hold                                          gated:require_project_owner
+POST   /api/projects/{project_id}/officer/release                                       gated:require_project_owner
 GET    /api/projects/{project_id}/repositories                                          gated:require_project_member
 POST   /api/projects/{project_id}/repositories                                          gated:require_project_owner
 DELETE /api/projects/{project_id}/repositories/{repo_id}                                gated:require_project_owner

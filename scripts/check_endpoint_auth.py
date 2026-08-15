@@ -84,14 +84,23 @@ GATE_NAMES = {
 
 
 # main.py does not follow local helpers in general (see _collect_module for
-# why). These names are the audited exception: each is a thin dispatch boundary
-# shared by a back-compat route and its explicit twin, and each calls the gate
-# as its first statement. Following only these — never every module-level def —
-# keeps the conflation risk the blanket rule guards against, because a bare call
-# to anything not listed here is still not followed.
+# why). These names are the audited exception: each is a thin boundary shared
+# by a small family of routes, each calls its gate as the first statement, and
+# none reaches a second gate — so following it reports that family's real gate
+# rather than conflating it with something else downstream. Following only
+# these — never every module-level def — keeps the conflation risk the blanket
+# rule guards against, because a bare call to anything not listed here is still
+# not followed.
+#
+# Membership rule, when you are tempted to add one: the helper must call
+# exactly one GATE_NAMES function, unconditionally, before any other work.
 FOLLOW_LOCAL_MAIN = {
     "_enter_infrastructure_storage_source_shadow",
     "_schedule_infrastructure_storage_source_activation",
+    # Officer message actions (officer-reply/-escalate/-ack): `await
+    # require_internal(request)` is its first statement, and every later check
+    # is officer-identity, not a second gate.
+    "_require_officer_route_actor",
 }
 
 
