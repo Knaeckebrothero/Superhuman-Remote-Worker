@@ -17,6 +17,16 @@ blocking it should be taken before the next bench campaign.
 
 | doc | why now |
 |---|---|
+| [officer_control_plane_post_implementation_audit](officer_control_plane_post_implementation_audit.md) | **INDEX — keep `auto_pull` off.** O1–B7 mechanics exist; this audit orders the individual release/security/liveness issues below. Do not close the index until its P0 live gates pass. |
+| [officer_message_actions_trust_shared_transport_identity](officer_message_actions_trust_shared_transport_identity.md) | **P0 security / first fix.** A shared fleet transport key plus a claimed thread ID can authorize reply/escalate/ack as the officer. Establish incarnation-bound actor identity. |
+| [backlog_machine_tags_trust_any_persistent_session](backlog_machine_tags_trust_any_persistent_session.md) | **P0 security/spend.** Any persistent project session, including a viewer, is treated as officer authority for `ready`, `parallel-safe`, and charter writes. |
+| [officer_admission_does_not_lock_the_durable_post](officer_admission_does_not_lock_the_durable_post.md) | **P0 concurrency/authority.** Manual admission releases its lock before INSERT, the tick enumerates metadata instead of posts, and lifecycle changes race stale thread-keyed locks. |
+| [officer_decommission_is_not_atomic](officer_decommission_is_not_atomic.md) | **P0 data integrity.** Harvest, wake fold, route drain, unlink, and incarnation append are independent transactions and failure is swallowed. |
+| [direct_blocking_message_freeze_can_outlive_route](direct_blocking_message_freeze_can_outlive_route.md) | **P0 liveness.** Default `user_direct` can freeze before its timeout route exists, stranding job, claim, and slot forever. |
+| [message_route_resume_lacks_generation_cas](message_route_resume_lacks_generation_cas.md) | **P0 race.** Reply/timeout CAS only `waiting_for_reply`, so a delayed route-A actor can resume route B. |
+| [officer_evidence_and_messages_leak_secret_shaped_content](officer_evidence_and_messages_leak_secret_shaped_content.md) | **P0 security.** Evidence, completion reports, and routed messages do not use the generic/known-secret presentation sanitizer. |
+| [backlog_fixed_windows_starve_eligible_tickets](backlog_fixed_windows_starve_eligible_tickets.md) | **P0 liveness.** Limits are applied before claim/validity/outcome filtering; a stable invalid head can hide eligible work forever. |
+| [officer_post_cannot_enable_auto_pull](officer_post_cannot_enable_auto_pull.md) | **P0 functional, release last.** The supported post API rejects `auto_pull`/century spend fields and Cockpit has no enable control. Build behind the other P0 gates. |
 | [gitea_admin_credential_in_every_agent_workspace](gitea_admin_credential_in_every_agent_workspace.md) | **Security.** The Gitea admin credential lands in every agent workspace. Blast radius: any job/agent can act as git admin. |
 
 ### P0-adjacent, tracked outside this directory
@@ -39,6 +49,16 @@ blocking it should be taken before the next bench campaign.
 
 | doc | why |
 |---|---|
+| [message_route_delivery_failure_is_stamped_delivered](message_route_delivery_failure_is_stamped_delivered.md) | A notifier error is logged as failed and then unconditionally stamped delivered, disabling retry. |
+| [officer_internal_messages_consume_human_rate_limits](officer_internal_messages_consume_human_rate_limits.md) | Officer-only triage is counted against the user's human interruption quotas because limits run before routing. |
+| [job_liveness_defaults_disagree_across_surfaces](job_liveness_defaults_disagree_across_surfaces.md) | Shared/MCP defaults use 30 minutes while REST/officer/session defaults use 60; one job receives contradictory stale classifications. |
+| [officer_card_ignores_viewer_authority_and_i18n](officer_card_ignores_viewer_authority_and_i18n.md) | Viewers see owner-only mutations that always 403, and the entire card bypasses the required EN/DE Transloco catalogs. |
+| [deleting_a_job_releases_its_backlog_ticket_claim](deleting_a_job_releases_its_backlog_ticket_claim.md) | Claims live only on job rows, so physical deletion silently re-arms a still-ready ticket without officer re-ready. |
+| [auto_pull_jobs_are_dispatchable_before_provisioning](auto_pull_jobs_are_dispatchable_before_provisioning.md) | Jobs commit as `created` before strict provisioning and infra failures become ordinary `failed`, racing dispatch and polluting breakers. |
+| [kb_materialization_failure_reports_ready_or_closed](kb_materialization_failure_reports_ready_or_closed.md) | KB mutation ignores failed canonical-file materialization and can report false READY/closed success that reindex later reverses. |
+| [backlog_floor_wake_failure_consumes_debounce](backlog_floor_wake_failure_consumes_debounce.md) | Missing/failed notification still records a successful wake timestamp and suppresses retry for six hours. |
+| [officer_roster_patch_cannot_remove_or_drain_a_slot](officer_roster_patch_cannot_remove_or_drain_a_slot.md) | Recursive map merge preserves removed slots and Cockpit clamps away the server's zero-count drain. |
+| [headless_officer_cannot_read_screenshot_evidence](headless_officer_cannot_read_screenshot_evidence.md) | Screenshot evidence resolves to a text viewer pointer; the background officer cannot see pixels without forbidden object-plane tools. |
 | [kb_connector_token_auth_over_http_fails_invisibly](kb_connector_token_auth_over_http_fails_invisibly.md) | **FIXED `d215e727` (08-14)** — source-construction failures now update the watermark without weakening the HTTPS/token boundary; POST/PUT effective-pair validation is regression-pinned. TLS-ingress workaround remains required. |
 | [kb_sweep_indexes_archived_projects_and_starves_connectors](kb_sweep_indexes_archived_projects_and_starves_connectors.md) | **FIXED `d215e727` (08-14)** — active-project SQL filter, external-first phase ordering, and best-effort enumeration isolation. Workaround row `4e7c6a46` may be restored after the fixed build is deployed. |
 | [homelab_wan_outage_severs_cluster_from_own_llm](homelab_wan_outage_severs_cluster_from_own_llm.md) | Cheap CoreDNS rewrite makes every job immune to WAN outages (08-05 cost a 3 h cluster-wide LLM blackout + 1 job). |
@@ -60,6 +80,8 @@ hydration; critic verdict survived via the checkpointed mirror + ledger.)*
 
 | doc | status |
 |---|---|
+| [unknown_work_category_fails_open_for_parallelism](unknown_work_category_fails_open_for_parallelism.md) | OPEN/LATENT — `allows_parallel(None/unknown)` returns true. No production caller yet; fix before activation. |
+| [officer_ready_depth_poll_multiplies_backlog_queries](officer_ready_depth_poll_multiplies_backlog_queries.md) | OPEN — 15-second card polls run unused count queries serially per pool; optimize after exact pagination semantics land. |
 | [live_permission_mode_change_never_persisted](live_permission_mode_change_never_persisted.md) | Open, found 2026-08-08 on the k3d tier-row gate. Live permission-mode changes apply to the running agent but never reach `threads.permission_mode`; survives a page reload (agent reports in-memory state), so it silently reverts on pod restart. Pre-existing — reproduced on the pre-change build. Transport is fine; only the "top-level column sync" is missing. |
 | [bench_infra_exclusion_misses_midflight_outages](bench_infra_exclusion_misses_midflight_outages.md) | Open, analysis-level workaround exists. Found 2026-08-05 during |
 | [project_scoped_memory_deadlocks_under_parallel_jobs](project_scoped_memory_deadlocks_under_parallel_jobs.md) | Containment tier **SHIPPED 08-06 (batch #2)** — ordered locking + contained/retried access stats + heartbeat telemetry. OPEN: the semantic per-consumer TTL model (criterion 3) and pinned-budget share (criterion 5). |
