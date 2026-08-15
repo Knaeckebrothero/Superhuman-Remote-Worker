@@ -774,6 +774,13 @@ class TestCommissionEndpoint:
         assert req.model == "MiniMax-M3"
         assert req.reasoning_level == "high"
         assert req.permission_mode == "autonomous"
+        # The expert IS the job surface. Without an explicit config_name the
+        # request falls to session_base and the officer boots with NO
+        # job_control plane — he cannot dispatch, steer, approve or read
+        # evidence. Found live on the Resavio change of command 2026-08-15:
+        # the endpoint-commissioned officer had 34 tools, none of which could
+        # create a job.
+        assert req.config_name == "centurion"
         officer_frag = req.config_override["officer"]
         assert officer_frag["enabled"] is True
         assert "conference" not in officer_frag
