@@ -355,3 +355,49 @@ class TestOfficerSummaryEndpoint:
         assert out["incarnations"] == []
         assert out["communication_policy"]["officer_response_minutes"] == 15
         assert out["while_vacant"] == {"entries": [], "dropped": 0}
+
+    @pytest.mark.asyncio
+    async def test_stale_ended_thread_link_reads_as_vacant(self, monkeypatch):
+        """OC-03 read surface: a post link pointing at an ENDED thread must
+        not claim ``commissioned: true`` over an empty officer block.
+
+        ``get_officer_thread_for_project`` filters non-ended, so a stale link
+        (a retire predating the O3 decommission flow, or a thread ended
+        around this endpoint) yields officer=None while post.thread_id stays
+        set. The old ``bool(post['thread_id'])`` derivation reported a
+        commissioned post the card could not render; commissioned must come
+        from the live join, and the stale case renders exactly like vacancy.
+        """
+        db = SimpleNamespace()
+        # The live join found nothing — the linked thread is ended.
+        db.get_officer_thread_for_project = AsyncMock(return_value=None)
+        db.get_or_create_project_officer = AsyncMock(
+            return_value={
+                "project_id": PROJECT_ID,
+                # The stale link: non-null, but names a dead thread.
+                "thread_id": OFFICER_TID,
+                "config_override": {"officer": {"slots": {"line": {"count": 2}}}},
+                "communication_policy": {
+                    "worker_messages": "user_direct",
+                    "officer_response_minutes": 15,
+                },
+                "state": {},
+                "incarnations": [],
+            }
+        )
+        db.get_project_officer_lineage = AsyncMock(return_value=[])
+        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(
+            main, "require_approved_user", AsyncMock(return_value={"id": "u"})
+        )
+        monkeypatch.setattr(main, "require_project_member", AsyncMock())
+        monkeypatch.setattr(
+            main, "_find_open_conference_thread", AsyncMock(return_value=None)
+        )
+        out = await main.get_project_officer_summary(MagicMock(), PROJECT_ID)
+        assert out["commissioned"] is False
+        # And it renders as ordinary vacancy — editor seeded from the row,
+        # live-only fields null — not as some third state.
+        assert out["officer"]["thread_id"] is None
+        assert out["officer"]["status"] is None
+        assert out["kit"] == {"line": {"count": 2, "in_flight": 0}}
