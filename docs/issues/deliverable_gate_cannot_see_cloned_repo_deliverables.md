@@ -107,11 +107,25 @@ on the branch → full merge + warning") is **unreachable for loop jobs**:
 merge)"` (`orchestrator/services/completion.py:939`). The fallback rule is real; this path is
 not how it gets triggered.
 
-## Loose thread
+## Loose thread — CLOSED, harmless
 
-The agent's freeze notes say no remote PR tool was available during its corrective phase.
-`repo_pr_status` exists and is read-only-safe, so either that phase ran with a narrower
-toolset or something else is off. Separate seam; unchased.
+The agent's freeze notes say remote PR status "could not be re-queried in the corrective final
+review because no remote PR tool was available". That is simply true and not a defect: the
+tool did not exist yet.
+
+| event | UTC |
+|---|---|
+| job `29c28492` ran | `00:44:33` → `~02:12` |
+| `repo_pr_status` committed (`23bbf28a`) | `09:19:43` |
+| deployed as `sha-6b15c93` (`ce9f2873`) | `09:33:33` |
+
+The job finished **~7.3 hours before the tool was written**. It is also not a critic
+observation — the record is `freeze_type: job_complete`, written by the job about itself, and
+this was a manual job with no critic.
+
+It will not recur: `repo_pr_status` is granted under BOTH repository tiers
+(`src/core/datasource_setup.py:130` read, `:136` write), so any job with a repository
+datasource attached can read live PR state regardless of access level.
 
 ## Related
 
