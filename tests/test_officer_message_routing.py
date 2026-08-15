@@ -1093,3 +1093,129 @@ class TestWakeAndToolPlumbing:
             await _worker_messages_section(db, PROJECT_ID, datetime.now(timezone.utc))
             == []
         )
+
+
+# =============================================================================
+# Audit repairs OC-05 (content redaction) and OC-06 (honest delivery stamps)
+# =============================================================================
+
+
+class TestDeliveryOutcomeClassification:
+    """OC-06. NotificationService reports failure by RETURNING an error dict,
+    not by raising, so a try/except around dispatch sees success. Every route
+    and log decision now derives from one normalized outcome instead."""
+
+    def test_provider_acceptance_is_accepted(self):
+        from services.message_routing import classify_dispatch
+
+        assert classify_dispatch(
+            {"email": True, "email_message_id": "<m@x>", "queued": False}
+        ).accepted
+
+    def test_queued_for_digest_is_accepted(self):
+        # Quiet-hours queueing is durable and genuinely accepted; retrying it
+        # would double-send once the window closes.
+        from services.message_routing import classify_dispatch
+
+        assert classify_dispatch({"queued": True}).accepted
+
+    def test_an_uninitialized_service_is_retryable_not_delivered(self):
+        from services.message_routing import classify_dispatch
+
+        out = classify_dispatch({"error": "NotificationService not initialized"})
+        assert not out.accepted and "not initialized" in out.detail
+
+    def test_empty_and_all_false_results_are_retryable(self):
+        from services.message_routing import classify_dispatch
+
+        assert not classify_dispatch({}).accepted
+        assert not classify_dispatch({"email": False, "ntfy": False}).accepted
+
+    def test_a_non_dict_result_is_retryable_rather_than_crashing(self):
+        from services.message_routing import classify_dispatch
+
+        assert not classify_dispatch(None).accepted
+
+    def test_log_status_derives_from_the_same_outcome(self):
+        from services.message_routing import classify_dispatch
+
+        assert classify_dispatch({"email": True}).log_status == "sent"
+        assert classify_dispatch({"error": "x"}).log_status == "failed"
+
+
+class TestFailedDeliveryStaysRetryable:
+    """OC-06 end to end: the reconciler retries exactly while
+    ``user_delivery_at`` is null, so stamping a failure is what strands the
+    user's thread forever."""
+
+    @pytest.mark.asyncio
+    async def test_a_failed_dispatch_does_not_stamp_delivery(self):
+        from services import message_routing
+
+        db = _send_db(_job(), "user_direct")
+        notifier = MagicMock()
+        notifier.dispatch = AsyncMock(
+            return_value={"error": "NotificationService not initialized"}
+        )
+        route = {
+            "route_id": str(uuid4()),
+            "job_id": str(uuid4()),
+            "thread_id": str(uuid4()),
+        }
+        ok = await message_routing.deliver_route_to_user(
+            db, route, reason="officer_escalated", notifier=notifier
+        )
+        assert ok is False
+        db.mark_route_user_delivery.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_accepted_dispatch_stamps_exactly_once(self):
+        from services import message_routing
+
+        db = _send_db(_job(), "user_direct")
+        route = {
+            "route_id": str(uuid4()),
+            "job_id": str(uuid4()),
+            "thread_id": str(uuid4()),
+        }
+        ok = await message_routing.deliver_route_to_user(
+            db, route, reason="officer_escalated", notifier=_notifier()
+        )
+        assert ok is True
+        db.mark_route_user_delivery.assert_awaited_once()
+
+
+class TestRoutedWorkerTextIsSanitized:
+    """OC-05. 'Verbatim' means unedited by us, not unsanitized — this body is
+    emailed to a human."""
+
+    @pytest.mark.asyncio
+    async def test_a_credential_in_worker_text_never_reaches_the_user(self):
+        from services import message_routing
+
+        db = _send_db(_job(), "user_direct")
+        db.get_thread_messages = AsyncMock(
+            return_value={
+                "subject": "deploy failed",
+                "messages": [
+                    {
+                        "direction": "outbound",
+                        "subject": "deploy failed",
+                        "message": "used sk-abcdefghijklmnopqrstuvwxyz012345 to push",
+                    }
+                ],
+            }
+        )
+        notifier = _notifier()
+        route = {
+            "route_id": str(uuid4()),
+            "job_id": str(uuid4()),
+            "thread_id": str(uuid4()),
+        }
+        await message_routing.deliver_route_to_user(
+            db, route, reason="officer_escalated", notifier=notifier
+        )
+        sent = notifier.dispatch.await_args.kwargs["message_md"]
+        assert "sk-abcdefghijklmnopqrstuvwxyz012345" not in sent
+        # The reader is told text was withheld rather than shown a quiet edit.
+        assert "redacted" in sent.lower()

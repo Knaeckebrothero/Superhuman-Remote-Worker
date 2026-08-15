@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from services.deliverable_gate import normalize_deliverable_path
-from services.kb_git_source import redact_git_error
+from src.shared.content_redaction import sanitize
 
 logger = logging.getLogger(__name__)
 
@@ -413,6 +413,17 @@ def _paginate(text: str, offset: int) -> dict[str, Any]:
     }
 
 
+def _redaction_note(clean: Any) -> dict[str, Any]:
+    """The machine-readable withheld-content signal (OC-05).
+
+    Absent when nothing was removed, so a clean page stays byte-identical to
+    what it was before redaction existed.
+    """
+    if not clean.redacted:
+        return {}
+    return {"redacted": True, "redacted_count": clean.count}
+
+
 async def read_evidence_entry(
     job: dict[str, Any],
     entry: dict[str, Any],
@@ -426,6 +437,11 @@ async def read_evidence_entry(
     entries return safe metadata plus the job-file viewer pointer. All reads
     resolve at the PINNED revision recorded in the manifest — never a branch
     head — and verify the recorded sha256 before returning content.
+
+    Redaction is reported, not silent (audit OC-05): a page that had secrets
+    removed carries ``redacted: true`` and a count, so the officer judges a
+    knowingly-incomplete artifact rather than a quietly-shortened one. The
+    stored bytes and their sha256 are untouched — only this view is sanitized.
     """
     public_entry = {k: v for k, v in entry.items() if k != "inline_content"}
     availability = entry.get("availability")
@@ -444,8 +460,9 @@ async def read_evidence_entry(
 
     inline = entry.get("inline_content")
     if isinstance(inline, str):
-        page = _paginate(redact_git_error(inline), offset)
-        return {"entry": public_entry, **page}
+        clean = sanitize(inline)
+        page = _paginate(clean.text, offset)
+        return {"entry": public_entry, **page, **_redaction_note(clean)}
 
     source = entry.get("source") or {}
     repo = source.get("repo")
@@ -487,8 +504,9 @@ async def read_evidence_entry(
             "view": {"type": "job_repo_file", "path": path, "ref": revision},
         }
     text = content.decode("utf-8", errors="replace")
-    page = _paginate(redact_git_error(text), offset)
-    return {"entry": public_entry, **page}
+    clean = sanitize(text)
+    page = _paginate(clean.text, offset)
+    return {"entry": public_entry, **page, **_redaction_note(clean)}
 
 
 __all__ = [
