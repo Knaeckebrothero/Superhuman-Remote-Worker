@@ -47,7 +47,31 @@ it** — a brand-new thread, six messages, first turn. So the failure is not
 "compaction drops the pairing"; it is "an assistant message with
 `tool_calls` can be committed without its results, and nothing repairs it".
 
-## Correction — the orphan lives in MEMORY, not in durable history
+## ROOT CAUSE FOUND — a supervised permission mode on a headless officer
+
+**Superseded diagnosis.** Both this wedge and the "zero `tool` rows" mystery
+below have one cause, found later the same evening and fixed in `c62b8eae`:
+the officer was commissioned with `permission_mode = supervised`, and a
+background officer is headless — no session exists in which a human could
+answer the prompt. Every turn read:
+
+```
+Permission gate unanswered for tool <name> — parking turn; N call(s) left ungated
+repair_tool_pairing: … stripped 14 orphaned tool call(s)
+```
+
+So the calls were never executed, never produced results, and accumulated as
+orphans until the provider rejected the history. **The orphans were a
+symptom; the ungated gate was the disease.**
+
+That makes this issue narrower still: the residual defect is only that the
+live loop kept re-issuing a rejected request instead of repairing its own
+state, and that nothing escalated. Both are worth fixing — a session should
+not be able to spin silently on any cause — but neither is what broke the
+Resavio officer. See
+`docs/issues/commissioned_officer_boots_without_a_job_surface.md`.
+
+## Earlier correction — the orphan lives in MEMORY, not in durable history
 
 The first version of this note claimed the poison was durable and survived
 restarts. That is wrong, and the correction narrows the bug usefully.
