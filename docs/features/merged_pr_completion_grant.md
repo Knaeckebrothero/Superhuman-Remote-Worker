@@ -16,7 +16,7 @@ related:
 
 # Require a merged pull request before a job can be sealed
 
-**Status:** approved 2026-08-15, not yet implemented.
+**Status:** **implemented on develop `644ca703`, 2026-08-15. Not deployed, not live-gated.**
 
 ## 1. What and why
 
@@ -110,15 +110,15 @@ one.
 
 ## 5. Enforcement — two points, one predicate
 
-**5a. Human approve.** In `approve_job` (`orchestrator/main.py:16871`), beside the existing
+**5a. Human approve.** In `approve_job` (`orchestrator/main.py:16909`), beside the existing
 `diff_status == 'pending'` gate. **403**, matching the `public_datasources` capability
 precedent, with a message naming the PR's actual state so the actionable next step ("merge
 it") is obvious to a non-technical reader.
 
-**5b. Autonomous seal.** In the terminal-status path, mirroring the cloud-diff downgrade at
-`orchestrator/main.py:24989`: a job that would become `completed` becomes `pending_review`
-instead, with an action line recording why. The principal is the job owner, so an
-admin-owned job is unaffected.
+**5b. Autonomous seal.** In the terminal-status path (`orchestrator/main.py:25048`),
+mirroring the cloud-diff downgrade immediately above it at `main.py:25040`: a job that
+would become `completed` becomes `pending_review` instead, with an action line recording
+why. The principal is the job owner, so an admin-owned job is unaffected.
 
 Both points consult the same predicate and the same capability. Neither duplicates forge
 knowledge.
@@ -135,7 +135,7 @@ loop is admin-owned*, which is a property of today's deployment rather than of t
 non-admin ever runs a loop, the downgrade would park it in `pending_review` where the loop
 advance never fires — a stall, which is the specific failure this project treats as worse than
 a bad write. `unmerged_pr_seal_status` therefore excludes loop jobs explicitly, exactly as the
-cloud-diff downgrade does (`not _completion_loop_id`, `main.py:24955`), and the pure gate pins
+cloud-diff downgrade does (`not _completion_loop_id`, `main.py:25010`), and the pure gate pins
 it with a test.
 
 The loop also owns its own delivery and merge (`should_merge_job_contribution` returns early
@@ -179,3 +179,45 @@ never been exercised against actual data.
 - Merging pull requests from the cockpit. SRW opens PRs and never merges them; the human
   merge gate is deliberate.
 - Any change to the autonomy ladder.
+
+---
+
+## 9. Implementation — 2026-08-15
+
+| piece | where |
+|---|---|
+| catalog key `complete_unmerged_pr` | `src/core/capability_grants.py` |
+| capability read `user_can_complete_unmerged_pr` | `orchestrator/database/postgres.py` |
+| live predicate `unmerged_pr_block_reason` | `orchestrator/services/job_delivery.py` |
+| shared gate `_unmerged_pr_gate_reason` | `orchestrator/main.py` |
+| pure decision `unmerged_pr_seal_status` | `orchestrator/services/completion.py` |
+| enforcement 5a (403) | `approve_job`, beside the `diff_status` check |
+| enforcement 5b (downgrade) | `_complete_job_legacy`, beside the mode A downgrade |
+| tests | `tests/test_merged_pr_completion_grant.py` (24), `tests/test_capability_grants.py` |
+
+Built TDD, RED verified before every GREEN. `approve_job` now binds `user, job` where it
+previously discarded the user — the human path needs the principal.
+
+### Two tests worth knowing about
+
+`tests/test_capability_grants.py` contains a completeness test that enumerates `CATALOG` and
+demands every key either have a `strip_to_grants` branch or appear in
+`_NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP` **with a reason**. A new key fails it by default.
+That is the design working: this key is excluded there, stating that it gates a terminal
+transition against live forge state and has no config fragment to strip.
+
+The negative controls carry the regression risk, not the happy path:
+
+- a job with **no** pull request is refused by nothing and costs zero I/O (asserted on the
+  mocks, not merely on the return value);
+- a principal **holding** the grant is never blocked;
+- a **loop** job is never downgraded.
+
+### Not done
+
+- **Not deployed.** No image build, no dev rollout. Verify from
+  `.status.containerStatuses[].image` on the pods, never the Deployment spec.
+- **Live gate not run.** The §7 sequence — open a PR, refuse, merge, approve — is unexecuted.
+  It needs a job that actually opens a pull request, which also makes it the first real render
+  of the Delivery panel.
+- **No grant has ever been issued** for this key, so the allow path is unit-tested only.

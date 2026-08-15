@@ -386,7 +386,7 @@ class TestApproveJobGate:
 
 
 class TestUnmergedPrSealStatus:
-    """Pure counterpart of the cloud-diff downgrade at main.py:25039.
+    """Pure counterpart of the cloud-diff downgrade it sits beside.
 
     The I/O half is covered by TestUnmergedPrGateReason; this pins only the
     decision, which is what the seal site inlines.
