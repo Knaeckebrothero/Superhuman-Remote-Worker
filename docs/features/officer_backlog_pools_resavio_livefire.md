@@ -150,6 +150,49 @@ the comparison is honest:
   commit — straight to his own `pending_review` job, before any ticket
   work.
 
+- 16:28:58 he **cancelled** `bbce4bed` rather than approving it,
+  preserved the candidate by commit+branch, and rebuilt its acceptance as
+  an independent tester ticket. P1 ✅ (unprompted). P2 ✅ (executor ticket
+  = promote the accepted WEB UI demo; no CLI shape anywhere). P3 partial
+  (tester ticket verifies his own preserved candidate, not the 12
+  unattended loop iterations). P5 ✅ so far (no dispatch, ready only where
+  dispatchable).
+- 16:29:13 turn 417 complete — 19 tool calls covering judge + 4 KB writes
+  + sleep(30). M-7 ✅: 22 queued events coalesced into ONE turn.
+- 16:33:16 stale pod deleted (LF-2 remedy). Durable sleep timer
+  (fire_at 16:59) survived deletion — external-timer design ✅.
+- 16:36:54 watchdog respawn onto `sha-80cfc57` (the deploy's agent
+  image), attach 16:37:03, message restore 1.97 s, officer capability
+  ceiling dropped 3 tools on boot (K-plane ✅). 16:37:26 boot turn ends
+  in sleep: "Reoriented after restart; category backlog is filed, no
+  workers are dispatched, and I am awaiting the Legate's confirmation."
+  **Respawn continuity ✅ — ~3.5 min pod-death-to-reoriented, identity
+  from charter+KB, not the window.**
+- 16:38:51 Legate correction sent: category: grammar + ready re-stamp +
+  dispatch the acceptance ticket into the test pool.
+- 16:39:16 correction turn (419, 8 tool calls): all three tickets retagged
+  with `category:` forms (human labels kept), `ready_at` stamped
+  16:39:16.49 by the NEW kb tools on his explicit ready re-add — **B2
+  authorization works when the code is present** (M-3 ✅).
+- 16:39:33 dispatch: job `660a8eec`, `work_category: tester`,
+  `officer_slot: test`, MiniMax-M3, kickoff opens with the tester category
+  block ("Your output is ISSUE TICKETS, not file commits…") — M-4 ✅
+  except: **the claim did not land** (LF-3, below). His sleep(2) was
+  clamped to the roster's 10-minute floor — bounds behave as configured.
+- 16:41 operator repair: `ticket_note_id` stamped by hand into
+  `660a8eec`'s context (his improvised `backlog_ticket` value was the
+  EXACT right slug — only the key name failed him). Card flipped to
+  `ready_depth: 0` / `in_flight: 1`: claim semantics hold once the key
+  exists (M-5/M-6 ✅ with repair; unrepaired they FAIL — see LF-3).
+  Duplicate-dispatch probe deliberately skipped: the admission funnel is
+  being rewritten in a concurrent Codex session (the BP-02/03/04 P0), so
+  the DB-error-vs-409 shape is mid-change.
+- 16:45 worker underway: `660a8eec` processing, assigned, workspace pod
+  Running, MiniMax-M3 on sandbox (M-9 ✅ for the tester leg).
+- Respawn re-registered him as agent `f71a5549`, status `session`,
+  heartbeating — the agents row is healthy again, so LF-1 is BOUNDED:
+  it bites only pods that never re-register; recycling clears it.
+
 **Findings:**
 
 - **LF-1 — agents row stuck `offline` while the pod heartbeats 200.**
@@ -190,6 +233,19 @@ the comparison is honest:
   his pod never got it. Mid-run remedy: pod recycle → watchdog respawn
   onto the current image (the ops-realistic fix, and a live test of the
   respawn-continuity design). Filed as its own issue.
+- **LF-3 — the officer's own dispatch tool could not claim a ticket.**
+  `JobCreate.ticket` (B3's funnel half: → `context.ticket_note_id`, the
+  one key the claim ledger and `uq_jobs_active_ticket_claim` read) was
+  never exposed on the `create_job` descriptor his tool schema is
+  generated from. He improvised `context.backlog_ticket` with the correct
+  slug and reported the ticket claimed; the ledger disagreed and the card
+  kept `ready_depth: 1` — with auto_pull on, the tick would have
+  dispatched a second worker onto the ticket. The exact failure the claim
+  exists to prevent, produced by the claim being unreachable. FIXED in
+  `05ef8dac` (descriptor + client forwarding + MockTransport pin);
+  requires the next deploy to reach dev. The manual path is proven only
+  WITH this fix; until deployed, manual officer dispatches need the
+  operator repair above.
 - His turn-1 quality, for the record: cancelled his own `pending_review`
   job rather than rubber-stamping it, preserved the candidate by commit
   (`0140f70`) and branch, and rebuilt its acceptance as an INDEPENDENT
