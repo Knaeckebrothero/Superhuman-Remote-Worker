@@ -39,11 +39,11 @@ related:
 
 ## Status
 
-**CLEARED TO BUILD (2026-08-15).** Nothing in *this* document is implemented; everything
-it depends on is, and the six §13 defaults are now **decided** — there is no open
-question and no pending approval. Two of those decisions changed the design: the ready
-floor scales with pool capacity rather than being a constant, and there are **no
-per-ticket budget caps** (the officer is the brake; §3 records the residual gap). See
+**BUILDING (2026-08-15).** **B1 has landed**; everything this document depends on is in.
+The six §13 defaults are **decided** — no open question, no pending approval. Two of those
+decisions changed the design: the ready floor scales with pool capacity rather than being a
+constant, and there are **no per-ticket budget caps** (the officer is the brake; §3 records
+the residual gap). See
 [Implementation start-here](#implementation-start-here--the-as-built-substrate-2026-08-14)
 for the substrate as actually built, with anchors — that section exists so a cold session
 can begin B1 without re-deriving yesterday's landings.
@@ -211,10 +211,13 @@ bigger discoveries become follow-up tickets, not scope creep.
 
 - **researcher** — *"Your deliverable is an ANSWER, not a product increment."* Researcher
   tickets are **spikes** in the XP sense, and carry spike discipline **[R-org]**:
-  - **Timeboxed**: a smaller default budget than executor tickets, enforced through the
-    existing `budget_exceeded` freeze. At expiry the worker documents what was learned and
-    what remains unknown and STOPS — extension is an officer decision (a follow-up ticket),
-    never a worker decision.
+  - **Bounded by posture, not by a cap** (revised B1, 2026-08-15): §13.4 rejected
+    per-ticket budget and wall-clock caps for *every* category, so the research round's
+    "smaller default budget enforced through `budget_exceeded`" does not ship. The block
+    carries the discipline in words instead: answer the question and STOP; document what
+    was learned and what remains unknown; **extension is an officer decision (a follow-up
+    ticket), never a worker decision.** That last clause is what makes a timebox mean
+    anything without a timer — a worker that may extend its own spike has no bound at all.
   - **Deliverable = a decision note**: findings + residual unknowns + recommendation,
     written to the KB. Code is disposable evidence — it lives and dies in the job's
     isolated repo and is never delivered to the project cloud folder.
@@ -718,9 +721,23 @@ supervision E1–E3 plus E4 or the explicit recon-only disposition fallback; mes
 M2–M4 for any worker that can block on `send_message`. Do not duplicate those mechanisms in
 the tick.
 
-- **B1 — `work_categories.py`**: category constants, membership map, `_CATEGORY_BLOCKS`
-  (with effort ceilings, spike discipline, anchored-rubric text, close-checklists),
-  `role_to_category` for legacy loops. Pure module + unit tests.
+- **B1 — `work_categories.py` — DONE (2026-08-15).** Shipped as **two** pure modules, not
+  one: `orchestrator/services/work_categories.py` (categories, membership map,
+  `CATEGORY_DEFAULT_EXPERT`, `KNOWN_EXPERTS`, `allows_parallel`, `_CATEGORY_BLOCKS` +
+  `close_checklist`, `classify_ticket`/`resolve_expert`, `role_to_category`) and
+  **`src/shared/backlog_tags.py`** (the machine-tag namespace: `ready`, `parallel-safe`,
+  `category:`, `expert:`; `normalize_tag`, `strip_officer_tags`, `strip_machine_tags`,
+  `category_values`/`expert_values`). The split is forced by the import direction —
+  `src/` never imports `orchestrator/`, and B2's worker-side stripping lives in
+  `src/tools/knowledge/knowledge_tools.py`. Two copies of the officer-only tag list would
+  be a privilege-escalation hole (a tag the tick honours and the stripper misses), so the
+  namespace has exactly one home, reachable from both sides. `classify_ticket` returns
+  `problems[]` rather than resolving ambiguity: two `category:` tags or a misspelled
+  expert make a ticket non-dispatchable with a sitrep reason, never a coin flip — a typo
+  caught here would otherwise surface at agent boot as a job failure and chain-trip the
+  pool breaker. Tests: `tests/test_work_categories.py` (43), including doctrine pins on
+  the load-bearing sentences and a brace-safety pin (the blocks sit beside
+  `_ROLE_BLOCK_DEFAULT`, which goes through `.format()`).
 - **B2 — ticket plumbing**: `remove_tags`/`set_tags` on `kb_update` **[A2]**; lowercase
   normalization on both write paths; machine-tag exclusion from `search_doc` at write;
   worker-side stripping of `ready`/`parallel-safe` (provenance) **[X]**; `fetch_backlog`
