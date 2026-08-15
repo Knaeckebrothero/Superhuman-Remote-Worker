@@ -89,6 +89,42 @@ def normalize_deliverable_path(path: Any) -> str | None:
     return candidate or None
 
 
+# Cloned repository datasources land here, and the platform gitignores the
+# directory at seed time on purpose — src/core/workspace.py,
+# src/core/datasource_setup.py and src/tools/orchestrator/repositories.py all
+# write it ("working-tree only; never versioned"), guarding the
+# contentless-gitlink bug b1758f38. Note the single character between this and
+# the F14 ``repo/`` prefix normalized away above: ``repo/`` is the job's OWN
+# tree, ``repos/`` is somebody else's repository, mounted and unversioned.
+CLONED_REPO_PREFIX = "repos/"
+
+
+def is_cloned_repo_deliverable(path: Any) -> bool:
+    """True for a manifest entry inside a cloned repository datasource.
+
+    Such an entry can never be verified from the job's own versioned tree,
+    because the platform refuses to version it. Treating it as missing is a
+    false negative, and a costly one: it bounces a job that delivered, and
+    teaches the agent that the way to pass is to defeat the .gitignore.
+    See docs/issues/deliverable_gate_cannot_see_cloned_repo_deliverables.md.
+    """
+    if not isinstance(path, str) or path.startswith(KB_DELIVERABLE_PREFIX):
+        return False
+    if not path.startswith(CLONED_REPO_PREFIX):
+        return False
+    remainder = path[len(CLONED_REPO_PREFIX) :].strip("/")
+    return bool(remainder)
+
+
+def cloned_repo_deliverables(manifest: list[str]) -> list[str]:
+    """The manifest entries this gate can never verify, in declared order.
+
+    Used by the gate to fail open per entry, and by job creation to refuse
+    the manifest outright — one definition of the rule, two consumers.
+    """
+    return [p for p in manifest if is_cloned_repo_deliverable(p)]
+
+
 def parse_required_deliverables(context: Any) -> list[str]:
     """The job's manifest as a clean, deduplicated list (possibly empty).
 
@@ -331,6 +367,20 @@ async def evaluate_deliverable_gate(
             continue
         if _tree_has_path(tree_paths, path):
             present.append(path)
+        elif is_cloned_repo_deliverable(path):
+            # Checked the tree FIRST on purpose: a path that really is
+            # committed (job 29c28492 forced two in by hand) is reported
+            # present, not excused. Fail open only where the gate genuinely
+            # cannot see — the module's standing rule, "never block a seal on
+            # infrastructure the worker cannot fix".
+            logger.warning(
+                "Deliverable gate: %r is inside a cloned repository datasource "
+                "for job %s — unverifiable from the job tree, treating as "
+                "satisfied",
+                path,
+                job.get("id"),
+            )
+            unverified.append(path)
         else:
             missing.append(path)
 
@@ -483,7 +533,23 @@ async def run_deliverable_gate(
             f"deliverable gate passed ({n_present}/{n_present + n_unverified} present"
         )
         if n_unverified:
-            action += f", {n_unverified} unverifiable kb entr(y/ies) failed open"
+            # Name the KIND. This line predated cloned-repo entries and called
+            # every fail-open a "kb" one; saying kb about a repos/ path
+            # describes a check that never ran.
+            unverified_paths = report.get("unverified") or []
+            kb_n = sum(
+                1 for p in unverified_paths if str(p).startswith(KB_DELIVERABLE_PREFIX)
+            )
+            repo_n = n_unverified - kb_n
+            kinds = []
+            if kb_n:
+                kinds.append(f"{kb_n} kb")
+            if repo_n:
+                kinds.append(f"{repo_n} cloned-repo")
+            noun = "entry" if n_unverified == 1 else "entries"
+            action += (
+                f", {n_unverified} unverifiable {noun} failed open ({', '.join(kinds)})"
+            )
         action += ")"
         return new_status, [action], False
 
