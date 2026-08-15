@@ -495,6 +495,29 @@ class TestRenderBacklogBlock:
         block = render_backlog_block([_row("a")], {1: 1})
         assert "IN PROGRESS: (none)" in block
 
+    def test_claimed_tickets_are_marked_with_their_job(self):
+        """B2: a pool read by agents that can't see claim state gets re-picked.
+        Claim state stays derived — the caller resolves it, this only renders."""
+        from orchestrator.services.project_backlog import render_backlog_block
+
+        block = render_backlog_block(
+            [_row("issue-login"), _row("feature-dark")],
+            {1: 2},
+            claims={"issue-login": "4f2a91c8-1111-2222-3333-444444444444"},
+        )
+        lines = block.splitlines()
+        assert "issue-login — T · claimed by job 4f2a91c8" in lines[2]
+        assert "claimed by" not in lines[3]
+
+    def test_unclaimed_rendering_is_byte_identical_without_claims(self):
+        # Passing no claims must not perturb the block every existing pin reads.
+        from orchestrator.services.project_backlog import render_backlog_block
+
+        rows, counts = [_row("a"), _row("b", priority=0)], {0: 1, 1: 1}
+        assert render_backlog_block(rows, counts) == render_backlog_block(
+            rows, counts, claims={}
+        )
+
     def test_in_progress_without_priority_omits_the_tag(self):
         """Fix round 1, Finding 2: the caller (main.py's _spawn_loop_job)
         cannot honestly assert a priority for the campaign's in-progress
@@ -739,6 +762,71 @@ class TestFetchBacklog:
         assert (
             "ORDER BY priority ASC, created_at ASC NULLS LAST, note_id ASC" in first_sql
         )
+
+
+class TestFetchBacklogTagFilter:
+    """B2: the auto-pull tick asks "what may this pool take next", which is a
+    different question from "what is open"."""
+
+    @pytest.mark.asyncio
+    async def test_no_filter_binds_an_empty_array_and_matches_everything(self):
+        from orchestrator.services.project_backlog import fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        await fetch_backlog(_fake_vector_db(conn), "p-1")
+
+        rows_call, counts_call = conn.fetch.await_args_list
+        assert rows_call.args[4] == []
+        assert counts_call.args[3] == []
+
+    @pytest.mark.asyncio
+    async def test_filter_binds_as_the_trailing_parameter_on_both_queries(self):
+        # Trailing on purpose: the positional slots above it are pinned by the
+        # tests around this one and by the plan-shape reasoning in fetch_backlog's
+        # docstring, so a filter inserted mid-list would renumber them.
+        from orchestrator.services.project_backlog import fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        await fetch_backlog(
+            _fake_vector_db(conn),
+            "p-1",
+            require_tags=["ready", "category:researcher"],
+        )
+
+        rows_call, counts_call = conn.fetch.await_args_list
+        assert rows_call.args[4] == ["ready", "category:researcher"]
+        assert counts_call.args[3] == ["ready", "category:researcher"]
+
+    @pytest.mark.asyncio
+    async def test_uses_containment_not_any_so_the_gin_index_is_reachable(self):
+        # `tags @> ARRAY[...]` is indexable by idx_knowledge_tags; `= ANY` is
+        # not. Same class of mistake as the note-type literal above it.
+        from orchestrator.services.project_backlog import fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        await fetch_backlog(_fake_vector_db(conn), "p-1", require_tags=["ready"])
+
+        for call in conn.fetch.await_args_list:
+            sql = " ".join(call.args[0].split())
+            assert "tags @>" in sql
+            assert "= ANY" not in sql
+
+    @pytest.mark.asyncio
+    async def test_rows_carry_tags_and_ready_at(self):
+        # The tick needs both: tags to classify, ready_at to decide whether the
+        # authorization is newer than the newest claim.
+        from orchestrator.services.project_backlog import fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        await fetch_backlog(_fake_vector_db(conn), "p-1")
+
+        rows_sql = conn.fetch.await_args_list[0].args[0]
+        assert "tags" in rows_sql.split("FROM")[0]
+        assert "ready_at" in rows_sql.split("FROM")[0]
 
 
 class TestBacklogIndexPredicateMatchesNoteTypes:

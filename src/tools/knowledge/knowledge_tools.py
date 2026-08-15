@@ -19,10 +19,17 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, NamedTuple, Optional
 
 import httpx
 from langchain_core.tools import tool
+
+from src.shared.backlog_tags import (
+    READY_TAG,
+    has_tag,
+    is_officer_only_tag,
+    normalize_tags,
+)
 
 from ...services.knowledge_graph import (
     CONFIDENCE_LEVELS,
@@ -123,6 +130,189 @@ def _charter_write_denied(context: "ToolContext") -> Optional[str]:
         "cannot be written from a worker job. File your findings as a "
         "'report' note instead."
     )
+
+
+def _has_officer_authority(context: "ToolContext") -> bool:
+    """True if this caller may set dispatch-authorization tags.
+
+    Same trust boundary as the charter (:func:`_charter_write_denied`) and for
+    the same reason, one step further out: ``ready`` is not a label, it is the
+    signal that lets the auto-pull tick spawn a job. A worker that could stamp
+    it — or that summarized a web page which told it to — would be authorizing
+    its own successor onto the century's executor slot. Sessions (the Legate's
+    hands, or the officer's) carry a persistent-thread id; worker jobs do not.
+    """
+    return bool(getattr(context, "_thread_id", None))
+
+
+class _TagResolution(NamedTuple):
+    """The outcome of applying a tag mutation to a note.
+
+    ``ready`` is the tri-state flag ``KnowledgeStore.upsert_note`` takes:
+    True/False when this write explicitly granted or withdrew dispatch
+    authorization, None when it said nothing about it.
+    """
+
+    tags: List[str]
+    ready: Optional[bool]
+    dropped: List[str]
+    changed: bool
+
+
+def _resolve_tags(
+    existing: Optional[List[str]],
+    *,
+    add: Optional[List[str]] = None,
+    remove: Optional[List[str]] = None,
+    replace: Optional[List[str]] = None,
+    officer_authority: bool,
+) -> _TagResolution:
+    """Apply a tag mutation, enforcing the officer-only namespace.
+
+    ``replace`` (the ``set_tags`` argument) is absolute and wins over
+    ``add``/``remove``; otherwise the result is ``existing + add - remove``.
+    Removal happens before addition so a caller that swaps a value in one call
+    — drop ``category:researcher``, add ``category:executor`` — cannot have the
+    removal cancel its own addition when the lists overlap.
+
+    Without officer authority the caller's officer-only tags are dropped AND
+    the note's existing ones are carried over untouched. Stripping the input
+    alone would not be enough: ``set_tags`` is absolute, so a worker could
+    un-ready a queued ticket simply by rewriting the list without it. The
+    invariant is that a worker write can neither grant nor withdraw dispatch
+    authorization, which is also why ``ready`` comes back None on that path.
+    """
+    current = normalize_tags(existing)
+
+    if replace is not None:
+        requested = normalize_tags(replace)
+        if officer_authority:
+            return _TagResolution(
+                tags=requested,
+                ready=has_tag(requested, READY_TAG),
+                dropped=[],
+                changed=requested != current,
+            )
+        base = [t for t in requested if not is_officer_only_tag(t)]
+        carried = [t for t in current if is_officer_only_tag(t)]
+        resolved = base + [t for t in carried if t not in base]
+        return _TagResolution(
+            tags=resolved,
+            ready=None,
+            dropped=[t for t in requested if is_officer_only_tag(t)],
+            changed=resolved != current,
+        )
+
+    add_list = normalize_tags(add)
+    remove_list = normalize_tags(remove)
+    dropped: List[str] = []
+    if not officer_authority:
+        dropped = [t for t in add_list + remove_list if is_officer_only_tag(t)]
+        add_list = [t for t in add_list if not is_officer_only_tag(t)]
+        remove_list = [t for t in remove_list if not is_officer_only_tag(t)]
+
+    resolved = [t for t in current if t not in remove_list]
+    for tag in add_list:
+        if tag not in resolved:
+            resolved.append(tag)
+
+    if not officer_authority:
+        ready: Optional[bool] = None
+    elif has_tag(add_list, READY_TAG):
+        ready = True
+    elif has_tag(remove_list, READY_TAG):
+        ready = False
+    else:
+        # Silence, not a re-assertion. A content edit on a ready ticket carries
+        # `ready` in its tag list but must NOT bump ready_at: that would re-arm
+        # a ticket the tick has already claimed and dispatch a second job for
+        # work in flight.
+        ready = None
+
+    return _TagResolution(
+        tags=resolved, ready=ready, dropped=dropped, changed=resolved != current
+    )
+
+
+def _dropped_tag_notice(dropped: List[str]) -> str:
+    """Tell the caller what was refused, rather than silently discarding it.
+
+    A worker that asked for ``ready`` and got no acknowledgement would keep
+    asking; naming the boundary costs one clause and teaches the model the
+    actual model of the system.
+    """
+    if not dropped:
+        return ""
+    names = ", ".join(sorted(set(dropped)))
+    return (
+        f" (ignored {names}: dispatch-authorization tags are set by the "
+        f"officer, not from a worker job)"
+    )
+
+
+def _apply_ready_frontmatter(
+    note: Dict[str, Any],
+    ready: Optional[bool],
+    existing: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Carry ``ready_at`` into the OKF file this write is about to materialise.
+
+    The file is canonical, so the authorization has to live there too — a
+    rebuild from files that dropped it would silently park every ready ticket
+    in the vault. Present-and-set means armed, absent means "this file says
+    nothing", which is what ``upsert_kb_note`` COALESCEs against the stored
+    value; a rebuilt row with neither fails closed, which is the right
+    direction for a dispatch authorization.
+
+    The timestamp comes from this process while the index row gets ``NOW()``
+    from Postgres. They differ by under a millisecond, and the only comparison
+    that reads them is against a job's ``created_at`` a tick or more later.
+    """
+    if ready is True:
+        note["ready_at"] = datetime.now(timezone.utc).isoformat()
+    elif ready is False:
+        note.pop("ready_at", None)
+    elif existing and existing.get("ready_at"):
+        prior = existing["ready_at"]
+        note["ready_at"] = (
+            prior.isoformat() if isinstance(prior, datetime) else str(prior)
+        )
+
+
+def _describe_update(
+    *,
+    content: Optional[str],
+    append: Optional[str],
+    status: Optional[str],
+    confidence: Optional[str],
+    add_links: Optional[List[dict]],
+    tag_change: _TagResolution,
+) -> List[str]:
+    """The human-readable change list both kb_update paths report.
+
+    Shared so the two backends cannot describe the same edit differently. The
+    readiness line is called out by name rather than folded into a tag count:
+    arming a ticket is the act that lets a job be spawned, and it should never
+    read as "+1 tag(s)".
+    """
+    changes: List[str] = []
+    if content is not None:
+        changes.append("content replaced")
+    if append is not None:
+        changes.append("content appended")
+    if status:
+        changes.append(f"status → {status}")
+    if confidence:
+        changes.append(f"confidence → {confidence}")
+    if tag_change.changed:
+        changes.append(f"tags → [{', '.join(tag_change.tags)}]")
+    if tag_change.ready is True:
+        changes.append("READY for dispatch")
+    elif tag_change.ready is False:
+        changes.append("dispatch authorization withdrawn")
+    if add_links:
+        changes.append(f"+{len(add_links)} link(s)")
+    return changes
 
 
 # The kb_lint URL sweep checks at most this many unique external URLs per run;
@@ -495,9 +685,9 @@ def _render_note_md(note: Dict[str, Any]) -> str:
 
     Expected keys (all optional except ``id``/``type``): ``id``, ``type``,
     ``title``, ``description``, ``content``, ``tags``, ``keywords``,
-    ``confidence``, ``status``, ``priority``, ``author``, ``job``, ``branch``,
-    ``created``, ``modified``, ``superseded_by``, ``relationships``
-    ([{type, target}]).
+    ``confidence``, ``status``, ``priority``, ``ready_at``, ``author``,
+    ``job``, ``branch``, ``created``, ``modified``, ``superseded_by``,
+    ``relationships`` ([{type, target}]).
     """
     note_id = note.get("id", "unknown")
     content = note.get("content", "") or ""
@@ -523,6 +713,12 @@ def _render_note_md(note: Dict[str, Any]) -> str:
         )
         if word in ("high", "normal", "low"):
             fm.append(f"priority: {word}")
+    # Dispatch authorization (B2). Quoted — a bare ISO timestamp is a YAML
+    # timestamp scalar, and the reindexer wants the string back unchanged.
+    # Omitted when absent, so every non-ticket note's frontmatter stays
+    # byte-identical, same rule as priority.
+    if note.get("ready_at"):
+        fm.append(f"ready_at: {_yaml_quote(str(note['ready_at']))}")
     fm.append(f"status: {note.get('status', 'active')}")
     # Provenance (§7) — origin binding that git authorship can't carry.
     if note.get("author"):
@@ -1088,6 +1284,8 @@ def create_kb_tools(
         add_tags: Optional[List[str]],
         add_links: Optional[List[dict]],
         priority: Optional[int] = None,
+        remove_tags: Optional[List[str]] = None,
+        set_tags: Optional[List[str]] = None,
     ) -> str:
         """Neo4j-less update: read the row from the store, apply the mutation in
         Python (the graph does this in Cypher), write back to store + OKF file.
@@ -1139,11 +1337,14 @@ def create_kb_tools(
             new_type = existing.get("type") or "learning"
             new_title = existing.get("title") or note
 
-            merged_tags = list(existing.get("tags") or [])
-            for t in add_tags or []:
-                tl = t.lower()
-                if tl not in merged_tags:
-                    merged_tags.append(tl)
+            tag_change = _resolve_tags(
+                existing.get("tags"),
+                add=add_tags,
+                remove=remove_tags,
+                replace=set_tags,
+                officer_authority=_has_officer_authority(context),
+            )
+            merged_tags = tag_change.tags
 
             _jid = existing.get("job_id")
             job_id_arg = uuid.UUID(_jid) if isinstance(_jid, str) else _jid
@@ -1165,6 +1366,7 @@ def create_kb_tools(
             }
             if new_type in _TICKET_TYPES:
                 updated_note["priority"] = new_priority
+            _apply_ready_frontmatter(updated_note, tag_change.ready, existing)
             _materialize_note(context, note, updated_note)
             try:
                 _run_async(
@@ -1182,25 +1384,24 @@ def create_kb_tools(
                         phase=existing.get("phase"),
                         modified_at=datetime.now(timezone.utc),
                         priority=new_priority,
+                        ready=tag_change.ready,
                     )
                 )
             except Exception as e:
                 logger.warning(f"pgvector write-through failed for {note}: {e}")
 
-            changes = []
-            if content is not None:
-                changes.append("content replaced")
-            if append is not None:
-                changes.append("content appended")
-            if status:
-                changes.append(f"status → {status}")
-            if confidence:
-                changes.append(f"confidence → {confidence}")
-            if add_tags:
-                changes.append(f"+{len(add_tags)} tag(s)")
-            if add_links:
-                changes.append(f"+{len(add_links)} link(s)")
-            return f"Updated **{note}**: {', '.join(changes)}"
+            changes = _describe_update(
+                content=content,
+                append=append,
+                status=status,
+                confidence=confidence,
+                add_links=add_links,
+                tag_change=tag_change,
+            )
+            return (
+                f"Updated **{note}**: {', '.join(changes)}"
+                f"{_dropped_tag_notice(tag_change.dropped)}"
+            )
         except Exception as e:
             logger.error(f"kb_update failed: {e}")
             return f"Error updating note: {e}"
@@ -1214,6 +1415,8 @@ def create_kb_tools(
         priority: Optional[int] = None,
         add_tags: Optional[List[str]] = None,
         add_links: Optional[List[dict]] = None,
+        remove_tags: Optional[List[str]] = None,
+        set_tags: Optional[List[str]] = None,
     ) -> str:
         """Update an existing note: Neo4j + OKF file + pgvector write-through.
 
@@ -1233,6 +1436,8 @@ def create_kb_tools(
                 add_tags,
                 add_links,
                 priority=priority,
+                remove_tags=remove_tags,
+                set_tags=set_tags,
             )
 
         project_id = _get_project_id(context)
@@ -1253,6 +1458,21 @@ def create_kb_tools(
                 if denied:
                     return denied
 
+            # Resolve tags against the pre-read, then hand Neo4j the DIFF.
+            # ``set_tags`` has no Cypher equivalent — the graph only knows
+            # attach/detach — so all three mutation modes collapse to one
+            # add/remove pair here. When the pre-read failed, ``prior_tags`` is
+            # empty and the diff degrades to add-only: the same best-effort
+            # posture as the priority lookback below, and never a wrong removal.
+            prior_tags = _pre.get("tags") if isinstance(_pre, dict) else None
+            tag_change = _resolve_tags(
+                prior_tags,
+                add=add_tags,
+                remove=remove_tags,
+                replace=set_tags,
+                officer_authority=_has_officer_authority(context),
+            )
+            _prior_normalized = normalize_tags(prior_tags)
             updated = kg.update_note(
                 project_id=project_id,
                 note_id=note,
@@ -1260,8 +1480,9 @@ def create_kb_tools(
                 append=append,
                 status=status,
                 confidence=confidence,
-                add_tags=add_tags,
+                add_tags=[t for t in tag_change.tags if t not in _prior_normalized],
                 add_links=add_links,
+                remove_tags=[t for t in _prior_normalized if t not in tag_change.tags],
             )
 
             if not updated:
@@ -1286,30 +1507,38 @@ def create_kb_tools(
                     # previously clobbered a real existing priority whenever
                     # the lookback failed (fix round 1, Finding 1).
                     new_priority: Optional[int] = None
+                    prior_row: Optional[Dict[str, Any]] = None
                     if new_type in _TICKET_TYPES:
-                        if priority is not None:
+                        # Neo4j holds neither priority nor ready_at (both live
+                        # only on the pgvector row), so one best-effort lookback
+                        # serves both. It runs whenever either value still needs
+                        # carrying over — a caller-supplied priority alone no
+                        # longer skips it, because the OKF file this write is
+                        # about to rewrite would otherwise silently drop the
+                        # ticket's dispatch authorization.
+                        if priority is not None and tag_change.ready is not None:
                             new_priority = priority
                         else:
-                            # Neo4j has no priority property (Tasks 1-2 only
-                            # added it to the pgvector row) — best-effort
-                            # read the row's current value. A failed *or*
-                            # not-found lookback leaves new_priority at None:
-                            # not-found means a fresh pgvector row is about
-                            # to be inserted (nothing to preserve, 1 is an
-                            # honest default there — see upsert_note), and a
-                            # failure must never be resolved by guessing.
+                            # A failed *or* not-found lookback leaves
+                            # new_priority at None: not-found means a fresh
+                            # pgvector row is about to be inserted (nothing to
+                            # preserve, 1 is an honest default there — see
+                            # upsert_note), and a failure must never be resolved
+                            # by guessing.
                             try:
                                 prior_row = _run_async(
                                     ks.get_note_by_slug(uuid.UUID(project_id), note)
                                 )
-                                if prior_row:
-                                    new_priority = prior_row.get(
-                                        "priority", DEFAULT_PRIORITY_RANK
-                                    )
                             except Exception as e:
                                 logger.warning(
                                     f"priority lookback failed for {note}, "
                                     f"leaving its priority unchanged: {e}"
+                                )
+                            if priority is not None:
+                                new_priority = priority
+                            elif prior_row:
+                                new_priority = prior_row.get(
+                                    "priority", DEFAULT_PRIORITY_RANK
                                 )
                     # Files-canonical materialisation — before the
                     # disposable-index upsert, so the canonical file lands even
@@ -1329,6 +1558,9 @@ def create_kb_tools(
                     }
                     if new_type in _TICKET_TYPES and new_priority is not None:
                         full_note_dict["priority"] = new_priority
+                    _apply_ready_frontmatter(
+                        full_note_dict, tag_change.ready, prior_row
+                    )
                     _materialize_note(context, note, full_note_dict)
                     _run_async(
                         ks.upsert_note(
@@ -1348,26 +1580,25 @@ def create_kb_tools(
                             retrieval_messages=full_note.get("retrieval_messages", []),
                             modified_at=datetime.now(timezone.utc),
                             priority=new_priority,
+                            ready=tag_change.ready,
                         )
                     )
             except Exception as e:
                 logger.warning(f"pgvector write-through failed for {note}: {e}")
 
-            changes = []
-            if content is not None:
-                changes.append("content replaced")
-            if append is not None:
-                changes.append("content appended")
-            if status:
-                changes.append(f"status → {status}")
-            if confidence:
-                changes.append(f"confidence → {confidence}")
-            if add_tags:
-                changes.append(f"+{len(add_tags)} tag(s)")
-            if add_links:
-                changes.append(f"+{len(add_links)} link(s)")
+            changes = _describe_update(
+                content=content,
+                append=append,
+                status=status,
+                confidence=confidence,
+                add_links=add_links,
+                tag_change=tag_change,
+            )
 
-            return f"Updated **{note}**: {', '.join(changes)}"
+            return (
+                f"Updated **{note}**: {', '.join(changes)}"
+                f"{_dropped_tag_notice(tag_change.dropped)}"
+            )
 
         except ValueError as e:
             return f"Error: {e}"
@@ -1425,6 +1656,16 @@ def create_kb_tools(
         project_id = _get_project_id(context)
         if not project_id:
             return _write_scope_error(context)
+
+        # Normalize machine tags (lowercase) and enforce the officer-only
+        # namespace at the one write path that could otherwise create an
+        # already-authorized ticket. `existing` is empty: a new note has no
+        # prior tags to carry over.
+        _new_tags = _resolve_tags(
+            None, replace=tags or [], officer_authority=_has_officer_authority(context)
+        )
+        tags = _new_tags.tags
+        _tag_notice = _dropped_tag_notice(_new_tags.dropped)
 
         if type == "charter":
             denied = _charter_write_denied(context)
@@ -1578,6 +1819,7 @@ def create_kb_tools(
                         created_at=now,
                         modified_at=now,
                         priority=rank,
+                        ready=_new_tags.ready,
                     )
                 )
             except Exception as e:
@@ -1623,6 +1865,7 @@ def create_kb_tools(
                 # entirely when the key is absent, keeping non-ticket notes'
                 # frontmatter byte-identical (Global constraint).
                 new_note["priority"] = rank
+            _apply_ready_frontmatter(new_note, _new_tags.ready)
             _materialize_note(context, slug, new_note)
 
             # Verdict SUPERSEDE: retire the stale note(s) the candidate replaces,
@@ -1642,14 +1885,17 @@ def create_kb_tools(
                 if retired:
                     return (
                         f"Created knowledge note: **{slug}** (type={type}) — "
-                        f"superseded {', '.join(retired)}"
+                        f"superseded {', '.join(retired)}{_tag_notice}"
                     )
 
             link_info = ""
             if links:
                 link_info = f", {len(links)} link(s)"
 
-            return f"Created knowledge note: **{slug}** (type={type}{link_info})"
+            return (
+                f"Created knowledge note: **{slug}** (type={type}{link_info})"
+                f"{_tag_notice}"
+            )
 
         except ValueError as e:
             return f"Error: {e}"
@@ -1667,6 +1913,8 @@ def create_kb_tools(
         priority: Optional[PriorityValue] = None,
         add_tags: Optional[List[str]] = None,
         add_links: Optional[List[dict]] = None,
+        remove_tags: Optional[List[str]] = None,
+        set_tags: Optional[List[str]] = None,
     ) -> str:
         """Update an existing knowledge note.
 
@@ -1681,10 +1929,20 @@ def create_kb_tools(
             priority: Change the backlog rank; omit to leave it unchanged.
             add_tags: Additional tags to add
             add_links: Additional relationships — list of {"target": "slug", "type": "RELATIONSHIP_TYPE"}
+            remove_tags: Tags to remove. Use this to retract a tag rather than
+                leaving it stuck — swapping a ticket's `category:` needs the old
+                one removed, or it matches two work pools at once.
+            set_tags: Replace the tag list entirely (wins over add_tags /
+                remove_tags when given).
 
         Returns:
             Confirmation or error message
         """
+        if set_tags is not None and (add_tags or remove_tags):
+            return (
+                "Error: set_tags replaces the whole tag list — do not combine "
+                "it with add_tags/remove_tags in one call."
+            )
         alias, note_slug = split_note_handle(note)
         if alias and _has_bound_scopes:
             binding = _resolve_binding(context, alias)
@@ -1711,6 +1969,8 @@ def create_kb_tools(
             priority=PRIORITY_RANKS[priority] if priority is not None else None,
             add_tags=add_tags,
             add_links=add_links,
+            remove_tags=remove_tags,
+            set_tags=set_tags,
         )
 
     # =========================================================================

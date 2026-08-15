@@ -439,7 +439,11 @@ class TestUpsertNotePriorityCoalesceSentinel:
             priority=0,
         )
         update_call = mock_db.fetchval.call_args_list[1]
-        assert update_call[0][-1] == 0
+        # Positional, not [-1]: args[0] is the query, so $13 (priority) is
+        # index 13. B2 appended $14 (ready) after it, and a trailing-slot pin
+        # would silently start asserting against whatever lands last next.
+        assert update_call[0][13] == 0
+        assert update_call[0][14] is None  # this write said nothing about ready
 
 
 # =============================================================================
@@ -535,7 +539,10 @@ class TestUpsertKbNotePriorityCoalesceSentinel:
             priority=0,
         )
         params = mock_db.fetchval.call_args[0][1:]
-        assert params[-1] == 0
+        # $21 (priority) by position, not [-1]: B2 appended $22 (ready_at)
+        # after it, and a trailing-slot pin would follow whatever lands last.
+        assert params[20] == 0
+        assert params[21] is None  # no ready_at: line in this note's frontmatter
 
 
 # =============================================================================

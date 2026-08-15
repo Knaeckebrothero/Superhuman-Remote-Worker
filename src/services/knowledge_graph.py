@@ -453,6 +453,7 @@ class KnowledgeGraphDB:
         confidence: Optional[str] = None,
         add_tags: Optional[List[str]] = None,
         add_links: Optional[List[Dict[str, str]]] = None,
+        remove_tags: Optional[List[str]] = None,
     ) -> bool:
         """Update an existing note.
 
@@ -465,6 +466,13 @@ class KnowledgeGraphDB:
             confidence: New confidence
             add_tags: Additional tags
             add_links: Additional relationships
+            remove_tags: Tags to detach. Removal exists because tags became
+                dispatch state, not just labels: a ``ready`` tag that can only
+                be added is a one-way door, and a ticket whose category
+                changes would otherwise match two pools at once
+                (docs/features/officer_backlog_pools.md §4). Detaching the
+                ``:TAGGED`` edge leaves the ``:Tag`` node — it is shared across
+                the project's notes and may still have other holders.
 
         Returns:
             True if note was found and updated
@@ -507,6 +515,19 @@ class KnowledgeGraphDB:
             """,
             params,
         )
+
+        # Remove before add, so a caller that does both in one call (a category
+        # change: drop category:researcher, add category:executor) cannot have
+        # the removal undo the addition when the two lists overlap.
+        for tag in remove_tags or []:
+            self._db.execute_write(
+                """
+                MATCH (n:Note {project_id: $pid, id: $nid})-[r:TAGGED]->
+                      (t:Tag {name: $tag, project_id: $pid})
+                DELETE r
+                """,
+                {"pid": project_id, "nid": note_id, "tag": tag.lower()},
+            )
 
         # Add new tags
         for tag in add_tags or []:

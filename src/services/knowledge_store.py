@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from src.shared.backlog_tags import strip_machine_tags
+
 logger = logging.getLogger(__name__)
 
 
@@ -274,6 +276,7 @@ class KnowledgeStore:
         created_at: Optional[datetime] = None,
         modified_at: Optional[datetime] = None,
         priority: Optional[int] = 1,
+        ready: Optional[bool] = None,
     ) -> uuid.UUID:
         """Upsert a note into the search index (write-through from Neo4j).
 
@@ -304,6 +307,17 @@ class KnowledgeStore:
                 against the row's own existing value, and only fall back to
                 1 for a genuinely new row, which has no prior value to
                 clobber in the first place.
+            ready: Whether THIS write authorizes the ticket for dispatch.
+                Tri-state, and the distinction is load-bearing (see
+                ``knowledge_index.ready_at``, vector migration 0020):
+                ``True`` stamps ``ready_at = now`` — the officer explicitly
+                (re-)armed the ticket in this call; ``False`` clears it — he
+                withdrew the authorization; ``None`` leaves it alone.
+                Every write that merely happens to carry a ``ready`` tag in
+                its tag list MUST pass ``None``. Bumping the timestamp on an
+                ordinary content edit would re-arm a ticket that is already
+                claimed, and the tick would dispatch a second job for work
+                already in flight.
 
         Returns:
             UUID of the upserted row
@@ -325,6 +339,10 @@ class KnowledgeStore:
 
         if existing_hash == new_hash:
             # Content unchanged — update metadata only, skip embedding.
+            # This is the branch a re-ready lands in: stamping `ready` on a
+            # ticket touches tags and nothing else, so ready_at has to be
+            # handled here or the officer's one re-arm action would be a no-op
+            # and the ticket would stay parked forever.
             # priority = COALESCE($13, priority): this branch only ever runs
             # against a row that was just confirmed to exist (the
             # existing_hash lookup above), so a NULL $13 ("unknown, leave
@@ -336,7 +354,12 @@ class KnowledgeStore:
                 SET title = $3, note_type = $4, status = $5, confidence = $6,
                     tags = $7, keywords = $8, job_id = $9, phase = $10,
                     retrieval_messages = $11, modified_at = $12,
-                    indexed_at = NOW(), priority = COALESCE($13, priority)
+                    indexed_at = NOW(), priority = COALESCE($13, priority),
+                    ready_at = CASE
+                        WHEN $14::boolean IS NULL THEN ready_at
+                        WHEN $14::boolean THEN NOW()
+                        ELSE NULL
+                    END
                 WHERE project_id = $1 AND note_id = $2
                 RETURNING id
                 """,
@@ -353,6 +376,7 @@ class KnowledgeStore:
                 retrieval_list,
                 modified_at,
                 priority,
+                ready,
             )
             logger.debug(f"Updated knowledge index (metadata only): {note_id}")
             return row_id
@@ -366,12 +390,19 @@ class KnowledgeStore:
         embedding_raw = await self.embedding_service.embed(embed_text)
         embedding_vec = self._prepare_embedding(embedding_raw)
 
-        # Build tsvector text from all searchable fields
+        # Build tsvector text from all searchable fields. Machine tags are
+        # excluded: `category:researcher` is dispatch metadata, and a search for
+        # "researcher" that surfaces every ticket in a pool buries the notes that
+        # are actually about research. This is the only write path that puts tags
+        # into search_doc at all (the reindexer indexes content alone), and only
+        # on a content change — the metadata-only branch above leaves search_doc
+        # untouched, so a row polluted before this landed stays polluted until
+        # its content is edited or the vault is reindexed.
         search_text = " ".join(
             [
                 title,
                 content,
-                " ".join(tags_list),
+                " ".join(strip_machine_tags(tags_list)),
                 " ".join(keywords_list),
                 " ".join(retrieval_list),
             ]
@@ -393,18 +424,25 @@ class KnowledgeStore:
         # unchanged"). Referencing EXCLUDED.priority there instead would be
         # wrong: it would already be the coalesced-to-1 VALUES-list result,
         # never NULL, so the "leave unchanged" case could never trigger.
+        #
+        # ready ($20) splits the same way for a different reason: a brand-new
+        # row has no authorization to preserve, so NULL and False both mean
+        # "not ready" there, while the ON CONFLICT branch must distinguish
+        # them — NULL preserves an existing ready_at (this write said nothing
+        # about readiness), False clears it (the officer withdrew it).
         row_id = await self.db.fetchval(
             """
             INSERT INTO knowledge_index (
                 note_id, project_id, title, note_type, status, confidence,
                 tags, keywords, job_id, phase, content, retrieval_messages,
                 embedding, search_doc, created_at, modified_at, indexed_at,
-                content_hash, remaining_cycles, priority
+                content_hash, remaining_cycles, priority, ready_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10, $11, $12,
                 $13, to_tsvector('english', $14), $15, $16, NOW(),
-                $17, $18, COALESCE($19, 1)
+                $17, $18, COALESCE($19, 1),
+                CASE WHEN $20::boolean THEN NOW() ELSE NULL END
             )
             ON CONFLICT (project_id, note_id) DO UPDATE SET
                 title = EXCLUDED.title,
@@ -422,7 +460,12 @@ class KnowledgeStore:
                 modified_at = EXCLUDED.modified_at,
                 indexed_at = NOW(),
                 content_hash = EXCLUDED.content_hash,
-                priority = COALESCE($19, knowledge_index.priority)
+                priority = COALESCE($19, knowledge_index.priority),
+                ready_at = CASE
+                    WHEN $20::boolean IS NULL THEN knowledge_index.ready_at
+                    WHEN $20::boolean THEN NOW()
+                    ELSE NULL
+                END
             RETURNING id
             """,
             note_id,
@@ -444,6 +487,7 @@ class KnowledgeStore:
             new_hash,
             ttl_value,
             priority,
+            ready,
         )
 
         logger.debug(f"Upserted knowledge index: {note_id} (content changed)")
@@ -894,6 +938,7 @@ class KnowledgeStore:
         created_at: Optional[datetime] = None,
         modified_at: Optional[datetime] = None,
         priority: Optional[int] = 1,
+        ready_at: Optional[datetime] = None,
     ) -> uuid.UUID:
         """Upsert a note-level row keyed by ``(kb_id, path)``.
 
@@ -923,6 +968,15 @@ class KnowledgeStore:
         conflict, and to 1 only for a genuinely new row (nothing to
         preserve there).
 
+        ``ready_at`` follows the same sentinel, and for a sharper reason. It
+        is an ABSOLUTE timestamp here, not the action flag
+        :meth:`upsert_note` takes: a file replay is not an authorization
+        event, it is a replay of one that already happened, so the value
+        comes off the frontmatter rather than the clock. ``None`` means the
+        file carried no ``ready_at:`` line — leave the stored value alone.
+        Stamping ``now()`` here instead would re-arm every ready ticket in
+        the vault on the next reindex and re-dispatch work already done.
+
         Returns the row id (for the chunk FK).
         """
         content_hash = self._content_hash(content)
@@ -943,14 +997,14 @@ class KnowledgeStore:
                  status, confidence, tags, keywords, retrieval_messages,
                  blob_sha, embedding_version, superseded_by, invalidated_at,
                  job_id, phase, content_hash, created_at, modified_at, indexed_at,
-                 priority)
+                 priority, ready_at)
             VALUES
                 ($1, $1, $2, $3, $4, $5, $6,
                  to_tsvector('english', $6),
                  $7, $8, $9, $10, $11,
                  $12, $13, $14, $15,
                  $16, $17, $18, $19, $20, NOW(),
-                 COALESCE($21, 1))
+                 COALESCE($21, 1), $22)
             ON CONFLICT (kb_id, path) WHERE kb_id IS NOT NULL AND path IS NOT NULL
             DO UPDATE SET
                 note_id = $2, title = $4, note_type = $5, content = $6,
@@ -959,7 +1013,8 @@ class KnowledgeStore:
                 superseded_by = $14, invalidated_at = $15, job_id = $16,
                 phase = $17, content_hash = $18, modified_at = $20, indexed_at = NOW(),
                 search_doc = EXCLUDED.search_doc,
-                priority = COALESCE($21, knowledge_index.priority)
+                priority = COALESCE($21, knowledge_index.priority),
+                ready_at = COALESCE($22, knowledge_index.ready_at)
             RETURNING id
             """,
             kb_id,
@@ -983,6 +1038,7 @@ class KnowledgeStore:
             created_at,
             modified_at,
             priority,
+            ready_at,
         )
 
     async def stamp_note_indexed(
@@ -1242,7 +1298,7 @@ class KnowledgeStore:
             """
             SELECT note_id, title, note_type, status, content, confidence,
                    tags, keywords, job_id, phase, created_at, modified_at,
-                   priority
+                   priority, ready_at
             FROM knowledge_index
             WHERE kb_id = $1 AND note_id = $2 AND path IS NOT NULL
             LIMIT 1
@@ -1270,6 +1326,11 @@ class KnowledgeStore:
             # kb_update can preserve an existing ticket's priority when the
             # caller doesn't specify a new one.
             "priority": r.get("priority", 1),
+            # Dispatch authorization (B2) — read back for the same reason:
+            # every kb_update rewrites the canonical OKF file, and a file that
+            # silently dropped ready_at would lose the ticket's authorization
+            # on the next full vault rebuild.
+            "ready_at": r.get("ready_at"),
         }
 
     async def get_charter_note(self, project_id: uuid.UUID) -> Optional[Dict[str, Any]]:

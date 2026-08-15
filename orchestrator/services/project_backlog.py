@@ -64,6 +64,7 @@ async def fetch_backlog(
     *,
     exclude_note_id: str | None = None,
     limit: int = BACKLOG_INJECTION_LIMIT,
+    require_tags: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[int, int]]:
     """Return ``(rows, counts_by_rank)`` for a project's open ticket pool.
 
@@ -75,22 +76,39 @@ async def fetch_backlog(
     1, Finding 1). Binding this shifts ``exclude_note_id``/``limit`` down to
     ``$2``/``$3`` (row query) and ``$2`` (count query) -- there is no longer a
     ``$2`` slot for the note-type list.
+
+    ``require_tags`` narrows to tickets carrying ALL of the given tags --
+    ``ready_tag()``/``category_tag(...)`` for the auto-pull tick, which needs
+    "what may this pool take next", not "what is open". It is appended as the
+    LAST bound parameter of each query for that reason: the positional slots
+    above are pinned by tests and by the plan-shape reasoning, and a filter
+    added in the middle would renumber them. The containment operator is
+    load-bearing -- ``tags @> ARRAY[...]`` can use the GIN index on tags,
+    ``= ANY`` cannot.
+
+    ``ready_at`` rides along on every row. The tick compares it against its
+    claiming job's ``created_at`` (one-shot claims, officer_backlog_pools
+    §5.3); a row carrying the ``ready`` tag with a NULL here is unauthorized
+    and must not be dispatched.
     """
+    tag_filter = list(require_tags or [])
     async with vector_db.acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT note_id, note_type, title, priority
+            SELECT note_id, note_type, title, priority, tags, ready_at
               FROM knowledge_index
              WHERE project_id = $1::uuid
                AND status = 'active'
                AND note_type IN {_BACKLOG_NOTE_TYPES_SQL}
                AND ($2::text IS NULL OR note_id <> $2)
+               AND ($4::text[] = '{{}}' OR tags @> $4::text[])
              ORDER BY priority ASC, created_at ASC NULLS LAST, note_id ASC
              LIMIT $3
             """,
             project_id,
             exclude_note_id,
             limit,
+            tag_filter,
         )
         count_rows = await conn.fetch(
             f"""
@@ -100,10 +118,12 @@ async def fetch_backlog(
                AND status = 'active'
                AND note_type IN {_BACKLOG_NOTE_TYPES_SQL}
                AND ($2::text IS NULL OR note_id <> $2)
+               AND ($3::text[] = '{{}}' OR tags @> $3::text[])
              GROUP BY priority
             """,
             project_id,
             exclude_note_id,
+            tag_filter,
         )
     return (
         [dict(r) for r in rows],
@@ -124,6 +144,7 @@ def render_backlog_block(
     *,
     in_progress: dict[str, Any] | None = None,
     limit: int = BACKLOG_INJECTION_LIMIT,
+    claims: dict[str, str] | None = None,
 ) -> str:
     """Render the kickoff's backlog block. Pure — no I/O, no DB.
 
@@ -134,7 +155,15 @@ def render_backlog_block(
         PROJECT BACKLOG — 34 open: 12 high, 15 normal, 7 low (showing top 20)
         IN PROGRESS: [high] issue-deploy-docs — Deployment docs missing
           [high]   feature  feature-rag-boundary — Permission-aware RAG boundary
+          [normal] issue    issue-login-timeout — Login times out · claimed by job 4f2a91c8
           … 18 more
+
+    ``claims`` maps ``note_id -> job id`` for tickets a job already carries.
+    Claim state is DERIVED — it lives on the job row and is never written back
+    to the note — so the caller resolves it and this function only renders it.
+    Showing it matters because the pool is read by agents that would otherwise
+    re-pick work already in flight; the marker is the same signal a human gets
+    from an assignee avatar on a tracker card.
 
     ``in_progress`` with no ``priority`` key (or an explicit ``None``) renders
     with the ``[...]`` tag OMITTED entirely (``IN PROGRESS: note-id — Title``)
@@ -181,10 +210,16 @@ def render_backlog_block(
 
     for row in rows:
         word = _priority_word(row.get("priority"))
+        note_id = row.get("note_id")
+        claimed_by = (claims or {}).get(str(note_id))
+        # Short id: the officer reads this to decide whether to look at the
+        # job, and the full uuid would push the title off the line.
+        suffix = f" · claimed by job {str(claimed_by)[:8]}" if claimed_by else ""
         lines.append(
             f"  [{word}]".ljust(12)
             + f"{row.get('note_type', ''):<9}"
-            + f"{row.get('note_id')} — {row.get('title') or ''}".rstrip()
+            + f"{note_id} — {row.get('title') or ''}".rstrip()
+            + suffix
         )
 
     remainder = total - len(rows)

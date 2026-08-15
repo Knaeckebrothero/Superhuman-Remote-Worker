@@ -78,9 +78,11 @@ class TestUpsertSetsTtl:
         )
         insert_call = mock_db.fetchval.call_args_list[1]
         assert "remaining_cycles" in insert_call[0][0]
-        # ttl_value is second-to-last positional arg (priority — project
-        # backlog pipeline task 2 — is now appended after it).
-        assert insert_call[0][-2] == 2
+        # ttl_value is $18, so index 18 (args[0] is the query). Pinned
+        # absolutely: this assertion has now been chased twice by a new
+        # trailing parameter — priority ($19), then ready ($20) — and a
+        # relative pin quietly starts asserting about the newcomer instead.
+        assert insert_call[0][18] == 2
 
     @pytest.mark.asyncio
     async def test_insert_sets_null_ttl_for_durable(self):
@@ -93,7 +95,7 @@ class TestUpsertSetsTtl:
             note_type="decision",
             content="body",
         )
-        assert mock_db.fetchval.call_args_list[1][0][-2] is None
+        assert mock_db.fetchval.call_args_list[1][0][18] is None  # $18 = ttl_value
 
     @pytest.mark.asyncio
     async def test_on_conflict_branch_preserves_ttl(self):
@@ -122,7 +124,7 @@ class TestUpsertSetsTtl:
 
 class TestUpsertNotePriorityBinding:
     @pytest.mark.asyncio
-    async def test_insert_branch_binds_priority_last(self):
+    async def test_insert_branch_binds_priority_at_its_own_slot(self):
         store, mock_db, _ = _make_store()
         mock_db.fetchval.side_effect = [None, uuid.uuid4()]  # no existing -> INSERT
         await store.upsert_note(
@@ -135,7 +137,7 @@ class TestUpsertNotePriorityBinding:
         )
         insert_call = mock_db.fetchval.call_args_list[1]
         assert "priority" in insert_call[0][0]
-        assert insert_call[0][-1] == 0
+        assert insert_call[0][19] == 0  # $19 = priority; $20 = ready (B2)
 
     @pytest.mark.asyncio
     async def test_metadata_only_branch_binds_priority(self):
@@ -155,7 +157,7 @@ class TestUpsertNotePriorityBinding:
         )
         update_call = mock_db.fetchval.call_args_list[1]
         assert "priority" in update_call[0][0]
-        assert update_call[0][-1] == 2
+        assert update_call[0][13] == 2  # $13 = priority; $14 = ready (B2)
 
 
 # =============================================================================

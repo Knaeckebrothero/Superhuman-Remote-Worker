@@ -459,11 +459,14 @@ class TestUpsertKbNote:
         assert "created_at" not in query.split("DO UPDATE")[1]
 
     @pytest.mark.asyncio
-    async def test_binds_priority_at_final_position(self):
+    async def test_binds_priority_at_its_own_position(self):
         # Mutation-tested (project-backlog-pipeline task 2, fix round 1
         # finding 2): colliding priority's DO-UPDATE placeholder with
         # modified_at's ($20 instead of $21) left this path untested before —
         # pin both the query's SET clause and the bound value's position.
+        # No longer the FINAL position: B2 appended $22 (ready_at), and the
+        # whole point of this test is that a placeholder collision is caught,
+        # which a [-1] pin stops doing the moment something else lands last.
         store, mock_db, _ = _make_store()
         mock_db.fetchval.return_value = uuid.uuid4()
         await store.upsert_kb_note(
@@ -482,7 +485,9 @@ class TestUpsertKbNote:
         # see TestUpsertKbNotePriorityCoalesceSentinel for the sentinel
         # semantics themselves; this test only pins the position.
         assert "priority = COALESCE($21, knowledge_index.priority)" in query
-        assert params[-1] == 0
+        assert params[20] == 0
+        assert "ready_at = COALESCE($22, knowledge_index.ready_at)" in query
+        assert params[21] is None
 
 
 # =============================================================================

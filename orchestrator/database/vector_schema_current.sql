@@ -142,6 +142,7 @@ CREATE TABLE public.knowledge_index (
     invalidated_at timestamp with time zone,
     embedding_version text,
     priority smallint DEFAULT 1 NOT NULL,
+    ready_at timestamp with time zone,
     CONSTRAINT knowledge_index_priority_valid CHECK (((priority >= 0) AND (priority <= 2))),
     CONSTRAINT valid_note_status CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'resolved'::character varying, 'superseded'::character varying, 'archived'::character varying])::text[]))),
     CONSTRAINT valid_note_type CHECK (((note_type)::text = ANY ((ARRAY['goal'::character varying, 'plan'::character varying, 'decision'::character varying, 'learning'::character varying, 'code'::character varying, 'source'::character varying, 'question'::character varying, 'state'::character varying, 'retrospective'::character varying, 'datasource'::character varying, 'feature'::character varying, 'issue'::character varying, 'idea'::character varying, 'charter'::character varying, 'report'::character varying])::text[])))
@@ -153,6 +154,13 @@ CREATE TABLE public.knowledge_index (
 --
 
 COMMENT ON COLUMN public.knowledge_index.priority IS 'Backlog rank: 0=high, 1=normal, 2=low. A display label only — no code path may gate or reorder work on it.';
+
+
+--
+-- Name: COLUMN knowledge_index.ready_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.knowledge_index.ready_at IS 'When this ticket was last authorized for dispatch (officer stamped `ready`). NULL means unauthorized: a ticket carrying the `ready` tag with no ready_at fails CLOSED and is not dispatchable, which is the deliberate outcome after a vault rebuild that lost the value. Compared against the newest claiming job''s created_at to implement one-shot claims.';
 
 
 --
