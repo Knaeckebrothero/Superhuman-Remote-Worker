@@ -34,7 +34,26 @@ def test_pruner_preserves_receipts_until_owner_request_is_terminal():
 
 
 def test_applied_session_memory_migration_checksum_is_immutable():
-    """0145 was live-applied before later milestones; its bytes are an API."""
+    """0145 was live-applied before later milestones; its bytes are an API.
+
+    The authority for "its bytes" is ``schema_migrations.checksum`` — what the
+    runner recorded when it applied the file — NOT whatever the file happens
+    to say today. Those diverged: cf7891e8 deleted a COMMENT ON TABLE block
+    from 0145 after it had been applied, and this guard was then written
+    against the post-edit bytes. The result pinned a snapshot that no database
+    ever applied, so every orchestrator boot failed on
+
+        checksum changed: 0145_session_turn_memory_effects.sql
+
+    for 41 hours while this test stayed green. A guard asserting the wrong
+    snapshot is worse than no guard: it makes the broken state the enforced
+    one.
+
+    The hash below is the applied one, verified against dev's
+    schema_migrations row (650ad97e). If this test ever fails again, read the
+    checksum out of the database before touching either side — the file is the
+    thing that may be wrong.
+    """
 
     import hashlib
     from pathlib import Path
@@ -44,7 +63,7 @@ def test_applied_session_memory_migration_checksum_is_immutable():
         / "orchestrator/database/migrations/app/0145_session_turn_memory_effects.sql"
     )
     assert hashlib.sha256(path.read_bytes()).hexdigest() == (
-        "059b263a24dfa6c06f2883a560038720374e332aff34b056eca59d8b878a182a"
+        "2cfd047791f6530f7640571cdc4108e16e1012447899628faa341deca38e80f9"
     )
 
 
