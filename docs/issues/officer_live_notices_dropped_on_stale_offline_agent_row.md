@@ -25,10 +25,25 @@ related:
 Officer agent `ea8dd2ee` (thread `d67ee261`, pod `persistent-d67ee261-334`,
 15 days old, Running) heartbeats every 60 s — `last_heartbeat` was 19–25 s
 old on every read — yet `agents.status` stayed `offline` for the whole
-observation window. The heartbeat handler passes the agent's self-reported
-status through `update_agent_heartbeat`, so either the persistent agent
-self-reports a status that maps to offline, or an effective-status override
-keeps offline sticky until re-registration. Root cause not yet traced.
+observation window.
+
+## Root cause (traced)
+
+`update_agent_heartbeat` makes `offline` sticky on BOTH sides: the UPDATE
+uses `CASE WHEN status = 'offline' THEN 'offline' … ELSE <reported> END`,
+and the returned `effective_status` mirrors it. Only **registration**
+resets an offline row. That is deliberate — an agent the stale-detector
+marked offline may have had its jobs orphan-recovered, and a heartbeat
+alone must not resurrect its claims.
+
+The assumption that breaks is that every agent re-registers soon after
+going offline, because going offline implies the pod died. Pool agents:
+true — respawn = re-register. A dedicated officer pod: false — it is
+designed to live for weeks, so ONE offline mark (any orchestrator outage
+longer than the 3-minute staleness window — e.g. a deploy — marks every
+agent offline; the officer's pod survives deploys, see LF-2) leaves it
+permanently offline while perfectly healthy. It heartbeats forever into a
+row that will never believe it.
 
 ## Impact
 
@@ -52,13 +67,16 @@ indefinitely, not for the documented ~4-minute staleness lag.
 
 ## Direction
 
-- Trace why a heartbeating persistent agent's row reads offline (agent
-  self-report vs orchestrator effective-status vs a stale-marking sweep
-  that heartbeats never reverse).
-- Either make heartbeat acceptance flip `offline` back to the reported
-  status, or make `_resolve_live_agent` trust its own port probe over the
-  row for agents with a fresh heartbeat (the probe exists precisely
-  because the row lags).
+Do NOT simply un-stick offline on heartbeat — the stickiness protects
+against a zombie resurrecting job claims after orphan recovery. The clean
+fix uses the channel that already exists: the heartbeat response carries
+**intents**. When a heartbeat arrives for an `offline` row, return a
+`reregister` intent; the agent re-registers (the path that legitimately
+revives a row, re-issuing identity and clearing stale claims), and the
+officer is live again within one heartbeat interval instead of never.
+Alternatively (or additionally), `_resolve_live_agent` may trust its own
+port probe over the row when `last_heartbeat` is fresh — the probe exists
+precisely because the row lags.
 
 ## Acceptance
 
