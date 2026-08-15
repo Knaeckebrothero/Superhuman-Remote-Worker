@@ -68,8 +68,14 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Chart correctness gates (Phase 1) — render matrix + schema validation.
-  # Full-power branch: always runs, every step is a hard gate. Distinct from
-  # generator-test, which gates the website config-generator's output.
+  # Full-power branch: always runs, every step is a hard gate.
+  #
+  # The installer-* scenarios are the self-host config generator's verbatim
+  # output. The generator moved to the private srw-cloud repo on 2026-08-15;
+  # these fixtures are the half of the contract that stays here, so a chart
+  # change that breaks the installer fails in the repo that caused it rather
+  # than days later in srw-cloud's CI. Regenerate them from that repo's
+  # www/test/generator.drift.test.mjs CASES if the generator changes.
   # ---------------------------------------------------------------------------
   chart-test:
     runs-on: ubuntu-latest
@@ -84,6 +90,9 @@ jobs:
           - customer-external
           - eval
           - vm
+          - installer-evaluation
+          - installer-production
+          - installer-production-vms
     steps:
       - uses: actions/checkout@v4
 
@@ -149,37 +158,6 @@ jobs:
             exit 1
           fi
           echo "OK: invalid-values.yaml was correctly rejected by values.schema.json"
-
-  # ---------------------------------------------------------------------------
-  # Config-generator drift-gate (website/). Always-run, hard gate on the release
-  # branch: generated values must render against the real chart and carry a
-  # complete secret-key set.
-  # ---------------------------------------------------------------------------
-  generator-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Install Helm
-        uses: azure/setup-helm@v4
-        with:
-          version: v3.17.0
-      - name: Build Helm dependencies
-        run: |
-          helm repo add collabora https://collaboraonline.github.io/online --force-update
-          helm dependency build helm/
-      - name: Install kubeconform
-        run: |
-          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
-            | sudo tar -xz -C /usr/local/bin kubeconform
-          kubeconform -v
-      - name: Generator unit + drift tests
-        run: node --test website/test/generator.unit.test.mjs website/test/generator.drift.test.mjs
 
   # ---------------------------------------------------------------------------
   # CodeQL — static analysis for security vulnerabilities

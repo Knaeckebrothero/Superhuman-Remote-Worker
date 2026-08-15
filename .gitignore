@@ -229,3 +229,8 @@ KurortEngine/
 KurortEngine-salvage/
 KurortEngine-extracted/
 BetterResavio-KB/
+
+# Separate repos checked out inside this working tree. Untracked is not enough —
+# one `git add -A` would publish a private repo into the public one.
+HomeLab/
+srw-cloud-import/
