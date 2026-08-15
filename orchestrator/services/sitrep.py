@@ -179,7 +179,9 @@ async def build_wake_message(
         lines += await _pending_section(db, thread_id, project_id, now)
         lines += await _worker_messages_section(db, project_id, now)
         lines += await _knowledge_section(vector_db, project_id)
-        lines += await _capacity_section(db, thread, thread_id)
+        lines += await _capacity_section(
+            db, thread, thread_id, vector_db, project_id, now
+        )
         lines += await _fleet_section(db)
         lines += await _budget_section(usage_ledger, project_id, now)
 
@@ -510,34 +512,71 @@ async def _knowledge_section(vector_db: Any, project_id: Optional[str]) -> list[
 
 
 async def _capacity_section(
-    db: Any, thread: dict[str, Any], thread_id: str
+    db: Any,
+    thread: dict[str, Any],
+    thread_id: str,
+    vector_db: Any = None,
+    project_id: Optional[str] = None,
+    now: Optional[datetime] = None,
 ) -> list[str]:
     try:
+        from services.officer_admission import count_in_flight_by_slot
+        from services.officer_backlog import (
+            pool_status_lines,
+            pools_from_meta,
+            ready_depth_by_pool,
+        )
         from services.officer_slots import capacity_lines
 
         metadata = _as_dict(thread.get("metadata"))
         officer_meta = _as_dict(
             _as_dict(metadata.get("config_override")).get("officer")
         )
+        officer_state = _as_dict(metadata.get("officer_state"))
         # Lineage-aware count (officer_post.md §4): jobs dispatched by a
         # prior incarnation on this post still occupy their slots, so the
         # officer's own capacity line matches what admission will enforce.
         lineage = await db.get_officer_capacity_lineage(thread_id)
         if not lineage:
             lineage = [thread_id]
+        # Through the SAME helper admission uses. This query used to be inlined
+        # here with an `IN ('created','processing')` predicate; when admission
+        # widened to all-non-terminal, that copy would have shown the officer a
+        # free slot the funnel then refused with a 409 — the capacity line has
+        # to be the number he will actually be held to.
         async with db.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT context->>'officer_slot' AS slot, COUNT(*) AS n
-                  FROM jobs
-                 WHERE created_by_thread_id = ANY($1::uuid[])
-                   AND status IN ('created', 'processing')
-                 GROUP BY 1
-                """,
-                lineage,
+            in_flight_by_slot = await count_in_flight_by_slot(conn, lineage)
+
+        ready_by_pool: Optional[dict[str, int]] = None
+        pools = pools_from_meta(officer_meta)
+        if pools and vector_db is not None and project_id:
+            ready_by_pool = await ready_depth_by_pool(
+                db, vector_db, str(project_id), pools, now=now
             )
-        in_flight_by_slot = {r["slot"]: int(r["n"]) for r in rows}
-        return [capacity_lines(officer_meta, in_flight_by_slot)]
+
+        oldest_hours: Optional[float] = None
+        try:
+            claims = await db.list_officer_slot_claims(lineage, limit=50)
+            ages = [
+                (now or datetime.now(timezone.utc)) - created
+                for created in (_parse_iso(claim.get("created_at")) for claim in claims)
+                if created is not None
+            ]
+            if ages:
+                oldest_hours = max(ages).total_seconds() / 3600.0
+        except Exception:
+            logger.warning("sitrep: oldest-claim age unavailable", exc_info=True)
+
+        lines = [
+            capacity_lines(
+                officer_meta,
+                in_flight_by_slot,
+                ready_by_pool=ready_by_pool,
+                oldest_claim_age_hours=oldest_hours,
+            )
+        ]
+        lines += pool_status_lines(officer_meta, officer_state, now)
+        return lines
     except Exception:
         logger.warning("sitrep: capacity query failed", exc_info=True)
         return ["Capacity: (unavailable)"]

@@ -9255,6 +9255,17 @@ class JobCreate(BaseModel):
             "the same work on its next cycle."
         ),
     )
+    work_category: str | None = Field(
+        None,
+        description=(
+            "The kind of work this is: researcher (the deliverable is an "
+            "ANSWER), tester (the deliverable is issue tickets), or executor "
+            "(the deliverable is shipped files). Officer dispatches into a "
+            "categorized slot only. The slot's own category always supplies "
+            "the contract the worker is held to; naming a different one here "
+            "is allowed and is stated in the kickoff rather than refused."
+        ),
+    )
     datasource_ids: list[str] | None = Field(
         None, description="Connector IDs to attach to the job"
     )
@@ -12551,6 +12562,25 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 # (officer_backlog_pools.md §5.3).
                 if job.ticket:
                     context["ticket_note_id"] = str(job.ticket)
+
+                # Precedence law (§6): the SLOT's category decides the contract
+                # this worker is held to; the officer's explicit arguments win
+                # over the roster default. A cross-category dispatch — sending
+                # a slot into work its category does not describe — is NOT
+                # refused, because warn-not-forbid is the whole posture. It is
+                # named in the kickoff and logged instead, so the one thing
+                # that cannot happen is a silent contradiction between the
+                # contract the worker reads and the slot it occupies.
+                _slot_category = _officer_slot_category(officer_meta, officer_slot_name)
+                if _slot_category:
+                    context.setdefault("work_category", _slot_category)
+                    context["kickoff_message"] = _compose_category_kickoff(
+                        _slot_category,
+                        context.get("kickoff_message"),
+                        requested_category=job.work_category,
+                        slot=officer_slot_name,
+                        thread_id=_officer_admit_thread_id,
+                    )
 
         # VM permission gate: refuse at submit time so the user gets a clear
         # 403 instead of a silent failure later in the dispatcher. The
@@ -20278,6 +20308,64 @@ def _loop_deadline_passed(run_until: Any) -> bool:
     if run_until.tzinfo is None:
         run_until = run_until.replace(tzinfo=timezone.utc)
     return datetime.now(timezone.utc) >= run_until
+
+
+def _officer_slot_category(
+    officer_meta: dict[str, Any], slot_name: str | None
+) -> str | None:
+    """The work category a named slot pins, if it is a pool at all."""
+    if not slot_name:
+        return None
+    from services.officer_slots import roster_from_meta
+    from services.work_categories import normalize_category
+
+    roster = roster_from_meta(officer_meta) or {}
+    spec = roster.get(slot_name) or {}
+    return normalize_category(spec.get("category")) if isinstance(spec, dict) else None
+
+
+def _compose_category_kickoff(
+    category: str,
+    existing_kickoff: str | None,
+    *,
+    requested_category: str | None = None,
+    slot: str | None = None,
+    thread_id: str | None = None,
+) -> str:
+    """Prepend the slot's category contract to an officer-authored kickoff.
+
+    The contract goes in the KICKOFF, never in ``instructions`` — that
+    parameter replaces the rendered instructions.md template wholesale, which
+    would cost the worker everything else it needs to operate.
+
+    A mismatch between what the officer asked for and what the slot pins is
+    stated in the text rather than refused (§6 warn-not-forbid). Silence would
+    be the bad outcome: the worker would read an executor's delivery contract
+    while sitting in a researcher slot and have no way to know which one the
+    officer meant.
+    """
+    from services.work_categories import category_block, normalize_category
+
+    parts = [category_block(category)]
+    asked = normalize_category(requested_category)
+    if asked and asked != category:
+        note = (
+            f"NOTE: the officer dispatched this as {asked} work into the "
+            f"{slot or category} slot, whose contract is {category} — the "
+            "contract above is the one you are held to. If that reads as a "
+            "mistake, say so in your completion report rather than guessing."
+        )
+        parts.append(note)
+        logger.info(
+            "officer=%s slot=%s cross-category dispatch: asked=%s slot_contract=%s",
+            str(thread_id or "")[:8],
+            slot,
+            asked,
+            category,
+        )
+    if existing_kickoff:
+        parts.append(str(existing_kickoff))
+    return "\n\n".join(parts)
 
 
 async def _enforce_officer_ticket_grants(
