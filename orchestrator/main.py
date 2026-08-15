@@ -14922,12 +14922,19 @@ async def _route_inbound_reply(
         raise ValueError(f"Job '{job_id}' not found")
     await _guard_completion_control(job_id, source="inbound_reply")
 
-    async def _resume_reply_or_conflict(*, reason: str) -> None:
+    async def _resume_reply_or_conflict(
+        *, reason: str, route_id: str | None = None
+    ) -> None:
         resumed = await _internal_resume_job(
             job_id,
             feedback=message,
             reason=reason,
             expected_status=str(job.get("status") or ""),
+            # OC-04: reply and timeout race for the same freeze. Both now CAS
+            # on the route generation, so exactly one wins and a delayed actor
+            # for an OLD route cannot resume a job that has since refrozen on
+            # a new one. None (an unrouted freeze) keeps the status-only CAS.
+            expected_route_id=route_id,
         )
         if resumed:
             return
@@ -14995,6 +15002,7 @@ async def _route_inbound_reply(
                 "This job froze waiting for a reply to its outbound message; "
                 "the reply below answers it."
             ),
+            route_id=(freeze_data or {}).get("route_id"),
         )
         # The resume CAS won — record who answered on the route ledger
         # (officer_message_routing.md §3). Best-effort: the worker is
@@ -17740,6 +17748,7 @@ async def _internal_resume_job(
     reason: str | None = None,
     *,
     expected_status: str | None = None,
+    expected_route_id: str | None = None,
     additional_context: Mapping[str, Any] | None = None,
     completion_owner_command_id: str | None = None,
     completion_owner: str | None = None,
@@ -17817,6 +17826,7 @@ async def _internal_resume_job(
                     job_id,
                     updates,
                     expected_status=observed_status,
+                    expected_route_id=expected_route_id,
                     **_completion_resume_guard_kwargs(
                         completion_owner_command_id, completion_owner
                     ),
@@ -17828,6 +17838,7 @@ async def _internal_resume_job(
             job_id,
             updates,
             expected_status=observed_status,
+            expected_route_id=expected_route_id,
             **_completion_resume_guard_kwargs(
                 completion_owner_command_id, completion_owner
             ),

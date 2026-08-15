@@ -143,6 +143,10 @@ async def _resume_timed_out_route(
             "no-answer notice."
         ),
         expected_status="waiting_for_reply",
+        # OC-04: the Python check above is a cheap pre-filter, not the
+        # guarantee. Between it and the write the job can resume and refreeze
+        # onto a different route; only this token makes the CAS refuse that.
+        expected_route_id=str(route["route_id"]),
     )
     return "resumed" if resumed else "resume_lost"
 

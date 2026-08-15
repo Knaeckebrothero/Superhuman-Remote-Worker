@@ -957,6 +957,10 @@ async def test_internal_resume_retries_pinned_verb_after_vm_lane_repair(monkeypa
         JOB_ID,
         {"queued_feedback": "continue"},
         expected_status="waiting",
+        # OC-04 threads the route-generation token through every resume.
+        # None here is the documented no-guard default: this verb is a lane
+        # repair, not a route resolution, so it has no generation to prove.
+        expected_route_id=None,
     )
 
 

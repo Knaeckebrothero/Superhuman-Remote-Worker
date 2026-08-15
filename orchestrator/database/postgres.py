@@ -10919,12 +10919,23 @@ class PostgresDB:
         void_completion_decision: bool,
         stateless_only: bool = False,
         expected_status: str | None = None,
+        expected_route_id: str | None = None,
         completion_commands_enabled: bool = False,
         completion_owner_command_id: str | None = None,
         completion_owner: str | None = None,
         completion_control_claim_id: str | None = None,
     ):
-        """The Class-A resume write, reusable inside a caller transaction."""
+        """The Class-A resume write, reusable inside a caller transaction.
+
+        ``expected_route_id`` is the blocking-message GENERATION token (audit
+        OC-04). Status alone is not enough to identify what a job is waiting
+        on: a job can wait on route A, briefly resume, and wait again on route
+        B, at which point a delayed actor for A still sees
+        ``status='waiting_for_reply'`` and would resume B's wait. Callers that
+        resolve a specific route pass its id, and the CAS then requires the
+        job to still be frozen on THAT route — the check the docstrings used
+        to claim and the SQL did not make.
+        """
         # Fixed literals chosen by trusted booleans — never caller SQL.
         drop_decision = " - 'completion_decision'" if void_completion_decision else ""
         lane_guard = " AND execution_lane = 'stateless'" if stateless_only else ""
@@ -10939,6 +10950,12 @@ class PostgresDB:
         args: tuple[Any, ...] = (job_uuid, json.dumps(context_merge or {}))
         if expected_status is not None:
             args += (expected_status,)
+        route_guard = ""
+        if expected_route_id is not None:
+            args += (str(expected_route_id),)
+            # Read from the PRE-update row: a WHERE clause sees the row as it
+            # was, and this statement nulls freeze_data as part of resuming.
+            route_guard = f" AND freeze_data->>'route_id' = ${len(args)}"
         control_drop = ""
         control_guard = ""
         if completion_control_claim_id is not None:
@@ -10993,7 +11010,7 @@ class PostgresDB:
                    assigned_agent_id = NULL,
                    freeze_data = NULL,
                    updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{completion_guard}{control_guard}
+             WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}
             RETURNING id, priority, user_id
             """,
             *args,
@@ -11058,6 +11075,7 @@ class PostgresDB:
         *,
         void_completion_decision: bool = True,
         expected_status: str | None = None,
+        expected_route_id: str | None = None,
         completion_commands_enabled: bool = False,
         completion_owner_command_id: str | None = None,
         completion_owner: str | None = None,
@@ -11115,6 +11133,7 @@ class PostgresDB:
                         context_merge,
                         void_completion_decision=void_completion_decision,
                         expected_status=expected_status,
+                        expected_route_id=expected_route_id,
                         completion_commands_enabled=True,
                         completion_owner_command_id=completion_owner_command_id,
                         completion_owner=completion_owner,
@@ -11127,6 +11146,7 @@ class PostgresDB:
                     context_merge,
                     void_completion_decision=void_completion_decision,
                     expected_status=expected_status,
+                    expected_route_id=expected_route_id,
                     completion_control_claim_id=completion_control_claim_id,
                 )
             return row is not None
