@@ -129,7 +129,75 @@ the comparison is honest:
 
 ## Results
 
-*(fill during the run)*
+**Run log (UTC):**
+
+- 16:24:57 PATCH `{"slots": null}` → 200, `applied_to_thread: true`. The
+  wholesale clear worked; no `line`/`heavy` ghosts in the returned config.
+- 16:25:05 PATCH category roster → 200. Thread projection verified
+  byte-identical to the row.
+- pre-release card: all three pools render `ready_depth: 0`,
+  `below_floor: true`, `auto_pull: false` — computed through the tick's
+  own eligibility path against the live vector DB (M-8 pre-check ✅).
+- 16:25:46 release → 200, hold cleared (was `kind=maintenance` since
+  08-01). **`notified: false`** — see finding LF-1.
+- 16:25:46+ drain kick: 20 of 22 queued events flipped `sent` in one
+  claim; sitrep turn (iter 417) began on his 15-day-old pod without a
+  respawn (M-1 ✅ — durable path; live-notice half failed, LF-1).
+- 16:27:05 Legate directive accepted mid-turn (`turn_id: 416`,
+  `queue_depth: 1`). Directive deliberately does not name `bbce4bed`.
+- 16:27:19 **P1 confirms unprompted**: his first substantive tool reads
+  are `GET /api/jobs/bbce4bed…`, its repo `output/` listing, and its last
+  commit — straight to his own `pending_review` job, before any ticket
+  work.
+
+**Findings:**
+
+- **LF-1 — agents row stuck `offline` while the pod heartbeats 200.**
+  `agents.status` for `ea8dd2ee` reads `offline` with `last_heartbeat`
+  19–25 s old, continuously. The heartbeat handler writes the agent's
+  self-reported status, so either the persistent agent self-reports a
+  status that maps to offline, or an effective-status override keeps it
+  sticky. Consequence: `_resolve_live_agent` refuses on
+  `status='offline'` before probing, so **every live officer notice is
+  silently dropped** (`release` returned `notified: false`), and the wake
+  drain routed the sitrep through its DURABLE branch
+  (`save_thread_message` + finish) rather than live injection — confirmed
+  by the code path and the `sent` flips with no inject log. Two knock-on
+  effects while the row is stale: sitreps reach a LIVE officer only at
+  his next turn trigger (input or the ~2h agent-local backstop) instead
+  of immediately, and the sitrep watermark deliberately does not advance
+  on durable delivery, so fingerprints re-diff until a live delivery
+  lands. Degraded-but-functional; the run continued through it. Needs
+  its own issue.
+- Codex streaming quirk observed twice in iter 417: "Streaming produced
+  tool calls with empty args — retrying with ainvoke", retry succeeded
+  (second instance logged empty content with reasoning_content present).
+  Known shape, non-fatal, no action.
+- **LF-2 — a deploy leaves a live officer on pre-deploy agent code
+  indefinitely.** His dedicated pod (`persistent-d67ee261-334`, 15 d old)
+  is not deployment-managed, so the 15:52 rollout recycled every pool
+  agent but not him. Consequences observed in one turn: (a) he runs the
+  pre-B5 persona, which never taught the `category:` machine-tag grammar
+  — his tickets carry bare `tester`/`researcher`/`executor` tags that
+  `classify_ticket` cannot see, so the card honestly reports
+  `ready_depth: 0` against a ready ticket he honestly filed; (b) he runs
+  pre-B2 kb tools, which cannot stamp `ready_at` — his `ready` tag
+  persisted with `ready_at` NULL, which fails closed exactly as designed
+  (`eligible_tickets`: "ready tag with no ready_at"). The officer and the
+  machinery disagree about the backlog and BOTH are being honest. My
+  release directive also said "tagged with its category" loosely, which
+  compounded (a) — but the persona was supposed to be the teacher, and
+  his pod never got it. Mid-run remedy: pod recycle → watchdog respawn
+  onto the current image (the ops-realistic fix, and a live test of the
+  respawn-continuity design). Filed as its own issue.
+- His turn-1 quality, for the record: cancelled his own `pending_review`
+  job rather than rubber-stamping it, preserved the candidate by commit
+  (`0140f70`) and branch, and rebuilt its acceptance as an INDEPENDENT
+  tester verification — with the executor promotion gated on that test
+  going green, research parallel, and only the genuinely dispatchable
+  ticket marked ready. The dependency chain is exactly what the category
+  model wants. "Legatus" spelling in his sleep reason — his charter
+  predates the rename; historical artifacts, as documented.
 
 ## Verdict
 
