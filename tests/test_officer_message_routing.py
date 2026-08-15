@@ -622,10 +622,13 @@ class TestDrains:
         assert outcome == {"escalated": False, "delivered": False}
 
     @pytest.mark.asyncio
-    async def test_hold_endpoint_drains_pending_blocking_routes(self):
+    async def test_hold_endpoint_stages_routes_in_the_hold_transaction(self):
         db = MagicMock()
         db.get_officer_thread_for_project = AsyncMock(return_value=_officer_thread())
-        db.merge_thread_config_override = AsyncMock(return_value=True)
+        routes = [{"route_id": str(uuid4()), "job_id": str(uuid4())} for _ in range(3)]
+        db.set_project_officer_hold = AsyncMock(
+            return_value={"thread": _officer_thread(), "routes": routes}
+        )
         with (
             patch.object(
                 main, "require_project_owner", AsyncMock(return_value=({}, {}))
@@ -633,15 +636,20 @@ class TestDrains:
             patch.object(main, "postgres_db", db),
             patch.object(main, "_inject_officer_notice", AsyncMock(return_value=True)),
             patch(
-                "services.message_routing.drain_officer_blocking_routes",
-                AsyncMock(return_value=3),
-            ) as drain,
+                "services.message_routing.deliver_route_to_user",
+                AsyncMock(return_value=True),
+            ) as deliver,
         ):
             result = await main.hold_project_officer(MagicMock(), PROJECT_ID, None)
         assert result["status"] == "held"
         assert result["drained_blocking_routes"] == 3
-        drain.assert_awaited_once()
-        assert drain.await_args.kwargs["reason"] == "officer_hold"
+        assert result["delivered_blocking_routes"] == 3
+        db.set_project_officer_hold.assert_awaited_once()
+        assert db.set_project_officer_hold.await_args.kwargs["route_reason"] == (
+            "officer_hold"
+        )
+        assert deliver.await_count == 3
+        assert deliver.await_args.kwargs["reason"] == "officer_hold"
 
 
 # =============================================================================

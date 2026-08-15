@@ -26,6 +26,7 @@ from services.officer_backlog import (
     breaker_is_open,
     eligible_tickets,
     evaluate_breaker,
+    officer_backlog_tick_once,
     pools_from_meta,
     stale_claims,
     tick_officer,
@@ -33,6 +34,8 @@ from services.officer_backlog import (
 from services.work_categories import EXECUTOR, RESEARCHER
 
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
+OFFICER_THREAD_ID = "11111111-1111-1111-1111-111111111111"
+OFFICER_PROJECT_ID = "22222222-2222-2222-2222-222222222222"
 
 
 def _row(note_id, *, tags, ready_at=None, title="T", note_type="feature"):
@@ -78,6 +81,25 @@ class TestAutoPullGate:
     def test_no_roster_means_no_pools(self):
         assert pools_from_meta({}) == {}
         assert pools_from_meta({"max_concurrent_workers": 3}) == {}
+
+    @pytest.mark.asyncio
+    async def test_scheduler_enumerates_only_commissioned_posts(self):
+        db = AsyncMock()
+        db.list_commissioned_officer_posts_for_backlog.return_value = []
+        db.list_officer_threads.side_effect = AssertionError(
+            "runtime officer enumeration is not backlog authority"
+        )
+
+        totals = await officer_backlog_tick_once(db, MagicMock())
+
+        assert totals == {
+            "dispatched": 0,
+            "skipped": 0,
+            "breakers_opened": 0,
+            "wakes": 0,
+        }
+        db.list_commissioned_officer_posts_for_backlog.assert_awaited_once()
+        db.list_officer_threads.assert_not_awaited()
 
 
 # =============================================================================
@@ -277,8 +299,8 @@ class TestStaleClaims:
 
 def _officer_row(**over):
     row = {
-        "id": str(uuid.uuid4()),
-        "project_id": str(uuid.uuid4()),
+        "id": OFFICER_THREAD_ID,
+        "project_id": OFFICER_PROJECT_ID,
         "status": "active",
         "metadata": {
             "config_override": {
@@ -303,9 +325,7 @@ def _db(*, claims=None, slot_claims=None, locked_claim_at=None):
     returns — the racing-replica case. None means "still unclaimed".
     """
     db = AsyncMock()
-    db.get_officer_capacity_lineage.return_value = [
-        "11111111-1111-1111-1111-111111111111"
-    ]
+    db.get_officer_capacity_lineage.return_value = [OFFICER_THREAD_ID]
     db.newest_ticket_claims.return_value = claims or {}
     db.list_officer_slot_claims.return_value = slot_claims or []
     db.merge_thread_officer_state.return_value = True
@@ -321,8 +341,63 @@ def _db(*, claims=None, slot_claims=None, locked_claim_at=None):
 
     conn = MagicMock()
     conn.execute = AsyncMock()
-    conn.fetchval = AsyncMock(return_value=locked_claim_at)
     conn.fetch = AsyncMock(return_value=[])
+
+    runtime_metadata = {
+        "config_override": {
+            "officer": {
+                "enabled": True,
+                "auto_pull": True,
+                "slots": {
+                    "researchers": {"count": 1, "category": RESEARCHER},
+                    "executors": {"count": 1, "category": EXECUTOR},
+                },
+            }
+        }
+    }
+    post = {
+        "project_id": uuid.UUID(OFFICER_PROJECT_ID),
+        "thread_id": uuid.UUID(OFFICER_THREAD_ID),
+        "config_override": {},
+        "incarnations": [],
+        "updated_at": NOW,
+    }
+    thread = {
+        "id": uuid.UUID(OFFICER_THREAD_ID),
+        "project_id": uuid.UUID(OFFICER_PROJECT_ID),
+        "status": "active",
+        "metadata": runtime_metadata,
+        "user_id": None,
+        "created_at": NOW - timedelta(days=1),
+    }
+
+    async def _fetchrow(query, *args):
+        if "LEFT JOIN threads" in query:
+            return {
+                "project_id": post["project_id"],
+                "thread_id": post["thread_id"],
+                "config_override": post["config_override"],
+                "incarnations": post["incarnations"],
+                "post_updated_at": post["updated_at"],
+                "current_thread_id": thread["id"],
+                "thread_project_id": thread["project_id"],
+                "thread_status": thread["status"],
+                "thread_metadata": thread["metadata"],
+                "thread_user_id": thread["user_id"],
+                "thread_created_at": thread["created_at"],
+            }
+        if "FROM project_officers" in query and "FOR UPDATE" in query:
+            return post
+        if "FROM threads" in query and "FOR UPDATE" in query:
+            return thread
+        if "MAX(created_at) AS newest" in query:
+            return {
+                "newest": locked_claim_at,
+                "has_non_terminal": locked_claim_at is not None,
+            }
+        raise AssertionError(query)
+
+    conn.fetchrow = AsyncMock(side_effect=_fetchrow)
     tx = MagicMock()
     tx.__aenter__ = AsyncMock(return_value=None)
     tx.__aexit__ = AsyncMock(return_value=False)
@@ -368,8 +443,8 @@ class TestTickOfficer:
         assert "instructions" not in created
         # No expert pin on the ticket -> the category default.
         assert created["config_name"] == "scholar"
-        # The INSERT shares the caller's transaction, or the advisory lock is
-        # gone before the row lands.
+        # The INSERT shares the post-lock transaction; admission and the row
+        # write therefore have one linearization point.
         assert created["conn"] is not None
 
     @pytest.mark.asyncio

@@ -363,6 +363,7 @@ def _post_row(**over):
         },
         "state": {},
         "incarnations": [],
+        "updated_at": datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc),
     }
     row.update(over)
     return row
@@ -394,12 +395,36 @@ def db(monkeypatch):
     db.fold_project_officer_wake_queue = AsyncMock(
         return_value={"folded": 0, "deleted": 0, "dropped": 0}
     )
+    db.update_project_officer_post = AsyncMock(
+        return_value={
+            "post": _post_row(),
+            "thread": None,
+            "applied_to_thread": False,
+        }
+    )
+    db.set_project_officer_hold = AsyncMock(
+        return_value={"thread": _officer_thread(), "previous_hold": None, "routes": []}
+    )
+    db.decommission_project_officer = AsyncMock(
+        return_value={
+            "transitioned": False,
+            "already_decommissioned": False,
+            "vacant": True,
+            "routes": [],
+            "folded": 0,
+            "deleted": 0,
+            "dropped": 0,
+            "harvested": False,
+            "incarnation": None,
+        }
+    )
     db.drain_project_officer_while_vacant = AsyncMock(
         return_value={"entries": [], "dropped": 0}
     )
     db.merge_thread_config_override = AsyncMock(return_value=True)
     db.merge_thread_officer_state = AsyncMock(return_value=True)
     db.enqueue_session_wake_event = AsyncMock(return_value=True)
+    db.confirm_project_officer_incarnation = AsyncMock(return_value=True)
     db.get_thread = AsyncMock(return_value=None)
     monkeypatch.setattr(orch_main, "postgres_db", db)
     return db
@@ -478,9 +503,12 @@ class TestHoldRelease:
             MagicMock(), PROJECT_ID, OfficerHoldRequest(note="quarterly maintenance")
         )
         assert out["status"] == "held"
-        tid, patch = db.merge_thread_config_override.await_args.args
-        assert tid == THREAD_ID
-        hold = patch["officer"]["hold"]
+        db.set_project_officer_hold.assert_awaited_once()
+        args, kwargs = db.set_project_officer_hold.await_args
+        assert args == (PROJECT_ID,)
+        assert kwargs["expected_thread_id"] == THREAD_ID
+        assert kwargs["route_reason"] == "officer_hold"
+        hold = kwargs["hold"]
         assert hold["kind"] == "maintenance"
         assert hold["note"] == "quarterly maintenance"
         assert hold["since"]
@@ -527,9 +555,11 @@ class TestHoldRelease:
         db.get_officer_thread_for_project = AsyncMock(return_value=held)
         out = await release_project_officer(MagicMock(), PROJECT_ID)
         assert out["status"] == "released"
-        tid, patch = db.merge_thread_config_override.await_args.args
-        assert tid == THREAD_ID
-        assert patch == {"officer": {"hold": None}}
+        db.set_project_officer_hold.assert_awaited_once_with(
+            PROJECT_ID,
+            expected_thread_id=THREAD_ID,
+            hold=None,
+        )
         kick.assert_called_once()
 
     @pytest.mark.asyncio
@@ -551,8 +581,10 @@ class TestPatchEndpoint:
         out = await patch_project_officer(
             MagicMock(), PROJECT_ID, {"max_pages_per_day": 5}
         )
-        db.merge_project_officer_config.assert_awaited_once_with(
-            PROJECT_ID, {"officer": {"max_pages_per_day": 5}}
+        db.update_project_officer_post.assert_awaited_once_with(
+            PROJECT_ID,
+            config_updates={"officer": {"max_pages_per_day": 5}},
+            communication_policy_patch=None,
         )
         db.merge_thread_config_override.assert_not_awaited()
         assert out["commissioned"] is False
@@ -565,14 +597,28 @@ class TestPatchEndpoint:
     ):
         notice = AsyncMock(return_value=True)
         monkeypatch.setattr(orch_main, "_inject_officer_notice", notice)
-        db.get_officer_thread_for_project = AsyncMock(return_value=_officer_thread())
+        officer = _officer_thread()
+        db.update_project_officer_post = AsyncMock(
+            return_value={
+                "post": _post_row(
+                    thread_id=THREAD_ID,
+                    config_override={
+                        "officer": {"slots": {"line": {"count": 1}}},
+                        "llm": {"reasoning_level": "high"},
+                    },
+                ),
+                "thread": officer,
+                "applied_to_thread": True,
+            }
+        )
         out = await patch_project_officer(
             MagicMock(),
             PROJECT_ID,
             {"slots": {"line": {"count": 1}}, "brain": {"reasoning_level": "high"}},
         )
-        tid, fragment = db.merge_thread_config_override.await_args.args
-        assert tid == THREAD_ID
+        db.update_project_officer_post.assert_awaited_once()
+        _, kwargs = db.update_project_officer_post.await_args
+        fragment = kwargs["config_updates"]
         assert fragment["officer"]["slots"]["line"]["count"] == 1
         assert fragment["llm"]["reasoning_level"] == "high"
         notice.assert_awaited_once()
@@ -585,14 +631,15 @@ class TestPatchEndpoint:
     async def test_communication_policy_is_never_mirrored_to_the_thread(
         self, db, as_project_admin, quiet_side_channels
     ):
-        db.get_officer_thread_for_project = AsyncMock(return_value=_officer_thread())
         await patch_project_officer(
             MagicMock(),
             PROJECT_ID,
             {"communication_policy": {"worker_messages": "officer_first"}},
         )
-        db.merge_project_officer_communication_policy.assert_awaited_once_with(
-            PROJECT_ID, {"worker_messages": "officer_first"}
+        db.update_project_officer_post.assert_awaited_once_with(
+            PROJECT_ID,
+            config_updates=None,
+            communication_policy_patch={"worker_messages": "officer_first"},
         )
         db.merge_project_officer_config.assert_not_awaited()
         db.merge_thread_config_override.assert_not_awaited()
@@ -664,7 +711,19 @@ class TestCommissionEndpoint:
         self, db, as_project_admin, quiet_side_channels, monkeypatch
     ):
         new_tid = str(uuid4())
-        create = AsyncMock(return_value={"thread_id": new_tid, "status": "created"})
+        continuity = {
+            "brief_enqueued": True,
+            "while_vacant": [{"job_id": "j1", "status": "completed"}],
+            "while_vacant_dropped": 2,
+            "state_restored": True,
+            "payload": {"vacant_since": "2026-08-10T00:00:00+00:00"},
+        }
+
+        async def create_with_continuity(req, _request):
+            req._officer_commission_result = continuity
+            return {"thread_id": new_tid, "status": "created"}
+
+        create = AsyncMock(side_effect=create_with_continuity)
         monkeypatch.setattr(orch_main, "create_thread", create)
         row = _post_row(
             config_override={
@@ -687,7 +746,9 @@ class TestCommissionEndpoint:
             ],
         )
         db.get_or_create_project_officer = AsyncMock(return_value=row)
-        db.merge_project_officer_config = AsyncMock(return_value=row)
+        db.update_project_officer_post = AsyncMock(
+            return_value={"post": row, "thread": None, "applied_to_thread": False}
+        )
         db.get_project_officer = AsyncMock(return_value=row)
         db.drain_project_officer_while_vacant = AsyncMock(
             return_value={
@@ -699,9 +760,12 @@ class TestCommissionEndpoint:
         body = {"max_pages_per_day": 4}
         out = await commission_project_officer(MagicMock(), PROJECT_ID, body)
 
-        # Body validated + merged into the row FIRST.
-        db.merge_project_officer_config.assert_awaited_once_with(
-            PROJECT_ID, {"officer": {"max_pages_per_day": 4}}
+        # Body validated + merged into the row under the post lock FIRST.
+        db.update_project_officer_post.assert_awaited_once_with(
+            PROJECT_ID,
+            config_updates={"officer": {"max_pages_per_day": 4}},
+            communication_policy_patch=None,
+            expected_vacant_updated_at=row["updated_at"],
         )
         # One funnel: the create-thread endpoint, with the row's kit.
         req = create.await_args.args[0]
@@ -716,23 +780,15 @@ class TestCommissionEndpoint:
         assert officer_frag["slots"]["line"]["count"] == 2
         assert req.config_override["workspace"] == {"backend": "sandbox"}
 
-        # Continuity: harvested state (minus the ledger keys) restored onto
-        # the new incarnation.
-        tid, restored = db.merge_thread_officer_state.await_args.args
-        assert tid == new_tid
-        assert restored == {"sitrep_fingerprints": {"j": "fp"}}
-
-        # The brief: source='commission', dedup on the thread id, ledger +
-        # vacancy window in the payload.
-        args, kwargs = db.enqueue_session_wake_event.await_args
-        assert args[0] == new_tid
-        assert kwargs["source"] == "commission"
-        assert kwargs["dedup_key"] == new_tid
-        assert kwargs["payload"]["while_vacant"] == [
-            {"job_id": "j1", "status": "completed"}
-        ]
-        assert kwargs["payload"]["while_vacant_dropped"] == 2
-        assert kwargs["payload"]["vacant_since"] == "2026-08-10T00:00:00+00:00"
+        # Continuity was already restored/drained/enqueued inside registration's
+        # post-locked transaction. The endpoint performs no split follow-up writes.
+        assert req._officer_commission_result == continuity
+        db.merge_thread_officer_state.assert_not_awaited()
+        db.drain_project_officer_while_vacant.assert_not_awaited()
+        db.enqueue_session_wake_event.assert_not_awaited()
+        db.confirm_project_officer_incarnation.assert_awaited_once_with(
+            PROJECT_ID, new_tid
+        )
         assert out["status"] == "commissioned"
         assert out["thread_id"] == new_tid
         assert out["brief_enqueued"] is True
@@ -746,7 +802,17 @@ class TestCommissionEndpoint:
         must drop them — the funnel spells 'default' by omission, and its
         validator 400s on null ints/slots."""
         new_tid = str(uuid4())
-        create = AsyncMock(return_value={"thread_id": new_tid, "status": "created"})
+
+        async def create_with_continuity(req, _request):
+            req._officer_commission_result = {
+                "brief_enqueued": True,
+                "while_vacant": [],
+                "while_vacant_dropped": 0,
+                "state_restored": False,
+            }
+            return {"thread_id": new_tid, "status": "created"}
+
+        create = AsyncMock(side_effect=create_with_continuity)
         monkeypatch.setattr(orch_main, "create_thread", create)
         row = _post_row(
             config_override={
@@ -761,6 +827,9 @@ class TestCommissionEndpoint:
         )
         db.get_or_create_project_officer = AsyncMock(return_value=row)
         db.get_project_officer = AsyncMock(return_value=row)
+        db.update_project_officer_post = AsyncMock(
+            return_value={"post": row, "thread": None, "applied_to_thread": False}
+        )
 
         await commission_project_officer(MagicMock(), PROJECT_ID, None)
 
@@ -791,10 +860,16 @@ class TestCommissionEndpoint:
 
 class TestDecommissionEndpoint:
     @pytest.mark.asyncio
-    async def test_vacant_post_400s(self, db, as_project_admin, quiet_side_channels):
-        with pytest.raises(HTTPException) as exc:
-            await decommission_project_officer(MagicMock(), PROJECT_ID, None)
-        assert exc.value.status_code == 400
+    async def test_vacant_post_is_an_idempotent_success(
+        self, db, as_project_admin, quiet_side_channels
+    ):
+        out = await decommission_project_officer(MagicMock(), PROJECT_ID, None)
+        assert out == {
+            "status": "decommissioned",
+            "already_vacant": True,
+            "incarnations": [],
+        }
+        db.decommission_project_officer.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_in_flight_jobs_warn_is_a_200_without_force(
@@ -808,16 +883,21 @@ class TestDecommissionEndpoint:
         )
         db.get_thread = AsyncMock(return_value=_officer_thread())
         jobs = [{"job_id": "j1", "status": "processing", "slot": "line", "title": "d"}]
-        monkeypatch.setattr(
-            orch_main, "_officer_in_flight_jobs", AsyncMock(return_value=jobs)
+        flow = AsyncMock(
+            return_value={
+                "status": "in_flight",
+                "warning": "1 job(s) in flight; retry with force=true",
+                "in_flight_jobs": jobs,
+            }
         )
-        flow = AsyncMock()
         monkeypatch.setattr(orch_main, "_end_thread_flow", flow)
         out = await decommission_project_officer(MagicMock(), PROJECT_ID, None)
         assert out["status"] == "in_flight"
         assert out["in_flight_jobs"] == jobs
         assert "force=true" in out["warning"]
-        flow.assert_not_awaited()
+        flow.assert_awaited_once()
+        assert flow.await_args.kwargs["force"] is False
+        assert flow.await_args.kwargs["officer_post_required"] is True
         db.clear_project_officer_thread.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -829,10 +909,12 @@ class TestDecommissionEndpoint:
         )
         db.get_thread = AsyncMock(return_value=_officer_thread())
         jobs = [{"job_id": "j1", "status": "processing", "slot": "line", "title": "d"}]
-        monkeypatch.setattr(
-            orch_main, "_officer_in_flight_jobs", AsyncMock(return_value=jobs)
+        flow = AsyncMock(
+            return_value={
+                "status": "ended",
+                "_officer_handoff": {"in_flight_jobs": jobs},
+            }
         )
-        flow = AsyncMock(return_value={"status": "ended"})
         monkeypatch.setattr(orch_main, "_end_thread_flow", flow)
         out = await decommission_project_officer(
             MagicMock(), PROJECT_ID, OfficerDecommissionRequest(force=True)
@@ -855,10 +937,12 @@ class TestDecommissionEndpoint:
             return_value=_post_row(thread_id=THREAD_ID)
         )
         db.get_thread = AsyncMock(return_value=_officer_thread())
-        monkeypatch.setattr(
-            orch_main, "_officer_in_flight_jobs", AsyncMock(return_value=[])
+        flow = AsyncMock(
+            return_value={
+                "status": "ended",
+                "_officer_handoff": {"in_flight_jobs": []},
+            }
         )
-        flow = AsyncMock(return_value={"status": "ended"})
         monkeypatch.setattr(orch_main, "_end_thread_flow", flow)
         out = await decommission_project_officer(MagicMock(), PROJECT_ID, None)
         assert out["status"] == "decommissioned"
@@ -882,16 +966,36 @@ class TestDecommissionEndpoint:
         assert out["already_ended"] is True
 
     @pytest.mark.asyncio
-    async def test_missing_thread_row_clears_the_link(
+    async def test_missing_thread_row_uses_the_atomic_handoff(
         self, db, as_project_admin, quiet_side_channels
     ):
         db.get_or_create_project_officer = AsyncMock(
             return_value=_post_row(thread_id=THREAD_ID)
         )
         db.get_thread = AsyncMock(return_value=None)
+        db.decommission_project_officer = AsyncMock(
+            return_value={
+                "transitioned": True,
+                "already_decommissioned": False,
+                "vacant": True,
+                "routes": [],
+                "folded": 0,
+                "deleted": 0,
+                "dropped": 0,
+                "harvested": False,
+                "incarnation": {"thread_id": THREAD_ID},
+            }
+        )
         out = await decommission_project_officer(MagicMock(), PROJECT_ID, None)
-        db.clear_project_officer_thread.assert_awaited_once_with(PROJECT_ID)
-        db.append_project_officer_incarnation.assert_awaited_once()
+        db.decommission_project_officer.assert_awaited_once_with(
+            PROJECT_ID,
+            THREAD_ID,
+            reason="decommissioned",
+            force=False,
+            allow_orphan_retirement=False,
+        )
+        db.clear_project_officer_thread.assert_not_awaited()
+        db.append_project_officer_incarnation.assert_not_awaited()
         assert out["status"] == "decommissioned"
 
 
@@ -909,21 +1013,39 @@ class TestDecommissionHygieneHelper:
             "sitrep_fingerprints": {"j": "fp"},
             "digest": [{"subject": "s"}],
         }
-        db.get_project_officer = AsyncMock(return_value=_post_row(thread_id=THREAD_ID))
+        db.decommission_project_officer = AsyncMock(
+            return_value={
+                "transitioned": True,
+                "already_decommissioned": False,
+                "vacant": True,
+                "routes": [],
+                "folded": 1,
+                "deleted": 2,
+                "dropped": 0,
+                "harvested": True,
+                "incarnation": {
+                    "thread_id": THREAD_ID,
+                    "commissioned_at": created_at.isoformat(),
+                    "reason": "decommissioned",
+                },
+            }
+        )
         out = await _decommission_officer_post(thread, reason="decommissioned")
         assert out is not None
-        db.merge_project_officer_state.assert_awaited_once_with(
-            PROJECT_ID, thread["metadata"]["officer_state"]
+        db.decommission_project_officer.assert_awaited_once_with(
+            PROJECT_ID,
+            THREAD_ID,
+            reason="decommissioned",
+            force=False,
+            allow_orphan_retirement=False,
         )
-        db.fold_project_officer_wake_queue.assert_awaited_once_with(
-            PROJECT_ID, THREAD_ID
-        )
-        db.clear_project_officer_thread.assert_awaited_once_with(PROJECT_ID)
-        entry = db.append_project_officer_incarnation.await_args.args[1]
-        assert entry["thread_id"] == THREAD_ID
-        assert entry["commissioned_at"] == created_at.isoformat()
-        assert entry["reason"] == "decommissioned"
-        assert entry["decommissioned_at"]
+        assert out["harvested"] is True
+        assert out["folded"] == 1
+        assert out["deleted"] == 2
+        db.merge_project_officer_state.assert_not_awaited()
+        db.fold_project_officer_wake_queue.assert_not_awaited()
+        db.clear_project_officer_thread.assert_not_awaited()
+        db.append_project_officer_incarnation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unregistered_officer_thread_touches_nothing(self, db):
@@ -933,7 +1055,14 @@ class TestDecommissionHygieneHelper:
             return_value=_post_row(thread_id=str(uuid4()))
         )
         out = await _decommission_officer_post(_officer_thread(), reason="retired")
-        assert out is None
+        assert out["transitioned"] is False
+        db.decommission_project_officer.assert_awaited_once_with(
+            PROJECT_ID,
+            THREAD_ID,
+            reason="retired",
+            force=False,
+            allow_orphan_retirement=False,
+        )
         db.merge_project_officer_state.assert_not_awaited()
         db.clear_project_officer_thread.assert_not_awaited()
         db.append_project_officer_incarnation.assert_not_awaited()
@@ -960,6 +1089,19 @@ class TestEndThreadReroute:
         monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         db.get_project_officer = AsyncMock(return_value=_post_row(thread_id=THREAD_ID))
+        db.decommission_project_officer = AsyncMock(
+            return_value={
+                "transitioned": True,
+                "already_decommissioned": False,
+                "vacant": True,
+                "routes": [],
+                "folded": 0,
+                "deleted": 0,
+                "dropped": 0,
+                "harvested": True,
+                "incarnation": {"thread_id": THREAD_ID, "reason": "retired"},
+            }
+        )
         db.end_thread = AsyncMock()
         thread = _officer_thread(execution_lane="pinned")
         thread["metadata"]["officer_state"] = {"pages": {"count": 1}}
@@ -969,21 +1111,24 @@ class TestEndThreadReroute:
         )
 
         assert out == {"status": "ended"}
-        # The runtime projection stands down…
-        flip = db.merge_thread_config_override.await_args_list[0].args
-        assert flip == (THREAD_ID, {"officer": {"enabled": False}})
-        # …and the post hygiene ran: harvest, fold, unlink, incarnation.
-        db.merge_project_officer_state.assert_awaited_once_with(
-            PROJECT_ID, {"pages": {"count": 1}}
+        # The post handoff and server-owned runtime disable are one database
+        # transaction; End cannot retire the thread after a partial handoff.
+        db.decommission_project_officer.assert_awaited_once_with(
+            PROJECT_ID,
+            THREAD_ID,
+            reason="retired",
+            force=False,
+            allow_orphan_retirement=True,
         )
-        db.fold_project_officer_wake_queue.assert_awaited_once()
-        db.clear_project_officer_thread.assert_awaited_once_with(PROJECT_ID)
-        entry = db.append_project_officer_incarnation.await_args.args[1]
-        assert entry["reason"] == "retired"
+        db.merge_thread_config_override.assert_not_awaited()
+        db.merge_project_officer_state.assert_not_awaited()
+        db.fold_project_officer_wake_queue.assert_not_awaited()
+        db.clear_project_officer_thread.assert_not_awaited()
+        db.append_project_officer_incarnation.assert_not_awaited()
         db.end_thread.assert_awaited_once_with(THREAD_ID)
 
     @pytest.mark.asyncio
-    async def test_hygiene_failure_never_blocks_the_end(self, db, monkeypatch):
+    async def test_authoritative_handoff_failure_blocks_the_end(self, db, monkeypatch):
         monkeypatch.setattr(
             orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
         )
@@ -996,11 +1141,229 @@ class TestEndThreadReroute:
         )
         db.end_thread = AsyncMock()
         thread = _officer_thread(execution_lane="pinned")
-        out = await orch_main._end_thread_flow(
-            THREAD_ID, thread, permanent=False, force=False
+        with pytest.raises(RuntimeError, match="post table on fire"):
+            await orch_main._end_thread_flow(
+                THREAD_ID, thread, permanent=False, force=False
+            )
+        db.end_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_direct_end_returns_post_locked_in_flight_warning_without_cleanup(
+        self, db, monkeypatch
+    ):
+        jobs = [
+            {
+                "job_id": "j1",
+                "status": "pending_review",
+                "slot": "line",
+                "title": "still owned",
+            }
+        ]
+        db.decommission_project_officer = AsyncMock(
+            return_value={
+                "transitioned": False,
+                "blocked_by_in_flight": True,
+                "vacant": False,
+                "routes": [],
+                "in_flight_jobs": jobs,
+            }
         )
+        monkeypatch.setattr(
+            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+        )
+        release = AsyncMock()
+        conclude = AsyncMock()
+        monkeypatch.setattr(orch_main, "_release_thread_resources", release)
+        monkeypatch.setattr(orch_main, "_conclude_conference_if_any", conclude)
+        db.end_thread = AsyncMock()
+
+        out = await orch_main._end_thread_flow(
+            THREAD_ID,
+            _officer_thread(execution_lane="pinned"),
+            permanent=False,
+            force=False,
+        )
+
+        assert out["status"] == "in_flight"
+        assert out["in_flight_jobs"] == jobs
+        db.decommission_project_officer.assert_awaited_once_with(
+            PROJECT_ID,
+            THREAD_ID,
+            reason="retired",
+            force=False,
+            allow_orphan_retirement=True,
+        )
+        release.assert_not_awaited()
+        conclude.assert_not_awaited()
+        db.end_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_direct_end_accepts_atomic_orphan_retirement(self, db, monkeypatch):
+        db.decommission_project_officer = AsyncMock(
+            return_value={
+                "transitioned": False,
+                "orphan_retired": True,
+                "vacant": False,
+                "routes": [],
+                "in_flight_jobs": [],
+            }
+        )
+        monkeypatch.setattr(
+            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+        )
+        monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
+        monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
+        db.end_thread = AsyncMock()
+
+        out = await orch_main._end_thread_flow(
+            THREAD_ID,
+            _officer_thread(execution_lane="pinned"),
+            permanent=False,
+            force=False,
+        )
+
         assert out == {"status": "ended"}
-        db.end_thread.assert_awaited_once()
+        db.merge_thread_config_override.assert_not_awaited()
+        db.end_thread.assert_awaited_once_with(THREAD_ID)
+
+    @pytest.mark.asyncio
+    async def test_direct_end_and_explicit_decommission_share_one_transition(
+        self, db, as_project_admin, quiet_side_channels, monkeypatch
+    ):
+        """Both public controls reach the same post/thread transaction."""
+        monkeypatch.setattr(
+            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+        )
+        monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
+        monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
+        db.get_or_create_project_officer = AsyncMock(
+            return_value=_post_row(thread_id=THREAD_ID)
+        )
+        thread = _officer_thread(execution_lane="pinned")
+        db.get_thread = AsyncMock(return_value=thread)
+        db.get_project_officer = AsyncMock(return_value=_post_row())
+        db.end_thread = AsyncMock()
+        db.decommission_project_officer = AsyncMock(
+            return_value={
+                "transitioned": True,
+                "already_decommissioned": False,
+                "vacant": True,
+                "routes": [],
+                "folded": 0,
+                "deleted": 0,
+                "dropped": 0,
+                "harvested": False,
+                "incarnation": {"thread_id": THREAD_ID, "reason": "retired"},
+            }
+        )
+
+        await orch_main._end_thread_flow(
+            THREAD_ID,
+            thread,
+            permanent=False,
+            force=False,
+            officer_retire_reason="retired",
+        )
+        direct_call = db.decommission_project_officer.await_args
+
+        db.decommission_project_officer.reset_mock()
+        await decommission_project_officer(
+            MagicMock(),
+            PROJECT_ID,
+            OfficerDecommissionRequest(reason="retired"),
+        )
+        endpoint_call = db.decommission_project_officer.await_args
+
+        assert direct_call.args == endpoint_call.args == (PROJECT_ID, THREAD_ID)
+        assert direct_call.kwargs == {
+            "reason": "retired",
+            "force": False,
+            "allow_orphan_retirement": True,
+        }
+        assert endpoint_call.kwargs == {
+            "reason": "retired",
+            "force": False,
+            "allow_orphan_retirement": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_notifier_failure_does_not_falsify_committed_handoff(
+        self, db, monkeypatch
+    ):
+        from services import message_routing
+
+        route = {
+            "route_id": str(uuid4()),
+            "job_id": str(uuid4()),
+            "user_delivery_at": None,
+        }
+        db.decommission_project_officer = AsyncMock(
+            return_value={
+                "transitioned": True,
+                "already_decommissioned": False,
+                "vacant": True,
+                "routes": [route],
+                "folded": 0,
+                "deleted": 0,
+                "dropped": 0,
+                "harvested": False,
+                "incarnation": {"thread_id": THREAD_ID},
+            }
+        )
+
+        async def fail_after_commit(*args, **kwargs):
+            db.decommission_project_officer.assert_awaited_once()
+            return False
+
+        deliver = AsyncMock(side_effect=fail_after_commit)
+        monkeypatch.setattr(message_routing, "deliver_route_to_user", deliver)
+
+        out = await _decommission_officer_post(
+            _officer_thread(), reason="decommissioned"
+        )
+
+        assert out["transitioned"] is True
+        assert out["routes_staged"] == 1
+        assert out["routes_delivered"] == 0
+        assert route["user_delivery_at"] is None
+        deliver.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_notifier_exception_does_not_falsify_committed_handoff(
+        self, db, monkeypatch
+    ):
+        from services import message_routing
+
+        route = {
+            "route_id": str(uuid4()),
+            "job_id": str(uuid4()),
+            "user_delivery_at": None,
+        }
+        db.decommission_project_officer = AsyncMock(
+            return_value={
+                "transitioned": True,
+                "already_decommissioned": False,
+                "vacant": True,
+                "routes": [route],
+                "folded": 0,
+                "deleted": 0,
+                "dropped": 0,
+                "harvested": False,
+                "incarnation": {"thread_id": THREAD_ID},
+            }
+        )
+        deliver = AsyncMock(side_effect=RuntimeError("notifier unavailable"))
+        monkeypatch.setattr(message_routing, "deliver_route_to_user", deliver)
+
+        out = await _decommission_officer_post(
+            _officer_thread(), reason="decommissioned"
+        )
+
+        assert out["transitioned"] is True
+        assert out["routes_staged"] == 1
+        assert out["routes_delivered"] == 0
+        assert route["user_delivery_at"] is None
+        deliver.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_plain_session_end_skips_officer_hygiene(self, db, monkeypatch):
@@ -1039,6 +1402,14 @@ class TestWhileVacantLeg:
                 "description": "review the quarterly numbers",
             }
         )
+        db.route_project_officer_job_transition = AsyncMock(
+            return_value={
+                "destination": "wake" if officer else "while_vacant",
+                "thread_id": THREAD_ID if officer else None,
+                "enqueued": bool(officer),
+                "appended": not bool(officer),
+            }
+        )
         db.get_officer_thread_for_project = AsyncMock(return_value=officer)
         db.append_project_officer_while_vacant = AsyncMock(return_value=_post_row())
         db.enqueue_session_wake_event = AsyncMock(return_value=True)
@@ -1049,13 +1420,15 @@ class TestWhileVacantLeg:
         db = self._db(officer=None)
         ok = await session_wake._notify_project_officer_of_job(db, "j1", "completed")
         assert ok is False
-        args = db.append_project_officer_while_vacant.await_args.args
-        assert args[0] == PROJECT_ID
-        (entry,) = args[1]
-        assert entry["job_id"] == "j1"
-        assert entry["status"] == "completed"
-        assert entry["description"] == "review the quarterly numbers"
-        assert entry["at"]
+        db.route_project_officer_job_transition.assert_awaited_once_with(
+            PROJECT_ID,
+            job_id="j1",
+            status="completed",
+            description="review the quarterly numbers",
+            dedup_key="j1:completed",
+        )
+        db.get_officer_thread_for_project.assert_not_awaited()
+        db.append_project_officer_while_vacant.assert_not_awaited()
         db.enqueue_session_wake_event.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1063,16 +1436,20 @@ class TestWhileVacantLeg:
         db = self._db(officer={"id": THREAD_ID})
         ok = await session_wake._notify_project_officer_of_job(db, "j1", "paused")
         assert ok is True
-        args, kwargs = db.enqueue_session_wake_event.await_args
-        assert args[0] == THREAD_ID
-        assert kwargs["source"] == "job_transition"
-        assert kwargs["dedup_key"] == "j1:paused"
+        db.route_project_officer_job_transition.assert_awaited_once_with(
+            PROJECT_ID,
+            job_id="j1",
+            status="paused",
+            description="review the quarterly numbers",
+            dedup_key="j1:paused",
+        )
         db.append_project_officer_while_vacant.assert_not_awaited()
+        db.enqueue_session_wake_event.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_ledger_failure_never_raises_into_the_completion_path(self):
         db = self._db(officer=None)
-        db.append_project_officer_while_vacant = AsyncMock(
+        db.route_project_officer_job_transition = AsyncMock(
             side_effect=RuntimeError("boom")
         )
         assert (

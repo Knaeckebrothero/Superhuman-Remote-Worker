@@ -345,6 +345,15 @@ class DatasourceCatalogCursorError(ValueError):
     """A datasource catalog/linkable-project cursor is malformed."""
 
 
+class OfficerPostLifecycleConflict(RuntimeError):
+    """A stale/invalid Officer Post lifecycle mutation lost its CAS."""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
 def _uuid_list(values: list[str] | tuple[str, ...] | None) -> list[UUID]:
     """Parse and de-duplicate UUID strings while preserving request order.
 
@@ -1700,14 +1709,13 @@ class PostgresDB:
             execution_lane: Explicit execution plane, or None to inherit an
                 authoritative parent job's lane. Root jobs default to pinned.
             conn: Optional caller-owned connection ALREADY inside a transaction.
-                The officer's auto-pull tick needs the ticket-claim check, the
-                slot capacity count and this INSERT to be one atomic unit: the
-                advisory lock it takes releases at transaction close, so a
-                check-then-insert across two connections leaves exactly the
-                daylight in which two replicas double-claim a ticket
-                (docs/features/officer_backlog_pools.md §5.3). Passing a conn
-                makes the caller responsible for the transaction — this method
-                opens none of its own and does not retry.
+                Officer admission needs its stable post lock, ticket-claim
+                check, lineage capacity count and this INSERT to be one atomic
+                unit. A check and insert on separate connections leaves the
+                exact daylight in which parallel manual/tick callers exceed a
+                slot or double-claim a ticket. Passing a conn makes the caller
+                responsible for the transaction — this method opens none of
+                its own and does not retry.
 
         Returns:
             Created job dict with id
@@ -8679,45 +8687,66 @@ class PostgresDB:
                 project_uuid = None
         payload_json = json.dumps(payload or {})
         async with self.acquire() as conn:
-            if source == "timer":
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO session_wake_events
-                        (thread_id, project_id, source, dedup_key, payload,
-                         fire_at)
-                    VALUES ($1, $2, 'timer', $3, $4::jsonb, $5)
-                    ON CONFLICT (thread_id, source, dedup_key)
-                        WHERE state = 'pending'
-                    DO UPDATE SET fire_at = EXCLUDED.fire_at,
-                                  payload = EXCLUDED.payload
-                    RETURNING id
-                    """,
-                    thread_uuid,
-                    project_uuid,
-                    dedup_key,
-                    payload_json,
-                    fire_at,
-                )
-            else:
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO session_wake_events
-                        (thread_id, project_id, source, dedup_key, payload,
-                         fire_at)
-                    VALUES ($1, $2, $3, $4, $5::jsonb, $6)
-                    ON CONFLICT (thread_id, source, dedup_key)
-                        WHERE state = 'pending'
-                    DO NOTHING
-                    RETURNING id
-                    """,
-                    thread_uuid,
-                    project_uuid,
-                    source,
-                    dedup_key,
-                    payload_json,
-                    fire_at,
-                )
-            return row is not None
+            return await self._enqueue_session_wake_event_on_conn(
+                conn,
+                thread_uuid,
+                source=source,
+                dedup_key=dedup_key,
+                payload_json=payload_json,
+                project_uuid=project_uuid,
+                fire_at=fire_at,
+            )
+
+    async def _enqueue_session_wake_event_on_conn(
+        self,
+        conn: Any,
+        thread_uuid: UUID,
+        *,
+        source: str,
+        dedup_key: str,
+        payload_json: str,
+        project_uuid: Optional[UUID] = None,
+        fire_at: Optional[datetime] = None,
+    ) -> bool:
+        """Connection-owned wake INSERT for post-authoritative transactions."""
+
+        if source == "timer":
+            row = await conn.fetchrow(
+                """
+                INSERT INTO session_wake_events
+                    (thread_id, project_id, source, dedup_key, payload, fire_at)
+                VALUES ($1, $2, 'timer', $3, $4::jsonb, $5)
+                ON CONFLICT (thread_id, source, dedup_key)
+                    WHERE state = 'pending'
+                DO UPDATE SET fire_at = EXCLUDED.fire_at,
+                              payload = EXCLUDED.payload
+                RETURNING id
+                """,
+                thread_uuid,
+                project_uuid,
+                dedup_key,
+                payload_json,
+                fire_at,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO session_wake_events
+                    (thread_id, project_id, source, dedup_key, payload, fire_at)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+                ON CONFLICT (thread_id, source, dedup_key)
+                    WHERE state = 'pending'
+                DO NOTHING
+                RETURNING id
+                """,
+                thread_uuid,
+                project_uuid,
+                source,
+                dedup_key,
+                payload_json,
+                fire_at,
+            )
+        return row is not None
 
     async def claim_pending_session_wake_events(
         self,
@@ -9295,9 +9324,13 @@ class PostgresDB:
                 """
                 SELECT t.id, t.status, t.project_id, t.agent_id, t.metadata
                   FROM project_officers po
-                  JOIN threads t ON t.id = po.thread_id
+                  JOIN threads t
+                    ON t.id = po.thread_id
+                   AND t.project_id = po.project_id
                  WHERE po.project_id = $1
                    AND t.status != 'ended'
+                   AND COALESCE(t.metadata->'config_override'
+                                ->'officer'->>'enabled','false') = 'true'
                 """,
                 project_uuid,
             )
@@ -9319,6 +9352,38 @@ class PostgresDB:
                  WHERE t.status != 'ended'
                    AND COALESCE(t.metadata->'config_override'
                                 ->'officer'->>'enabled','false') = 'true'
+                """
+            )
+        return [dict(row) for row in rows]
+
+    async def list_commissioned_officer_posts_for_backlog(
+        self,
+    ) -> List[Dict[str, Any]]:
+        """Current live commissioned incarnations eligible for backlog scans.
+
+        This query is intentionally distinct from :meth:`list_officer_threads`.
+        Fleet wake/watchdog callers enumerate runtime officer-shaped threads;
+        backlog scheduling is an authority decision and therefore starts from
+        ``project_officers``.  An orphan, legacy, duplicate, disabled, ended,
+        missing, or cross-project thread can never enter the automatic tick.
+
+        Final admission still locks and revalidates the post.  This read only
+        bounds the scan and is not relied on for correctness.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT t.id, t.status, t.project_id, t.agent_id, t.user_id,
+                       t.metadata, po.updated_at AS officer_post_updated_at,
+                       jsonb_array_length(po.incarnations) AS officer_incarnation
+                  FROM project_officers po
+                  JOIN threads t
+                    ON t.id = po.thread_id
+                   AND t.project_id = po.project_id
+                 WHERE t.status != 'ended'
+                   AND COALESCE(t.metadata->'config_override'
+                                ->'officer'->>'enabled','false') = 'true'
+                 ORDER BY po.project_id
                 """
             )
         return [dict(row) for row in rows]
@@ -9558,29 +9623,47 @@ class PostgresDB:
         project_id: str,
         thread_id: str,
         config_override: Optional[Dict[str, Any]] = None,
+        *,
+        expected_post_config_override: Optional[Dict[str, Any]] = None,
+        commission_continuity: bool = False,
+        fault_injector: Any = None,
     ) -> Optional[Dict[str, Any]]:
-        """Claim the post for a newly created officer thread.
+        """Claim a vacant post for one validated live officer incarnation.
 
-        The create-thread funnel's registration step (officer_post.md §4):
-        exactly one path raises an officer, so the row can never disagree
-        with the threads table about who holds the post. Returns the updated
-        row, or None when the post is already commissioned by a live thread —
-        the funnel maps that to 409.
+        Lock order is post -> existing current thread -> candidate thread.
+        Registration never performs a partial stale-link fold: an ended
+        predecessor must first pass through :meth:`decommission_project_officer`
+        so wake folding, route fallback, state harvest and history are one
+        handoff.  This makes concurrent decommission/recommission serialize on
+        the same durable row.
 
-        A link still pointing at an *ended* thread (a retire that predates
-        the O3 decommission rerouting) is folded first — officer_state
-        harvested onto ``state``, an incarnation entry appended — so the
-        stale link self-heals instead of blocking every future commission.
-        ``config_override`` (the funnel's redacted fragment) is stamped onto
-        the row minus the runtime keys (``officer.hold`` /
-        ``officer.last_respawn_at``), keeping the durable kit in sync with
-        the incarnation being raised.
+        ``expected_post_config_override`` is used by the explicit commission
+        flow after external thread provisioning.  A concurrent post edit makes
+        registration lose cleanly instead of overwriting the newer kit with
+        the provisioning snapshot. Direct legacy creates omit it and retain
+        the established behavior of stamping their validated kit onto a vacant
+        post.
+
+        Explicit commission sets ``commission_continuity``. Registration,
+        durable state restore, while-vacant drain, and commission-wake INSERT
+        then share this transaction and exact post/incarnation fence. The
+        returned row carries a transient ``commission_continuity`` result for
+        the endpoint; it is not persisted as a post column.
         """
         try:
             project_uuid = UUID(project_id)
             thread_uuid = UUID(thread_id)
         except (ValueError, TypeError):
             return None
+
+        async def _fault(step: str) -> None:
+            if fault_injector is None:
+                return
+            outcome = fault_injector(step)
+            if hasattr(outcome, "__await__"):
+                await outcome
+
+        continuity: Dict[str, Any] | None = None
         async with self.acquire() as conn:
             async with conn.transaction():
                 try:
@@ -9591,40 +9674,78 @@ class PostgresDB:
                     )
                 except asyncpg.ForeignKeyViolationError:
                     return None
-                await conn.execute(
-                    """
-                    UPDATE project_officers po
-                       SET state = po.state
-                             || (CASE WHEN jsonb_typeof(
-                                          t.metadata->'officer_state')
-                                          = 'object'
-                                      THEN t.metadata->'officer_state'
-                                      ELSE '{}'::jsonb END),
-                           incarnations = po.incarnations
-                             || jsonb_build_array(jsonb_build_object(
-                                    'thread_id', t.id,
-                                    'commissioned_at', t.created_at,
-                                    'decommissioned_at',
-                                    COALESCE(t.ended_at, t.last_activity,
-                                             now()),
-                                    'reason', 'retired')),
-                           thread_id = NULL,
-                           updated_at = now()
-                      FROM threads t
-                     WHERE po.project_id = $1
-                       AND po.thread_id = t.id
-                       AND t.id != $2
-                       AND t.status = 'ended'
-                    """,
+                post = await conn.fetchrow(
+                    "SELECT * FROM project_officers WHERE project_id = $1 FOR UPDATE",
                     project_uuid,
+                )
+                if post is None:
+                    return None
+                await _fault("post_locked")
+                current_thread_id = post["thread_id"]
+                if current_thread_id is not None and current_thread_id != thread_uuid:
+                    # Lock the predecessor after the post even though this
+                    # request loses. That keeps the order explicit and makes
+                    # a concurrent authoritative handoff the only way forward.
+                    await conn.fetchrow(
+                        "SELECT id FROM threads WHERE id = $1 FOR UPDATE",
+                        current_thread_id,
+                    )
+                    return None
+
+                candidate = await conn.fetchrow(
+                    """
+                    SELECT id, project_id, status, metadata
+                      FROM threads
+                     WHERE id = $1
+                     FOR UPDATE
+                    """,
                     thread_uuid,
+                )
+                if (
+                    candidate is None
+                    or candidate["project_id"] != project_uuid
+                    or candidate["status"] == "ended"
+                    or str(
+                        (
+                            candidate["metadata"]
+                            if isinstance(candidate["metadata"], dict)
+                            else json.loads(candidate["metadata"] or "{}")
+                        )
+                        .get("config_override", {})
+                        .get("officer", {})
+                        .get("enabled", False)
+                    ).lower()
+                    != "true"
+                ):
+                    return None
+
+                current_config = post["config_override"]
+                if isinstance(current_config, str):
+                    try:
+                        current_config = json.loads(current_config)
+                    except (TypeError, ValueError):
+                        current_config = {}
+                if not isinstance(current_config, dict):
+                    current_config = {}
+                if (
+                    expected_post_config_override is not None
+                    and current_config != expected_post_config_override
+                ):
+                    return None
+                durable_config = (
+                    current_config
+                    if expected_post_config_override is not None
+                    else (
+                        config_override
+                        if config_override is not None
+                        else current_config
+                    )
                 )
                 row = await conn.fetchrow(
                     """
                     UPDATE project_officers
                        SET thread_id = $2,
-                           config_override =
-                               COALESCE($3::jsonb, config_override)
+                           config_override = $3::jsonb
                                    #- '{officer,hold}'
                                    #- '{officer,last_respawn_at}',
                            updated_at = now()
@@ -9634,11 +9755,963 @@ class PostgresDB:
                     """,
                     project_uuid,
                     thread_uuid,
-                    json.dumps(config_override)
-                    if config_override is not None
-                    else None,
+                    json.dumps(durable_config),
                 )
-        return self._project_officer_row_to_dict(row)
+                if row is None:
+                    return None
+                await _fault("post_linked")
+
+                if commission_continuity:
+                    state = row["state"]
+                    if isinstance(state, str):
+                        try:
+                            state = json.loads(state)
+                        except (TypeError, ValueError):
+                            state = {}
+                    if not isinstance(state, dict):
+                        state = {}
+                    state_restore = {
+                        key: value
+                        for key, value in state.items()
+                        if key not in ("while_vacant", "while_vacant_dropped")
+                    }
+                    restored = await conn.fetchrow(
+                        """
+                        UPDATE threads
+                           SET metadata = jsonb_set(
+                                   COALESCE(metadata, '{}'::jsonb),
+                                   '{officer_state}',
+                                   COALESCE(metadata->'officer_state', '{}'::jsonb)
+                                       || $2::jsonb),
+                               last_activity = now()
+                         WHERE id = $1
+                           AND project_id = $3
+                           AND status != 'ended'
+                        RETURNING id
+                        """,
+                        thread_uuid,
+                        json.dumps(state_restore),
+                        project_uuid,
+                    )
+                    if restored is None:
+                        raise OfficerPostLifecycleConflict(
+                            "stale_incarnation",
+                            "Officer incarnation ended during continuity restore.",
+                        )
+                    await _fault("state_restored")
+
+                    entries = state.get("while_vacant")
+                    if not isinstance(entries, list):
+                        entries = []
+                    try:
+                        ledger_dropped = max(
+                            0, int(state.get("while_vacant_dropped") or 0)
+                        )
+                    except (TypeError, ValueError):
+                        ledger_dropped = 0
+                    row = await conn.fetchrow(
+                        """
+                        UPDATE project_officers
+                           SET state = state || $2::jsonb,
+                               updated_at = now()
+                         WHERE project_id = $1
+                           AND thread_id = $3
+                        RETURNING *
+                        """,
+                        project_uuid,
+                        json.dumps({"while_vacant": [], "while_vacant_dropped": 0}),
+                        thread_uuid,
+                    )
+                    if row is None:
+                        raise OfficerPostLifecycleConflict(
+                            "stale_incarnation",
+                            "Officer incarnation changed during continuity drain.",
+                        )
+                    await _fault("continuity_drained")
+
+                    incarnations = row["incarnations"]
+                    if isinstance(incarnations, str):
+                        try:
+                            incarnations = json.loads(incarnations)
+                        except (TypeError, ValueError):
+                            incarnations = []
+                    if not isinstance(incarnations, list):
+                        incarnations = []
+                    vacant_since = (
+                        incarnations[-1].get("decommissioned_at")
+                        if incarnations and isinstance(incarnations[-1], dict)
+                        else None
+                    )
+                    brief_payload = {
+                        "summary": (
+                            "commissioned — you hold this project's post. Your "
+                            "durable state (digest, page counter, sitrep fingerprints) "
+                            "was restored to this session; re-read your charter and "
+                            "the project stores before your first scheduling decision."
+                        ),
+                        "vacant_since": vacant_since,
+                        "vacant_until": datetime.now(timezone.utc).isoformat(),
+                        "while_vacant": entries,
+                        "while_vacant_dropped": ledger_dropped,
+                        "last_state_restored": bool(state_restore),
+                    }
+                    brief_enqueued = await self._enqueue_session_wake_event_on_conn(
+                        conn,
+                        thread_uuid,
+                        source="commission",
+                        dedup_key=str(thread_uuid),
+                        payload_json=json.dumps(brief_payload),
+                        project_uuid=project_uuid,
+                    )
+                    await _fault("commission_wake_enqueued")
+                    continuity = {
+                        "brief_enqueued": brief_enqueued,
+                        "while_vacant": entries,
+                        "while_vacant_dropped": ledger_dropped,
+                        "state_restored": bool(state_restore),
+                        "payload": brief_payload,
+                    }
+
+        result = self._project_officer_row_to_dict(row)
+        if result is not None and continuity is not None:
+            result["commission_continuity"] = continuity
+        return result
+
+    async def update_project_officer_post(
+        self,
+        project_id: str,
+        *,
+        config_updates: Optional[Dict[str, Any]] = None,
+        communication_policy_patch: Optional[Dict[str, Any]] = None,
+        expected_vacant_updated_at: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically update durable post config and its runtime projection.
+
+        This is the only Officer Post kit/config writer. It locks the post and
+        then the current thread, deep-merges the durable row, mirrors the same
+        fragment into a live incarnation, and updates row-only communication
+        policy in one transaction. Admission therefore observes either the old
+        complete configuration or the new one, never a split row/thread view.
+
+        Explicit commission supplies ``expected_vacant_updated_at`` from its
+        pre-provisioning snapshot. The write then requires both the same row
+        generation and continued vacancy. A losing commission can neither
+        overwrite the winning durable kit nor mirror its patch into the
+        winner's runtime thread.
+        """
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return None
+
+        def _deep_merge(base: Any, override: Any) -> Dict[str, Any]:
+            merged = dict(base) if isinstance(base, dict) else {}
+            if not isinstance(override, dict):
+                return merged
+            for key, value in override.items():
+                if isinstance(merged.get(key), dict) and isinstance(value, dict):
+                    merged[key] = _deep_merge(merged[key], value)
+                else:
+                    merged[key] = value
+            return merged
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                post = await conn.fetchrow(
+                    "SELECT * FROM project_officers WHERE project_id = $1 FOR UPDATE",
+                    project_uuid,
+                )
+                if post is None:
+                    return None
+
+                if expected_vacant_updated_at is not None and (
+                    post["thread_id"] is not None
+                    or post["updated_at"] != expected_vacant_updated_at
+                ):
+                    raise OfficerPostLifecycleConflict(
+                        "commission_generation_changed",
+                        "Officer Post vacancy/configuration changed; retry commission.",
+                    )
+
+                thread = None
+                if post["thread_id"] is not None:
+                    thread = await conn.fetchrow(
+                        "SELECT id, project_id, status, metadata "
+                        "FROM threads WHERE id = $1 FOR UPDATE",
+                        post["thread_id"],
+                    )
+
+                current_config = post["config_override"]
+                if isinstance(current_config, str):
+                    try:
+                        current_config = json.loads(current_config)
+                    except (TypeError, ValueError):
+                        current_config = {}
+                if not isinstance(current_config, dict):
+                    current_config = {}
+                merged_config = _deep_merge(current_config, config_updates or {})
+
+                officer_config = merged_config.get("officer") or {}
+                if isinstance(officer_config, dict):
+                    try:
+                        sleep_min = int(officer_config.get("sleep_min_minutes") or 5)
+                        sleep_max = int(officer_config.get("sleep_max_minutes") or 60)
+                    except (TypeError, ValueError) as exc:
+                        raise OfficerPostLifecycleConflict(
+                            "invalid_config", "Officer sleep bounds must be integers."
+                        ) from exc
+                    if sleep_min > sleep_max:
+                        raise OfficerPostLifecycleConflict(
+                            "invalid_config",
+                            f"sleep_min_minutes ({sleep_min}) must not exceed "
+                            f"sleep_max_minutes ({sleep_max})",
+                        )
+
+                policy = post["communication_policy"]
+                if isinstance(policy, str):
+                    try:
+                        policy = json.loads(policy)
+                    except (TypeError, ValueError):
+                        policy = {}
+                if not isinstance(policy, dict):
+                    policy = {}
+                merged_policy = {
+                    **policy,
+                    **(communication_policy_patch or {}),
+                }
+
+                updated_post = await conn.fetchrow(
+                    """
+                    UPDATE project_officers
+                       SET config_override = $2::jsonb
+                               #- '{officer,hold}'
+                               #- '{officer,last_respawn_at}',
+                           communication_policy = $3::jsonb,
+                           updated_at = now()
+                     WHERE project_id = $1
+                    RETURNING *
+                    """,
+                    project_uuid,
+                    json.dumps(merged_config),
+                    json.dumps(merged_policy),
+                )
+
+                applied_to_thread = False
+                updated_thread = None
+                if (
+                    thread is not None
+                    and thread["project_id"] == project_uuid
+                    and thread["status"] != "ended"
+                    and config_updates
+                ):
+                    metadata = thread["metadata"]
+                    if isinstance(metadata, str):
+                        try:
+                            metadata = json.loads(metadata)
+                        except (TypeError, ValueError):
+                            metadata = {}
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    runtime_config = metadata.get("config_override") or {}
+                    runtime_config = _deep_merge(runtime_config, config_updates)
+                    updated_thread = await conn.fetchrow(
+                        """
+                        UPDATE threads
+                           SET metadata = jsonb_set(
+                                   COALESCE(metadata, '{}'::jsonb),
+                                   '{config_override}', $2::jsonb),
+                               last_activity = now()
+                         WHERE id = $1
+                        RETURNING id, project_id, status, metadata, user_id
+                        """,
+                        thread["id"],
+                        json.dumps(runtime_config),
+                    )
+                    applied_to_thread = updated_thread is not None
+
+        result_thread = (
+            dict(updated_thread)
+            if updated_thread is not None
+            else (dict(thread) if thread is not None else None)
+        )
+        if result_thread is not None:
+            result_metadata = result_thread.get("metadata")
+            if isinstance(result_metadata, str):
+                try:
+                    result_metadata = json.loads(result_metadata)
+                except (TypeError, ValueError):
+                    result_metadata = {}
+            if not isinstance(result_metadata, dict):
+                result_metadata = {}
+            result_officer = (result_metadata.get("config_override") or {}).get(
+                "officer"
+            ) or {}
+            if (
+                result_thread.get("project_id") != project_uuid
+                or result_thread.get("status") == "ended"
+                or not isinstance(result_officer, dict)
+                or str(result_officer.get("enabled", False)).lower() != "true"
+            ):
+                result_thread = None
+
+        return {
+            "post": self._project_officer_row_to_dict(updated_post),
+            "thread": result_thread,
+            "applied_to_thread": applied_to_thread,
+        }
+
+    async def confirm_project_officer_incarnation(
+        self, project_id: str, expected_thread_id: str
+    ) -> bool:
+        """Linearize commission's response against a racing decommission.
+
+        The continuity transaction establishes the incarnation. This final
+        post -> thread locked read defines whether commission may truthfully
+        return ``commissioned``: if decommission won first, the endpoint
+        reports a retryable conflict instead of success for an ended thread.
+        """
+
+        try:
+            project_uuid = UUID(project_id)
+            thread_uuid = UUID(expected_thread_id)
+        except (ValueError, TypeError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                post = await conn.fetchrow(
+                    "SELECT thread_id FROM project_officers "
+                    "WHERE project_id = $1 FOR UPDATE",
+                    project_uuid,
+                )
+                if post is None or post["thread_id"] != thread_uuid:
+                    return False
+                thread = await conn.fetchrow(
+                    "SELECT project_id, status, metadata FROM threads "
+                    "WHERE id = $1 FOR UPDATE",
+                    thread_uuid,
+                )
+                if (
+                    thread is None
+                    or thread["project_id"] != project_uuid
+                    or thread["status"] == "ended"
+                ):
+                    return False
+                metadata = thread["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        metadata = {}
+                if not isinstance(metadata, dict):
+                    return False
+                officer = (metadata.get("config_override") or {}).get("officer") or {}
+                return (
+                    isinstance(officer, dict)
+                    and str(officer.get("enabled", False)).lower() == "true"
+                )
+
+    async def set_project_officer_hold(
+        self,
+        project_id: str,
+        *,
+        expected_thread_id: str,
+        hold: Optional[Dict[str, Any]],
+        route_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Set/clear the runtime hold under the stable post lock.
+
+        Entering a hold also moves pending blocking officer routes to their
+        durable ``escalated_to_user`` outbox state inside the transaction.
+        Notification delivery is intentionally left to the caller after
+        commit. Release performs no route transition.
+        """
+        try:
+            project_uuid = UUID(project_id)
+            thread_uuid = UUID(expected_thread_id)
+        except (ValueError, TypeError) as exc:
+            raise OfficerPostLifecycleConflict(
+                "invalid_identity", "Officer Post identity is invalid."
+            ) from exc
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                post = await conn.fetchrow(
+                    "SELECT project_id, thread_id FROM project_officers "
+                    "WHERE project_id = $1 FOR UPDATE",
+                    project_uuid,
+                )
+                if post is None or post["thread_id"] is None:
+                    raise OfficerPostLifecycleConflict(
+                        "post_vacant", "The post is vacant."
+                    )
+                if post["thread_id"] != thread_uuid:
+                    raise OfficerPostLifecycleConflict(
+                        "stale_incarnation", "Officer Post incarnation changed; retry."
+                    )
+                thread = await conn.fetchrow(
+                    "SELECT id, project_id, status, metadata, user_id "
+                    "FROM threads WHERE id = $1 FOR UPDATE",
+                    thread_uuid,
+                )
+                if (
+                    thread is None
+                    or thread["project_id"] != project_uuid
+                    or thread["status"] == "ended"
+                ):
+                    raise OfficerPostLifecycleConflict(
+                        "invalid_incarnation", "The current officer thread is not live."
+                    )
+                metadata = thread["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                runtime_config = metadata.get("config_override") or {}
+                if not isinstance(runtime_config, dict):
+                    runtime_config = {}
+                officer_config = runtime_config.get("officer") or {}
+                if not isinstance(officer_config, dict):
+                    officer_config = {}
+                previous_hold = officer_config.get("hold")
+                if hold is not None and previous_hold:
+                    raise OfficerPostLifecycleConflict(
+                        "already_held", "The officer is already held."
+                    )
+                if hold is None and not previous_hold:
+                    raise OfficerPostLifecycleConflict(
+                        "not_held", "The officer is not held."
+                    )
+                runtime_config = {
+                    **runtime_config,
+                    "officer": {**officer_config, "hold": hold},
+                }
+                updated_thread = await conn.fetchrow(
+                    """
+                    UPDATE threads
+                       SET metadata = jsonb_set(
+                               COALESCE(metadata, '{}'::jsonb),
+                               '{config_override}', $2::jsonb),
+                           last_activity = now()
+                     WHERE id = $1
+                    RETURNING id, project_id, status, metadata, user_id
+                    """,
+                    thread_uuid,
+                    json.dumps(runtime_config),
+                )
+
+                route_rows = []
+                if hold is not None and route_reason:
+                    route_rows = await conn.fetch(
+                        """
+                        UPDATE job_message_routes
+                           SET state = 'escalated_to_user',
+                               transitions = transitions || jsonb_build_array(
+                                   jsonb_build_object(
+                                       'at', now()::text,
+                                       'from', state,
+                                       'to', 'escalated_to_user',
+                                       'actor_kind', 'system',
+                                       'actor_id', $3,
+                                       'note', $2)),
+                               updated_at = now()
+                         WHERE project_id = $1
+                           AND officer_thread_id = $4
+                           AND state = 'pending_officer'
+                           AND blocking
+                        RETURNING *
+                        """,
+                        project_uuid,
+                        route_reason,
+                        f"drain:{route_reason}",
+                        thread_uuid,
+                    )
+
+        return {
+            "thread": dict(updated_thread),
+            "previous_hold": previous_hold,
+            "routes": [self._message_route_row_to_dict(row) for row in route_rows],
+        }
+
+    async def decommission_project_officer(
+        self,
+        project_id: str,
+        expected_thread_id: str,
+        *,
+        reason: str,
+        force: bool = False,
+        allow_orphan_retirement: bool = False,
+        fault_injector: Any = None,
+    ) -> Dict[str, Any]:
+        """One atomic, idempotent commissioned -> vacant post handoff.
+
+        The transaction locks post -> current thread -> jobs -> wake rows ->
+        route rows. Before any handoff write, it counts every status except
+        completed/failed/cancelled across the complete post lineage. Unless
+        ``force`` acknowledges those jobs, it returns an in-flight result and
+        leaves the same commissioned post. Admission takes the same post lock,
+        so job INSERT and a no-force handoff cannot both succeed.
+
+        A direct End may set ``allow_orphan_retirement``. If the target is not
+        the linked incarnation, this transaction locks the current thread and
+        target in order, then disables/ends only the target. It deliberately
+        performs no harvest, history, wake, route, or post mutation.
+
+        For the linked incarnation the transaction then harvests authoritative
+        thread state, folds/deletes wakes, writes durable user-fallback intent,
+        appends one incarnation, unlinks the post and disables/ends the thread.
+        External cleanup and route delivery are post-commit responsibilities.
+
+        ``fault_injector`` is an isolated-test hook invoked after each named DB
+        substep. Production callers leave it unset; real-Postgres tests use it
+        to prove every injected exception rolls the complete handoff back.
+        """
+        try:
+            project_uuid = UUID(project_id)
+            thread_uuid = UUID(expected_thread_id)
+        except (ValueError, TypeError) as exc:
+            raise OfficerPostLifecycleConflict(
+                "invalid_identity", "Officer Post identity is invalid."
+            ) from exc
+
+        async def _fault(step: str) -> None:
+            if fault_injector is None:
+                return
+            outcome = fault_injector(step)
+            if hasattr(outcome, "__await__"):
+                await outcome
+
+        result: Dict[str, Any]
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                post_row = await conn.fetchrow(
+                    "SELECT * FROM project_officers WHERE project_id = $1 FOR UPDATE",
+                    project_uuid,
+                )
+                if post_row is None:
+                    raise OfficerPostLifecycleConflict(
+                        "post_missing", "Officer Post does not exist."
+                    )
+                await _fault("post_locked")
+
+                incarnations = post_row["incarnations"]
+                if isinstance(incarnations, str):
+                    try:
+                        incarnations = json.loads(incarnations)
+                    except (TypeError, ValueError):
+                        incarnations = []
+                if not isinstance(incarnations, list):
+                    incarnations = []
+                already_recorded = any(
+                    isinstance(entry, dict)
+                    and str(entry.get("thread_id") or "") == str(thread_uuid)
+                    for entry in incarnations
+                )
+                linked = post_row["thread_id"]
+                if allow_orphan_retirement and linked != thread_uuid:
+                    # Match registration's post -> current -> candidate order.
+                    # Merely locking the commissioned incarnation is not
+                    # "touching" it: no field on the post/current thread is
+                    # mutated by this orphan-only branch.
+                    if linked is not None:
+                        await conn.fetchrow(
+                            "SELECT id FROM threads WHERE id = $1 FOR UPDATE",
+                            linked,
+                        )
+                    orphan_row = await conn.fetchrow(
+                        """
+                        SELECT id, project_id, status, metadata
+                          FROM threads
+                         WHERE id = $1
+                         FOR UPDATE
+                        """,
+                        thread_uuid,
+                    )
+                    if (
+                        orphan_row is not None
+                        and orphan_row["project_id"] != project_uuid
+                    ):
+                        raise OfficerPostLifecycleConflict(
+                            "project_mismatch",
+                            "Officer orphan/thread project mismatch.",
+                        )
+                    if orphan_row is not None:
+                        orphan_metadata = orphan_row["metadata"]
+                        if isinstance(orphan_metadata, str):
+                            try:
+                                orphan_metadata = json.loads(orphan_metadata)
+                            except (TypeError, ValueError):
+                                orphan_metadata = {}
+                        if not isinstance(orphan_metadata, dict):
+                            orphan_metadata = {}
+                        runtime_config = orphan_metadata.get("config_override") or {}
+                        if not isinstance(runtime_config, dict):
+                            runtime_config = {}
+                        officer_config = runtime_config.get("officer") or {}
+                        if not isinstance(officer_config, dict):
+                            officer_config = {}
+                        runtime_config = {
+                            **runtime_config,
+                            "officer": {**officer_config, "enabled": False},
+                        }
+                        await conn.execute(
+                            """
+                            UPDATE threads
+                               SET metadata = jsonb_set(
+                                       COALESCE(metadata, '{}'::jsonb),
+                                       '{config_override}', $2::jsonb),
+                                   status = 'ended',
+                                   ended_at = COALESCE(ended_at, now()),
+                                   control_admission_agent_id = NULL,
+                                   last_activity = now()
+                             WHERE id = $1
+                            """,
+                            thread_uuid,
+                            json.dumps(runtime_config),
+                        )
+                    await _fault("orphan_thread_disabled")
+                    return {
+                        "transitioned": False,
+                        "orphan_retired": orphan_row is not None,
+                        "already_decommissioned": already_recorded,
+                        "vacant": linked is None,
+                        "current_thread_id": str(linked) if linked else None,
+                        "routes": [],
+                        "folded": 0,
+                        "deleted": 0,
+                        "dropped": 0,
+                        "harvested": False,
+                        "in_flight_jobs": [],
+                        "incarnation": None,
+                    }
+                if linked is None:
+                    return {
+                        "transitioned": False,
+                        "orphan_retired": False,
+                        "already_decommissioned": already_recorded,
+                        "vacant": True,
+                        "routes": [],
+                        "folded": 0,
+                        "deleted": 0,
+                        "dropped": 0,
+                        "harvested": False,
+                        "in_flight_jobs": [],
+                        "incarnation": next(
+                            (
+                                entry
+                                for entry in incarnations
+                                if isinstance(entry, dict)
+                                and str(entry.get("thread_id") or "")
+                                == str(thread_uuid)
+                            ),
+                            None,
+                        ),
+                    }
+                if linked != thread_uuid:
+                    raise OfficerPostLifecycleConflict(
+                        "stale_incarnation",
+                        "Officer Post is held by a different incarnation.",
+                    )
+
+                thread_row = await conn.fetchrow(
+                    """
+                    SELECT id, project_id, status, metadata, created_at, ended_at
+                      FROM threads
+                     WHERE id = $1
+                     FOR UPDATE
+                    """,
+                    thread_uuid,
+                )
+                if thread_row is not None and thread_row["project_id"] != project_uuid:
+                    raise OfficerPostLifecycleConflict(
+                        "project_mismatch", "Officer Post/thread project mismatch."
+                    )
+                await _fault("thread_locked")
+
+                lineage = [thread_uuid]
+                for incarnation in incarnations:
+                    if not isinstance(incarnation, dict):
+                        continue
+                    try:
+                        incarnation_uuid = UUID(str(incarnation.get("thread_id") or ""))
+                    except (TypeError, ValueError):
+                        continue
+                    if incarnation_uuid not in lineage:
+                        lineage.append(incarnation_uuid)
+                in_flight_rows = await conn.fetch(
+                    """
+                    SELECT id, status, context->>'officer_slot' AS slot,
+                           description
+                      FROM jobs
+                     WHERE created_by_thread_id = ANY($1::uuid[])
+                       AND status NOT IN ('completed', 'failed', 'cancelled')
+                     ORDER BY created_at, id
+                    """,
+                    lineage,
+                )
+                in_flight_jobs = [
+                    {
+                        "job_id": str(row["id"]),
+                        "status": str(row["status"]),
+                        "slot": row["slot"],
+                        "title": str(row["description"] or "")[:200],
+                    }
+                    for row in in_flight_rows
+                ]
+                await _fault("in_flight_checked")
+                if in_flight_jobs and not force:
+                    return {
+                        "transitioned": False,
+                        "orphan_retired": False,
+                        "blocked_by_in_flight": True,
+                        "already_decommissioned": False,
+                        "vacant": False,
+                        "routes": [],
+                        "folded": 0,
+                        "deleted": 0,
+                        "dropped": 0,
+                        "harvested": False,
+                        "in_flight_jobs": in_flight_jobs,
+                        "incarnation": None,
+                    }
+
+                metadata: Dict[str, Any] = {}
+                if thread_row is not None:
+                    raw_metadata = thread_row["metadata"]
+                    if isinstance(raw_metadata, str):
+                        try:
+                            raw_metadata = json.loads(raw_metadata)
+                        except (TypeError, ValueError):
+                            raw_metadata = {}
+                    if isinstance(raw_metadata, dict):
+                        metadata = raw_metadata
+                officer_state = metadata.get("officer_state") or {}
+                if not isinstance(officer_state, dict):
+                    officer_state = {}
+                if officer_state:
+                    await conn.execute(
+                        """
+                        UPDATE project_officers
+                           SET state = state || $2::jsonb, updated_at = now()
+                         WHERE project_id = $1
+                        """,
+                        project_uuid,
+                        json.dumps(officer_state),
+                    )
+                await _fault("state_harvested")
+
+                wake_rows = await conn.fetch(
+                    """
+                    SELECT id, source, payload, created_at
+                      FROM session_wake_events
+                     WHERE thread_id = $1
+                       AND state IN ('pending', 'sending')
+                     ORDER BY created_at
+                     FOR UPDATE
+                    """,
+                    thread_uuid,
+                )
+                await _fault("wake_rows_locked")
+                entries: List[Dict[str, Any]] = []
+                recovered_dropped = 0
+                for wake in wake_rows:
+                    payload = wake["payload"]
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except (TypeError, ValueError):
+                            payload = {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    source = str(wake["source"])
+                    if source == "commission":
+                        # A decommission immediately after registration may
+                        # win before the continuity brief is delivered. Put
+                        # the drained ledger back instead of deleting the only
+                        # remaining copy with the non-job commission wake.
+                        continuity_entries = payload.get("while_vacant")
+                        if isinstance(continuity_entries, list):
+                            entries.extend(
+                                dict(item)
+                                for item in continuity_entries
+                                if isinstance(item, dict)
+                            )
+                        try:
+                            recovered_dropped += max(
+                                0, int(payload.get("while_vacant_dropped") or 0)
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                        continue
+                    if source != "job_transition":
+                        continue
+                    entry: Dict[str, Any] = {
+                        "job_id": payload.get("job_id"),
+                        "status": payload.get("status"),
+                        "description": payload.get("description"),
+                    }
+                    created_at = wake["created_at"]
+                    if created_at is not None:
+                        entry["at"] = (
+                            created_at.isoformat()
+                            if hasattr(created_at, "isoformat")
+                            else str(created_at)
+                        )
+                    entries.append(entry)
+                dropped = 0
+                if entries or recovered_dropped:
+                    state = post_row["state"]
+                    if isinstance(state, str):
+                        try:
+                            state = json.loads(state)
+                        except (TypeError, ValueError):
+                            state = {}
+                    if not isinstance(state, dict):
+                        state = {}
+                    state = {**state, **officer_state}
+                    try:
+                        prior_dropped = max(
+                            0, int(state.get("while_vacant_dropped") or 0)
+                        )
+                    except (TypeError, ValueError):
+                        prior_dropped = 0
+                    state["while_vacant_dropped"] = prior_dropped + recovered_dropped
+                    fragment, overflow = self._while_vacant_ring(
+                        state, entries, self.WHILE_VACANT_CAP
+                    )
+                    dropped = recovered_dropped + overflow
+                    await conn.execute(
+                        """
+                        UPDATE project_officers
+                           SET state = state || $2::jsonb, updated_at = now()
+                         WHERE project_id = $1
+                        """,
+                        project_uuid,
+                        json.dumps(fragment),
+                    )
+                await _fault("wake_entries_folded")
+                if wake_rows:
+                    await conn.execute(
+                        "DELETE FROM session_wake_events WHERE id = ANY($1::bigint[])",
+                        [int(row["id"]) for row in wake_rows],
+                    )
+                await _fault("wakes_cleared")
+
+                route_rows = await conn.fetch(
+                    """
+                    UPDATE job_message_routes
+                       SET state = 'escalated_to_user',
+                           transitions = transitions || jsonb_build_array(
+                               jsonb_build_object(
+                                   'at', now()::text,
+                                   'from', state,
+                                   'to', 'escalated_to_user',
+                                   'actor_kind', 'system',
+                                   'actor_id', 'drain:officer_decommissioned',
+                                   'note', 'officer_decommissioned')),
+                           updated_at = now()
+                     WHERE project_id = $1
+                       AND officer_thread_id = $2
+                       AND state = 'pending_officer'
+                       AND blocking
+                    RETURNING *
+                    """,
+                    project_uuid,
+                    thread_uuid,
+                )
+                await _fault("routes_fallback_staged")
+
+                commissioned_at = (
+                    thread_row["created_at"] if thread_row is not None else None
+                )
+                decommissioned_at = datetime.now(timezone.utc)
+                entry = {
+                    "thread_id": str(thread_uuid),
+                    "commissioned_at": (
+                        commissioned_at.isoformat()
+                        if hasattr(commissioned_at, "isoformat")
+                        else commissioned_at
+                    ),
+                    "decommissioned_at": decommissioned_at.isoformat(),
+                    "reason": reason,
+                }
+                if not already_recorded:
+                    await conn.execute(
+                        """
+                        UPDATE project_officers
+                           SET incarnations = incarnations
+                                   || jsonb_build_array($2::jsonb),
+                               updated_at = now()
+                         WHERE project_id = $1
+                        """,
+                        project_uuid,
+                        json.dumps(entry),
+                    )
+                await _fault("incarnation_appended")
+
+                unlinked = await conn.fetchrow(
+                    """
+                    UPDATE project_officers
+                       SET thread_id = NULL, updated_at = now()
+                     WHERE project_id = $1 AND thread_id = $2
+                    RETURNING *
+                    """,
+                    project_uuid,
+                    thread_uuid,
+                )
+                if unlinked is None:
+                    raise OfficerPostLifecycleConflict(
+                        "stale_incarnation", "Officer Post unlink CAS lost."
+                    )
+                await _fault("post_unlinked")
+
+                if thread_row is not None:
+                    runtime_config = metadata.get("config_override") or {}
+                    if not isinstance(runtime_config, dict):
+                        runtime_config = {}
+                    officer_config = runtime_config.get("officer") or {}
+                    if not isinstance(officer_config, dict):
+                        officer_config = {}
+                    runtime_config = {
+                        **runtime_config,
+                        "officer": {**officer_config, "enabled": False},
+                    }
+                    await conn.execute(
+                        """
+                        UPDATE threads
+                           SET metadata = jsonb_set(
+                                   COALESCE(metadata, '{}'::jsonb),
+                                   '{config_override}', $2::jsonb),
+                               status = 'ended',
+                               ended_at = COALESCE(ended_at, now()),
+                               control_admission_agent_id = NULL,
+                               last_activity = now()
+                         WHERE id = $1
+                        """,
+                        thread_uuid,
+                        json.dumps(runtime_config),
+                    )
+                await _fault("thread_disabled")
+
+                result = {
+                    "transitioned": True,
+                    "orphan_retired": False,
+                    "already_decommissioned": False,
+                    "vacant": True,
+                    "routes": [
+                        self._message_route_row_to_dict(row) for row in route_rows
+                    ],
+                    "folded": len(entries),
+                    "deleted": len(wake_rows),
+                    "dropped": dropped,
+                    "harvested": bool(officer_state),
+                    "in_flight_jobs": in_flight_jobs,
+                    "incarnation": entry,
+                    "post": self._project_officer_row_to_dict(unlinked),
+                }
+        return result
 
     async def clear_project_officer_thread(
         self, project_id: str
@@ -9969,6 +11042,167 @@ class PostgresDB:
             },
             overflow,
         )
+
+    async def route_project_officer_job_transition(
+        self,
+        project_id: str,
+        *,
+        job_id: str,
+        status: str,
+        description: str,
+        dedup_key: str,
+        cap: int = WHILE_VACANT_CAP,
+        fault_injector: Any = None,
+    ) -> Dict[str, Any]:
+        """Choose current-incarnation wake or vacant ledger under one post lock.
+
+        Completion used to read the current officer on one connection and then
+        enqueue/append on another. Commission could change the post between
+        those calls. This method linearizes the decision with registration and
+        decommission: post -> exact current live thread -> wake row, or post ->
+        while-vacant JSONB merge. A completion racing commission therefore
+        appears exactly once in either the commission brief or that
+        incarnation's wake queue.
+        """
+
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return {
+                "destination": "none",
+                "thread_id": None,
+                "enqueued": False,
+                "appended": False,
+            }
+
+        async def _fault(step: str) -> None:
+            if fault_injector is None:
+                return
+            outcome = fault_injector(step)
+            if hasattr(outcome, "__await__"):
+                await outcome
+
+        entry = {
+            "job_id": str(job_id),
+            "status": str(status),
+            "description": str(description)[:200],
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    await conn.execute(
+                        "INSERT INTO project_officers (project_id) VALUES ($1) "
+                        "ON CONFLICT (project_id) DO NOTHING",
+                        project_uuid,
+                    )
+                except asyncpg.ForeignKeyViolationError:
+                    return {
+                        "destination": "none",
+                        "thread_id": None,
+                        "enqueued": False,
+                        "appended": False,
+                    }
+                post = await conn.fetchrow(
+                    "SELECT thread_id, state FROM project_officers "
+                    "WHERE project_id = $1 FOR UPDATE",
+                    project_uuid,
+                )
+                if post is None:
+                    return {
+                        "destination": "none",
+                        "thread_id": None,
+                        "enqueued": False,
+                        "appended": False,
+                    }
+                await _fault("post_locked")
+
+                current_thread_id = post["thread_id"]
+                if current_thread_id is not None:
+                    current = await conn.fetchrow(
+                        "SELECT project_id, status, metadata FROM threads "
+                        "WHERE id = $1 FOR UPDATE",
+                        current_thread_id,
+                    )
+                    metadata: Dict[str, Any] = {}
+                    if current is not None:
+                        raw_metadata = current["metadata"]
+                        if isinstance(raw_metadata, str):
+                            try:
+                                raw_metadata = json.loads(raw_metadata)
+                            except (TypeError, ValueError):
+                                raw_metadata = {}
+                        if isinstance(raw_metadata, dict):
+                            metadata = raw_metadata
+                    config_override = metadata.get("config_override") or {}
+                    if not isinstance(config_override, dict):
+                        config_override = {}
+                    officer = config_override.get("officer") or {}
+                    live = (
+                        current is not None
+                        and current["project_id"] == project_uuid
+                        and current["status"] != "ended"
+                        and isinstance(officer, dict)
+                        and str(officer.get("enabled", False)).lower() == "true"
+                    )
+                    if live:
+                        enqueued = await self._enqueue_session_wake_event_on_conn(
+                            conn,
+                            current_thread_id,
+                            source="job_transition",
+                            dedup_key=dedup_key,
+                            payload_json=json.dumps(
+                                {
+                                    "job_id": entry["job_id"],
+                                    "status": entry["status"],
+                                    "description": entry["description"],
+                                }
+                            ),
+                            project_uuid=project_uuid,
+                        )
+                        await _fault("wake_enqueued")
+                        return {
+                            "destination": "wake",
+                            "thread_id": str(current_thread_id),
+                            "enqueued": enqueued,
+                            "appended": False,
+                        }
+
+                state = post["state"]
+                if isinstance(state, str):
+                    try:
+                        state = json.loads(state)
+                    except (TypeError, ValueError):
+                        state = {}
+                if not isinstance(state, dict):
+                    state = {}
+                ledger = state.get("while_vacant")
+                if not isinstance(ledger, list):
+                    ledger = []
+                duplicate = any(
+                    isinstance(item, dict)
+                    and str(item.get("job_id") or "") == entry["job_id"]
+                    and str(item.get("status") or "") == entry["status"]
+                    for item in ledger
+                )
+                if not duplicate:
+                    fragment, _ = self._while_vacant_ring(state, [entry], cap)
+                    await conn.execute(
+                        """
+                        UPDATE project_officers
+                           SET state = state || $2::jsonb, updated_at = now()
+                         WHERE project_id = $1
+                        """,
+                        project_uuid,
+                        json.dumps(fragment),
+                    )
+                await _fault("ledger_appended")
+                return {
+                    "destination": "while_vacant",
+                    "thread_id": None,
+                    "enqueued": False,
+                    "appended": not duplicate,
+                }
 
     async def append_project_officer_while_vacant(
         self,
@@ -10372,6 +11606,67 @@ class PostgresDB:
         try:
             async with self.acquire() as conn:
                 async with conn.transaction():
+                    # A blocking officer route is another lifecycle-adjacent
+                    # writer. Lock the stable post before queue/job authority
+                    # so decommission cannot drain the old routes, commit a
+                    # vacant post, and then have this stale snapshot insert a
+                    # new pending_officer route for the retired incarnation.
+                    # Hold/decommission/config/admission all use the same
+                    # post -> current-thread prefix.
+                    if str(route.get("state") or "") == "pending_officer":
+                        if project_uuid is None or officer_uuid is None:
+                            raise _Abort()
+                        post = await conn.fetchrow(
+                            "SELECT thread_id, incarnations "
+                            "FROM project_officers "
+                            "WHERE project_id=$1 FOR UPDATE",
+                            project_uuid,
+                        )
+                        if post is None or post["thread_id"] != officer_uuid:
+                            raise _Abort()
+                        current = await conn.fetchrow(
+                            "SELECT project_id, status, metadata "
+                            "FROM threads WHERE id=$1 FOR UPDATE",
+                            officer_uuid,
+                        )
+                        if (
+                            current is None
+                            or current["project_id"] != project_uuid
+                            or current["status"] == "ended"
+                        ):
+                            raise _Abort()
+                        metadata = current["metadata"]
+                        if isinstance(metadata, str):
+                            try:
+                                metadata = json.loads(metadata)
+                            except (TypeError, ValueError):
+                                metadata = {}
+                        if not isinstance(metadata, dict):
+                            metadata = {}
+                        officer_config = (metadata.get("config_override") or {}).get(
+                            "officer"
+                        ) or {}
+                        if (
+                            not isinstance(officer_config, dict)
+                            or str(officer_config.get("enabled", False)).lower()
+                            != "true"
+                        ):
+                            raise _Abort()
+                        if officer_config.get("hold"):
+                            raise _Abort()
+                        expected_incarnation = route.get("officer_incarnation")
+                        if expected_incarnation is not None:
+                            incarnations = post["incarnations"]
+                            if isinstance(incarnations, str):
+                                try:
+                                    incarnations = json.loads(incarnations)
+                                except (TypeError, ValueError):
+                                    incarnations = []
+                            if not isinstance(incarnations, list) or len(
+                                incarnations
+                            ) != int(expected_incarnation):
+                                raise _Abort()
+
                     queue = None
                     if expected_lane == "stateless":
                         queue = await conn.fetchrow(

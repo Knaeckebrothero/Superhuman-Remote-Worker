@@ -13,8 +13,8 @@ Legate assigns a kit at provision time::
 and the officer names a slot per dispatch (``create_job(...,
 slot="heavy")``). The job-creation funnel stamps the slot's model/backend
 onto the job config server-side — the officer chooses WHICH troops to send,
-never what they are made of — and enforces the per-slot count with the same
-advisory-locked 409 the flat cap uses (docs/features/centurion.md §6).
+never what they are made of — and enforces the per-slot count under the
+durable Officer Post row lock (docs/features/centurion.md §6).
 
 Pure module by design: validation and admission are plain functions over
 dicts so they unit-test without the FastAPI app. ``main.py`` owns the HTTP
@@ -168,7 +168,7 @@ def admit(
 
     ``in_flight_by_slot`` maps stamp → count for the officer's non-terminal
     jobs (None key = pre-roster jobs); the caller reads it under the same
-    advisory lock that serializes his parallel creates.
+    durable post lock that serializes parallel creates across incarnations.
     """
     roster = roster_from_meta(officer_meta)
 

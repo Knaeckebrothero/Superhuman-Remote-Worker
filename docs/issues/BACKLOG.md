@@ -17,9 +17,7 @@ blocking it should be taken before the next bench campaign.
 
 | doc | why now |
 |---|---|
-| [officer_control_plane_post_implementation_audit](officer_control_plane_post_implementation_audit.md) | **INDEX — keep `auto_pull` off.** O1–B7 mechanics exist; this audit orders the release/security/liveness issues below. **The six pre-deployment findings are closed (2026-08-15); nothing here has run on k3d yet.** Next gates are officer_admission_does_not_lock_the_durable_post + officer_decommission_is_not_atomic, before supervised officer testing. Do not close the index until its P0 live gates pass. |
-| [officer_admission_does_not_lock_the_durable_post](officer_admission_does_not_lock_the_durable_post.md) | **P0 concurrency/authority.** Manual admission releases its lock before INSERT, the tick enumerates metadata instead of posts, and lifecycle changes race stale thread-keyed locks. |
-| [officer_decommission_is_not_atomic](officer_decommission_is_not_atomic.md) | **P0 data integrity.** Harvest, wake fold, route drain, unlink, and incarnation append are independent transactions and failure is swallowed. |
+| [officer_control_plane_post_implementation_audit](officer_control_plane_post_implementation_audit.md) | **INDEX — keep `auto_pull` off.** The six pre-deployment findings, BP-02/BP-03/BP-04 and OC-03 are closed. O6 was already released successfully with `auto_pull=false` on the deployed earlier tranche, while the final transaction checkpoint is local and undeployed. Do not close the index until the remaining live gates pass. |
 | [backlog_fixed_windows_starve_eligible_tickets](backlog_fixed_windows_starve_eligible_tickets.md) | **P0 liveness.** Limits are applied before claim/validity/outcome filtering; a stable invalid head can hide eligible work forever. |
 | [officer_post_cannot_enable_auto_pull](officer_post_cannot_enable_auto_pull.md) | **P0 functional, release last.** The supported post API rejects `auto_pull`/century spend fields and Cockpit has no enable control. Build behind the other P0 gates. |
 | [gitea_admin_credential_in_every_agent_workspace](gitea_admin_credential_in_every_agent_workspace.md) | **Security.** The Gitea admin credential lands in every agent workspace. Blast radius: any job/agent can act as git admin. |
@@ -836,10 +834,11 @@ The advertised-but-never-implemented `blocking_timeout_hours` finally exists as
 a leader-gated reconciler. Officer file reads are gone by design — he judges on
 a pinned evidence manifest and delegates inspection.
 
-**Owed:** O6 (release the held Resavio officer through the new endpoint — the
-live-fire acceptance for E5/M and the precondition for backlog-pool acceptance),
-M5 route badges, K4 knowledge-health surfacing, and the KB hygiene pair (retire
+**Live-fire status:** O6 released the Resavio officer successfully through the new
+endpoint with `auto_pull=false`; the committed acceptance run remains in progress.
+Still owed: the remaining observations from that run, M5 route badges, K4
+knowledge-health surfacing, and the KB hygiene pair (retire
 the stale "No renderer available" RecallStore belief; run `assert-browser-stack`
-on a live workspace). Next build:
-[officer_backlog_pools](../features/officer_backlog_pools.md) B1+, blocked only
-on its six §13 defaults.
+on a live workspace). The built backlog substrate and its remaining unattended-release
+gates are tracked in
+[officer_backlog_pools](../features/officer_backlog_pools.md) and the Officer audit.

@@ -123,6 +123,7 @@ from database.postgres import (  # noqa: E402
     DatasourceProjectAuthorizationError,
     DatasourcePolicyValidationError,
     DatasourceScopeAuthorizationError,
+    OfficerPostLifecycleConflict,
     _completion_control_active_sql,
     _completion_control_owned_active_sql,
 )
@@ -12542,16 +12543,15 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 config_override or {}, request_config_override
             )
 
-        # Officer admission (centurion.md §6, S5/S5b): capacity + slot roster,
-        # enforced here — the single job-creation funnel — so a forgetful
-        # model cannot bypass it. Sits BEFORE the VM gate on purpose: a slot
-        # that pins backend=vm must stamp the config first so the submit-time
-        # 403 still fires for owners without the grant. The advisory xact
-        # lock serializes parallel creates from one officer (TOCTOU, risk 9);
-        # it is per-thread, so ordinary creates never contend. The slot's
-        # model/backend merge ON TOP of everything — the officer chooses
-        # which troops to send, the Legate decides what they are made of.
+        # Officer admission preparation (BP-02/BP-03/BP-04). Expensive grant,
+        # datasource and provisioning inputs are resolved after this snapshot
+        # but before the authoritative transaction. The final INSERT below
+        # locks project_officers -> current thread, revalidates this exact
+        # incarnation/config/lineage, recomputes all-non-terminal capacity and
+        # writes the job on that same connection. Ordinary sessions never take
+        # the post lock.
         officer_slot_name: str | None = None
+        officer_admission_preparation = None
         _officer_admit_thread_id = (
             str(job.thread_id) if (job.thread_id and root_creation) else None
         )
@@ -12561,48 +12561,50 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             except Exception:
                 _admit_thread = None
             officer_meta = _thread_officer_meta(_admit_thread or {})
-            if _officer_meta_enabled(officer_meta):
+
+            # Every ordinary session materializes officer.enabled=false, so
+            # that flag alone cannot distinguish a retired officer from a
+            # plain session. The durable post lineage can. Enabled orphan /
+            # duplicate threads are also candidates so the authoritative
+            # post check refuses them instead of letting them dispatch as an
+            # ordinary session.
+            _officer_lineage_member = False
+            if project_id:
+                try:
+                    _officer_lineage_member = _officer_admit_thread_id in set(
+                        await postgres_db.get_project_officer_lineage(project_id)
+                    )
+                except Exception:
+                    _officer_lineage_member = False
+            if _officer_meta_enabled(officer_meta) or _officer_lineage_member:
                 from services.officer_admission import (
-                    OFFICER_HELD_MESSAGE,
+                    OfficerAdmissionConflict,
                     SlotAdmissionError,
+                    apply_prepared_slot_config,
+                    prepare_officer_admission,
                 )
-                from services.officer_admission import admit as officer_slot_admit
-                from services.officer_admission import officer_is_held
 
-                # Conference fence (centurion.md §4, belt-and-suspenders):
-                # while the Legate is in conference the HELD background
-                # officer must not dispatch on stale direction — the meeting
-                # may be revising it. The conference session itself (a
-                # different thread) dispatches freely.
-                if officer_is_held(officer_meta):
-                    raise HTTPException(status_code=409, detail=OFFICER_HELD_MESSAGE)
-
-                # Lineage-aware in-flight count (officer_post.md §4): jobs
-                # created by ANY incarnation on this post keep occupying
-                # their slots across a decommission→recommission. Resolved
-                # before the lock — incarnations change only at fold
-                # transitions, and the advisory lock's job is serializing
-                # the count against parallel creates from this officer.
-                _officer_lineage = await postgres_db.get_officer_capacity_lineage(
-                    _officer_admit_thread_id
-                )
+                if not project_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Officer dispatch requires its durable project post.",
+                    )
                 requested_slot = context.get("officer_slot")
                 try:
-                    officer_slot_name, slot_patch = await officer_slot_admit(
+                    officer_admission_preparation = await prepare_officer_admission(
                         postgres_db,
+                        project_id=project_id,
                         thread_id=_officer_admit_thread_id,
-                        officer_meta=officer_meta,
-                        capacity_lineage=_officer_lineage,
                         requested_slot=str(requested_slot) if requested_slot else None,
                     )
-                except SlotAdmissionError as exc:
+                except (OfficerAdmissionConflict, SlotAdmissionError) as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
+                officer_slot_name = officer_admission_preparation.slot_name
                 if officer_slot_name:
                     context["officer_slot"] = officer_slot_name
-                if slot_patch:
-                    config_override = _deep_merge_dicts(
-                        config_override or {}, slot_patch
-                    )
+                config_override = apply_prepared_slot_config(
+                    config_override, officer_admission_preparation
+                )
                 # One claim ledger for both dispatch paths. Without this the
                 # officer manually working the top ready ticket races his own
                 # tick into double-work on the very next cycle
@@ -12618,7 +12620,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 # named in the kickoff and logged instead, so the one thing
                 # that cannot happen is a silent contradiction between the
                 # contract the worker reads and the slot it occupies.
-                _slot_category = _officer_slot_category(officer_meta, officer_slot_name)
+                _slot_category = officer_admission_preparation.category
                 if _slot_category:
                     context.setdefault("work_category", _slot_category)
                     context["kickoff_message"] = _compose_category_kickoff(
@@ -12814,30 +12816,52 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             str(job.thread_id) if (job.thread_id and root_creation) else None
         )
 
-        result = await postgres_db.create_job(
-            description=job.description,
-            document_path=job.document_path,
-            document_dir=job.document_dir,
-            config_name=config_name,
-            expert_id=resolved_expert_id,
-            config_override=config_override,
-            context=context if context else None,
-            user_id=effective_user_id,
-            project_id=project_id,
-            parent_job_id=job.parent_job_id,
-            priority=job.priority,
-            creation_order=job.creation_order,
-            worktree_path=job.worktree_path,
-            delegation_context=job.delegation_context,
-            created_by_thread_id=creating_thread_id,
-            wake_on_complete=bool(creating_thread_id),
-            datasource_ids=selected_ds_ids,
-            datasource_selection_provenance=selection_provenance,
-            datasource_policy_revisions=selected_ds_revisions,
-            authority_user_id=(str(effective_user_id) if effective_user_id else None),
-            authority_project_ids=(target_project_ids if effective_user_id else None),
-            execution_lane=execution_lane,
-        )
+        create_kwargs = {
+            "description": job.description,
+            "document_path": job.document_path,
+            "document_dir": job.document_dir,
+            "config_name": config_name,
+            "expert_id": resolved_expert_id,
+            "config_override": config_override,
+            "context": context if context else None,
+            "user_id": effective_user_id,
+            "project_id": project_id,
+            "parent_job_id": job.parent_job_id,
+            "priority": job.priority,
+            "creation_order": job.creation_order,
+            "worktree_path": job.worktree_path,
+            "delegation_context": job.delegation_context,
+            "created_by_thread_id": creating_thread_id,
+            "wake_on_complete": bool(creating_thread_id),
+            "datasource_ids": selected_ds_ids,
+            "datasource_selection_provenance": selection_provenance,
+            "datasource_policy_revisions": selected_ds_revisions,
+            "authority_user_id": (
+                str(effective_user_id) if effective_user_id else None
+            ),
+            "authority_project_ids": (
+                target_project_ids if effective_user_id else None
+            ),
+            "execution_lane": execution_lane,
+        }
+        if officer_admission_preparation is not None:
+            from services.officer_admission import (
+                OfficerAdmissionConflict,
+                SlotAdmissionError,
+                admit_and_create_job,
+            )
+
+            try:
+                result = await admit_and_create_job(
+                    postgres_db,
+                    preparation=officer_admission_preparation,
+                    job_kwargs=create_kwargs,
+                    ticket_note_id=str(job.ticket) if job.ticket else None,
+                )
+            except (OfficerAdmissionConflict, SlotAdmissionError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        else:
+            result = await postgres_db.create_job(**create_kwargs)
 
         # Create Gitea repo/branch + grant creator access + seed the Mode A
         # cloud baseline. Shared with the automation paths (cron + run-now)
@@ -34646,33 +34670,24 @@ async def _hold_officer_for_conference(
         if not officer or str(officer["id"]) == str(conference_thread_id):
             return
         officer_tid = str(officer["id"])
-        await postgres_db.merge_thread_config_override(
-            officer_tid,
-            {
-                "officer": {
-                    "hold": {
-                        "kind": "conference",
-                        "thread_id": str(conference_thread_id),
-                        "since": datetime.now(timezone.utc).isoformat(),
-                    }
-                }
+        hold_result = await postgres_db.set_project_officer_hold(
+            project_id,
+            expected_thread_id=officer_tid,
+            hold={
+                "kind": "conference",
+                "thread_id": str(conference_thread_id),
+                "since": datetime.now(timezone.utc).isoformat(),
             },
+            route_reason="officer_hold",
         )
         logger.info(
             "officer %s: conference hold stamped (conference %s)",
             officer_tid[:8],
             str(conference_thread_id)[:8],
         )
-        # §5.1: entering a hold drains already-pending officer-first BLOCKING
-        # routes to the user — a frozen worker must not wait out a meeting.
-        try:
-            from services import message_routing as _routing_svc
-
-            await _routing_svc.drain_officer_blocking_routes(
-                postgres_db, project_id, reason="officer_hold"
-            )
-        except Exception:
-            logger.exception("conference hold: route drain failed (non-fatal)")
+        await _deliver_staged_officer_routes(
+            hold_result.get("routes") or [], reason="officer_hold"
+        )
         from services import session_wake as _sw
 
         officer_thread = await postgres_db.get_thread(officer_tid)
@@ -34714,8 +34729,10 @@ async def _conclude_conference_if_any(thread: dict) -> None:
         officer_tid = str(officer["id"])
         hold = _thread_officer_meta(officer).get("hold") or {}
         if isinstance(hold, dict) and hold.get("thread_id") in (None, conf_tid):
-            await postgres_db.merge_thread_config_override(
-                officer_tid, {"officer": {"hold": None}}
+            await postgres_db.set_project_officer_hold(
+                str(project_id),
+                expected_thread_id=officer_tid,
+                hold=None,
             )
         await postgres_db.enqueue_session_wake_event(
             officer_tid,
@@ -35303,102 +35320,116 @@ async def _inject_officer_notice(officer_thread: dict[str, Any], text: str) -> b
         return False
 
 
-async def _officer_in_flight_jobs(project_id: str) -> list[dict[str, Any]]:
-    """In-flight jobs across the post's thread lineage (§4 counting rules)."""
-    lineage = await postgres_db.get_project_officer_lineage(project_id)
-    if not lineage:
-        return []
-    async with postgres_db.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, status, context->>'officer_slot' AS slot, description
-              FROM jobs
-             WHERE created_by_thread_id = ANY($1::uuid[])
-               AND status IN ('created', 'processing')
-             ORDER BY created_at
-            """,
-            lineage,
-        )
-    return [
-        {
-            "job_id": str(r["id"]),
-            "status": r["status"],
-            "slot": r["slot"],
-            "title": (r["description"] or "")[:200],
-        }
-        for r in rows
-    ]
+async def _deliver_staged_officer_routes(
+    routes: list[dict[str, Any]], *, reason: str
+) -> int:
+    """Deliver durable route fallback intents after their transaction commits.
+
+    A failed dispatch leaves ``user_delivery_at`` null, which is the routing
+    reconciler's retry contract. Delivery can therefore never roll back or
+    falsify a hold/decommission transition.
+    """
+    if not routes:
+        return 0
+    from services import message_routing as _routing_svc
+
+    delivered = 0
+    for route in routes:
+        try:
+            if await _routing_svc.deliver_route_to_user(
+                postgres_db, route, reason=reason
+            ):
+                delivered += 1
+        except Exception:
+            logger.warning(
+                "Officer route %s delivery failed after durable %s transition; "
+                "leaving it retryable",
+                str(route.get("route_id") or "")[:8],
+                reason,
+                exc_info=True,
+            )
+    return delivered
 
 
 async def _decommission_officer_post(
-    thread: dict[str, Any], *, reason: str
+    thread: dict[str, Any],
+    *,
+    reason: str,
+    force: bool = False,
+    allow_orphan_retirement: bool = False,
 ) -> Optional[dict[str, Any]]:
-    """Decommission hygiene on the post (officer_post.md §5, steps 2/3/5).
+    """Run the authoritative commissioned -> vacant database transition.
 
-    Runs only when ``thread`` IS its project's registered officer — a legacy
-    enabled thread that never claimed the post must not harvest over another
-    incarnation's state. Order: harvest ``metadata.officer_state`` → row
-    (whole — the fingerprints are the point), fold + clear the wake queue
-    (job events → while-vacant ring, timers/fleet deleted), unlink, append
-    the incarnation entry. Called from ``end_thread``'s stand-down, so a
-    direct DELETE on an officer thread and the decommission endpoint are one
-    funnel. Returns a summary dict, or None when the thread holds no post.
+    PostgreSQL reads the thread state again under post -> thread row locks;
+    the caller's ``thread`` is identity only. Harvest, wake folding, durable
+    route fallback, one incarnation append, unlink and server-owned
+    disable/end are one transaction. Route notification delivery happens only
+    after that commit and a failed notifier leaves ``user_delivery_at`` null
+    for the reconciler.
     """
     project_id = thread.get("project_id")
     if not project_id:
         return None
     project_id = str(project_id)
     thread_id = str(thread["id"])
-    post = await postgres_db.get_project_officer(project_id)
-    if not post or str(post.get("thread_id") or "") != thread_id:
-        return None
-
-    metadata = thread_metadata_object(thread)
-    officer_state = metadata.get("officer_state")
-    harvested = False
-    if isinstance(officer_state, dict) and officer_state:
-        harvested = (
-            await postgres_db.merge_project_officer_state(project_id, officer_state)
-            is not None
-        )
-
-    fold = await postgres_db.fold_project_officer_wake_queue(project_id, thread_id)
-
-    # §5.1 (officer_message_routing): decommission drains already-pending
-    # officer-first BLOCKING routes to the user — and a later recommission
-    # never adopts an old waiting route (the reply/ack guards additionally
-    # fence on the route's officer_thread_id).
-    try:
-        from services import message_routing as _routing_svc
-
-        await _routing_svc.drain_officer_blocking_routes(
-            postgres_db, project_id, reason="officer_decommissioned"
-        )
-    except Exception:
-        logger.exception("officer decommission: route drain failed (non-fatal)")
-
-    await postgres_db.clear_project_officer_thread(project_id)
-    commissioned_at = thread.get("created_at")
-    if hasattr(commissioned_at, "isoformat"):
-        commissioned_at = commissioned_at.isoformat()
-    entry = {
-        "thread_id": thread_id,
-        "commissioned_at": commissioned_at,
-        "decommissioned_at": datetime.now(timezone.utc).isoformat(),
-        "reason": reason,
-    }
-    await postgres_db.append_project_officer_incarnation(project_id, entry)
-    logger.info(
-        "officer post %s: decommissioned thread %s (reason=%s, harvested=%s, "
-        "queue folded=%d deleted=%d)",
-        project_id[:8],
-        thread_id[:8],
-        reason,
-        harvested,
-        fold.get("folded", 0),
-        fold.get("deleted", 0),
+    summary = await postgres_db.decommission_project_officer(
+        project_id,
+        thread_id,
+        reason=reason,
+        force=force,
+        allow_orphan_retirement=allow_orphan_retirement,
     )
-    return {"harvested": harvested, "incarnation": entry, **fold}
+
+    routes = summary.get("routes") or []
+    delivered = (
+        await _deliver_staged_officer_routes(routes, reason="officer_decommissioned")
+        if summary.get("transitioned")
+        else 0
+    )
+    summary["routes_staged"] = len(routes)
+    summary["routes_delivered"] = delivered
+    summary.pop("routes", None)
+    if summary.get("blocked_by_in_flight"):
+        logger.info(
+            "officer post %s: no-force decommission held by %d in-flight jobs",
+            project_id[:8],
+            len(summary.get("in_flight_jobs") or []),
+        )
+    elif summary.get("transitioned"):
+        logger.info(
+            "officer post %s: decommissioned thread %s (reason=%s, harvested=%s, "
+            "queue folded=%d deleted=%d)",
+            project_id[:8],
+            thread_id[:8],
+            reason,
+            summary.get("harvested", False),
+            summary.get("folded", 0),
+            summary.get("deleted", 0),
+        )
+    else:
+        logger.info(
+            "officer post %s: decommission no-op for thread %s "
+            "(already_decommissioned=%s orphan_retired=%s)",
+            project_id[:8],
+            thread_id[:8],
+            summary.get("already_decommissioned", False),
+            summary.get("orphan_retired", False),
+        )
+    return summary
+
+
+def _officer_in_flight_decommission_response(
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    jobs = list(summary.get("in_flight_jobs") or [])
+    return {
+        "status": "in_flight",
+        "warning": (
+            f"{len(jobs)} job(s) in flight on this post. Decommission leaves "
+            "them running; retry with force=true to proceed."
+        ),
+        "in_flight_jobs": jobs,
+    }
 
 
 class OfficerDecommissionRequest(BaseModel):
@@ -35433,11 +35464,12 @@ async def commission_project_officer(
     Auth: project admin (owner or platform admin) — the kit belongs to the
     century, not to whoever clicked provision (§11 Q1, decided). Optional
     body: the same partial kit as PATCH; validated and merged into the row
-    FIRST, so the thread is created from the durable record. The thread goes
-    through the one create funnel — registration links it and 409s rivals;
-    a stale ended-thread link is folded there (harvest + incarnation) before
-    the claim. The continuity brief is his first wake: vacant-since/until, a
-    pointer at his restored state + charter, and the while-vacant ledger.
+    FIRST, so the thread is created from the durable record. A stale
+    ended/disabled link completes the authoritative handoff before provisioning;
+    the new thread then goes through the one create funnel, whose registration
+    claim links it and 409s rivals. The continuity brief is his first wake:
+    vacant-since/until, a pointer at his restored state + charter, and the
+    while-vacant ledger.
 
     Project-binding invariant (officer_knowledge_plane.md §3.1, K1): a
     commissioned background officer has exactly one project — the sole native
@@ -35474,25 +35506,49 @@ async def commission_project_officer(
             ),
         )
 
-    fragment, comm_patch, _effects = _validated_officer_post_patch(body)
     post = await postgres_db.get_or_create_project_officer(project_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Project post not found")
+
+    # A stale ended/disabled link is not a live commission, but it still owns
+    # an unfinished handoff. Complete that handoff atomically before preparing
+    # a successor; registration itself never performs a partial fold.
+    stale_link = post.get("thread_id")
+    if stale_link:
+        stale_thread = await postgres_db.get_thread(str(stale_link)) or {
+            "id": str(stale_link),
+            "project_id": project_id,
+        }
+        try:
+            await _decommission_officer_post(stale_thread, reason="retired", force=True)
+        except OfficerPostLifecycleConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
+        post = await postgres_db.get_project_officer(project_id) or post
+
+    fragment, comm_patch, _effects = _validated_officer_post_patch(body)
     _check_officer_sleep_bounds(
         (post.get("config_override") or {}).get("officer") or {},
         fragment.get("officer") or {},
     )
-    if fragment:
-        post = (
-            await postgres_db.merge_project_officer_config(project_id, fragment) or post
-        )
-    if comm_patch:
-        post = (
-            await postgres_db.merge_project_officer_communication_policy(
-                project_id, comm_patch
+    try:
+        post_generation = post.get("updated_at")
+        if post_generation is None:
+            raise OfficerPostLifecycleConflict(
+                "commission_generation_missing",
+                "Officer Post has no lifecycle generation; retry commission.",
             )
-            or post
+        updated = await postgres_db.update_project_officer_post(
+            project_id,
+            config_updates=fragment or None,
+            communication_policy_patch=comm_patch,
+            expected_vacant_updated_at=post_generation,
         )
+    except OfficerPostLifecycleConflict as exc:
+        status = 400 if exc.code == "invalid_config" else 409
+        raise HTTPException(status_code=status, detail=exc.detail) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Project post not found")
+    post = updated["post"] or post
 
     # Build the funnel request from the row. llm/interactive ride the
     # request's own bridges (the funnel rebuilds config_override from
@@ -35525,51 +35581,26 @@ async def commission_project_officer(
         temperature=row_llm.get("temperature"),
         permission_mode=row_interactive.get("permission_mode"),
     )
+    create_request._officer_post_config_snapshot = copy.deepcopy(row_cfg)
     created = await create_thread(create_request, request)
     thread_id = str(created["thread_id"])
 
-    # Continuity restore (§2 row→thread, §5): the harvested officer_state —
-    # digest ring, page counter, and above all the sitrep fingerprints — is
-    # stamped onto the new incarnation so his first watch reports deltas,
-    # not 242 jobs of news. The while-vacant ledger is drained into the
-    # brief instead (atomically, so a racing completion lands in exactly one
-    # of the two).
-    post = await postgres_db.get_project_officer(project_id) or post
-    state_restore = {
-        k: v
-        for k, v in (post.get("state") or {}).items()
-        if k not in ("while_vacant", "while_vacant_dropped")
-    }
-    if state_restore:
-        await postgres_db.merge_thread_officer_state(thread_id, state_restore)
-
-    ledger = await postgres_db.drain_project_officer_while_vacant(project_id)
-    incarnations = post.get("incarnations") or []
-    vacant_since = (
-        incarnations[-1].get("decommissioned_at")
-        if incarnations and isinstance(incarnations[-1], dict)
-        else None
-    )
-    brief_payload = {
-        "summary": (
-            "commissioned — you hold this project's post. Your durable state "
-            "(digest, page counter, sitrep fingerprints) was restored to this "
-            "session; re-read your charter and the project stores before your "
-            "first scheduling decision."
-        ),
-        "vacant_since": vacant_since,
-        "vacant_until": datetime.now(timezone.utc).isoformat(),
-        "while_vacant": ledger.get("entries") or [],
-        "while_vacant_dropped": int(ledger.get("dropped") or 0),
-        "last_state_restored": bool(state_restore),
-    }
-    brief_enqueued = await postgres_db.enqueue_session_wake_event(
-        thread_id,
-        source="commission",
-        dedup_key=thread_id,
-        payload=brief_payload,
-        project_id=project_id,
-    )
+    # Registration, state restore, while-vacant drain, and brief INSERT were
+    # one post-locked transaction inside the create funnel. This final locked
+    # confirmation linearizes the response against an immediately racing
+    # decommission: whichever holds the post first defines the truthful result.
+    continuity = create_request._officer_commission_result
+    if continuity is None or not await postgres_db.confirm_project_officer_incarnation(
+        project_id, thread_id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Officer commission was superseded by a concurrent lifecycle "
+                "transition; re-read the post before retrying."
+            ),
+        )
+    brief_enqueued = bool(continuity.get("brief_enqueued"))
     if brief_enqueued:
         _kick_officer_event_drain(postgres_db)
     else:
@@ -35582,10 +35613,10 @@ async def commission_project_officer(
         "status": "commissioned",
         "thread_id": thread_id,
         "title": create_request.title,
-        "brief_enqueued": bool(brief_enqueued),
-        "while_vacant": len(ledger.get("entries") or []),
-        "while_vacant_dropped": int(ledger.get("dropped") or 0),
-        "state_restored": bool(state_restore),
+        "brief_enqueued": brief_enqueued,
+        "while_vacant": len(continuity.get("while_vacant") or []),
+        "while_vacant_dropped": int(continuity.get("while_vacant_dropped") or 0),
+        "state_restored": bool(continuity.get("state_restored")),
     }
 
 
@@ -35597,7 +35628,7 @@ async def decommission_project_officer(
 ) -> dict[str, Any]:
     """Stand the officer down and keep everything he had (officer_post.md §5).
 
-    Auth: project admin. Warns (409, listing them) on in-flight jobs unless
+    Auth: project admin. Returns a 200 warning result listing in-flight jobs unless
     ``force`` — and force only acknowledges the warning: jobs are LEFT
     RUNNING either way; their completions land on the vacant post's ledger.
     The actual hygiene (harvest → queue fold → unlink → incarnation) runs
@@ -35613,35 +35644,55 @@ async def decommission_project_officer(
         raise HTTPException(status_code=404, detail="Project post not found")
     linked_tid = post.get("thread_id")
     if not linked_tid:
-        raise HTTPException(
-            status_code=400, detail="The post is vacant — nothing to decommission"
-        )
+        # Idempotent lifecycle command: a lost first response may be retried.
+        # The post row is already the durable proof of vacancy; do not append
+        # a synthetic second incarnation.
+        return {
+            "status": "decommissioned",
+            "already_vacant": True,
+            "incarnations": post.get("incarnations") or [],
+        }
     linked_tid = str(linked_tid)
 
     thread = await postgres_db.get_thread(linked_tid)
     if thread is None:
-        # Hard-deleted thread behind a stale link: nothing to harvest, just
-        # record the incarnation and vacate.
-        await postgres_db.clear_project_officer_thread(project_id)
-        await postgres_db.append_project_officer_incarnation(
-            project_id,
-            {
-                "thread_id": linked_tid,
-                "commissioned_at": None,
-                "decommissioned_at": datetime.now(timezone.utc).isoformat(),
-                "reason": reason,
-            },
-        )
+        # The FK normally clears this link on hard delete, but a stale/missing
+        # fixture is repaired through the SAME atomic handoff, not two writes.
+        try:
+            summary = await _decommission_officer_post(
+                {"id": linked_tid, "project_id": project_id},
+                reason=reason,
+                force=body.force,
+            )
+        except OfficerPostLifecycleConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
+        if summary and summary.get("blocked_by_in_flight"):
+            return _officer_in_flight_decommission_response(summary)
         return {
             "status": "decommissioned",
             "thread_id": linked_tid,
             "note": "thread row was already gone; link cleared",
+            **{
+                key: value
+                for key, value in (summary or {}).items()
+                if key not in {"incarnation", "post"}
+            },
         }
 
     if thread.get("status") == "ended":
         # Crash-ended incarnation under the page-and-wait policy: the thread
         # is already down — run the post hygiene directly, no end flow.
-        summary = await _decommission_officer_post(thread, reason=reason) or {}
+        try:
+            summary = (
+                await _decommission_officer_post(
+                    thread, reason=reason, force=body.force
+                )
+                or {}
+            )
+        except OfficerPostLifecycleConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
+        if summary.get("blocked_by_in_flight"):
+            return _officer_in_flight_decommission_response(summary)
         return {
             "status": "decommissioned",
             "thread_id": linked_tid,
@@ -35649,34 +35700,24 @@ async def decommission_project_officer(
             **{k: v for k, v in summary.items() if k != "incarnation"},
         }
 
-    in_flight = await _officer_in_flight_jobs(project_id)
-    if in_flight and not body.force:
-        # The warning is a 200, not an error (the card routes error statuses
-        # to its failure path, not the leave-running confirmation flow). The
-        # post is untouched; the caller re-sends with force to proceed.
-        return {
-            "status": "in_flight",
-            "warning": (
-                f"{len(in_flight)} job(s) in flight on this post. "
-                "Decommission leaves them running; retry with force=true to "
-                "proceed."
-            ),
-            "in_flight_jobs": in_flight,
-        }
-
-    await _end_thread_flow(
+    flow_result = await _end_thread_flow(
         linked_tid,
         thread,
         permanent=False,
         force=body.force,
         officer_retire_reason=reason,
+        officer_post_required=True,
+        include_officer_handoff=True,
     )
+    if flow_result.get("status") == "in_flight":
+        return flow_result
+    handoff = flow_result.pop("_officer_handoff", {}) or {}
 
     fresh_post = await postgres_db.get_project_officer(project_id) or {}
     return {
         "status": "decommissioned",
         "thread_id": linked_tid,
-        "in_flight_jobs": in_flight,
+        "in_flight_jobs": handoff.get("in_flight_jobs") or [],
         "harvested": bool(
             {
                 k: v
@@ -35725,22 +35766,19 @@ async def hold_project_officer(
         "since": datetime.now(timezone.utc).isoformat(),
         "note": ((body.note if body else None) or "").strip(),
     }
-    await postgres_db.merge_thread_config_override(
-        officer_tid, {"officer": {"hold": hold}}
-    )
-    # §5.1 (officer_message_routing): a hold drains already-pending
-    # officer-first BLOCKING routes to the user immediately — the frozen
-    # workers behind them must not wait out the maintenance window. Async
-    # officer-first routes stay queued behind the hold by design.
-    drained_routes = 0
     try:
-        from services import message_routing as _routing_svc
-
-        drained_routes = await _routing_svc.drain_officer_blocking_routes(
-            postgres_db, project_id, reason="officer_hold"
+        hold_result = await postgres_db.set_project_officer_hold(
+            project_id,
+            expected_thread_id=officer_tid,
+            hold=hold,
+            route_reason="officer_hold",
         )
-    except Exception:
-        logger.exception("officer hold: route drain failed (non-fatal)")
+    except OfficerPostLifecycleConflict as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    staged_routes = hold_result.get("routes") or []
+    delivered_routes = await _deliver_staged_officer_routes(
+        staged_routes, reason="officer_hold"
+    )
     notified = await _inject_officer_notice(
         officer,
         "[maintenance hold — the Legate has stood you down. Take no "
@@ -35757,7 +35795,8 @@ async def hold_project_officer(
         "thread_id": officer_tid,
         "held": hold,
         "notified": notified,
-        "drained_blocking_routes": drained_routes,
+        "drained_blocking_routes": len(staged_routes),
+        "delivered_blocking_routes": delivered_routes,
     }
 
 
@@ -35780,9 +35819,14 @@ async def release_project_officer(request: Request, project_id: str) -> dict[str
     hold = _thread_officer_meta(officer).get("hold")
     if not hold:
         raise HTTPException(status_code=400, detail="The officer is not held")
-    await postgres_db.merge_thread_config_override(
-        officer_tid, {"officer": {"hold": None}}
-    )
+    try:
+        await postgres_db.set_project_officer_hold(
+            project_id,
+            expected_thread_id=officer_tid,
+            hold=None,
+        )
+    except OfficerPostLifecycleConflict as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     _kick_officer_event_drain(postgres_db)
     notified = await _inject_officer_notice(
         officer,
@@ -35829,25 +35873,21 @@ async def patch_project_officer(
         (post.get("config_override") or {}).get("officer") or {},
         fragment.get("officer") or {},
     )
-
-    if fragment:
-        post = (
-            await postgres_db.merge_project_officer_config(project_id, fragment) or post
+    try:
+        update = await postgres_db.update_project_officer_post(
+            project_id,
+            config_updates=fragment or None,
+            communication_policy_patch=comm_patch,
         )
-    if comm_patch is not None:
-        post = (
-            await postgres_db.merge_project_officer_communication_policy(
-                project_id, comm_patch
-            )
-            or post
-        )
-
-    officer = await postgres_db.get_officer_thread_for_project(project_id)
-    applied_to_thread = False
-    if officer and fragment:
-        applied_to_thread = await postgres_db.merge_thread_config_override(
-            str(officer["id"]), fragment
-        )
+    except OfficerPostLifecycleConflict as exc:
+        status = 400 if exc.code == "invalid_config" else 409
+        raise HTTPException(status_code=status, detail=exc.detail) from exc
+    if update is None:
+        raise HTTPException(status_code=404, detail="Project post not found")
+    post = update["post"] or post
+    officer = update.get("thread")
+    applied_to_thread = bool(update.get("applied_to_thread"))
+    if officer and fragment and applied_to_thread:
         changed = ", ".join(sorted(k for k in effects if k != "communication_policy"))
         await _inject_officer_notice(
             officer,
@@ -36464,6 +36504,17 @@ async def _apply_thread_config_update(
     (``actor`` is the resolved caller for owner-facing requests, None for
     internal ones — the recorded path distinguishes the two).
     """
+    if "officer" in config_override and thread_row and thread_row.get("project_id"):
+        post = await postgres_db.get_project_officer(str(thread_row["project_id"]))
+        if post and str(post.get("thread_id") or "") == str(thread_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The commissioned officer block is owned by the Officer "
+                    "Post; use the project Officer Post endpoint so durable "
+                    "and runtime configuration change atomically."
+                ),
+            )
     if thread_row and thread_row.get("execution_lane") == "stateless":
         # Generic config mutation is not the workspace-upgrade protocol. Refuse
         # an already-drifted row and allow only same-tier workspace tuning.
@@ -37477,6 +37528,16 @@ class ThreadCreateRequest(BaseModel):
     # model-facing MCP tool can author this seed. The job review endpoint sets
     # it only after deriving the delivery from an access-checked job id.
     _trusted_seed: "TrustedThreadSeed | None" = PrivateAttr(default=None)
+    # Explicit Officer commission provisions a thread outside the post
+    # transaction, then atomically registers it. This server-only snapshot
+    # prevents a concurrent post edit from being overwritten at registration;
+    # JSON callers cannot populate a Pydantic private attribute.
+    _officer_post_config_snapshot: "dict[str, Any] | None" = PrivateAttr(default=None)
+    # Filled only by the authoritative registration transaction for the
+    # explicit commission endpoint. It carries the already-persisted
+    # continuity outcome back through the shared create funnel without
+    # exposing a client-authored field.
+    _officer_commission_result: "dict[str, Any] | None" = PrivateAttr(default=None)
 
     @model_validator(mode="before")
     @classmethod
@@ -38283,17 +38344,27 @@ async def create_thread(
         # thread it minted is stood down so the JSONB-predicate machinery
         # (wake claim, watchdog) never sees two live officers.
         if _officer_requested and primary_project_id:
+            _explicit_officer_commission = (
+                request_body._officer_post_config_snapshot is not None
+            )
             _registered = await postgres_db.register_project_officer_thread(
                 primary_project_id,
                 str(thread_id),
                 config_override=redact_config_override(config_override),
+                expected_post_config_override=(
+                    request_body._officer_post_config_snapshot
+                ),
+                commission_continuity=_explicit_officer_commission,
             )
             if _registered is None:
                 try:
-                    await postgres_db.merge_thread_config_override(
-                        str(thread_id), {"officer": {"enabled": False}}
+                    await postgres_db.decommission_project_officer(
+                        primary_project_id,
+                        str(thread_id),
+                        reason="commission_race_lost",
+                        force=True,
+                        allow_orphan_retirement=True,
                     )
-                    await postgres_db.update_thread_status(str(thread_id), "ended")
                 except Exception:
                     logger.warning(
                         "officer registration race: stand-down of thread %s failed",
@@ -38303,6 +38374,10 @@ async def create_thread(
                     status_code=409,
                     detail="already commissioned: this project's post was "
                     "claimed by a concurrent officer create.",
+                )
+            if _explicit_officer_commission:
+                request_body._officer_commission_result = _registered.get(
+                    "commission_continuity"
                 )
 
         # Conference open → hold the background officer (centurion.md §4):
@@ -40922,7 +40997,7 @@ async def end_thread(
     request: Request,
     permanent: bool = False,
     force: bool = False,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """End (or permanently delete) a persistent thread (auth: owner only).
 
     Query params:
@@ -40944,7 +41019,9 @@ async def _end_thread_flow(
     permanent: bool,
     force: bool,
     officer_retire_reason: str = "retired",
-) -> dict[str, str]:
+    officer_post_required: bool = False,
+    include_officer_handoff: bool = False,
+) -> dict[str, Any]:
     """The End funnel body — everything ``end_thread`` does after auth.
 
     Shared by the owner-facing DELETE and the project-admin officer
@@ -40952,19 +41029,26 @@ async def _end_thread_flow(
     stand-down, resource release, and status write, so there is exactly one
     way a thread leaves service. ``officer_retire_reason`` is recorded on
     the post's incarnation entry when the thread holds one ('retired' for a
-    direct DELETE, 'decommissioned' via the endpoint).
+    direct DELETE, 'decommissioned' via the endpoint). Direct End permits the
+    transaction's orphan-only branch; the explicit project endpoint requires
+    that its expected thread still holds the post. ``include_officer_handoff``
+    is an internal response bridge for that endpoint, never a public request
+    field.
     """
     stateless = thread.get("execution_lane") == "stateless"
     initial_status = thread.get("status")
     initial_stateless_authority: dict[str, Any] | None = None
 
-    async def _stand_down(authoritative_thread: dict[str, Any]) -> None:
+    async def _stand_down(
+        authoritative_thread: dict[str, Any],
+    ) -> dict[str, Any] | None:
         """Run End-owned side effects only after lifecycle authority is held."""
 
         authoritative_metadata = thread_metadata_object(authoritative_thread)
         officer_meta = (authoritative_metadata.get("config_override") or {}).get(
             "officer"
         ) or {}
+        handoff: dict[str, Any] | None = None
         if isinstance(officer_meta, dict) and officer_meta.get("enabled") in (
             True,
             "true",
@@ -40972,29 +41056,31 @@ async def _end_thread_flow(
             1,
         ):
             try:
-                await postgres_db.merge_thread_config_override(
+                handoff = await _decommission_officer_post(
+                    authoritative_thread,
+                    reason=officer_retire_reason,
+                    force=force,
+                    allow_orphan_retirement=not officer_post_required,
+                )
+            except OfficerPostLifecycleConflict as exc:
+                raise HTTPException(status_code=409, detail=exc.detail) from exc
+            # An enabled legacy/orphan thread may own no durable post. It must
+            # still be disabled before ordinary End continues, but it may not
+            # harvest over another incarnation. Current-post failures are NOT
+            # swallowed: the authoritative method raises and End stays
+            # visibly retryable.
+            if handoff and handoff.get("blocked_by_in_flight"):
+                return handoff
+            if not handoff:
+                disabled = await postgres_db.merge_thread_config_override(
                     thread_id, {"officer": {"enabled": False}}
                 )
-            except Exception:
-                logger.warning(
-                    "Officer stand-down merge failed for thread %s", thread_id
-                )
-            # O3 rerouting (officer_post.md §5): ending the project's
-            # registered officer IS a decommission — harvest his state onto
-            # the post, fold the wake queue into the while-vacant ledger,
-            # unlink, and append the incarnation entry. One funnel whether
-            # the caller was the decommission endpoint or a direct DELETE.
-            try:
-                await _decommission_officer_post(
-                    authoritative_thread, reason=officer_retire_reason
-                )
-            except Exception:
-                logger.exception(
-                    "Officer post decommission hygiene failed for thread %s "
-                    "(non-fatal — the next registration folds the stale link)",
-                    thread_id,
-                )
+                if not disabled:
+                    raise RuntimeError(
+                        f"Officer stand-down could not disable thread {thread_id}"
+                    )
         await _conclude_conference_if_any(authoritative_thread)
+        return handoff
 
     async def _delete_auxiliary_state(
         authoritative_thread: dict[str, Any],
@@ -41048,14 +41134,22 @@ async def _end_thread_flow(
                     "Retry with ?force=true to end it anyway."
                 ),
             )
-        await _stand_down(thread)
+        officer_handoff = await _stand_down(thread)
+        if officer_handoff and officer_handoff.get("blocked_by_in_flight"):
+            return _officer_in_flight_decommission_response(officer_handoff)
         await _release_thread_resources(thread_id, reclaim_volume=permanent)
         if permanent:
             await _delete_auxiliary_state(thread)
             await postgres_db.delete_thread(thread_id)
-            return {"status": "deleted"}
+            result: dict[str, Any] = {"status": "deleted"}
+            if include_officer_handoff:
+                result["_officer_handoff"] = officer_handoff
+            return result
         await postgres_db.end_thread(thread_id)
-        return {"status": "ended"}
+        result = {"status": "ended"}
+        if include_officer_handoff:
+            result["_officer_handoff"] = officer_handoff
+        return result
 
     # Every stateless tier uses the queue lifecycle, including lite sessions.
     # The validator keeps VM/unknown tiers refused while admitting only the
@@ -44628,9 +44722,13 @@ async def _officer_watchdog_check_one(officer_row: dict, session_wake_svc) -> No
                 if conf is not None:
                     await _conclude_conference_if_any(conf)
                 else:
-                    await postgres_db.merge_thread_config_override(
-                        thread_id, {"officer": {"hold": None}}
-                    )
+                    project_id = officer_row.get("project_id")
+                    if project_id:
+                        await postgres_db.set_project_officer_hold(
+                            str(project_id),
+                            expected_thread_id=thread_id,
+                            hold=None,
+                        )
                 return  # next tick resumes normal duties, unheld
         return
     try:
