@@ -1,0 +1,321 @@
+"""Pool surfacing — B4 of docs/features/officer_backlog_pools.md.
+
+B3 made the tick enforce policy; B4 makes the officer able to SEE it. That is
+not cosmetic. A policy enforced but invisible invites doctrine drift: he
+watches a pool sit idle, concludes the queue is healthy, and never learns its
+breaker is open. Everything rendered here is state the tick already wrote.
+
+The other half is the precedence law. A slot's category decides the contract
+its worker is held to, and an officer dispatching cross-category is warned
+rather than refused — but never silently contradicted, which would leave the
+worker reading one contract while occupying a slot that means another.
+"""
+
+import uuid
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from services.officer_backlog import pool_status_lines, ready_depth_by_pool
+from services.officer_slots import capacity_lines, validate_slots_spec
+
+NOW = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
+
+POOLS = {
+    "researchers": {"count": 2, "category": "researcher"},
+    "executors": {"count": 1, "category": "executor"},
+}
+META = {"enabled": True, "auto_pull": True, "slots": POOLS}
+
+
+# =============================================================================
+# The capacity line — utilization is the wrong question on its own
+# =============================================================================
+
+
+class TestCapacityLine:
+    def test_legacy_rosters_render_exactly_as_before(self):
+        # No categories, no ready depth: a century that never opted into pools
+        # must see a byte-identical line.
+        flat = {"slots": {"line": {"count": 2}, "heavy": {"count": 1}}}
+        assert capacity_lines(flat, {"line": 1}) == (
+            "Capacity: heavy 0/1, line 1/2 worker slots in use."
+        )
+
+    def test_flat_cap_path_is_untouched(self):
+        assert capacity_lines({"max_concurrent_workers": 3}, {None: 2}) == (
+            "Capacity: 2/3 worker slots in use."
+        )
+
+    def test_pools_carry_their_ready_depth(self):
+        line = capacity_lines(
+            META, {"researchers": 1}, ready_by_pool={"researchers": 4, "executors": 2}
+        )
+        assert "researchers 1/2 (ready 4)" in line
+        assert "executors 0/1 (ready 2)" in line
+
+    def test_a_pool_below_its_floor_says_so(self):
+        # The floor IS the slot count (§13.2): if every agent lands at once,
+        # each must find a ticket. An idle slot with a healthy queue is slack
+        # and fine; an empty queue is the thing to act on.
+        line = capacity_lines(
+            META, {}, ready_by_pool={"researchers": 1, "executors": 1}
+        )
+        assert "researchers 0/2 (ready 1, BELOW FLOOR)" in line
+        assert "executors 0/1 (ready 1)" in line  # at its floor, not below
+
+    def test_depth_is_omitted_rather_than_faked_when_unread(self):
+        # ready_by_pool=None means the KB was not read. Rendering "ready:0"
+        # would be an assertion nobody measured.
+        line = capacity_lines(META, {"researchers": 1})
+        assert "ready" not in line
+
+    def test_uncategorized_slots_never_show_depth(self):
+        meta = {"slots": {"adhoc": {"count": 1}, "researchers": POOLS["researchers"]}}
+        line = capacity_lines(meta, {}, ready_by_pool={"researchers": 3})
+        assert "adhoc 0/1," in line and "adhoc 0/1 (ready" not in line
+
+    def test_oldest_claim_age_is_the_counterweight_to_a_deep_queue(self):
+        line = capacity_lines(
+            META,
+            {"researchers": 1},
+            ready_by_pool={"researchers": 9},
+            oldest_claim_age_hours=51.4,
+        )
+        assert "Oldest open claim 51h." in line
+
+
+# =============================================================================
+# Policy rendering — what the tick enforces, the officer can read
+# =============================================================================
+
+
+class TestPoolStatusLines:
+    def test_an_open_breaker_is_stated_with_its_cause(self):
+        state = {
+            "backlog_breakers": {
+                "researchers": {
+                    "until": (NOW + timedelta(minutes=18)).isoformat(),
+                    "cause": "2 consecutive job failures on distinct tickets",
+                    "tickets": ["feature-a", "feature-b"],
+                }
+            }
+        }
+        lines = pool_status_lines(META, state, NOW)
+        breaker = next(line for line in lines if "BREAKER OPEN" in line)
+        assert "researchers" in breaker and "18m" in breaker
+        assert "feature-a, feature-b" in breaker
+        # The point of naming the tickets: he should read the failures before
+        # re-readying anything in that pool.
+        assert "Read those failures" in breaker
+
+    def test_an_expired_breaker_is_not_rendered(self):
+        state = {
+            "backlog_breakers": {
+                "researchers": {"until": (NOW - timedelta(minutes=1)).isoformat()}
+            }
+        }
+        assert not [
+            line for line in pool_status_lines(META, state, NOW) if "BREAKER" in line
+        ]
+
+    def test_stalled_claims_say_they_will_not_self_release(self):
+        # Auto-release is deliberately rejected — it recreates the silent
+        # duplicate-execution failure. So the line has to tell him it is his.
+        state = {
+            "backlog_stale_claims": [
+                {
+                    "job_id": "1ad5d2a0-1111-2222-3333-444444444444",
+                    "ticket_note_id": "feature-a",
+                    "status": "pending_review",
+                    "age_hours": 27.0,
+                }
+            ]
+        }
+        line = next(
+            line
+            for line in pool_status_lines(META, state, NOW)
+            if "Claimed but stalled" in line
+        )
+        assert "feature-a" in line and "1ad5d2a0" in line and "27.0h" in line
+        assert "NOT released automatically" in line
+
+    def test_a_long_stall_list_is_capped_and_says_so(self):
+        state = {
+            "backlog_stale_claims": [
+                {
+                    "job_id": f"job{i}",
+                    "ticket_note_id": f"t{i}",
+                    "status": "paused",
+                    "age_hours": 5,
+                }
+                for i in range(8)
+            ]
+        }
+        line = next(
+            line
+            for line in pool_status_lines(META, state, NOW)
+            if "Claimed but stalled" in line
+        )
+        assert "(+3 more)" in line
+
+    def test_auto_pull_off_is_stated_so_idleness_is_not_a_mystery(self):
+        meta = {**META, "auto_pull": False}
+        lines = pool_status_lines(meta, {}, NOW)
+        assert any("Auto-pull: OFF" in line for line in lines)
+
+    def test_auto_pull_on_and_quiet_renders_nothing(self):
+        assert pool_status_lines(META, {}, NOW) == []
+
+    def test_a_century_without_pools_renders_nothing(self):
+        assert pool_status_lines({"slots": {"line": {"count": 1}}}, {}, NOW) == []
+
+
+# =============================================================================
+# Ready depth reuses the tick's own eligibility, not a cheaper count
+# =============================================================================
+
+
+def _vector_db(rows):
+    conn = MagicMock()
+    # fetch_backlog issues two queries: the row window, then the counts-by-rank.
+    conn.fetch = AsyncMock(side_effect=[rows, []])
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    vector_db = MagicMock()
+    vector_db.acquire = MagicMock(return_value=acq)
+    return vector_db
+
+
+class TestReadyDepth:
+    @pytest.mark.asyncio
+    async def test_counts_only_what_the_tick_would_actually_take(self):
+        # A "ready 4" the tick reads as 1 would have the officer waiting for
+        # dispatches that are never coming.
+        rows = [
+            {
+                "note_id": "ok",
+                "tags": ["ready", "category:researcher"],
+                "ready_at": NOW,
+            },
+            {  # claimed since it was armed
+                "note_id": "claimed",
+                "tags": ["ready", "category:researcher"],
+                "ready_at": NOW - timedelta(hours=2),
+            },
+            {  # ambiguous
+                "note_id": "ambiguous",
+                "tags": ["ready", "category:researcher", "category:executor"],
+                "ready_at": NOW,
+            },
+            {  # armed tag, no timestamp -> fails closed
+                "note_id": "unauthorized",
+                "tags": ["ready", "category:researcher"],
+                "ready_at": None,
+            },
+        ]
+        db = AsyncMock()
+        db.newest_ticket_claims.return_value = {"claimed": NOW - timedelta(hours=1)}
+        depth = await ready_depth_by_pool(
+            db,
+            _vector_db(rows),
+            str(uuid.uuid4()),
+            {"researchers": POOLS["researchers"]},
+            now=NOW,
+        )
+        assert depth == {"researchers": 1}
+
+    @pytest.mark.asyncio
+    async def test_a_kb_outage_omits_the_pool_rather_than_reporting_zero(self):
+        db = AsyncMock()
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(side_effect=RuntimeError("pgvector down"))
+        depth = await ready_depth_by_pool(
+            db, vector_db, str(uuid.uuid4()), POOLS, now=NOW
+        )
+        # Zero would read as "starved queue, go file tickets"; absent reads as
+        # "unknown", which is the truth.
+        assert depth == {}
+
+
+# =============================================================================
+# Slot spec — category and the optional per-slot ceiling
+# =============================================================================
+
+
+class TestPrecedenceLaw:
+    """§6: the slot's category decides the contract; a mismatch is named."""
+
+    def _main(self):
+        import main
+
+        return main
+
+    def test_a_pool_slot_resolves_its_category(self):
+        main = self._main()
+        assert main._officer_slot_category(META, "researchers") == "researcher"
+        assert main._officer_slot_category(META, "executors") == "executor"
+
+    def test_an_uncategorized_or_unknown_slot_has_none(self):
+        main = self._main()
+        assert main._officer_slot_category({"slots": {"a": {"count": 1}}}, "a") is None
+        assert main._officer_slot_category(META, "nope") is None
+        assert main._officer_slot_category(META, None) is None
+
+    def test_the_contract_leads_and_the_officer_brief_follows(self):
+        main = self._main()
+        text = main._compose_category_kickoff("researcher", "Work ticket feature-a.")
+        assert text.startswith("Your deliverable is an ANSWER")
+        assert text.rstrip().endswith("Work ticket feature-a.")
+
+    def test_a_matching_category_adds_no_noise(self):
+        main = self._main()
+        text = main._compose_category_kickoff(
+            "researcher", "brief", requested_category="researcher"
+        )
+        assert "NOTE:" not in text
+
+    def test_a_cross_category_dispatch_is_named_not_refused(self):
+        # Warn-not-forbid. The worker must never read an executor's delivery
+        # contract while sitting in a researcher slot with no way to tell which
+        # one the officer meant.
+        main = self._main()
+        text = main._compose_category_kickoff(
+            "researcher",
+            "brief",
+            requested_category="executor",
+            slot="researchers",
+        )
+        assert text.startswith("Your deliverable is an ANSWER")
+        assert "dispatched this as executor work into the researchers slot" in text
+        assert "the contract above is the one you are held to" in text
+        assert "say so in your completion report" in text
+
+    def test_no_kickoff_still_yields_the_contract(self):
+        main = self._main()
+        assert "ANSWER" in main._compose_category_kickoff("researcher", None)
+
+
+class TestSlotSpec:
+    def test_a_category_makes_a_slot_a_pool(self):
+        cleaned = validate_slots_spec({"r": {"count": 2, "category": "Researcher"}})
+        assert cleaned["r"]["category"] == "researcher"
+
+    def test_an_unknown_category_fails_at_provision_not_at_dispatch(self):
+        with pytest.raises(ValueError, match="category must be one of"):
+            validate_slots_spec({"r": {"count": 1, "category": "designer"}})
+
+    def test_the_spend_ceiling_is_optional_and_positive(self):
+        assert (
+            "spend_ceiling_daily" not in validate_slots_spec({"r": {"count": 1}})["r"]
+        )
+        assert (
+            validate_slots_spec({"r": {"count": 1, "spend_ceiling_daily": 15}})["r"][
+                "spend_ceiling_daily"
+            ]
+            == 15.0
+        )
+        with pytest.raises(ValueError, match="must be positive"):
+            validate_slots_spec({"r": {"count": 1, "spend_ceiling_daily": 0}})

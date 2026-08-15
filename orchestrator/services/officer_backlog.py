@@ -82,6 +82,10 @@ FLOOR_WAKE_DEBOUNCE_HOURS = float(os.getenv("OFFICER_FLOOR_WAKE_HOURS", "6"))
 # head-of-queue does not block the ticket behind it.
 _CANDIDATE_LIMIT = 10
 
+# Ready-depth counting stops here. The floor is the pool's slot count (max 20),
+# so anything past this is "plenty" for every decision the number informs.
+_READY_DEPTH_LIMIT = 25
+
 ProvisionFn = Callable[..., Awaitable[None]]
 GrantsFn = Callable[..., Awaitable[None]]
 
@@ -274,6 +278,105 @@ def eligible_tickets(
             continue
         ready.append({**row, "classification": classification})
     return ready, notes
+
+
+async def ready_depth_by_pool(
+    db: Any,
+    vector_db: Any,
+    project_id: str,
+    pools: dict[str, dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, int]:
+    """How many tickets each pool could actually take right now.
+
+    Deliberately the tick's OWN read path — ``fetch_backlog`` →
+    ``newest_ticket_claims`` → :func:`eligible_tickets` — rather than a cheaper
+    count of everything wearing a ``ready`` tag. The officer steers by this
+    number, and a "ready 4" that the tick reads as zero (because all four are
+    claimed, or ambiguous, or lost their ``ready_at``) is worse than showing
+    nothing: it would have him waiting for dispatches that are never coming.
+
+    Returns ``{}` on any read failure — the caller renders capacity without
+    depth rather than asserting a zero it did not measure.
+    """
+    now = now or _now()
+    depths: dict[str, int] = {}
+    for pool, spec in pools.items():
+        category = str(spec.get("category") or "")
+        if not category:
+            continue
+        try:
+            rows, _counts = await fetch_backlog(
+                vector_db,
+                project_id,
+                require_tags=[READY_TAG, category_tag(category)],
+                limit=_READY_DEPTH_LIMIT,
+            )
+            claims = await db.newest_ticket_claims(
+                project_id, [str(r.get("note_id")) for r in rows]
+            )
+        except Exception:
+            logger.warning("officer backlog: ready-depth read failed for pool %s", pool)
+            continue
+        ready, _notes = eligible_tickets(rows, claims, now)
+        depths[pool] = len(ready)
+    return depths
+
+
+def pool_status_lines(
+    officer_meta: dict[str, Any],
+    officer_state: dict[str, Any],
+    now: Optional[datetime] = None,
+) -> list[str]:
+    """Sitrep lines for the policies the tick enforces on the officer's behalf.
+
+    A policy that is enforced but invisible invites doctrine drift: the officer
+    watches a pool sit idle and concludes the queue is fine, when in fact its
+    breaker is open. Everything here is state the tick already wrote to
+    ``officer_state``; this only renders it.
+    """
+    now = now or _now()
+    lines: list[str] = []
+    pools = pools_from_meta(officer_meta)
+    if not pools:
+        return lines
+
+    if not auto_pull_enabled(officer_meta):
+        lines.append(
+            "Auto-pull: OFF for this century — categorized pools are not "
+            "filled automatically; dispatch by hand or ask the Legate to "
+            "enable it."
+        )
+
+    breakers = officer_state.get("backlog_breakers") or {}
+    for pool in sorted(pools):
+        entry = breakers.get(pool) or {}
+        until = _aware(entry.get("until"))
+        if until and until > now:
+            minutes = max(1, int((until - now).total_seconds() // 60))
+            tickets = ", ".join(entry.get("tickets") or []) or "unknown tickets"
+            lines.append(
+                f"Pool {pool}: BREAKER OPEN for {minutes}m — "
+                f"{entry.get('cause') or 'repeated failures'} ({tickets}). "
+                "Read those failures before re-readying anything in this pool."
+            )
+
+    stalled = officer_state.get("backlog_stale_claims") or []
+    if stalled:
+        rendered = "; ".join(
+            f"{item.get('ticket_note_id')} held by job "
+            f"{str(item.get('job_id'))[:8]} ({item.get('status')}, "
+            f"{item.get('age_hours')}h)"
+            for item in stalled[:5]
+        )
+        more = f" (+{len(stalled) - 5} more)" if len(stalled) > 5 else ""
+        lines.append(
+            f"Claimed but stalled: {rendered}{more}. These tickets are NOT "
+            "released automatically — resume or cancel the job, then close or "
+            "re-ready the ticket."
+        )
+    return lines
 
 
 async def _spend_exhausted(

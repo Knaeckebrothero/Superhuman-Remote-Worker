@@ -39,9 +39,10 @@ related:
 
 ## Status
 
-**BUILDING (2026-08-15).** **B1, B2 and B3 have landed** — the tick is built, mounted and
-dormant (`auto_pull` ships off). What remains is surfacing (B4 sitrep/capacity lines, B5
-prompt doctrine, B6 cockpit) and the live-fire acceptance run.
+**BUILDING (2026-08-15).** **B1–B4 have landed** — the tick is built, mounted, dormant
+(`auto_pull` ships off) and verified end to end on k3d; the officer's sitrep now renders
+capacity, ready depth, open breakers and stalled claims. What remains is B5 (prompt
+doctrine), B6 (cockpit), optional B7 (writer expert), and the live-fire acceptance run.
 The six §13 defaults are **decided** — no open question, no pending approval. Two of those
 decisions changed the design: the ready floor scales with pool capacity rather than being a
 constant, and there are **no per-ticket budget caps** (the officer is the brake; §3 records
@@ -835,10 +836,29 @@ the tick.
     exists to remove. `loop_floor` is now executor-only. Re-arming the ticket afterwards
     also confirmed one-shot claims live: while the failed job held the claim the tick
     refused to re-dispatch ("claimed at …"), and a fresh `ready_at` released it.
-- **B4 — slots** (`category` in `_SPEC_KEYS`/validation landed with B3): precedence law
-  in admit/kickoff;
-  `capacity_lines(ready_by_category=…, oldest_claim_age=…)` + sitrep vector-db plumbing
-  **[A3]**.
+- **B4 — slots + surfacing — DONE (2026-08-15).** Precedence law in
+  `_officer_slot_category` / `_compose_category_kickoff` (`main.py`): the slot's category
+  supplies the contract, a `work_category` argument naming a different one is **named in
+  the kickoff and logged, never refused** — warn-not-forbid, with the one forbidden
+  outcome being a silent contradiction between the contract the worker reads and the slot
+  it occupies. `capacity_lines(ready_by_pool=…, oldest_claim_age_hours=…)` renders
+  `researchers 1/2 (ready 4), testers 0/1 (ready 0, BELOW FLOOR) … Oldest open claim 27h`;
+  `pool_status_lines()` renders the policies the tick enforces (open breaker + cause +
+  tickets, claimed-but-stalled with "NOT released automatically", and an explicit
+  "Auto-pull: OFF" so idleness is never a mystery). `ready_depth_by_pool()` deliberately
+  reuses the tick's own `fetch_backlog → newest_ticket_claims → eligible_tickets` path
+  rather than counting `ready` tags: a depth the tick reads as zero would have the officer
+  waiting for dispatches that never come. A KB outage omits the number instead of
+  reporting a zero nobody measured. Tests: `tests/test_officer_pool_surfacing.py` (25).
+  - **Predicate drift caught here.** `_capacity_section` carried its own inlined
+    `IN ('created','processing')` count. B3 widened admission to all-non-terminal, so
+    that copy would have shown the officer a free slot the funnel then refused with a
+    409. It now goes through the shared `count_in_flight_by_slot`, which is the whole
+    reason that helper exists.
+  - Legacy rosters and the flat-cap path render byte-identically — pinned.
+  - The `ready_by_category` naming in the original sketch became **`ready_by_pool`**:
+    two pools can share a category (a MiniMax and a frontier executor line), and the
+    officer steers slots, not categories.
 - **B5 — prompts & doctrine**: §7 edits + new-wording pins; `_ROLE_BLOCKS` slimming with
   the pinned-string superset commitment **[A3]**; charter posture template (§8).
 - **B6 — cockpit**: `OfficerSlotSpec`/`SlotDraft`/`buildSlotsSpec`/form/chips + spec gain

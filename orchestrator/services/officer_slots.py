@@ -225,11 +225,26 @@ def admit(
 def capacity_lines(
     officer_meta: dict[str, Any],
     in_flight_by_slot: dict[Optional[str], int],
+    *,
+    ready_by_pool: Optional[dict[str, int]] = None,
+    oldest_claim_age_hours: Optional[float] = None,
 ) -> str:
     """One sitrep line describing capacity, slot-aware.
 
     "Capacity: heavy 0/1, line 1/2 worker slots in use." for a roster;
     the flat "N/cap worker slots in use." otherwise.
+
+    For categorized pools the line carries what the officer actually steers by
+    (officer_backlog_pools.md §6). Utilization alone answers "am I busy",
+    which is the wrong question — an idle slot with a healthy queue is slack,
+    and slack is fine. The question that matters is whether the QUEUE is
+    starved, so each pool renders ``in-use/count ready:N`` and a pool below its
+    floor is marked. ``oldest_claim_age_hours`` is the counterweight: a deep
+    queue with a three-day-old claim is not a healthy pool, it is a stuck one.
+
+    ``ready_by_pool`` counts tickets the tick would actually dispatch —
+    ready, categorized, unambiguous and unclaimed — not everything wearing a
+    ``ready`` tag. A number the officer cannot act on is worse than no number.
     """
     roster = roster_from_meta(officer_meta)
     if roster is None:
@@ -239,10 +254,25 @@ def capacity_lines(
             cap = 3
         total = sum(in_flight_by_slot.values())
         return f"Capacity: {total}/{cap} worker slots in use."
-    parts = [
-        f"{name} {in_flight_by_slot.get(name, 0)}/{roster[name]['count']}"
-        for name in sorted(roster)
-    ]
+
+    parts = []
+    for name in sorted(roster):
+        count = roster[name]["count"]
+        segment = f"{name} {in_flight_by_slot.get(name, 0)}/{count}"
+        if ready_by_pool is not None and roster[name].get("category"):
+            ready = ready_by_pool.get(name, 0)
+            # The floor IS the pool's slot count (§13.2): if every agent in the
+            # pool lands at once, each must find a ticket waiting. Parenthesised
+            # so the sentence still parses — an unbracketed "BELOW FLOOR" ran
+            # straight into the trailing "worker slots in use" and read as if it
+            # described the slots rather than the queue.
+            flag = ", BELOW FLOOR" if ready < count else ""
+            segment += f" (ready {ready}{flag})"
+        parts.append(segment)
+
     stray = in_flight_by_slot.get(None, 0)
     tail = f" (+{stray} unslotted)" if stray else ""
-    return f"Capacity: {', '.join(parts)} worker slots in use{tail}."
+    line = f"Capacity: {', '.join(parts)} worker slots in use{tail}."
+    if oldest_claim_age_hours is not None:
+        line += f" Oldest open claim {oldest_claim_age_hours:.0f}h."
+    return line
