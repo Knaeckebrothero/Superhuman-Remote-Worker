@@ -1210,20 +1210,29 @@ async def search_knowledge(
 
 
 @mcp_tool
-async def list_projects(user_id: str | None = None) -> str:
-    """List projects, optionally filtered by user membership.
+async def list_projects(
+    user_id: str | None = None, include_archived: bool = False
+) -> str:
+    """List ACTIVE projects, optionally filtered by user membership.
 
-    Shows project name, status, goal, and last update time.
+    Shows project name, status, goal, and last update time. Archived
+    projects are excluded by default — they are a historical record, and
+    dispatching work or commissioning an officer against one is almost
+    always a mistake. The count of hidden archives is reported in the
+    footer, so nothing disappears silently.
 
     Args:
         user_id: Filter to projects this user belongs to (optional)
+        include_archived: Also list archived projects, each marked
+            [ARCHIVED]. Use when looking for historical context, never to
+            pick a target for new work.
 
     Returns:
         Formatted list of projects
     """
     client = _get_client()
     projects = await client.list_projects(user_id=user_id)
-    return fmt.format_projects(projects)
+    return fmt.format_projects(projects, include_archived=include_archived)
 
 
 @mcp_tool

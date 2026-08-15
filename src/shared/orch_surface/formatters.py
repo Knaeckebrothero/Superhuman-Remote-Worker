@@ -2593,20 +2593,54 @@ def format_knowledge_search(data: dict[str, Any]) -> str:
 # =============================================================================
 
 
-def format_projects(projects: list[dict[str, Any]]) -> str:
-    """Format project list for display."""
+def format_projects(
+    projects: list[dict[str, Any]], *, include_archived: bool = False
+) -> str:
+    """Format project list for display.
+
+    Archived projects are hidden unless ``include_archived``. They are a
+    read-only historical record: dispatching work, commissioning an officer
+    or filing tickets against one is almost always a mistake, and the old
+    rendering — one parenthesised ``(archived)`` among many rows — was easy
+    to read straight past. A project that is split leaves its archive behind
+    under a near-identical name, which is exactly when the confusion bites.
+
+    Hidden is not silent. The footer names how many were withheld and how to
+    see them, so a caller hunting a project they know exists is told where it
+    went instead of concluding it is gone.
+    """
     if not projects:
         return "No projects found."
 
-    lines = [f"Found {len(projects)} project(s):\n"]
-    for project in projects:
+    def _is_archived(project: dict[str, Any]) -> bool:
+        return str(project.get("status") or "").lower() == "archived"
+
+    hidden = 0
+    if include_archived:
+        shown = list(projects)
+    else:
+        shown = [p for p in projects if not _is_archived(p)]
+        hidden = len(projects) - len(shown)
+
+    if not shown:
+        return (
+            "No active projects found "
+            f"({hidden} archived project(s) hidden — pass "
+            "include_archived=true to list them)."
+        )
+
+    lines = [f"Found {len(shown)} project(s):\n"]
+    for project in shown:
         pid = project.get("id", "?")
         name = project.get("name", "Untitled")
         status = project.get("status", "active")
         goal = project.get("goal", "")
         updated = str(project.get("updated_at", ""))[:19]
 
-        lines.append(f"  {name} ({status})")
+        # Loud on the row itself: a caller who explicitly asked for archived
+        # projects still needs to see WHICH of these are the dead ones.
+        marker = "  [ARCHIVED] " if _is_archived(project) else "  "
+        lines.append(f"{marker}{name} ({status})")
         lines.append(f"    ID: {pid}")
         if goal:
             goal_preview = goal[:120]
@@ -2617,12 +2651,31 @@ def format_projects(projects: list[dict[str, Any]]) -> str:
             lines.append(f"    Updated: {updated}")
         lines.append("")
 
+    if hidden:
+        lines.append(
+            f"({hidden} archived project(s) hidden — pass include_archived=true "
+            "to list them.)"
+        )
+
     return "\n".join(lines)
 
 
 def format_project_detail(project: dict[str, Any]) -> str:
-    """Format single project details."""
-    lines = [
+    """Format single project details.
+
+    An archived project leads with a warning line rather than burying the
+    state in a ``Status:`` field, because the reader of this output is
+    usually deciding whether to act on the project.
+    """
+    lines: list[str] = []
+    if str(project.get("status") or "").lower() == "archived":
+        lines.append(
+            "[ARCHIVED] This project is a historical record. Do not dispatch "
+            "work, commission an officer, or file tickets against it — find "
+            "the active project that succeeded it."
+        )
+        lines.append("")
+    lines += [
         f"Project: {project.get('name', 'Untitled')}",
         f"ID: {project.get('id', '?')}",
         f"Status: {project.get('status', 'active')}",
