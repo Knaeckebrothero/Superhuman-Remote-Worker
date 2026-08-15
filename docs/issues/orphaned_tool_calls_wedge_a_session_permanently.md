@@ -47,43 +47,73 @@ it** — a brand-new thread, six messages, first turn. So the failure is not
 "compaction drops the pairing"; it is "an assistant message with
 `tool_calls` can be committed without its results, and nothing repairs it".
 
-## Why it is P0
+## Correction — the orphan lives in MEMORY, not in durable history
 
-- **Silent and total.** Nothing pages. The card shows an ACTIVE officer with
-  a healthy heartbeat and a pending timer. He simply never does anything.
-- **Self-perpetuating.** Each wake burns tokens producing another error row.
-- **Unrecoverable by any normal operation.** Restarting the pod re-attaches
-  and re-hydrates the same poisoned history.
+The first version of this note claimed the poison was durable and survived
+restarts. That is wrong, and the correction narrows the bug usefully.
+
+Two facts found after filing:
+
+1. **`tool_results` being NULL on an `ai` row is normal, not a symptom.**
+   On the healthy officer thread `d67ee261`: 613 `ai` rows carry tool calls
+   and **all 613** have `tool_results` NULL. Results are persisted as
+   separate `role='tool'` rows (890 of them there). The column is vestigial;
+   checking it diagnoses nothing.
+2. **`repair_tool_pairing` (`src/core/context.py`) already exists**, is
+   bidirectional, and its docstring says it is shared by the live turn loop
+   *and* the resume path — precisely to strip orphans before a strict-pairing
+   API call. A re-attach therefore repairs a poisoned history on its own.
+
+So the live sequence was: an interrupted turn left an orphaned call in the
+**in-process LangGraph state**, and turns 2 and 3 replayed *that* — not the
+database. The restart is what cured it; the row deletion was belt-and-braces.
+
+**The real defect is narrower and still worth fixing:** the live loop went on
+issuing the same rejected request turn after turn instead of repairing its
+own state, so a session can wedge in-process indefinitely with no operator
+signal. Whether `repair_tool_pairing` is not reached on that path, or runs
+before the point where the orphan appears, is the open question.
 
 ## Manual repair (used live)
 
-Delete the unmatched assistant row (and the accumulated error rows), then
-force a re-attach — the agent holds the restored history in memory, so a DB
-fix alone is not enough:
+**Force a re-attach** — delete the agent pod. For an officer the watchdog
+respawns onto a dedicated `persistent-<tid8>` pod within ~30 s. That alone
+should suffice, since restore repairs the pairing.
+
+If you also want the history clean (optional, and it discards the
+interrupted turn):
 
 ```sql
 DELETE FROM thread_messages
  WHERE thread_id = '<tid>' AND role = 'ai'
    AND tool_calls IS NOT NULL AND jsonb_array_length(tool_calls) > 0
-   AND tool_results IS NULL;
+   AND NOT EXISTS (SELECT 1 FROM thread_messages t
+                    WHERE t.thread_id = '<tid>' AND t.role = 'tool');
 DELETE FROM thread_messages WHERE thread_id = '<tid>' AND role = 'error';
 ```
 
-Nothing of value is lost: the calls never returned, so the message carries
-no results and (in this instance) no content.
+## Adjacent observation (unexplained)
+
+Thread `6ce5bc4c` has written **zero `role='tool'` rows** since commission,
+including for a turn that executed seven tool calls successfully — while
+`d67ee261` was writing them normally on the same deploy in the same hour
+(21 rows in 19:00Z alone). Whatever the cause, a thread that never persists
+tool rows loses each turn's tool context at the next attach, since
+`repair_tool_pairing` drops the now-orphaned calls. Not proven to be the
+same defect; recorded so it is not lost.
 
 ## Direction
 
-- **Never persist an assistant message carrying `tool_calls` without, in the
-  same transaction, either its results or a synthetic
-  "tool call did not complete" result per call.** The pairing is a protocol
-  invariant of the Responses API; a half-written turn must not be able to
-  break it.
-- **Repair on restore.** At attach, drop or complete any assistant message
-  whose `tool_calls` have no matching results, rather than faithfully
-  replaying a history the provider will reject.
+- **Repair the live state, not just the restored state.** `repair_tool_pairing`
+  must run against the in-process message list immediately before every
+  provider call, so an orphan created by an interrupted turn cannot survive
+  into the next one. This is the actual fix.
 - **Fail loudly.** A session that raises the same provider 400 on N
-  consecutive turns should stop retrying and page, not spend forever.
+  consecutive turns should stop retrying and page, not spend forever writing
+  `error` rows. Two identical 400s is enough signal.
+- **Treat an interrupted turn as an event.** A turn whose tool calls never
+  executed should log/notify rather than complete silently with
+  `0 tool calls`.
 
 ## Acceptance
 
