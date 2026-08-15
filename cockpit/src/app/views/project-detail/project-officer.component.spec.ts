@@ -195,13 +195,119 @@ describe('drainHint (shrink-below-in-flight is drain semantics, §7)', () => {
 describe('kitChips (utilization, not just allocation)', () => {
   it('renders in-flight over count when the GET carries utilization', () => {
     expect(kitChips({line: {count: 2, model: 'MiniMax-M3', backend: 'vm', in_flight: 1}})).toEqual([
-      {name: 'line', label: 'line 1/2 · MiniMax-M3 · vm'},
+      {name: 'line', label: 'line 1/2 · MiniMax-M3 · vm', alert: false},
     ]);
   });
 
   it('falls back to the ×N allocation chip without live data', () => {
-    expect(kitChips({line: {count: 2}})).toEqual([{name: 'line', label: 'line ×2'}]);
+    expect(kitChips({line: {count: 2}})).toEqual([
+      {name: 'line', label: 'line ×2', alert: false},
+    ]);
     expect(kitChips(null)).toEqual([]);
+  });
+});
+
+describe('backlogState (policy the officer can read, §6)', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const withPools = (over: Partial<OfficerPost> = {}): OfficerPost =>
+    commissionedPost({
+      kit: {researchers: {count: 1, category: 'researcher', in_flight: 0}},
+      backlog: {auto_pull: true, breakers: {}, stale_claims: []},
+      ...over,
+    });
+
+  it('is null for a century with no pools — nothing to explain', () => {
+    const {component, api} = createComponent();
+    api.getOfficerPost.mockReturnValue(of(commissionedPost()));
+    component.refresh();
+    expect(component.backlogState()).toBeNull();
+  });
+
+  it('surfaces auto-pull so an idle pool is never a mystery', () => {
+    const {component, api} = createComponent();
+    api.getOfficerPost.mockReturnValue(
+      of(withPools({backlog: {auto_pull: false, breakers: {}, stale_claims: []}})),
+    );
+    component.refresh();
+    expect(component.backlogState()?.auto_pull).toBe(false);
+  });
+
+  it('surfaces stalled claims, which are never released automatically', () => {
+    const {component, api} = createComponent();
+    api.getOfficerPost.mockReturnValue(
+      of(
+        withPools({
+          backlog: {
+            auto_pull: true,
+            breakers: {},
+            stale_claims: [
+              {job_id: 'j-1', ticket_note_id: 'feature-a', status: 'pending_review', age_hours: 27},
+            ],
+          },
+        }),
+      ),
+    );
+    component.refresh();
+    expect(component.staleClaims()).toHaveLength(1);
+    expect(component.staleClaims()[0].ticket_note_id).toBe('feature-a');
+  });
+});
+
+describe('kitChips — pools (B6 of officer_backlog_pools.md §6)', () => {
+  const future = new Date(Date.now() + 20 * 60_000).toISOString();
+  const past = new Date(Date.now() - 60_000).toISOString();
+
+  it('names the category and the ready depth for a pool', () => {
+    expect(
+      kitChips({
+        researchers: {count: 2, category: 'researcher', in_flight: 1, ready_depth: 4},
+      }),
+    ).toEqual([
+      {name: 'researchers', label: 'researchers 1/2 · researcher · ready 4', alert: false},
+    ]);
+  });
+
+  it('flags a pool sitting below its floor', () => {
+    // The floor IS the slot count: if every agent lands at once, each must
+    // find a ticket. An idle slot with a healthy queue is slack and fine.
+    const chips = kitChips({
+      researchers: {count: 2, category: 'researcher', ready_depth: 1, below_floor: true},
+    });
+    expect(chips[0].label).toContain('ready 1 — BELOW FLOOR');
+    expect(chips[0].alert).toBe(true);
+  });
+
+  it('omits depth entirely when the knowledge base could not be read', () => {
+    // Absent means unknown. Rendering "ready 0" would be an unmeasured claim
+    // that the queue is starved.
+    const chips = kitChips({researchers: {count: 2, category: 'researcher'}});
+    expect(chips[0].label).toBe('researchers ×2 · researcher');
+    expect(chips[0].alert).toBe(false);
+  });
+
+  it('an open breaker wins the flag — idle-because-broken is not idle-because-quiet', () => {
+    const chips = kitChips(
+      {testers: {count: 1, category: 'tester', ready_depth: 5}},
+      {testers: {until: future}},
+    );
+    expect(chips[0].label).toContain('BREAKER OPEN');
+    expect(chips[0].alert).toBe(true);
+  });
+
+  it('an expired breaker is not rendered', () => {
+    const chips = kitChips(
+      {testers: {count: 1, category: 'tester', ready_depth: 5}},
+      {testers: {until: past}},
+    );
+    expect(chips[0].label).not.toContain('BREAKER');
+    expect(chips[0].alert).toBe(false);
+  });
+
+  it('leaves uncategorized slots exactly as they were', () => {
+    expect(kitChips({line: {count: 2, model: 'M', backend: 'vm', in_flight: 1}})).toEqual([
+      {name: 'line', label: 'line 1/2 · M · vm', alert: false},
+    ]);
   });
 });
 
@@ -217,7 +323,7 @@ describe('draftFromPost', () => {
   it('seeds a vacant post from the row’s last real kit when one exists', () => {
     const post = vacantPost({kit: {heavy: {count: 1, model: 'gpt-x', backend: 'vm'}}});
     expect(draftFromPost(post).slots).toEqual([
-      {name: 'heavy', count: 1, model: 'gpt-x', backend: 'vm'},
+      {name: 'heavy', count: 1, model: 'gpt-x', backend: 'vm', category: ''},
     ]);
   });
 
@@ -227,7 +333,7 @@ describe('draftFromPost', () => {
 
   it('populates the whole editor live when commissioned (in_flight stays out of the draft)', () => {
     expect(draftFromPost(commissionedPost())).toEqual({
-      slots: [{name: 'line', count: 2, model: 'MiniMax-M3', backend: 'vm'}],
+      slots: [{name: 'line', count: 2, model: 'MiniMax-M3', backend: 'vm', category: ''}],
       brainModel: 'MiniMax-M3',
       reasoning: 'high',
       sleepMin: '5',
@@ -353,7 +459,7 @@ describe('ProjectOfficerComponent state machine', () => {
     expect(component.postState()).toBe('commissioned');
     expect(component.showImmediacy()).toBe(true);
     expect(component.kitRows()).toEqual([
-      {name: 'line', label: 'line 1/2 · MiniMax-M3 · vm'},
+      {name: 'line', label: 'line 1/2 · MiniMax-M3 · vm', alert: false},
     ]);
     expect(component.spendCeiling()).toBe(5000000);
 
@@ -398,7 +504,7 @@ describe('ProjectOfficerComponent editor seeding', () => {
     component.refresh();
     expect(component.fBrainModel()).toBe('MiniMax-M3');
     expect(component.slotDrafts()).toEqual([
-      {name: 'line', count: 2, model: 'MiniMax-M3', backend: 'vm'},
+      {name: 'line', count: 2, model: 'MiniMax-M3', backend: 'vm', category: ''},
     ]);
 
     component.fBrainModel.set('other-model');
@@ -555,6 +661,9 @@ describe('buildSlotsSpec', () => {
     count: 2,
     model: 'MiniMax-M3',
     backend: 'vm',
+    // '' = not a pool. The default stays uncategorized on purpose: turning a
+    // slot into a pool is an explicit act, never a side effect of editing it.
+    category: '',
     ...over,
   });
 
@@ -586,6 +695,26 @@ describe('buildSlotsSpec', () => {
       line: {count: 2, model: 'MiniMax-M3', backend: 'vm'},
       scout: {count: 1, model: 'MiniMax-M3', backend: 'vm'},
     });
+  });
+
+  it('carries the category through — the field that makes a slot a pool', () => {
+    // This builder is allow-list shaped, so a field it does not name is
+    // silently dropped. Until category was added here, choosing one in the
+    // form never reached the server and the slot was never a pool.
+    expect(buildSlotsSpec([row({name: 'researchers', category: 'Researcher'})])).toEqual({
+      researchers: {count: 2, model: 'MiniMax-M3', backend: 'vm', category: 'researcher'},
+    });
+  });
+
+  it('omits the category when the row is not a pool', () => {
+    expect(buildSlotsSpec([row({category: '  '})])).toEqual({
+      line: {count: 2, model: 'MiniMax-M3', backend: 'vm'},
+    });
+  });
+
+  it('survives a draft assembled before the field existed', () => {
+    const legacy = {name: 'line', count: 1, model: '', backend: ''} as SlotDraft;
+    expect(buildSlotsSpec([legacy])).toEqual({line: {count: 1}});
   });
 
   it('last row wins a duplicate name (the server 400s ambiguity anyway)', () => {

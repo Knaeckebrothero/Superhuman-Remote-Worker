@@ -1239,14 +1239,52 @@ export interface OfficerSlotSpec {
   count: number;
   model?: string;
   backend?: string;
+  /**
+   * Work category this slot is a POOL for — researcher | tester | executor.
+   * A slot with one may be filled automatically from ready, categorized
+   * tickets; a slot without one stays officer-directed capacity and the
+   * auto-pull tick never touches it (officer_backlog_pools.md §6).
+   */
+  category?: string;
+  /** Optional per-slot daily USD ceiling. Unset means no mechanical brake. */
+  spend_ceiling_daily?: number;
 }
 
 /**
  * A kit slot as the GET reports it: allocation plus live utilization.
  * `in_flight` is lineage-aware (counts jobs of prior incarnations too, §4).
+ * `ready_depth` / `below_floor` are pool-only and ABSENT when the knowledge
+ * base could not be read — absent means unknown, never zero.
  */
 export interface OfficerKitSlot extends OfficerSlotSpec {
   in_flight?: number;
+  ready_depth?: number;
+  below_floor?: boolean;
+}
+
+/** An open pool circuit breaker, as the tick recorded it. */
+export interface OfficerPoolBreaker {
+  until?: string;
+  cause?: string;
+  tickets?: string[];
+  tripped_on_job?: string;
+}
+
+/** A ticket whose claiming job has stopped moving. Never auto-released. */
+export interface OfficerStaleClaim {
+  job_id?: string;
+  ticket_note_id?: string;
+  slot?: string | null;
+  status?: string;
+  age_hours?: number;
+}
+
+/** Backlog-pool policy state: what the tick enforces, made visible (§6). */
+export interface OfficerBacklogState {
+  auto_pull: boolean;
+  breakers: Record<string, OfficerPoolBreaker>;
+  stale_claims: OfficerStaleClaim[];
+  worker_spend_ceiling_daily?: number | null;
 }
 
 /** Standing-down marker on a commissioned post (maintenance or conference). */
@@ -1316,6 +1354,7 @@ export interface OfficerPost {
   communication_policy?: OfficerCommunicationPolicy | null;
   incarnations?: OfficerIncarnation[] | null;
   while_vacant?: OfficerVacantLedger | null;
+  backlog?: OfficerBacklogState | null;
 }
 
 /** The officer's own brain (distinct from the slot models his workers run on). */
@@ -1332,6 +1371,10 @@ export interface OfficerBrainSpec {
  */
 export interface OfficerPostPatch {
   slots?: Record<string, OfficerSlotSpec> | null;
+  /** Let the tick fill categorized pools. Ships off; flipped per century. */
+  auto_pull?: boolean | null;
+  /** Optional century-wide daily USD ceiling on worker spend. */
+  worker_spend_ceiling_daily?: number | null;
   max_concurrent_workers?: number | null;
   max_pages_per_day?: number | null;
   max_actions_per_wake?: number | null;
