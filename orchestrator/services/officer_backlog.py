@@ -82,7 +82,7 @@ FLOOR_WAKE_DEBOUNCE_HOURS = float(os.getenv("OFFICER_FLOOR_WAKE_HOURS", "6"))
 # head-of-queue does not block the ticket behind it.
 _CANDIDATE_LIMIT = 10
 
-ProvisionFn = Callable[[dict[str, Any]], Awaitable[None]]
+ProvisionFn = Callable[..., Awaitable[None]]
 GrantsFn = Callable[..., Awaitable[None]]
 
 
@@ -524,7 +524,7 @@ async def _dispatch_one(
 
     if provision_repo is not None:
         try:
-            await provision_repo(job)
+            await provision_repo(job, category=category)
         except Exception:
             logger.exception(
                 "officer backlog: repo provisioning failed for job %s — sealing",
