@@ -1,8 +1,8 @@
 # Stateless Agents — Turn Execution as a Deployment
 
-**Status:** v3.6 — **GATE 3 STEP 5 IMPLEMENTATION BUILT; ITS WORKER CLOUD SOAK WAS NOT STARTED. SESSION HARDENING M0–M4 IS BUILT AND PARTIALLY LIVE-PROVEN (2026-08-14).** The session spine, its performance work, the S1 session lane, the S2 handoff substrate, the S3 worker driver, Gate 3 steps 1–5, and the session final-memory/permission/wake hardening stack are on `develop` milestone commits. This run did not push; its M3–M5 hardening tail remains local/unpushed. Step 6 (opening worker admission) remains unshipped and default-off. **Where things stand is §9.1 Implementation status**, written against the code rather than intent.
+**Status:** v3.7 — **GATE 3 STEPS 1–5, SESSION HARDENING AND THE WORKER WEDGE FOLLOW-UPS ARE BUILT, LIVE-VERIFIED AND PUSHED (2026-08-14).** The session spine, its performance work, the S1 session lane, the S2 handoff substrate, the S3 worker driver, Gate 3 steps 1–5, the session final-memory/permission/wake hardening stack and the worker wedge follow-ups are all on `origin/develop` and green in CI. The deferred worker cloud soak ran with the follow-ups (five clean rotations, forced-422 recovery, specimen convergence), and the previously unproven executor-after-persist crash row is now proven live. Step 6 (opening worker admission) remains unshipped and default-off — it is a values flip plus opt-in probe jobs, not a build. **Where things stand is §9.1 Implementation status**, written against the code rather than intent.
 
-In one paragraph: the shared queue/lease substrate is built, k3d-verified and genuinely kind-agnostic; **the session lane is functionally complete** — turns queue and run on any pod, survive a mid-generation kill, never double-answer, reconnect with no socket, and take durable control verbs, all without the cockpit ever learning a lane exists; **the worker driver is built behind an independent default-off admission gate** — exact Kubernetes workspaces can enqueue, rotate without calling the completion handler, resume on another pod with checkpoint/Todo/tmux state intact, and fence a stale completion report. VM jobs remain pinned. Gate 3 now durably accepts and finalizes pinned and stateless-worker reports, orders product delivery before terminal status, and returns HTTP 202 for a freshly accepted stateless-worker report so the existing background drain can finish it. The worker holds its exact tmux lifecycle until that command's stored outcome or a fail-closed handoff boundary: terminal outcomes retire it; human-facing/retry outcomes preserve it for reattachment. Admission-off leaves the stateless executor running to drain durable residue, with independent oldest-runnable-queue monitoring. The later session-hardening run durably covered final-memory obligations and claim-bound permission/wake convergence, and live-proved exact interrupt plus permission owner-loss on `MiniMax-M3`; its executor-after-persist crash row remains unproven. Step 6 still has not opened worker admission, and the **separate Gate 3 step-5 worker cloud soak** was left not-started after that run's selected provider failed its availability gate (§9.1). Turn latency went 99.6 s → 5.4 s cold / 3.0 s warm (§5.3.3, §5.3.4). Build history, measurements and failures: `docs/research/stateless_agents/implementation_log.md`; the completion-path evidence base is `docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
+In one paragraph: the shared queue/lease substrate is built, k3d-verified and genuinely kind-agnostic; **the session lane is functionally complete** — turns queue and run on any pod, survive a mid-generation kill, never double-answer, reconnect with no socket, and take durable control verbs, all without the cockpit ever learning a lane exists; **the worker driver is built behind an independent default-off admission gate** — exact Kubernetes workspaces can enqueue, rotate without calling the completion handler, resume on another pod with checkpoint/Todo/tmux state intact, and fence a stale completion report. VM jobs remain pinned. Gate 3 now durably accepts and finalizes pinned and stateless-worker reports, orders product delivery before terminal status, and returns HTTP 202 for a freshly accepted stateless-worker report so the existing background drain can finish it. The worker holds its exact tmux lifecycle until that command's stored outcome or a fail-closed handoff boundary: terminal outcomes retire it; human-facing/retry outcomes preserve it for reattachment. Admission-off leaves the stateless executor running to drain durable residue, with independent oldest-runnable-queue monitoring. The later session-hardening run durably covered final-memory obligations and claim-bound permission/wake convergence, and live-proved exact interrupt plus permission owner-loss on `MiniMax-M3`; its executor-after-persist crash row is now proven too — a fenced final-memory obligation survived deletion of the pod that minted it and drained exactly once against a deliberately blocked destination (§9.1). The worker wedge follow-ups then closed the last known worker-lane failure mode: a second LangGraph state update was consuming the pending successor task, so the graph ran no successor and the driver fell through to `/complete` with a continue-shaped report that the accept path used to honour. Routing and arming are now one durable update; a coded non-terminal 422 is a definitive pre-write refusal the worker releases from with its shell preserved; and a stateless job whose queue row is terminal with no unfinished command is parked for an operator rather than owned by nobody. The deferred worker cloud soak ran with them (§9.1). Step 6 still has not opened worker admission. Turn latency went 99.6 s → 5.4 s cold / 3.0 s warm (§5.3.3, §5.3.4). Build history, measurements and failures: `docs/research/stateless_agents/implementation_log.md`; the completion-path evidence base is `docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
 
 v1 2026-08-06 (initial proposal); v2 2026-08-07 after an 8-agent research fan-out; **v3 same night after a 6-lens adversarial panel** (10 critical + 28 major findings folded in). Raw research and critic reports: `docs/research/stateless_agents/`. Related implementation docs carrying pieces of this work: `no_workspace_agent_mode.md` §5.1 (op count is the cost — the virtual backend's scoped metadata index) and `cloud_collaboration_model.md` §4 (one `Depth: infinity` PROPFIND per turn boundary).
 **Origin:** user proposal — an LLM turn is conversation JSON in, bigger conversation JSON out; so agents can be a Deployment, not pinned pods.
@@ -1677,8 +1677,8 @@ The migration's steady state is **dual control planes** for the whole soak — a
 
 ### 9.1 Implementation status (2026-08-14)
 
-Written against local `develop`, not against intent. This run did not push and
-its M3–M5 hardening tail remains local. The short version: **the shared substrate is
+Written against `develop`, not against intent. Everything described here is
+pushed and green in CI. The short version: **the shared substrate is
 genuinely kind-agnostic; the session lane accepts exact virtual/none and
 Kubernetes sandbox workspaces; the default-off worker driver is built end to
 end; and Gate 3 steps 1–5 now provide durable completion, delivery-before-
@@ -1692,6 +1692,58 @@ rotation still obeys the 2026-08-10 §5.4.5 scope correction: it releases only
 through `run_queue` and never calls `/complete`. The production two-Deployment/
 KEDA shape, Job Bench rollout gate and step 6's worker-admission opening remain
 open/default-off.
+
+**Worker wedge follow-ups (2026-08-14) — the last known worker-lane failure
+mode, closed at the source.** A step-5 hand-check produced a stateless worker
+job that ran ~35 minutes and then reported `should_stop=false`. Accept honoured
+the lease fence and terminalized the queue row as it does for every stateless
+report, the finalizer correctly declined to dispose a non-stop, and the job sat
+in `processing` forever — invisible to every rescuer, because a `done` command
+escapes the exclusion view while the lane has neither an assigned agent nor a
+jobs-row lease. Three changes, in order of authority:
+
+1. **Source.** Stateless auto-continue selected a real successor task in one
+   LangGraph state update, then `_arm_worker_batch` issued a second update that
+   LangGraph read as *consuming* that pending task; the graph therefore ran no
+   successor node and returned the armed `should_stop=false` state, which the
+   executor reported. Routing and arming are now a single durable update, with
+   an arm-envelope validator. Reproduced exactly against the pinned LangGraph.
+2. **Accept.** Only a terminal report may close the unit — decision (6) always
+   said so and the implementation had keyed on the lane alone. A non-terminal
+   stateless payload is now refused before any write with a coded
+   `completion_non_terminal_report` 422 (fail-closed on an absent
+   `should_stop`); pinned still accepts continue reports, which are a real
+   pinned path.
+3. **Driver contract for that 422.** It is a definitive pre-write refusal: the
+   worker treats the report as never accepted, never records an accepted
+   generation, never enters the finalization hold, retires the local runtime
+   with the durable tmux preserved, and fence-releases the same generation with
+   linear backoff so a successor reattaches under token N+1. Every *other*
+   failure stays ambiguous and keeps the renew/exact-acceptance lookup — only a
+   success response or durable acceptance proof may enter the hold.
+
+**The rescue route.** A stateless-lane job in a non-terminal status whose queue
+row is terminal or absent, with no unfinished command, is owned by nobody. It is
+routed to `pending_review` with the stable `stateless_terminal_queue_unowned`
+marker and an operator alert. It is deliberately **never re-enqueued**: the
+missing outcome may follow already-executed work, so replay would duplicate it.
+Queue→jobs lock order and an exact jobs-status CAS preserve concurrent claim
+authority, and the ownership census moves from zero owners to exactly one.
+
+**Live verification (k3d, MiniMax-M3).** Five clean queue rotations across a
+570 s job with zero `/complete` calls and zero 422s, the sixth token making the
+sole terminal 202; a forced continue-report taking exactly one coded 422,
+backing off ~5 s with zero commands and the same workspace/tmux, then the next
+token reattaching and making the sole accepted 202; and the preserved wedge
+specimen parking once, producing one snapshot and one UID-fenced workspace
+release before a public delete. A separate hand-check on the public job API with
+`context.worker_batch.target_wall_seconds=60` rotated **40+ times with zero
+completion commands** while `plan.md` accumulated across rotations — checkpoint
+continuity under sustained rotation. Independently, the session-hardening
+final-memory crash row was proven by holding `ACCESS EXCLUSIVE` on the vector
+execution ledger, force-deleting the executor that minted the obligation while
+the ledger was still empty, then releasing: recovery converged to `done` with
+exactly one execution receipt and one stored memory.
 
 **Integration history (2026-08-12).** Before the direct-develop Gate 3 runs,
 `origin/develop` was merged into `feature/stateless-agents` (`8a730c63`). The
