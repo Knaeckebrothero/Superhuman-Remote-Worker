@@ -7053,6 +7053,77 @@ ALTER TABLE public.run_queue ALTER COLUMN enqueue_ord ADD GENERATED ALWAYS AS ID
 
 
 --
+-- Name: runtime_actor_access_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.runtime_actor_access_tokens (
+    token_hash bytea NOT NULL,
+    grant_id uuid NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_used_at timestamp with time zone
+);
+
+
+--
+-- Name: TABLE runtime_actor_access_tokens; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.runtime_actor_access_tokens IS 'Short-lived opaque access credentials for runtime actor authorization.';
+
+
+--
+-- Name: runtime_actor_bootstraps; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.runtime_actor_bootstraps (
+    token_hash bytea NOT NULL,
+    thread_id uuid NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_used_at timestamp with time zone
+);
+
+
+--
+-- Name: TABLE runtime_actor_bootstraps; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.runtime_actor_bootstraps IS 'Short-lived per-pod bootstrap credentials used only by dedicated session registration; never shared with stateless workers.';
+
+
+--
+-- Name: runtime_actor_grants; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.runtime_actor_grants (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    refresh_token_hash bytea NOT NULL,
+    caller_kind text NOT NULL,
+    user_id uuid,
+    project_id uuid,
+    project_role text,
+    thread_id uuid,
+    officer_incarnation integer,
+    refresh_expires_at timestamp with time zone NOT NULL,
+    revoked_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_refreshed_at timestamp with time zone,
+    CONSTRAINT runtime_actor_grants_incarnation_check CHECK (((officer_incarnation IS NULL) OR (officer_incarnation >= 0))),
+    CONSTRAINT runtime_actor_grants_kind_check CHECK ((caller_kind = ANY (ARRAY['worker'::text, 'human'::text, 'conference'::text, 'officer'::text]))),
+    CONSTRAINT runtime_actor_grants_officer_shape_check CHECK (((caller_kind <> 'officer'::text) OR ((project_id IS NOT NULL) AND (thread_id IS NOT NULL) AND (officer_incarnation IS NOT NULL)))),
+    CONSTRAINT runtime_actor_grants_role_check CHECK (((project_role IS NULL) OR (project_role = ANY (ARRAY['admin'::text, 'owner'::text, 'editor'::text, 'viewer'::text]))))
+);
+
+
+--
+-- Name: TABLE runtime_actor_grants; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.runtime_actor_grants IS 'Server-derived runtime identities. Opaque refresh credentials are hashed; every authorization re-checks current post/membership state.';
+
+
+--
 -- Name: schema_migrations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -9702,6 +9773,38 @@ ALTER TABLE ONLY public.run_queue
 
 
 --
+-- Name: runtime_actor_access_tokens runtime_actor_access_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runtime_actor_access_tokens
+    ADD CONSTRAINT runtime_actor_access_tokens_pkey PRIMARY KEY (token_hash);
+
+
+--
+-- Name: runtime_actor_bootstraps runtime_actor_bootstraps_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runtime_actor_bootstraps
+    ADD CONSTRAINT runtime_actor_bootstraps_pkey PRIMARY KEY (token_hash);
+
+
+--
+-- Name: runtime_actor_grants runtime_actor_grants_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runtime_actor_grants
+    ADD CONSTRAINT runtime_actor_grants_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: runtime_actor_grants runtime_actor_grants_refresh_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runtime_actor_grants
+    ADD CONSTRAINT runtime_actor_grants_refresh_token_hash_key UNIQUE (refresh_token_hash);
+
+
+--
 -- Name: schema_migrations schema_migrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -11008,6 +11111,27 @@ CREATE UNIQUE INDEX idx_run_queue_dedup ON public.run_queue USING btree (unit_ki
 --
 
 CREATE INDEX idx_run_queue_expiry ON public.run_queue USING btree (leased_until) WHERE (state = 'leased'::text);
+
+
+--
+-- Name: idx_runtime_actor_access_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_runtime_actor_access_expiry ON public.runtime_actor_access_tokens USING btree (expires_at);
+
+
+--
+-- Name: idx_runtime_actor_bootstrap_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_runtime_actor_bootstrap_expiry ON public.runtime_actor_bootstraps USING btree (expires_at);
+
+
+--
+-- Name: idx_runtime_actor_grants_refresh_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_runtime_actor_grants_refresh_expiry ON public.runtime_actor_grants USING btree (refresh_expires_at) WHERE (revoked_at IS NULL);
 
 
 --
@@ -13443,6 +13567,46 @@ ALTER TABLE ONLY public.resource_publication_plan_events
 
 ALTER TABLE ONLY public.resource_publication_plans
     ADD CONSTRAINT resource_publication_plans_interval_revision_fkey FOREIGN KEY (source_interval_id, source_revision) REFERENCES public.resource_intervals(id, source_revision) ON DELETE RESTRICT;
+
+
+--
+-- Name: runtime_actor_access_tokens runtime_actor_access_tokens_grant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runtime_actor_access_tokens
+    ADD CONSTRAINT runtime_actor_access_tokens_grant_id_fkey FOREIGN KEY (grant_id) REFERENCES public.runtime_actor_grants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: runtime_actor_bootstraps runtime_actor_bootstraps_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runtime_actor_bootstraps
+    ADD CONSTRAINT runtime_actor_bootstraps_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: runtime_actor_grants runtime_actor_grants_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runtime_actor_grants
+    ADD CONSTRAINT runtime_actor_grants_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: runtime_actor_grants runtime_actor_grants_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runtime_actor_grants
+    ADD CONSTRAINT runtime_actor_grants_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: runtime_actor_grants runtime_actor_grants_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.runtime_actor_grants
+    ADD CONSTRAINT runtime_actor_grants_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
 
 
 --
