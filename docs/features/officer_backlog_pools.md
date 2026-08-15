@@ -6,6 +6,7 @@ tags:
   - officers
   - projects
   - self-improvement
+status: implemented-B1-B7-audit-blocked
 aliases:
   - backlog pools
   - work categories
@@ -22,6 +23,7 @@ related:
   - "[[loop_campaign_scheduling]]"
   - "[[loop_parallel_stages]]"
   - "[[project_self_improvement_loop]]"
+  - "[[officer_control_plane_post_implementation_audit]]"
 ---
 
 # Officer backlog pools — category-typed capacity, expert-per-ticket, machine liveness
@@ -39,14 +41,18 @@ related:
 
 ## Status
 
-**BUILDING (2026-08-15).** **B1–B6 have landed** — the feature is end-to-end usable. The
-tick is built, mounted, dormant (`auto_pull` ships off) and verified on k3d; the sitrep and
+**BUILT BUT RELEASE-BLOCKED (2026-08-15).** **B1–B6 have landed**, but the feature is not
+yet safe or operable end to end. The tick is built, mounted, dormant (`auto_pull` ships
+off) and verified on its happy path; the sitrep and
 the cockpit card both render capacity, ready depth, open breakers and stalled claims; a
 pool can be provisioned from the UI; and **every loop carries the category doctrine whether
 or not it has an officer**, so the evidence repricing reaches the plain `standard` loops
-that produced the original failure. What remains is optional B7 (writer expert), the
-deferred digest lines, and the live-fire acceptance run (§12) — which still needs O6 and
-the KB hygiene pair.
+that produced the original failure. **B1–B7 are all built.** What remains is the
+deferred digest lines and the live-fire acceptance run (§12) — which still needs O6 and
+the KB hygiene pair. More importantly, the supported post API cannot currently enable
+`auto_pull`, and the authority/atomicity/liveness findings in
+[[officer_control_plane_post_implementation_audit]] block doing so out of band. Keep the
+safe database default off until that audit's release gates pass.
 The six §13 defaults are **decided** — no open question, no pending approval. Two of those
 decisions changed the design: the ready floor scales with pool capacity rather than being a
 constant, and there are **no per-ticket budget caps** (the officer is the brake; §3 records
@@ -188,7 +194,7 @@ Default membership map (warn-not-forbid; the officer may override per dispatch):
 |------------|--------------------------------------------------|---------------------|
 | researcher | scholar, designer, developer, general-worker     | yes                 |
 | tester     | product-qa, bughunter, critic                    | yes                 |
-| executor   | developer, designer, general-worker, (writer)    | **no** (singleton, §5.5) |
+| executor   | developer, designer, general-worker, writer      | **no** (singleton, §5.5) |
 
 The parallelism column generalizes the old `LOOP_ANALYSIS_ROLES` rule: researchers and
 testers write to the KB (conflict-free); executors touch shared project state. Externally,
@@ -915,13 +921,25 @@ the tick.
     ratio) — they need per-day aggregates nothing records yet, and the self-filed ratio in
     particular is the Goodhart guard §8 promises, so it deserves its own slice rather than
     a guess at the query.
-- **B7 (optional) — `writer` expert**: minimal shape per the `general-worker` precedent
-  (config.yaml `$extends: worker_base` + persona.txt; strategic/tactical optional)
-  **[A3]**. Test touchpoints: regen `tests/test_config_tool_grants_snapshot.py`
-  (`UPDATE_TOOL_GRANTS_SNAPSHOT=1`), add the roster row in
-  `config/skills/app-guide/references/experts.md` (pinned), `test_config_tool_names…`
-  auto-covers, brace-safety only if prompts contain literal braces; do NOT touch
-  `MANAGED_SEEDS`.
+- **B7 — `writer` expert — DONE (2026-08-15, subagent-built).** `config/experts/writer/`
+  on the `general-worker` precedent (`$extends: worker_base` + persona.txt, no `tools:`
+  override, no strategic/tactical); `writer` added to `CATEGORY_EXPERTS[EXECUTOR]`;
+  app-guide roster row; `config_tool_grants.json` regenerated (grants byte-identical to
+  `general-worker`, 64 tools); `MANAGED_SEEDS` untouched.
+  - **Executor-ONLY, unlike every other multi-category expert.** A writer is handed the
+    findings — it does not go and get them. Making it a researcher too would produce
+    exactly the confusion the category/expert split exists to prevent: a research
+    deliverable that happens to read well.
+  - The persona's load-bearing rule is **do not fill a gap with plausible prose**. Fluent
+    text hides missing knowledge better than code does — nobody can see the difference
+    from the page — so an honest "unknown, and here is what would settle it" is the
+    required output where a developer would get a failing test instead.
+  - Deliberate absences, both inherited rather than restated: **no shell** (nothing here
+    is built or run) and **no delegation** (a document has one voice; a fanned-out draft
+    reads like four people wrote it). Verified against the regenerated grants.
+  - §13.6 said the writer ships *after* the first acceptance week, on the grounds that
+    week one proves categories and the tick rather than roster width. Building it early
+    does not change that: it stays out of the acceptance kit unless the Legate puts it in.
 
 ## 12. Acceptance — Resavio century (dev)
 
