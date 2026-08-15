@@ -9245,6 +9245,16 @@ class JobCreate(BaseModel):
             )
         return value
 
+    ticket: str | None = Field(
+        None,
+        description=(
+            "Backlog ticket (knowledge-note slug) this job claims. Officer "
+            "dispatches only. Stamped into context.ticket_note_id, which is "
+            "the claim ledger the auto-pull tick reads — pass it when working "
+            "a ticket by hand so the tick does not dispatch a second job for "
+            "the same work on its next cycle."
+        ),
+    )
     datasource_ids: list[str] | None = Field(
         None, description="Connector IDs to attach to the job"
     )
@@ -11219,6 +11229,29 @@ async def lifespan(app: FastAPI):
             _shutdown_event,
         )
     )
+    # Officer auto-pull tick (officer_backlog_pools.md §5): fill a pool's free
+    # slot from its ready, categorized, unclaimed tickets. Leader-gated as an
+    # optimization only — correctness is the advisory-locked claim+create
+    # transaction plus uq_jobs_active_ticket_claim, because dual-leader windows
+    # are real. Dormant until a century sets officer.auto_pull (ships off).
+    from services.officer_backlog import officer_backlog_tick_loop
+    from services.session_wake import notify_officer
+
+    officer_backlog_task = asyncio.create_task(
+        run_when_leader(
+            lambda ev: officer_backlog_tick_loop(
+                postgres_db,
+                vector_db,
+                ev,
+                provision_repo=_provision_officer_ticket_repo,
+                trigger_dispatch=_trigger_dispatch,
+                enforce_grants=_enforce_officer_ticket_grants,
+                usage_ledger=usage_ledger,
+                notify=notify_officer,
+            ),
+            _shutdown_event,
+        )
+    )
     ide_sweeper_task = asyncio.create_task(
         run_when_leader(ide_session_ttl_sweeper, _shutdown_event)
     )
@@ -11477,6 +11510,7 @@ async def lifespan(app: FastAPI):
     await attention_sleep_task
     await officer_watchdog_task
     await message_route_reconciler_task
+    await officer_backlog_task
     await ide_sweeper_task
     await ws_sweeper_task
     await ide_settings_sweeper_task
@@ -12470,22 +12504,20 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 _admit_thread = None
             officer_meta = _thread_officer_meta(_admit_thread or {})
             if _officer_meta_enabled(officer_meta):
+                from services.officer_admission import (
+                    OFFICER_HELD_MESSAGE,
+                    SlotAdmissionError,
+                )
+                from services.officer_admission import admit as officer_slot_admit
+                from services.officer_admission import officer_is_held
+
                 # Conference fence (centurion.md §4, belt-and-suspenders):
                 # while the Legate is in conference the HELD background
                 # officer must not dispatch on stale direction — the meeting
                 # may be revising it. The conference session itself (a
                 # different thread) dispatches freely.
-                if officer_meta.get("hold"):
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "conference in progress — this officer is held; "
-                            "scheduling resumes with the session brief after "
-                            "the conference ends."
-                        ),
-                    )
-                from services.officer_slots import SlotAdmissionError
-                from services.officer_slots import admit as officer_slot_admit
+                if officer_is_held(officer_meta):
+                    raise HTTPException(status_code=409, detail=OFFICER_HELD_MESSAGE)
 
                 # Lineage-aware in-flight count (officer_post.md §4): jobs
                 # created by ANY incarnation on this post keep occupying
@@ -12496,30 +12528,14 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 _officer_lineage = await postgres_db.get_officer_capacity_lineage(
                     _officer_admit_thread_id
                 )
-                async with postgres_db.acquire() as conn:
-                    async with conn.transaction():
-                        await conn.execute(
-                            "SELECT pg_advisory_xact_lock(hashtext($1))",
-                            _officer_admit_thread_id,
-                        )
-                        slot_rows = await conn.fetch(
-                            """
-                            SELECT context->>'officer_slot' AS slot,
-                                   COUNT(*) AS n
-                              FROM jobs
-                             WHERE created_by_thread_id = ANY($1::uuid[])
-                               AND status IN ('created', 'processing')
-                             GROUP BY 1
-                            """,
-                            _officer_lineage,
-                        )
-                in_flight_by_slot = {r["slot"]: int(r["n"]) for r in slot_rows}
                 requested_slot = context.get("officer_slot")
                 try:
-                    officer_slot_name, slot_patch = officer_slot_admit(
-                        officer_meta,
-                        str(requested_slot) if requested_slot else None,
-                        in_flight_by_slot,
+                    officer_slot_name, slot_patch = await officer_slot_admit(
+                        postgres_db,
+                        thread_id=_officer_admit_thread_id,
+                        officer_meta=officer_meta,
+                        capacity_lineage=_officer_lineage,
+                        requested_slot=str(requested_slot) if requested_slot else None,
                     )
                 except SlotAdmissionError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -12529,6 +12545,12 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     config_override = _deep_merge_dicts(
                         config_override or {}, slot_patch
                     )
+                # One claim ledger for both dispatch paths. Without this the
+                # officer manually working the top ready ticket races his own
+                # tick into double-work on the very next cycle
+                # (officer_backlog_pools.md §5.3).
+                if job.ticket:
+                    context["ticket_note_id"] = str(job.ticket)
 
         # VM permission gate: refuse at submit time so the user gets a clear
         # 403 instead of a silent failure later in the dispatcher. The
@@ -20256,6 +20278,50 @@ def _loop_deadline_passed(run_until: Any) -> bool:
     if run_until.tzinfo is None:
         run_until = run_until.replace(tzinfo=timezone.utc)
     return datetime.now(timezone.utc) >= run_until
+
+
+async def _enforce_officer_ticket_grants(
+    config_override: dict | None, *, user_id: str | None, project_ids: list[str]
+) -> None:
+    """Create-time PEP for auto-pulled ticket jobs.
+
+    Deliberately NOT ``_enforce_job_create_grants``: that one resolves grants as
+    ``runner_kind='user'`` and raises an HTTPException, neither of which fits
+    here. A tick job is dispatched as ``lifecycle``, whose grant class raises
+    the autonomy ceiling to full while keeping the owner's capability grants —
+    check it under the same class it will run under, or the autonomy exemption
+    the tick stamps would be refused at create on every project whose owner has
+    a review ceiling. ``GrantDenied`` propagates as itself so the tick can skip
+    the pool and log, rather than a 422 escaping into a background loop.
+    """
+    if not user_id or not config_override:
+        return
+    await _enforce_dispatch_grants(
+        config_override,
+        runner_user_id=user_id,
+        project_ids=project_ids,
+        runner_kind="lifecycle",
+    )
+
+
+async def _provision_officer_ticket_repo(job_row: dict[str, Any]) -> None:
+    """Repo/cloud provisioning for one auto-pulled ticket job.
+
+    The adapter the officer backlog tick injects, so that service never imports
+    main. ``loop_floor=True`` for the same reason the loop uses it: this job
+    runs unattended and produces files, so a missing isolated repo or an
+    incomplete project-cloud baseline must fail loudly rather than let the
+    worker write into a void.
+    """
+    from services.job_provisioning import provision_job_repo
+
+    await provision_job_repo(
+        job_row=job_row,
+        gitea_client=gitea_client,
+        postgres_db=postgres_db,
+        main_cloud_router=main_cloud_router,
+        loop_floor=True,
+    )
 
 
 async def _spawn_loop_job(

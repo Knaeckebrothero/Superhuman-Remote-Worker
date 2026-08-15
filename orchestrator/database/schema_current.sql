@@ -11697,6 +11697,13 @@ CREATE UNIQUE INDEX uq_grants_scope_key ON public.capability_grants USING btree 
 
 
 --
+-- Name: uq_jobs_active_ticket_claim; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_jobs_active_ticket_claim ON public.jobs USING btree (project_id, ((context ->> 'ticket_note_id'::text))) WHERE ((context ? 'ticket_note_id'::text) AND ((status)::text <> ALL ((ARRAY['completed'::character varying, 'failed'::character varying, 'cancelled'::character varying])::text[])));
+
+
+--
 -- Name: uq_llm_endpoint_label_system; Type: INDEX; Schema: public; Owner: -
 --
 
