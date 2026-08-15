@@ -5,8 +5,8 @@ tags:
   - security
   - evidence
   - communication
-status: resolved
-priority: P0
+status: open
+priority: P2
 created: 2026-08-15
 aliases:
   - OC-05
@@ -17,17 +17,21 @@ related:
   - "[[officer_message_routing]]"
 ---
 
-# Officer evidence and routed messages leak secret-shaped worker content
+# Remaining unsanitized surfaces: completion reports, SITREP excerpts, notifications
 
-**Status:** RESOLVED (partial coverage) 2026-08-15. Audit finding **OC-05**.
+**Status:** OPEN — RESCOPED 2026-08-15. Residue of audit finding **OC-05**.
 
-`src/shared/content_redaction.py` is the shared presentation-boundary sanitizer:
-known runtime values plus anchored secret shapes, reporting a count so a surface
-can say content was withheld rather than silently shortening it. Wired into
-evidence reads (`redacted: true` + count on the page) and routed message
-subjects/bodies. **Still owed:** completion reports, officer inbox/SITREP
-excerpts and outbound notification bodies read from the same sanitizer but are
-not yet wired — do that before relying on evidence triage at volume.
+**No longer a deployment blocker.** The sanitizer exists
+(`src/shared/content_redaction.py`) and the two paths that carry the most
+worker-authored text — evidence reads and routed message subjects/bodies — go
+through it, reporting a count so a surface can say content was withheld rather
+than silently shortening it.
+
+What is left is wiring the same sanitizer into the remaining presentation
+surfaces: raw completion reports, officer inbox/SITREP excerpts, escalation
+context, and outbound notification bodies. Each is a call site, not a design
+problem — the shared piece and its false-positive characterisation already
+exist. Do this before relying on officer evidence triage at volume.
 
 ## Problem
 

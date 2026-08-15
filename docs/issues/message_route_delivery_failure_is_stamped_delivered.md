@@ -5,8 +5,8 @@ tags:
   - communication
   - notifications
   - liveness
-status: resolved
-priority: P1
+status: open
+priority: P3
 created: 2026-08-15
 aliases:
   - OC-06
@@ -16,16 +16,20 @@ related:
   - "[[officer_message_routing]]"
 ---
 
-# A failed routed notification is stamped as delivered
+# Route delivery has no persisted attempt count or last error
 
-**Status:** RESOLVED (core) 2026-08-15. Audit finding **OC-06**.
+**Status:** OPEN — RESCOPED 2026-08-15. Residue of audit finding **OC-06**.
 
-`classify_dispatch` normalizes the notifier result into one `DeliveryOutcome`;
-only an accepted outcome stamps `user_delivery_at`, and the message-log status
-derives from the same value so the two cannot disagree. **Still owed:** the
-persisted attempt count / last error / next retry — that needs a schema change,
-and the liveness property (the reconciler retries while the stamp is null) holds
-without it.
+**No longer a deployment blocker.** The false stamp is fixed: `classify_dispatch`
+normalizes the notifier result into one `DeliveryOutcome`, only an accepted
+outcome stamps `user_delivery_at`, and the message-log status derives from the
+same value so the two cannot disagree. The reconciler retries exactly while the
+stamp is null, so liveness holds.
+
+What is left is observability, not correctness: persisting attempt count, last
+error/class and next-retry on the route so a stuck delivery is diagnosable
+without reading logs. That needs a schema change, which is why it was not done
+under deployment pressure.
 
 ## Problem
 
