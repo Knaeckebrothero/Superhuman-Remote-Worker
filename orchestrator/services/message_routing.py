@@ -27,8 +27,11 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+
+from src.shared.content_redaction import sanitize
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +313,65 @@ def route_deadlines(
 
 
 # ---------------------------------------------------------------------------
+# Delivery outcome (audit OC-06)
+# ---------------------------------------------------------------------------
+
+# ``user_delivery_at`` means "the notification provider ACCEPTED this", not
+# "a human read it". Nothing downstream can observe the latter, and the
+# reconciler retries precisely while this stamp is null — so stamping on
+# anything weaker than acceptance silently ends the retry loop.
+_ACCEPTED = "accepted"
+_RETRYABLE = "retryable"
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryOutcome:
+    """Normalized result of one notification dispatch.
+
+    ``NotificationService.dispatch`` reports failure by RETURNING an error dict
+    rather than raising — an uninitialized service is the common case — so a
+    try/except around it sees success. Everything that decides route state or
+    message-log status derives from this one value instead.
+    """
+
+    kind: str
+    detail: str = ""
+
+    @property
+    def accepted(self) -> bool:
+        return self.kind == _ACCEPTED
+
+    @property
+    def log_status(self) -> str:
+        """What the message log records, from the same normalized outcome."""
+        return "sent" if self.accepted else "failed"
+
+
+def classify_dispatch(result: Any) -> DeliveryOutcome:
+    """Map a dispatch return value onto :class:`DeliveryOutcome`.
+
+    Accepted means the provider took ownership: a channel reported success, or
+    the message was queued for digest delivery after quiet hours (durable, and
+    genuinely accepted). Everything else — an explicit error, an empty result,
+    every channel false — stays retryable, because the honest thing to say
+    about it is that we do not know it arrived.
+    """
+    if not isinstance(result, dict):
+        return DeliveryOutcome(
+            _RETRYABLE, f"non-dict dispatch result: {type(result).__name__}"
+        )
+    if result.get("error"):
+        return DeliveryOutcome(_RETRYABLE, str(result["error"]))
+    if not result:
+        return DeliveryOutcome(_RETRYABLE, "empty dispatch result")
+    if result.get("queued"):
+        return DeliveryOutcome(_ACCEPTED, "queued for digest (quiet hours)")
+    if any(result.get(channel) for channel in ("email", "ntfy", "in_app", "sse")):
+        return DeliveryOutcome(_ACCEPTED, "provider accepted")
+    return DeliveryOutcome(_RETRYABLE, "no channel reported success")
+
+
+# ---------------------------------------------------------------------------
 # Escalation — the one shared "hand this thread to the user" path
 # ---------------------------------------------------------------------------
 
@@ -330,9 +392,17 @@ def _delimited_user_body(
             "**Officer context** (as written by the officer):\n\n"
             + "\n".join(f"> {line}" for line in officer_context.strip().splitlines())
         )
-    parts.append(
-        "---\n**Original worker message** (verbatim):\n\n" + original_body.strip()
-    )
+    # "verbatim" means unedited by us, not unsanitized: a worker (or a page it
+    # summarized) can put a credential in here, and this body goes to email
+    # (audit OC-05). Redaction is visible so the reader knows text was removed.
+    worker_text = sanitize(original_body.strip())
+    body_block = worker_text.text
+    if worker_text.redacted:
+        body_block += (
+            f"\n\n_({worker_text.count} secret-shaped value(s) redacted "
+            "from the worker's text.)_"
+        )
+    parts.append("---\n**Original worker message** (verbatim):\n\n" + body_block)
     parts.append(
         "---\nReply to this thread to answer the worker; your reply resumes "
         "it directly."
@@ -443,10 +513,11 @@ async def deliver_route_to_user(
         )
         # A repair re-sends the ORIGINAL delivery; only genuine escalations
         # wear the [Escalated] badge.
+        clean_subject = sanitize(str(original["subject"])).text
         if reason == "delivery_repair":
-            subject = str(original["subject"])
+            subject = clean_subject
         else:
-            subject = f"[Escalated] {original['subject']}"
+            subject = f"[Escalated] {clean_subject}"
 
         dispatch = await notifier.dispatch(
             user_id=str(job["user_id"]),
@@ -459,6 +530,7 @@ async def deliver_route_to_user(
             recipient_email=user.get("email"),
             recipient_name=user.get("display_name") or "User",
         )
+        outcome = classify_dispatch(dispatch)
         # Thread continuity: the escalation is an outbound row on the SAME
         # thread, so the cockpit shows it and an emailed reply (In-Reply-To
         # of this message id) routes back to the same thread → same resume.
@@ -472,7 +544,7 @@ async def deliver_route_to_user(
                 subject=subject,
                 message=body,
                 mode="async",
-                status="sent" if not dispatch.get("error") else "failed",
+                status=outcome.log_status,
                 email_message_id=dispatch.get("email_message_id"),
             )
         except Exception:
@@ -480,6 +552,17 @@ async def deliver_route_to_user(
                 "message routing: escalation log_message failed (non-fatal)",
                 exc_info=True,
             )
+        # OC-06: only an ACCEPTED dispatch may stamp delivery. The
+        # reconciler retries exactly while this stamp is null, so stamping a
+        # failure is what stops the retry loop and strands the user's thread.
+        if not outcome.accepted:
+            logger.warning(
+                "message routing: delivery not accepted for route %s (%s) — "
+                "leaving retryable",
+                str(route.get("route_id"))[:8],
+                outcome.detail,
+            )
+            return False
         stamped = await db.mark_route_user_delivery(str(route["route_id"]))
         return bool(stamped)
     except Exception:
