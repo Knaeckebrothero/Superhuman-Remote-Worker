@@ -2188,6 +2188,12 @@
           "default": 30,
           "minimum": 0,
           "description": "Auto-end session after idle period in minutes (0 = disabled)"
+        },
+        "narration_mode": {
+          "type": "string",
+          "enum": ["silent", "verbose", "auto"],
+          "default": "auto",
+          "description": "How much the agent narrates its work in an interactive session. Changed live through the session control endpoint ('narration.set'), which enforces the same vocabulary."
         }
       },
       "additionalProperties": false
@@ -2205,6 +2211,12 @@
           "type": "string",
           "default": "critic",
           "description": "Expert config name to use for the reviewer job"
+        },
+        "max_rounds": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 0,
+          "description": "Max critic/worker feedback round-trips before the job is auto-accepted (0 = unlimited). worker_base ships 5; 3 is the code default when the key is absent."
         }
       },
       "additionalProperties": false
@@ -2292,6 +2304,12 @@
               "default": 3,
               "minimum": 1,
               "description": "Maximum concurrent readers per turn"
+            },
+            "timeout_seconds": {
+              "type": "number",
+              "default": 240,
+              "minimum": 0,
+              "description": "Wall-clock budget for one reader, in seconds (0 = unbounded). This is a deadline, not a retryable timeout — light_runner never retries it."
             },
             "allow_writes": {
               "type": "boolean",
