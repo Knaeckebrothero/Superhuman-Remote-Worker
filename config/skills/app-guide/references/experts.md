@@ -31,6 +31,7 @@ expert cannot start a session, and a session expert cannot run a job.
 | **Design Studio** | Session | Interactive iteration on mockups and design specifications. |
 | **Bug Hunter** | Worker | Adversarial testing with a reproduction for each finding; it hunts rather than fixes. |
 | **Product QA Tester** | Worker | Product-level usability and integration auditing with evidence-backed issue candidates; it does not fix them. |
+| **Writer** | Worker | User-facing prose — reports, documentation, guides, release notes, and copy — written for a named reader from the brief, the knowledge base, and cited sources. |
 
 Choose **General Worker** or **Assistant** when the task does not need a
 specialized role. Choose the role from the work you want performed, not from

@@ -156,7 +156,16 @@ class TestCategories:
         assert KNOWN_EXPERTS == frozenset(
             {"scholar", "designer", "developer", "general-worker"}
             | {"product-qa", "bughunter", "critic"}
+            | {"writer"}
         )
+
+    def test_writer_is_an_executor_only(self):
+        # B7. Prose for a reader is a shipped artifact under projects/<slug>/,
+        # so the writer belongs to the delivery contract and to no other. It is
+        # deliberately NOT a researcher: it is handed the findings.
+        assert expert_fits_category("writer", EXECUTOR)
+        assert not expert_fits_category("writer", RESEARCHER)
+        assert not expert_fits_category("writer", TESTER)
 
     def test_membership_is_many_to_many(self):
         # The whole point: one expert, two contracts. A developer is a

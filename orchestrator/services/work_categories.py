@@ -64,8 +64,11 @@ WORK_CATEGORIES: tuple[str, ...] = (RESEARCHER, TESTER, EXECUTOR)
 CATEGORY_EXPERTS: dict[str, frozenset[str]] = {
     RESEARCHER: frozenset({"scholar", "designer", "developer", "general-worker"}),
     TESTER: frozenset({"product-qa", "bughunter", "critic"}),
-    # ``writer`` joins this set with B7 — user-facing prose is executor output.
-    EXECUTOR: frozenset({"developer", "designer", "general-worker"}),
+    # ``writer`` is executor-only: user-facing prose is a shipped artifact under
+    # ``projects/<slug>/``, not an answer written to the KB. A writer sent to
+    # investigate would be a researcher whose deliverable happens to read well —
+    # which is exactly the confusion the category/expert split exists to prevent.
+    EXECUTOR: frozenset({"developer", "designer", "general-worker", "writer"}),
 }
 
 # Used when a ticket carries no ``expert:`` pin.
@@ -134,7 +137,7 @@ def expert_fits_category(expert: str, category: str) -> bool:
 # ---------------------------------------------------------------------------
 
 # Loop roles that map to an analysis category. Everything else — developer,
-# designer, general-worker, a future writer, an unknown role — is execution.
+# designer, general-worker, writer, an unknown role — is execution.
 # This mirrors ``is_loop_execution_role``'s law that execution is the open set
 # and analysis is the closed one.
 #
