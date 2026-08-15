@@ -59,10 +59,12 @@ class TestTagNamespace:
         assert normalize_tag("Category:Researcher") == "category:researcher"
         assert normalize_tag("Expert:Product-QA") == "expert:product-qa"
 
-    def test_human_tags_keep_their_case(self):
-        # Display text the user chose — folding it would be a silent edit.
-        assert normalize_tag("Onboarding UX") == "Onboarding UX"
-        assert normalize_tag("  proposal  ") == "proposal"
+    def test_every_tag_folds_not_only_the_machine_ones(self):
+        # kb_update and the Neo4j :TAGGED writer have always lowercased, and
+        # tags are matched by exact string — a preserved-case tag is a tag that
+        # silently fails `tags @>` containment.
+        assert normalize_tag("Onboarding UX") == "onboarding ux"
+        assert normalize_tag("  Proposal  ") == "proposal"
 
     def test_normalize_tags_drops_blanks_and_non_strings(self):
         assert normalize_tags(["Ready", "", "  ", None, 7, "keep"]) == [
@@ -89,12 +91,12 @@ class TestTagNamespace:
         kept = strip_officer_tags(
             ["Ready", "parallel-safe", "category:executor", "Onboarding UX"]
         )
-        assert kept == ["category:executor", "Onboarding UX"]
+        assert kept == ["category:executor", "onboarding ux"]
 
     def test_search_text_excludes_the_whole_machine_namespace(self):
         assert strip_machine_tags(
             ["ready", "category:researcher", "expert:scholar", "Design System"]
-        ) == ["Design System"]
+        ) == ["design system"]
 
     def test_tag_builders_round_trip(self):
         assert category_tag("Researcher") == f"{CATEGORY_PREFIX}researcher"

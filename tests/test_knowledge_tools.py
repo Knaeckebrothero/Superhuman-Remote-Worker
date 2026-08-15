@@ -447,7 +447,9 @@ class TestKbUpdate:
             )
         assert "content replaced" in result
         assert "status → resolved" in result
-        assert "+2 tag(s)" in result
+        # The resulting list, not a count: with remove_tags/set_tags in play a
+        # bare "+2 tag(s)" no longer describes what the note now carries.
+        assert "tags → [a, b]" in result
 
     def test_pgvector_writethrough_failure_nonfatal(self):
         tools, ctx = _make_tools()

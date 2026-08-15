@@ -31,6 +31,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from src.services.forge import parse_owner_repo
+from src.shared.backlog_tags import normalize_tags
 
 from src.tools.knowledge.chunker import (
     embed_note_chunks,
@@ -231,7 +232,7 @@ def plan_reindex(
 
 
 def _parse_created_at(value: Any) -> Optional[datetime]:
-    """Best-effort parse of frontmatter ``created`` into a timestamp.
+    """Best-effort parse of a frontmatter timestamp (``created``, ``ready_at``).
 
     ``_render_note_md`` writes ``created:`` unquoted (knowledge_tools.py:449),
     so YAML's implicit timestamp resolver has usually already turned the
@@ -344,11 +345,19 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
         "note_type": note_type,
         "status": status,
         "priority": priority,
-        "tags": _as_list(fm.get("tags")),
+        # Machine tags are folded to lowercase here so a hand-edited file that
+        # writes `Ready` or `Category:Executor` still matches the tick's
+        # containment queries. Human tags keep whatever case their author
+        # chose — they are display text.
+        "tags": normalize_tags(_as_list(fm.get("tags"))),
         "keywords": _as_list(fm.get("keywords")),
         "confidence": str(confidence)[:_CONFIDENCE_MAX] if confidence else None,
         "superseded_by": str(superseded_by)[:_NOTE_ID_MAX] if superseded_by else None,
         "created_at": _parse_created_at(fm.get("created")),
+        # Absent means "this file carries no opinion, leave the stored value
+        # alone" — the same sentinel as priority. A replay is not an
+        # authorization event, so this never falls back to now().
+        "ready_at": _parse_created_at(fm.get("ready_at")),
     }
 
 
@@ -922,6 +931,7 @@ async def _reindex_snapshot(
                 superseded_by=fields["superseded_by"],
                 priority=fields["priority"],
                 created_at=fields["created_at"],
+                ready_at=fields["ready_at"],
             )
             await store.replace_note_chunks(
                 note_row=note_row,

@@ -47,18 +47,18 @@ _MACHINE_PREFIXES: tuple[str, ...] = (CATEGORY_PREFIX, EXPERT_PREFIX)
 
 
 def normalize_tag(tag: str) -> str:
-    """Canonicalize one tag: machine tags lowercase, human tags keep their case.
+    """Canonicalize one tag: stripped and lowercased.
 
-    Machine tags are matched case-insensitively and folded, so ``Ready`` and
-    ``Category:Researcher`` cannot smuggle themselves past a stripper or a
-    ``tags @>`` containment query. Human tags are left alone — they are display
-    text and the user chose their capitalization.
+    Every tag, not only the machine ones. That is the convention the system
+    already ran on — ``kb_update`` and the Neo4j ``:TAGGED`` writer have always
+    folded case — and tags are matched by exact string: ``tags @> ARRAY['ready']``
+    does not see ``Ready``. Folding at the write paths is what makes a tag
+    mean the same thing to the tick, to search, and to a human typing it into
+    a frontmatter block. ``kb_write`` and the reindexer are brought onto the
+    same footing here; they preserved case before, which is precisely how a
+    hand-edited ``Category:Executor`` would have been invisible to its pool.
     """
-    stripped = tag.strip()
-    lowered = stripped.lower()
-    if lowered in OFFICER_ONLY_TAGS or lowered.startswith(_MACHINE_PREFIXES):
-        return lowered
-    return stripped
+    return tag.strip().lower()
 
 
 def normalize_tags(tags: Iterable[str] | None) -> list[str]:

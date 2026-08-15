@@ -39,7 +39,8 @@ related:
 
 ## Status
 
-**BUILDING (2026-08-15).** **B1 has landed**; everything this document depends on is in.
+**BUILDING (2026-08-15).** **B1 and B2 have landed**; everything this document depends on
+is in. Next is B3 — the claim funnel and the tick, the bulk of the new code.
 The six §13 defaults are **decided** — no open question, no pending approval. Two of those
 decisions changed the design: the ready floor scales with pool capacity rather than being a
 constant, and there are **no per-ticket budget caps** (the officer is the brake; §3 records
@@ -628,10 +629,12 @@ Everything below was verified against the tree on 2026-08-15. File anchors are g
 symbol names, not line numbers (line numbers drift; grep the symbol).
 
 **Migrations.** Next free app migration is **0160** (0157 `project_officers`, 0158 tool-group
-marker repair, 0159 `job_message_routes` are applied). v1 of this feature needs **no
-migration** — category/expert/ready ride `knowledge_index.tags` (§4) and `auto_pull` rides
-the post row's `config_override`. If B3 adds the partial unique index on the ticket stamp
-(§5.3), that is 0160. Regenerate `schema_current.sql` and bump `APP_CURRENT_MIGRATION_HEAD`
+marker repair, 0159 `job_message_routes` are applied); if B3 adds the partial unique index
+on the ticket stamp (§5.3), that is it. Next free **vector** migration is **0021** — B2
+took 0020 for `knowledge_index.ready_at`. (The original "v1 needs no migration" claim held
+only for the *app* DB: category/expert/ready ride `knowledge_index.tags` and `auto_pull`
+rides the post row's `config_override`, but readiness needed a queryable timestamp, not a
+tag.) Regenerate `schema_current.sql` and bump `APP_CURRENT_MIGRATION_HEAD`
 (`tests/test_infrastructure_metering_migrations.py`) whenever a migration lands.
 
 **The post row (B3's home for `auto_pull` + breaker state).** `project_officers` per
@@ -703,11 +706,17 @@ which is the intended answer, not a bug to work around. (2) The officer lane sta
 `X-MCP-Scope: project:<uuid>` and the plain session lane deliberately does not
 (`make_bound_handler`) — server-side fencing is `_scope_permits_project`.
 
-**B2's known gaps, unchanged and confirmed still open.** `kb_update` exposes only
-`add_tags` — no removal path exists anywhere (`src/tools/knowledge/knowledge_tools.py`),
-so `ready`/category assignments remain one-way doors until B2 adds `remove_tags`/`set_tags`.
-Machine tags still feed `search_doc` on the agent write path but not the reindex path.
-Officer close instrument is `kb_update(status='resolved'|'archived')`.
+**B2's gaps are now closed (2026-08-15).** `kb_update` takes `remove_tags`/`set_tags`,
+machine tags no longer feed `search_doc`, every write path folds case, workers cannot set
+or clear `ready`/`parallel-safe`, `fetch_backlog` filters by tag containment and returns
+`ready_at`, and `render_backlog_block` marks claimed tickets. **What B3 consumes:**
+`fetch_backlog(vector_db, project_id, require_tags=[READY_TAG, category_tag(c)])` for
+eligibility, `classify_ticket(row["tags"])` to resolve category/expert (skip on
+`problems`), `row["ready_at"]` compared against the newest claiming job's `created_at`
+for one-shot semantics — **and a NULL `ready_at` is not dispatchable**, never "ready since
+forever". Officer close instrument is still `kb_update(status='resolved'|'archived')`; the
+re-ready action is `kb_update(add_tags=['ready'])`, which stamps a fresh `ready_at` even
+when the tag was already present.
 
 **Live-fire preconditions (unchanged, both still owed).** O6 — release the Resavio officer
 through `POST /api/projects/{id}/officer/release`; and the KB hygiene pair — retire the
@@ -738,12 +747,30 @@ the tick.
   pool breaker. Tests: `tests/test_work_categories.py` (43), including doctrine pins on
   the load-bearing sentences and a brace-safety pin (the blocks sit beside
   `_ROLE_BLOCK_DEFAULT`, which goes through `.format()`).
-- **B2 — ticket plumbing**: `remove_tags`/`set_tags` on `kb_update` **[A2]**; lowercase
-  normalization on both write paths; machine-tag exclusion from `search_doc` at write;
-  worker-side stripping of `ready`/`parallel-safe` (provenance) **[X]**; `fetch_backlog`
-  trailing optional category/ready filters using `tags @>` containment; claimed-marker in
-  `render_backlog_block`; ready-authorization timestamp (`ready_at`) on the index row.
-  Test updates: `tests/test_project_backlog.py` exact-line pins + positional SQL slots.
+- **B2 — ticket plumbing — DONE (2026-08-15).** `remove_tags`/`set_tags` on `kb_update`
+  (both backends; Neo4j gets the add/remove **diff**, since Cypher has no "set" and
+  `set_tags` must collapse to attach/detach); lowercase normalization of **every** tag at
+  both write paths (`kb_write` + the reindexer join `kb_update`, which always folded —
+  B1's "human tags keep their case" was wrong and a real regression against a pinned
+  test: `tags @>` matches by exact string, so a preserved-case tag is an unfindable tag);
+  machine-tag exclusion from `search_doc`; worker-side officer-tag stripping, *reported*
+  in the tool result rather than silently dropped; `fetch_backlog(require_tags=…)` bound
+  as the trailing parameter with `tags @>` containment, rows now carrying `tags` +
+  `ready_at`; claimed-marker in `render_backlog_block(claims=…)`.
+  - **`ready_at` needed vector migration 0020** (the doc's "v1 needs no migration" was
+    about *app* migrations). Three-state on the agent write path — `ready=True` stamps,
+    `False` clears, `None` leaves alone — because the re-ready action is a tag-only
+    change that lands in `upsert_note`'s metadata-only branch, and because a content edit
+    on a ready ticket must NOT bump the timestamp (that re-arms a claimed ticket and puts
+    a second job on live work). The reindex path takes an absolute `ready_at` instead: a
+    file replay is not an authorization event. Round-trips through OKF frontmatter so a
+    vault rebuild does not park the whole queue, and fails **closed** (ready tag + NULL
+    `ready_at` = not dispatchable) if it is ever missing.
+  - Test updates: four positional-slot pins in `test_kb_convergence` /
+    `test_knowledge_store` / `test_kb_index_chunking` were written as `[-1]`/`[-2]` and
+    had already been chased once by `priority`; all four are now absolute, with the
+    reason recorded. New suites: `tests/test_backlog_ticket_plumbing.py` (28) plus
+    filter/claim coverage in `tests/test_project_backlog.py`.
 - **B3 — claim funnel + tick** (the bulk): extract the officer-admission helper from
   `main.py:12318-12378`; conn-accepting `create_job` variant so claim check + capacity +
   INSERT share one advisory-locked transaction **[A1]**; partial unique index on the ticket
