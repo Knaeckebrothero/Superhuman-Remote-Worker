@@ -5,7 +5,7 @@ tags:
   - communication
   - security
   - authentication
-status: open
+status: resolved
 priority: P0
 created: 2026-08-15
 aliases:
@@ -19,7 +19,8 @@ related:
 
 # Officer message actions trust a shared transport key as actor identity
 
-**Status:** OPEN SECURITY BLOCKER. Audit finding **OC-02**.
+**Status:** **RESOLVED on `develop`** (2026-08-15), pending deployment. Audit finding
+**OC-02**.
 
 ## Problem
 
@@ -60,6 +61,30 @@ the fleet-wide bootstrap secret is not.
 - Expired, missing, duplicated, and malformed actor credentials fail closed and are audited.
 - MCP/operator and interactive user routes retain their separately authenticated behavior;
   they do not masquerade as the background officer.
+
+## Resolution
+
+OC-02 and BP-09 now use one server-derived `RuntimeActorContext`, backed by opaque,
+database-hashed access and refresh credentials. The context carries caller kind, project ID,
+project role, thread ID, and officer incarnation. Dedicated session pods exchange a unique,
+short-lived provision-time bootstrap; stateless jobs receive a worker actor directly in their
+server-built dispatch bundle. The fleet-wide `MCP_INTERNAL_KEY` remains transport
+authentication only and cannot mint or select an actor.
+
+The officer job adapter forwards the access credential in a hidden header. Reply, escalate,
+and acknowledge bodies no longer contain `officer_thread_id`; `_require_officer_route_actor`
+derives it from the credential and revalidates the project post/thread/incarnation against
+durable state on every request. Refresh performs the same current-actor check, so an old
+credential cannot survive decommission/recommission.
+
+| Acceptance gate | Automated evidence |
+|---|---|
+| Shared-key stateless worker is denied reply/escalate/ack despite the correct scope and claimed thread | `TestOfficerActionGuards::test_shared_key_worker_is_denied_every_officer_action` |
+| Commissioned officer succeeds with no actor field in the public schema | `test_public_action_schema_contains_no_actor_identity`, `TestOfficerActionFlows` |
+| Project A credential cannot act on project B | `test_project_a_credential_cannot_act_on_project_b` (all shared actions) |
+| Recommission invalidates the prior incarnation immediately | `test_recommission_invalidates_old_incarnation_immediately` |
+| Missing, malformed, duplicate, and expired credentials fail closed and audit | `test_bad_actor_credentials_fail_closed_and_are_audited`, `test_expired_actor_credential_fails_closed_and_audits_actor` |
+| MCP/operator and ordinary interactive routes retain their own identity lanes | shared job-surface auth-context regression suite; only a server-derived officer actor selects the officer lane |
 
 ## Dependencies
 

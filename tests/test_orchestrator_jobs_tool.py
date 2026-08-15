@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 import pytest
 
 from src.shared.orch_surface.client import AsyncCockpitClient
+from src.shared.runtime_actor import RUNTIME_ACTOR_HEADER, RuntimeActorContext
 from src.tools.context import ToolContext
 from src.tools.orchestrator import jobs as jobs_module
 from src.tools.orchestrator.jobs import create_orchestrator_tools
@@ -159,12 +161,23 @@ async def test_create_job_explicit_project_id_wins_over_lineage(
     assert body["user_id"] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 
-def test_caller_ctx_detects_officer_via_k3_runtime_fact() -> None:
-    """officer_supervision_surface E2: the lane is 'officer' iff the K3
-    runtime fact ``config["officer_session"] is True`` (stamped by the
-    persistent-session runtime from the parsed officer config). A nested
-    officer block in config never trips it — that was the pre-unification
-    dead branch — and truthy-but-not-True values stay strict."""
+def _officer_actor(project_id: str) -> RuntimeActorContext:
+    return RuntimeActorContext(
+        caller_kind="officer",
+        project_id=project_id,
+        project_role="owner",
+        thread_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        officer_incarnation=2,
+        user_id="user-1",
+        access_credential="sra_abcdefghijklmnopqrstuvwxyzABCDEFG123456789",
+        refresh_credential="srr_abcdefghijklmnopqrstuvwxyzABCDEFG123456789",
+        access_expires_at=datetime.now(timezone.utc) + timedelta(minutes=4),
+        refresh_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+
+def test_caller_ctx_detects_officer_only_from_runtime_actor() -> None:
+    """Parsed config may shape tools, but it can never mint actor authority."""
     context = ToolContext(
         user_id="user-1",
         config={"officer": {"enabled": True}},  # not the runtime fact
@@ -174,14 +187,15 @@ def test_caller_ctx_detects_officer_via_k3_runtime_fact() -> None:
     officer_context = ToolContext(
         user_id="user-1",
         config={"officer_session": True},
+        runtime_actor=_officer_actor("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
     )
     assert jobs_module._caller_ctx(officer_context).kind == "officer"
 
-    truthy_context = ToolContext(
+    config_only_context = ToolContext(
         user_id="user-1",
-        config={"officer_session": 1},  # strict `is True` — MagicMock safety
+        config={"officer_session": True},
     )
-    assert jobs_module._caller_ctx(truthy_context).kind == "session"
+    assert jobs_module._caller_ctx(config_only_context).kind == "session"
 
 
 @pytest.mark.asyncio
@@ -199,12 +213,17 @@ async def test_officer_lane_stamps_project_scope_and_fails_closed_unbound(
         _project_id=project_id,
         _project_ids=[project_id],
         config={"officer_session": True},
+        runtime_actor=_officer_actor(project_id),
     )
     try:
         await _tool(create_orchestrator_tools(officer_ctx), "list_jobs").ainvoke({})
         scoped_request = recorder.requests[-1]
 
-        unbound_ctx = ToolContext(user_id="user-1", config={"officer_session": True})
+        unbound_ctx = ToolContext(
+            user_id="user-1",
+            config={"officer_session": True},
+            runtime_actor=_officer_actor(project_id),
+        )
         refusal = await _tool(
             create_orchestrator_tools(unbound_ctx), "list_jobs"
         ).ainvoke({})
@@ -220,6 +239,7 @@ async def test_officer_lane_stamps_project_scope_and_fails_closed_unbound(
         await client.close()
 
     assert scoped_request.headers["X-MCP-Scope"] == f"project:{project_id}"
+    assert scoped_request.headers[RUNTIME_ACTOR_HEADER].startswith("sra_")
     assert "Officer project binding error" in refusal
     assert "X-MCP-Scope" not in session_request.headers
 

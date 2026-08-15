@@ -273,6 +273,7 @@ class TestPureInternalEndpoints:
             response = await orch_main.register_agent(MagicMock(), reg)
 
         assert response.agent_id == "agent-new"
+        assert response.runtime_actor is None
         assert (
             db.register_agent.await_args.kwargs["completion_commands_enabled"]
             is orch_main.COMPLETION_COMMANDS_ENABLED

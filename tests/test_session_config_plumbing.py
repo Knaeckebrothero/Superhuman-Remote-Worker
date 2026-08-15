@@ -26,6 +26,7 @@ from fastapi import HTTPException
 import orchestrator.main as orch_main
 from src.api.persistent_app import _load_expert_config
 from src.core.tool_policy import ToolPolicyError, validate_tool_override_fragment
+from src.shared.runtime_actor import RuntimeActorContext
 
 
 class _FakeResponse:
@@ -97,6 +98,24 @@ def _patch_session_attach_reservation():
             "_reserve_session_attach_binding",
             AsyncMock(return_value=True),
         ),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _patch_session_runtime_actor_mint():
+    """Config-plumbing tests stop at the server-derived actor delivery seam."""
+
+    actor = RuntimeActorContext(
+        caller_kind="human",
+        thread_id="tid-1",
+        access_credential="sra_" + ("A" * 43),
+        refresh_credential="srr_" + ("B" * 43),
+    )
+    with patch.object(
+        orch_main,
+        "mint_thread_runtime_actor",
+        AsyncMock(return_value=actor),
     ):
         yield
 
@@ -911,6 +930,8 @@ class TestSendSessionAttachPayload:
         assert call["url"] == "http://10.0.0.1:8001/session/attach"
         assert call["json"]["config_name"] == "session_base"
         assert call["json"]["thread_id"] == "tid-1"
+        assert call["json"]["runtime_actor"]["caller_kind"] == "human"
+        assert call["json"]["runtime_actor"]["access_credential"].startswith("sra_")
 
     @pytest.mark.asyncio
     async def test_attach_refuses_revoked_persisted_datasource_before_http(self):

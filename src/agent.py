@@ -3975,14 +3975,19 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         }
 
         from src.services.knowledge.bindings import build_knowledge_bindings
+        from src.shared.runtime_actor import RuntimeActorContext
 
         raw_project_id = (
             self._job_metadata.get("project_id") if self._job_metadata else None
         )
         native_project_ids = [str(raw_project_id)] if raw_project_id else []
+        runtime_actor = RuntimeActorContext.from_payload(
+            self._job_metadata.get("runtime_actor") if self._job_metadata else None
+        )
         knowledge_bindings = build_knowledge_bindings(
             project_ids=native_project_ids,
             datasources=kb_datasources,
+            runtime_actor=runtime_actor,
         )
 
         context = ToolContext(
@@ -3998,6 +4003,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             _llm_config=self.config.llm,
             _instruction_files=self.config.instruction_files,
             knowledge_bindings=knowledge_bindings,
+            runtime_actor=runtime_actor,
             orchestrator_client=self._orchestrator_client,
             _job_metadata=job_metadata,
         )

@@ -8,6 +8,7 @@ pre-E1 S1/S2 output — that gate deliberately does not apply here.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -20,6 +21,7 @@ from src.shared.orch_surface.jobs.envelope import (
     friendly_reason,
     overall_status,
 )
+from src.shared.runtime_actor import RuntimeActorContext
 
 JOB_ID = "19707fa1-0000-4000-8000-000000000001"
 
@@ -269,6 +271,16 @@ class TestStuckThresholdDefaults:
             project_ids=("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",)
             if kind == "officer"
             else (),
+            runtime_actor=RuntimeActorContext(
+                caller_kind="officer",
+                project_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                thread_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                officer_incarnation=1,
+                access_credential="test-access-credential",
+                access_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+            if kind == "officer"
+            else None,
         )
         try:
             await _invoke("get_stuck_jobs", client, caller)()

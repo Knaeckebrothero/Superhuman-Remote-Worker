@@ -22,15 +22,25 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.tools.knowledge.knowledge_tools import create_kb_tools
+from src.services.knowledge.bindings import KnowledgeBinding
+from src.shared.runtime_actor import (
+    SENSITIVE_KNOWLEDGE_HUMAN_ROLE_POLICY,
+    RuntimeActorContext,
+    RuntimeAuthorizationResult,
+)
 
 # =============================================================================
-# Harness — mirrors tests/test_officer_charter.py: a session carries a
-# persistent-thread id, a worker job does not, and that is the whole trust
-# boundary.
+# Harness: authority comes from the server-derived actor carried by the exact
+# writable binding. A thread id by itself has no standing.
 # =============================================================================
 
 
-def _session_context(thread_id="11111111-2222-3333-4444-555555555555"):
+def _session_context(
+    thread_id="11111111-2222-3333-4444-555555555555",
+    *,
+    caller_kind="human",
+    project_role="owner",
+):
     ctx = MagicMock()
     ctx.project_id = str(uuid.uuid4())
     ctx.project_ids = [ctx.project_id]
@@ -38,16 +48,63 @@ def _session_context(thread_id="11111111-2222-3333-4444-555555555555"):
     ctx.config = {"current_phase": None}
     ctx.knowledge_graph = None
     ctx.knowledge_store = AsyncMock()
-    ctx.knowledge_bindings = []
+    actor = RuntimeActorContext(
+        caller_kind=caller_kind,
+        project_id=ctx.project_id,
+        project_role=project_role,
+        thread_id=thread_id,
+        officer_incarnation=0 if caller_kind == "officer" else None,
+        user_id=str(uuid.uuid4()),
+    )
+    ctx.runtime_actor = actor
+    ctx.knowledge_bindings = [
+        KnowledgeBinding(
+            kb_id=uuid.UUID(ctx.project_id),
+            alias="project",
+            name="Project Knowledge",
+            kind="native",
+            writable=True,
+            runtime_actor=actor,
+        )
+    ]
     ctx._thread_id = thread_id
     ctx.has_git = MagicMock(return_value=False)
     return ctx
 
 
 def _worker_context():
-    ctx = _session_context(thread_id=None)
+    ctx = _session_context(
+        thread_id=None, caller_kind="worker", project_role=None
+    )
     ctx.job_id = str(uuid.uuid4())
     return ctx
+
+
+def _officer_context():
+    return _session_context(caller_kind="officer", project_role="owner")
+
+
+def _authorize_from_test_actor(ctx, project_id, action):
+    actor = ctx.runtime_actor
+    allowed = bool(
+        actor.project_id == project_id
+        and (
+            actor.caller_kind == "officer"
+            or (
+                actor.caller_kind in {"human", "conference"}
+                and SENSITIVE_KNOWLEDGE_HUMAN_ROLE_POLICY.get(
+                    actor.project_role or "", False
+                )
+            )
+        )
+    )
+    return RuntimeAuthorizationResult(
+        authorized=allowed,
+        code="authorized" if allowed else "project_role_denied",
+        action=action,
+        actor=actor.audit_payload(),
+        message="allowed by test PEP" if allowed else "role is denied by policy",
+    )
 
 
 def _tool(ctx, name):
@@ -77,9 +134,15 @@ def _ticket(tags, note_id="feature-dark-mode", content="body"):
 
 @pytest.fixture(autouse=True)
 def _no_materialization_http():
-    with patch(
-        "src.tools.knowledge.knowledge_tools._post_vault_file",
-        return_value={"status": "skipped", "reason": "no-repo"},
+    with (
+        patch(
+            "src.tools.knowledge.knowledge_tools._post_vault_file",
+            return_value={"status": "skipped", "reason": "no-repo"},
+        ),
+        patch(
+            "src.tools.knowledge.knowledge_tools._request_runtime_actor_authorization",
+            side_effect=_authorize_from_test_actor,
+        ),
     ):
         yield
 
@@ -201,10 +264,10 @@ class TestOfficerOnlyTags:
                 "tags": ["ready", "category:executor"],
             }
         )
-        assert _upsert_kwargs(ctx)["tags"] == ["category:executor"]
-        assert _upsert_kwargs(ctx)["ready"] is None
-        # Named, not silently dropped: a worker that gets no answer keeps asking.
-        assert "ignored ready" in result
+        ctx.knowledge_store.upsert_note.assert_not_called()
+        assert "Authorization denied" in result
+        assert "No changes were made" in result
+        assert "actor=worker" in result
 
     def test_worker_may_still_classify(self):
         # Classification is triage help; authorization is not. A worker filing a
@@ -225,10 +288,11 @@ class TestOfficerOnlyTags:
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["category:executor"]
         )
-        _tool(ctx, "kb_update").invoke(
+        result = _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "add_tags": ["parallel-safe"]}
         )
-        assert "parallel-safe" not in _upsert_kwargs(ctx)["tags"]
+        ctx.knowledge_store.upsert_note.assert_not_called()
+        assert "No changes were made" in result
 
     def test_worker_cannot_un_arm_a_queued_ticket(self):
         # Stripping the INPUT is not enough on its own: set_tags is absolute, so
@@ -237,27 +301,25 @@ class TestOfficerOnlyTags:
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["ready", "category:executor"]
         )
-        _tool(ctx, "kb_update").invoke(
+        result = _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "set_tags": ["category:researcher"]}
         )
-        kwargs = _upsert_kwargs(ctx)
-        assert "ready" in kwargs["tags"]
-        assert kwargs["ready"] is None
+        ctx.knowledge_store.upsert_note.assert_not_called()
+        assert "No changes were made" in result
 
     def test_worker_remove_tags_cannot_reach_the_officer_namespace(self):
         ctx = _worker_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["ready", "category:executor"]
         )
-        _tool(ctx, "kb_update").invoke(
+        result = _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "remove_tags": ["ready", "category:executor"]}
         )
-        kwargs = _upsert_kwargs(ctx)
-        assert kwargs["tags"] == ["ready"]  # the category went, the arming stayed
-        assert kwargs["ready"] is None
+        ctx.knowledge_store.upsert_note.assert_not_called()
+        assert "No changes were made" in result
 
     def test_officer_may_do_all_of_it(self):
-        ctx = _session_context()
+        ctx = _officer_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["category:executor"]
         )
@@ -267,6 +329,79 @@ class TestOfficerOnlyTags:
         kwargs = _upsert_kwargs(ctx)
         assert "ready" in kwargs["tags"] and "parallel-safe" in kwargs["tags"]
         assert kwargs["ready"] is True
+
+    @pytest.mark.parametrize(
+        ("caller_kind", "project_role", "allowed"),
+        [
+            ("worker", None, False),
+            ("human", "viewer", False),
+            ("human", "editor", False),
+            ("human", "owner", True),
+            ("human", "admin", True),
+            ("officer", "owner", True),
+            ("conference", "viewer", False),
+            ("conference", "editor", False),
+            ("conference", "owner", True),
+            ("conference", "admin", True),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("initial_tags", "mutation", "expected_ready"),
+        [
+            (["category:executor"], {"add_tags": ["ready"]}, True),
+            (["ready", "category:executor"], {"remove_tags": ["ready"]}, False),
+            (["ready", "category:executor"], {"add_tags": ["ready"]}, True),
+            (["category:executor"], {"add_tags": ["parallel-safe"]}, None),
+        ],
+        ids=["ready", "remove-ready", "re-ready", "parallel-safe"],
+    )
+    def test_sensitive_tag_human_role_matrix(
+        self,
+        caller_kind,
+        project_role,
+        allowed,
+        initial_tags,
+        mutation,
+        expected_ready,
+    ):
+        ctx = _session_context(
+            thread_id=None if caller_kind == "worker" else "thread-1",
+            caller_kind=caller_kind,
+            project_role=project_role,
+        )
+        ctx.knowledge_store.get_note_by_slug.return_value = _ticket(initial_tags)
+        result = _tool(ctx, "kb_update").invoke(
+            {"note": "feature-dark-mode", **mutation}
+        )
+        if allowed:
+            assert _upsert_kwargs(ctx)["ready"] is expected_ready
+        else:
+            ctx.knowledge_store.upsert_note.assert_not_called()
+            assert "No changes were made" in result
+
+    def test_denied_machine_tag_write_has_zero_projection_or_file_side_effects(self):
+        ctx = _session_context(caller_kind="human", project_role="viewer")
+        existing = _ticket(["category:executor"])
+        before = {**existing, "tags": list(existing["tags"])}
+        ctx.knowledge_graph = MagicMock()
+        ctx.knowledge_graph.read_note.return_value = existing
+        with patch(
+            "src.tools.knowledge.knowledge_tools._post_vault_file"
+        ) as canonical_write:
+            result = _tool(ctx, "kb_update").invoke(
+                {
+                    "note": "feature-dark-mode",
+                    "content": "also change the body",
+                    "add_tags": ["ready", "parallel-safe"],
+                }
+            )
+
+        assert "Authorization denied" in result
+        assert "No changes were made" in result
+        assert existing == before  # tags + ready_at remain byte-for-byte intent
+        ctx.knowledge_graph.update_note.assert_not_called()
+        ctx.knowledge_store.upsert_note.assert_not_called()
+        canonical_write.assert_not_called()
 
 
 # =============================================================================

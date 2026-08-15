@@ -1277,6 +1277,7 @@ class StatelessTurnExecutor:
             ("repositories", "repositories"),
             ("branch_name", "branch_name"),
             ("project_id", "project_id"),
+            ("runtime_actor", "runtime_actor"),
             ("workspace_generation", "workspace_generation"),
             (
                 "workspace_runtime_incarnation",

@@ -284,6 +284,8 @@ class PersistentSession:
     # Authorized native + selected external OKF KB scopes. External entries
     # carry ids/display metadata only; repository credentials stay orchestrator-side.
     knowledge_bindings: List[Any] = field(default_factory=list)
+    # Hidden server-derived identity used by job-surface and knowledge PEPs.
+    runtime_actor: Optional[Any] = None
     # Parent clients for cleanup (e.g. MongoClient)
     _datasource_clients: Dict[str, Any] = field(default_factory=dict)
     # Raw datasource payloads (orchestrator-shaped dicts) currently attached —
@@ -1665,6 +1667,7 @@ class PersistentSession:
             knowledge_graph=self._knowledge_graph,
             knowledge_store=self.knowledge_store,
             knowledge_bindings=list(self.knowledge_bindings),
+            runtime_actor=self.runtime_actor,
         )
         if self.project_ids:
             self.tool_context.project_ids = self.project_ids

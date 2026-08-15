@@ -30,6 +30,12 @@ from src.shared.backlog_tags import (
     is_officer_only_tag,
     normalize_tags,
 )
+from src.shared.runtime_actor import (
+    RUNTIME_ACTOR_HEADER,
+    RUNTIME_ACTOR_REFRESH_HEADER,
+    RuntimeActorContext,
+    RuntimeAuthorizationResult,
+)
 
 from ...services.knowledge_graph import (
     CONFIDENCE_LEVELS,
@@ -113,36 +119,186 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode()).hexdigest()
 
 
-def _charter_write_denied(context: "ToolContext") -> Optional[str]:
-    """Trust boundary for the pinned charter (centurion.md §5).
+def _runtime_actor_for_project(
+    context: "ToolContext", project_id: str
+) -> RuntimeActorContext | None:
+    """Return only an actor attached to the exact writable native binding."""
 
-    Worker jobs process untrusted external content; a prompt-injection chain
-    from the object level must not be able to rewrite the officer's standing
-    orders. Only sessions — Legate or officer hands, identified by the
-    ToolContext carrying a persistent-session thread id — may create or edit
-    'charter' notes. Workers file 'report' notes instead (provenance rides
-    the job_id column).
-    """
-    if getattr(context, "_thread_id", None):
+    bindings = [
+        binding
+        for binding in (getattr(context, "knowledge_bindings", None) or [])
+        if isinstance(binding, KnowledgeBinding)
+    ]
+    for binding in bindings:
+        if (
+            binding.is_native
+            and binding.writable
+            and str(binding.kb_id) == str(project_id)
+        ):
+            actor = binding.runtime_actor
+            return actor if isinstance(actor, RuntimeActorContext) else None
+    if bindings:
         return None
-    return (
-        "Error: 'charter' notes are Legate/officer-owned standing orders and "
-        "cannot be written from a worker job. File your findings as a "
-        "'report' note instead."
+    # Legacy/test contexts predating explicit bindings retain a fail-closed
+    # exact-project fallback. Production attach/dispatch paths always bind the
+    # actor above to their sole writable native scope.
+    actor = getattr(context, "runtime_actor", None)
+    if isinstance(actor, RuntimeActorContext) and actor.project_id == str(project_id):
+        return actor
+    return None
+
+
+def _authorization_denial(
+    *,
+    code: str,
+    action: str,
+    actor: RuntimeActorContext | None,
+    message: str,
+) -> RuntimeAuthorizationResult:
+    return RuntimeAuthorizationResult(
+        authorized=False,
+        code=code,
+        action=action,
+        actor=(actor.audit_payload() if actor else {"caller_kind": "unresolved"}),
+        message=message,
     )
 
 
-def _has_officer_authority(context: "ToolContext") -> bool:
-    """True if this caller may set dispatch-authorization tags.
+def _request_runtime_actor_authorization(
+    context: "ToolContext", project_id: str, action: str
+) -> RuntimeAuthorizationResult:
+    """Ask the orchestrator PEP before any sensitive knowledge mutation."""
 
-    Same trust boundary as the charter (:func:`_charter_write_denied`) and for
-    the same reason, one step further out: ``ready`` is not a label, it is the
-    signal that lets the auto-pull tick spawn a job. A worker that could stamp
-    it — or that summarized a web page which told it to — would be authorizing
-    its own successor onto the century's executor slot. Sessions (the Legate's
-    hands, or the officer's) carry a persistent-thread id; worker jobs do not.
-    """
-    return bool(getattr(context, "_thread_id", None))
+    actor = _runtime_actor_for_project(context, project_id)
+    base_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085").rstrip("/")
+    base_headers: Dict[str, str] = {}
+    internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+    if internal_key:
+        base_headers["X-Internal-Key"] = internal_key
+
+    try:
+        with httpx.Client(timeout=10.0, headers=base_headers) as client:
+            if (
+                actor is not None
+                and actor.access_needs_refresh()
+                and actor.refresh_credential
+            ):
+                refreshed = client.post(
+                    f"{base_url}/api/runtime-actors/refresh",
+                    headers={
+                        RUNTIME_ACTOR_REFRESH_HEADER: actor.refresh_credential
+                    },
+                )
+                if refreshed.status_code != 200:
+                    return _authorization_result_from_response(
+                        refreshed, action=action, fallback_actor=actor
+                    )
+                try:
+                    refreshed_payload = refreshed.json().get("runtime_actor")
+                except Exception:
+                    refreshed_payload = None
+                if not actor.apply_refreshed_payload(refreshed_payload):
+                    return _authorization_denial(
+                        code="malformed_refresh",
+                        action=action,
+                        actor=actor,
+                        message="Runtime actor refresh response was malformed.",
+                    )
+
+            headers: Dict[str, str] = {}
+            if actor is not None and actor.access_credential:
+                headers[RUNTIME_ACTOR_HEADER] = actor.access_credential
+            response = client.post(
+                f"{base_url}/api/runtime-actors/authorize",
+                headers=headers,
+                json={"action": action, "project_id": project_id},
+            )
+    except Exception as exc:  # noqa: BLE001 - fail closed before all writes
+        return _authorization_denial(
+            code="authorization_unavailable",
+            action=action,
+            actor=actor,
+            message=f"Authorization service is unavailable ({type(exc).__name__}).",
+        )
+    return _authorization_result_from_response(
+        response, action=action, fallback_actor=actor
+    )
+
+
+def _authorization_result_from_response(
+    response: httpx.Response,
+    *,
+    action: str,
+    fallback_actor: RuntimeActorContext | None,
+) -> RuntimeAuthorizationResult:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {}
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    source = detail if isinstance(detail, dict) else payload
+    if response.status_code == 200 and isinstance(source, dict):
+        return RuntimeAuthorizationResult(
+            authorized=source.get("authorized") is True,
+            code=str(source.get("code") or "authorized"),
+            action=str(source.get("action") or action),
+            actor=source.get("actor")
+            if isinstance(source.get("actor"), dict)
+            else (
+                fallback_actor.audit_payload()
+                if fallback_actor
+                else {"caller_kind": "unresolved"}
+            ),
+            message=str(source.get("message") or "Runtime actor is authorized."),
+        )
+    return _authorization_denial(
+        code=str(source.get("code") or f"http_{response.status_code}")
+        if isinstance(source, dict)
+        else f"http_{response.status_code}",
+        action=action,
+        actor=fallback_actor,
+        message=str(source.get("message") or "Runtime actor was denied.")
+        if isinstance(source, dict)
+        else "Runtime actor was denied.",
+    )
+
+
+def _has_officer_authority(
+    context: "ToolContext", project_id: str, action: str = "machine_tags"
+) -> RuntimeAuthorizationResult:
+    """Authorize dispatch/charter authority from the server-derived actor."""
+
+    return _request_runtime_actor_authorization(context, project_id, action)
+
+
+def _charter_write_denied(context: "ToolContext", project_id: str) -> Optional[str]:
+    """Return an explicit, audited denial for a charter mutation."""
+
+    result = _has_officer_authority(context, project_id, "charter")
+    return None if result else result.tool_message()
+
+
+def _machine_tag_mutation_requested(
+    existing: Optional[List[str]],
+    *,
+    add: Optional[List[str]] = None,
+    remove: Optional[List[str]] = None,
+    replace: Optional[List[str]] = None,
+) -> bool:
+    """Whether the request would grant or withdraw an officer-only tag."""
+
+    if replace is not None:
+        current = {
+            tag for tag in normalize_tags(existing) if is_officer_only_tag(tag)
+        }
+        requested = {
+            tag for tag in normalize_tags(replace) if is_officer_only_tag(tag)
+        }
+        return current != requested
+    return any(
+        is_officer_only_tag(tag)
+        for tag in normalize_tags([*(add or []), *(remove or [])])
+    )
 
 
 class _TagResolution(NamedTuple):
@@ -1310,9 +1466,21 @@ def create_kb_tools(
                 return f"Error: Note '{note}' not found in project."
 
             if (existing.get("type") or "") == "charter":
-                denied = _charter_write_denied(context)
+                denied = _charter_write_denied(context, project_id)
                 if denied:
                     return denied
+
+            machine_tags_authorized = False
+            if _machine_tag_mutation_requested(
+                existing.get("tags"),
+                add=add_tags,
+                remove=remove_tags,
+                replace=set_tags,
+            ):
+                authorization = _has_officer_authority(context, project_id)
+                if not authorization:
+                    return authorization.tool_message()
+                machine_tags_authorized = True
 
             if content is not None:
                 new_content = content
@@ -1342,7 +1510,7 @@ def create_kb_tools(
                 add=add_tags,
                 remove=remove_tags,
                 replace=set_tags,
-                officer_authority=_has_officer_authority(context),
+                officer_authority=machine_tags_authorized,
             )
             merged_tags = tag_change.tags
 
@@ -1445,16 +1613,21 @@ def create_kb_tools(
             return _write_scope_error(context)
 
         try:
-            # The graph path never loads the note before mutating it — the
-            # charter trust boundary needs the type, so pre-read here. A
-            # read failure falls through to the update (the note may simply
-            # not exist yet; update_note reports that itself).
+            # The charter trust boundary needs the durable type before ANY
+            # graph mutation. If it cannot be read, fail closed: falling
+            # through would let a transient read failure bypass charter auth.
             try:
                 _pre = kg.read_note(project_id, note)
-            except Exception:
-                _pre = None
-            if isinstance(_pre, dict) and (_pre.get("type") or "") == "charter":
-                denied = _charter_write_denied(context)
+            except Exception as exc:
+                logger.warning("kb_update type pre-read failed: %s", exc)
+                return (
+                    "Error: could not verify the note type before update; "
+                    "refusing the write. No changes were made."
+                )
+            if not isinstance(_pre, dict):
+                return f"Error: Note '{note}' not found in project."
+            if (_pre.get("type") or "") == "charter":
+                denied = _charter_write_denied(context, project_id)
                 if denied:
                     return denied
 
@@ -1464,13 +1637,24 @@ def create_kb_tools(
             # add/remove pair here. When the pre-read failed, ``prior_tags`` is
             # empty and the diff degrades to add-only: the same best-effort
             # posture as the priority lookback below, and never a wrong removal.
-            prior_tags = _pre.get("tags") if isinstance(_pre, dict) else None
+            prior_tags = _pre.get("tags")
+            machine_tags_authorized = False
+            if _machine_tag_mutation_requested(
+                prior_tags,
+                add=add_tags,
+                remove=remove_tags,
+                replace=set_tags,
+            ):
+                authorization = _has_officer_authority(context, project_id)
+                if not authorization:
+                    return authorization.tool_message()
+                machine_tags_authorized = True
             tag_change = _resolve_tags(
                 prior_tags,
                 add=add_tags,
                 remove=remove_tags,
                 replace=set_tags,
-                officer_authority=_has_officer_authority(context),
+                officer_authority=machine_tags_authorized,
             )
             _prior_normalized = normalize_tags(prior_tags)
             updated = kg.update_note(
@@ -1661,14 +1845,22 @@ def create_kb_tools(
         # namespace at the one write path that could otherwise create an
         # already-authorized ticket. `existing` is empty: a new note has no
         # prior tags to carry over.
+        machine_tags_authorized = False
+        if _machine_tag_mutation_requested(None, replace=tags or []):
+            authorization = _has_officer_authority(context, project_id)
+            if not authorization:
+                return authorization.tool_message()
+            machine_tags_authorized = True
         _new_tags = _resolve_tags(
-            None, replace=tags or [], officer_authority=_has_officer_authority(context)
+            None,
+            replace=tags or [],
+            officer_authority=machine_tags_authorized,
         )
         tags = _new_tags.tags
         _tag_notice = _dropped_tag_notice(_new_tags.dropped)
 
         if type == "charter":
-            denied = _charter_write_denied(context)
+            denied = _charter_write_denied(context, project_id)
             if denied:
                 return denied
             # One ACTIVE charter per project (centurion.md §5) — enforced here,

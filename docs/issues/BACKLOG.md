@@ -18,8 +18,6 @@ blocking it should be taken before the next bench campaign.
 | doc | why now |
 |---|---|
 | [officer_control_plane_post_implementation_audit](officer_control_plane_post_implementation_audit.md) | **INDEX — keep `auto_pull` off.** O1–B7 mechanics exist; this audit orders the individual release/security/liveness issues below. Do not close the index until its P0 live gates pass. |
-| [officer_message_actions_trust_shared_transport_identity](officer_message_actions_trust_shared_transport_identity.md) | **P0 security / first fix.** A shared fleet transport key plus a claimed thread ID can authorize reply/escalate/ack as the officer. Establish incarnation-bound actor identity. |
-| [backlog_machine_tags_trust_any_persistent_session](backlog_machine_tags_trust_any_persistent_session.md) | **P0 security/spend.** Any persistent project session, including a viewer, is treated as officer authority for `ready`, `parallel-safe`, and charter writes. |
 | [officer_admission_does_not_lock_the_durable_post](officer_admission_does_not_lock_the_durable_post.md) | **P0 concurrency/authority.** Manual admission releases its lock before INSERT, the tick enumerates metadata instead of posts, and lifecycle changes race stale thread-keyed locks. |
 | [officer_decommission_is_not_atomic](officer_decommission_is_not_atomic.md) | **P0 data integrity.** Harvest, wake fold, route drain, unlink, and incarnation append are independent transactions and failure is swallowed. |
 | [direct_blocking_message_freeze_can_outlive_route](direct_blocking_message_freeze_can_outlive_route.md) | **P0 liveness.** Default `user_direct` can freeze before its timeout route exists, stranding job, claim, and slot forever. |

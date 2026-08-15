@@ -23,6 +23,8 @@ from uuid import UUID, uuid4
 
 from src.core.loader import canonical_config_name
 
+from .runtime_actor import issue_runtime_actor_bootstrap
+
 logger = logging.getLogger(__name__)
 
 # Must exceed the executor's 120s shutdown/abort budget plus local backend and
@@ -368,6 +370,20 @@ class AgentProvisioner:
                 )
                 return None
 
+        runtime_actor_bootstrap: Optional[str] = None
+        if purpose == "session" and thread_id:
+            try:
+                runtime_actor_bootstrap = await issue_runtime_actor_bootstrap(
+                    self._db, thread_id
+                )
+            except Exception:
+                logger.exception(
+                    "Could not issue runtime actor bootstrap for session %s; "
+                    "refusing to provision an identity-less pod",
+                    thread_id,
+                )
+                return None
+
         manifest = self._build_pod_manifest(
             pod_name=pod_name,
             purpose=purpose,
@@ -379,6 +395,7 @@ class AgentProvisioner:
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
             pvc_name=pvc_name,
+            runtime_actor_bootstrap=runtime_actor_bootstrap,
         )
 
         try:
@@ -1388,6 +1405,7 @@ class AgentProvisioner:
         memory_limit: str,
         expert_id: Optional[str] = None,
         pvc_name: Optional[str] = None,
+        runtime_actor_bootstrap: Optional[str] = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for an agent.
 
@@ -1501,6 +1519,10 @@ class AgentProvisioner:
                     {
                         "name": "SESSION_BOUND_THREAD_ID",
                         "value": thread_id or "",
+                    },
+                    {
+                        "name": "SRW_RUNTIME_ACTOR_BOOTSTRAP",
+                        "value": runtime_actor_bootstrap or "",
                     },
                     {
                         "name": "SESSION_JWT_SECRET",

@@ -6,7 +6,7 @@ tags:
   - knowledge
   - authorization
   - security
-status: open
+status: resolved
 priority: P0
 created: 2026-08-15
 aliases:
@@ -20,7 +20,8 @@ related:
 
 # Backlog machine tags trust any persistent session as officer authority
 
-**Status:** OPEN SECURITY/SPEND BLOCKER. Audit finding **BP-09**.
+**Status:** **RESOLVED on `develop`** (2026-08-15), pending deployment. Audit finding
+**BP-09**.
 
 ## Problem
 
@@ -63,6 +64,36 @@ Test the full matrix for `ready`, removal/re-ready, `parallel-safe`, and charter
 
 Additionally, a denied write must not change `ready_at`, tags, the vector projection, or
 the canonical file; it must return an explicit authorization result and audit actor.
+
+## Resolution
+
+BP-09 consumes the same server-derived `RuntimeActorContext` and authorization service as
+OC-02. The context is attached only to the exact writable native knowledge binding, and the
+orchestrator revalidates its project, current human role, thread, and officer incarnation
+before either a machine-tag or charter mutation. A thread ID or Centurion configuration flag
+has no authority by itself.
+
+The policy awaiting explicit Legate confirmation is centralized as the single named constant
+`SENSITIVE_KNOWLEDGE_HUMAN_ROLE_POLICY`: project `owner` and global `admin` are allowed;
+`viewer` and `editor` are denied. This implements the specified safe default without silently
+choosing editor authority. Conference actors pass through this same authenticated-human role
+matrix. A future Legate decision is one constant edit plus its matrix tests, not an audit of
+multiple write paths.
+
+Sensitive requests are authorized before any graph, vector, `ready_at`, tag, or canonical-file
+mutation. A denial returns a structured authorization code/actor from the server and an
+explicit tool result ending in “No changes were made.” Worker-side tag stripping remains as
+defense in depth, but the sensitive request itself now fails atomically.
+
+| Acceptance gate | Automated evidence |
+|---|---|
+| Full caller matrix for `ready`, removal, re-ready, and `parallel-safe` | `TestOfficerOnlyTags::test_sensitive_tag_human_role_matrix` |
+| Full caller matrix for charter creation/writes | `TestCharterWriteAuthority::test_charter_human_role_matrix` |
+| Officer for another project or an old incarnation is denied | shared server tests `test_project_a_credential_cannot_act_on_project_b` and `test_recommission_invalidates_old_incarnation_immediately` |
+| Denied tag write changes no tags/`ready_at`, graph, vector row, or canonical file | `test_denied_machine_tag_write_has_zero_projection_or_file_side_effects` |
+| Denied charter write changes no graph, vector row, or canonical file | `test_denied_charter_update_has_zero_side_effects` |
+| A graph type-read failure cannot bypass charter authorization | `test_graph_type_read_failure_refuses_before_any_update` |
+| Denials are explicit and actor-audited | runtime-actor authorization denial tests plus both zero-side-effect tool tests |
 
 ## Dependencies
 

@@ -288,6 +288,9 @@ class ToolContext:
     knowledge_bindings: List["KnowledgeBinding"] = field(
         default_factory=list
     )  # Native + selected external OKF KB scopes
+    runtime_actor: Optional[Any] = (
+        None  # Hidden server-derived RuntimeActorContext; never a tool argument
+    )
     _project_id: Optional[str] = None  # Project UUID for knowledge scoping
     _project_ids: List[str] = field(
         default_factory=list
