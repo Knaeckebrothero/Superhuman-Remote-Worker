@@ -27,9 +27,7 @@ from src.shared.runtime_actor import (
 
 
 ACCESS_TTL_SECONDS = int(os.environ.get("RUNTIME_ACTOR_ACCESS_TTL_SECONDS", "300"))
-REFRESH_TTL_SECONDS = int(
-    os.environ.get("RUNTIME_ACTOR_REFRESH_TTL_SECONDS", "86400")
-)
+REFRESH_TTL_SECONDS = int(os.environ.get("RUNTIME_ACTOR_REFRESH_TTL_SECONDS", "86400"))
 BOOTSTRAP_TTL_SECONDS = int(
     os.environ.get("RUNTIME_ACTOR_BOOTSTRAP_TTL_SECONDS", "900")
 )
@@ -157,9 +155,10 @@ async def derive_runtime_actor(
                 if isinstance(config_override, dict)
                 else None
             )
-            if isinstance(officer_config, dict) and officer_config.get(
-                "conference"
-            ) is True:
+            if (
+                isinstance(officer_config, dict)
+                and officer_config.get("conference") is True
+            ):
                 caller_kind = "conference"
 
     return RuntimeActorContext(
@@ -250,9 +249,7 @@ async def mint_thread_runtime_actor(
     thread_id: str,
     project_ids: list[str] | tuple[str, ...] | None = None,
 ) -> RuntimeActorContext:
-    actor = await derive_runtime_actor(
-        db, thread_id=thread_id, project_ids=project_ids
-    )
+    actor = await derive_runtime_actor(db, thread_id=thread_id, project_ids=project_ids)
     return await mint_runtime_actor(db, actor)
 
 
@@ -268,9 +265,7 @@ async def issue_runtime_actor_bootstrap(db: Any, thread_id: str) -> str:
     """Create one unique, short-lived workload bootstrap for a session pod."""
 
     token = _token("srb")
-    expires_at = datetime.now(timezone.utc) + timedelta(
-        seconds=BOOTSTRAP_TTL_SECONDS
-    )
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=BOOTSTRAP_TTL_SECONDS)
     async with db.acquire() as conn:
         await conn.execute(
             """
@@ -328,11 +323,7 @@ def _header_values(request: Any, name: str) -> list[str]:
     getter = getattr(headers, "getlist", None)
     if callable(getter):
         raw_values = getter(name)
-        return [
-            part.strip()
-            for value in raw_values
-            for part in str(value).split(",")
-        ]
+        return [part.strip() for value in raw_values for part in str(value).split(",")]
     try:
         value = headers.get(name)
     except Exception:
@@ -491,7 +482,9 @@ async def _audit_denial(
 
 
 def _http_denial(error: RuntimeActorCredentialError, *, action: str) -> HTTPException:
-    actor = error.actor.audit_payload() if error.actor else {"caller_kind": "unresolved"}
+    actor = (
+        error.actor.audit_payload() if error.actor else {"caller_kind": "unresolved"}
+    )
     return HTTPException(
         status_code=403,
         detail={
@@ -551,9 +544,7 @@ async def authorize_runtime_actor_request(
             )
         return actor
     except RuntimeActorCredentialError as error:
-        await _audit_denial(
-            db, request, error, action=action, project_id=project_id
-        )
+        await _audit_denial(db, request, error, action=action, project_id=project_id)
         raise _http_denial(error, action=action) from error
 
 
@@ -562,9 +553,7 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
 
     action = "refresh"
     try:
-        token = _required_request_token(
-            request, RUNTIME_ACTOR_REFRESH_HEADER, "srr"
-        )
+        token = _required_request_token(request, RUNTIME_ACTOR_REFRESH_HEADER, "srr")
         async with db.acquire() as conn:
             row = await conn.fetchrow(
                 """

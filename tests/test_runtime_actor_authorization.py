@@ -31,8 +31,7 @@ def _request(*values: str) -> MagicMock:
     request.method = "POST"
     request.headers = Headers(
         raw=[
-            (RUNTIME_ACTOR_HEADER.lower().encode(), value.encode())
-            for value in values
+            (RUNTIME_ACTOR_HEADER.lower().encode(), value.encode()) for value in values
         ]
     )
     request.url.path = "/api/runtime-actors/authorize"
@@ -265,9 +264,7 @@ async def test_recommission_invalidates_old_incarnation_immediately():
         await service._current_actor(db, old_actor)
     assert exc.value.code == "runtime_not_current"
 
-    with patch.object(
-        service, "_actor_for_access", AsyncMock(return_value=old_actor)
-    ):
+    with patch.object(service, "_actor_for_access", AsyncMock(return_value=old_actor)):
         with pytest.raises(HTTPException) as denied:
             await service.authorize_runtime_actor_request(
                 db,

@@ -73,9 +73,7 @@ def _session_context(
 
 
 def _worker_context():
-    ctx = _session_context(
-        thread_id=None, caller_kind="worker", project_role=None
-    )
+    ctx = _session_context(thread_id=None, caller_kind="worker", project_role=None)
     ctx.job_id = str(uuid.uuid4())
     return ctx
 
