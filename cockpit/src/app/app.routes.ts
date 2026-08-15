@@ -16,7 +16,6 @@ import {ExpertsPageComponent} from './views/experts/experts-page.component';
 import {ExpertEditorComponent} from './views/experts/expert-editor.component';
 import {SkillsPageComponent} from './views/skills/skills-page.component';
 import {SkillEditorComponent} from './views/skills/skill-editor.component';
-import {AutomationsPageComponent} from './views/automations/automations-page.component';
 import {authGuard} from './core/guards/auth.guard';
 import {adminGuard} from './core/guards/admin.guard';
 import {projectAccessGuard} from './core/guards/project-access.guard';
@@ -61,7 +60,15 @@ export const routes: Routes = [
   { path: 'skills', component: SkillsPageComponent, canActivate: [authGuard] },
   { path: 'skills/new', component: SkillEditorComponent, canActivate: [authGuard] },
   { path: 'skills/:id/edit', component: SkillEditorComponent, canActivate: [authGuard] },
-  { path: 'automations', component: AutomationsPageComponent, canActivate: [authGuard] },
+  // Automations loads on demand: the schedule editor is the only screen that
+  // needs cronstrue + cron-parser, and both are CommonJS, so keeping the route
+  // eager taxed every page load with a cron library it would never call.
+  {
+    path: 'automations',
+    loadComponent: () =>
+      import('./views/automations/automations-page.component').then(m => m.AutomationsPageComponent),
+    canActivate: [authGuard],
+  },
   { path: 'settings', component: SettingsComponent, canActivate: [authGuard] },
   { path: 'settings/api-keys', component: ApiKeysPageComponent, canActivate: [authGuard] },
   // Admin and the workbench load on demand. They are large (the config, usage
