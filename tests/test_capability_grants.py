@@ -40,6 +40,7 @@ def test_catalog_keys_and_defaults():
         "public_datasources",
         "email_autonomous_send",
         "catalog_authoring",
+        "complete_unmerged_pr",
     }
     assert all(spec["restrict_only"] for spec in CATALOG.values())
     assert CATALOG["personal_default_experts"]["default"] is True
@@ -56,6 +57,10 @@ def test_catalog_keys_and_defaults():
     assert CATALOG["model_selection"]["default"] is None
     assert CATALOG["autonomy_ceiling"]["default"] == "review"
     assert CATALOG["permission_mode"]["default"] == "auto_accept"
+    # Deny-by-default and NOT backfilled: the gate can only fire on a job that
+    # carries a recorded context.pull_request, and no such job existed when the
+    # key was introduced, so there is nothing to grandfather.
+    assert CATALOG["complete_unmerged_pr"]["default"] is False
 
 
 def test_meet_bool_enum_list():
@@ -597,6 +602,11 @@ _NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP = {
     "email_autonomous_send": (
         "gates datasource.unattended_send at the datasource routes, not a "
         "field evaluate() reads on an expert fragment"
+    ),
+    "complete_unmerged_pr": (
+        "gates the terminal job transition against LIVE forge state at "
+        "approve_job and the autonomous seal — there is no config fragment "
+        "to strip, so evaluate() never reads it"
     ),
 }
 

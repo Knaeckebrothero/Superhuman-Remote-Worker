@@ -16868,6 +16868,43 @@ class JobApproveRequest(BaseModel):
     notes: str | None = Field(None, description="Optional reviewer notes")
 
 
+async def _unmerged_pr_gate_reason(
+    job: dict[str, Any], *, user: dict[str, Any] | None
+) -> str | None:
+    """Why this job may not be sealed yet, or ``None`` if nothing blocks it.
+
+    The single gate behind BOTH terminal paths — ``approve_job`` (a human
+    clicking approve) and the autonomous seal — so the two can never drift.
+
+    Ordered by cost. A job that never opened a pull request is outside this
+    feature entirely and must cost no I/O at all; a principal holding
+    ``complete_unmerged_pr`` short-circuits before the forge is contacted.
+
+    The principal is the calling user, or — on the internal/agent path, where
+    ``require_internal_or_job_access`` yields ``None`` — the job's owner. An
+    unresolvable principal holds no grant and therefore does not lift the
+    block. Spec: docs/features/merged_pr_completion_grant.md §5.
+    """
+    from services.job_delivery import parse_job_pull_request, unmerged_pr_block_reason
+
+    if parse_job_pull_request(job.get("context")) is None:
+        return None
+
+    principal = user
+    if principal is None:
+        owner_id = job.get("user_id")
+        principal = await postgres_db.get_user(str(owner_id)) if owner_id else None
+
+    project_id = job.get("project_id")
+    if principal is not None and await postgres_db.user_can_complete_unmerged_pr(
+        principal, project_id
+    ):
+        return None
+
+    datasources = await postgres_db.resolve_datasources_for_job(str(job.get("id")))
+    return await unmerged_pr_block_reason(job, datasources=datasources)
+
+
 @app.post("/api/jobs/{job_id}/approve")
 async def approve_job(
     req: Request,
@@ -16889,7 +16926,7 @@ async def approve_job(
     4. Removes job_frozen.json from the Gitea repo
     5. Updates DB status to 'completed' with completed_at timestamp
     """
-    _, job = await require_internal_or_job_access(req, postgres_db, job_id)
+    user, job = await require_internal_or_job_access(req, postgres_db, job_id)
     if request is None:
         request = JobApproveRequest()
     await _guard_completion_control(job_id, source="public_approve")
@@ -16911,6 +16948,16 @@ async def approve_job(
                     "This job has a pending project-cloud diff. Use the diff "
                     "accept or reject action so cloud delivery is resolved "
                     "before the job becomes terminal."
+                ),
+            )
+        unmerged_pr = await _unmerged_pr_gate_reason({**job, "id": job_id}, user=user)
+        if unmerged_pr is not None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"This job cannot be completed yet: {unmerged_pr}. Merge the "
+                    "pull request first, or fail the job if the work was "
+                    "rejected."
                 ),
             )
         control_claim = await _claim_completion_control(
@@ -23593,6 +23640,7 @@ async def _complete_job_legacy(
         is_verification_enabled,
         should_persist_completion_freeze,
         should_reset_recovery_counter,
+        unmerged_pr_seal_status,
     )
 
     try:
@@ -24990,6 +25038,20 @@ async def _complete_job_legacy(
             if mode_a_capture["captured"] and new_status == "completed":
                 new_status = "pending_review"
                 actions.append("mode A diff captured -> pending_review")
+
+        # A job whose deliverable is a pull request is not done while that PR is
+        # open. Routed to human review rather than refused, because refusing a
+        # self-sealing job would strand it. Sibling of the mode A downgrade
+        # above; both are deliberate exceptions to `full` autonomy being
+        # terminal (docs/issues/full_autonomy_is_not_actually_terminal.md).
+        if new_status == "completed":
+            new_status, unmerged_pr_action = unmerged_pr_seal_status(
+                new_status,
+                loop_id=_completion_loop_id,
+                reason=await _unmerged_pr_gate_reason({**job, "id": job_id}, user=None),
+            )
+            if unmerged_pr_action:
+                actions.append(unmerged_pr_action)
 
         # Step 4 is selected only by the immutable value captured on this
         # command at admission. A process-global flag must never reinterpret a

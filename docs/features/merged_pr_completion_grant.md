@@ -123,12 +123,23 @@ admin-owned job is unaffected.
 Both points consult the same predicate and the same capability. Neither duplicates forge
 knowledge.
 
-### 5c. The loop needs no special case
+### 5c. Loop jobs are excluded from the downgrade
 
-The cloud-diff downgrade had to exclude loop jobs explicitly (`not _completion_loop_id`,
-`main.py:24955`). This gate does not: the principal is the job owner and admins short-circuit,
-so an admin-owned loop bypasses it for free. If loops are ever run by non-admins, that becomes
-a deliberate decision rather than an oversight.
+**Changed during implementation.** The design originally argued no special case was needed,
+because the principal is the job owner and admins short-circuit, so an admin-owned loop
+bypasses the gate for free. That reasoning holds for the *human* path and is why 5a needs no
+loop check.
+
+It is not sufficient for 5b. Admin bypass makes the exclusion unnecessary *only while every
+loop is admin-owned*, which is a property of today's deployment rather than of the code. If a
+non-admin ever runs a loop, the downgrade would park it in `pending_review` where the loop
+advance never fires — a stall, which is the specific failure this project treats as worse than
+a bad write. `unmerged_pr_seal_status` therefore excludes loop jobs explicitly, exactly as the
+cloud-diff downgrade does (`not _completion_loop_id`, `main.py:24955`), and the pure gate pins
+it with a test.
+
+The loop also owns its own delivery and merge (`should_merge_job_contribution` returns early
+for loop jobs), so its pull requests are a different lifecycle from a one-shot job's.
 
 ## 6. Accepted limitations
 
