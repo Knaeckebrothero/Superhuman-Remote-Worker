@@ -22,14 +22,42 @@ related:
 
 **No longer a deployment blocker.** The false stamp is fixed: `classify_dispatch`
 normalizes the notifier result into one `DeliveryOutcome`, only an accepted
-outcome stamps `user_delivery_at`, and the message-log status derives from the
-same value so the two cannot disagree. The reconciler retries exactly while the
+outcome stamps `user_delivery_at`, and the reconciler retries exactly while the
 stamp is null, so liveness holds.
+
+**Verified live on k3d 2026-08-15** during the OC-01 pass, against a genuine
+delivery failure (no notification channel configured):
+
+* the send returned 200 with `email_delivered: false`
+* `user_delivery_at` stayed NULL — the gate held
+* the reconciler picked the route up on the tick after the 180 s grace and
+  every 30 s after, logging `delivery not accepted for route db8115d2 (no
+  channel reported success) — leaving retryable`
 
 What is left is observability, not correctness: persisting attempt count, last
 error/class and next-retry on the route so a stuck delivery is diagnosable
 without reading logs. That needs a schema change, which is why it was not done
 under deployment pressure.
+
+## Correction: message-log status does NOT yet derive from the outcome
+
+An earlier revision of this note claimed the message-log status and the route
+state derive from the same value "so the two cannot disagree". That is not true
+of the **blocking** path, confirmed by the live row above.
+
+`main.py::send_agent_message` writes the blocking message inside the freeze
+transaction with `"status": "sent"` hard-coded and no error field, and the
+post-dispatch branch only sets the email id and (conditionally) the delivery
+stamp. So a blocking send whose delivery failed leaves `message_log.status =
+'sent'` with `error_message` NULL. The async branch, by contrast, passes
+`error_message="Email not configured or send failed"`, so the failure *is*
+recorded there.
+
+Liveness is unaffected — the reconciler keys on `user_delivery_at`, not on the
+message log — but the message log is the surface a human reads, and on the
+blocking path it currently shows no trace that delivery failed. Folding
+`error_message` into the same normalized outcome is part of this issue's
+remaining scope and is cheaper than the attempt-count schema change.
 
 ## Problem
 
