@@ -487,3 +487,120 @@ async def test_open_route_listing_for_sitrep(db):
         actor_kind="officer",
     )
     assert await db.list_open_worker_message_routes(seed["project_id"]) == []
+
+
+# =============================================================================
+# OC-04 — the resume CAS is on the route GENERATION, not just the status
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_resume_refuses_a_stale_route_generation(db):
+    """The ABA race, against real transactional state.
+
+    A job waits on route A, resumes, then waits again on route B. A delayed
+    actor for A still sees ``status='waiting_for_reply'`` — the old CAS would
+    have let it resume B's wait, unblocking a worker whose question nobody
+    answered.
+    """
+    seed = await _seed(db)
+    route_a = _route_dict(seed)
+    assert await db.create_routed_blocking_freeze(
+        seed["job_id"],
+        _freeze(route_a),
+        route=route_a,
+        message_entry=_MESSAGE_ENTRY,
+        expected_lane="pinned",
+    )
+
+    # A is answered: the job resumes on its own generation.
+    assert await db.queue_job_for_resume(
+        seed["job_id"],
+        {},
+        expected_status="waiting_for_reply",
+        expected_route_id=route_a["route_id"],
+    )
+
+    # The job asks again and freezes on a NEW route.
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET status='processing' WHERE id=$1::uuid", seed["job_id"]
+        )
+    route_b = _route_dict(seed)
+    assert await db.create_routed_blocking_freeze(
+        seed["job_id"],
+        _freeze(route_b),
+        route=route_b,
+        message_entry=_MESSAGE_ENTRY,
+        expected_lane="pinned",
+    )
+
+    # The delayed actor for A arrives. Status matches; the generation does not.
+    assert not await db.queue_job_for_resume(
+        seed["job_id"],
+        {},
+        expected_status="waiting_for_reply",
+        expected_route_id=route_a["route_id"],
+    )
+
+    async with db.acquire() as conn:
+        job = await conn.fetchrow(
+            "SELECT status, freeze_data FROM jobs WHERE id=$1::uuid", seed["job_id"]
+        )
+    assert job["status"] == "waiting_for_reply"
+    assert json.loads(job["freeze_data"])["route_id"] == route_b["route_id"]
+
+    # B's own actor still wins.
+    assert await db.queue_job_for_resume(
+        seed["job_id"],
+        {},
+        expected_status="waiting_for_reply",
+        expected_route_id=route_b["route_id"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_reply_and_timeout_race_resolves_exactly_once(db):
+    """Both actors hold the SAME generation; the database picks one winner."""
+    seed = await _seed(db)
+    route = _route_dict(seed)
+    assert await db.create_routed_blocking_freeze(
+        seed["job_id"],
+        _freeze(route),
+        route=route,
+        message_entry=_MESSAGE_ENTRY,
+        expected_lane="pinned",
+    )
+
+    results = await asyncio.gather(
+        db.queue_job_for_resume(
+            seed["job_id"],
+            {},
+            expected_status="waiting_for_reply",
+            expected_route_id=route["route_id"],
+        ),
+        db.queue_job_for_resume(
+            seed["job_id"],
+            {},
+            expected_status="waiting_for_reply",
+            expected_route_id=route["route_id"],
+        ),
+    )
+    assert sum(1 for r in results if r) == 1, results
+
+
+@pytest.mark.asyncio
+async def test_an_unrouted_freeze_keeps_the_status_only_cas(db):
+    """Backwards compatibility: a freeze with no route_id (an ordinary pause,
+    or a pre-routing job) must still resume on status alone."""
+    seed = await _seed(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET status='waiting_for_reply', "
+            'freeze_data=\'{"type":"blocking_message"}\'::jsonb '
+            "WHERE id=$1::uuid",
+            seed["job_id"],
+        )
+    assert await db.queue_job_for_resume(
+        seed["job_id"], {}, expected_status="waiting_for_reply"
+    )
