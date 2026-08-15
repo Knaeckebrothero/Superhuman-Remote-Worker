@@ -5,7 +5,7 @@ tags:
   - communication
   - notifications
   - liveness
-status: open
+status: resolved
 priority: P1
 created: 2026-08-15
 aliases:
@@ -18,7 +18,14 @@ related:
 
 # A failed routed notification is stamped as delivered
 
-**Status:** OPEN. Audit finding **OC-06**.
+**Status:** RESOLVED (core) 2026-08-15. Audit finding **OC-06**.
+
+`classify_dispatch` normalizes the notifier result into one `DeliveryOutcome`;
+only an accepted outcome stamps `user_delivery_at`, and the message-log status
+derives from the same value so the two cannot disagree. **Still owed:** the
+persisted attempt count / last error / next retry — that needs a schema change,
+and the liveness property (the reconciler retries while the stamp is null) holds
+without it.
 
 ## Problem
 

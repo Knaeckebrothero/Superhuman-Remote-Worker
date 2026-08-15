@@ -5,7 +5,7 @@ tags:
   - communication
   - concurrency
   - liveness
-status: open
+status: resolved
 priority: P0
 created: 2026-08-15
 aliases:
@@ -19,7 +19,14 @@ related:
 
 # Message reply and timeout resume only the status, not the route generation
 
-**Status:** OPEN — concurrency/liveness blocker. Audit finding **OC-04**.
+**Status:** RESOLVED 2026-08-15. Audit finding **OC-04**.
+
+`freeze_data.route_id` is the generation token: the resume CAS takes
+`expected_route_id` and requires the job to still be frozen on that route.
+Reply, officer reply and the timeout reconciler all pass it; an unrouted freeze
+passes None and keeps the status-only CAS. Acceptance is tested against real
+Postgres — a stale generation is refused while the current one still wins, and
+two actors racing one generation produce exactly one winner.
 
 ## Problem
 
