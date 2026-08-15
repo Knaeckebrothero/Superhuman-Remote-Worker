@@ -114,8 +114,48 @@ That is the exact failure mode that started this work, prevented. Cause was oper
 the connector was linked to the project but `auto_attach=false`, and `datasource_ids` was
 omitted, so the code never reached the job. Fixed at source (`auto_attach=true`).
 
-Also observed: the **deliverable gate bounced once** and the agent corrected — the contract
-mechanism works.
+**The deliverable gate bounced, and this doc previously scored that backwards.** It said the
+bounce proved "the contract mechanism works". It proved the opposite: the gate emitted a
+**false negative**, and the agent recovered by defeating a deliberate platform invariant.
+
+The contract required `repos/KurortEngine/docs/design/theme.md` and `…/theme-preview.html`.
+Cloned repository datasources land at `repos/<name>/`, which the platform **gitignores at seed
+time on purpose** (`src/core/workspace.py`, `src/core/datasource_setup.py`,
+`src/tools/orchestrator/repositories.py` — "working-tree only; never versioned", guarding the
+contentless-gitlink bug `b1758f38`). So the gate demanded a git-tracked path the platform
+refuses to track.
+
+The two halves of the contract read different substrates and only agree when the deliverable
+sits in the job's own versioned tree:
+
+| half | reads | verdict on `repos/KurortEngine/docs/design/theme.md` |
+|---|---|---|
+| agent (`resolve_workspace_deliverable`) | live filesystem | present, accepted |
+| orchestrator (`evaluate_deliverable_gate`) | Gitea job tree | missing → bounce |
+
+Both normalize the **singular** `repo/` prefix (the F14 fix, `deliverable_gate.py:86`);
+neither knows the plural `repos/`. One character apart, opposite meanings.
+
+To pass, the agent moved `repos/KurortEngine/.git` aside, un-ignored exactly those two paths,
+committed them into the job repo, then restored `.git` and reverted `.gitignore` — git keeps
+tracking files once added. Surgical and honestly documented in `output/job_frozen.json`, with
+no `src/`/`tests/`/`spec/` leakage. It was cornered, not sloppy.
+
+**This is the same blind spot as §6a, in a different module.** `job_delivered_nothing` was
+taught on 08-14 that a pushed branch plus an open PR is delivery. The gate never got that
+lesson: `deliverable_gate.py` contains no reference to `pull_request` and was last modified
+08-07. `context.pull_request` is sitting right there — orchestrator-written, `verified: true`,
+fails closed on malformed records — and the gate does not look at it.
+
+Filed as `docs/issues/deliverable_gate_cannot_see_cloned_repo_deliverables.md`.
+**Unfixed, and it blocks a clean step 12**: every loop code turn has this shape, costing two
+resume cycles and then either the `.gitignore` workaround or demotion to `pending_review` for
+work that actually shipped.
+
+Not a risk here, checked: the full-squash-merge fallback in `merge_loop_job_contribution`
+(none-of-the-contracted-files-present → full merge) is **unreachable for loop jobs** —
+`should_merge_job_contribution` returns early with "loop job (the loop advance owns its
+merge)" (`completion.py:939`).
 
 ## 6. What remains
 
