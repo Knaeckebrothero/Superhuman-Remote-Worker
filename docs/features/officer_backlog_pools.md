@@ -39,8 +39,9 @@ related:
 
 ## Status
 
-**BUILDING (2026-08-15).** **B1 and B2 have landed**; everything this document depends on
-is in. Next is B3 — the claim funnel and the tick, the bulk of the new code.
+**BUILDING (2026-08-15).** **B1, B2 and B3 have landed** — the tick is built, mounted and
+dormant (`auto_pull` ships off). What remains is surfacing (B4 sitrep/capacity lines, B5
+prompt doctrine, B6 cockpit) and the live-fire acceptance run.
 The six §13 defaults are **decided** — no open question, no pending approval. Two of those
 decisions changed the design: the ready floor scales with pool capacity rather than being a
 constant, and there are **no per-ticket budget caps** (the officer is the brake; §3 records
@@ -628,13 +629,11 @@ ticket edits, not more gates.
 Everything below was verified against the tree on 2026-08-15. File anchors are given as
 symbol names, not line numbers (line numbers drift; grep the symbol).
 
-**Migrations.** Next free app migration is **0160** (0157 `project_officers`, 0158 tool-group
-marker repair, 0159 `job_message_routes` are applied); if B3 adds the partial unique index
-on the ticket stamp (§5.3), that is it. Next free **vector** migration is **0021** — B2
-took 0020 for `knowledge_index.ready_at`. (The original "v1 needs no migration" claim held
-only for the *app* DB: category/expert/ready ride `knowledge_index.tags` and `auto_pull`
-rides the post row's `config_override`, but readiness needed a queryable timestamp, not a
-tag.) Regenerate `schema_current.sql` and bump `APP_CURRENT_MIGRATION_HEAD`
+**Migrations.** Next free app migration is **0161** (B3 took 0160 for
+`uq_jobs_active_ticket_claim`); next free **vector** migration is **0021** (B2 took 0020
+for `knowledge_index.ready_at`). The original "v1 needs no migration" claim was wrong in
+both directions: readiness needed a queryable timestamp rather than a tag, and the
+double-claim backstop needed an index. Regenerate `schema_current.sql` and bump `APP_CURRENT_MIGRATION_HEAD`
 (`tests/test_infrastructure_metering_migrations.py`) whenever a migration lands.
 
 **The post row (B3's home for `auto_pull` + breaker state).** `project_officers` per
@@ -649,14 +648,15 @@ pattern to copy for breaker/ramp state), `merge_project_officer_communication_po
 Config-vs-runtime split per §10 is already enforced by these helpers' shapes: kit/policy on
 the row, live counters in the thread's `officer_state`.
 
-**Dispatch admission is still inline — B3 extracts it.** The officer hold fence, the
-advisory-locked in-flight count, `officer_slots.admit()`, and the slot config patch live
-inside the `POST /api/jobs` handler in `orchestrator/main.py` (grep `officer_slot_admit`).
-There is still no callable funnel: the tick must reuse the extracted helper plus the
-loop-style internal spawn (`_spawn_loop_job` → `db.create_job` + `provision_job_repo` +
-`_trigger_dispatch`), exactly as §5.4 specifies. The advisory lock still does not span the
-INSERT, so §5.3's single-transaction claim+create (or the partial unique index backstop)
-remains required.
+**Dispatch admission was extracted by B3 (2026-08-15).** The officer hold fence, the
+advisory-locked lineage in-flight count and `officer_slots.admit()` now live in
+`orchestrator/services/officer_admission.py` — `admit()` for the endpoint (own short
+transaction) and `admit_in_transaction()` for the tick, whose transaction stays open
+through its own INSERT via `create_job(conn=…)`. Both count **all non-terminal statuses**.
+The internal spawn mirrors `_spawn_loop_job` (`db.create_job` + `provision_job_repo` +
+`_trigger_dispatch`), with `_provision_officer_ticket_repo` /
+`_enforce_officer_ticket_grants` in `main.py` as the injected adapters so the service
+never imports main.
 
 **Liveness (§5's stale-claim ages, free).** `orchestrator/services/job_liveness.py`:
 `compute_job_liveness(...)` and the batch `compute_jobs_liveness(...)` — the batch form was
@@ -771,25 +771,53 @@ the tick.
     had already been chased once by `priority`; all four are now absolute, with the
     reason recorded. New suites: `tests/test_backlog_ticket_plumbing.py` (28) plus
     filter/claim coverage in `tests/test_project_backlog.py`.
-- **B3 — claim funnel + tick** (the bulk): extract the officer-admission helper from
-  `main.py:12318-12378`; conn-accepting `create_job` variant so claim check + capacity +
-  INSERT share one advisory-locked transaction **[A1]**; partial unique index on the ticket
-  stamp (fail-closed double-claim backstop); one-shot eligibility query (ready_at vs newest
-  claim `created_at`); `ticket=` parameter on `create_worker_job` through the same helper
-  **[X]**; internal spawn path mirroring `_spawn_loop_job` (+ `provision_job_repo` +
-  `_trigger_dispatch` + explicit grant check); autonomy-`full` stamp (loop-exemption
-  precedent `main.py:16727`); non-terminal capacity/serialization predicate; executor
-  disposition gate; **optional** spend-ceiling check via
-  `query_usage(scope_project_id=…)` (century- and slot-level, skipped entirely when
-  unset — §13.3; **no per-ticket caps**, §13.4); breaker in `officer_state`
-  (job-failures-only, per-pool); capacity-scaled floor-breach officer wake (floor = the
-  pool's slot count, §13.2, debounced 6 h/pool); stale-claim detection at 4 h with a
-  24 h page for `pending_review` claims (§13.5); `run_when_leader` mount.
-  Stale-claim classification reuses [[officer_supervision_surface]] E3's shared liveness
-  result; the tick does not invent a second `updated_at` threshold.
-  Observability: per-tick log line `officer=<id8> pool=<name> dispatched=<note>/<job8> |
-  skip=<reason>` **[X]**.
-- **B4 — slots**: `category` in `_SPEC_KEYS`/validation; precedence law in admit/kickoff;
+- **B3 — claim funnel + tick — DONE (2026-08-15).** `orchestrator/services/
+  officer_admission.py` (the extracted hold fence + advisory-locked lineage count +
+  `admit()`, shared by the endpoint and the tick), `orchestrator/services/
+  officer_backlog.py` (the tick), app migration **0160** (`uq_jobs_active_ticket_claim`),
+  `create_job(conn=…)`, `ticket=` on `POST /api/jobs`, `run_when_leader` mount, log line
+  `officer=<id8> pool=<name> dispatched=<note>/<job8> | skip=<reason>`. Tests:
+  `tests/test_officer_backlog_tick.py` (44).
+  - **The in-flight predicate moved to all-non-terminal for BOTH paths, not just the
+    tick.** The endpoint counted `('created','processing')`. Sharing one helper with two
+    predicates would have let the officer hand-dispatch into a slot a paused job still
+    owns — the same double-executor failure, reached through the direct path. A slot now
+    means "occupied until the job is actually done"; the officer gets a truthful 409 and
+    can resume or cancel the stalled job. Deliberate tightening, fail-safe direction.
+  - **The claim is re-read under the lock**, so a racing replica is a quiet skip rather
+    than a unique-index stack trace. Only the app-side half can be closed this way —
+    `ready_at` lives in the vector DB and cannot join the transaction, which is the
+    residual window §5 already accepts.
+  - **Three bugs a mocked test could not have caught**, found by reading the schema:
+    `runner_kind="officer"` violates `jobs_runner_kind_check` (accepts user | lifecycle |
+    service) — and `lifecycle` is not merely legal but *correct*, being the class whose
+    grants raise the autonomy ceiling to full; `autonomy: "full"` belongs in
+    `config_override`, not `context`, because that is what both grant PEPs read; and
+    `list_officer_threads` did not select `user_id`, so every tick job would have been
+    created **ownerless** and failed at dispatch with no grants to resolve. The tick's
+    grant check is therefore `_enforce_officer_ticket_grants` (runner_kind=lifecycle,
+    raising `GrantDenied`) rather than `_enforce_job_create_grants` (runner_kind=user,
+    raising HTTPException — which would both deny the exemption and throw a 422 inside a
+    background loop).
+  - **Migration 0160 carries exactly one statement.** A multi-statement `.notx.sql` is
+    sent as a simple query, Postgres wraps that in an implicit transaction, and
+    `CONCURRENTLY` refuses to run there — the `COMMENT ON INDEX` moved into the file
+    header instead of costing a second migration. It also scopes to
+    `(project_id, ticket)`: note ids are slugs unique only within a project, so a global
+    index would let one project's claim block another's.
+  - `_SPEC_KEYS` gains `category` and `spend_ceiling_daily` here rather than in B4 —
+    without the first, a categorized roster cannot be provisioned and the tick is dead
+    code; without the second, §13.3's per-slot ceiling would be a config key that does
+    nothing. `usage_ledger.query_usage` gained a `ref_ids` set form so the per-slot
+    ceiling can actually be costed (the job set is in the app DB, the events are in the
+    audit DB, so no join is available).
+  - Stale-claim detection reads `updated_at` deliberately and only here: this is the
+    control-plane question "has anything touched this row", not the liveness verdict —
+    the sitrep still gets its reading from `compute_jobs_liveness`.
+  - **Not built:** the stale-claim list and breaker state are written to `officer_state`
+    for B4/B6 to render; nothing surfaces them yet.
+- **B4 — slots** (`category` in `_SPEC_KEYS`/validation landed with B3): precedence law
+  in admit/kickoff;
   `capacity_lines(ready_by_category=…, oldest_claim_age=…)` + sitrep vector-db plumbing
   **[A3]**.
 - **B5 — prompts & doctrine**: §7 edits + new-wording pins; `_ROLE_BLOCKS` slimming with

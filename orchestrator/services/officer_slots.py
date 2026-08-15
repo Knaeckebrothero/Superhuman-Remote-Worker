@@ -29,6 +29,9 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
+from services.work_categories import WORK_CATEGORIES
+from services.work_categories import normalize_category as normalize_work_category
+
 # Workspace tiers a slot may pin. Mirrors the values the job funnel and
 # dispatcher understand today; extend deliberately, not defensively.
 ALLOWED_SLOT_BACKENDS = frozenset({"sandbox", "virtual", "none", "vm"})
@@ -36,7 +39,7 @@ ALLOWED_SLOT_BACKENDS = frozenset({"sandbox", "virtual", "none", "vm"})
 _SLOT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
 _MAX_SLOTS = 8
 _MAX_SLOT_COUNT = 20
-_SPEC_KEYS = frozenset({"count", "model", "backend"})
+_SPEC_KEYS = frozenset({"count", "model", "backend", "category", "spend_ceiling_daily"})
 
 # Jobs created before slots existed (or while the roster was flat) carry no
 # stamp; they surface under this label in capacity reporting.
@@ -95,6 +98,35 @@ def validate_slots_spec(slots: Any) -> dict[str, dict[str, Any]]:
                     f"{sorted(ALLOWED_SLOT_BACKENDS)}"
                 )
             entry["backend"] = backend
+        category = spec.get("category")
+        if category is not None:
+            # A slot with a category is a POOL: the auto-pull tick may fill it
+            # from ready tickets of that category. A slot without one keeps
+            # today's behaviour exactly — officer-directed dispatch only, never
+            # touched by the tick (officer_backlog_pools.md §6).
+            if normalize_work_category(category) is None:
+                raise ValueError(
+                    f"slot {name!r} category must be one of {sorted(WORK_CATEGORIES)}"
+                )
+            entry["category"] = str(category).strip().lower()
+        ceiling = spec.get("spend_ceiling_daily")
+        if ceiling is not None:
+            # Optional and unset by default (§13.3). A MiniMax research pool
+            # and a frontier executor pool differ by more than an order of
+            # magnitude in burn, so there is no global number worth defaulting
+            # to — the knob belongs beside the model and backend it prices.
+            try:
+                ceiling_value = float(ceiling)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"slot {name!r} spend_ceiling_daily must be a number of USD"
+                ) from exc
+            if ceiling_value <= 0:
+                raise ValueError(
+                    f"slot {name!r} spend_ceiling_daily must be positive "
+                    "(omit the key for no ceiling)"
+                )
+            entry["spend_ceiling_daily"] = ceiling_value
         cleaned[name] = entry
     return cleaned
 

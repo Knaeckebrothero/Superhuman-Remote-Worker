@@ -1652,6 +1652,7 @@ class PostgresDB:
         authority_user_id: str | None = None,
         authority_project_ids: list[str] | None = None,
         execution_lane: str | None = None,
+        conn: Any = None,
     ) -> Dict[str, Any]:
         """Create a new job.
 
@@ -1698,6 +1699,15 @@ class PostgresDB:
                 memberships are required at the insertion linearization point.
             execution_lane: Explicit execution plane, or None to inherit an
                 authoritative parent job's lane. Root jobs default to pinned.
+            conn: Optional caller-owned connection ALREADY inside a transaction.
+                The officer's auto-pull tick needs the ticket-claim check, the
+                slot capacity count and this INSERT to be one atomic unit: the
+                advisory lock it takes releases at transaction close, so a
+                check-then-insert across two connections leaves exactly the
+                daylight in which two replicas double-claim a ticket
+                (docs/features/officer_backlog_pools.md §5.3). Passing a conn
+                makes the caller responsible for the transaction — this method
+                opens none of its own and does not retry.
 
         Returns:
             Created job dict with id
@@ -1745,69 +1755,79 @@ class PostgresDB:
         # which is what actually makes it safe.
         description = (description or "").strip()
 
-        async with self.acquire() as conn:
-            async with _transaction_if(
-                conn, bool(datasource_uuids) or authority_user_id is not None
-            ):
-                await _lock_and_compare_policy_snapshot(
-                    conn,
-                    datasource_uuids,
-                    policy_snapshot,
-                    legacy_job_id=parent_uuid,
-                )
-                await _lock_and_validate_work_owner(
-                    conn,
-                    authority_user_id=authority_user_id,
-                    materialized_user_uuid=user_uuid,
-                    target_project_uuids=authority_project_uuids,
-                )
-                row = await conn.fetchrow(
+        async def _write(active_conn) -> Any:
+            await _lock_and_compare_policy_snapshot(
+                active_conn,
+                datasource_uuids,
+                policy_snapshot,
+                legacy_job_id=parent_uuid,
+            )
+            await _lock_and_validate_work_owner(
+                active_conn,
+                authority_user_id=authority_user_id,
+                materialized_user_uuid=user_uuid,
+                target_project_uuids=authority_project_uuids,
+            )
+            written = await active_conn.fetchrow(
+                """
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete, execution_lane)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                        COALESCE(
+                            $21::text,
+                            (SELECT parent.execution_lane
+                               FROM jobs parent
+                              WHERE parent.id = $10
+                              FOR SHARE),
+                            'pinned'
+                        ))
+                RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind, created_by_thread_id, wake_on_complete, execution_lane
+                """,
+                description,
+                document_path or document_dir,
+                config_name,
+                json.dumps(config_override) if config_override else None,
+                json.dumps(context) if context else None,
+                status,
+                user_uuid,
+                project_uuid,
+                branch_name,
+                parent_uuid,
+                priority,
+                repo_name,
+                creation_order,
+                worktree_path,
+                delegation_context,
+                UUID(expert_id) if expert_id else None,
+                runner_kind,
+                json.dumps(freeze_data) if freeze_data else None,
+                thread_uuid,
+                wake_on_complete,
+                execution_lane,
+            )
+            if datasource_uuids:
+                await active_conn.executemany(
                     """
-                    INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete, execution_lane)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                            COALESCE(
-                                $21::text,
-                                (SELECT parent.execution_lane
-                                   FROM jobs parent
-                                  WHERE parent.id = $10
-                                  FOR SHARE),
-                                'pinned'
-                            ))
-                    RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind, created_by_thread_id, wake_on_complete, execution_lane
+                    INSERT INTO job_datasources (job_id, datasource_id)
+                    VALUES ($1, $2)
                     """,
-                    description,
-                    document_path or document_dir,
-                    config_name,
-                    json.dumps(config_override) if config_override else None,
-                    json.dumps(context) if context else None,
-                    status,
-                    user_uuid,
-                    project_uuid,
-                    branch_name,
-                    parent_uuid,
-                    priority,
-                    repo_name,
-                    creation_order,
-                    worktree_path,
-                    delegation_context,
-                    UUID(expert_id) if expert_id else None,
-                    runner_kind,
-                    json.dumps(freeze_data) if freeze_data else None,
-                    thread_uuid,
-                    wake_on_complete,
-                    execution_lane,
+                    [
+                        (written["id"], datasource_uuid)
+                        for datasource_uuid in datasource_uuids
+                    ],
                 )
-                if datasource_uuids:
-                    await conn.executemany(
-                        """
-                        INSERT INTO job_datasources (job_id, datasource_id)
-                        VALUES ($1, $2)
-                        """,
-                        [
-                            (row["id"], datasource_uuid)
-                            for datasource_uuid in datasource_uuids
-                        ],
-                    )
+            return written
+
+        if conn is not None:
+            # Caller-owned transaction: no acquire, no nested transaction, no
+            # retry. Whatever lock the caller is holding must still be held
+            # when this INSERT lands, which is the entire point.
+            row = await _write(conn)
+        else:
+            async with self.acquire() as owned_conn:
+                async with _transaction_if(
+                    owned_conn, bool(datasource_uuids) or authority_user_id is not None
+                ):
+                    row = await _write(owned_conn)
 
         return dict(row)
 
@@ -9284,11 +9304,17 @@ class PostgresDB:
         return dict(row) if row else None
 
     async def list_officer_threads(self) -> List[Dict[str, Any]]:
-        """Every non-ended officer thread (fleet events + the watchdog)."""
+        """Every non-ended officer thread (fleet events + the watchdog).
+
+        ``user_id`` is the post owner. The backlog tick needs it: a job created
+        without one is ownerless, and an ownerless job has no grants to resolve
+        — it fails at dispatch rather than running with the owner's capabilities.
+        """
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT t.id, t.status, t.project_id, t.agent_id, t.metadata
+                SELECT t.id, t.status, t.project_id, t.agent_id, t.user_id,
+                       t.metadata
                   FROM threads t
                  WHERE t.status != 'ended'
                    AND COALESCE(t.metadata->'config_override'
@@ -9820,6 +9846,88 @@ class PostgresDB:
             )
         lineage = [str(r["tid"]) for r in rows]
         return lineage or [str(thread_uuid)]
+
+    async def newest_ticket_claims(
+        self, project_id: str, note_ids: List[str]
+    ) -> Dict[str, datetime]:
+        """Newest claim timestamp per backlog ticket, in ANY job status.
+
+        The one-shot claim read (officer_backlog_pools.md §5.3). Terminal jobs
+        are deliberately included: disposition is asynchronous and officer-owned,
+        so a completed job still holds its ticket until the officer reviews the
+        outcome and re-readies it. Excluding them was the original design's
+        fatal bug — every finished ticket would be re-dispatched within a
+        minute, and every failing one re-burned at breaker cadence forever.
+
+        The caller compares each value against the ticket's ``ready_at``: an
+        authorization NEWER than the newest claim means the officer has re-armed
+        it since, and only then is the ticket eligible again.
+        """
+        if not note_ids:
+            return {}
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return {}
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT context->>'ticket_note_id' AS note_id,
+                       MAX(created_at) AS newest
+                  FROM jobs
+                 WHERE project_id = $1
+                   AND context->>'ticket_note_id' = ANY($2::text[])
+                 GROUP BY 1
+                """,
+                project_uuid,
+                list(note_ids),
+            )
+        return {r["note_id"]: r["newest"] for r in rows if r["note_id"]}
+
+    async def list_officer_slot_claims(
+        self,
+        capacity_lineage: List[str],
+        *,
+        slot: str | None = None,
+        include_terminal: bool = False,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Ticket-claiming jobs from an officer post's lineage, newest first.
+
+        Serves three of the tick's reads off one shape: the executor
+        disposition gate (newest terminal executor claim), the pool circuit
+        breaker (were the last two distinct-ticket outcomes failures), and
+        stale-claim surfacing (how long has this claim sat without moving).
+        """
+        if not capacity_lineage:
+            return []
+        clauses = [
+            "created_by_thread_id = ANY($1::uuid[])",
+            "context ? 'ticket_note_id'",
+        ]
+        params: List[Any] = [[UUID(t) for t in capacity_lineage]]
+        if slot is not None:
+            params.append(slot)
+            clauses.append(f"context->>'officer_slot' = ${len(params)}")
+        if not include_terminal:
+            clauses.append("status NOT IN ('completed', 'failed', 'cancelled')")
+        params.append(int(limit))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT id, status, created_at, updated_at, completed_at,
+                       project_id, assigned_agent_id,
+                       context->>'ticket_note_id' AS ticket_note_id,
+                       context->>'officer_slot' AS officer_slot,
+                       context->>'work_category' AS work_category
+                  FROM jobs
+                 WHERE {" AND ".join(clauses)}
+                 ORDER BY created_at DESC
+                 LIMIT ${len(params)}
+                """,
+                *params,
+            )
+        return [dict(row) for row in rows]
 
     # While-vacant ledger cap (officer_post.md §5): a ring, newest kept,
     # drop-oldest with a running dropped count so the commission brief can

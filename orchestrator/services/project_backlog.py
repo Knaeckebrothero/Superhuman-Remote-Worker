@@ -131,6 +131,31 @@ async def fetch_backlog(
     )
 
 
+async def fetch_ticket_state(
+    vector_db: Any, project_id: str, note_id: str
+) -> dict[str, Any] | None:
+    """Status/tags/ready_at for ONE ticket, whatever its status.
+
+    ``fetch_backlog`` only ever returns ``active`` rows, which is right for a
+    work pool and wrong for the executor disposition gate: that gate has to
+    distinguish "the officer closed this ticket" (resolved/archived — no longer
+    active, so invisible to the pool query) from "nobody has looked at it yet".
+    Returns None when the note does not exist.
+    """
+    async with vector_db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT note_id, note_type, title, status, priority, tags, ready_at
+              FROM knowledge_index
+             WHERE project_id = $1::uuid AND note_id = $2
+             LIMIT 1
+            """,
+            project_id,
+            note_id,
+        )
+    return dict(row) if row else None
+
+
 def _priority_word(rank: Any) -> str:
     try:
         return PRIORITY_WORDS.get(int(rank), "normal")

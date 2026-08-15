@@ -1016,6 +1016,7 @@ class UsageLedger:
         visible_project_ids: Optional[Sequence[str]] = None,
         scope_project_id: Optional[str] = None,
         ref_id: Optional[str] = None,
+        ref_ids: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         """Aggregate usage in [from_ts, to_ts), grouped by (category, unit).
 
@@ -1046,6 +1047,15 @@ class UsageLedger:
         if ref_id is not None:
             params.append(_uuid(ref_id))
             clauses.append(f"ref_id = ${len(params)}")
+        if ref_ids is not None:
+            # Set form of ref_id, for costing a GROUP of jobs in one round trip
+            # — the officer's per-slot spend ceiling sums today's cost across
+            # every job stamped with that slot, and the job set comes from the
+            # app DB while the events live here, so a join is not available.
+            # An empty set means "no jobs", which must match no rows rather
+            # than degrade to the whole project.
+            params.append([_uuid(r) for r in ref_ids])
+            clauses.append(f"ref_id = ANY(${len(params)}::uuid[])")
 
         sql = (
             "SELECT category, unit, SUM(quantity) AS quantity, "
