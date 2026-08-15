@@ -34727,27 +34727,35 @@ async def get_project_officer_summary(
     lineage = await postgres_db.get_project_officer_lineage(project_id)
     in_flight_by_slot: dict[Any, int] = {}
     if lineage:
+        # Through the shared admission helper, not a local copy of its query.
+        # This is the third place that count lived; when admission widened to
+        # all-non-terminal, a stale copy here would show the Legate a free slot
+        # the funnel then refuses with a 409.
+        from services.officer_admission import count_in_flight_by_slot
+
         async with postgres_db.acquire() as conn:
-            _slot_rows = await conn.fetch(
-                """
-                SELECT context->>'officer_slot' AS slot, COUNT(*) AS n
-                  FROM jobs
-                 WHERE created_by_thread_id = ANY($1::uuid[])
-                   AND status IN ('created', 'processing')
-                 GROUP BY 1
-                """,
-                lineage,
-            )
-        in_flight_by_slot = {r["slot"]: int(r["n"]) for r in _slot_rows}
+            in_flight_by_slot = await count_in_flight_by_slot(conn, lineage)
+
+    # Ready depth per pool — the number the officer's queue duty is measured
+    # against (officer_backlog_pools.md §6). Computed through the tick's own
+    # eligibility path so the card cannot promise dispatches the tick will not
+    # make; a KB outage leaves it absent rather than showing a false zero.
+    ready_by_pool: dict[str, int] = {}
 
     def _kit_view(slots: Any) -> dict[str, Any] | None:
-        """Roster spec + per-slot in-flight, or None on a flat cap."""
+        """Roster spec + per-slot in-flight + pool depth, or None on a flat cap."""
         if not isinstance(slots, dict) or not slots:
             return None
         kit: dict[str, Any] = {}
         for name, spec in slots.items():
             entry = dict(spec) if isinstance(spec, dict) else {}
             entry["in_flight"] = int(in_flight_by_slot.get(name) or 0)
+            if entry.get("category") and str(name) in ready_by_pool:
+                depth = ready_by_pool[str(name)]
+                entry["ready_depth"] = depth
+                # The floor IS the slot count (§13.2). Rendered, not just
+                # enforced: a policy the officer cannot see invites drift.
+                entry["below_floor"] = depth < int(entry.get("count") or 0)
             kit[str(name)] = entry
         return kit
 
@@ -34764,6 +34772,17 @@ async def get_project_officer_summary(
         "communication_policy": post.get("communication_policy") or {},
         "incarnations": post.get("incarnations") or [],
         "while_vacant": _while_vacant_view(post.get("state")),
+        # Always present so the card never has to branch on shape. A vacant
+        # post has no live counters — only the setting the next incarnation
+        # will boot with.
+        "backlog": {
+            "auto_pull": bool(row_officer_cfg.get("auto_pull")),
+            "breakers": {},
+            "stale_claims": [],
+            "worker_spend_ceiling_daily": row_officer_cfg.get(
+                "worker_spend_ceiling_daily"
+            ),
+        },
     }
 
     if not officer:
@@ -34828,9 +34847,30 @@ async def get_project_officer_summary(
 
     # Hold is thread-scoped runtime state (officer_post.md §5) — read live.
     post_block["held"] = officer_meta.get("hold") or None
+
+    from services.officer_backlog import auto_pull_enabled, pools_from_meta
+    from services.officer_backlog import ready_depth_by_pool as _ready_depth
+
+    _pools = pools_from_meta(officer_meta)
+    if _pools and vector_db is not None:
+        ready_by_pool = await _ready_depth(postgres_db, vector_db, project_id, _pools)
+
     post_block["kit"] = _kit_view(
         officer_meta.get("slots") or row_officer_cfg.get("slots")
     )
+    # The backlog policies the tick enforces on his behalf. Breakers and stale
+    # claims are already computed and stored by the tick — this only surfaces
+    # them, so the card cannot disagree with what actually happened.
+    post_block["backlog"] = {
+        "auto_pull": auto_pull_enabled(officer_meta),
+        "breakers": {
+            pool: entry
+            for pool, entry in (officer_state.get("backlog_breakers") or {}).items()
+            if isinstance(entry, dict)
+        },
+        "stale_claims": officer_state.get("backlog_stale_claims") or [],
+        "worker_spend_ceiling_daily": officer_meta.get("worker_spend_ceiling_daily"),
+    }
 
     return {
         **post_block,

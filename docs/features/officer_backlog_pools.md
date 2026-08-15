@@ -39,12 +39,14 @@ related:
 
 ## Status
 
-**BUILDING (2026-08-15).** **B1–B5 have landed.** The tick is built, mounted, dormant
-(`auto_pull` ships off) and verified end to end on k3d; the sitrep renders capacity, ready
-depth, open breakers and stalled claims; and **every loop now carries the category
-doctrine whether or not it has an officer** — the evidence repricing reaches the plain
-`standard` loops that produced the original failure. What remains is B6 (cockpit),
-optional B7 (writer expert), and the live-fire acceptance run.
+**BUILDING (2026-08-15).** **B1–B6 have landed** — the feature is end-to-end usable. The
+tick is built, mounted, dormant (`auto_pull` ships off) and verified on k3d; the sitrep and
+the cockpit card both render capacity, ready depth, open breakers and stalled claims; a
+pool can be provisioned from the UI; and **every loop carries the category doctrine whether
+or not it has an officer**, so the evidence repricing reaches the plain `standard` loops
+that produced the original failure. What remains is optional B7 (writer expert), the
+deferred digest lines, and the live-fire acceptance run (§12) — which still needs O6 and
+the KB hygiene pair.
 The six §13 defaults are **decided** — no open question, no pending approval. Two of those
 decisions changed the design: the ready floor scales with pool capacity rather than being a
 constant, and there are **no per-ticket budget caps** (the officer is the brake; §3 records
@@ -887,11 +889,32 @@ the tick.
     `BREAKER_OPEN_MINUTES`, and the claim rules must match one-shot semantics
     (`tests/test_officer_pool_surfacing.py::TestBacklogDoctrineMatchesTheMachinery`).
     Doctrine that disagrees with the code is worse than no doctrine.
-- **B6 — cockpit**: `OfficerSlotSpec`/`SlotDraft`/`buildSlotsSpec`/form/chips + spec gain
-  `category` (buildSlotsSpec drops unknown fields today) **[A3]**; `OfficerSummary` +
-  `get_project_officer_summary` gain `slots_in_flight`/`ready_depth`/breaker/spend fields;
-  digest lines (dispatches/day, spend/day, re-ready counts, self-filed ratio, breaker
-  cause).
+- **B6 — cockpit — DONE (2026-08-15).** **A category can now be provisioned from the UI**,
+  which is what made the whole feature reachable: `OfficerSlotSpec`/`SlotDraft`/
+  `buildSlotsSpec`/`draftFromPost`/`STARTER_SLOT_DRAFT`/`addSlot` gain `category`, and the
+  kit editor gains a per-row **Pool** select. `get_project_officer_summary` gains
+  `kit[].ready_depth` / `kit[].below_floor` and a `backlog` block (auto_pull, breakers,
+  stale_claims, spend ceiling); `kitChips` renders category, ready depth, `BELOW FLOOR`
+  and `BREAKER OPEN` with a warning-styled chip. Absent `ready_depth` renders as nothing,
+  never `ready 0`. Tests: 62 in `project-officer.component.spec.ts` (12 new), full cockpit
+  suite 2164 green.
+  - **A THIRD copy of the in-flight query lived here** with the stale
+    `IN ('created','processing')` predicate — the officer card would have shown the Legate
+    a free slot the funnel refuses. Now through `count_in_flight_by_slot`. That is three
+    consumers found (sitrep, card, endpoint); the shared helper earned itself.
+  - **`tsc --noEmit -p tsconfig.json` does not typecheck app sources** — it is
+    solution-style. It passed while `addSlot()` was constructing a `SlotDraft` without
+    `category`, and 2164 vitest tests passed too; only the Angular compiler in the running
+    pod caught it (`TS2741`, CrashLooping cockpit). **Use `tsconfig.app.json`.**
+  - Verified in a browser on k3d, which caught what specs could not: the per-row hint
+    repeated verbatim for every slot, so the explanation moved above the rows once.
+  - **Do NOT run prettier on this repo.** It is configured in `package.json` but not in
+    CI, and the committed sources are not prettier-clean — `--write` reformatted three
+    whole files (753 lines) around a ~150-line change. Reverted and re-applied by hand.
+  - Not built: the digest lines (dispatches/day, spend/day, re-ready counts, self-filed
+    ratio) — they need per-day aggregates nothing records yet, and the self-filed ratio in
+    particular is the Goodhart guard §8 promises, so it deserves its own slice rather than
+    a guess at the query.
 - **B7 (optional) — `writer` expert**: minimal shape per the `general-worker` precedent
   (config.yaml `$extends: worker_base` + persona.txt; strategic/tactical optional)
   **[A3]**. Test touchpoints: regen `tests/test_config_tool_grants_snapshot.py`

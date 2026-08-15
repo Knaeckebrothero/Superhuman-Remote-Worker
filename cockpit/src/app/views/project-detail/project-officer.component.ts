@@ -22,6 +22,7 @@ import type {
   OfficerKitSlot,
   OfficerPost,
   OfficerPostPatch,
+  OfficerSlotSpec,
   OfficerVacantLedger,
   WorkerMessagesPolicy,
 } from '../../core/models/api.model';
@@ -37,7 +38,21 @@ export interface SlotDraft {
   count: number;
   model: string;
   backend: string;
+  /** '' = not a pool (officer-directed only); otherwise a work category. */
+  category: string;
 }
+
+/**
+ * The categories a slot may be a pool for. Mirrors WORK_CATEGORIES in
+ * orchestrator/services/work_categories.py — the server validates against its
+ * own copy at provision time, so a drift here costs a 400, never a bad kit.
+ */
+export const WORK_CATEGORY_OPTIONS = [
+  {value: '', label: 'No pool — officer dispatches by hand'},
+  {value: 'researcher', label: 'Researcher — deliverable is an answer'},
+  {value: 'tester', label: 'Tester — deliverable is issue tickets'},
+  {value: 'executor', label: 'Executor — deliverable is shipped files'},
+] as const;
 
 /** The whole kit editor as plain strings ('' = unset / server default). */
 export interface OfficerEditorDraft {
@@ -61,6 +76,9 @@ export const STARTER_SLOT_DRAFT: SlotDraft = {
   count: 2,
   model: '',
   backend: 'sandbox',
+  // No category by default: a starter kit must not silently arm auto-pull on
+  // a century whose officer has never triaged a backlog.
+  category: '',
 };
 
 /** Vacant / commissioned / held — held is commissioned-and-standing-down. */
@@ -118,17 +136,38 @@ export function drainHint(
   return `${inFlight} in flight — drains to ${newCount}`;
 }
 
-/** Utilization chip per kit slot: `line 1/2 · MiniMax-M3 · vm` (×N without live data). */
+/**
+ * Utilization chip per kit slot: `line 1/2 · MiniMax-M3 · vm` (×N without live
+ * data). Pools carry two more facts, because utilization alone answers the
+ * wrong question — an idle slot with a healthy queue is slack, and slack is
+ * fine. What matters is whether the QUEUE is starved, so a pool shows its ready
+ * depth and is flagged when it sits below its floor (= its slot count). An open
+ * breaker wins the flag: an idle pool that is idle because it is BROKEN must
+ * not read as merely quiet.
+ *
+ * `ready_depth` absent means the knowledge base could not be read. It renders
+ * as nothing rather than as `ready 0`, which would be an unmeasured claim about
+ * a starved queue.
+ */
 export function kitChips(
   kit: Record<string, OfficerKitSlot> | null | undefined,
-): {name: string; label: string}[] {
+  breakers: Record<string, {until?: string}> | null | undefined = null,
+  now: Date = new Date(),
+): {name: string; label: string; alert: boolean}[] {
   if (!kit) return [];
   return Object.entries(kit).map(([name, s]) => {
     const alloc = s.in_flight != null ? `${s.in_flight}/${s.count}` : `×${s.count}`;
     const parts = [`${name} ${alloc}`];
+    if (s.category) parts.push(s.category);
     if (s.model) parts.push(s.model);
     if (s.backend) parts.push(s.backend);
-    return {name, label: parts.join(' · ')};
+    if (s.ready_depth != null) {
+      parts.push(`ready ${s.ready_depth}${s.below_floor ? ' — BELOW FLOOR' : ''}`);
+    }
+    const until = breakers?.[name]?.until;
+    const broken = !!until && new Date(until).getTime() > now.getTime();
+    if (broken) parts.push('BREAKER OPEN');
+    return {name, label: parts.join(' · '), alert: broken || !!s.below_floor};
   });
 }
 
@@ -146,6 +185,7 @@ export function draftFromPost(post: OfficerPost | null): OfficerEditorDraft {
         count: s.count,
         model: s.model ?? '',
         backend: s.backend ?? '',
+        category: s.category ?? '',
       }))
     : [];
   const slots = kitRows.length
@@ -169,18 +209,21 @@ export function draftFromPost(post: OfficerPost | null): OfficerEditorDraft {
 }
 
 /** Assemble the `officer.slots` spec from form rows; null = no roster (flat cap). */
-export function buildSlotsSpec(
-  rows: SlotDraft[],
-): Record<string, {count: number; model?: string; backend?: string}> | null {
-  const spec: Record<string, {count: number; model?: string; backend?: string}> = {};
+export function buildSlotsSpec(rows: SlotDraft[]): Record<string, OfficerSlotSpec> | null {
+  const spec: Record<string, OfficerSlotSpec> = {};
   for (const row of rows) {
     const name = row.name.trim().toLowerCase();
     if (!name) continue;
-    const entry: {count: number; model?: string; backend?: string} = {
+    const entry: OfficerSlotSpec = {
       count: Math.max(1, Math.floor(row.count)),
     };
     if (row.model.trim()) entry.model = row.model.trim();
     if (row.backend.trim()) entry.backend = row.backend.trim();
+    // `?? ''` because this field is newer than the type: a draft assembled
+    // before it existed (or by a caller that skips the type) must degrade to
+    // "not a pool" rather than throwing mid-save.
+    const category = (row.category ?? '').trim();
+    if (category) entry.category = category.toLowerCase();
     spec[name] = entry;
   }
   return Object.keys(spec).length ? spec : null;
@@ -416,9 +459,39 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
                 <div class="officer-slots" data-testid="officer-slots">
                   <span class="k">Kit</span>
                   @for (s of kitRows(); track s.name) {
-                    <span class="officer-slot-chip">{{ s.label }}</span>
+                    <span
+                      class="officer-slot-chip"
+                      [class.officer-slot-chip-alert]="s.alert"
+                      >{{ s.label }}</span
+                    >
                   }
                 </div>
+              }
+
+              @if (backlogState(); as bl) {
+                <div class="officer-slots" data-testid="officer-backlog">
+                  <span class="k">Auto-pull</span>
+                  <span class="v">
+                    @if (bl.auto_pull) {
+                      on — ready tickets are dispatched into free pool slots
+                    } @else {
+                      <span class="officer-warn"
+                        >off — pools stay idle until he dispatches by hand</span
+                      >
+                    }
+                  </span>
+                </div>
+                @if (staleClaims().length) {
+                  <div class="officer-slots" data-testid="officer-stale-claims">
+                    <span class="k">Stalled</span>
+                    <span class="v officer-warn">
+                      {{ staleClaims().length }} claimed
+                      {{ staleClaims().length === 1 ? 'ticket' : 'tickets' }} not
+                      moving — these are never released automatically; resume or
+                      cancel the job, then close or re-ready the ticket.
+                    </span>
+                  </div>
+                }
               }
             }
           }
@@ -472,6 +545,11 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
                 <span class="officer-immediacy" data-testid="immediacy-slots">{{ immediacy('slots') }}</span>
               }
             </div>
+            <p class="officer-hint dim">
+              Give a slot a <strong>pool</strong> and the officer fills it
+              automatically from ready tickets of that kind; leave it unset for
+              capacity he dispatches by hand.
+            </p>
             @for (row of slotDrafts(); track $index; let i = $index) {
               <div class="officer-slot-row">
                 <app-form-field label="Slot">
@@ -503,6 +581,16 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
                     <option value="virtual">virtual</option>
                     <option value="none">none</option>
                     <option value="vm">VM (root)</option>
+                  </app-select>
+                </app-form-field>
+                <app-form-field label="Pool">
+                  <app-select
+                    [value]="row.category"
+                    (changed)="patchSlot(i, {category: $event ?? ''})"
+                  >
+                    @for (c of categoryOptions; track c.value) {
+                      <option [value]="c.value">{{ c.label }}</option>
+                    }
                   </app-select>
                 </app-form-field>
                 <app-button variant="secondary" size="sm" (clicked)="removeSlot(i)">✕</app-button>
@@ -808,6 +896,13 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
         border: 1px solid var(--border-color);
         background: var(--bg-tertiary);
       }
+      /* A starved or broken pool. Border + text rather than a fill: it must
+         read as attention-needed at a glance without competing with a real
+         error state elsewhere on the card. */
+      .officer-slot-chip-alert {
+        border-color: var(--color-warning, #b45309);
+        color: var(--color-warning, #b45309);
+      }
       .officer-editor { display: flex; flex-direction: column; gap: 10px; }
       .officer-editor-head { display: flex; align-items: baseline; gap: 10px; margin-top: 4px; }
       .officer-section-title { font-size: 12px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.4px; }
@@ -868,6 +963,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   // state transitions only (editorSeedKey), so the 15s poll never clobbers
   // in-progress edits.
   readonly slotDrafts = signal<SlotDraft[]>([{...STARTER_SLOT_DRAFT}]);
+  readonly categoryOptions = WORK_CATEGORY_OPTIONS;
   // The officer's OWN brain (distinct from the slot models, which are what
   // his workers run on — the classic mistake is arming the troops and leaving
   // the commander on the account default).
@@ -898,7 +994,16 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   readonly digest = computed(() =>
     [...(this.post()?.officer?.digest ?? [])].reverse(),
   );
-  readonly kitRows = computed(() => kitChips(this.post()?.kit));
+  readonly kitRows = computed(() =>
+    kitChips(this.post()?.kit, this.post()?.backlog?.breakers),
+  );
+  /** Pool policy the officer is operating under, or null when he has no pools. */
+  readonly backlogState = computed(() => {
+    const post = this.post();
+    const hasPools = Object.values(post?.kit ?? {}).some((s) => !!s.category);
+    return hasPools ? (post?.backlog ?? null) : null;
+  });
+  readonly staleClaims = computed(() => this.backlogState()?.stale_claims ?? []);
   readonly spendCeiling = computed(
     () =>
       this.post()?.spend_today?.ceiling ??
@@ -1019,7 +1124,9 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   addSlot(): void {
     this.slotDrafts.update((rows) => [
       ...rows,
-      {name: '', count: 1, model: '', backend: ''},
+      // Uncategorized: a new row is plain capacity until someone chooses a
+      // pool for it, so adding a slot can never arm auto-pull by accident.
+      {name: '', count: 1, model: '', backend: '', category: ''},
     ]);
   }
 
