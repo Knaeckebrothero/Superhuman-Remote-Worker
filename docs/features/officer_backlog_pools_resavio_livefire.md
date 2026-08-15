@@ -116,16 +116,16 @@ the comparison is honest:
 
 | # | Check | Result |
 |---|---|---|
-| M-1 | Release endpoint clears hold, drain fires, he wakes without respawn (pod is 15d old and Running) | |
-| M-2 | Sitrep renders pool section: per-pool ready depth + below_floor | |
-| M-3 | Tickets in project KB with `ready` + `category:` tags; officer-only tags survive only via officer provenance | |
-| M-4 | Dispatch stamps `context.work_category`, `context.officer_slot`, `context.ticket_note_id`; kickoff carries the category block | |
-| M-5 | One-shot claim: second dispatch attempt on a claimed ticket refuses (409/committed claim visible in `uq_jobs_active_ticket_claim`) | |
-| M-6 | Ready consumed on dispatch; re-arm requires explicit officer act | |
-| M-7 | 22 queued events coalesce into ≤3 turns, not 22 | |
-| M-8 | Officer card (`GET /api/projects/{id}/officer`) shows kit with `ready_depth`/`below_floor` per pool and lineage-aware in_flight | |
-| M-9 | Worker jobs run on MiniMax-M3 in sandbox pods; category contract visible in the worker's kickoff | |
-| M-10 | No admission while pool full; capacity 409 names the roster | |
+| M-1 | Release endpoint clears hold, drain fires, he wakes without respawn (pod is 15d old and Running) | ✅ durable path (live half blocked by LF-1; cleared after respawn) |
+| M-2 | Sitrep renders pool section: per-pool ready depth + below_floor | ✅ card + his own reports track it |
+| M-3 | Tickets in project KB with `ready` + `category:` tags; officer-only tags survive only via officer provenance | ✅ after LF-2 remedy + grammar correction; `ready_at` stamped on both explicit re-adds (16:39:16, 16:52:04) |
+| M-4 | Dispatch stamps `context.work_category`, `context.officer_slot`, `context.ticket_note_id`; kickoff carries the category block | ✅ category/slot/kickoff on both jobs; `ticket_note_id` ❌ until LF-3 deploys (operator-repaired both times) |
+| M-5 | One-shot claim: second dispatch attempt on a claimed ticket refuses | ◐ index verified present; claim-vs-eligibility proven via ready_depth flip; dup-probe deliberately skipped (admission rewrite in flight in a concurrent session) |
+| M-6 | Ready consumed on dispatch; re-arm requires explicit officer act | ✅ claimed tickets left every eligibility view; his explicit re-stamps moved `ready_at` |
+| M-7 | 22 queued events coalesce into ≤3 turns, not 22 | ✅ one turn |
+| M-8 | Officer card shows kit with `ready_depth`/`below_floor` per pool and lineage-aware in_flight | ✅ live throughout, honest at every state change |
+| M-9 | Worker jobs run on MiniMax-M3 in sandbox pods; category contract visible in the worker's kickoff | ✅ tester ("output is ISSUE TICKETS") + researcher ("deliverable is an ANSWER… SPIKE"); officer's 4-field brief became 4 predefined strategic todos |
+| M-10 | No admission while pool full; capacity 409 names the roster | not exercised (no pool reached full+1 this session) |
 
 ## Results
 
@@ -255,7 +255,51 @@ the comparison is honest:
   model wants. "Legatus" spelling in his sleep reason — his charter
   predates the rename; historical artifacts, as documented.
 
-## Verdict
+- 16:51:37 Legate release: research may dispatch on his judgment; told him
+  honestly that his tool cannot pass the claim and the ledger is being
+  repaired server-side until the fix deploys.
+- 16:52:04 he stamped the research ticket ready (`ready_at` moved);
+  16:52:20 dispatched `a9a468df` — researcher contract landed
+  (`work_category: researcher`, `officer_slot: research`, SPIKE kickoff).
+  Having been told `backlog_ticket` was dead, he stopped writing it —
+  literal, correct instruction-following; claim operator-stamped with the
+  slug. Board after: test 1/0, research 1/0, build 0/0, `below_floor`
+  everywhere — the true queue-duty signal.
 
-*(fill at the end: which of F1–F4 the feature demonstrably fixed on its
-home arena, which predictions held, what broke)*
+## Verdict (as of 17:00Z — two workers in flight, executor gated by design)
+
+**The feature holds on its home arena once its code actually reaches every
+party.** All three structural findings are versions of the same sentence:
+the contract machinery works, but a participant was running or reading a
+surface that never got the contract (stale persona, stale kb tools, a
+descriptor that never exposed the funnel's field). Nothing found wrong
+with the design; everything found wrong was reachability.
+
+- **F1 phantom steering: FIXED.** Every officer KB write landed in the
+  loop's project KB, first try, verified independently before any
+  dispatch.
+- **F2 self-inferred DoD: FIXED on this evidence.** The Legate's web-UI
+  demo DoD survived two weeks of hold and a pod respawn; both the
+  executor ticket and the tester's acceptance criteria are shaped by it.
+  No CLI-bias artifact anywhere in his backlog.
+- **F3 counter collision: STRUCTURALLY REPLACED.** Tickets are claimed by
+  note id + `ready_at` generation; no iteration counter exists to
+  collide. The 08-06 loop's reuse of iter-1..12 over July's numbers shows
+  the old failure alive in the old mechanism; the officer did NOT flag it
+  (P4 missed, as predicted low-confidence).
+- **F4 QA starvation: FIXED in mechanism.** The tester pool is a
+  first-class floor-bearing pool; the first dispatched worker of the new
+  regime IS a tester; `below_floor` is rendered where the officer and the
+  Legate both read it.
+- **Predictions: P1 ✅ (unprompted, and better than predicted — he
+  cancelled rather than approved), P2 ✅, P3 partial (verification of his
+  own candidate, not the unattended loop claims), P4 ❌, P5 ✅ with the
+  LF-3 caveat (his claim BELIEF was wrong through no fault of his own).**
+- **Officer quality throughout:** verify-before-report on every single
+  claim he made; precise digests; dependency-gated dispatch; honored
+  every hold. gpt-5.6-sol as the brain is earning its keep.
+
+Remaining to observe (next session): tester completion → his judgment on
+the acceptance → executor release → the full chain closing. Plus the
+LF-3 deploy removing the operator-repair crutch, and decisions on
+LF-1/LF-2.
