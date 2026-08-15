@@ -395,12 +395,22 @@ class TestOfficerFirstBlockingSend:
 
     @pytest.mark.asyncio
     async def test_infra_failure_falls_back_to_user_immediately(self):
-        """§5.1: wake-enqueue/transaction failure → the blocking question goes
-        to the user through the unchanged direct path."""
+        """§5.1: an officer-leg failure (e.g. the wake insert) still reaches
+        the user — now through the SAME atomic unit, minus the wake.
+
+        The old fallback wrote a freeze with best-effort route bookkeeping,
+        which is precisely the OC-01 defect. The retry is safe because the
+        thing that failed is the officer half: with wake=None it commits."""
         job = _job()
         db = _send_db(job, {"worker_messages": "officer_first"})
+
+        async def _fail_only_the_officer_leg(*args, **kwargs):
+            if kwargs.get("wake") is not None:
+                raise RuntimeError("wake insert failed")
+            return {"route_id": str(uuid4()), "originating_message_id": str(uuid4())}
+
         db.create_routed_blocking_freeze = AsyncMock(
-            side_effect=RuntimeError("insert failed")
+            side_effect=_fail_only_the_officer_leg
         )
         notifier = _notifier()
         p1, p2, p3, p4, p5 = _send_patches(db, notifier)
@@ -412,8 +422,10 @@ class TestOfficerFirstBlockingSend:
         assert result["routing"]["applied"] == "user_direct"
         assert result["routing"]["reason"] == "officer_route_failed"
         notifier.dispatch.assert_awaited_once()
-        db.publish_blocking_message.assert_awaited_once()
-        db.log_message.assert_awaited_once()
+        # The direct retry is the same transactional unit without the wake,
+        # which also logs the message — hence no separate log_message call.
+        assert db.create_routed_blocking_freeze.await_args.kwargs["wake"] is None
+        db.log_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_held_officer_routes_blocking_to_user_immediately(self):
@@ -427,7 +439,11 @@ class TestOfficerFirstBlockingSend:
             )
         assert result["routing"]["applied"] == "user_direct"
         assert result["routing"]["reason"] == "officer_held"
-        db.create_routed_blocking_freeze.assert_not_awaited()
+        # OC-01: the direct path is atomic too now, so the helper IS called —
+        # what marks it as direct is the absence of an officer wake.
+        kwargs = db.create_routed_blocking_freeze.await_args.kwargs
+        assert kwargs["wake"] is None
+        assert kwargs["route"]["state"] == "user_direct"
         notifier.dispatch.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -442,7 +458,9 @@ class TestOfficerFirstBlockingSend:
             )
         assert result["routing"]["applied"] == "user_direct"
         assert result["routing"]["reason"] == "vacant"
-        db.create_routed_blocking_freeze.assert_not_awaited()
+        kwargs = db.create_routed_blocking_freeze.await_args.kwargs
+        assert kwargs["wake"] is None
+        assert kwargs["route"]["state"] == "user_direct"
         notifier.dispatch.assert_awaited_once()
 
 
@@ -504,18 +522,26 @@ class TestUserDirectByteCompat:
             )
         assert result["status"] == "sent"
         assert result["recipient"] == "o***@example.com"
-        # The legacy order: publish (flag on), dispatch, log — untouched.
-        db.publish_blocking_message.assert_awaited_once()
-        notifier.dispatch.assert_awaited_once()
-        db.log_message.assert_awaited_once()
-        db.create_routed_blocking_freeze.assert_not_awaited()
-        # Additive: the [A-timeout] route row and the freeze generation.
-        route = db.create_message_route.await_args.args[0]
+        # OC-01 changed this contract deliberately. The old order — freeze,
+        # dispatch, log, then best-effort route — is exactly the window that
+        # could strand a job forever, and user_direct is the DEFAULT policy so
+        # it was the common path. Message, route and freeze now commit as ONE
+        # unit BEFORE any external delivery.
+        kwargs = db.create_routed_blocking_freeze.await_args.kwargs
+        assert kwargs["wake"] is None
+        route = kwargs["route"]
         assert route["state"] == "user_direct"
         assert route["blocking"] is True
         assert route["total_deadline"] is not None
-        publish_freeze = db.publish_blocking_message.await_args.args[1]
-        assert publish_freeze["route_id"] == route["route_id"]
+        freeze = db.create_routed_blocking_freeze.await_args.args[1]
+        assert freeze["route_id"] == route["route_id"]
+        assert kwargs["message_entry"]["subject"] == "Need input"
+        # The separate freeze and best-effort route are gone; the message is
+        # logged inside the transaction, so no second log entry.
+        db.publish_blocking_message.assert_not_awaited()
+        db.create_message_route.assert_not_awaited()
+        db.log_message.assert_not_awaited()
+        notifier.dispatch.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_route_bookkeeping_failure_never_fails_the_send(self):
@@ -743,8 +769,7 @@ class TestOfficerActionGuards:
     def test_public_action_schema_contains_no_actor_identity(self):
         assert "officer_thread_id" not in main.OfficerMessageReplyRequest.model_fields
         assert (
-            "officer_thread_id"
-            not in main.OfficerMessageEscalateRequest.model_fields
+            "officer_thread_id" not in main.OfficerMessageEscalateRequest.model_fields
         )
         assert "officer_thread_id" not in main.OfficerMessageAckRequest.model_fields
 

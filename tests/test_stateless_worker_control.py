@@ -5,7 +5,7 @@ import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -1278,24 +1278,24 @@ async def test_blocking_message_status_is_exact_worker_fenced(
 ):
     from orchestrator import main
 
-    conn = MagicMock()
-    conn.transaction.return_value = _AsyncCM()
-
-    async def fetchrow(sql, *_args):
-        normalized = " ".join(sql.split())
-        if normalized.startswith("SELECT state, lease_token FROM run_queue"):
-            return {"state": "leased", "lease_token": 9}
-        if normalized.startswith("UPDATE jobs"):
-            assert "AND status = 'processing'" in normalized
-            assert "AND execution_lane = 'stateless'" in normalized
-            return {"id": UUID(JOB_ID)} if status_cas_wins else None
-        raise AssertionError(normalized)
-
-    conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    # OC-01: the stateless fence used to be inline SQL in send_agent_message.
+    # It now lives inside create_routed_blocking_freeze, which commits the
+    # message, the route and the freeze as one unit — and whose lane/lease
+    # guards are exercised against real Postgres in the routing suite. What
+    # this test still owns is the DELEGATION: the endpoint must hand the
+    # helper the exact lane and lease, and must 409 rather than proceed when
+    # the helper reports a lost guard.
+    committed = AsyncMock(
+        return_value=(
+            {"route_id": str(uuid4()), "originating_message_id": str(uuid4())}
+            if status_cas_wins
+            else None
+        )
+    )
 
     @asynccontextmanager
     async def acquire():
-        yield conn
+        yield MagicMock()
 
     monkeypatch.setattr(main, "require_internal", AsyncMock())
     monkeypatch.setattr(
@@ -1327,6 +1327,9 @@ async def test_blocking_message_status_is_exact_worker_fenced(
         main.postgres_db, "get_message_sequence", AsyncMock(return_value=1)
     )
     monkeypatch.setattr(main.postgres_db, "log_message", AsyncMock())
+    monkeypatch.setattr(main.postgres_db, "set_message_email_id", AsyncMock())
+    monkeypatch.setattr(main.postgres_db, "mark_route_user_delivery", AsyncMock())
+    monkeypatch.setattr(main.postgres_db, "create_routed_blocking_freeze", committed)
     monkeypatch.setattr(main.postgres_db, "acquire", acquire)
     monkeypatch.setattr(
         main.notification_service,
@@ -1349,6 +1352,10 @@ async def test_blocking_message_status_is_exact_worker_fenced(
             await main.send_agent_message(MagicMock(), JOB_ID, body)
         assert lost.value.status_code == 409
         assert lost.value.detail == "Job changed before blocking message was committed"
+
+    kwargs = committed.await_args.kwargs
+    assert kwargs["expected_lane"] == "stateless"
+    assert kwargs["lease_token"] == 9
 
 
 @pytest.mark.asyncio
