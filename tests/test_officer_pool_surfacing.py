@@ -298,6 +298,76 @@ class TestPrecedenceLaw:
         assert "ANSWER" in main._compose_category_kickoff("researcher", None)
 
 
+class TestBacklogDoctrineMatchesTheMachinery:
+    """The charter posture text (§8) vs what the tick actually does.
+
+    Doctrine that disagrees with the code is worse than no doctrine: the
+    officer follows the words, the machinery does something else, and the gap
+    only shows up as behaviour nobody can explain. These pin the load-bearing
+    claims against the constants they describe, so changing one without the
+    other fails here rather than in a century.
+    """
+
+    def _doctrine(self):
+        from pathlib import Path
+
+        text = Path("config/experts/centurion/persona.txt").read_text()
+        assert "<backlog_doctrine>" in text, "backlog doctrine block is missing"
+        return text.split("<backlog_doctrine>")[1].split("</backlog_doctrine>")[0]
+
+    def test_the_floor_it_states_is_the_floor_the_tick_enforces(self):
+        # §13.2: floor == the pool's slot count, not a constant.
+        doctrine = self._doctrine()
+        assert "at least as many tickets as that pool has slots" in doctrine
+
+    def test_it_states_slack_is_healthy_not_a_utilization_target(self):
+        doctrine = self._doctrine()
+        assert "idle slot with a healthy queue is slack" in doctrine
+        assert "Utilization is not the target" in doctrine
+
+    def test_it_states_the_anti_amplification_firewall(self):
+        # The one invariant separating a century from an agent that spawns
+        # agents. If this line ever softens, so does the firewall.
+        doctrine = self._doctrine()
+        assert "Nothing dispatches until YOU stamp it ready" in doctrine
+        assert "no bulk-ready" in doctrine
+
+    def test_it_states_one_shot_claims_the_way_the_tick_implements_them(self):
+        doctrine = self._doctrine()
+        assert "Dispatch consumes readiness" in doctrine
+        # Terminal outcomes hold the claim — the whole point.
+        assert "in any outcome, success or failure" in doctrine
+
+    def test_it_promises_no_auto_release_which_is_what_the_tick_does(self):
+        doctrine = self._doctrine()
+        assert "Claims are never released for you" in doctrine
+        assert "Two jobs must never work one ticket" in doctrine
+
+    def test_the_breaker_window_it_quotes_matches_the_constant(self):
+        from services.officer_backlog import BREAKER_FAILURES, BREAKER_OPEN_MINUTES
+
+        doctrine = self._doctrine()
+        assert BREAKER_FAILURES == 2 and "fails twice in a row" in doctrine
+        assert f"{int(BREAKER_OPEN_MINUTES)} minutes" in doctrine or (
+            "thirty minutes" in doctrine and BREAKER_OPEN_MINUTES == 30
+        )
+        # Per-pool, never global.
+        assert "that pool only" in doctrine
+
+    def test_it_carries_the_evidence_repricing(self):
+        doctrine = self._doctrine()
+        assert "An answer is a deliverable, a screenshot is evidence" in doctrine
+        assert "regression rails rather than a score" in doctrine
+        # The sentence that names the actual failure mode.
+        assert "most likely to have been skipped" in doctrine
+
+    def test_the_doctrine_has_no_format_placeholders(self):
+        # The persona is .format()-ed with agent_display_name; a stray brace in
+        # this block would raise KeyError at every officer spawn.
+        doctrine = self._doctrine()
+        assert "{" not in doctrine and "}" not in doctrine
+
+
 class TestSlotSpec:
     def test_a_category_makes_a_slot_a_pool(self):
         cleaned = validate_slots_spec({"r": {"count": 2, "category": "Researcher"}})

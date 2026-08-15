@@ -39,10 +39,12 @@ related:
 
 ## Status
 
-**BUILDING (2026-08-15).** **B1–B4 have landed** — the tick is built, mounted, dormant
-(`auto_pull` ships off) and verified end to end on k3d; the officer's sitrep now renders
-capacity, ready depth, open breakers and stalled claims. What remains is B5 (prompt
-doctrine), B6 (cockpit), optional B7 (writer expert), and the live-fire acceptance run.
+**BUILDING (2026-08-15).** **B1–B5 have landed.** The tick is built, mounted, dormant
+(`auto_pull` ships off) and verified end to end on k3d; the sitrep renders capacity, ready
+depth, open breakers and stalled claims; and **every loop now carries the category
+doctrine whether or not it has an officer** — the evidence repricing reaches the plain
+`standard` loops that produced the original failure. What remains is B6 (cockpit),
+optional B7 (writer expert), and the live-fire acceptance run.
 The six §13 defaults are **decided** — no open question, no pending approval. Two of those
 decisions changed the design: the ready floor scales with pool capacity rather than being a
 constant, and there are **no per-ticket budget caps** (the officer is the brake; §3 records
@@ -859,8 +861,32 @@ the tick.
   - The `ready_by_category` naming in the original sketch became **`ready_by_pool`**:
     two pools can share a category (a MiniMax and a frontier executor line), and the
     officer steers slots, not categories.
-- **B5 — prompts & doctrine**: §7 edits + new-wording pins; `_ROLE_BLOCKS` slimming with
-  the pinned-string superset commitment **[A3]**; charter posture template (§8).
+- **B5 — prompts & doctrine — DONE (2026-08-15).** `build_loop_kickoff` now composes
+  `category_block(role) + slimmed identity block`, so **every loop gets the doctrine,
+  officer or not** — this is the slice that actually reaches the Better Resavio failure
+  mode. `_ROLE_BLOCKS` slimmed of what the contract now says (scholar's isolated-repo
+  paragraph, product-qa's 3-7/severity/absence-evidence/no-blocking-issues list,
+  developer's validate-your-own-work). All pinned strings in `test_project_loops`,
+  `test_kb_convergence` and `test_project_backlog` survive unchanged. The two incentive
+  edits shipped with new pins: "ONE solid, **verifiable** increment" → "ONE solid
+  increment with **EVIDENCE APPROPRIATE TO THE WORK** … Do not pick the work whose
+  evidence is easiest to produce", and the critic rubric's "evidence quality" → "evidence
+  **APPROPRIATE TO THE CLAIM** … A ticket is not weaker because its evidence would be a
+  screenshot rather than a test". §8's charter posture ships as a `<backlog_doctrine>`
+  block in `config/experts/centurion/persona.txt`.
+  - **The critic is exempt from contract composition, deliberately.**
+    `role_to_category("critic")` is `tester` — right for the expert, wrong here: the
+    loop's critic SELECTS, and prepending the tester contract would tell it to file 3-7
+    issue tickets, contradicting its duty on the same screen. Categories describe work;
+    selection is orchestration. `_ROLE_CONTRACT_EXEMPT` names it.
+  - **The blocks became context-free.** They said "This *ticket* is a SPIKE" and "deliver
+    THIS ticket" — true for an officer dispatch, a small lie on every loop kickoff, which
+    has no ticket. Caught by rendering the composed output rather than by a test.
+  - Doctrine is pinned **against the machinery**, not as string presence: the floor
+    wording must match "the pool's slot count", the breaker window must match
+    `BREAKER_OPEN_MINUTES`, and the claim rules must match one-shot semantics
+    (`tests/test_officer_pool_surfacing.py::TestBacklogDoctrineMatchesTheMachinery`).
+    Doctrine that disagrees with the code is worse than no doctrine.
 - **B6 — cockpit**: `OfficerSlotSpec`/`SlotDraft`/`buildSlotsSpec`/form/chips + spec gain
   `category` (buildSlotsSpec drops unknown fields today) **[A3]**; `OfficerSummary` +
   `get_project_officer_summary` gain `slots_in_flight`/`ready_depth`/breaker/spend fields;

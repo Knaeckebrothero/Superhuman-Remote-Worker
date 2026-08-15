@@ -316,9 +316,10 @@ class TestContractBlocks:
         assert "ANSWER, not a product increment" in block
         assert "SPIKE" in block
         assert "then STOP" in block
-        # Extension is an officer decision — a worker that can extend its own
-        # spike has no timebox at all.
-        assert "extending a spike is the officer's decision, never yours" in block
+        # A worker that can extend its own spike has no timebox at all.
+        # Phrased context-free on purpose: the block is composed into loop
+        # kickoffs too, where there is no officer to defer to.
+        assert "extending a spike is not your call to make" in block
         assert "residual unknowns" in block
         # Design research is first-class and anchored, not vibes.
         assert "Material 3" in block and "WCAG" in block

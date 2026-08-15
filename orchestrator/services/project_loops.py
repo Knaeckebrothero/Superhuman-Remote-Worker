@@ -29,6 +29,7 @@ from typing import Any
 # migration lands. It now inserts a structured PostgreSQL record; it does not
 # write a retro file into an agent-visible repository.
 from services.job_records import write_loop_retro as write_loop_retro
+from services.work_categories import category_block, role_to_category
 
 from .completion_effect_reconciliation import (
     CompletionEffectProbeError,
@@ -471,14 +472,39 @@ def validate_loop_plan(plan: Any, loop: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# Role-specific task blocks. Keyed by expert config name; unknown roles fall to
+# Loop roles that get a WORK-CATEGORY contract prepended to their identity block
+# (docs/features/officer_backlog_pools.md §7). The contract says what shape the
+# deliverable takes and what counts as evidence; the identity block below says
+# who this agent is within the loop's rotation.
+#
+# The critic is deliberately absent, and the omission is the interesting part.
+# ``role_to_category("critic")`` is ``tester`` — correct for the *expert*, which
+# can work critique tickets — but the loop's critic does something no category
+# describes: it SELECTS from the pool. Prepending the tester contract would tell
+# it to file 3-7 issue tickets, contradicting its actual duty on the very same
+# screen. Categories describe work; selection is orchestration.
+_ROLE_CONTRACT_EXEMPT: frozenset[str] = frozenset({"critic"})
+
+
+def _role_contract_category(role: str | None) -> str | None:
+    """The category contract a loop role carries, or None for the selector."""
+    if not role or role.strip().lower() in _ROLE_CONTRACT_EXEMPT:
+        return None
+    return role_to_category(role)
+
+
+# Role-specific IDENTITY blocks — who this agent is in the rotation and what it
+# hands to the next one. Keyed by expert config name; unknown roles fall to
 # _ROLE_BLOCK_DEFAULT so the loop stays domain-agnostic (swap `developer` for a
-# `writer` / `default` execution role without code changes). Research-tuned:
-# Scholar self-grounds via research, then generates diverse candidates and does
-# NOT self-filter; Critic verifies at the GOAL level against the Definition of
-# Done (not surface checks) and always selects the next improvement (the loop is
-# unconditional — there is no goal-met stop); the executor validates its own work
-# before "done".
+# `writer` / `default` execution role without code changes).
+#
+# Deliverable shape, evidence class and stopping rules used to live here too and
+# now come from the category contract, so these are the loop-specific half only:
+# Scholar self-grounds then generates diverse candidates and does NOT
+# self-filter; Product-QA is Scholar's inward-looking counterpart feeding the
+# same pool; Critic verifies at the GOAL level against the Definition of Done
+# and always selects the next improvement (the loop is unconditional — there is
+# no goal-met stop); the executor implements what the Critic chose.
 _ROLE_BLOCKS: dict[str, str] = {
     "scholar": (
         "FIRST ground yourself: you MUST research the target/competitor system "
@@ -494,10 +520,7 @@ _ROLE_BLOCKS: dict[str, str] = {
         "first so you don't re-propose a dead end. Write each candidate to the KB "
         "as a `plan` note tagged `proposal` (a one-line thesis and why it differs "
         "from the others). Do NOT self-filter — selecting is the Critic's job. "
-        "Your output is proposal notes, not file commits. This job's repository "
-        "is isolated; only deliberate edits below `projects/<project-slug>/` "
-        "are eligible for delivery to the project cloud folder. Research "
-        "scratch belongs in the KB, not that folder. Default to foraging "
+        "Default to foraging "
         "widely rather than waiting to be told what to look at — file what you "
         "find as `idea` notes; that is how the backlog grows."
     ),
@@ -511,7 +534,10 @@ _ROLE_BLOCKS: dict[str, str] = {
         "setup, or a missing product surface can outweigh yet another new "
         "backend slice. Judge every ticket on user-visible value, "
         "product-stability risk of ignoring it, leverage of already-shipped "
-        "work, implementation size, and evidence quality. Verify any claimed "
+        "work, implementation size, and evidence APPROPRIATE TO THE CLAIM — "
+        "tests for logic, screenshots for UI, a running deployment for "
+        "hosting, citations for research. A ticket is not weaker because its "
+        "evidence would be a screenshot rather than a test. Verify any claimed "
         "progress at the "
         "GOAL level, not surface checks (do not approve merely because code "
         "compiles or has no leftover TODOs). Fan independent verification "
@@ -543,15 +569,14 @@ _ROLE_BLOCKS: dict[str, str] = {
         "mechanical delivery record, and trust it over KB self-reports."
     ),
     "developer": (
-        "Implement the Critic's chosen action. VALIDATE YOUR OWN WORK before "
-        "declaring done — run it and test it; do not rely on it merely "
-        "compiling. Fan the UNDERSTANDING out, not the writing: use subagents "
+        "Implement the Critic's chosen action. Fan the UNDERSTANDING out, not "
+        "the writing: use subagents "
         "(multiple spawn_subagent calls in one turn) to explore unfamiliar code "
         "areas and look things up (docs, APIs, errors) in parallel, but write "
         "every production change yourself — subagent-driven coding fragments the "
         "one thing that needs a coherent head. The current durable project "
         "files are seeded under `projects/<project-slug>/` in this isolated "
-        "workspace. Make project deliverables there. When you finish, the "
+        "workspace. When you finish, the "
         "orchestrator applies a conflict-free diff to the project cloud folder; "
         "a conflict pauses the loop for review instead of overwriting newer "
         "cloud state. Job-scoped scratch stays outside that folder. "
@@ -564,35 +589,22 @@ _ROLE_BLOCKS: dict[str, str] = {
         "unusable in what already exists. Exercise the product: run setup from a "
         "fresh checkout, launch any UI/CLI/API/demo path, check that shipped "
         "modules are reachable in one workflow, look for regressions, setup "
-        "failures, integration gaps, and documentation holes. A tested backend "
-        "module that no user can reach IS a product gap — missing product "
-        "surfaces (no UI, no demo path, no persistence) are legitimate HIGH "
-        "findings even when every unit test passes; the evidence for an absence "
-        "is the audit trail (paths searched, commands run, expected-vs-observed), "
-        "not a reproduction. First check the KB (and the backlog pool above) for "
+        "failures, integration gaps, and documentation holes. First check the KB "
+        "(and the backlog pool above) for "
         "findings already filed — UPDATE them (kb_update), don't re-file "
         "duplicates — and consult the PROJECT JOB HISTORY in this kickoff for "
-        "what prior iterations actually delivered. Then file 3-7 defects "
-        "MAXIMUM — high-leverage over a "
-        "long bug list — each as its OWN `issue` note (kb_write, type=`issue`) "
-        "carrying: severity, confidence, target user/workflow, evidence, "
-        "smallest useful remediation, acceptance criteria, and a priority "
-        "(high/normal/low — weigh user-visible value, risk of leaving it "
-        "unfixed, leverage on already-shipped work) — presented as "
+        "what prior iterations actually delivered. Each `issue` note also "
+        "carries acceptance criteria and a priority (high/normal/low — weigh "
+        "user-visible value, risk of leaving it unfixed, leverage on "
+        "already-shipped work), and is presented as "
         "evidence, not an argument against Scholar. An issue that exists only "
         "in your report is invisible to the next iteration: the `issue` note "
         "IS the handoff, and it is what puts the defect in the project "
         "backlog pool — a repro script or audit transcript is a fine "
-        "attachment, never a substitute. Do NOT fix anything and do NOT "
-        "propose new features "
-        "— repairing is the Developer's job, new ideas are Scholar's lane. "
-        "If the product is genuinely stable and usable, SAY SO "
-        "plainly in one summary note — 'no blocking issues found' is a valid "
-        "outcome, not a failure to find work. You and Scholar are peers "
+        "attachment, never a substitute. Repairing is the Developer's job, new "
+        "ideas are Scholar's lane. You and Scholar are peers "
         "feeding the same backlog pool; you do not rank against each "
-        "other — the Critic reads the pool and decides what to do next. "
-        "Your output is `issue` tickets, not file commits. No project-cloud "
-        "change is expected — your findings live in the KB."
+        "other — the Critic reads the pool and decides what to do next."
     ),
 }
 
@@ -856,7 +868,19 @@ def build_loop_kickoff(
     budget_line = _format_budget(
         loop.get("remaining_iterations"), loop.get("run_until")
     )
-    role_block = _ROLE_BLOCKS.get(role) or _ROLE_BLOCK_DEFAULT.format(role=role)
+    # Category contract first, loop identity second (§7). The contract answers
+    # "what shape is the deliverable and what counts as evidence"; the identity
+    # answers "who are you in this rotation". Composing in that order means a
+    # loop with no officer still gets the doctrine the pools were built to
+    # carry — an answer is a deliverable, a screenshot is evidence, tests are
+    # regression rails and never the score.
+    identity_block = _ROLE_BLOCKS.get(role) or _ROLE_BLOCK_DEFAULT.format(role=role)
+    contract_category = _role_contract_category(role)
+    role_block = (
+        f"{category_block(contract_category)}\n\n{identity_block}"
+        if contract_category
+        else identity_block
+    )
     user_prompt = (loop.get("user_prompt") or "").strip()
 
     parts = [
@@ -869,8 +893,11 @@ def build_loop_kickoff(
         "DEFINITION OF DONE — the quality bar you STEER TOWARD (the loop keeps "
         f"improving past it; it does not stop when it's 'met'):\n{criteria}",
         f"LOOP STATUS: iteration {iteration}. {budget_line} Do NOT try to finish "
-        "the whole goal in one job — make ONE solid, verifiable increment and "
-        "hand off through the KB.",
+        "the whole goal in one job — make ONE solid increment with EVIDENCE "
+        "APPROPRIATE TO THE WORK (tests for logic, screenshots for UI, a "
+        "running deployment for hosting, citations for research) and hand off "
+        "through the KB. Do not pick the work whose evidence is easiest to "
+        "produce; pick the work that moves the goal.",
     ]
 
     # The work pool, handed over rather than searched for. Placed before the
