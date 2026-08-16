@@ -44267,10 +44267,23 @@ def _magic_link_confirmation_page(
         )
 
     # Disable the extend button if we already know the cap was hit.
-    extend_disabled_attr = (
-        ' disabled style="opacity: 0.5; cursor: not-allowed;"'
-        if extend_status == "cap_reached"
-        else ""
+    #
+    # The disabled look MUST be merged into the button's own style attribute.
+    # HTML keeps the FIRST style= on an element and ignores every later one,
+    # so emitting a second one meant the cap_reached branch -- and only that
+    # branch -- rendered a button with opacity/cursor and none of the brand
+    # colours, border or type scale.
+    _extend_cap_reached = extend_status == "cap_reached"
+    extend_disabled_attr = " disabled" if _extend_cap_reached else ""
+    extend_button_style = (
+        f"background: transparent; color: {_BRAND['accent-color']}; "
+        f"padding: 10px 20px; border: 1px solid {_BRAND['accent-color']}; "
+        f"font-weight: 600; font-size: 14px; "
+        + (
+            "opacity: 0.5; cursor: not-allowed;"
+            if _extend_cap_reached
+            else "cursor: pointer;"
+        )
     )
 
     return f"""<!DOCTYPE html>
@@ -44290,7 +44303,7 @@ def _magic_link_confirmation_page(
         <button type="submit" style="background: {button_color}; color: {_BRAND['on-accent']}; padding: 10px 28px; border: 0; cursor: pointer; font-weight: 600; font-size: 14px;">{button_label}</button>
       </form>
       <form method="POST" action="/magic/extend/{quoted_token}" style="display: inline; margin-left: 8px;">
-        <button type="submit"{extend_disabled_attr} style="background: transparent; color: {_BRAND['accent-color']}; padding: 10px 20px; border: 1px solid {_BRAND['accent-color']}; cursor: pointer; font-weight: 600; font-size: 14px;">I'm reviewing — extend 60min</button>
+        <button type="submit"{extend_disabled_attr} style="{extend_button_style}">I'm reviewing — extend 60min</button>
       </form>
       <p style="margin: 16px 0 0 0; color: {_BRAND['text-secondary']}; font-size: 12px;">Approve link is single-use and expires in 30 minutes.</p>
     </div>
