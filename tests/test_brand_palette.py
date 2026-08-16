@@ -70,3 +70,53 @@ def test_normalize_hex_expands_shorthand() -> None:
     # 'on-accent' is #fff in SCSS; comparing raw strings would false-fail.
     assert brand.normalize_hex("#FFF") == "#ffffff"
     assert brand.normalize_hex("#9C2832") == "#9c2832"
+
+
+def _contrast_ratio(hex_a: str, hex_b: str) -> float:
+    """WCAG 2.x relative-luminance contrast ratio between two hex colours."""
+
+    def _luminance(hexstr: str) -> float:
+        h = hexstr.lstrip("#")
+        channels = [int(h[i : i + 2], 16) / 255 for i in (0, 2, 4)]
+
+        def _linearize(c: float) -> float:
+            return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+        r, g, b = (_linearize(c) for c in channels)
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    lum_a, lum_b = _luminance(hex_a), _luminance(hex_b)
+    lighter, darker = max(lum_a, lum_b), min(lum_a, lum_b)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def test_footer_text_colour_meets_wcag_aa_on_light_surfaces() -> None:
+    """text-muted fails AA (needs 4.5:1) on every Travertine surface it was
+    used on -- 3.26:1 on surface-0, 3.82:1 on panel-bg, 3.50:1 on app-bg.
+    Footer/legal/muted copy uses text-secondary instead (7.06-8.27:1 on those
+    same surfaces). This guards against text-muted quietly creeping back into
+    that role.
+    """
+    footer_colour = brand.TRAVERTINE["text-secondary"]
+    for surface in ("panel-bg", "surface-0", "app-bg"):
+        ratio = _contrast_ratio(footer_colour, brand.TRAVERTINE[surface])
+        assert ratio >= 4.5, (
+            f"text-secondary on {surface} is {ratio:.2f}:1 -- AA needs 4.5:1"
+        )
+
+
+def test_text_muted_itself_fails_aa_on_light_surfaces() -> None:
+    """Documents *why* the ruling above exists: text-muted is not usable for
+    body-weight text against any current Travertine surface. If this ever
+    starts passing (e.g. the token's value changes), the ruling that moved
+    footer copy to text-secondary should be revisited.
+    """
+    muted = brand.TRAVERTINE["text-muted"]
+    for surface in ("panel-bg", "surface-0", "app-bg"):
+        ratio = _contrast_ratio(muted, brand.TRAVERTINE[surface])
+        assert ratio < 4.5, (
+            f"text-muted on {surface} is now {ratio:.2f}:1 (>= 4.5:1) -- "
+            "the text-muted-fails-AA premise behind the text-secondary "
+            "ruling no longer holds; re-check whether footer text should "
+            "move back."
+        )

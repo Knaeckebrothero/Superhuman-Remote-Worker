@@ -44221,7 +44221,7 @@ def _magic_link_confirmation_page(
       <form method="POST" action="/magic/extend/{quoted_token}" style="display: inline; margin-left: 8px;">
         <button type="submit"{extend_disabled_attr} style="background: transparent; color: {_BRAND['accent-color']}; padding: 10px 20px; border: 1px solid {_BRAND['accent-color']}; cursor: pointer; font-weight: 600; font-size: 14px;">I'm reviewing — extend 60min</button>
       </form>
-      <p style="margin: 16px 0 0 0; color: {_BRAND['text-muted']}; font-size: 12px;">Approve link is single-use and expires in 30 minutes.</p>
+      <p style="margin: 16px 0 0 0; color: {_BRAND['text-secondary']}; font-size: 12px;">Approve link is single-use and expires in 30 minutes.</p>
     </div>
   </div>
 </body></html>"""
