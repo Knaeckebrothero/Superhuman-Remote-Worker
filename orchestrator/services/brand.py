@@ -24,15 +24,15 @@ def normalize_hex(value: str) -> str:
 
 
 TRAVERTINE: dict[str, str] = {
-    "app-bg": "#f3ece0",          # travertine cream -- page ground
-    "panel-bg": "#fbf6ec",        # card surface
-    "surface-0": "#ede4d2",       # code / args block
+    "app-bg": "#f3ece0",  # travertine cream -- page ground
+    "panel-bg": "#fbf6ec",  # card surface
+    "surface-0": "#ede4d2",  # code / args block
     "border-color": "#dccfb6",
-    "text-primary": "#2a1d12",    # deep umber
+    "text-primary": "#2a1d12",  # deep umber
     "text-secondary": "#5a4632",
     "text-muted": "#8a7b66",
-    "accent-color": "#9c2832",    # porphyry -- links, primary action
-    "success": "#446b3e",         # laurel -- approve
-    "danger": "#9c2832",          # blood -- deny
+    "accent-color": "#9c2832",  # porphyry -- links, primary action
+    "success": "#446b3e",  # laurel -- approve
+    "danger": "#9c2832",  # blood -- deny
     "on-accent": "#ffffff",
 }

@@ -320,11 +320,11 @@ def _build_permission_email_bodies(
 
     body_html = (
         f"<p style='margin:0 0 12px 0;'>The agent wants to call "
-        f"<code style=\"background:{_C['surface-0']};padding:2px 6px;"
-        f"font-family:monospace;\">{safe_tool}</code>:</p>"
-        f"<pre style=\"background:{_C['surface-0']};padding:12px;"
+        f'<code style="background:{_C["surface-0"]};padding:2px 6px;'
+        f'font-family:monospace;">{safe_tool}</code>:</p>'
+        f'<pre style="background:{_C["surface-0"]};padding:12px;'
         f"margin:0;overflow-x:auto;font-size:12px;line-height:18px;"
-        f"font-family:monospace;color:{_C['text-primary']};\">{safe_args}</pre>"
+        f'font-family:monospace;color:{_C["text-primary"]};">{safe_args}</pre>'
     )
 
     html_body = render_email(
