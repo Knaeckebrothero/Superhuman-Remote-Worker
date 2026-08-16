@@ -240,9 +240,16 @@ def test_email_wrapper_guards_version_dependent_variables() -> None:
 
 def test_email_wrapper_sets_inline_fallbacks() -> None:
     """Message bodies are inherited <p>/<a> fragments; clients that strip
-    <head> must still get sane typography from the containing <td>."""
+    <head> must still get sane typography from the containing <td>.
+
+    Isolates the <tr> immediately preceding <#nested> rather than everything
+    since <body>: the fallback logo <span> above it also carries a
+    (unrelated) font-family, so a looser slice would still pass after the
+    containing <td>'s own font-family was deleted.
+    """
     ftl = (THEME / "email/html/template.ftl").read_text()
-    assert "font-family" in ftl.split("<#nested>")[0].split("<body")[1]
+    enclosing_td = ftl.split("<#nested>")[0].rsplit("<tr>", 1)[1]
+    assert "font-family" in enclosing_td
 
 
 def test_both_realms_use_the_srw_email_theme() -> None:
