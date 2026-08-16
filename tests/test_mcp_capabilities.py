@@ -193,8 +193,13 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
     # server-bound.
     assert "project_id" in job_fields
     assert not {"user_id", "thread_id", "parent_job_id"} & set(job_fields)
-    assert job_fields["datasource_ids"]["type"] == "array"
-    assert "anyOf" not in job_fields["datasource_ids"]
+    # datasource_ids left this descriptor with the dispatch-time attach
+    # (2afbf956): its callers are dispatchers with no basis for connector
+    # surgery, and an advertised array invited the empty one, which reads as
+    # neutral but means "attach nothing". Omission now resolves the project's
+    # auto-attach defaults server-side. Narrowing stays on the surfaces a
+    # human reviews — create_project_job below, REST, cockpit.
+    assert "datasource_ids" not in job_fields
 
     project_job_fields = tools["create_project_job"]["inputSchema"]["properties"]
     assert {
