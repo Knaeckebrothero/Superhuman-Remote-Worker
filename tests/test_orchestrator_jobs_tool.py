@@ -245,35 +245,34 @@ async def test_officer_lane_stamps_project_scope_and_fails_closed_unbound(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("arguments", "expected"),
-    [
-        ({}, None),
-        ({"datasource_ids": []}, []),
-        ({"datasource_ids": ["connector-1"]}, ["connector-1"]),
-    ],
-)
-async def test_create_job_preserves_datasource_tristate(
+async def test_create_job_always_asks_for_the_projects_connector_defaults(
     monkeypatch: pytest.MonkeyPatch,
-    arguments: dict[str, Any],
-    expected: list[str] | None,
 ) -> None:
+    """The dispatch plane does not name connectors — it cannot.
+
+    ``datasource_ids`` was a parameter here, tri-state and correctly documented.
+    The only thing it ever did in anger was let an officer pass ``[]`` — which
+    means "attach none" — because the schema advertised an array and the empty
+    one reads as the neutral value. His workers came up with no repository
+    checkout and the century idled for a night.
+
+    The callers of this plane are dispatchers (officer, session) with no basis
+    for connector surgery, so the lever is gone rather than merely discouraged:
+    a model cannot mis-set what it is never shown. Narrowing still exists on the
+    surfaces where a human reviews the choice — MCP, REST, cockpit.
+    """
     recorder = Recorder()
     client = _install_surface_client(monkeypatch, recorder)
+    tool = _tool(create_orchestrator_tools(ToolContext()), "create_job")
     try:
-        await _tool(create_orchestrator_tools(ToolContext()), "create_job").ainvoke(
-            {"description": "connector contract", **arguments}
-        )
+        await tool.ainvoke({"description": "connector contract"})
     finally:
         await client.close()
 
     body = _json_body(recorder.requests[-1])
-    if expected is None:
-        assert "datasource_ids" not in body
-        assert body["use_datasource_defaults"] is True
-    else:
-        assert body["datasource_ids"] == expected
-        assert "use_datasource_defaults" not in body
+    assert body["use_datasource_defaults"] is True
+    assert "datasource_ids" not in body
+    assert "datasource_ids" not in tool.args_schema.model_json_schema()["properties"]
 
 
 @pytest.mark.asyncio
@@ -429,7 +428,9 @@ def test_create_job_schema_has_no_model_selectable_lineage() -> None:
         "description",
         "config_name",
         "expert_id",
-        "datasource_ids",
+        # datasource_ids is deliberately absent: connectors are resolved
+        # server-side from the project's auto-attach defaults. See
+        # test_create_job_always_asks_for_the_projects_connector_defaults.
         "instructions",
         "kickoff_message",
         "config_override",

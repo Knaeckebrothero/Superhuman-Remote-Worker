@@ -848,6 +848,47 @@ class TestCommissionEndpoint:
         assert req.config_name == "centurion"
 
     @pytest.mark.asyncio
+    async def test_commission_asks_the_funnel_for_connector_defaults(
+        self, db, as_project_admin, quiet_side_channels, monkeypatch
+    ):
+        """The third field this endpoint forgot, after config_name and
+        permission_mode.
+
+        It hand-builds the funnel request, so anything the cockpit supplies and
+        this call site does not is silently absent. Without the flag the post
+        falls to ``omitted_compat`` and persists ``datasource_ids: []`` — and an
+        empty list is authoritative on the inheritance path, so it is not a
+        blank to be filled in later but a standing instruction to attach
+        nothing. Found live on Better Resavio 2026-08-15: the officer's workers
+        came up with no repository checkout and he idled a whole watch.
+        """
+        new_tid = str(uuid4())
+
+        async def create_with_continuity(req, _request):
+            req._officer_commission_result = {
+                "brief_enqueued": True,
+                "while_vacant": [],
+                "while_vacant_dropped": 0,
+                "state_restored": False,
+            }
+            return {"thread_id": new_tid, "status": "created"}
+
+        create = AsyncMock(side_effect=create_with_continuity)
+        monkeypatch.setattr(orch_main, "create_thread", create)
+        row = _post_row(config_override={"officer": {"enabled": True}})
+        db.get_or_create_project_officer = AsyncMock(return_value=row)
+        db.update_project_officer_post = AsyncMock(
+            return_value={"post": row, "thread": None, "applied_to_thread": False}
+        )
+        db.get_project_officer = AsyncMock(return_value=row)
+
+        await commission_project_officer(MagicMock(), PROJECT_ID, None)
+
+        req = create.await_args.args[0]
+        assert req.use_datasource_defaults is True
+        assert "datasource_ids" not in req.model_fields_set
+
+    @pytest.mark.asyncio
     async def test_cleared_row_fields_do_not_travel_to_the_funnel(
         self, db, as_project_admin, quiet_side_channels, monkeypatch
     ):

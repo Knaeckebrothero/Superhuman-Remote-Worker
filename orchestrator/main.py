@@ -12687,6 +12687,29 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         trusted_system_origin = bool(
             internal_call and internal_origin_bound and selection_actor is None
         )
+        # Inheritance is for DELEGATION; project defaults are for DISPATCH.
+        #
+        # A parented subjob (critic, curator, pre-job scholar, delegate_work)
+        # must never exceed its parent's connectors, so ``parent_job_id`` keeps
+        # inheriting unconditionally. But a thread that *commissions* fresh
+        # project work — an officer, a session — is not delegating its own
+        # charge, and it only landed in the inheritance branch because it
+        # happens to be a thread. That mis-classification made
+        # ``use_datasource_defaults`` unreachable for every thread-originated
+        # job: the branch below it was never evaluated, so the flag the client
+        # already sends on omission (orch_surface/client.py) was silently
+        # dropped.
+        #
+        # Cost of that, found live on Better Resavio 2026-08-15: the officer's
+        # own thread had been created without a selection, which persists as
+        # ``datasource_ids: []`` (origin ``omitted_compat``). Every job he
+        # commissioned faithfully inherited the empty list, so his workers got
+        # no KurortEngine checkout, could not clone/commit/push, and he
+        # correctly refused to dispatch further against a candidate that could
+        # never be produced — a full night idle on one absent field.
+        wants_dispatch_defaults = bool(
+            effective_user_id and job.use_datasource_defaults and not job.parent_job_id
+        )
 
         if selection_was_supplied:
             selection_origin = "explicit"
@@ -12731,7 +12754,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 trusted_system_inheritance=trusted_explicit_reuse,
                 legacy_job_id=str(job.parent_job_id) if job.parent_job_id else None,
             )
-        elif job.thread_id or job.parent_job_id:
+        elif (job.thread_id or job.parent_job_id) and not wants_dispatch_defaults:
             selection_origin = "inherited"
             inherited_ids = await _inherit_parent_datasource_ids(
                 thread_id=job.thread_id, parent_job_id=job.parent_job_id
@@ -35617,6 +35640,16 @@ async def commission_project_officer(
         # case is defaulted.
         permission_mode=row_interactive.get("permission_mode")
         or OFFICER_PERMISSION_MODE,
+        # Third field of this shape, after config_name and permission_mode:
+        # the endpoint hand-builds the funnel request and omits what the UI
+        # supplies (buildConferenceThreadCreateBody sends exactly this for the
+        # conference thread). Without it the post falls to ``omitted_compat``
+        # and persists ``datasource_ids: []``, which is then inherited by
+        # anything that legitimately reads the officer's own selection. His
+        # tier is lite, so default_datasource_selection correctly withholds
+        # clone-based repositories here — dispatch resolves defaults again
+        # against the *worker's* backend, which is where the repo attaches.
+        use_datasource_defaults=True,
     )
     create_request._officer_post_config_snapshot = copy.deepcopy(row_cfg)
     created = await create_thread(create_request, request)
