@@ -723,3 +723,67 @@ operator-precreated Secret keeps its explicit name.
 {{- $credentials.existingSecret -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Keycloak SMTP port and STARTTLS flag for the realm bootstrap (kcadm).
+
+Both are WHITELISTS, not sanitizers: each emits either a literal drawn from a
+closed set, or the default. Nothing else can reach the rendered output, for
+any value of email.smtp.port / email.smtp.useTls -- nil, bool, int64,
+float64, string, map or slice, which is every Go kind Helm's loaders can
+produce (--set, --set-string, --set-json, a values file, --set key=null).
+
+Why a whitelist: four blacklist remedies shipped here and each one closed the
+case in front of it while opening another. `default` swallowed a real boolean
+false; `toString | default` then forwarded the literal "<nil>"; `kindIs
+"invalid"` let an empty string through verbatim; adding `eq (toString .) ""`
+let a whitespace-only string through. A blacklist is only ever as complete as
+the list of shapes someone thought to try.
+
+Why this is total, argued from structure rather than from a list of cases:
+  - `toString` is total: Sprig falls through to fmt's "%v" for every type,
+    nil included, so the guard always compares a string, never a bare Go
+    value that could error or format surprisingly.
+  - Membership is exact equality against a literal set (starttls), or a fully
+    anchored ASCII-digit match (port). Go's ^ and $ are start/end of TEXT
+    without (?m), so an embedded newline cannot slip past the anchors.
+  - The else-branch is the DEFAULT, not the input: an unrecognised value is
+    dropped, never forwarded.
+The output alphabet is therefore closed -- "true"/"false" for starttls, a
+decimal literal or "1025" for port -- under every input, including shapes
+nobody has tried yet. `trim` and `lower` only widen which inputs map to an
+intended value; they cannot widen that output.
+
+Why the fallback direction matters: Keycloak parses starttls with Java's
+Boolean.parseBoolean, which returns false for anything not literally "true"
+and does no trimming. Forwarding a meaningless value therefore DISABLES
+STARTTLS silently and puts the SMTP password on the wire in cleartext. Only
+true/false -- any case, surrounding whitespace tolerated -- count as the
+operator asking; every other shape means "did not ask", and gets the default.
+
+The closed alphabet also settles a second exposure: this text is rendered
+inside a double-quoted shell word in the Keycloak postStart hook, so before
+the whitelist a value containing a double quote was command injection, and
+one containing a newline broke the rendered manifest outright.
+
+Two deliberate boundaries:
+  - `--set-string email.smtp.useTls=null` now yields the default instead of
+    the literal it used to forward. Helm's --set-string contract is untouched
+    (the value in .Values is still that 4-character string); the guard simply
+    does not recognise it as a boolean -- and forwarding it meant
+    parseBoolean == false, i.e. STARTTLS off without being asked.
+  - The port guard validates FORM, not policy. Any decimal literal passes,
+    including 0 (a real, explicitly-set value it must not swallow) and values
+    above 65535. Range is Keycloak's to reject, loudly, with the operator's
+    own number in the error; quietly substituting the dev mail-catcher port
+    would be the very bug this task exists to fix.
+*/}}
+{{- define "srw.keycloak.smtpStartTls" -}}
+{{- $canonical := lower (trim (toString .Values.email.smtp.useTls)) -}}
+{{- if has $canonical (list "true" "false") -}}{{ $canonical }}{{- else -}}true{{- end -}}
+{{- end -}}
+
+{{- define "srw.keycloak.smtpPort" -}}
+{{- $canonical := trim (toString .Values.email.smtp.port) -}}
+{{- if regexMatch "^[0-9]+$" $canonical -}}{{ $canonical }}{{- else -}}1025{{- end -}}
+{{- end -}}

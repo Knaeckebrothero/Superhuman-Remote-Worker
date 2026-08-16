@@ -53,7 +53,27 @@ def _properties_directives(text: str) -> str:
     something else. Strip comments before judging directives -- the
     .properties analogue of _css_rules() above.
     """
-    lines = (line for line in text.splitlines() if line.strip() and not line.strip().startswith("#"))
+    lines = (
+        line
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    )
+    return "\n".join(lines)
+
+
+def _template_directives(text: str) -> str:
+    """Helm template text with {{/* ... */}} and whole-line # comments removed.
+
+    The SMTP guards below are documented by a long comment block that has to
+    name the shapes it rejects -- including the literal `smtpServer.port=1025`
+    hardcode it replaced. A raw-text assertion for that literal would then be
+    satisfied by the prose explaining its removal. Strip comments before
+    judging directives -- the Helm-template analogue of _css_rules() above.
+    Only whole-line `#` comments are dropped, so a mid-line `#` inside a real
+    shell command or URL is never mangled.
+    """
+    text = re.sub(r"\{\{-?\s*/\*.*?\*/\s*-?\}\}", "", text, flags=re.S)
+    lines = (line for line in text.splitlines() if not line.lstrip().startswith("#"))
     return "\n".join(lines)
 
 
@@ -133,7 +153,7 @@ def test_light_tokens_match_the_shared_brand_palette() -> None:
 
     css = LOGIN_CSS.read_text()
     rules = _css_rules(css)
-    root = rules[rules.index(":root {"): rules.index(".pf-v5-theme-dark")]
+    root = rules[rules.index(":root {") : rules.index(".pf-v5-theme-dark")]
 
     expected = {
         "--pf-v5-global--primary-color--100": brand.TRAVERTINE["accent-color"],
@@ -212,7 +232,9 @@ def test_configmap_keys_have_no_slashes() -> None:
     data = _render_theme_configmap_data()
     assert data, "keycloak-theme ConfigMap rendered with an EMPTY data block"
     for key in data:
-        assert "/" not in key, f"{key!r} still contains '/' -- the API server would reject it"
+        assert "/" not in key, (
+            f"{key!r} still contains '/' -- the API server would reject it"
+        )
 
 
 def test_theme_is_mounted_at_the_themes_root() -> None:
@@ -244,7 +266,7 @@ def test_both_realms_use_the_srw_login_theme() -> None:
 def test_display_name_html_carries_the_logo_hook() -> None:
     """--keycloak-logo-url only renders if displayNameHtml provides
     .kc-logo-text for the stylesheet to turn into a background image."""
-    assert 'kc-logo-text' in KC.read_text()
+    assert "kc-logo-text" in KC.read_text()
     export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
     assert "kc-logo-text" in export["displayNameHtml"]
 
@@ -300,13 +322,25 @@ def test_both_realms_use_the_srw_email_theme() -> None:
     assert export["emailTheme"] == "srw"
 
 
+HELPERS = ROOT / "helm/templates/_helpers.tpl"
+
+
 def test_smtp_port_and_tls_come_from_values() -> None:
     """values.yaml exposes email.smtp.port but the bootstrap hardcoded 1025 --
-    a dev mail-catcher port -- so any real relay on 587 was unreachable."""
-    kc = KC.read_text()
-    assert 'smtpServer.port=1025' not in kc
-    assert ".Values.email.smtp.port" in kc
-    assert ".Values.email.smtp.useTls" in kc
+    a dev mail-catcher port -- so any real relay on 587 was unreachable.
+
+    Judges directives, not raw text: the guards' own comment block names the
+    `smtpServer.port=1025` hardcode it replaced (see _template_directives).
+    """
+    kc = _template_directives(KC.read_text())
+    helpers = _template_directives(HELPERS.read_text())
+    assert "smtpServer.port=1025" not in kc, (
+        "the dev mail-catcher port is hardcoded again"
+    )
+    assert 'include "srw.keycloak.smtpPort"' in kc
+    assert 'include "srw.keycloak.smtpStartTls"' in kc
+    assert ".Values.email.smtp.port" in helpers
+    assert ".Values.email.smtp.useTls" in helpers
 
 
 def _render_keycloak_poststart_script(*extra_args: str) -> str:
@@ -314,14 +348,12 @@ def _render_keycloak_poststart_script(*extra_args: str) -> str:
     shell script -- the text that actually runs `kcadm update ... smtpServer`.
 
     A source-text assertion can only ever see the literal `{{ }}` expression,
-    never what Sprig's `default` actually decides at render time -- and that
-    decision is exactly what's under test here: `default` treats a Go-template
-    "empty" value (including the boolean `false`) as absent and substitutes
-    its fallback, so `.Values.email.smtp.useTls | default "true"` silently
-    re-enabled STARTTLS for an operator who explicitly passed
-    `--set email.smtp.useTls=false` (Helm's `--set` parses that as a real
-    bool). Only a rendered assertion proves the fix. Mirrors
-    _render_theme_configmap_data() above, but reads the Deployment
+    never what the guard inside it decides for a given input -- and that
+    decision is the entire subject of these tests. It is also why every bug in
+    this line's history shipped: the template source looked correct in all
+    four of them. Only rendering shows what kcadm is actually handed.
+
+    Mirrors _render_theme_configmap_data() above, but reads the Deployment
     (kind == Deployment, name endswith "-keycloak") rather than the theme
     ConfigMap, and drills into containers[].lifecycle.postStart instead of
     .data.
@@ -358,94 +390,149 @@ def _render_keycloak_poststart_script(*extra_args: str) -> str:
     raise AssertionError("no keycloak Deployment in the render")
 
 
-@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
-def test_smtp_port_and_starttls_survive_every_override_shape() -> None:
-    """Regression for three Sprig `default`/emptiness gotchas hit in
-    sequence, each fix closing one hole while leaving another open:
+def _smtp_field(script: str, field: str) -> str:
+    """The exact value kcadm receives for `-s "smtpServer.<field>=<value>"`.
 
-    1. `default` treats a Go-template "empty" value -- including the
-       boolean `false` -- as absent, so a bare `--set ...useTls=false`
-       (parsed as a real bool, not a string) silently fell back to "true":
-       an operator who explicitly disabled STARTTLS got it silently
-       re-enabled.
-    2. Piping through `toString` before `default` fixed that but traded it
-       for another: `toString(nil)` renders the Go `%v` string "<nil>",
-       which is non-empty, so `--set ...=null` (Helm's documented idiom for
-       unsetting a value) rendered the literal text "<nil>" instead of
-       falling back at all.
-    3. Switching to `kindIs "invalid"` fixed both of those, but an empty
-       string (`--set email.smtp.useTls=` -- reachable from an ordinary CI
-       pattern like `--set email.smtp.useTls=$USE_TLS` with an unset
-       variable) has kind `string`, not `invalid`, so the guard's
-       else-branch rendered it verbatim: `smtpServer.starttls=`. Keycloak's
-       `Boolean.parseBoolean("")` returns false, so this one fails in the
-       *unsafe* direction -- STARTTLS silently disabled, credentials sent
-       in cleartext -- unlike the two prior bugs, which both failed toward
-       TLS staying on.
+    Substring assertions are the wrong shape for this guard. `"port=1025" in
+    script` passes on a prefix, so a rendered `port=10250` satisfies it; and
+    when the guard regressed to `starttls=` or `starttls=" "` -- the two bugs
+    that cost this task four rounds -- the only signal a substring check could
+    give was the absence of some other string, never the offending value
+    itself. Capture up to the closing quote and compare with ==, so every
+    failure message names what was actually rendered.
 
-    The final guard treats "invalid" OR "empty string" as absent. All
-    seven rows of the input/output matrix are asserted on RENDERED output,
-    not template source: source only ever shows the literal `{{ }}`
-    expression, never what the guard decided for a given input, so a
-    source-text assertion cannot see any of these bugs.
+    A value containing a `"` truncates the capture rather than escaping it,
+    which is the correct outcome: such a value would also terminate the shell
+    string early, and the == assertion fails loudly instead of matching.
     """
-    # 1. Unset (normal path): values.yaml supplies the string default.
-    default_script = _render_keycloak_poststart_script()
-    assert "smtpServer.port=1025" in default_script
-    assert "smtpServer.starttls=true" in default_script
+    found = re.search(rf'-s "smtpServer\.{re.escape(field)}=([^"]*)"', script)
+    assert found is not None, (
+        f"no smtpServer.{field} assignment in the rendered postStart script"
+    )
+    return found.group(1)
 
-    # 2. --set ...=null: the case neither `default` alone nor
-    #    `toString | default` survived -- asserted explicitly on BOTH
-    #    lines, since this is the regression the second remedy still missed
-    #    and the "unset" case above never reaches this branch at all.
-    null_script = _render_keycloak_poststart_script(
-        "--set", "email.smtp.port=null", "--set", "email.smtp.useTls=null"
-    )
-    assert "smtpServer.port=1025" in null_script, (
-        "--set email.smtp.port=null must fall back to the default, not render '<nil>'"
-    )
-    assert "smtpServer.starttls=true" in null_script, (
-        "--set email.smtp.useTls=null must fall back to the default, not render '<nil>'"
-    )
 
-    # 3. --set ...= (empty string): the case `kindIs "invalid"` alone
-    #    still missed -- it has kind `string`, not `invalid`, so the bare
-    #    guard let it through verbatim as `smtpServer.starttls=`, which
-    #    Keycloak parses as false (STARTTLS silently disabled -- the
-    #    unsafe direction). Asserted explicitly on BOTH lines, distinct
-    #    from the null case above, since an empty string and a nil value
-    #    are different Go kinds and a fix for one does not imply the other.
-    empty_script = _render_keycloak_poststart_script(
-        "--set", "email.smtp.port=", "--set", "email.smtp.useTls="
-    )
-    assert "smtpServer.port=1025" in empty_script, (
-        "--set email.smtp.port= (empty string) must fall back to the default"
-    )
-    assert "smtpServer.starttls=true" in empty_script, (
-        "--set email.smtp.useTls= (empty string) must fall back to true, "
-        "not render empty (Keycloak parses '' as false -- TLS silently off)"
-    )
+def _both(flag: str, value: str) -> list[str]:
+    """The same override, same shape, applied to BOTH SMTP fields.
 
-    # 4. --set ...useTls=false (bare boolean): the case the plain `default`
-    #    remedy silently broke. Asserted on its own, not folded into the
-    #    --set-string case below.
-    bare_bool_script = _render_keycloak_poststart_script("--set", "email.smtp.useTls=false")
-    assert "smtpServer.starttls=false" in bare_bool_script, (
-        "a bare --set boolean false must render as false, not silently fall back to the default"
+    Requirement: the port and starttls guards stay consistent. Driving both
+    from one row means a fix applied to only one of them fails the matrix.
+    """
+    return [flag, f"email.smtp.port={value}", flag, f"email.smtp.useTls={value}"]
+
+
+# (helm args, expected rendered port, expected rendered starttls).
+#
+# Organised by the Go kind Helm hands the template, because kind -- not the
+# spelling of the flag -- is the axis the guards are total over. Every kind
+# Helm's loaders can produce for a leaf value is represented: invalid (nil),
+# bool, int64, float64, string, map, slice. Within `string`, the sub-rows are
+# the content classes that decide whitelist membership.
+#
+# The starttls expectations are the load-bearing ones. Keycloak parses that
+# field with Java's Boolean.parseBoolean, which returns false for anything
+# that is not literally "true" and does no trimming, so EVERY row expecting
+# "true" is also asserting that a meaningless value did not silently disable
+# STARTTLS and put SMTP credentials on the wire in cleartext.
+#
+# Read the two columns together. Where a row expects starttls "true" and the
+# default is also "true", that column alone cannot tell "honoured" from
+# "defaulted" -- but the same row's port column can, because the same raw
+# value is a valid port for almost none of these shapes. The rows that pin
+# "honoured" for starttls specifically are the four expecting "false".
+_SMTP_OVERRIDE_MATRIX = [
+    # --- absent / nil ---
+    pytest.param([], "1025", "true", id="absent"),
+    pytest.param(_both("--set", "null"), "1025", "true", id="nil-via-set-null"),
+    # --- string: the empty and near-empty classes ---
+    # Reachable from an ordinary CI pattern: --set email.smtp.useTls=$USE_TLS
+    # with the variable unset, or set to a value that is only whitespace.
+    pytest.param(_both("--set", ""), "1025", "true", id="empty-string"),
+    pytest.param(_both("--set", " "), "1025", "true", id="whitespace-space"),
+    pytest.param(_both("--set", "\t"), "1025", "true", id="whitespace-tab"),
+    pytest.param(_both("--set", "\n"), "1025", "true", id="whitespace-newline"),
+    # --- bool: what a bare --set produces ---
+    pytest.param(_both("--set", "false"), "1025", "false", id="bool-false"),
+    pytest.param(_both("--set", "true"), "1025", "true", id="bool-true"),
+    # --- string: real boolean literals, as --set-string produces them ---
+    pytest.param(_both("--set-string", "false"), "1025", "false", id="string-false"),
+    pytest.param(_both("--set-string", "true"), "1025", "true", id="string-true"),
+    pytest.param(
+        _both("--set-string", "FALSE"), "1025", "false", id="string-false-uppercase"
+    ),
+    pytest.param(
+        _both("--set-string", " false "), "1025", "false", id="string-false-padded"
+    ),
+    # --- string: shapes that are NOT boolean literals -> default, never passthrough ---
+    pytest.param(_both("--set-string", "null"), "1025", "true", id="string-null"),
+    pytest.param(_both("--set-string", "yes"), "1025", "true", id="string-yes"),
+    pytest.param(_both("--set-string", "1.5"), "1025", "true", id="string-fractional"),
+    # --- int64: what a bare --set produces for an integer literal ---
+    pytest.param(_both("--set", "0"), "0", "true", id="int-zero"),
+    pytest.param(_both("--set", "587"), "587", "true", id="int-587"),
+    pytest.param(_both("--set", "65535"), "65535", "true", id="int-65535"),
+    pytest.param(_both("--set-string", "587"), "587", "true", id="string-digits"),
+    pytest.param(
+        _both("--set-string", "0587"), "0587", "true", id="string-leading-zero"
+    ),
+    # --- float64: what a values FILE and --set-json produce for any number ---
+    pytest.param(_both("--set-json", "587"), "587", "true", id="float-587"),
+    pytest.param(_both("--set-json", "1.5"), "1025", "true", id="float-fractional"),
+    # --- map / slice: a whole subtree pasted where a scalar belongs ---
+    pytest.param(_both("--set-json", '{"a":1}'), "1025", "true", id="map"),
+    pytest.param(_both("--set-json", "[1,2]"), "1025", "true", id="slice"),
+    # --- hostile strings: the rendered value lands inside a double-quoted
+    #     shell word in the postStart hook, so a `"` or a newline that reaches
+    #     it is command injection, not just a bad config value.
+    pytest.param(
+        _both("--set-string", '1"; id; echo "'),
+        "1025",
+        "true",
+        id="shell-metacharacters",
+    ),
+    pytest.param(
+        _both("--set-string", "false\nid"), "1025", "true", id="interior-newline"
+    ),
+]
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
+@pytest.mark.parametrize(("args", "want_port", "want_starttls"), _SMTP_OVERRIDE_MATRIX)
+def test_smtp_port_and_starttls_are_total_over_every_value_shape(
+    args: list[str], want_port: str, want_starttls: str
+) -> None:
+    """The two guards emit a member of a closed set, or the default. Nothing else.
+
+    Four previous remedies each closed the one broken case in front of them
+    and opened another, because each was a blacklist -- `default`, then
+    `toString | default`, then `kindIs "invalid"`, then that OR `eq (toString
+    .) ""` -- and a blacklist is only ever as complete as the list of shapes
+    someone thought to try. `starttls=` and `starttls=" "` both survived to
+    the rendered output, and Boolean.parseBoolean reads both as false: TLS off
+    without being asked.
+
+    The guards are now whitelists, so the argument is structural rather than
+    enumerative. `toString` is total (Sprig falls through to fmt "%v" for
+    every type, nil included), so the comparison always has a string on the
+    left; membership is exact equality against a literal set, or a fully
+    anchored ASCII-digits regex (Go's `$` is end-of-TEXT without `(?m)`, so an
+    embedded newline cannot slip past it); and the else-branch is the default,
+    not the input. The output alphabet is therefore closed under every
+    possible input, which is what makes the "never silently false" and "never
+    shell-injectable" properties hold for shapes nobody has tried yet.
+
+    This matrix does not establish that property -- it samples it. It is here
+    so that a future edit which reintroduces a passthrough branch fails.
+    """
+    script = _render_keycloak_poststart_script(*args)
+
+    assert _smtp_field(script, "port") == want_port, (
+        f"helm {' '.join(args) or '(no override)'} rendered "
+        f"smtpServer.port={_smtp_field(script, 'port')!r}, expected {want_port!r}"
     )
-
-    # 5. --set-string ...useTls=false: worked before every fix; kept as a control.
-    string_script = _render_keycloak_poststart_script("--set-string", "email.smtp.useTls=false")
-    assert "smtpServer.starttls=false" in string_script
-
-    # 6. --set ...port=587: the ordinary configured-relay path this task exists for.
-    port_script = _render_keycloak_poststart_script("--set", "email.smtp.port=587")
-    assert "smtpServer.port=587" in port_script
-
-    # 7. --set ...port=0: a real (if impractical) int, not absent -- must
-    #    pass through literally and NOT be swallowed by the new
-    #    empty-string clause (toString(0) == "0", not "").
-    zero_port_script = _render_keycloak_poststart_script("--set", "email.smtp.port=0")
-    assert "smtpServer.port=0" in zero_port_script, (
-        "an explicit port=0 must render literally, not fall back to the default"
+    assert _smtp_field(script, "starttls") == want_starttls, (
+        f"helm {' '.join(args) or '(no override)'} rendered "
+        f"smtpServer.starttls={_smtp_field(script, 'starttls')!r}, expected {want_starttls!r} "
+        "-- Boolean.parseBoolean reads anything that is not literally 'true' as false, "
+        "so a wrong value here disables STARTTLS silently"
     )
