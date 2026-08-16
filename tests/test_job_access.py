@@ -979,8 +979,9 @@ class TestJobMutationGates:
         assert "owner" in exc.value.detail.lower()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("has_claim", [False, True])
     async def test_delete_job_tears_down_workspace_before_row_delete(
-        self, user_a, job_a, fake_db, fake_request
+        self, user_a, job_a, fake_db, fake_request, has_claim
     ):
         """Owner-path delete must release workspace/VM resources and the S3
         snapshots while the row still exists — once the row is gone the
@@ -995,11 +996,22 @@ class TestJobMutationGates:
             calls.append("workspace")
             return []
 
-        async def _row_delete(jid):
+        async def _row_delete(jid, **kwargs):
+            assert kwargs == {
+                "deletion_actor_user_id": str(user_a["id"]),
+                "deletion_reason": "authorized_api_delete",
+                "return_claim_state": True,
+            }
             calls.append("row")
-            return True
+            return {
+                "deleted": True,
+                "ticket_claim_retained": has_claim,
+            }
 
         fake_db.delete_job = AsyncMock(side_effect=_row_delete)
+        fake_db.job_has_durable_ticket_claim = AsyncMock(
+            side_effect=AssertionError("deletion must not perform a post-commit read")
+        )
         fake_db.has_child_jobs = AsyncMock(return_value=False)
         cleanup = AsyncMock(side_effect=_cleanup)
         fake_snapshot = MagicMock()
@@ -1017,9 +1029,13 @@ class TestJobMutationGates:
         ):
             result = await delete_job(fake_request, str(job_a["id"]))
 
-        assert result == {"status": "deleted"}
+        assert result["status"] == "deleted"
+        assert result["ticket_claim_retained"] is has_claim
+        assert result["ticket_rearmed"] is False
+        assert ("remains durable" in result["message"]) is has_claim
         cleanup.assert_awaited_once_with(str(job_a["id"]))
         fake_snapshot.delete_snapshot.assert_awaited_once_with(str(job_a["id"]))
+        fake_db.job_has_durable_ticket_claim.assert_not_awaited()
         assert calls == ["workspace", "row"]
 
     @pytest.mark.asyncio

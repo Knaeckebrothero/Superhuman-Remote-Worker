@@ -48,15 +48,20 @@ The result remains mixed, but the authority/atomicity baseline has materially ad
 - Real-PostgreSQL tests now exercise final-slot and same-ticket contention, lifecycle/config
   races, rollback after every decommission substep, idempotency, route fallback, and
   decommission/recommission serialization. These are no longer inferred from AsyncMocks.
+- BP-05 is closed locally after independent-review repair. Migration 0162 now governs old
+  replicas with an atomic jobs-table cut, strict/collision-loud backfill and jobs triggers;
+  raw claim context is server-owned, null/missing provenance fails closed, historical
+  context merges remain compatible, and deletion truth comes from the delete transaction.
 - Unattended backlog release is still blocked by the supported enable-control gap and fixed
-  pre-filter starvation, followed by the still-open durable-claim, provisioning,
-  materialization, roster, evidence, and operational residues listed below.
+  pre-filter starvation, followed by the still-open provisioning, materialization, roster,
+  evidence, and operational residues listed below.
 
 “Implemented” in the feature docs therefore still does not mean unattended backlog release
 is safe. The earlier tranche was deployed and O6 was released successfully with
-`auto_pull=false`; that live-fire was in progress before this local, not-yet-deployed
-transaction checkpoint. Nothing here authorizes `auto_pull=true` or unattended backlog
-release. The umbrella stays open until the remaining P0 live gates in
+`auto_pull=false`; the later lifecycle/configuration transaction checkpoint was also
+deployed and passed a bounded disposable Officer gate on 2026-08-16. BP-05 is the current
+local, uncommitted and not-deployed checkpoint. Nothing here authorizes `auto_pull=true` or
+unattended backlog release. The umbrella stays open until the remaining P0 live gates in
 [Release order and acceptance](#release-order-and-acceptance) pass.
 
 ## Individual issue ledger
@@ -67,9 +72,10 @@ dependency chain; it is not a claim that every item in one priority must ship in
 change.
 
 **Pre-deployment tranche (orders 1, 2, 5, 6, 7, 10), BP-02/BP-03/BP-04 and OC-03
-closed 2026-08-15.** The earlier tranche reached dev and O6 was released successfully
-with `auto_pull=false`; this additional transaction checkpoint is local, uncommitted and
-not deployed.
+closed 2026-08-15; deployed disposable gate passed 2026-08-16.** The earlier tranche
+reached dev and O6 was released successfully with `auto_pull=false`; the additional
+transaction/configuration checkpoint later reached dev and passed the bounded gate recorded
+in [[officer_backlog_pools_resavio_livefire]]. BP-05 below is local and not deployed.
 
 | Order | Priority | Issue | Audit finding(s) | Why this boundary |
 |---:|---|---|---|---|
@@ -86,7 +92,7 @@ not deployed.
 | 11 | P1 | [[officer_internal_messages_consume_human_rate_limits]] | OC-07 | Split internal flood control from human interruption quotas. |
 | 12 | P1 | [[job_liveness_defaults_disagree_across_surfaces]] | OC-08 | Give every supervision surface one liveness policy. |
 | 13 | P1 | [[officer_card_ignores_viewer_authority_and_i18n]] | OC-10 | Make the management surface truthful for roles and locales. |
-| 14 | P1 | [[deleting_a_job_releases_its_backlog_ticket_claim]] | BP-05 | Decide and persist claim retention independently of job retention. |
+| 14 | P1 | [[deleting_a_job_releases_its_backlog_ticket_claim]] | BP-05 | Persist claim retention independently of job retention. **DONE 2026-08-16 after rolling-upgrade/authority repair; local and not deployed.** |
 | 15 | P1 | [[auto_pull_jobs_are_dispatchable_before_provisioning]] | BP-07 | Add non-dispatchable preflight and honest failure causes. |
 | 16 | P1 | [[kb_materialization_failure_reports_ready_or_closed]] | BP-08 | Stop authorization/disposition writes from reporting false success. |
 | 17 | P1 | [[backlog_floor_wake_failure_consumes_debounce]] | BP-10 | Debounce durable wake success, not an attempted call. |
@@ -104,8 +110,9 @@ These are real gains and should be preserved while repairing the findings:
   `context.kickoff_message`.
 - Machine tags are normalized, excluded from search documents, and queried with GIN-backed
   containment. `ready_at` survives ordinary edits and changes only on an explicit re-ready.
-- Worker jobs have `ready` and `parallel-safe` stripped. Terminal jobs continue to block a
-  ticket while their job rows exist; a newer `ready_at` explicitly re-arms it.
+- Worker jobs have `ready` and `parallel-safe` stripped. Durable claims survive terminal
+  status and physical job deletion; only a newer trusted `ready_at` generation can re-arm,
+  and a preceding non-terminal job still blocks it.
 - Migration 0160 adds a partial unique index against concurrent non-terminal claims for the
   same ticket.
 - Manual and automatic officer creation both lock the durable post, revalidate the current
@@ -156,8 +163,9 @@ deliberate enable/disable live test.
 
 Manual `POST /api/jobs` and automatic tick dispatch now call the same
 `admit_and_create_job()` transaction. It locks the durable post and current thread,
-revalidates configuration/lineage, counts all non-terminal capacity, validates the job-row
-claim, stamps provenance, and inserts with `create_job(conn=...)`. Real-PostgreSQL races
+revalidates configuration/lineage, counts all non-terminal capacity, validates the durable
+ticket generation, stamps provenance, and inserts with `create_job(conn=...)` in the same
+claim transaction. Real-PostgreSQL races
 prove one winner for both different-ticket final-slot contention and same-ticket
 manual/manual or manual/tick contention; the loser is a normal 409/skip, not a 500.
 
@@ -179,17 +187,37 @@ category, owner and full lineage. Real-PostgreSQL tests interleave hold, disable
 change, decommission and recommission immediately before INSERT and prove the stale request
 never creates a job.
 
-### BP-05 — deleting a job deletes its one-shot claim (**P1 data integrity**)
+### BP-05 — durable claim ledger (**DONE 2026-08-16; not deployed**)
 
-The claim ledger is reconstructed solely from extant `jobs` rows
-(`newest_ticket_claims`). The authorized DELETE endpoint physically deletes those rows.
-If its KB ticket remains `ready`, the claim disappears; after a re-ready cycle, the newest
-surviving older claim predates `ready_at`, so deletion silently re-arms the ticket without
-the explicit officer action the design requires.
+Migration 0162 creates `officer_ticket_claims`, unique per project/ticket/ready generation
+and per job identity, without a jobs FK. It backfills every verifiable extant ticket job,
+rejects questionable provenance and same-generation collisions, and preserves multiple
+legitimate re-ready generations. Manual and tick admission now insert
+the durable claim and exact preallocated job UUID in the same post-locked transaction.
+Eligibility, ready depth, stale claims, breaker history and executor disposition read this
+ledger rather than reconstructing claims from current jobs.
 
-**Acceptance:** either claims live in a durable ledger/tombstone independent of job
-retention, or deletion has an explicit, authorized “release claim” semantic with audit and
-UI warning. A hard-delete regression test must prove the chosen behavior.
+Authorized job deletion records status/time/actor/reason on the claim in the same database
+transaction and never releases it. Equal/older generations stay consumed; a newer trusted
+Officer `ready_at` wins exactly once only after prior work is terminal. Real-PostgreSQL
+tests cover manual/manual and manual/tick contention, the claim/job fault boundary, terminal
+and non-terminal deletion, legacy retention DELETE, newer/equal/older generations, project
+scope, recommission continuity and idempotent backfill. Manual `ticket=` resolves project,
+readiness and generation server-side; no ready timestamp is model-selectable. See
+[[deleting_a_job_releases_its_backlog_ticket_claim]].
+
+Independent review found the application transaction correct but the rollout boundary
+incomplete. The repair takes `SHARE ROW EXCLUSIVE` on `jobs` through backfill and trigger
+installation. Pre-lock commits are captured; later old ticket INSERTs fail the named
+integrity constraint, while old DELETEs trigger-audit status. Backfill idempotency is
+`ON CONFLICT (job_id) DO NOTHING` only. Public/internal/tool/database funnels strip raw
+claim authority. The trigger is ledger-first and null-safe, preserves the authentic
+source-less pre-0162 stamp on backfilled rows, and forbids a live claimed job from removing
+its authority stamp. Deletion truth is returned inside the delete transaction rather than
+queried after commit. Real PostgreSQL covers the lock boundary, old writers, collision
+diagnostics, nullable/missing provenance, historical context merging, endpoint bypasses,
+atomic deletion response and the index plan. See
+[[deleting_a_job_releases_its_backlog_ticket_claim]].
 
 ### BP-06 — fixed pre-filter windows can starve valid work forever (**P0 liveness**)
 
@@ -334,9 +362,9 @@ sequence is:
    now have transactional/CAS boundaries, including the full-lineage no-force gate,
    orphan-End decision, commission continuity, completion routing and commission config
    generation fence.
-3. **Durable eligibility and preflight:** BP-05, BP-06, BP-07, OC-08, OC-09. Claims must
-   survive retention, scans must not starve, and a job must not be dispatchable until its
-   prerequisites are ready.
+3. **Durable eligibility and preflight:** BP-05 is completed locally; BP-06, BP-07, OC-08
+   and OC-09 remain. Claims now survive retention; scans must not starve, and a job must not
+   be dispatchable until its prerequisites are ready.
 4. **Truthful content and delivery:** OC-05–OC-07, BP-08, BP-10, ES-01. Redact before either
    audience, distinguish attempted from delivered, and surface degraded canonical writes.
 5. **Supported operation:** BP-01, BP-11, BP-12, OC-10. Only after the invariants exist
@@ -355,6 +383,9 @@ Completed automated transaction gates (not a substitute for live fire):
   commissioned successor; commission continuity and job-completion routing remain
   exactly-once across commission/decommission races; a losing commission cannot patch the
   winner.
+- Durable claim/job insertion rolls back together; manual/manual and manual/tick races
+  produce one claim/job; deletion, retention, re-ready and recommission preserve the
+  project-scoped ledger contract.
 - Route A reply/timeout actors cannot resume a refrozen route B generation.
 
 Remaining minimum regression/live gates before `auto_pull` leaves its safe default:
@@ -364,8 +395,6 @@ Remaining minimum regression/live gates before `auto_pull` leaves its safe defau
 - Put more than 10 claimed/invalid tickets ahead of an eligible ticket, more than 10 mixed
   breaker outcomes in a pool, and more than 50 open claims. The correct tail item/outcome/
   oldest stale claim remains visible.
-- Delete a claimed terminal and non-terminal job and assert the explicitly chosen claim
-  retention/release policy.
 - Make repository/cloud provisioning fail and delay it beyond a dispatcher poll. No job
   executes early and the infrastructure outcome does not trip the job-failure breaker.
 - Attempt charter/`ready`/`parallel-safe` writes as worker, viewer session, editor session,
@@ -454,5 +483,43 @@ passes alone (**24 passed**). These are explicit local-environment/test-isolatio
 officer checkpoint failures.
 
 The umbrella nevertheless remains open: this automated transaction evidence does not
-close BP-01/BP-05/BP-06/BP-07/BP-08/BP-11, ES-01, the remaining OC-05/OC-06 residues, or
+close BP-01/BP-06/BP-07/BP-08/BP-11, ES-01, the remaining OC-05/OC-06 residues, or
 the live background-officer image-consumption gate.
+
+### 2026-08-16 deployed gate and local BP-05 checkpoint
+
+The intended shared development environment was resolved explicitly as context `main`,
+namespace `superhuman-remote-worker`, rather than local `k3d-srw`. One uniquely named
+disposable project commissioned a fresh Officer through the supported endpoint. Database,
+API and runtime evidence agreed on `centurion`, `autonomous`, one exact live post link,
+the 49-tool control/inspection/evidence surface, absence of workspace/object tools,
+persisted tool-result pairing, useful output and a normal next wake. A tiny ticketed
+sandbox researcher job carried authoritative ticket/incarnation/slot/category provenance.
+After an exact-pod restart the replacement restored 59 messages and completed another
+paired inspection turn. LF-5 did not reproduce, but the tool results landed before process
+death, so the exact orphan window and repeated-400 escalation remain unverified. All named
+disposable rows and pods were removed; `auto_pull` stayed false.
+
+The subsequent local BP-05 implementation and independent-review repair verified:
+
+```text
+earlier focused Officer/admission/deletion set:        662 passed in 239.96s
+earlier real Officer Post PostgreSQL file:              53 passed in 117.42s
+follow-up malformed/backfill/delete cases:              13 passed in 40.03s
+follow-up complete Officer PostgreSQL file:             64 passed in 137.24s
+follow-up broader Officer/API/tool checkpoint:         636 passed in 262.65s
+follow-up deletion collaborator checkpoint:            150 passed in 0.73s
+migration/head tests:                                   34 passed in 28.82s
+schema replay and generated drift check:                OK (all artifacts current)
+Cockpit job-list (earlier checkpoint):                  19 passed
+Cockpit EN/DE i18n (earlier checkpoint):                2530 keys, clean
+ruff check / format check / git diff --check:           clean
+```
+
+The repository fast suite exposed two genuine stale tests (the app migration-head sentinel
+and a ready-depth mock), both corrected. Its final system-Python run reached **14,783
+passed / 123 skipped** before the already-known missing `arxiv` dependency stopped it; the
+exact file passes under the project virtualenv (**22 passed**). The review repair ran the
+proportionate focused set rather than repeating that environment-limited full suite. BP-05
+remains uncommitted and not deployed. This evidence permits continued supervised manual/O6
+testing only with `auto_pull=false`; it does not authorize unattended backlog release.

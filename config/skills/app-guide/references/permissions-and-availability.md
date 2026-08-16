@@ -77,6 +77,14 @@ The current grant catalog covers:
   skills, and automations. The writes are owner-scoped by the same endpoints the
   UI uses, and a new automation is created switched off; the grant exists because
   an enabled automation goes on to spawn jobs;
+- `unattended_operations` — start a project self-improvement loop and commission
+  a project officer (centurion). These are the two surfaces that spawn jobs with
+  no human clicking anything, so the grant bounds unattended token spend as much
+  as permission. Without it the project's **Loop** and **Centurion** tabs do not
+  appear, starting/resuming a loop or converting it to officer scheduling is
+  refused, and a session configuration that switches `officer.enabled` on is
+  rejected. Reading a loop's state, pausing it, and stopping it stay available —
+  nobody is locked out of halting work that is already running;
 - `complete_unmerged_pr` — approve or auto-complete a job whose delivered pull
   request has not been merged. Without it, a job that opened a pull request stays
   in review until that pull request lands: approval is refused, and a job that

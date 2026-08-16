@@ -17,10 +17,10 @@ durable kit, hold, enabled flag, auto-pull flag, or lineage change makes a
 prepared request retry instead of inserting with a stale slot snapshot.
 Runtime-only ``last_respawn_at`` does not affect admission and is excluded.
 
-``admit_and_create_job_in_transaction`` is connection-aware by design.  BP-05
-can add a durable ticket-claim INSERT to the same caller-owned transaction
-without replacing this funnel; this checkpoint keeps the existing job-row
-claim and partial unique-index backstop intact.
+``admit_and_create_job_in_transaction`` is connection-aware by design. BP-05's
+durable claim INSERT, capacity decision and exact preallocated job INSERT share
+that caller-owned transaction. The historical partial jobs index remains a
+second non-terminal backstop.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from services.officer_slots import SlotAdmissionError
 from services.officer_slots import admit as admit_slot
@@ -395,34 +395,44 @@ async def _validate_ticket_claim(
 ) -> None:
     if not note_id:
         return
+    generation = _aware(ready_at)
+    if generation is None:
+        raise _conflict(
+            "ticket_not_ready",
+            f"Backlog ticket '{note_id}' has no trusted ready generation.",
+        )
     row = await conn.fetchrow(
         f"""
-        SELECT MAX(created_at) AS newest,
-               COALESCE(bool_or(status NOT IN {_TERMINAL_STATUSES_SQL}), FALSE)
-                   AS has_non_terminal
-          FROM jobs
-         WHERE project_id = $1
-           AND context->>'ticket_note_id' = $2
+        SELECT MAX(claim.ready_generation_at) AS newest_generation,
+               COALESCE(bool_or(
+                   (live.id IS NOT NULL AND
+                    live.status NOT IN {_TERMINAL_STATUSES_SQL})
+                   OR
+                   (live.id IS NULL AND (
+                       claim.job_deleted_at IS NULL
+                       OR claim.job_status_at_delete IS NULL
+                       OR claim.job_status_at_delete
+                          NOT IN {_TERMINAL_STATUSES_SQL}
+                   ))
+               ), FALSE) AS has_non_terminal
+          FROM officer_ticket_claims claim
+          LEFT JOIN jobs live ON live.id = claim.job_id
+         WHERE claim.project_id = $1
+           AND claim.ticket_note_id = $2
         """,
         UUID(project_id),
         str(note_id),
     )
-    newest = _aware(row["newest"]) if row else None
-    generation = _aware(ready_at)
-    if generation is not None:
-        if newest is not None and newest >= generation:
-            raise _conflict(
-                "ticket_claimed",
-                f"Backlog ticket '{note_id}' is already claimed for this ready generation.",
-            )
-    elif row and bool(row["has_non_terminal"]):
-        # Manual callers historically supplied only the ticket slug. Preserve
-        # that behavior while making same-ticket contention a normal 409:
-        # terminal one-shot/re-ready comparison is used when a ready generation
-        # is supplied (the automatic tick does supply it).
+    newest = _aware(row["newest_generation"]) if row else None
+    if row and bool(row["has_non_terminal"]):
         raise _conflict(
             "ticket_claimed",
             f"Backlog ticket '{note_id}' already has a non-terminal job.",
+        )
+    if newest is not None and newest >= generation:
+        raise _conflict(
+            "ticket_claimed",
+            f"Backlog ticket '{note_id}' is already claimed for this ready generation.",
         )
 
 
@@ -434,6 +444,7 @@ async def admit_and_create_job_in_transaction(
     job_kwargs: dict[str, Any],
     ticket_note_id: str | None = None,
     ticket_ready_at: datetime | str | None = None,
+    ticket_claim_source: str = "manual",
 ) -> dict[str, Any]:
     """Revalidate, count, claim-check and INSERT on ``conn``'s transaction."""
 
@@ -486,8 +497,26 @@ async def admit_and_create_job_in_transaction(
 
     final_kwargs = dict(job_kwargs)
     context = dict(final_kwargs.get("context") or {})
-    if slot_name:
+    # Raw context is never claim authority, even when the caller legitimately
+    # originates from the Officer thread. Replace the complete claim namespace
+    # before stamping the final post-locked decision.
+    for key in (
+        "ticket_note_id",
+        "officer_admission",
+        "ticket_ready_at",
+        "ready_generation_at",
+        "ticket_claim_source",
+        "claim_source",
+        "officer_thread_id",
+        "officer_incarnation",
+    ):
+        context.pop(key, None)
+    if slot_name is not None:
         context["officer_slot"] = slot_name
+    else:
+        context.pop("officer_slot", None)
+    if current.category is not None:
+        context["work_category"] = current.category
     if ticket_note_id:
         context["ticket_note_id"] = str(ticket_note_id)
     context["officer_admission"] = {
@@ -499,16 +528,37 @@ async def admit_and_create_job_in_transaction(
         "config_fingerprint": current.config_fingerprint,
         "lineage_size": len(lineage),
     }
-    if ticket_ready_at is not None and _aware(ticket_ready_at) is not None:
-        context["officer_admission"]["ticket_ready_at"] = _aware(
-            ticket_ready_at
-        ).isoformat()
+    ready_generation = _aware(ticket_ready_at)
+    if ready_generation is not None:
+        context["officer_admission"]["ticket_ready_at"] = ready_generation.isoformat()
+        context["officer_admission"]["ticket_claim_source"] = str(ticket_claim_source)
     final_kwargs["context"] = context
     final_kwargs["config_override"] = _deep_merge(
         final_kwargs.get("config_override"), slot_patch
     )
     final_kwargs["project_id"] = preparation.project_id
     final_kwargs["created_by_thread_id"] = preparation.thread_id
+    if ticket_note_id:
+        # The preallocated identity lets the immutable claim land first while
+        # still referring to the exact job INSERT that follows. Both disappear
+        # on any failure because the caller owns one transaction.
+        admitted_job_id = uuid4()
+        await db.insert_officer_ticket_claim(
+            conn=conn,
+            project_id=preparation.project_id,
+            ticket_note_id=str(ticket_note_id),
+            ready_generation_at=ready_generation,
+            source=str(ticket_claim_source),
+            officer_thread_id=preparation.thread_id,
+            officer_incarnation=current.incarnation,
+            officer_slot=slot_name,
+            work_category=current.category,
+            admission_config_fingerprint=current.config_fingerprint,
+            admission_lineage_size=len(lineage),
+            job_id=admitted_job_id,
+        )
+        final_kwargs["job_id"] = admitted_job_id
+    final_kwargs["authoritative_officer_admission"] = True
     final_kwargs["conn"] = conn
     return await db.create_job(**final_kwargs)
 
@@ -520,6 +570,7 @@ async def admit_and_create_job(
     job_kwargs: dict[str, Any],
     ticket_note_id: str | None = None,
     ticket_ready_at: datetime | str | None = None,
+    ticket_claim_source: str = "manual",
 ) -> dict[str, Any]:
     """Own the authoritative admission transaction and normalize contention."""
 
@@ -533,6 +584,7 @@ async def admit_and_create_job(
                     job_kwargs=job_kwargs,
                     ticket_note_id=ticket_note_id,
                     ticket_ready_at=ticket_ready_at,
+                    ticket_claim_source=ticket_claim_source,
                 )
     except OfficerAdmissionConflict:
         raise
@@ -540,7 +592,10 @@ async def admit_and_create_job(
         # The partial unique index remains a fail-closed backstop. Stable post
         # locking makes this exceptional, but another legacy/direct writer can
         # still race it; report ordinary ticket contention, never a 500.
-        if getattr(exc, "constraint_name", None) == "uq_jobs_active_ticket_claim":
+        if getattr(exc, "constraint_name", None) in {
+            "uq_jobs_active_ticket_claim",
+            "uq_officer_ticket_claim_generation",
+        }:
             raise _conflict(
                 "ticket_claimed",
                 f"Backlog ticket '{ticket_note_id}' was claimed concurrently.",

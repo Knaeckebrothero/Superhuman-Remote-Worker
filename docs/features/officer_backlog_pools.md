@@ -41,7 +41,8 @@ related:
 
 ## Status
 
-**BUILT BUT RELEASE-BLOCKED (2026-08-15).** **B1–B6 have landed**, but the feature is not
+**BUILT BUT RELEASE-BLOCKED (updated 2026-08-16).** **B1–B7 have landed; BP-05 is
+complete locally, including rolling-upgrade and authority hardening**, and the feature is not
 yet safe or operable end to end. The tick is built, mounted, dormant (`auto_pull` ships
 off) and verified on its happy path; the sitrep and
 the cockpit card both render capacity, ready depth, open breakers and stalled claims; a
@@ -446,25 +447,31 @@ its claim minutes before the officer could close the ticket — the tick would r
 every completed ticket, and re-burn every failing ticket at breaker cadence forever.
 Claims are therefore **one-shot**:
 
-- A ticket is **claimed** iff any job — in **any status, terminal included** — carries its
-  `context.ticket_note_id` stamp with `created_at` newer than the ticket's last
-  ready-authorization. Dispatch consumes readiness.
+- A ticket generation is **claimed** iff `officer_ticket_claims` contains its exact
+  `(project_id, ticket_note_id, ready_generation_at)` identity. The claim is independent
+  of job status and survives physical job deletion. Dispatch consumes readiness.
 - **Re-arm is explicit**: the officer re-sets `ready` after reviewing the outcome; the
-  tick's eligibility query compares the ready-authorization timestamp against the newest
-  claiming job's `created_at`. (Implementation: the ready re-arm writes a timestamp the
-  query can compare — a `ready_at` value in the note's frontmatter/index row, set by
-  kb_update — so "re-ready" is one officer action.) Job DELETE removes the claim row and
-  is thereby the deliberate manual re-arm, matching how loop claims already die with their
-  job rows.
+  tick's eligibility query compares the server-observed ready authorization against the
+  newest consumed ledger generation. (Implementation: the ready re-arm writes a
+  `ready_at` value in the note's frontmatter/index row, set by `kb_update`, so "re-ready"
+  is one officer action.) Equal/older values remain consumed. Job DELETE is audit only and
+  never re-arms; a deleted non-terminal predecessor continues to block a newer generation,
+  so cancel or finish it first.
 - This single change is also the **item-level dead-letter queue** **[R-fw]**: a failed
   ticket stays parked until the officer looks — SQS's DLQ pattern without new machinery —
   and it defuses the reindex-resurrection quirk (§4).
 - **Claim+create is atomic** **[A1][X]**: both the officer's manual path and the tick perform
-  claim check + lineage capacity count + job INSERT in **one transaction holding the
-  stable durable-post lock** (via connection-aware `create_job`). The fail-closed backstop
-  remains a partial unique index on
+  durable generation validation + claim INSERT + lineage capacity count + exact job INSERT
+  in **one transaction holding the stable durable-post lock** (via connection-aware
+  `create_job`). Migration 0162 adds the durable generation/job uniqueness backstops. The
+  fail-closed secondary backstop remains a partial unique index on
   `((context->>'ticket_note_id'))` over claim-bearing jobs, so a racing double-claim fails
   the second INSERT instead of double-working the ticket.
+- **Rolling upgrade is fail-closed:** migration 0162 locks `jobs` across strict provenance
+  backfill and jobs-trigger installation. A pre-lock writer is backfilled; an old ticket
+  INSERT after commit is explicitly rejected because it has no matching claim. Old/direct
+  DELETE remains supported and trigger-audits the observed terminal/non-terminal status.
+  Raw public/internal/tool context cannot supply claim identity or Officer provenance.
 - **The officer's own dispatches claim too** **[X]**: `create_worker_job` gains an optional
   `ticket=<note_id>` parameter routed through the same helper — one claim ledger for tick
   and officer. Without it, the officer manually working the top ready ticket races the
@@ -640,8 +647,9 @@ ticket edits, not more gates.
 Everything below was verified against the tree on 2026-08-15. File anchors are given as
 symbol names, not line numbers (line numbers drift; grep the symbol).
 
-**Migrations.** Next free app migration is **0161** (B3 took 0160 for
-`uq_jobs_active_ticket_claim`); next free **vector** migration is **0021** (B2 took 0020
+**Migrations.** App migration **0162** now owns durable ticket claims (the next free app
+number is **0163**; B3 took 0160 for `uq_jobs_active_ticket_claim` and 0161 is the runtime
+actor credential boundary); next free **vector** migration is **0021** (B2 took 0020
 for `knowledge_index.ready_at`). The original "v1 needs no migration" claim was wrong in
 both directions: readiness needed a queryable timestamp rather than a tag, and the
 double-claim backstop needed an index. Regenerate `schema_current.sql` and bump `APP_CURRENT_MIGRATION_HEAD`
@@ -670,8 +678,13 @@ The follow-up lifecycle checkpoint puts the no-force decommission gate under tha
 post lock and counts the same all-non-terminal full lineage, so job insertion and
 no-force retirement cannot both succeed. Commission continuity and job-completion routing
 also make post-locked exact-incarnation decisions; a losing commission's config update is
-vacancy/generation fenced. These changes are local and not part of the already-deployed O6
-tranche.
+vacancy/generation fenced. These changes were not part of the earlier O6 tranche; they were
+subsequently deployed and passed a bounded disposable lifecycle/configuration gate on
+2026-08-16. The later BP-05 ledger implementation is local and not deployed.
+Its final review repair makes the jobs trigger ledger-first and null-safe, preserves the
+source-less admission shape of genuine pre-0162 backfilled jobs during unrelated context
+merges, forbids provenance removal from a live claimed job, and returns claim-retention
+truth from the same transaction that deletes the job.
 The internal spawn mirrors `_spawn_loop_job` (`db.create_job` + `provision_job_repo` +
 `_trigger_dispatch`), with `_provision_officer_ticket_repo` /
 `_enforce_officer_ticket_grants` in `main.py` as the injected adapters so the service
@@ -731,7 +744,7 @@ or clear `ready`/`parallel-safe`, `fetch_backlog` filters by tag containment and
 `ready_at`, and `render_backlog_block` marks claimed tickets. **What B3 consumes:**
 `fetch_backlog(vector_db, project_id, require_tags=[READY_TAG, category_tag(c)])` for
 eligibility, `classify_ticket(row["tags"])` to resolve category/expert (skip on
-`problems`), `row["ready_at"]` compared against the newest claiming job's `created_at`
+`problems`), `row["ready_at"]` compared against the newest durable consumed generation
 for one-shot semantics — **and a NULL `ready_at` is not dispatchable**, never "ready since
 forever". Officer close instrument is still `kb_update(status='resolved'|'archived')`; the
 re-ready action is `kb_update(add_tags=['ready'])`, which stamps a fresh `ready_at` even
@@ -866,7 +879,7 @@ the tick.
   `pool_status_lines()` renders the policies the tick enforces (open breaker + cause +
   tickets, claimed-but-stalled with "NOT released automatically", and an explicit
   "Auto-pull: OFF" so idleness is never a mystery). `ready_depth_by_pool()` deliberately
-  reuses the tick's own `fetch_backlog → newest_ticket_claims → eligible_tickets` path
+  reuses the tick's own `fetch_backlog → ticket_claim_states → eligible_tickets` path
   rather than counting `ready` tags: a depth the tick reads as zero would have the officer
   waiting for dispatches that never come. A KB outage omits the number instead of
   reporting a zero nobody measured. Tests: `tests/test_officer_pool_surfacing.py` (25).
@@ -955,8 +968,9 @@ the tick.
 
 **In progress:** O6 release itself succeeded with `auto_pull=false` on the deployed earlier
 tranche. This section remains the wider acceptance contract; see the committed live log in
-[[officer_backlog_pools_resavio_livefire]]. The subsequent Officer Post transaction
-checkpoint is local and not deployed into that run.
+[[officer_backlog_pools_resavio_livefire]]. The subsequent Officer Post transaction and
+commission-configuration checkpoint was deployed and passed a separate disposable gate on
+2026-08-16. BP-05's durable ledger is the newer local, uncommitted, not-deployed checkpoint.
 
 Pre-requisites: officer_post O1–O6 done (incl. O2 lineage capacity), knowledge-plane K1–K3,
 supervision E1–E3 and the chosen disposition-evidence path, message-routing M2–M4, and the

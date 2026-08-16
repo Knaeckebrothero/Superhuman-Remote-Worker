@@ -17,6 +17,18 @@ _EXPLICIT_GATE = (
     "named explicitly by the caller configuration; lane defaults come from the "
     "descriptor caller-default policy (officer_supervision_surface E2)"
 )
+_SERVER_OWNED_OFFICER_CONTEXT_KEYS = frozenset(
+    {
+        "ticket_note_id",
+        "officer_admission",
+        "ticket_ready_at",
+        "ready_generation_at",
+        "ticket_claim_source",
+        "claim_source",
+        "officer_thread_id",
+        "officer_incarnation",
+    }
+)
 
 
 @descriptor(group="job_control", plane="job_control", caller_defaults=_ALL)
@@ -170,10 +182,9 @@ async def create_job(
             context.officer_slot; when both are supplied, this value wins.
         ticket: Backlog ticket this job claims — the knowledge-note slug of
             the ready ticket being dispatched. REQUIRED when working a
-            backlog ticket: it is the one-shot claim (context.ticket_note_id)
-            that stops the auto-pull tick or a second dispatch from starting
-            duplicate work on the same ticket. A context key like
-            "backlog_ticket" is NOT read by the claim ledger.
+            backlog ticket: the server resolves the current ready generation
+            and writes the durable claim atomically with the job. A context
+            key like "backlog_ticket" is not claim authority.
         work_category: Explicit category for this dispatch (researcher,
             tester, executor). Optional — the slot's category governs the
             worker's contract; this records your stated intent and is named
@@ -198,6 +209,9 @@ async def create_job(
         )
 
     merged_context = dict(context) if context is not None else None
+    if merged_context is not None:
+        for key in _SERVER_OWNED_OFFICER_CONTEXT_KEYS:
+            merged_context.pop(key, None)
     if slot is not None:
         merged_context = merged_context or {}
         merged_context["officer_slot"] = str(slot)
@@ -251,6 +265,9 @@ async def delete_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str)
     MUTATION: This permanently deletes the job record and its requirements.
     Any job can be deleted regardless of status. WARNING: Deleting a job in
     'processing' status may leave an orphaned agent. This action is irreversible.
+    A backlog-ticket claim is retained permanently: deleting the job never
+    makes that ticket dispatchable again; only a newer Officer re-ready
+    generation can do so, and a deleted non-terminal claim remains blocked.
 
     Args:
         job_id: Job UUID to delete

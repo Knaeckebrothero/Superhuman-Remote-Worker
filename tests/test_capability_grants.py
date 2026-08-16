@@ -41,6 +41,7 @@ def test_catalog_keys_and_defaults():
         "email_autonomous_send",
         "catalog_authoring",
         "complete_unmerged_pr",
+        "unattended_operations",
     }
     assert all(spec["restrict_only"] for spec in CATALOG.values())
     assert CATALOG["personal_default_experts"]["default"] is True
@@ -61,6 +62,9 @@ def test_catalog_keys_and_defaults():
     # carries a recorded context.pull_request, and no such job existed when the
     # key was introduced, so there is nothing to grandfather.
     assert CATALOG["complete_unmerged_pr"]["default"] is False
+    # Deny-by-default and NOT backfilled: loops and officers are unbounded
+    # unattended spend, and nobody held a key for them before.
+    assert CATALOG["unattended_operations"]["default"] is False
 
 
 def test_meet_bool_enum_list():
@@ -386,6 +390,9 @@ _RULE_FRAGMENTS: dict[str, dict] = {
     "catalog_authoring": {
         "tools": {"catalog_authoring": ["create_expert"], "git": ["git_status"]}
     },
+    "unattended_operations": {
+        "officer": {"enabled": True, "sleep_seconds": 900, "max_daily_spend": 20}
+    },
     "vm_workspace": {"workspace": {"backend": "vm", "structure": ["notes/"]}},
     "model_selection": {"llm": {"model": "gpt-5.6-sol"}},
     "autonomy_ceiling": {"autonomy": "full"},
@@ -395,7 +402,7 @@ _RULE_FRAGMENTS: dict[str, dict] = {
 
 @pytest.mark.parametrize("grant_key", sorted(_RULE_FRAGMENTS))
 def test_each_rule_strips_and_reports_exactly_its_own_grant(grant_key):
-    """Test group 1: each of the nine rules, in isolation, comes back clean
+    """Test group 1: each of the ten rules, in isolation, comes back clean
     with that grant (and only that grant) reported."""
     fragment = _RULE_FRAGMENTS[grant_key]
     grants = _deny_only(grant_key)
@@ -429,6 +436,55 @@ def test_delegation_strip_keeps_settings_that_were_never_the_violation():
     assert "enabled" not in stripped["delegation"]
     assert stripped["delegation"]["max_depth"] == 3
     assert stripped["delegation"]["default_timeout"] == 600
+
+
+def test_unattended_operations_gates_officer_enabled_only():
+    """The rule fires on `officer.enabled` and nothing else: the rest of the
+    kit (slots, sleep bounds, pools) is inert configuration on a post nobody
+    holds, so a user without the grant may still edit it — he just cannot raise
+    anyone onto it. Mirrors delegation's `.enabled`-not-dict-presence rule."""
+    denied = _deny_only("unattended_operations")
+
+    assert evaluate({"officer": {"sleep_seconds": 900}}, denied) == []
+    assert evaluate({"officer": {"enabled": False}}, denied) == []
+    assert evaluate({}, denied) == []
+
+    flagged = evaluate({"officer": {"enabled": True}}, denied)
+    assert len(flagged) == 1
+    assert flagged[0].startswith("unattended_operations:")
+
+
+def test_unattended_operations_does_not_read_the_string_false_as_enabled():
+    """`_truthy` would call the string "false" enabled; this rule uses the same
+    explicit truthy set as main._officer_meta_enabled, which is what actually
+    decides whether a thread boots as an officer. A mismatch either way is a
+    real defect: too loose refuses a config that would never boot an officer,
+    too tight lets one boot ungated."""
+    denied = _deny_only("unattended_operations")
+
+    assert evaluate({"officer": {"enabled": "false"}}, denied) == []
+    for truthy in (True, "true", "True", 1):
+        assert evaluate({"officer": {"enabled": truthy}}, denied), truthy
+
+
+def test_unattended_operations_strip_keeps_the_rest_of_the_kit():
+    """Like delegation: drop only `.enabled`, never the whole officer dict —
+    sleep bounds and spend ceilings were never the violation."""
+    stripped, dropped = strip_to_grants(
+        _RULE_FRAGMENTS["unattended_operations"], _deny_only("unattended_operations")
+    )
+
+    assert dropped == ["unattended_operations"]
+    assert "enabled" not in stripped["officer"]
+    assert stripped["officer"]["sleep_seconds"] == 900
+    assert stripped["officer"]["max_daily_spend"] == 20
+
+
+def test_unattended_operations_denied_by_default():
+    """The whole point of the key: a brand-new principal cannot start a loop or
+    commission an officer until an administrator grants it."""
+    assert DEFAULTS["unattended_operations"] is False
+    assert evaluate({"officer": {"enabled": True}}, DEFAULTS)
 
 
 def test_datasource_strip_removes_every_connector_category():
@@ -559,6 +615,7 @@ def test_kitchen_sink_fragment_strips_every_current_violation_at_once():
             "catalog_authoring": ["create_expert"],
         },
         "delegation": {"enabled": True},
+        "officer": {"enabled": True},
         "workspace": {"backend": "vm"},
         "llm": {"model": "some-model"},
         "autonomy": "full",
@@ -575,6 +632,7 @@ def test_kitchen_sink_fragment_strips_every_current_violation_at_once():
             "datasource_tools",
             "browser",
             "catalog_authoring",
+            "unattended_operations",
             "vm_workspace",
             "model_selection",
             "autonomy_ceiling",

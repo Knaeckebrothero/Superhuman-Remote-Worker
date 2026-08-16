@@ -361,3 +361,45 @@ stakeholder questions and the LF-4 warning were carried across by hand in
 his first directive. **The class of mistake is now guarded in code**:
 `list_projects` hides archived projects by default and `get_project`
 leads with a warning naming what not to do to an archive (`5c0416b3`).
+
+## Post-deploy disposable Officer gate — 2026-08-16
+
+This is a separate follow-up to the committed Resavio chronology above; it does not rewrite
+that run or imply that its earlier findings were observed on a different build. The shared
+development environment was identified as kubectl context `main`, namespace
+`superhuman-remote-worker`, behind `api.srw.works` / `cockpit.srw.works`—not the ambient
+local `k3d-srw` context. At the time of the gate the relevant deployed images were
+orchestrator `sha-c62b8ea`, agent `sha-5c0416b` and cockpit `sha-505592a`.
+
+Only disposable artifacts were used:
+
+- project `4e5fb287-f0d6-4e8d-9b4b-fe185bbf57ea`,
+  `Codex Officer Gate 20260816T072759Z`;
+- Officer thread `77ab8ec2-9616-4e4f-9281-0989ff345f5c`;
+- ticket `officer-gate-tiny-sandbox-inspection` and sandbox researcher job
+  `6a5a3f46-43d2-4013-abf1-2a04a29fed70`; and
+- original/restarted exact Officer pod UIDs
+  `1cd74f74-d8ff-4493-9b87-4f037db433a4` /
+  `25eb4635-0ef2-4dc8-a61a-47f0d6081c9e`.
+
+The supported commission endpoint, with no permission override, produced one live durable
+post link to a `centurion`/`autonomous` thread with `auto_pull=false`. The runtime loaded
+49 tools: create/list/get plus job lifecycle, routing, inspection and evidence actions were
+bound; workspace/object-plane tools were absent. Its wake executed tools, persisted
+matching result messages, produced useful output and retained a normal next wake. A manual
+ticketed sandbox dispatch completed and carried ticket, incarnation, slot/category and
+admission provenance.
+
+A controlled exact-pod restart restored 59 messages and the next turn executed two paired
+inspection calls, emitted useful output and filed another normal wake. There was no
+permission wait, tool-pairing 400 or zero-tool loop. The kill lost the race to the four
+preceding tool-result commits, however, so LF-5's exact orphan window and repeated-error
+escalation remain unverified; LF-5 stays open. Every named project/post/thread/job/wake/
+message row and both pods were removed after the gate.
+
+This verifies the deployed lifecycle/configuration checkpoint and closes LF-6. It does not
+close this wider scorecard: the original M-10/full-capacity observation and LF-5's exact
+interruption contract remain outstanding, and `auto_pull` was never enabled. BP-05 is the
+subsequent local, uncommitted, not-deployed ledger checkpoint described in
+`docs/done/deleting_a_job_releases_its_backlog_ticket_claim.md`; none of its acceptance is
+claimed from the deployed system above.

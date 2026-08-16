@@ -102,6 +102,34 @@ $$;
 
 
 --
+-- Name: audit_officer_ticket_claim_job_delete(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.audit_officer_ticket_claim_job_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    UPDATE public.officer_ticket_claims
+       SET job_deleted_at = COALESCE(job_deleted_at, statement_timestamp()),
+           job_status_at_delete = COALESCE(job_status_at_delete, OLD.status),
+           deletion_reason = COALESCE(
+               deletion_reason,
+               'database_delete_compatibility_trigger'
+           )
+     WHERE job_id = OLD.id;
+    RETURN OLD;
+END
+$$;
+
+
+--
+-- Name: FUNCTION audit_officer_ticket_claim_job_delete(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.audit_officer_ticket_claim_job_delete() IS '0162 rolling-upgrade backstop: any claimed job DELETE records status/time before the operational row disappears.';
+
+
+--
 -- Name: close_compute_intervals_at_epoch_retirement(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -716,6 +744,121 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: enforce_officer_ticket_claim_job_integrity(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_officer_ticket_claim_job_integrity() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    durable_claim public.officer_ticket_claims%ROWTYPE;
+    admission     JSONB;
+    generation    TIMESTAMPTZ;
+    incarnation   INTEGER;
+    lineage_size  INTEGER;
+    claim_exists  BOOLEAN;
+BEGIN
+    SELECT *
+      INTO durable_claim
+      FROM public.officer_ticket_claims
+     WHERE job_id = NEW.id;
+    claim_exists := FOUND;
+
+    IF NOT (COALESCE(NEW.context, '{}'::jsonb) ? 'ticket_note_id') THEN
+        IF claim_exists THEN
+            RAISE EXCEPTION 'claimed job % cannot remove its server-owned ticket/admission provenance', NEW.id
+                USING ERRCODE = 'check_violation',
+                      CONSTRAINT = 'officer_ticket_claim_job_integrity';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF NOT claim_exists THEN
+        RAISE EXCEPTION 'ticket-bearing job % has no durable Officer claim; retry after rolling upgrade', NEW.id
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'officer_ticket_claim_job_integrity',
+                  HINT = 'Old replicas cannot dispatch ticket work after migration 0162; use the post-locked claim+job admission path.';
+    END IF;
+
+    admission := COALESCE(NEW.context, '{}'::jsonb)->'officer_admission';
+    IF jsonb_typeof(admission) IS DISTINCT FROM 'object' THEN
+        RAISE EXCEPTION 'ticket-bearing job % has no server Officer admission provenance', NEW.id
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'officer_ticket_claim_job_integrity';
+    END IF;
+    BEGIN
+        generation := (admission->>'ticket_ready_at')::timestamptz;
+        incarnation := (admission->>'incarnation')::integer;
+        lineage_size := (admission->>'lineage_size')::integer;
+    EXCEPTION
+        WHEN invalid_text_representation
+           OR invalid_datetime_format
+           OR datetime_field_overflow
+           OR numeric_value_out_of_range THEN
+            RAISE EXCEPTION 'ticket-bearing job % has invalid server Officer admission provenance', NEW.id
+                USING ERRCODE = 'check_violation',
+                      CONSTRAINT = 'officer_ticket_claim_job_integrity';
+    END;
+
+    IF generation IS NULL OR NOT isfinite(generation)
+       OR incarnation IS NULL OR incarnation < 0
+       OR lineage_size IS NULL
+       OR lineage_size IS DISTINCT FROM incarnation + 1 THEN
+        RAISE EXCEPTION 'ticket-bearing job % has missing or invalid Officer generation/incarnation/lineage provenance', NEW.id
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'officer_ticket_claim_job_integrity';
+    END IF;
+
+    IF NEW.project_id IS NULL
+       OR durable_claim.project_id IS DISTINCT FROM NEW.project_id
+       OR durable_claim.ticket_note_id
+              IS DISTINCT FROM NEW.context->>'ticket_note_id'
+       OR durable_claim.ready_generation_at IS DISTINCT FROM generation
+       OR (
+           durable_claim.source = 'backfill'
+           AND admission ? 'ticket_claim_source'
+       )
+       OR (
+           durable_claim.source <> 'backfill'
+           AND durable_claim.source
+                  IS DISTINCT FROM admission->>'ticket_claim_source'
+       )
+       OR durable_claim.officer_thread_id
+              IS DISTINCT FROM NEW.created_by_thread_id
+       OR durable_claim.officer_thread_id::text
+              IS DISTINCT FROM admission->>'thread_id'
+       OR durable_claim.project_id::text
+              IS DISTINCT FROM admission->>'project_id'
+       OR durable_claim.officer_incarnation IS DISTINCT FROM incarnation
+       OR durable_claim.officer_slot
+              IS DISTINCT FROM NEW.context->>'officer_slot'
+       OR durable_claim.officer_slot
+              IS DISTINCT FROM admission->>'slot'
+       OR durable_claim.work_category
+              IS DISTINCT FROM NEW.context->>'work_category'
+       OR durable_claim.work_category
+              IS DISTINCT FROM admission->>'category'
+       OR durable_claim.admission_config_fingerprint
+              IS DISTINCT FROM admission->>'config_fingerprint'
+       OR durable_claim.admission_lineage_size IS DISTINCT FROM lineage_size THEN
+        RAISE EXCEPTION 'ticket-bearing job % does not match its durable Officer claim', NEW.id
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'officer_ticket_claim_job_integrity';
+    END IF;
+
+    RETURN NEW;
+END
+$$;
+
+
+--
+-- Name: FUNCTION enforce_officer_ticket_claim_job_integrity(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.enforce_officer_ticket_claim_job_integrity() IS '0162 rolling-upgrade backstop: a ticket-bearing jobs row must match a durable claim already visible in the same transaction.';
 
 
 --
@@ -6071,6 +6214,64 @@ CREATE TABLE public.notification_queue (
 
 
 --
+-- Name: officer_ticket_claims; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.officer_ticket_claims (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    project_id uuid NOT NULL,
+    ticket_note_id text NOT NULL,
+    ready_generation_at timestamp with time zone NOT NULL,
+    claimed_at timestamp with time zone DEFAULT now() NOT NULL,
+    source text NOT NULL,
+    officer_thread_id uuid NOT NULL,
+    officer_incarnation integer NOT NULL,
+    officer_slot text,
+    work_category text,
+    admission_config_fingerprint text NOT NULL,
+    admission_lineage_size integer NOT NULL,
+    job_id uuid NOT NULL,
+    job_deleted_at timestamp with time zone,
+    job_status_at_delete text,
+    deletion_actor_user_id uuid,
+    deletion_reason text,
+    CONSTRAINT officer_ticket_claim_fingerprint_valid CHECK ((admission_config_fingerprint ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT officer_ticket_claim_incarnation_valid CHECK ((officer_incarnation >= 0)),
+    CONSTRAINT officer_ticket_claim_lineage_size_valid CHECK ((admission_lineage_size = (officer_incarnation + 1))),
+    CONSTRAINT officer_ticket_claim_source_nonempty CHECK ((btrim(source) <> ''::text)),
+    CONSTRAINT officer_ticket_claim_ticket_nonempty CHECK ((btrim(ticket_note_id) <> ''::text))
+);
+
+
+--
+-- Name: TABLE officer_ticket_claims; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.officer_ticket_claims IS 'Durable Officer backlog claim ledger. Claim identities survive job/thread deletion; job_deleted_at is audit only and never re-arms a ticket (BP-05).';
+
+
+--
+-- Name: COLUMN officer_ticket_claims.ready_generation_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.officer_ticket_claims.ready_generation_at IS 'The server-resolved Officer ready_at generation consumed by this claim. Backfill accepts only a valid server admission stamp; it never trusts a model timestamp or guesses from job.created_at.';
+
+
+--
+-- Name: COLUMN officer_ticket_claims.job_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.officer_ticket_claims.job_id IS 'Durable job identity without a jobs FK so physical deletion cannot erase or null claim history.';
+
+
+--
+-- Name: COLUMN officer_ticket_claims.job_status_at_delete; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.officer_ticket_claims.job_status_at_delete IS 'Status observed under the jobs row lock immediately before deletion. A non-terminal value remains a later-generation admission blocker.';
+
+
+--
 -- Name: processed_inbound_emails; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -9373,6 +9574,14 @@ ALTER TABLE ONLY public.notification_queue
 
 
 --
+-- Name: officer_ticket_claims officer_ticket_claims_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.officer_ticket_claims
+    ADD CONSTRAINT officer_ticket_claims_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: canvas_editor_awareness pk_canvas_editor_awareness; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -10245,6 +10454,22 @@ ALTER TABLE ONLY public.models
 
 
 --
+-- Name: officer_ticket_claims uq_officer_ticket_claim_generation; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.officer_ticket_claims
+    ADD CONSTRAINT uq_officer_ticket_claim_generation UNIQUE (project_id, ticket_note_id, ready_generation_at);
+
+
+--
+-- Name: officer_ticket_claims uq_officer_ticket_claim_job; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.officer_ticket_claims
+    ADD CONSTRAINT uq_officer_ticket_claim_job UNIQUE (job_id);
+
+
+--
 -- Name: thread_control_requests uq_thread_control_client_request; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -11013,6 +11238,20 @@ CREATE INDEX idx_models_provider ON public.models USING btree (provider_kind, pr
 --
 
 CREATE INDEX idx_notif_queue_pending ON public.notification_queue USING btree (user_id, queued_at) WHERE (delivered_at IS NULL);
+
+
+--
+-- Name: idx_officer_ticket_claims_lineage_slot_claimed; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_officer_ticket_claims_lineage_slot_claimed ON public.officer_ticket_claims USING btree (officer_thread_id, officer_slot, claimed_at DESC) WHERE (officer_thread_id IS NOT NULL);
+
+
+--
+-- Name: idx_officer_ticket_claims_project_ticket; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_officer_ticket_claims_project_ticket ON public.officer_ticket_claims USING btree (project_id, ticket_note_id, ready_generation_at DESC, claimed_at DESC);
 
 
 --
@@ -12185,6 +12424,20 @@ CREATE TRIGGER legacy_workspace_cutover_plans_frozen BEFORE DELETE OR UPDATE ON 
 
 
 --
+-- Name: jobs officer_ticket_claim_job_delete_audit; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER officer_ticket_claim_job_delete_audit BEFORE DELETE ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.audit_officer_ticket_claim_job_delete();
+
+
+--
+-- Name: jobs officer_ticket_claim_job_integrity; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER officer_ticket_claim_job_integrity AFTER INSERT OR UPDATE OF id, context, project_id, created_by_thread_id ON public.jobs DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION public.enforce_officer_ticket_claim_job_integrity();
+
+
+--
 -- Name: resource_intervals resource_intervals_compute_epoch_authority_guard; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -13239,6 +13492,14 @@ ALTER TABLE ONLY public.notification_queue
 
 ALTER TABLE ONLY public.notification_queue
     ADD CONSTRAINT notification_queue_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: officer_ticket_claims officer_ticket_claims_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.officer_ticket_claims
+    ADD CONSTRAINT officer_ticket_claims_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
 
 
 --

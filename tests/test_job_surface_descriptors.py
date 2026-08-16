@@ -331,6 +331,13 @@ async def test_create_job_forwards_ticket_and_category_to_the_funnel() -> None:
             slot="test",
             ticket="backlog-tester-final-runtime-acceptance",
             work_category="tester",
+            context={
+                "ordinary": "preserved",
+                "ticket_note_id": "forged-context-ticket",
+                "officer_admission": {"ticket_claim_source": "forged"},
+                "ticket_ready_at": "2099-01-01T00:00:00Z",
+                "ticket_claim_source": "forged",
+            },
         )
     finally:
         await client.close()
@@ -339,6 +346,13 @@ async def test_create_job_forwards_ticket_and_category_to_the_funnel() -> None:
     assert body["ticket"] == "backlog-tester-final-runtime-acceptance"
     assert body["work_category"] == "tester"
     assert body["context"]["officer_slot"] == "test"
+    assert body["context"]["ordinary"] == "preserved"
+    assert not set(body["context"]) & {
+        "ticket_note_id",
+        "officer_admission",
+        "ticket_ready_at",
+        "ticket_claim_source",
+    }
 
 
 @pytest.mark.asyncio

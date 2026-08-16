@@ -111,7 +111,8 @@ async def test_create_job_sql_inherits_omitted_parent_lane():
     assert "SELECT parent.execution_lane FROM jobs parent" in normalized
     assert "FOR SHARE" in normalized
     assert "COALESCE(" in sql
-    assert args[-1] is None
+    assert args[-2] is None
+    assert isinstance(args[-1], UUID)
     assert result["execution_lane"] == "stateless"
 
 
@@ -122,7 +123,8 @@ async def test_create_job_explicit_lane_is_bound_and_invalid_lane_rejected():
     db = _db_with_conn(conn)
 
     await db.create_job(description="root", execution_lane="stateless")
-    assert conn.fetchrow.await_args.args[-1] == "stateless"
+    assert conn.fetchrow.await_args.args[-2] == "stateless"
+    assert isinstance(conn.fetchrow.await_args.args[-1], UUID)
 
     with pytest.raises(ValueError):
         await db.create_job(description="bad", execution_lane="future")
@@ -386,9 +388,12 @@ async def test_final_prepared_delete_removes_queue_and_job_atomically():
         if normalized.startswith("SELECT execution_lane"):
             lock_order.append("job")
             return {"execution_lane": "stateless", "delete_pending": True}
+        if normalized.startswith("SELECT status FROM jobs"):
+            return {"status": "created"}
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetchval = AsyncMock(return_value=None)
 
     async def execute(sql, *_args):
         normalized = " ".join(sql.split())

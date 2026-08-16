@@ -20,6 +20,13 @@ import main as orch_main  # noqa: E402
 
 MODULE = "main"
 
+DELETE_RESULT = {
+    "status": "deleted",
+    "ticket_claim_retained": False,
+    "ticket_rearmed": False,
+    "message": "Job deleted. This job had no durable backlog-ticket claim.",
+}
+
 
 def _stub_request() -> MagicMock:
     """A minimal Request stub for endpoints whose Track A/B gates need one.
@@ -179,13 +186,14 @@ class TestDeleteJobGiteaCleanup:
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
             mock_gitea.is_initialized = True
             mock_gitea.delete_repo = AsyncMock()
             mock_gitea.delete_branch = AsyncMock()
 
             result = await orch_main.delete_job(_stub_request(), "abcd1234-xxxx")
 
-            assert result == {"status": "deleted"}
+            assert result == DELETE_RESULT
             mock_gitea.delete_repo.assert_awaited_once_with("job-abcd1234")
             mock_gitea.delete_branch.assert_not_awaited()
 
@@ -206,13 +214,14 @@ class TestDeleteJobGiteaCleanup:
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
             mock_gitea.is_initialized = True
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
             result = await orch_main.delete_job(_stub_request(), "abcd1234-xxxx")
 
-            assert result == {"status": "deleted"}
+            assert result == DELETE_RESULT
             mock_gitea.delete_branch.assert_awaited_once_with(
                 "job-parent12", "subjob/abcd1234/creator"
             )
@@ -235,6 +244,7 @@ class TestDeleteJobGiteaCleanup:
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
             mock_db.get_project_repositories = AsyncMock(
                 return_value=[{"name": "project-jobs-repo"}]
             )
@@ -244,7 +254,7 @@ class TestDeleteJobGiteaCleanup:
 
             result = await orch_main.delete_job(_stub_request(), "legacy-id")
 
-            assert result == {"status": "deleted"}
+            assert result == DELETE_RESULT
             mock_gitea.delete_branch.assert_awaited_once_with(
                 "project-jobs-repo", "job/legacy-branch"
             )
@@ -271,13 +281,14 @@ class TestDeleteJobGiteaCleanup:
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
             mock_gitea.is_initialized = True
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
             result = await orch_main.delete_job(_stub_request(), str(job["id"]))
 
-        assert result == {"status": "deleted"}
+        assert result == DELETE_RESULT
         mock_gitea.delete_branch.assert_awaited_once_with(
             "project-68137e29-jobs", "job/12345678"
         )
@@ -295,11 +306,12 @@ class TestDeleteJobGiteaCleanup:
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
             mock_gitea.is_initialized = False
 
             result = await orch_main.delete_job(_stub_request(), "some-id")
 
-            assert result == {"status": "deleted"}
+            assert result == DELETE_RESULT
             mock_gitea.delete_repo.assert_not_called()
             mock_gitea.delete_branch.assert_not_called()
 
@@ -331,21 +343,38 @@ class TestDeleteJobGiteaCleanup:
 
             cleanup_workspace.side_effect = cleanup_after_fence
 
-            async def delete_after_fence(_job_id, *, prepared_stateless=False):
+            async def delete_after_fence(
+                _job_id,
+                *,
+                prepared_stateless=False,
+                deletion_actor_user_id=None,
+                deletion_reason=None,
+                return_claim_state=False,
+            ):
                 mock_db.prepare_stateless_job_for_delete.assert_awaited_once()
                 assert prepared_stateless is True
-                return True
+                assert deletion_actor_user_id == (
+                    "00000000-0000-0000-0000-000000000099"
+                )
+                assert deletion_reason == "authorized_api_delete"
+                assert return_claim_state is True
+                return {"deleted": True, "ticket_claim_retained": False}
 
             mock_db.delete_job = AsyncMock(side_effect=delete_after_fence)
+            mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
             mock_gitea.is_initialized = False
             mock_snapshots.is_available = False
 
             result = await orch_main.delete_job(_stub_request(), str(job["id"]))
 
-        assert result == {"status": "deleted"}
+        assert result == DELETE_RESULT
         cleanup_workspace.assert_awaited_once_with(str(job["id"]))
         mock_db.delete_job.assert_awaited_once_with(
-            str(job["id"]), prepared_stateless=True
+            str(job["id"]),
+            prepared_stateless=True,
+            deletion_actor_user_id="00000000-0000-0000-0000-000000000099",
+            deletion_reason="authorized_api_delete",
+            return_claim_state=True,
         )
 
     @pytest.mark.asyncio

@@ -62,9 +62,13 @@ routing, blocking-route creation and decommission share the durable post lock; r
 PostgreSQL race/fault tests are recorded in
 [[officer_admission_does_not_lock_the_durable_post]] and
 [[officer_decommission_is_not_atomic]]. The earlier tranche was already deployed and O6
-was already released successfully with `auto_pull=false`; this additional checkpoint is
-local, uncommitted and not deployed. The ordered audit remains open because `auto_pull`
-and its remaining P0 gates are not released.
+was already released successfully with `auto_pull=false`. The additional transaction and
+commission-configuration checkpoint was subsequently deployed and passed a bounded
+disposable Officer gate on 2026-08-16: supported commission produced
+`centurion`/`autonomous`, the exact live post link and the expected no-workspace tool
+surface; manual sandbox dispatch and restart continuity completed. BP-05 is the later
+local, uncommitted and not-deployed checkpoint. The ordered audit remains open because
+`auto_pull` and its remaining P0 gates are not released.
 
 ## 1. Motivation — four defects with one root
 

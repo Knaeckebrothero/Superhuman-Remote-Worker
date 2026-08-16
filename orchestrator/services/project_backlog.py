@@ -145,7 +145,8 @@ async def fetch_ticket_state(
     async with vector_db.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT note_id, note_type, title, status, priority, tags, ready_at
+            SELECT project_id, note_id, note_type, title, status, priority,
+                   tags, ready_at
               FROM knowledge_index
              WHERE project_id = $1::uuid AND note_id = $2
              LIMIT 1
