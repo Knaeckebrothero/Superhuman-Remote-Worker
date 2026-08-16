@@ -73,6 +73,11 @@ class _InventoryConnection:
             return (
                 None if workspace is None else {"workspace": copy.deepcopy(workspace)}
             )
+        if sql.startswith("SELECT status FROM jobs"):
+            # Job deletion reads the pre-delete status for the Officer claim
+            # audit. This seam models workspace ownership only, so every
+            # represented job reports the same terminal status.
+            return None if str(args[0]) not in self.jobs else {"status": "completed"}
         if "AS workspace FROM threads" in sql:
             workspace = self.threads.get(str(args[0]))
             return (
@@ -121,6 +126,14 @@ class _InventoryConnection:
         if "FROM completion_effects" in sql:
             return []
         raise AssertionError(f"unexpected fetch: {sql}")
+
+    async def fetchval(self, query: str, *args):
+        sql = _compact(query)
+        if sql.startswith("UPDATE officer_ticket_claims"):
+            # No represented job holds a durable backlog-ticket claim, so the
+            # deletion audit stamps nothing and retains nothing.
+            return None
+        raise AssertionError(f"unexpected fetchval: {sql}")
 
     async def execute(self, query: str, *args):
         sql = _compact(query)
