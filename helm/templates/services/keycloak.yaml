@@ -919,12 +919,12 @@ spec:
                     if [ -n "$SMTP_HOST" ]; then
                       $KC update "realms/{{ .Values.keycloak.realm }}" \
                         -s "smtpServer.host=$SMTP_HOST" \
-                        -s "smtpServer.port={{ if kindIs "invalid" .Values.email.smtp.port }}1025{{ else }}{{ .Values.email.smtp.port }}{{ end }}" \
+                        -s "smtpServer.port={{ if or (kindIs "invalid" .Values.email.smtp.port) (eq (toString .Values.email.smtp.port) "") }}1025{{ else }}{{ .Values.email.smtp.port }}{{ end }}" \
                         -s "smtpServer.from={{ .Values.email.smtp.from | default (printf "noreply@%s" .Values.global.domain) }}" \
                         -s "smtpServer.fromDisplayName=Superhuman Remote Worker" \
                         -s "smtpServer.envelopeFrom={{ .Values.email.smtp.from | default (printf "noreply@%s" .Values.global.domain) }}" \
                         -s "smtpServer.ssl=false" \
-                        -s "smtpServer.starttls={{ if kindIs "invalid" .Values.email.smtp.useTls }}true{{ else }}{{ .Values.email.smtp.useTls }}{{ end }}" \
+                        -s "smtpServer.starttls={{ if or (kindIs "invalid" .Values.email.smtp.useTls) (eq (toString .Values.email.smtp.useTls) "") }}true{{ else }}{{ .Values.email.smtp.useTls }}{{ end }}" \
                         -s "smtpServer.auth=true" \
                         -s "smtpServer.authType=basic" \
                         -s "smtpServer.user=$SMTP_USER" \
