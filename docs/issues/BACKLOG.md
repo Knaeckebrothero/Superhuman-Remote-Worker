@@ -17,8 +17,7 @@ blocking it should be taken before the next bench campaign.
 
 | doc | why now |
 |---|---|
-| [officer_control_plane_post_implementation_audit](officer_control_plane_post_implementation_audit.md) | **INDEX — keep `auto_pull` off.** The six pre-deployment findings, BP-02/BP-03/BP-04 and OC-03 are closed. O6 was already released successfully with `auto_pull=false` on the deployed earlier tranche, while the final transaction checkpoint is local and undeployed. Do not close the index until the remaining live gates pass. |
-| [backlog_fixed_windows_starve_eligible_tickets](backlog_fixed_windows_starve_eligible_tickets.md) | **P0 liveness.** Limits are applied before claim/validity/outcome filtering; a stable invalid head can hide eligible work forever. |
+| [officer_control_plane_post_implementation_audit](officer_control_plane_post_implementation_audit.md) | **INDEX — keep `auto_pull` off.** The six pre-deployment findings, BP-02/BP-03/BP-04, OC-03, BP-05 and BP-06 are closed locally. O6 was released successfully with `auto_pull=false`; the durable-claim and semantic-pagination checkpoints remain undeployed. Do not close the index until the remaining live gates pass. |
 | [officer_post_cannot_enable_auto_pull](officer_post_cannot_enable_auto_pull.md) | **P0 functional, release last.** The supported post API rejects `auto_pull`/century spend fields and Cockpit has no enable control. Build behind the other P0 gates. |
 | [gitea_admin_credential_in_every_agent_workspace](gitea_admin_credential_in_every_agent_workspace.md) | **Security.** The Gitea admin credential lands in every agent workspace. Blast radius: any job/agent can act as git admin. |
 

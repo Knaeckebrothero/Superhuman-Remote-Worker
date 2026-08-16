@@ -11176,19 +11176,22 @@ class PostgresDB:
         capacity_lineage: List[str],
         *,
         slot: str | None = None,
+        work_category: str | None = None,
         include_terminal: bool = False,
-        limit: int = 20,
+        terminal_only: bool = False,
+        limit: int | None = 20,
     ) -> List[Dict[str, Any]]:
         """Durable ticket claims from an officer post's lineage, newest first.
 
-        Serves three of the tick's reads off one shape: the executor
-        disposition gate (newest terminal executor claim), the pool circuit
-        breaker (were the last two distinct-ticket outcomes failures), and
-        stale-claim surfacing (how long has this claim sat without moving).
-        Deleted jobs remain visible from their claim audit fields.
+        Semantic predicates are applied in SQL before an optional transport
+        limit. Deleted jobs remain visible from their claim audit fields.
+        Breaker and stale reads use their dedicated methods below because
+        neither question is a bounded newest-rows window.
         """
         if not capacity_lineage:
             return []
+        if terminal_only and not include_terminal:
+            raise ValueError("terminal_only requires include_terminal=True")
         clauses = [
             "claim.officer_thread_id = ANY($1::uuid[])",
         ]
@@ -11196,7 +11199,15 @@ class PostgresDB:
         if slot is not None:
             params.append(slot)
             clauses.append(f"claim.officer_slot = ${len(params)}")
-        if not include_terminal:
+        if work_category is not None:
+            params.append(work_category)
+            clauses.append(f"claim.work_category = ${len(params)}")
+        if terminal_only:
+            clauses.append(
+                "COALESCE(live.status, claim.job_status_at_delete) IN "
+                "('completed', 'failed', 'cancelled')"
+            )
+        elif not include_terminal:
             clauses.append(
                 "((live.id IS NOT NULL AND live.status NOT IN "
                 "('completed', 'failed', 'cancelled')) OR "
@@ -11205,7 +11216,10 @@ class PostgresDB:
                 "claim.job_status_at_delete NOT IN "
                 "('completed', 'failed', 'cancelled'))))"
             )
-        params.append(int(limit))
+        limit_sql = ""
+        if limit is not None:
+            params.append(int(limit))
+            limit_sql = f"LIMIT ${len(params)}"
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"""
@@ -11228,15 +11242,171 @@ class PostgresDB:
                        END AS legacy_rearm_after,
                        claim.source AS claim_source,
                        claim.job_deleted_at
-                  FROM officer_ticket_claims claim
+                 FROM officer_ticket_claims claim
                   LEFT JOIN jobs live ON live.id = claim.job_id
                  WHERE {" AND ".join(clauses)}
-                 ORDER BY claim.claimed_at DESC
-                 LIMIT ${len(params)}
+                 ORDER BY claim.claimed_at DESC, claim.id DESC
+                 {limit_sql}
                 """,
                 *params,
             )
         return [dict(row) for row in rows]
+
+    async def list_officer_distinct_terminal_outcomes(
+        self,
+        capacity_lineage: List[str],
+        *,
+        slot: str,
+        limit: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """Newest terminal outcome for each distinct ticket in a pool.
+
+        The terminal predicate and per-ticket de-duplication both precede the
+        final limit. Repeated outcomes for one ticket and arbitrary live rows
+        can therefore never hide the two outcomes the breaker evaluates.
+        """
+        if not capacity_lineage or limit <= 0:
+            return []
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH terminal AS (
+                    SELECT claim.id AS claim_id,
+                           claim.job_id AS id,
+                           COALESCE(live.status, claim.job_status_at_delete)
+                               AS status,
+                           claim.claimed_at AS created_at,
+                           COALESCE(live.updated_at, claim.job_deleted_at,
+                                    claim.claimed_at) AS updated_at,
+                           live.completed_at,
+                           claim.project_id,
+                           live.assigned_agent_id,
+                           claim.ticket_note_id,
+                           claim.officer_slot,
+                           claim.work_category,
+                           claim.ready_generation_at,
+                           CASE
+                               WHEN claim.source = 'legacy_unversioned'
+                               THEN claim.claimed_at
+                           END AS legacy_rearm_after,
+                           claim.source AS claim_source,
+                           claim.job_deleted_at
+                      FROM officer_ticket_claims claim
+                      LEFT JOIN jobs live ON live.id = claim.job_id
+                     WHERE claim.officer_thread_id = ANY($1::uuid[])
+                       AND claim.officer_slot = $2
+                       AND COALESCE(live.status, claim.job_status_at_delete)
+                           IN ('completed', 'failed', 'cancelled')
+                ), latest_per_ticket AS (
+                    SELECT DISTINCT ON (ticket_note_id) *
+                      FROM terminal
+                     ORDER BY ticket_note_id, created_at DESC, claim_id DESC
+                )
+                SELECT *
+                  FROM latest_per_ticket
+                 ORDER BY created_at DESC, claim_id DESC
+                 LIMIT $3
+                """,
+                [UUID(t) for t in capacity_lineage],
+                slot,
+                int(limit),
+            )
+        return [dict(row) for row in rows]
+
+    async def list_stale_officer_claims(
+        self,
+        capacity_lineage: List[str],
+        *,
+        stale_before: datetime,
+    ) -> List[Dict[str, Any]]:
+        """Every open claim already beyond the threshold, oldest first."""
+        if not capacity_lineage:
+            return []
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT claim.job_id AS id,
+                       COALESCE(live.status, claim.job_status_at_delete,
+                                'deleted_unknown') AS status,
+                       claim.claimed_at AS created_at,
+                       COALESCE(live.updated_at, claim.job_deleted_at,
+                                claim.claimed_at) AS updated_at,
+                       live.completed_at,
+                       claim.project_id,
+                       live.assigned_agent_id,
+                       claim.ticket_note_id,
+                       claim.officer_slot,
+                       claim.work_category,
+                       claim.ready_generation_at,
+                       CASE
+                           WHEN claim.source = 'legacy_unversioned'
+                           THEN claim.claimed_at
+                       END AS legacy_rearm_after,
+                       claim.source AS claim_source,
+                       claim.job_deleted_at
+                  FROM officer_ticket_claims claim
+                  LEFT JOIN jobs live ON live.id = claim.job_id
+                 WHERE claim.officer_thread_id = ANY($1::uuid[])
+                   AND (
+                       (live.id IS NOT NULL AND live.status NOT IN
+                           ('completed', 'failed', 'cancelled'))
+                       OR
+                       (live.id IS NULL AND (
+                           claim.job_deleted_at IS NULL
+                           OR claim.job_status_at_delete IS NULL
+                           OR claim.job_status_at_delete NOT IN
+                              ('completed', 'failed', 'cancelled')
+                       ))
+                   )
+                   AND COALESCE(live.updated_at, claim.job_deleted_at,
+                                claim.claimed_at) < $2
+                 ORDER BY COALESCE(live.updated_at, claim.job_deleted_at,
+                                   claim.claimed_at) ASC,
+                          claim.id ASC
+                """,
+                [UUID(t) for t in capacity_lineage],
+                stale_before,
+            )
+        return [dict(row) for row in rows]
+
+    async def get_oldest_open_officer_claim(
+        self, capacity_lineage: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        """The oldest open claim across a post lineage, with no pre-window."""
+        if not capacity_lineage:
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT claim.job_id AS id,
+                       claim.claimed_at AS created_at,
+                       COALESCE(live.updated_at, claim.job_deleted_at,
+                                claim.claimed_at) AS updated_at,
+                       COALESCE(live.status, claim.job_status_at_delete,
+                                'deleted_unknown') AS status,
+                       claim.ticket_note_id,
+                       claim.officer_slot,
+                       claim.work_category
+                  FROM officer_ticket_claims claim
+                  LEFT JOIN jobs live ON live.id = claim.job_id
+                 WHERE claim.officer_thread_id = ANY($1::uuid[])
+                   AND (
+                       (live.id IS NOT NULL AND live.status NOT IN
+                           ('completed', 'failed', 'cancelled'))
+                       OR
+                       (live.id IS NULL AND (
+                           claim.job_deleted_at IS NULL
+                           OR claim.job_status_at_delete IS NULL
+                           OR claim.job_status_at_delete NOT IN
+                              ('completed', 'failed', 'cancelled')
+                       ))
+                   )
+                 ORDER BY claim.claimed_at ASC, claim.id ASC
+                 LIMIT 1
+                """,
+                [UUID(t) for t in capacity_lineage],
+            )
+        return dict(row) if row else None
 
     # While-vacant ledger cap (officer_post.md §5): a ring, newest kept,
     # drop-oldest with a running dropped count so the commission brief can

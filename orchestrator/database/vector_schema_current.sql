@@ -1264,6 +1264,13 @@ CREATE INDEX idx_knowledge_backlog ON public.knowledge_index USING btree (projec
 
 
 --
+-- Name: idx_knowledge_backlog_page; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_backlog_page ON public.knowledge_index USING btree (project_id, priority, created_at, note_id) WHERE (((status)::text = 'active'::text) AND ((note_type)::text = ANY ((ARRAY['feature'::character varying, 'issue'::character varying, 'idea'::character varying])::text[])));
+
+
+--
 -- Name: idx_knowledge_chunks_embedding; Type: INDEX; Schema: public; Owner: -
 --
 

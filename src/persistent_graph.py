@@ -18,7 +18,7 @@ import time
 import uuid as _uuid
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -602,6 +602,16 @@ class PersistentLoopCallbacks:
         Callable[[List[Dict[str, Any]]], Awaitable[None]]
     ] = None
 
+    # Deterministic LF-5 fault seam. Invoked only after an assistant response
+    # containing tool calls has been appended and incrementally persisted, but
+    # before permission announcement or tool execution starts. Returning a
+    # truthy value simulates an interruption at that exact boundary. Production
+    # transports leave it unset; tests do not need timing or process signals to
+    # exercise the otherwise millisecond-wide crash window.
+    after_assistant_tool_calls_persisted: Optional[
+        Callable[[AIMessage], Awaitable[Any]]
+    ] = None
+
     def __post_init__(self) -> None:
         # Back-compat: callers that still pass the deprecated on_vm_upgrade_needed
         # get it promoted to the generalized on_workspace_upgrade_needed the loop
@@ -665,10 +675,57 @@ def _is_retryable_llm_error(error: BaseException) -> bool:
     accumulated that triage across several incidents (see its docstring) and
     sessions had none of it.
     """
-    if _is_context_overflow(error):
+    if _is_context_overflow(error) or _strict_pairing_error_signature(error):
         return False
 
     return _classify_llm_error(error) in _SESSION_RETRYABLE_CLASSIFICATIONS
+
+
+def _strict_pairing_error_signature(error: BaseException) -> Optional[str]:
+    """Classify only strict provider tool-call pairing HTTP 400s.
+
+    Provider errors arrive typed, wrapped through ``__cause__``, or with the
+    useful text only in ``body``. Status 400 plus a narrow known phrase is
+    required: unrelated bad requests retain their existing error behavior.
+    The signature describes the violated invariant rather than the volatile
+    call id, so two failures naming different ``call_*`` ids are equivalent.
+    """
+
+    candidates: list[BaseException] = []
+    current: Optional[BaseException] = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        candidates.append(current)
+        cause = getattr(current, "__cause__", None)
+        current = cause if isinstance(cause, BaseException) else None
+
+    status: Optional[int] = None
+    text_parts: list[str] = []
+    for candidate in candidates:
+        candidate_status = getattr(candidate, "status_code", None)
+        response = getattr(candidate, "response", None)
+        if candidate_status is None and response is not None:
+            candidate_status = getattr(response, "status_code", None)
+        if isinstance(candidate_status, int):
+            status = candidate_status
+        text_parts.append(str(candidate))
+        body = getattr(candidate, "body", None)
+        if body is not None:
+            text_parts.append(str(body))
+
+    if status != 400:
+        return None
+    text = " ".join(text_parts).lower()
+    if "no tool output found for function call" in text:
+        return "assistant_call_without_tool_output"
+    if "no tool call found for function call output" in text:
+        return "tool_output_without_assistant_call"
+    if "tool_use" in text and "without tool_result" in text:
+        return "assistant_call_without_tool_output"
+    if "tool_result" in text and "without a corresponding tool_use" in text:
+        return "tool_output_without_assistant_call"
+    return None
 
 
 def _session_llm_retry_delay(attempt: int, error: BaseException) -> float:
@@ -854,6 +911,13 @@ async def run_persistent_loop(
     extraction_interval = memory_config.observer_interval if memory_config else 5
     _last_extraction_turn = 0
 
+    # LF-5 circuit state is deliberately scoped to this attached process. The
+    # second equivalent strict-pairing 400 is persisted through on_error and
+    # then halts the loop, so no third wake can spend another provider call.
+    # A successful provider turn or any different error breaks the streak.
+    pairing_error_signature: Optional[str] = None
+    pairing_error_count = 0
+
     # Send system prompt as first message if not already present. Re-stamp the
     # date: a resumed session's prompt was built whenever the session was
     # created, which may be many days ago.
@@ -986,6 +1050,7 @@ async def run_persistent_loop(
             turn_callbacks = replace(callbacks, on_error=_capture_turn_error)
 
         result = None
+        halt_after_turn = False
         try:
             result = await _execute_turn(
                 llm_with_tools=llm_with_tools,
@@ -1005,15 +1070,57 @@ async def run_persistent_loop(
                 defer_memory_capture_to_outbox=defer_memory_extraction_to_outbox,
             )
             tool_calls_this_turn = result.tool_calls_made
+            pairing_error_signature = None
+            pairing_error_count = 0
         except asyncio.CancelledError:
             logger.info(f"Turn {turn_id} cancelled")
             return
         except Exception as e:
             logger.exception(f"Error in turn {turn_id}")
+            signature = _strict_pairing_error_signature(e)
+            if signature is not None:
+                # Repair the mutable source of the next provider request, not
+                # merely a throwaway prepared copy. Durable rows remain an
+                # append-only truthful record and restore performs the same
+                # repair after process replacement.
+                messages[:] = repair_tool_pairing(messages)
+                if signature == pairing_error_signature:
+                    pairing_error_count += 1
+                else:
+                    pairing_error_signature = signature
+                    pairing_error_count = 1
+                if pairing_error_count >= 2:
+                    halt_after_turn = True
+                    error_message = (
+                        "Session halted after two consecutive equivalent "
+                        "strict tool-call pairing provider errors. The live "
+                        "history was repaired without deleting durable "
+                        "messages, but automatic retries are stopped to "
+                        "prevent repeated LLM spend. Reattach/resume the "
+                        "session after inspecting the durable error and "
+                        "provider logs."
+                    )
+                    logger.error(
+                        "Strict-pairing liveness escalation after %d "
+                        "equivalent failures (%s)",
+                        pairing_error_count,
+                        signature,
+                    )
+                else:
+                    error_message = (
+                        "The provider rejected an invalid tool-call/result "
+                        "pair. The in-process history was repaired; the next "
+                        "turn can continue without deleting thread history "
+                        "or restarting this process."
+                    )
+            else:
+                pairing_error_signature = None
+                pairing_error_count = 0
+                error_message = _user_facing_turn_error(e)
             # turn_id lets the transport close the still-open turn in the UI
             # and persist the failure so it survives reload
             # (session_silent_failure_audit.md #2).
-            await turn_callbacks.on_error(_user_facing_turn_error(e), turn_id=turn_id)
+            await turn_callbacks.on_error(error_message, turn_id=turn_id)
 
         # Pinned sessions retain the historical interval writer. Stateless
         # claims skip BOTH implementations: their final transcript transaction
@@ -1147,6 +1254,9 @@ async def run_persistent_loop(
             if callbacks.on_turn_settled is not None:
                 await callbacks.on_turn_settled(turn_id)
 
+        if halt_after_turn:
+            return
+
         logger.info(
             f"Turn {turn_id} complete: {tool_calls_this_turn} tool calls, "
             f"{len(messages)} total messages"
@@ -1258,6 +1368,34 @@ async def _execute_turn(
         """
         if callbacks.persist_message is not None:
             await callbacks.persist_message(msg)
+
+    async def _record_unexecuted_tool_batch(
+        tool_calls: Sequence[dict[str, Any]], *, reason: str
+    ) -> None:
+        """Persist a truthful interruption event without fake tool results.
+
+        The assistant response remains in the append-only transcript with the
+        calls it actually emitted. No ToolMessage is manufactured for work
+        that never ran. The next provider-boundary repair strips only the
+        unpaired calls from the in-memory view; this event tells both the model
+        and operator why the durable turn has no corresponding tool rows.
+        """
+
+        names = [str(call.get("name") or "unknown") for call in tool_calls]
+        rendered = ", ".join(names[:8])
+        if len(names) > 8:
+            rendered += f", +{len(names) - 8} more"
+        event = HumanMessage(
+            content=(
+                "[tool-call interruption] The assistant requested "
+                f"{len(names)} tool call(s) ({rendered}), but they were not "
+                f"executed: {reason}. No tool result was recorded. Continue "
+                "from the user's request without assuming side effects."
+            ),
+            additional_kwargs={PERSIST_ROLE_KEY: "event"},
+        )
+        messages.append(_ensure_msg_id(event))
+        await _persist(event)
 
     # --- Memory retrieval (once per turn, before the inner loop) ---
     memory_block = ""
@@ -1548,6 +1686,13 @@ async def _execute_turn(
                 interrupted=True,
             )
 
+        # Repair the actual mutable session state before compaction and again
+        # at each concrete provider invocation below. The earlier guard only
+        # repaired an ephemeral ``prepared`` list; an orphan therefore stayed
+        # resident in ``messages`` and could poison every later wake in the
+        # same process.
+        messages[:] = repair_tool_pairing(messages)
+
         # Context compaction if needed — on the DURABLE session list, not the
         # per-call copy: a real compaction is adopted into `messages` once, so
         # the next LLM call starts from [summary + recent] instead of
@@ -1704,11 +1849,14 @@ async def _execute_turn(
         # sanitizes at the same point (src/graph.py:867); the resume path
         # repairs on restore (persistent_app). This is the equivalent guard for
         # the live turn loop, which previously had none.
-        prepared = repair_tool_pairing(prepared)
-        # Backstop: scrub malformed tool-call arguments already persisted in
-        # history (docs/features/outbound_message_hygiene.md) — MiniMax
-        # validates historical tool calls on input and 400s otherwise.
-        prepared = scrub_history_tool_call_arguments(prepared)
+        def _provider_input() -> List[BaseMessage]:
+            """Return the repaired input for one concrete provider call."""
+
+            messages[:] = repair_tool_pairing(messages)
+            prepared[:] = scrub_history_tool_call_arguments(
+                repair_tool_pairing(prepared)
+            )
+            return prepared
 
         # --- LLM call with streaming ---
         response_content = ""
@@ -1777,7 +1925,7 @@ async def _execute_turn(
                 # Manual iteration (vs. `async for`) so a hard interrupt can
                 # cancel a hung chunk read mid-stream instead of waiting for
                 # the next chunk to arrive before the cooperative check below.
-                _stream = llm_with_tools.astream(prepared)
+                _stream = llm_with_tools.astream(_provider_input())
                 _aiter = _stream.__aiter__()
                 _llm_attempt = 0
                 while True:
@@ -1823,7 +1971,7 @@ async def _execute_turn(
                             stream_finish_reason = None
                             response = None
                             _reasoning_buf.clear()
-                            _stream = llm_with_tools.astream(prepared)
+                            _stream = llm_with_tools.astream(_provider_input())
                             _aiter = _stream.__aiter__()
                             continue
                         raise
@@ -1914,7 +2062,7 @@ async def _execute_turn(
                     )
                     response_content = ""
                     response = await asyncio.wait_for(
-                        llm_with_tools.ainvoke(prepared),
+                        llm_with_tools.ainvoke(_provider_input()),
                         timeout=llm_timeout,
                     )
                     # Reasoning first: the non-streaming capture path parks it
@@ -2036,7 +2184,7 @@ async def _execute_turn(
                     logger.info(
                         f"Streaming not supported ({err_name}), falling back to ainvoke"
                     )
-                    response = await llm_with_tools.ainvoke(prepared)
+                    response = await llm_with_tools.ainvoke(_provider_input())
                     # Reasoning first: the non-streaming capture path parks it
                     # in additional_kwargs, so emit it before the answer text.
                     if await _emit_reasoning_content(
@@ -2286,7 +2434,7 @@ async def _execute_turn(
                 retry: Optional[AIMessage] = None
                 try:
                     retry = await asyncio.wait_for(
-                        llm_with_tools.ainvoke(prepared), timeout=llm_timeout
+                        llm_with_tools.ainvoke(_provider_input()), timeout=llm_timeout
                     )
                 except Exception as retry_err:
                     logger.warning(
@@ -2429,6 +2577,25 @@ async def _execute_turn(
         if not hasattr(response, "tool_calls") or not response.tool_calls:
             break
 
+        if callbacks.after_assistant_tool_calls_persisted is not None:
+            interrupted_at_seam = await callbacks.after_assistant_tool_calls_persisted(
+                response
+            )
+            if interrupted_at_seam:
+                await _record_unexecuted_tool_batch(
+                    list(response.tool_calls),
+                    reason=(
+                        "interrupted after the assistant response was persisted "
+                        "and before tool execution began"
+                    ),
+                )
+                return TurnResult(
+                    turn_id=0,
+                    messages_added=messages_added + 1,
+                    tool_calls_made=tool_calls_made,
+                    interrupted=True,
+                )
+
         # Announce the whole batch up front so the client can show every
         # pending call at once. Names that resolve to no tool are filtered out:
         # they are rejected below without ever reaching the gate, so announcing
@@ -2450,20 +2617,13 @@ async def _execute_turn(
             # Check for interrupt before each tool
             if callbacks.check_interrupt():
                 logger.info(f"Interrupt received before tool {tool_call['name']}")
-                for remaining in response.tool_calls[i:]:
-                    messages.append(
-                        _ensure_msg_id(
-                            ToolMessage(
-                                content="Interrupted by user.",
-                                tool_call_id=remaining["id"],
-                            )
-                        )
-                    )
-                    messages_added += 1
-                    await _persist(messages[-1])
+                await _record_unexecuted_tool_batch(
+                    list(response.tool_calls[i:]),
+                    reason="interrupted before tool execution",
+                )
                 return TurnResult(
                     turn_id=0,
-                    messages_added=messages_added,
+                    messages_added=messages_added + 1,
                     tool_calls_made=tool_calls_made,
                     interrupted=True,
                 )

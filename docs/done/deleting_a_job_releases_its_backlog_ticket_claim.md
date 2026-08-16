@@ -229,8 +229,9 @@ re-ready behavior, an ordinary-job control, and complete disposable cleanup whil
 `auto_pull=false`.
 
 This closes the local BP-05 repair only. Its main-dev deployment checkpoint remains open.
-BP-01, BP-06, BP-07, BP-08, BP-11, ES-01 and the remaining OC-05/OC-06 residues are
-unchanged; `auto_pull` remains false and unexposed.
+BP-06 subsequently closed locally in
+[[backlog_fixed_windows_starve_eligible_tickets]]; BP-01, BP-07, BP-08, BP-11, ES-01 and
+the remaining OC-05/OC-06 residues are unchanged. `auto_pull` remains false and unexposed.
 
 ## Dependencies
 

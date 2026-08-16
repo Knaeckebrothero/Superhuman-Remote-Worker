@@ -556,14 +556,12 @@ async def _capacity_section(
 
         oldest_hours: Optional[float] = None
         try:
-            claims = await db.list_officer_slot_claims(lineage, limit=50)
-            ages = [
-                (now or datetime.now(timezone.utc)) - created
-                for created in (_parse_iso(claim.get("created_at")) for claim in claims)
-                if created is not None
-            ]
-            if ages:
-                oldest_hours = max(ages).total_seconds() / 3600.0
+            claim = await db.get_oldest_open_officer_claim(lineage)
+            created = _parse_iso(claim.get("created_at")) if claim else None
+            if created is not None:
+                oldest_hours = (
+                    (now or datetime.now(timezone.utc)) - created
+                ).total_seconds() / 3600.0
         except Exception:
             logger.warning("sitrep: oldest-claim age unavailable", exc_info=True)
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
@@ -50,7 +51,7 @@ from services.officer_admission import (
     prepare_officer_admission,
 )
 from services.officer_slots import roster_from_meta
-from services.project_backlog import fetch_backlog, fetch_ticket_state
+from services.project_backlog import BacklogCursor, fetch_backlog, fetch_ticket_state
 from services.work_categories import (
     EXECUTOR,
     category_block,
@@ -84,17 +85,29 @@ BREAKER_OPEN_MINUTES = float(os.getenv("OFFICER_POOL_BREAKER_MINUTES", "30"))
 # because there is genuinely nothing to do must not page him every minute.
 FLOOR_WAKE_DEBOUNCE_HOURS = float(os.getenv("OFFICER_FLOOR_WAKE_HOURS", "6"))
 
-# Candidate tickets pulled per pool per tick. The tick dispatches at most one
-# job per pool anyway; the rest of the window exists so a claimed or ambiguous
-# head-of-queue does not block the ticket behind it.
-_CANDIDATE_LIMIT = 10
-
-# Ready-depth counting stops here. The floor is the pool's slot count (max 20),
-# so anything past this is "plenty" for every decision the number informs.
-_READY_DEPTH_LIMIT = 25
+# A transport page size, never a semantic ceiling. Cross-store eligibility
+# cannot be expressed as one SQL join because ticket ordering lives in the KB
+# database while durable claims live in the app database. The scanner below
+# therefore keyset-pages until it has enough eligible rows for its decision or
+# has proved exhaustion.
+_BACKLOG_SCAN_PAGE_SIZE = 100
 
 ProvisionFn = Callable[..., Awaitable[None]]
 GrantsFn = Callable[..., Awaitable[None]]
+
+
+@dataclass
+class EligibilityScan:
+    """Result of a cross-store backlog scan with explicit completeness."""
+
+    tickets: list[dict[str, Any]] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    exhausted: bool = False
+    lower_bound: bool = False
+    unavailable: bool = False
+    pages: int = 0
+    rows_scanned: int = 0
+    error: str | None = None
 
 
 def _now() -> datetime:
@@ -330,6 +343,78 @@ def eligible_tickets(
     return ready, notes
 
 
+async def _scan_eligible_tickets(
+    db: Any,
+    vector_db: Any,
+    project_id: str,
+    category: str,
+    now: datetime,
+    *,
+    minimum: int | None,
+) -> EligibilityScan:
+    """Keyset-page across KB order until eligibility is sufficient or exact.
+
+    ``minimum=None`` requests an exact count and therefore scans to exhaustion.
+    A positive minimum is enough for admission/floor decisions; reaching it is
+    an explicitly lower-bound result. Any KB or app-database failure is marked
+    unavailable, never reinterpreted as an empty pool.
+    """
+
+    result = EligibilityScan()
+    cursor: BacklogCursor | None = None
+    seen_cursors: set[BacklogCursor] = set()
+    target = None if minimum is None else max(1, int(minimum))
+
+    while True:
+        try:
+            rows, _counts = await fetch_backlog(
+                vector_db,
+                project_id,
+                require_tags=[READY_TAG, category_tag(category)],
+                limit=_BACKLOG_SCAN_PAGE_SIZE,
+                after=cursor,
+                include_counts=False,
+            )
+        except Exception as exc:
+            result.unavailable = True
+            result.error = f"KB backlog read failed: {type(exc).__name__}"
+            return result
+
+        result.pages += 1
+        result.rows_scanned += len(rows)
+        if not rows:
+            result.exhausted = True
+            return result
+
+        try:
+            claims = await db.ticket_claim_states(
+                project_id, [str(row.get("note_id")) for row in rows]
+            )
+        except Exception as exc:
+            result.unavailable = True
+            result.error = f"claim-state read failed: {type(exc).__name__}"
+            return result
+
+        ready, notes = eligible_tickets(rows, claims, now)
+        result.tickets.extend(ready)
+        result.notes.extend(notes)
+        if target is not None and len(result.tickets) >= target:
+            result.lower_bound = True
+            return result
+
+        if len(rows) < _BACKLOG_SCAN_PAGE_SIZE:
+            result.exhausted = True
+            return result
+
+        next_cursor = BacklogCursor.from_row(rows[-1])
+        if not next_cursor.note_id or next_cursor in seen_cursors:
+            result.unavailable = True
+            result.error = "KB backlog cursor did not advance"
+            return result
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+
 async def ready_depth_by_pool(
     db: Any,
     vector_db: Any,
@@ -356,21 +441,17 @@ async def ready_depth_by_pool(
         category = str(spec.get("category") or "")
         if not category:
             continue
-        try:
-            rows, _counts = await fetch_backlog(
-                vector_db,
-                project_id,
-                require_tags=[READY_TAG, category_tag(category)],
-                limit=_READY_DEPTH_LIMIT,
+        scan = await _scan_eligible_tickets(
+            db, vector_db, project_id, category, now, minimum=None
+        )
+        if scan.unavailable or not scan.exhausted:
+            logger.warning(
+                "officer backlog: ready-depth unavailable for pool %s (%s)",
+                pool,
+                scan.error or "incomplete scan",
             )
-            claims = await db.ticket_claim_states(
-                project_id, [str(r.get("note_id")) for r in rows]
-            )
-        except Exception:
-            logger.warning("officer backlog: ready-depth read failed for pool %s", pool)
             continue
-        ready, _notes = eligible_tickets(rows, claims, now)
-        depths[pool] = len(ready)
+        depths[pool] = len(scan.tickets)
     return depths
 
 
@@ -496,25 +577,20 @@ async def _executor_blocked(
        straight into the deliverable. If the officer stops reviewing, executors
        stop. That is the intended direction.
     """
-    in_flight = await db.list_officer_slot_claims(list(capacity_lineage), limit=50)
-    live_executors = [
-        job for job in in_flight if (job.get("work_category") or "") == EXECUTOR
-    ]
+    live_executors = await db.list_officer_slot_claims(
+        list(capacity_lineage), work_category=EXECUTOR, limit=1
+    )
     if live_executors and not ticket_is_parallel_safe:
         return f"executor singleton held by job {str(live_executors[0]['id'])[:8]}"
 
     recent = await db.list_officer_slot_claims(
-        list(capacity_lineage), include_terminal=True, limit=25
+        list(capacity_lineage),
+        work_category=EXECUTOR,
+        include_terminal=True,
+        terminal_only=True,
+        limit=1,
     )
-    previous = next(
-        (
-            job
-            for job in recent
-            if (job.get("work_category") or "") == EXECUTOR
-            and job.get("status") in ("completed", "failed", "cancelled")
-        ),
-        None,
-    )
+    previous = recent[0] if recent else None
     if previous is None:
         return None
     ticket_id = previous.get("ticket_note_id")
@@ -800,7 +876,10 @@ async def tick_officer(
     floor_wakes = dict(state.get("backlog_floor_wakes") or {})
 
     # Stale claims: computed once for the whole post, recorded for the sitrep.
-    open_claims = await db.list_officer_slot_claims(lineage, limit=50)
+    open_claims = await db.list_stale_officer_claims(
+        lineage,
+        stale_before=now - timedelta(hours=STALE_CLAIM_HOURS),
+    )
     stalled = stale_claims(open_claims, now)
     state_patch["backlog_stale_claims"] = stalled
     for claim in stalled:
@@ -831,14 +910,9 @@ async def tick_officer(
             continue
 
         # Breaker evaluation runs BEFORE the pull, on the pool's own history.
-        pool_history = await db.list_officer_slot_claims(
-            lineage, slot=pool, include_terminal=True, limit=10
+        terminal_history = await db.list_officer_distinct_terminal_outcomes(
+            lineage, slot=pool, limit=BREAKER_FAILURES
         )
-        terminal_history = [
-            job
-            for job in pool_history
-            if job.get("status") in ("completed", "failed", "cancelled")
-        ]
         tripped = evaluate_breaker(terminal_history, state, pool)
         if tripped:
             tripped["until"] = (
@@ -860,7 +934,7 @@ async def tick_officer(
             pool_job_ids = [
                 str(job["id"])
                 for job in await db.list_officer_slot_claims(
-                    lineage, slot=pool, include_terminal=True, limit=100
+                    lineage, slot=pool, include_terminal=True, limit=None
                 )
             ]
             if await _spend_exhausted(
@@ -875,34 +949,32 @@ async def tick_officer(
                 counts["skipped"] += 1
                 continue
 
-        try:
-            rows, _counts = await fetch_backlog(
-                vector_db,
-                project_id,
-                require_tags=[READY_TAG, category_tag(category)],
-                limit=_CANDIDATE_LIMIT,
-            )
-        except Exception:
-            # A KB/pgvector outage skips cleanly this tick. Infra failures
-            # never feed breakers.
+        floor = int(spec.get("count") or 0)
+        scan = await _scan_eligible_tickets(
+            db,
+            vector_db,
+            project_id,
+            category,
+            now,
+            minimum=max(floor, 1),
+        )
+        if scan.unavailable:
             logger.warning(
-                "officer=%s pool=%s skip=kb-unavailable", thread_id[:8], pool
+                "officer=%s pool=%s skip=backlog-unavailable reason=%s",
+                thread_id[:8],
+                pool,
+                scan.error,
             )
             counts["skipped"] += 1
             continue
-
-        claims = await db.ticket_claim_states(
-            project_id, [str(r.get("note_id")) for r in rows]
-        )
-        ready, notes = eligible_tickets(rows, claims, now)
-        for note in notes:
+        ready = scan.tickets
+        for note in scan.notes:
             logger.info("officer=%s pool=%s skip=%s", thread_id[:8], pool, note)
 
         # Floor = the pool's own slot count (§13.2): if every agent in the pool
         # lands at once, each must find a ticket waiting. The floor therefore
         # scales with the kit rather than needing its own knob.
-        floor = int(spec.get("count") or 0)
-        if len(ready) < floor:
+        if scan.exhausted and len(ready) < floor:
             last = _aware(floor_wakes.get(pool))
             if last is None or (now - last) >= timedelta(
                 hours=FLOOR_WAKE_DEBOUNCE_HOURS
