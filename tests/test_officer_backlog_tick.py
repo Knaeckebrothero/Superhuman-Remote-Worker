@@ -36,6 +36,9 @@ from services.work_categories import EXECUTOR, RESEARCHER
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
 OFFICER_THREAD_ID = "11111111-1111-1111-1111-111111111111"
 OFFICER_PROJECT_ID = "22222222-2222-2222-2222-222222222222"
+OWNER_ID = "33333333-3333-3333-3333-333333333333"
+KB_DS = "44444444-4444-4444-4444-444444444444"
+REPO_DS = "55555555-5555-5555-5555-555555555555"
 
 
 def _row(note_id, *, tags, ready_at=None, title="T", note_type="feature"):
@@ -324,11 +327,16 @@ def _db(
     slot_claims=None,
     locked_claim_at=None,
     locked_has_non_terminal=False,
+    slots=None,
 ):
     """A doubled PostgresDB.
 
     ``locked_claim_at`` is what the in-transaction re-read of the claim ledger
     returns — the racing-replica case. None means "still unclaimed".
+
+    ``slots`` overrides the runtime roster so a test can pin a worker tier —
+    connector resolution must measure against the worker's backend, never the
+    officer's.
     """
     db = AsyncMock()
     db.get_officer_capacity_lineage.return_value = [OFFICER_THREAD_ID]
@@ -358,7 +366,8 @@ def _db(
             "officer": {
                 "enabled": True,
                 "auto_pull": True,
-                "slots": {
+                "slots": slots
+                or {
                     "researchers": {"count": 1, "category": RESEARCHER},
                     "executors": {"count": 1, "category": EXECUTOR},
                 },
@@ -539,6 +548,102 @@ class TestTickOfficer:
         ]
         await tick_officer(db, _vector_db(rows), _officer_row(), now=NOW)
         assert db.created["config_name"] == "designer"
+
+    @pytest.mark.asyncio
+    async def test_an_auto_pulled_job_carries_the_projects_connector_defaults(
+        self, monkeypatch
+    ):
+        """Without this the tick creates jobs with no connectors at all.
+
+        The REST create path resolves them (`2afbf956`), but this path bypasses
+        it to keep the claim INSERT in the post-lock transaction — so the fix
+        did not reach here. A worker dispatched with an empty selection has no
+        repository checkout and no clone/commit/push; it can only report that
+        it could not do the work. Hand-dispatched, that cost Better Resavio a
+        night. Under auto-pull it would repeat every tick, unattended.
+        """
+        import services.officer_backlog as mod
+
+        resolved = ([KB_DS, REPO_DS], {KB_DS: 2, REPO_DS: 4})
+        monkeypatch.setattr(
+            mod, "default_datasource_selection", AsyncMock(return_value=resolved)
+        )
+
+        db = _db()
+        rows = [_row("feature-a", tags=["ready", "category:researcher"], ready_at=NOW)]
+        counts = await tick_officer(
+            db, _vector_db(rows), _officer_row(user_id=OWNER_ID), now=NOW
+        )
+
+        assert counts["dispatched"] == 1
+        assert db.created["datasource_ids"] == [KB_DS, REPO_DS]
+        assert db.created["datasource_policy_revisions"] == {KB_DS: 2, REPO_DS: 4}
+        provenance = db.created["datasource_selection_provenance"]
+        assert provenance["origin"] == "default"
+        assert provenance["creation_path"] == "officer_backlog_tick"
+        assert provenance["effective_work_owner_id"] == OWNER_ID
+
+    @pytest.mark.asyncio
+    async def test_connectors_resolve_against_the_workers_tier_not_the_officers(
+        self, monkeypatch
+    ):
+        """The tier argument decides whether the repository survives.
+
+        The policy service withholds clone-based repositories from lite tiers.
+        An officer's own post IS lite (he holds no workspace by design), so
+        resolving with his backend silently drops the repository and produces
+        exactly the symptom this resolution exists to remove — a worker that
+        can read the KB but cannot reach the code. The worker's slot backend is
+        the only correct measure.
+        """
+        import services.officer_backlog as mod
+
+        spy = AsyncMock(return_value=([KB_DS, REPO_DS], {}))
+        monkeypatch.setattr(mod, "default_datasource_selection", spy)
+
+        db = _db(
+            slots={
+                "researchers": {
+                    "count": 1,
+                    "category": RESEARCHER,
+                    "backend": "sandbox",
+                }
+            }
+        )
+        rows = [_row("feature-a", tags=["ready", "category:researcher"], ready_at=NOW)]
+        await tick_officer(
+            db, _vector_db(rows), _officer_row(user_id=OWNER_ID), now=NOW
+        )
+
+        assert spy.await_args.args[3] == "sandbox"
+
+    @pytest.mark.asyncio
+    async def test_unavailable_connectors_skip_the_pool_rather_than_dispatch(
+        self, monkeypatch
+    ):
+        """A revoked owner, membership or connector is not a job failure.
+
+        Dispatching anyway would put a worker on the ticket holding a partial
+        credential contract, and it would burn the ticket's one-shot claim to
+        do it. Skipping leaves the pool visibly below floor instead.
+        """
+        import services.officer_backlog as mod
+        from services.datasource_policy import DatasourceUnavailableError
+
+        monkeypatch.setattr(
+            mod,
+            "default_datasource_selection",
+            AsyncMock(side_effect=DatasourceUnavailableError()),
+        )
+
+        db = _db()
+        rows = [_row("feature-a", tags=["ready", "category:researcher"], ready_at=NOW)]
+        counts = await tick_officer(
+            db, _vector_db(rows), _officer_row(user_id=OWNER_ID), now=NOW
+        )
+
+        assert counts["dispatched"] == 0
+        db.create_job.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_auto_pull_off_dispatches_nothing(self):

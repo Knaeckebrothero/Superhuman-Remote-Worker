@@ -37,6 +37,10 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
+from services.datasource_policy import (
+    DatasourceUnavailableError,
+    default_datasource_selection,
+)
 from services.officer_admission import (
     OfficerAdmissionConflict,
     SlotAdmissionError,
@@ -95,6 +99,25 @@ GrantsFn = Callable[..., Awaitable[None]]
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _slot_workspace_backend(config_override: dict[str, Any] | None) -> Optional[str]:
+    """The WORKER's workspace tier, from the authoritative slot patch.
+
+    ``officer_slots`` writes ``workspace.backend`` per roster slot, so this is
+    the tier the dispatched job will actually run on. It is what connector
+    resolution must be measured against: the policy service withholds
+    clone-based repositories from lite tiers, and the officer's own post is
+    lite. Passing his tier instead of the worker's would silently drop the
+    repository and reproduce the very defect this resolution exists to fix.
+    """
+    if not isinstance(config_override, dict):
+        return None
+    workspace = config_override.get("workspace")
+    if not isinstance(workspace, dict):
+        return None
+    backend = workspace.get("backend")
+    return str(backend) if backend else None
 
 
 def _uuid_or_none(value: Any) -> Any:
@@ -591,6 +614,55 @@ async def _dispatch_one(
             project_ids=[project_id] if project_id else [],
         )
 
+    # Connectors. This path never touched them, so an auto-pulled job was
+    # created with none at all — no repository checkout, no clone/commit/push
+    # — and the worker could only report that it could not do the work. That
+    # is exactly what a hand-dispatched officer produced on Better Resavio
+    # 2026-08-15; `2afbf956` fixed the REST create path, which this one
+    # deliberately bypasses for the claim-ledger transaction, so the fix did
+    # not reach here. Under auto-pull the same failure repeats every tick with
+    # no human in the loop to notice.
+    #
+    # Resolve against the WORKER's tier (the slot patch's workspace backend),
+    # never the officer's. His own post is lite, where the policy service
+    # correctly withholds clone-based repositories; resolving with his backend
+    # would silently drop the repository again and look identical to the bug.
+    #
+    # Resolved per tick rather than cached on the post so a connector added to
+    # the project reaches the next dispatch, not the next commission.
+    target_project_ids = [project_id] if project_id else []
+    if effective_owner_user_id:
+        try:
+            (
+                datasource_ids,
+                datasource_policy_revisions,
+            ) = await default_datasource_selection(
+                db,
+                effective_owner_user_id,
+                target_project_ids,
+                _slot_workspace_backend(prepared_config),
+            )
+        except DatasourceUnavailableError as exc:
+            # A revoked owner, membership or connector. Skip the tick rather
+            # than dispatch a worker holding a partial credential contract;
+            # the pool stays visibly below floor instead of filling with jobs
+            # that cannot reach their sources.
+            logger.warning(
+                "officer=%s pool=%s skip=connectors-unavailable:%s",
+                officer_thread_id[:8],
+                pool,
+                exc,
+            )
+            return None
+        datasource_origin = "default"
+    else:
+        # No authoritative principal, so no ambient preferences may be
+        # borrowed — the complete, explicit selection is empty. Mirrors the
+        # project-loop tick.
+        datasource_ids = []
+        datasource_policy_revisions = {}
+        datasource_origin = "explicit"
+
     try:
         job = await admit_and_create_job(
             db,
@@ -611,6 +683,17 @@ async def _dispatch_one(
                 "authority_project_ids": [project_id]
                 if effective_owner_user_id
                 else None,
+                "datasource_ids": datasource_ids,
+                "datasource_selection_provenance": {
+                    "origin": datasource_origin,
+                    "creation_path": "officer_backlog_tick",
+                    "effective_work_owner_id": effective_owner_user_id,
+                    "target_project_ids": target_project_ids,
+                    "datasource_ids": datasource_ids,
+                    "policy_revisions": datasource_policy_revisions,
+                    "resolved_at": _now().isoformat(),
+                },
+                "datasource_policy_revisions": datasource_policy_revisions,
                 # `lifecycle` is the established system-subjob class with the
                 # owner's grants and a full autonomy ceiling.
                 "runner_kind": "lifecycle",
