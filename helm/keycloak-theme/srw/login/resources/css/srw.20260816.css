@@ -2,12 +2,12 @@
  * SRW Imperial theme for the Keycloak login pages.
  *
  * SPECIFICITY WARNING -- read before editing:
- * PatternFly v5 wraps every dark-mode token in a :where() wrapper, which has
- * ZERO specificity. A :root block (0,1,0) therefore beats it unconditionally,
- * in both colour schemes. Dark values below MUST stay on the bare dark-mode
- * theme class (see the second block), which ties :root on specificity and
- * wins by source order. Do NOT reintroduce a dark-mode media query -- Keycloak
- * toggles the theme class from JS on <html>, and a media query would desync
+ * PatternFly v5 wraps every dark-mode token in :where(.pf-v5-theme-dark),
+ * and :where() has ZERO specificity. A :root block (0,1,0) therefore beats it
+ * unconditionally, in both colour schemes. Dark values MUST go on the bare
+ * .pf-v5-theme-dark class below, which ties :root on specificity and wins by
+ * source order. Do NOT move them into @media (prefers-color-scheme: dark) --
+ * Keycloak toggles the class from JS on <html>, and a media query desyncs
  * from it.
  *
  * Filename is versioned: theme resources are served with max-age=2592000 and

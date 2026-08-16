@@ -5,11 +5,22 @@ token in :where(), which has zero specificity, so putting dark values under
 :root or a media query loses to nothing and silently disables dark mode.
 """
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 THEME = ROOT / "helm/keycloak-theme/srw"
 LOGIN_CSS = next((THEME / "login/resources/css").glob("srw.*.css"), None)
+
+
+def _css_rules(text: str) -> str:
+    """CSS with /* ... */ comments removed.
+
+    The dark-mode assertions below must judge rules, not prose. Reading the raw
+    file makes it impossible to document the prohibited patterns by name, which
+    is exactly what the header comment needs to do.
+    """
+    return re.sub(r"/\*.*?\*/", "", text, flags=re.S)
 
 
 def test_login_theme_properties_are_correct() -> None:
@@ -33,12 +44,13 @@ def test_css_filename_is_versioned() -> None:
 
 def test_dark_tokens_are_on_the_bare_class_not_root_or_media_query() -> None:
     css = LOGIN_CSS.read_text()
-    assert ".pf-v5-theme-dark" in css
-    assert "prefers-color-scheme" not in css, (
+    rules = _css_rules(css)
+    assert ".pf-v5-theme-dark" in rules
+    assert "prefers-color-scheme" not in rules, (
         "PatternFly toggles a class, not a media query -- a media query desyncs."
     )
-    dark_start = css.index(".pf-v5-theme-dark")
-    root_start = css.index(":root")
+    dark_start = rules.index(".pf-v5-theme-dark")
+    root_start = rules.index(":root")
     assert root_start < dark_start, ":root must come first so the class wins on tie"
 
 
@@ -68,8 +80,9 @@ def test_no_external_font_dependency() -> None:
     """The login page must work when everything else is down, and must not leak
     every login attempt's IP to a third party."""
     css = LOGIN_CSS.read_text()
-    assert "fonts.googleapis.com" not in css
-    assert "@import" not in css
+    rules = _css_rules(css)
+    assert "fonts.googleapis.com" not in rules
+    assert "@import" not in rules
 
 
 def test_light_tokens_match_the_shared_brand_palette() -> None:
@@ -79,12 +92,11 @@ def test_light_tokens_match_the_shared_brand_palette() -> None:
     ties the Keycloak CSS to brand.py, so all three move together or a test
     fails. Without it the login page is exactly the surface that silently rots.
     """
-    import re
-
     from orchestrator.services import brand
 
     css = LOGIN_CSS.read_text()
-    root = css[css.index(":root {"): css.index(".pf-v5-theme-dark")]
+    rules = _css_rules(css)
+    root = rules[rules.index(":root {"): rules.index(".pf-v5-theme-dark")]
 
     expected = {
         "--pf-v5-global--primary-color--100": brand.TRAVERTINE["accent-color"],
