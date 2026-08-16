@@ -5,6 +5,7 @@ token in :where(), which has zero specificity, so putting dark values under
 :root or a media query loses to nothing and silently disables dark mode.
 """
 
+import json
 import re
 import shutil
 import subprocess
@@ -201,3 +202,17 @@ def test_pod_template_has_a_theme_checksum_annotation() -> None:
 def test_compose_bind_mounts_the_same_source() -> None:
     compose = (ROOT / "docker-compose.yaml").read_text()
     assert "./helm/keycloak-theme/srw:/opt/keycloak/themes/srw" in compose
+
+
+def test_both_realms_use_the_srw_login_theme() -> None:
+    assert '"loginTheme": "srw"' in KC.read_text()
+    export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
+    assert export["loginTheme"] == "srw"
+
+
+def test_display_name_html_carries_the_logo_hook() -> None:
+    """--keycloak-logo-url only renders if displayNameHtml provides
+    .kc-logo-text for the stylesheet to turn into a background image."""
+    assert 'kc-logo-text' in KC.read_text()
+    export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
+    assert "kc-logo-text" in export["displayNameHtml"]

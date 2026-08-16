@@ -27,7 +27,7 @@ data:
       "realm": {{ .Values.keycloak.realm | quote }},
       "enabled": true,
       "displayName": "Superhuman Remote Worker",
-      "displayNameHtml": "<strong>Superhuman Remote Worker</strong>",
+      "displayNameHtml": "<div class=\"kc-logo-text\"><span>Superhuman Remote Worker</span></div>",
       "registrationAllowed": true,
       "registrationEmailAsUsername": false,
       "verifyEmail": true,
@@ -528,7 +528,7 @@ data:
         }
       ],
       "internationalizationEnabled": false,
-      "loginTheme": "keycloak",
+      "loginTheme": "srw",
       "accountTheme": "keycloak.v3"
     }
 ---
