@@ -23,7 +23,7 @@ related:
 
 > Bring the two remaining unbranded surfaces — transactional email and the Keycloak login page — onto the Imperial design system. Emails move off the retired Catppuccin palette onto Travertine via a shared layout module. Keycloak gets a CSS-only child theme (`srw`) covering both login and its own transactional email, delivered as a ConfigMap so we stay on the upstream image.
 
-**Status:** Design approved 2026-08-11. Revised the same day after a research pass; **not yet implemented**.
+**Status:** **SHIPPED** on `develop` 2026-08-16, commits `78434c92..37f37ece`. Designed 2026-08-11, revised the same day after a research pass, implemented across 12 tasks. Live gate passed via docker-compose. 138 tests green. See *Post-implementation status* at the foot of this document.
 **Triggered by:** Both surfaces still carry pre-Imperial design. The email templates use Catppuccin Mocha — the palette `cockpit/src/styles/README.md` calls "the Catppuccin era" and migrates localStorage away from. Keycloak still serves the stock, now-deprecated `keycloak` login theme.
 **Scope:** Three SRW application emails, a shared brand/palette module, an email layout module, a Keycloak `srw` login theme, a Keycloak `srw` email theme, the Catppuccin magic-link landing pages, and unpinning the hardcoded Keycloak SMTP port. **Does not** replace Keycloak's login pages with cockpit-native ones (see [[cockpit_owned_auth_ui]]), change email copy, brand plaintext email, or add MFA/registration flows.
 
@@ -40,7 +40,7 @@ related:
 | **Delivery** | Theme source in `helm/keycloak-theme/srw/`, ConfigMap-mounted at `/opt/keycloak/themes/srw`, with a checksum annotation forcing a pod roll. |
 | **Chart fix** | `smtpServer.port` stops being hardcoded to `1025`. |
 
-**Estimated effort:** ~1.5 days across three slices, up from ~1 day — the research pass added real work (accessibility fix, landing pages, cache handling).
+**Effort:** estimated ~1.5 days across three slices; the implementation ran longer, almost entirely in review-driven fix rounds rather than first-pass work. Nine vacuous tests, one container-crash blocker, one WCAG regression and one shell-injection vector were found *after* the code was written — see the pattern note at the foot of this document.
 
 ## Why not cockpit-owned auth pages
 
@@ -391,7 +391,7 @@ Fix: `{{ .Values.email.smtp.port | default "1025" }}`, with `smtpServer.starttls
 2. **Keycloak login theme + ConfigMap delivery + checksum annotation + smoke test.** All chart work lands here, plus the realm `displayNameHtml` change.
 3. **Keycloak email theme + SMTP port fix.** Reuses slice 2's delivery; the port fix is what makes slice 3 observable outside dev.
 
-Given ~10 days to alpha and that slices 2–3 touch a chart with a known strategic-merge hazard, **slice 1 is the one to ship before alpha**; 2–3 can follow.
+All three slices shipped. Slice 1 was sequenced first because it touches no chart and carries the injection and accessibility fixes; slices 2–3 followed without tripping the chart's known strategic-merge hazard.
 
 ---
 

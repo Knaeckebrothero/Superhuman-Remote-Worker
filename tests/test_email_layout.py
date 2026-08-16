@@ -1,7 +1,7 @@
 """Behavioural guards for the shared email layout.
 
 Each assertion here corresponds to a documented client failure or an
-accessibility requirement -- see docs/features/email_and_login_theme_alignment.md.
+accessibility requirement -- see docs/done/email_and_login_theme_alignment.md.
 """
 
 import re
