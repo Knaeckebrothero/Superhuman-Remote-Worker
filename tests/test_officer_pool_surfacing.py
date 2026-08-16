@@ -191,6 +191,30 @@ def _vector_db(rows):
 
 class TestReadyDepth:
     @pytest.mark.asyncio
+    async def test_more_than_twenty_five_candidates_are_counted_exactly(self):
+        rows = [
+            {
+                "note_id": f"ticket-{index:02d}",
+                "priority": 1,
+                "tags": ["ready", "category:researcher"],
+                "ready_at": NOW,
+            }
+            for index in range(30)
+        ]
+        db = AsyncMock()
+        db.ticket_claim_states.return_value = {}
+
+        depth = await ready_depth_by_pool(
+            db,
+            _vector_db(rows),
+            str(uuid.uuid4()),
+            {"researchers": POOLS["researchers"]},
+            now=NOW,
+        )
+
+        assert depth == {"researchers": 30}
+
+    @pytest.mark.asyncio
     async def test_counts_only_what_the_tick_would_actually_take(self):
         # A "ready 4" the tick reads as 1 would have the officer waiting for
         # dispatches that are never coming.

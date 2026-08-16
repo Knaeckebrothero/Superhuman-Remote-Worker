@@ -52,16 +52,17 @@ The result remains mixed, but the authority/atomicity baseline has materially ad
   replicas with an atomic jobs-table cut, strict/collision-loud backfill and jobs triggers;
   raw claim context is server-owned, null/missing provenance fails closed, historical
   context merges remain compatible, and deletion truth comes from the delete transaction.
-- Unattended backlog release is still blocked by the supported enable-control gap and fixed
-  pre-filter starvation, followed by the still-open provisioning, materialization, roster,
-  evidence, and operational residues listed below.
+- Unattended backlog release is still blocked by the supported enable-control gap followed
+  by the still-open provisioning, materialization, roster, evidence, and operational
+  residues listed below. BP-06's pre-filter starvation is closed locally.
 
 “Implemented” in the feature docs therefore still does not mean unattended backlog release
 is safe. The earlier tranche was deployed and O6 was released successfully with
 `auto_pull=false`; the later lifecycle/configuration transaction checkpoint was also
-deployed and passed a bounded disposable Officer gate on 2026-08-16. BP-05 is the current
-local, uncommitted and not-deployed checkpoint. Nothing here authorizes `auto_pull=true` or
-unattended backlog release. The umbrella stays open until the remaining P0 live gates in
+deployed and passed a bounded disposable Officer gate on 2026-08-16. BP-05 is committed in
+HEAD but has no claimed deployment gate; BP-06 is the current uncommitted, not-deployed
+checkpoint. Nothing here authorizes `auto_pull=true` or unattended backlog release. The
+umbrella stays open until the remaining P0 live gates in
 [Release order and acceptance](#release-order-and-acceptance) pass.
 
 ## Individual issue ledger
@@ -75,7 +76,8 @@ change.
 closed 2026-08-15; deployed disposable gate passed 2026-08-16.** The earlier tranche
 reached dev and O6 was released successfully with `auto_pull=false`; the additional
 transaction/configuration checkpoint later reached dev and passed the bounded gate recorded
-in [[officer_backlog_pools_resavio_livefire]]. BP-05 below is local and not deployed.
+in [[officer_backlog_pools_resavio_livefire]]. BP-05 and BP-06 below are local and not
+deployed.
 
 | Order | Priority | Issue | Audit finding(s) | Why this boundary |
 |---:|---|---|---|---|
@@ -86,7 +88,7 @@ in [[officer_backlog_pools_resavio_livefire]]. BP-05 below is local and not depl
 | 5 | P0 | [[direct_blocking_message_freeze_can_outlive_route]] | OC-01 | Make the default blocking-send creation recoverable.  **DONE 2026-08-15.**|
 | 6 | P0 | [[message_route_resume_lacks_generation_cas]] | OC-04 | Fence every reply/timeout to the exact freeze generation.  **DONE 2026-08-15.**|
 | 7 | P0 | [[officer_evidence_and_messages_leak_secret_shaped_content]] | OC-05 | Sanitize routine officer/user presentation before live use.  **DONE 2026-08-15 (blocker closed; remaining surfaces rescoped P2).**|
-| 8 | P0 | [[backlog_fixed_windows_starve_eligible_tickets]] | BP-06 | Remove permanent starvation before the tick is enabled. |
+| 8 | P0 | [[backlog_fixed_windows_starve_eligible_tickets]] | BP-06 | Remove permanent starvation before the tick is enabled. **DONE locally 2026-08-16; not deployed/live-fired.** |
 | 9 | P0 | [[officer_post_cannot_enable_auto_pull]] | BP-01 | Expose the owner control only after its downstream invariants exist. |
 | 10 | P1 | [[message_route_delivery_failure_is_stamped_delivered]] | OC-06 | Separate attempted/failed from durably accepted delivery.  **DONE 2026-08-15 (false stamp fixed; attempt-count rescoped P3).**|
 | 11 | P1 | [[officer_internal_messages_consume_human_rate_limits]] | OC-07 | Split internal flood control from human interruption quotas. |
@@ -241,22 +243,26 @@ recovery sequence and live gate pass.
 
 ### BP-06 — fixed pre-filter windows can starve valid work forever (**P0 liveness**)
 
-The tick asks `fetch_backlog(... limit=10)` and only afterwards filters one-shot claims,
-ambiguous tags, and expert validity. Completed-but-still-ready tickets intentionally remain
-claimed until officer disposition. Once ten higher-ranked claimed/invalid tickets occupy
-the head, eligible ticket eleven is never inspected on any tick. The same pattern appears
-elsewhere:
+**Closed locally 2026-08-16; not deployed/live-fired.** KB ordering and app claim state
+cannot be joined, so `BacklogCursor` + `_scan_eligible_tickets` now keyset-page the complete
+`priority → created_at NULLS LAST → note_id` order until admission has enough eligible
+rows or exhaustion is proven. Ready depth always scans to exhaustion and omits unavailable
+pools instead of publishing a false exact zero. The 100-row page size is transport only;
+there is no page/time correctness ceiling. Migration 0021 adds the matching partial vector
+index.
 
-- Cockpit ready depth is capped before eligibility filtering (25), so it can under-report
-  or hide an eligible tail.
-- Breaker history fetches ten jobs before filtering terminal outcomes and distinct ticket
-  IDs, so recent non-terminals or repeated outcomes can hide the relevant two outcomes.
-- Stale-claim detection fetches only the newest 50 open claims while it needs the oldest
-  overdue claim.
+Breaker history is a dedicated terminal-first, `DISTINCT ON (ticket_note_id)` query. Stale
+claims are selected by open + threshold predicates and ordered oldest-first in SQL; sitrep
+uses a dedicated oldest-open query. Executor category/terminal predicates now precede
+`LIMIT 1`, and optional slot spend reads the complete scoped job-id set.
 
-**Acceptance:** move semantic eligibility into a paginated/database query, or page until
-enough eligible rows are found/exhaustion is proven. Tests need more than every current
-limit, with claimed and malformed rows ahead of valid work.
+Acceptance evidence covers 11 claimed head rows plus a valid tail, equal-key page
+boundaries, 30 exact ready candidates, mixed repeated breaker history, 60 stale claims,
+KB/app failure states, and the existing manual/tick one-claim race. At 10k target rows,
+exhaustive vector pagination measured 183.85 ms (`idx_knowledge_backlog_page`; first-page
+plan 0.03 ms), and the expanded 10k-ledger app query set measured 22.71 ms
+(`idx_officer_ticket_claims_lineage_slot_claimed`; measured plan 0.08 ms). See
+[[backlog_fixed_windows_starve_eligible_tickets]] in `docs/done`.
 
 ### BP-07 — provisioning races dispatch and pollutes the failure breaker (**P1 major**)
 
@@ -382,9 +388,9 @@ sequence is:
    now have transactional/CAS boundaries, including the full-lineage no-force gate,
    orphan-End decision, commission continuity, completion routing and commission config
    generation fence.
-3. **Durable eligibility and preflight:** BP-05 is completed locally; BP-06, BP-07, OC-08
-   and OC-09 remain. Claims now survive retention; scans must not starve, and a job must not
-   be dispatchable until its prerequisites are ready.
+3. **Durable eligibility and preflight:** BP-05 and BP-06 are completed locally; BP-07,
+   OC-08 and OC-09 remain. Claims survive retention and cross-store scans no longer starve;
+   a job must still not become dispatchable until its prerequisites are ready.
 4. **Truthful content and delivery:** OC-05–OC-07, BP-08, BP-10, ES-01. Redact before either
    audience, distinguish attempted from delivered, and surface degraded canonical writes.
 5. **Supported operation:** BP-01, BP-11, BP-12, OC-10. Only after the invariants exist
@@ -503,7 +509,7 @@ passes alone (**24 passed**). These are explicit local-environment/test-isolatio
 officer checkpoint failures.
 
 The umbrella nevertheless remains open: this automated transaction evidence does not
-close BP-01/BP-06/BP-07/BP-08/BP-11, ES-01, the remaining OC-05/OC-06 residues, or
+close BP-01/BP-07/BP-08/BP-11, ES-01, the remaining OC-05/OC-06 residues, or
 the live background-officer image-consumption gate.
 
 ### 2026-08-16 deployed gate and local BP-05 checkpoint
@@ -516,9 +522,12 @@ the 49-tool control/inspection/evidence surface, absence of workspace/object too
 persisted tool-result pairing, useful output and a normal next wake. A tiny ticketed
 sandbox researcher job carried authoritative ticket/incarnation/slot/category provenance.
 After an exact-pod restart the replacement restored 59 messages and completed another
-paired inspection turn. LF-5 did not reproduce, but the tool results landed before process
-death, so the exact orphan window and repeated-400 escalation remain unverified. All named
-disposable rows and pods were removed; `auto_pull` stayed false.
+paired inspection turn. That live run missed LF-5's exact orphan window. LF-5 has since
+closed locally through a deterministic post-persist/pre-tool fault seam, same-process
+next-turn repair, restore coverage, and a two-equivalent-400 circuit that persists one
+operator-visible escalation and spends no third provider call. The exact pod-window run
+was not repeated and is not claimed as a passed live gate. All named disposable rows and
+pods were removed; `auto_pull` stayed false.
 
 The subsequent local BP-05 implementation and independent-review repair verified:
 
@@ -541,8 +550,9 @@ and a ready-depth mock), both corrected. Its final system-Python run reached **1
 passed / 123 skipped** before the already-known missing `arxiv` dependency stopped it; the
 exact file passes under the project virtualenv (**22 passed**). The review repair ran the
 proportionate focused set rather than repeating that environment-limited full suite. BP-05
-remains uncommitted and not deployed. This evidence permits continued supervised manual/O6
-testing only with `auto_pull=false`; it does not authorize unattended backlog release.
+is committed in HEAD but not claimed deployed; BP-06 remains uncommitted and not deployed.
+This evidence permits continued supervised manual/O6 testing only with `auto_pull=false`;
+it does not authorize unattended backlog release.
 
 The post-deployment BP-05 smoke is specified separately in
 [[officer_ticket_claim_ledger_live_gate_2026-08-16]]. Its PASS updates deployment evidence

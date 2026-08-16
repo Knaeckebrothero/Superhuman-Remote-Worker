@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -242,6 +243,223 @@ async def _claim_rows(
             ticket_note_id,
         )
     return [dict(row) for row in rows]
+
+
+def _plan_index_names(node: dict) -> set[str]:
+    names = {str(node["Index Name"])} if node.get("Index Name") else set()
+    for child in node.get("Plans") or []:
+        names.update(_plan_index_names(child))
+    return names
+
+
+@pytest.mark.asyncio
+async def test_bp06_distinct_breaker_and_stale_claim_queries_are_semantically_complete(
+    db,
+):
+    """Former LIMIT 10/50 windows stay correct at 10k ledger rows."""
+
+    seed = await _seed_post(db)
+    project_id = UUID(seed["project_id"])
+    thread_id = UUID(seed["thread_id"])
+    base = datetime.now(timezone.utc)
+
+    async with db.acquire() as conn:
+        # Supported high population: unrelated lineage rows make the production
+        # lineage index's selectivity and plan visible, not just its existence.
+        await conn.execute(
+            """
+            INSERT INTO officer_ticket_claims (
+                project_id, ticket_note_id, claimed_at, source,
+                officer_thread_id, officer_slot, work_category, job_id,
+                job_deleted_at, job_status_at_delete
+            )
+            SELECT $1, 'noise-' || n,
+                   $2::timestamptz - n * interval '1 second',
+                   'legacy_unversioned', gen_random_uuid(), 'noise',
+                   'researcher', gen_random_uuid(), $2, 'completed'
+              FROM generate_series(1, 10000) AS n
+            """,
+            project_id,
+            base,
+        )
+
+        rows = []
+        latest_repeated_job = None
+        # Eleven terminal outcomes for one ticket occupy the former breaker
+        # window. The older second ticket is the required distinct outcome.
+        for index in range(11):
+            job_id = uuid4()
+            if index == 0:
+                latest_repeated_job = job_id
+            rows.append(
+                (
+                    project_id,
+                    "ticket-repeated",
+                    base - timedelta(seconds=index + 1),
+                    thread_id,
+                    job_id,
+                    base,
+                    "failed",
+                )
+            )
+        older_distinct_job = uuid4()
+        rows.append(
+            (
+                project_id,
+                "ticket-distinct",
+                base - timedelta(seconds=20),
+                thread_id,
+                older_distinct_job,
+                base,
+                "failed",
+            )
+        )
+        # Mixed non-terminal rows are newer but must be rejected by the SQL
+        # predicate before breaker limiting.
+        for index in range(12):
+            rows.append(
+                (
+                    project_id,
+                    f"ticket-open-{index}",
+                    base + timedelta(seconds=index + 1),
+                    thread_id,
+                    uuid4(),
+                    None,
+                    None,
+                )
+            )
+        await conn.executemany(
+            """
+            INSERT INTO officer_ticket_claims (
+                project_id, ticket_note_id, claimed_at, source,
+                officer_thread_id, officer_slot, work_category, job_id,
+                job_deleted_at, job_status_at_delete
+            ) VALUES ($1, $2, $3, 'legacy_unversioned', $4, 'line',
+                      'executor', $5, $6, $7)
+            """,
+            rows,
+        )
+
+        stale_rows = [
+            (
+                project_id,
+                f"stale-{index:02d}",
+                base - timedelta(hours=100 + index),
+                thread_id,
+                uuid4(),
+            )
+            for index in range(60)
+        ]
+        await conn.executemany(
+            """
+            INSERT INTO officer_ticket_claims (
+                project_id, ticket_note_id, claimed_at, source,
+                officer_thread_id, officer_slot, work_category, job_id
+            ) VALUES ($1, $2, $3, 'legacy_unversioned', $4, 'stale',
+                      'researcher', $5)
+            """,
+            stale_rows,
+        )
+        fresh_non_executors = [
+            (
+                project_id,
+                f"fresh-researcher-{index}",
+                base + timedelta(minutes=10, seconds=index),
+                thread_id,
+                uuid4(),
+            )
+            for index in range(12)
+        ]
+        await conn.executemany(
+            """
+            INSERT INTO officer_ticket_claims (
+                project_id, ticket_note_id, claimed_at, source,
+                officer_thread_id, officer_slot, work_category, job_id
+            ) VALUES ($1, $2, $3, 'legacy_unversioned', $4, 'line',
+                      'researcher', $5)
+            """,
+            fresh_non_executors,
+        )
+        await conn.execute(
+            """
+            INSERT INTO officer_ticket_claims (
+                project_id, ticket_note_id, claimed_at, source,
+                officer_thread_id, officer_slot, work_category, job_id,
+                job_deleted_at, job_status_at_delete
+            )
+            SELECT $1, 'spend-' || n,
+                   $2::timestamptz - n * interval '1 second',
+                   'legacy_unversioned', $3, 'spend', 'researcher',
+                   gen_random_uuid(), $2, 'completed'
+              FROM generate_series(1, 101) AS n
+            """,
+            project_id,
+            base,
+            thread_id,
+        )
+        await conn.execute("ANALYZE officer_ticket_claims")
+
+        plan_doc = await conn.fetchval(
+            """
+            EXPLAIN (ANALYZE, FORMAT JSON)
+            SELECT claim.id
+              FROM officer_ticket_claims claim
+              LEFT JOIN jobs live ON live.id = claim.job_id
+             WHERE claim.officer_thread_id = ANY($1::uuid[])
+               AND claim.officer_slot = 'line'
+               AND COALESCE(live.status, claim.job_status_at_delete)
+                   IN ('completed', 'failed', 'cancelled')
+             ORDER BY claim.claimed_at DESC, claim.id DESC
+             LIMIT 2
+            """,
+            [thread_id],
+        )
+
+    started = time.perf_counter()
+    outcomes = await db.list_officer_distinct_terminal_outcomes(
+        [seed["thread_id"]], slot="line", limit=2
+    )
+    stale = await db.list_stale_officer_claims(
+        [seed["thread_id"]], stale_before=base - timedelta(hours=4)
+    )
+    oldest = await db.get_oldest_open_officer_claim([seed["thread_id"]])
+    live_executor = await db.list_officer_slot_claims(
+        [seed["thread_id"]], work_category="executor", limit=1
+    )
+    terminal_executor = await db.list_officer_slot_claims(
+        [seed["thread_id"]],
+        work_category="executor",
+        include_terminal=True,
+        terminal_only=True,
+        limit=1,
+    )
+    spend_ids = await db.list_officer_slot_claims(
+        [seed["thread_id"]], slot="spend", include_terminal=True, limit=None
+    )
+    elapsed = time.perf_counter() - started
+
+    assert [row["ticket_note_id"] for row in outcomes] == [
+        "ticket-repeated",
+        "ticket-distinct",
+    ]
+    assert outcomes[0]["id"] == latest_repeated_job
+    assert outcomes[1]["id"] == older_distinct_job
+    assert len(stale) == 60
+    assert stale[0]["ticket_note_id"] == "stale-59"
+    assert oldest and oldest["ticket_note_id"] == "stale-59"
+    assert live_executor[0]["ticket_note_id"] == "ticket-open-11"
+    assert terminal_executor[0]["ticket_note_id"] == "ticket-repeated"
+    assert len(spend_ids) == 101
+    assert elapsed < 5.0
+
+    if isinstance(plan_doc, str):
+        plan_doc = json.loads(plan_doc)
+    plan = plan_doc[0]["Plan"]
+    assert "idx_officer_ticket_claims_lineage_slot_claimed" in _plan_index_names(plan)
+    print(
+        "BP-06 app query latency "
+        f"{elapsed * 1000:.2f}ms; plan {plan['Actual Total Time']:.2f}ms"
+    )
 
 
 async def _remove_claim_migration_boundary(db: PostgresDB) -> None:

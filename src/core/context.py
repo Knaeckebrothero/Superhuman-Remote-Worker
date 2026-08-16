@@ -326,7 +326,11 @@ def repair_tool_pairing(messages: List[BaseMessage]) -> List[BaseMessage]:
             kept = [tc for tc in tool_calls if tc.get("id") in valid_ids]
             if len(kept) != len(tool_calls):
                 stripped_calls += len(tool_calls) - len(kept)
-                m = AIMessage(content=m.content, tool_calls=kept, id=m.id)
+                # Preserve provider-native metadata, reasoning blocks, usage,
+                # name and response ids. Reconstructing a bare AIMessage here
+                # fixed pairing while silently discarding everything else on
+                # the turn; model_copy changes only the poisoned field.
+                m = m.model_copy(update={"tool_calls": kept})
             if not kept and not m.content:
                 continue  # empty assistant turn carries no information
             repaired.append(m)

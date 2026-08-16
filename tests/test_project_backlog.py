@@ -598,6 +598,45 @@ def _fake_vector_db(conn):
 
 class TestFetchBacklog:
     @pytest.mark.asyncio
+    async def test_keyset_cursor_binds_the_complete_stable_order(self):
+        from datetime import datetime, timezone
+
+        from orchestrator.services.project_backlog import BacklogCursor, fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        cursor_time = datetime(2026, 8, 16, tzinfo=timezone.utc)
+
+        await fetch_backlog(
+            _fake_vector_db(conn),
+            "p-1",
+            after=BacklogCursor(1, cursor_time, "ticket-099"),
+            include_counts=False,
+        )
+
+        call = conn.fetch.await_args_list[0]
+        sql = " ".join(call.args[0].split())
+        assert "priority > $6::integer" in sql
+        assert "created_at IS NOT DISTINCT FROM $7::timestamptz" in sql
+        assert "note_id > $8::text" in sql
+        assert call.args[5:] == (True, 1, cursor_time, "ticket-099")
+        assert conn.fetch.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_scan_page_can_skip_the_unrelated_counts_query(self):
+        from orchestrator.services.project_backlog import fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+
+        rows, counts = await fetch_backlog(
+            _fake_vector_db(conn), "p-1", include_counts=False
+        )
+
+        assert rows == [] and counts == {}
+        assert conn.fetch.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_excludes_the_in_progress_initiative(self):
         """The overseer must never be offered a ticket already underway."""
         from orchestrator.services.project_backlog import fetch_backlog

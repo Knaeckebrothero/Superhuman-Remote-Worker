@@ -166,19 +166,31 @@ work in `src/shared/orch_surface/jobs/control.py`.
 - `tests/test_loop_unified_advance.py` — the spawn choke point.
 - `tests/test_officer_lifecycle.py` — the commission 403 fires before anything mutates.
 
-### Owed — the live exercise is NOT done
+### Live exercise — partially done
 
-This doc is filed under `done/` because the implementation is complete and unit-verified,
-not because it has been proven on a cluster. Three things have only ever run against mocks:
+**Done on k3d, 2026-08-16.** The catalog key is served by the running orchestrator
+(`/api/users/me/capabilities` returns 14 keys including `unattended_operations`), and the
+tab gate was observed in both directions on a real project page: with the grant absent the
+tab bar renders 8 tabs (Loop and Centurion filtered out, `canRunUnattendedOperations()`
+`false`), and with the admin bypass in effect it renders 10 with both present. Driven via
+Playwright against `https://localhost/`, reading the live component through `ng.getComponent`
+rather than trusting the rendered DOM alone.
 
-1. **The UI path** — log in as a non-admin, confirm the Loop and Centurion tabs are absent,
-   set `unattended_operations = true` under Admin → Grants, reload, confirm both appear.
-2. **Live revocation halting a loop** — start a loop as a non-admin, revoke the grant while
-   it runs, confirm it stops at the next advance with `last_error` naming the grant (rather
-   than continuing, which is the failure this design's choke-point re-check exists to
-   prevent).
-3. **The officer stand-down on re-attach** — revoke while a commissioned officer is live and
+**Still owed** — both need a running loop/officer, so neither has been observed:
+
+1. **Live revocation halting a loop** — start a loop, revoke the grant while it runs, confirm
+   it stops at the next advance with `last_error` naming the grant rather than continuing.
+2. **The officer stand-down on re-attach** — revoke while a commissioned officer is live and
    confirm the next attach refuses via the PDP.
 
-(2) and (3) are the two claims in this document that unit tests can only assert about
-mocked seams. Treat them as designed-and-believed, not observed, until the k3d run happens.
+These two are the claims unit tests can only assert about mocked seams. Treat them as
+designed-and-believed, not observed.
+
+### Interaction with view-as-user mode (worth knowing)
+
+An admin with **View as user** enabled (`srw.viewMode.<uid> = 'me'`, `X-Admin-View-As: user`)
+has `is_admin` forced false on the resolved user dict, so `/api/users/me/capabilities`
+returns *resolved grants* instead of the admin `null` — and the Loop and Centurion tabs
+correctly disappear, because that mode exists precisely to show what a regular user sees.
+This surprised the author on first live look and is not a defect. To get the tabs back,
+either turn view-as off or set `unattended_operations = true` on the admin's own user scope.

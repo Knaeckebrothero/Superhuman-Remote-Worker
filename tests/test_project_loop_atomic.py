@@ -322,7 +322,7 @@ def test_vector_idempotency_ledgers_are_current_and_in_generated_snapshot():
     migrations = sorted(
         (REPO_ROOT / "orchestrator/database/migrations/vector").glob("*.sql")
     )
-    assert migrations[-1].name == "0020_kb_ready_authorization.sql"
+    assert migrations[-1].name == "0021_kb_backlog_keyset_index.notx.sql"
     snapshot = (
         REPO_ROOT / "orchestrator/database/vector_schema_current.sql"
     ).read_text()
@@ -330,5 +330,6 @@ def test_vector_idempotency_ledgers_are_current_and_in_generated_snapshot():
     assert "project_loop_ttl_effects_pkey" in snapshot
     assert "CREATE TABLE public.session_memory_effect_executions" in snapshot
     assert "session_memory_effect_executions_pkey" in snapshot
-    # 0020 (B2): ready authorization for backlog tickets.
+    # 0020 (B2): ready authorization for backlog tickets. 0021 (BP-06):
+    # stable keyset ordering for exhaustive Officer scans.
     assert "ready_at timestamp with time zone" in snapshot

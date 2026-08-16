@@ -395,9 +395,11 @@ Per commissioned officer with `auto_pull=true`:
    redispatch races a second executor into the same story. Temporary under-use converges
    downward; two executors never converge.
 3. **Fetch eligible tickets** for categories with free slots: `status='active' AND tags @>
-   ARRAY['ready','category:<X>']`, small LIMIT per category, no counts pass (the counts
-   query belongs to ready-depth reporting at officer wake, not the tick) **[A2]**.
-   **Eligible additionally means unclaimed under one-shot semantics (§5.3).** Re-check
+   ARRAY['ready','category:<X>']`, keyset-paged by the total priority/age/note-id order,
+   with no counts pass (the counts query belongs to ordinary backlog display, not each tick
+   scan page) **[A2]**. The page size is transport only: scan until enough eligible rows
+   exist for the decision or exhaustion is proven; source failures are explicitly
+   unavailable. **Eligible additionally means unclaimed under one-shot semantics (§5.3).** Re-check
    `ready` by note_id immediately before stamping (vector-DB fetch and app-DB insert cannot
    share a transaction; the residual window is accepted — the guidance lane steers
    post-dispatch) **[X]**.
@@ -848,6 +850,14 @@ the tick.
   - Stale-claim detection reads `updated_at` deliberately and only here: this is the
     control-plane question "has anything touched this row", not the liveness verdict —
     the sitrep still gets its reading from `compute_jobs_liveness`.
+  - **BP-06 semantic completeness (2026-08-16):** `BacklogCursor` and
+    `_scan_eligible_tickets` page the cross-store eligibility path until sufficient or
+    exhausted; exact ready depth scans to exhaustion and omits unavailable pools.
+    Migration `0021_kb_backlog_keyset_index.notx.sql` completes the
+    `(project_id, priority, created_at, note_id)` order. Breaker outcomes and stale/oldest
+    claims use dedicated app-database queries whose semantic predicates precede limits.
+    The executor predicate likewise moves into SQL before `LIMIT 1`, and slot spend has no
+    arbitrary newest-job ceiling. BP-12's polling optimization remains separate.
   - **Not built:** the stale-claim list and breaker state are written to `officer_state`
     for B4/B6 to render; nothing surfaces them yet.
   - **k3d verification (2026-08-15), and what it caught.** Migration 0160 applied and the
@@ -879,10 +889,11 @@ the tick.
   `pool_status_lines()` renders the policies the tick enforces (open breaker + cause +
   tickets, claimed-but-stalled with "NOT released automatically", and an explicit
   "Auto-pull: OFF" so idleness is never a mystery). `ready_depth_by_pool()` deliberately
-  reuses the tick's own `fetch_backlog → ticket_claim_states → eligible_tickets` path
-  rather than counting `ready` tags: a depth the tick reads as zero would have the officer
-  waiting for dispatches that never come. A KB outage omits the number instead of
-  reporting a zero nobody measured. Tests: `tests/test_officer_pool_surfacing.py` (25).
+  reuses the tick's own keyset `fetch_backlog → ticket_claim_states → eligible_tickets`
+  path to exhaustion rather than counting `ready` tags: a depth the tick reads as zero
+  would have the officer waiting for dispatches that never come. A KB or claim-database
+  outage omits the number instead of reporting a zero nobody measured. Tests:
+  `tests/test_officer_pool_surfacing.py`.
   - **Predicate drift caught here.** `_capacity_section` carried its own inlined
     `IN ('created','processing')` count. B3 widened admission to all-non-terminal, so
     that copy would have shown the officer a free slot the funnel then refused with a
@@ -970,7 +981,8 @@ the tick.
 tranche. This section remains the wider acceptance contract; see the committed live log in
 [[officer_backlog_pools_resavio_livefire]]. The subsequent Officer Post transaction and
 commission-configuration checkpoint was deployed and passed a separate disposable gate on
-2026-08-16. BP-05's durable ledger is the newer local, uncommitted, not-deployed checkpoint.
+2026-08-16. BP-05's durable ledger is committed in HEAD but not claimed deployed; BP-06's
+semantic-pagination checkpoint is the newer local, uncommitted, not-deployed change.
 
 Pre-requisites: officer_post O1–O6 done (incl. O2 lineage capacity), knowledge-plane K1–K3,
 supervision E1–E3 and the chosen disposition-evidence path, message-routing M2–M4, and the
@@ -1055,6 +1067,12 @@ Settled earlier by the research round: breaker semantics (job-failures-only, per
 + named-write-surfaces `parallel-safe` — §5.5).
 
 ## 14. Decision log
+
+- **2026-08-16 (BP-06)** — Fixed candidate windows are no longer correctness boundaries.
+  Cross-store eligibility uses stable keyset pages with explicit exhausted/lower-bound/
+  unavailable states; ready depth is exact, while breaker distinct outcomes and stale/oldest claims
+  are database-native predicates. Real PostgreSQL/pgvector plans were measured at 10k
+  rows. `auto_pull` remains false and no live-fire gate is claimed.
 
 - **2026-08-15 (Legate)** — all six §13 defaults settled; see §13. Two shaped the design:
   the ready floor became **capacity-scaled** (pool slot count, so every simultaneously

@@ -24,6 +24,8 @@ import base64
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from .kb_forge import kb_client_for_repo
@@ -58,6 +60,23 @@ _BACKLOG_NOTE_TYPES_SQL = "(" + ", ".join(f"'{t}'" for t in BACKLOG_NOTE_TYPES) 
 BACKLOG_INJECTION_LIMIT = 20
 
 
+@dataclass(frozen=True)
+class BacklogCursor:
+    """Stable position in the backlog's priority/age/id order."""
+
+    priority: int
+    created_at: datetime | None
+    note_id: str
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "BacklogCursor":
+        return cls(
+            priority=int(row.get("priority") or 0),
+            created_at=row.get("created_at"),
+            note_id=str(row.get("note_id") or ""),
+        )
+
+
 async def fetch_backlog(
     vector_db: Any,
     project_id: str,
@@ -65,6 +84,8 @@ async def fetch_backlog(
     exclude_note_id: str | None = None,
     limit: int = BACKLOG_INJECTION_LIMIT,
     require_tags: list[str] | None = None,
+    after: BacklogCursor | None = None,
+    include_counts: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[int, int]]:
     """Return ``(rows, counts_by_rank)`` for a project's open ticket pool.
 
@@ -79,12 +100,17 @@ async def fetch_backlog(
 
     ``require_tags`` narrows to tickets carrying ALL of the given tags --
     ``ready_tag()``/``category_tag(...)`` for the auto-pull tick, which needs
-    "what may this pool take next", not "what is open". It is appended as the
-    LAST bound parameter of each query for that reason: the positional slots
-    above are pinned by tests and by the plan-shape reasoning, and a filter
-    added in the middle would renumber them. The containment operator is
-    load-bearing -- ``tags @> ARRAY[...]`` can use the GIN index on tags,
-    ``= ANY`` cannot.
+    "what may this pool take next", not "what is open". It remains the fourth
+    row-query parameter (the keyset cursor follows it) and the third count-query
+    parameter, preserving the existing positional contract. The containment
+    operator is load-bearing -- ``tags @> ARRAY[...]`` can use the GIN index on
+    tags, ``= ANY`` cannot.
+
+    ``after`` is a keyset cursor over the query's complete order. It is used by
+    correctness-sensitive Officer scans that must continue past an arbitrary
+    first window without duplicates or gaps, including when priority and
+    timestamp tie or ``created_at`` is NULL. ``include_counts=False`` avoids
+    repeating the unrelated aggregate on every scan page.
 
     ``ready_at`` rides along on every row. The tick compares it against its
     claiming job's ``created_at`` (one-shot claims, officer_backlog_pools
@@ -95,13 +121,31 @@ async def fetch_backlog(
     async with vector_db.acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT note_id, note_type, title, priority, tags, ready_at
+            SELECT note_id, note_type, title, priority, tags, ready_at,
+                   created_at
               FROM knowledge_index
              WHERE project_id = $1::uuid
                AND status = 'active'
                AND note_type IN {_BACKLOG_NOTE_TYPES_SQL}
                AND ($2::text IS NULL OR note_id <> $2)
                AND ($4::text[] = '{{}}' OR tags @> $4::text[])
+               AND (
+                    NOT $5::boolean
+                    OR priority > $6::integer
+                    OR (
+                        priority = $6::integer
+                        AND (
+                            ($7::timestamptz IS NOT NULL AND (
+                                created_at > $7::timestamptz
+                                OR created_at IS NULL
+                            ))
+                            OR (
+                                created_at IS NOT DISTINCT FROM $7::timestamptz
+                                AND note_id > $8::text
+                            )
+                        )
+                    )
+               )
              ORDER BY priority ASC, created_at ASC NULLS LAST, note_id ASC
              LIMIT $3
             """,
@@ -109,22 +153,28 @@ async def fetch_backlog(
             exclude_note_id,
             limit,
             tag_filter,
+            after is not None,
+            after.priority if after else 0,
+            after.created_at if after else None,
+            after.note_id if after else "",
         )
-        count_rows = await conn.fetch(
-            f"""
-            SELECT priority, COUNT(*) AS n
-              FROM knowledge_index
-             WHERE project_id = $1::uuid
-               AND status = 'active'
-               AND note_type IN {_BACKLOG_NOTE_TYPES_SQL}
-               AND ($2::text IS NULL OR note_id <> $2)
-               AND ($3::text[] = '{{}}' OR tags @> $3::text[])
-             GROUP BY priority
-            """,
-            project_id,
-            exclude_note_id,
-            tag_filter,
-        )
+        count_rows = []
+        if include_counts:
+            count_rows = await conn.fetch(
+                f"""
+                SELECT priority, COUNT(*) AS n
+                  FROM knowledge_index
+                 WHERE project_id = $1::uuid
+                   AND status = 'active'
+                   AND note_type IN {_BACKLOG_NOTE_TYPES_SQL}
+                   AND ($2::text IS NULL OR note_id <> $2)
+                   AND ($3::text[] = '{{}}' OR tags @> $3::text[])
+                 GROUP BY priority
+                """,
+                project_id,
+                exclude_note_id,
+                tag_filter,
+            )
     return (
         [dict(r) for r in rows],
         {int(r["priority"]): int(r["n"]) for r in count_rows},

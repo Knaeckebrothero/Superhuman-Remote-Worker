@@ -22,6 +22,7 @@ import pytest
 
 from services.officer_backlog import (
     STALE_CLAIM_HOURS,
+    _scan_eligible_tickets,
     auto_pull_enabled,
     breaker_is_open,
     eligible_tickets,
@@ -374,6 +375,9 @@ def _db(
     db.get_officer_capacity_lineage.return_value = [OFFICER_THREAD_ID]
     db.ticket_claim_states.return_value = claims or {}
     db.list_officer_slot_claims.return_value = slot_claims or []
+    db.list_officer_distinct_terminal_outcomes.return_value = []
+    db.list_stale_officer_claims.return_value = []
+    db.get_oldest_open_officer_claim.return_value = None
     db.merge_thread_officer_state.return_value = True
     db.insert_officer_ticket_claim.return_value = {
         "ticket_note_id": "feature-a",
@@ -474,6 +478,134 @@ def _vector_db(rows):
 
 
 class TestTickOfficer:
+    @pytest.mark.asyncio
+    async def test_eleven_claimed_head_tickets_do_not_hide_a_valid_tail(self):
+        claimed = {f"claimed-{index:02d}": NOW for index in range(11)}
+        db = _db(claims=claimed)
+        rows = [
+            _row(
+                note_id,
+                tags=["ready", "category:researcher"],
+                ready_at=NOW,
+            )
+            for note_id in claimed
+        ] + [
+            _row(
+                "valid-tail",
+                tags=["ready", "category:researcher"],
+                ready_at=NOW,
+            )
+        ]
+
+        counts = await tick_officer(db, _vector_db(rows), _officer_row(), now=NOW)
+
+        assert counts["dispatched"] == 1
+        assert db.created["context"]["ticket_note_id"] == "valid-tail"
+
+    @pytest.mark.asyncio
+    async def test_app_database_failure_is_unavailable_not_empty(self):
+        db = _db()
+        db.ticket_claim_states.side_effect = RuntimeError("app database down")
+        rows = [_row("feature-a", tags=["ready", "category:researcher"], ready_at=NOW)]
+
+        scan = await _scan_eligible_tickets(
+            db,
+            _vector_db(rows),
+            OFFICER_PROJECT_ID,
+            RESEARCHER,
+            NOW,
+            minimum=None,
+        )
+
+        assert scan.unavailable is True
+        assert scan.exhausted is False
+        assert scan.tickets == []
+        assert "claim-state" in (scan.error or "")
+
+    @pytest.mark.asyncio
+    async def test_exact_exhaustion_is_distinct_from_unavailable(self):
+        scan = await _scan_eligible_tickets(
+            _db(),
+            _vector_db([]),
+            OFFICER_PROJECT_ID,
+            RESEARCHER,
+            NOW,
+            minimum=None,
+        )
+
+        assert scan.exhausted is True
+        assert scan.lower_bound is False
+        assert scan.unavailable is False
+        assert scan.tickets == []
+
+    @pytest.mark.asyncio
+    async def test_sufficient_candidate_result_is_explicitly_a_lower_bound(self):
+        rows = [
+            _row(
+                "feature-a",
+                tags=["ready", "category:researcher"],
+                ready_at=NOW,
+            )
+        ]
+        scan = await _scan_eligible_tickets(
+            _db(),
+            _vector_db(rows),
+            OFFICER_PROJECT_ID,
+            RESEARCHER,
+            NOW,
+            minimum=1,
+        )
+
+        assert scan.lower_bound is True
+        assert scan.exhausted is False
+        assert scan.unavailable is False
+        assert len(scan.tickets) == 1
+
+    @pytest.mark.asyncio
+    async def test_equal_priority_timestamp_page_boundary_has_no_gap_or_duplicate(
+        self, monkeypatch
+    ):
+        import services.officer_backlog as module
+
+        created_at = NOW - timedelta(days=1)
+        first = [
+            {
+                **_row(
+                    f"ticket-{index:03d}",
+                    tags=["ready", "category:researcher"],
+                    ready_at=NOW,
+                ),
+                "created_at": created_at,
+            }
+            for index in range(100)
+        ]
+        tail = [
+            {
+                **_row(
+                    "ticket-100",
+                    tags=["ready", "category:researcher"],
+                    ready_at=NOW,
+                ),
+                "created_at": created_at,
+            }
+        ]
+        cursors = []
+
+        async def _fetch(_vector, _project, *, after=None, **_kwargs):
+            cursors.append(after)
+            return (first if after is None else tail), {}
+
+        monkeypatch.setattr(module, "fetch_backlog", _fetch)
+        scan = await _scan_eligible_tickets(
+            _db(), MagicMock(), OFFICER_PROJECT_ID, RESEARCHER, NOW, minimum=None
+        )
+
+        ids = [ticket["note_id"] for ticket in scan.tickets]
+        assert ids == [f"ticket-{index:03d}" for index in range(101)]
+        assert len(ids) == len(set(ids))
+        assert cursors[1].note_id == "ticket-099"
+        assert scan.exhausted is True
+
     @pytest.mark.asyncio
     async def test_dispatches_an_armed_ticket_with_the_category_contract(self):
         db = _db()
@@ -908,7 +1040,15 @@ class TestExecutorSerialization:
         }
         db = _db()
 
-        async def _claims(_lineage, *, slot=None, include_terminal=False, limit=20):
+        async def _claims(
+            _lineage,
+            *,
+            slot=None,
+            work_category=None,
+            include_terminal=False,
+            terminal_only=False,
+            limit=20,
+        ):
             return [finished] if include_terminal else []
 
         db.list_officer_slot_claims.side_effect = _claims
@@ -948,7 +1088,15 @@ class TestExecutorSerialization:
         }
         db = _db()
 
-        async def _claims(_lineage, *, slot=None, include_terminal=False, limit=20):
+        async def _claims(
+            _lineage,
+            *,
+            slot=None,
+            work_category=None,
+            include_terminal=False,
+            terminal_only=False,
+            limit=20,
+        ):
             return [finished] if include_terminal else []
 
         db.list_officer_slot_claims.side_effect = _claims
@@ -980,7 +1128,15 @@ class TestExecutorSerialization:
         }
         db = _db()
 
-        async def _claims(_lineage, *, slot=None, include_terminal=False, limit=20):
+        async def _claims(
+            _lineage,
+            *,
+            slot=None,
+            work_category=None,
+            include_terminal=False,
+            terminal_only=False,
+            limit=20,
+        ):
             return [finished] if include_terminal else []
 
         db.list_officer_slot_claims.side_effect = _claims
@@ -1019,7 +1175,15 @@ class TestExecutorSerialization:
         }
         db = _db()
 
-        async def _claims(_lineage, *, slot=None, include_terminal=False, limit=20):
+        async def _claims(
+            _lineage,
+            *,
+            slot=None,
+            work_category=None,
+            include_terminal=False,
+            terminal_only=False,
+            limit=20,
+        ):
             return [finished] if include_terminal else []
 
         db.list_officer_slot_claims.side_effect = _claims
