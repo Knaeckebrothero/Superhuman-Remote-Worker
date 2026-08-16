@@ -55,8 +55,8 @@ Neither knows the plural `repos/`. One character apart, opposite meanings.
 
 ## What the agent did, and why that is the alarming part
 
-Job `29c28492` completed correctly — clone → branch → commit → push → **PR #1**, with the PR
-recorded by the orchestrator into `jobs.context.pull_request`. `job_complete` returned:
+Job `29c28492` completed correctly — clone → branch → commit → push → **PR #1**.
+`job_complete` returned:
 
 ```
 deliverable contract gate: 2 of 2 required deliverables missing at commit 99907632d12d (bounce 1/2)
@@ -84,9 +84,17 @@ untouched on purpose. The gate never got that lesson:
 - `deliverable_gate.py` contains **no reference to `pull_request`**
 - last modified **2026-08-07**, before that fix
 
-`context.pull_request` is right there: orchestrator-written at tool-call time, `verified:
-true`, and `parse_job_pull_request` fails closed on a malformed record. The gate does not look
-at it.
+`context.pull_request` is the record the gate would need: orchestrator-written at tool-call
+time, `verified: true`, and `parse_job_pull_request` fails closed on a malformed record. The
+gate does not look at it.
+
+> **Correction (2026-08-16).** An earlier revision of this document stated that job
+> `29c28492`'s PR **was** recorded into `jobs.context.pull_request`. It was not. The live row
+> has `pull_request: null`, as does every job in the project — the `repo_open_pr` persist
+> (`23bbf28a`) shipped at 09:19 UTC on 2026-08-15, roughly 7.3 hours *after* this job ran, the
+> same timeline already given under "Loose thread" below. The mechanism described above is
+> real and available to new jobs; it simply had not shipped when this one executed, so this
+> job is not an example of it. Verified against the database 2026-08-16.
 
 ## Suggested fix — both halves
 
@@ -142,3 +150,9 @@ datasource attached can read live PR state regardless of access level.
 - `docs/features/better_resavio_restart_status.md` §5 (the job) and §6a (the sibling fix).
 - [`kb_read_missed_an_indexed_note_unexplained`](kb_read_missed_an_indexed_note_unexplained.md)
   — found in the same job.
+- [`deliverable_contract_satisfied_by_a_note_about_failure`](deliverable_contract_satisfied_by_a_note_about_failure.md)
+  — **the consequence of the fix shipped here.** The creation-time refusal works exactly as
+  designed, and the officer's response to it was to rewrite the contract into a `kb:` slug that
+  a note about the failure then satisfied. The refusal message names the right alternative
+  ("the pull request the agent opens") and nothing yet accepts that contract type, so the only
+  reachable escape launders the failure. Read the two together.

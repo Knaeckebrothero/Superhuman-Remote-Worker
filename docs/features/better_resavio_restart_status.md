@@ -241,6 +241,29 @@ container, and loop `3ed022a5` died on three consecutive VM provisioning failure
 | `kb_connector_token_auth_over_http_fails_invisibly.md` | Token auth is correctly refused over http, but the `ValueError` is raised during source construction — before anything writes `kb_index_watermark`. The connector retried and failed every tick for over an hour while the cockpit showed a stale, unrelated error. |
 | `job_review_delivery_links_and_review_session.md` | Job review linked only the scratch job repo; PRs were never persisted; no PR read path. **§3a/b/c now shipped.** |
 
+### 7a. Officer + loop live run, 2026-08-15 → 08-16
+
+First run with the officer (Centurion `6ce5bc4c`) driving the project unattended.
+It ran 10.5 h across 34 turns without wedging or crashing, commissioned three jobs,
+monitored and approved them, and reported honestly throughout. **Zero product change
+reached `KurortEngine`** — its last content commit is still `5e08d4fa` (08-14).
+
+| doc | summary |
+|---|---|
+| `deliverable_contract_satisfied_by_a_note_about_failure.md` | **P0.** All three jobs sealed `completed` with `deliverable_gate.passed: true` while shipping nothing — a `kb:` slug is satisfied by a note describing the failure. Triggered by the (correct) `repos/…` refusal shipped in §6a, which the officer answered by downgrading the contract. |
+| `cloned_repo_checkout_cannot_reach_non_default_refs.md` | **P1.** The `repos/KurortEngine/` checkout carries only `origin/main`; the ticket's base branch was deleted by the PR #1 merge, and no bound tool can fetch another ref. |
+| `queued_digest_suppresses_officer_escalation.md` | **P1.** Two `notify_user` digests were filed and never delivered; the officer then cited "the Legate's digest is already queued" as its reason not to page, for ~14 consecutive wake cycles. |
+| `officer_commission_can_silently_de_arm_its_workers.md` | **P2.** Two commissions reached their workers with zero connectors and therefore no `repo_*` tools. Self-healed on respawn; neither cause fixed. |
+| `officer_per_job_model_choice_is_silently_discarded.md` | **P2.** The officer's per-job model and backend are silently replaced by the roster slot's pins. |
+
+Also confirmed in the same sweep: **PR #1 merged** 08-15 16:09 (`aafad4ac`), and job
+`29c28492` approved at 16:09:54. The merged-PR completion gate (`644ca703`) is deployed
+— `git merge-base --is-ancestor 644ca703 c62b8eae` passes against the running pod tag —
+but has **never fired against real data**, because no job in this project has ever
+carried a `context.pull_request` record.
+
+Unrelated to the run, found while auditing: `public_repo_ships_a_workstation_ip_and_operator_emails.md`.
+
 ## 8. Instrumentation lessons (three failures, same root cause)
 
 Every monitor I built during this work watched a signal the failure path does not write:
