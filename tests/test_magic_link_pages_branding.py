@@ -52,3 +52,13 @@ def test_pages_use_the_brand_palette() -> None:
     for page in _pages():
         assert brand.TRAVERTINE["panel-bg"] in page
         assert brand.TRAVERTINE["text-primary"] in page
+
+
+def test_no_text_muted_anywhere() -> None:
+    """text-muted fails WCAG AA on every Travertine surface (see
+    tests/test_brand_palette.py). Both pages are short enough that a
+    document-wide absence check is meaningful -- footer/legal text on these
+    pages must use text-secondary instead, so its hex should never appear.
+    """
+    for page in _pages():
+        assert brand.TRAVERTINE["text-muted"] not in page
