@@ -359,29 +359,57 @@ def _render_keycloak_poststart_script(*extra_args: str) -> str:
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
-def test_smtp_starttls_survives_a_bare_boolean_override() -> None:
-    """Regression for the Sprig `default`-vs-boolean gotcha: `false` is
-    "empty" to `default`, so a bare `--set ...useTls=false` (parsed as a real
-    bool, not a string) used to silently fall back to "true" -- an operator
-    who explicitly disabled STARTTLS got it silently re-enabled. `toString`
-    before `default` fixes it: `false` becomes the non-empty string "false",
-    so `default` no longer fires, while a genuinely unset value still
-    toString()s to "" and correctly falls back.
+def test_smtp_port_and_starttls_survive_bare_boolean_and_null_overrides() -> None:
+    """Regression for two Sprig `default` gotchas hit in sequence:
 
-    All three cases are asserted on RENDERED output, not template source --
-    source only shows the `{{ }}` expression, never what `default` decided.
+    1. `default` treats a Go-template "empty" value -- including the boolean
+       `false` -- as absent, so a bare `--set ...useTls=false` (parsed as a
+       real bool, not a string) silently fell back to "true": an operator
+       who explicitly disabled STARTTLS got it silently re-enabled.
+    2. The first fix, piping through `toString` before `default`, traded
+       that bug for another: `toString(nil)` renders the Go `%v` string
+       "<nil>", which is non-empty, so `--set ...=null` (Helm's documented
+       idiom for unsetting a value) rendered the literal text "<nil>"
+       instead of falling back at all.
+
+    `kindIs "invalid"` is true only for a genuinely absent/nil value, so an
+    explicit `if`/`else` on it is the shape that survives every input in
+    the table below. All five cases are asserted on RENDERED output, not
+    template source: source only ever shows the literal `{{ }}` expression,
+    never what the guard decided for a given input, so a source-text
+    assertion cannot see any of these bugs.
     """
-    # Unset: falls back to the documented default, unchanged from before.
+    # 1. Unset (normal path): values.yaml supplies the string default.
     default_script = _render_keycloak_poststart_script()
+    assert "smtpServer.port=1025" in default_script
     assert "smtpServer.starttls=true" in default_script
 
-    # The regressing case: a bare boolean via --set. This is the one that
-    # silently broke -- asserted on its own, not folded into the string case.
+    # 2. --set ...=null: the case neither `default` alone nor
+    #    `toString | default` survived -- asserted explicitly on BOTH
+    #    lines, since this is the regression the second remedy still missed
+    #    and the "unset" case above never reaches this branch at all.
+    null_script = _render_keycloak_poststart_script(
+        "--set", "email.smtp.port=null", "--set", "email.smtp.useTls=null"
+    )
+    assert "smtpServer.port=1025" in null_script, (
+        "--set email.smtp.port=null must fall back to the default, not render '<nil>'"
+    )
+    assert "smtpServer.starttls=true" in null_script, (
+        "--set email.smtp.useTls=null must fall back to the default, not render '<nil>'"
+    )
+
+    # 3. --set ...useTls=false (bare boolean): the case the plain `default`
+    #    remedy silently broke. Asserted on its own, not folded into the
+    #    --set-string case below.
     bare_bool_script = _render_keycloak_poststart_script("--set", "email.smtp.useTls=false")
     assert "smtpServer.starttls=false" in bare_bool_script, (
         "a bare --set boolean false must render as false, not silently fall back to the default"
     )
 
-    # The string case already worked before this fix; kept as a control.
+    # 4. --set-string ...useTls=false: worked before either fix; kept as a control.
     string_script = _render_keycloak_poststart_script("--set-string", "email.smtp.useTls=false")
     assert "smtpServer.starttls=false" in string_script
+
+    # 5. --set ...port=587: the ordinary configured-relay path this task exists for.
+    port_script = _render_keycloak_poststart_script("--set", "email.smtp.port=587")
+    assert "smtpServer.port=587" in port_script
