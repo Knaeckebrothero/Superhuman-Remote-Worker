@@ -106,3 +106,40 @@ def test_no_text_muted_anywhere() -> None:
     """
     for page in _pages():
         assert brand.TRAVERTINE["text-muted"] not in page
+
+
+def test_disabled_extend_button_keeps_its_brand_styling() -> None:
+    """One style attribute, not two.
+
+    HTML keeps the FIRST style= on an element and ignores every later one, so
+    appending a second for the disabled look meant the cap_reached branch --
+    and only that branch -- rendered a button with opacity/cursor and none of
+    the brand colour, border or type scale. The palette tests above cannot see
+    it: the page as a whole still contains every brand hex.
+    """
+    from orchestrator.main import _magic_link_confirmation_page
+
+    page = _magic_link_confirmation_page(
+        tool_name="run_command",
+        tool_args_preview='{"cmd": "ls"}',
+        intended_decision="denied",
+        token="T1",
+        extend_status="cap_reached",
+    )
+    form = re.search(
+        r'<form[^>]*action="/magic/extend/[^"]*"[^>]*>.*?</form>', page, re.S
+    )
+    assert form, "no extend form on the confirmation page"
+    button = re.search(r"<button[^>]*>", form.group(0))
+    assert button, "no button inside the extend form"
+    markup = button.group(0)
+
+    assert " disabled" in markup, "the cap_reached button must be disabled"
+    assert markup.count("style=") == 1, (
+        f"{markup.count('style=')} style attributes -- the browser honours only "
+        "the first, so the later one is dead:\n" + markup
+    )
+    assert "not-allowed" in markup, "the disabled affordance was dropped"
+    assert brand.TRAVERTINE["accent-color"] in markup, (
+        "the disabled button lost its brand colour"
+    )

@@ -6,8 +6,10 @@ accessibility requirement -- see docs/features/email_and_login_theme_alignment.m
 
 import re
 
+import pytest
+
 from services import brand
-from services.email_layout import Action, render_email
+from services.email_layout import VARIANTS, Action, render_email
 
 PALETTE_HEXES = set(brand.TRAVERTINE.values())
 
@@ -141,3 +143,48 @@ def test_uses_no_unmanaged_colours() -> None:
     )
     used = {brand.normalize_hex(h) for h in re.findall(r"#[0-9a-fA-F]{3,6}\b", html)}
     assert used <= PALETTE_HEXES, f"unmanaged colours: {sorted(used - PALETTE_HEXES)}"
+
+
+@pytest.mark.parametrize("bad", ["Approve", "approved", "APPROVE", "", "ghost"])
+def test_unrecognised_variant_is_rejected(bad: str) -> None:
+    """A typo must not fall through to `primary` -- that is solid porphyry.
+
+    Rendered next to the solid laurel Approve it measures 1.24:1, the exact
+    WCAG 1.4.1 failure this layout exists to remove, reintroduced silently in
+    the one place nobody inspects. "Approve" (capitalised) is the realistic
+    case: it reads correct at the call site.
+    """
+    with pytest.raises(ValueError):
+        Action(label="A", url="https://e.test/a", variant=bad)
+
+
+def test_every_declared_variant_renders_distinctly() -> None:
+    """The other half of the guard above, in both directions.
+
+    A whitelist that is too tight breaks a real call site (Deny raises at send
+    time); one that is too loose is worse -- a variant admitted here but not
+    branched on in _button_cell falls through to solid `primary`, which is the
+    silent-fallthrough defect the ValueError was added to stop, just moved one
+    level up. Requiring the renderings to be pairwise distinct pins VARIANTS
+    to _button_cell's actual branches rather than restating the list.
+    """
+    cells = {}
+    for variant in VARIANTS:
+        html = render_email(
+            title="t",
+            body_html="<p>b</p>",
+            actions=[Action(label="A", url="https://e.test/a", variant=variant)],
+        )
+        cell = re.search(r"<td[^>]*>\s*<a[^>]*>A</a></td>", html)
+        assert cell, f"variant {variant!r} did not render an isolable button cell"
+        cells[variant] = cell.group(0)
+
+    collisions = [
+        (a, b)
+        for i, a in enumerate(VARIANTS)
+        for b in VARIANTS[i + 1 :]
+        if cells[a] == cells[b]
+    ]
+    assert not collisions, (
+        f"variants render identically (one falls through to the other): {collisions}"
+    )
