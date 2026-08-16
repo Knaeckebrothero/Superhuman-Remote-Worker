@@ -2,6 +2,14 @@
 
 They are the click target of the permission email's Approve/Deny buttons, so
 they must not be a design generation behind it.
+
+_pages() must actually exercise every branch that carries its own literal
+colours -- intended_decision's three arms (approved / denied / neutral) and
+extend_status's three arms (extended / cap_reached / not_awaiting) -- or a
+Catppuccin hex sitting in an untriggered branch passes silently. (This bit
+once: the original fixture passed intended_decision="approve", which matches
+neither the "approved" nor "denied" branch, so every render fell through to
+the neutral else and two branches' hexes were never checked.)
 """
 
 import re
@@ -21,11 +29,47 @@ def _pages() -> list[str]:
     )
 
     return [
+        # intended_decision arms -- each picks its own button_color literal.
         _magic_link_confirmation_page(
             tool_name="run_command",
             tool_args_preview='{"cmd": "ls"}',
-            intended_decision="approve",
+            intended_decision="approved",
             token="T1",
+        ),
+        _magic_link_confirmation_page(
+            tool_name="run_command",
+            tool_args_preview='{"cmd": "ls"}',
+            intended_decision="denied",
+            token="T1",
+        ),
+        _magic_link_confirmation_page(
+            tool_name="run_command",
+            tool_args_preview='{"cmd": "ls"}',
+            intended_decision=None,
+            token="T1",
+        ),
+        # extend_status arms -- each renders its own inline banner literal.
+        _magic_link_confirmation_page(
+            tool_name="run_command",
+            tool_args_preview='{"cmd": "ls"}',
+            intended_decision=None,
+            token="T1",
+            extend_status="extended",
+            extends_remaining=2,
+        ),
+        _magic_link_confirmation_page(
+            tool_name="run_command",
+            tool_args_preview='{"cmd": "ls"}',
+            intended_decision="denied",
+            token="T1",
+            extend_status="cap_reached",
+        ),
+        _magic_link_confirmation_page(
+            tool_name="run_command",
+            tool_args_preview='{"cmd": "ls"}',
+            intended_decision=None,
+            token="T1",
+            extend_status="not_awaiting",
         ),
         _magic_link_result_page(
             title="Approved",
