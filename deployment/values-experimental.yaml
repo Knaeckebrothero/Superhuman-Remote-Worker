@@ -491,10 +491,29 @@ agent:
   # executor pool serves lite+sandbox session tiers via the run_queue —
   # the first live-traffic deployment of the lane, for the unmeasured
   # acceptance criteria (TTFT, claim-wait, prompt-cache reuse). VM/remote
-  # tiers stay pinned/refused, and worker-job admission stays OFF: sessions
-  # are the only lane consumer on dev until Gate 3 step 4+ lands.
+  # tiers stay pinned/refused.
   stateless:
     enabled: true
+    # Gate 3 step 6 (2026-08-16): worker-job admission OPEN on dev. This
+    # opens a door, it does not move traffic — a job runs stateless only if
+    # its create request asks for `execution_lane: stateless` AND the gate
+    # validates it (in-cluster provisioner + Kubernetes sandbox workspace;
+    # VM jobs are pinned by capability regardless). Every existing job,
+    # every default-created job and everything the loop schedules stays
+    # pinned until a lane default is chosen — which waits on Job Bench
+    # numbers (§9 S3), not on this flag.
+    #
+    # Safe to open now because the whole worker-lane failure set is closed
+    # in the images this overlay pins: the continue-frontier fix at the
+    # source, the coded non-terminal 422 at accept with its driver release
+    # contract, and the park-not-re-enqueue rescue for an ownerless
+    # terminal-queue job (§9.1 "Worker wedge follow-ups").
+    #
+    # batchMinWallSeconds stays at the chart's 300 s production floor: dev
+    # is where rotation economics get measured, so the rotation cadence must
+    # be the real one, not k3d's 60 s acceptance value.
+    worker:
+      enabled: true
   # Apply admin-curated DB prompt overrides to provisioned agents. ON here
   # (dev/experimental) so the admin Prompt-overrides UI takes effect; the
   # chart default (helm/values.yaml) keeps this OFF for prod.
