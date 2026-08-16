@@ -130,7 +130,7 @@ def render_email(
     footer_row = (
         f'<tr><td style="padding:16px 32px 24px 32px;'
         f'border-top:1px solid {C["border-color"]};font-family:{_SANS};'
-        f'font-size:12px;line-height:18px;color:{C["text-muted"]};">'
+        f'font-size:12px;line-height:18px;color:{C["text-secondary"]};">'
         f"{safe_footer}</td></tr>"
         if safe_footer
         else ""
