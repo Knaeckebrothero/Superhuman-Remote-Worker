@@ -553,6 +553,13 @@ spec:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "keycloak") | nindent 6 }}
   template:
     metadata:
+      annotations:
+        # Theme edits are invisible without a pod roll: Keycloak caches the
+        # resolved theme, the compiled FreeMarker templates, AND gzipped static
+        # resources -- the last only regenerates when the .gz is absent, so
+        # browsers get stale CSS while curl looks fine. /opt/keycloak/data is an
+        # emptyDir here, so a roll clears it.
+        checksum/keycloak-theme: {{ include (print $.Template.BasePath "/services/keycloak-theme-configmap.yaml") . | sha256sum | quote }}
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "keycloak") | nindent 8 }}
     spec:
@@ -1170,6 +1177,9 @@ spec:
             - name: realm-import
               mountPath: /opt/keycloak/data/import
               readOnly: true
+            - name: keycloak-theme
+              mountPath: /opt/keycloak/themes/srw
+              readOnly: true
             - name: bridge-cert
               mountPath: /opt/keycloak/certs
               {{- if .Values.keycloak.bridgeCert.enabled }}
@@ -1199,6 +1209,16 @@ spec:
         - name: realm-import
           configMap:
             name: {{ include "srw.fullname" . }}-keycloak-realm
+        - name: keycloak-theme
+          configMap:
+            name: {{ include "srw.fullname" . }}-keycloak-theme
+            items:
+              - key: login_theme.properties
+                path: login/theme.properties
+              - key: login_resources_css_srw.20260816.css
+                path: login/resources/css/srw.20260816.css
+              - key: login_resources_img_srw-logo.svg
+                path: login/resources/img/srw-logo.svg
         - name: bridge-cert
           emptyDir: {}
 ---

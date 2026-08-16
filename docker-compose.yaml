@@ -146,6 +146,7 @@ services:
       OPENCLOUD_KEYCLOAK_CLIENT_SECRET: "${OPENCLOUD_KEYCLOAK_CLIENT_SECRET:?OPENCLOUD_KEYCLOAK_CLIENT_SECRET required}"
     volumes:
       - ./docker/keycloak/realm-export.json:/opt/keycloak/data/import/srw-realm.json:ro,Z
+      - ./helm/keycloak-theme/srw:/opt/keycloak/themes/srw:ro,Z
     ports:
       - "${KEYCLOAK_PORT:-8180}:8080"
     depends_on:
