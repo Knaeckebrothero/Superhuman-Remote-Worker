@@ -399,7 +399,28 @@ Given ~10 days to alpha and that slices 2–3 touch a chart with a known strateg
 
 **Shipped on `develop`, unpushed:** commits `78434c92..a278c350`. All 12 planned tasks complete except the Task 10 live gate (below). 138 tests across eight suites.
 
-### Owed: the Keycloak live gate
+### Live gate — PASSED via docker-compose (2026-08-16)
+
+Run against `docker compose up postgres-keycloak keycloak`, which already carries the theme bind-mount and a realm selecting `loginTheme`/`emailTheme` = `srw`. Results:
+
+| Check | Result |
+|---|---|
+| Realm imported, no theme-fallback errors | PASS — `Realm 'srw' imported`, zero `Failed to find … theme` |
+| Login page serves our stylesheet | PASS — `/resources/<tag>/login/srw/css/srw.20260816.css` |
+| `styles=` parent chain resolves | PASS — keycloak.v2's own `styles.css` served alongside, from our theme's path |
+| `.kc-logo-text` logo hook present | PASS — confirms the realm `displayNameHtml` change works |
+| **`template.ftl` compiles in real Keycloak** | **PASS** — zero `Failed to template`; the only failure was `MailConnectException`, which is downstream of rendering |
+| Branded email captured end to end | PASS — all Travertine tokens present in the delivered HTML |
+| Footer uses the corrected `#5a4632`, not `#8a7b66` | PASS — the WCAG fix verified in real delivered mail |
+| `ltr` version guard renders | PASS — `dir="ltr"` |
+| Plaintext part still present | PASS — multipart intact with only the HTML side overridden |
+| Realm displayName reaches Keycloak's own copy | PASS — "your Superhuman Remote Worker account", no message overrides needed |
+
+The discriminator that made this cheap: FreeMarker renders **before** SMTP is contacted, so a template error and a connection error are distinguishable in the log even with no mail catcher running.
+
+**Still unverified** (needs a browser or a production-mode cluster, all failing visibly rather than silently): dark-mode rendering of the login page, the gzip-cache staleness behaviour, and the ConfigMap `items[].path` mount in a real pod — though the latter is now covered by a test binding `items[].key` to rendered ConfigMap keys, and Tilt was independently observed applying the ConfigMap, volume and checksum annotation through the real deploy path.
+
+### Superseded: the original k3d gate
 
 The theme is verified by `helm template`, a server-side `kubectl apply --dry-run`, unit tests, and Tilt applying it through the real deploy path — but never by a running Keycloak serving a login page. The local k3d cluster could not start new pods (cluster-wide egress failure: `dial tcp: lookup registry-1.docker.io`, 8 pods stuck in `Init`, a bare busybox pod also timing out). Unrelated to this work.
 
