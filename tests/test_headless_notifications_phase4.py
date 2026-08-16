@@ -590,3 +590,24 @@ class TestPermissionNotifySweeperSQL:
         # Args is (age_threshold_str, recency_floor_secs).
         assert isinstance(args[1], int)
         assert args[1] >= 60
+
+
+def test_permission_email_uses_brand_palette_and_ghost_deny() -> None:
+    import re
+    from orchestrator.services import brand
+    from orchestrator.services import headless_notifications as hn
+
+    _text, html = hn._build_permission_email_bodies(
+        tool_name="run_command",
+        tool_args_preview='{"cmd": "ls"}',
+        approve_url="http://x/magic/approve/T1",
+        deny_url="http://x/magic/deny/T1",
+        cockpit_link="http://x/cockpit",
+        request_age_minutes=3,
+    )
+    assert "#1e1e2e" not in html and "#a6e3a1" not in html  # Catppuccin gone
+    assert brand.TRAVERTINE["panel-bg"] in html
+
+    deny_cell = re.search(r'<td[^>]*>\s*<a[^>]*>Deny</a>', html, re.S).group(0)
+    assert f"background-color:{brand.TRAVERTINE['panel-bg']}" in deny_cell
+    assert f"border:2px solid {brand.TRAVERTINE['danger']}" in deny_cell
