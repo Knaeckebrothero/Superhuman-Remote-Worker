@@ -529,6 +529,7 @@ data:
       ],
       "internationalizationEnabled": false,
       "loginTheme": "srw",
+      "emailTheme": "srw",
       "accountTheme": "keycloak.v3"
     }
 ---
@@ -1219,6 +1220,10 @@ spec:
                 path: login/resources/css/srw.20260816.css
               - key: login_resources_img_srw-logo.svg
                 path: login/resources/img/srw-logo.svg
+              - key: email_theme.properties
+                path: email/theme.properties
+              - key: email_html_template.ftl
+                path: email/html/template.ftl
         - name: bridge-cert
           emptyDir: {}
 ---
