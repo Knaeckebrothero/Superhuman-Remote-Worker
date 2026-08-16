@@ -359,25 +359,35 @@ def _render_keycloak_poststart_script(*extra_args: str) -> str:
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
-def test_smtp_port_and_starttls_survive_bare_boolean_and_null_overrides() -> None:
-    """Regression for two Sprig `default` gotchas hit in sequence:
+def test_smtp_port_and_starttls_survive_every_override_shape() -> None:
+    """Regression for three Sprig `default`/emptiness gotchas hit in
+    sequence, each fix closing one hole while leaving another open:
 
-    1. `default` treats a Go-template "empty" value -- including the boolean
-       `false` -- as absent, so a bare `--set ...useTls=false` (parsed as a
-       real bool, not a string) silently fell back to "true": an operator
-       who explicitly disabled STARTTLS got it silently re-enabled.
-    2. The first fix, piping through `toString` before `default`, traded
-       that bug for another: `toString(nil)` renders the Go `%v` string
-       "<nil>", which is non-empty, so `--set ...=null` (Helm's documented
-       idiom for unsetting a value) rendered the literal text "<nil>"
-       instead of falling back at all.
+    1. `default` treats a Go-template "empty" value -- including the
+       boolean `false` -- as absent, so a bare `--set ...useTls=false`
+       (parsed as a real bool, not a string) silently fell back to "true":
+       an operator who explicitly disabled STARTTLS got it silently
+       re-enabled.
+    2. Piping through `toString` before `default` fixed that but traded it
+       for another: `toString(nil)` renders the Go `%v` string "<nil>",
+       which is non-empty, so `--set ...=null` (Helm's documented idiom for
+       unsetting a value) rendered the literal text "<nil>" instead of
+       falling back at all.
+    3. Switching to `kindIs "invalid"` fixed both of those, but an empty
+       string (`--set email.smtp.useTls=` -- reachable from an ordinary CI
+       pattern like `--set email.smtp.useTls=$USE_TLS` with an unset
+       variable) has kind `string`, not `invalid`, so the guard's
+       else-branch rendered it verbatim: `smtpServer.starttls=`. Keycloak's
+       `Boolean.parseBoolean("")` returns false, so this one fails in the
+       *unsafe* direction -- STARTTLS silently disabled, credentials sent
+       in cleartext -- unlike the two prior bugs, which both failed toward
+       TLS staying on.
 
-    `kindIs "invalid"` is true only for a genuinely absent/nil value, so an
-    explicit `if`/`else` on it is the shape that survives every input in
-    the table below. All five cases are asserted on RENDERED output, not
-    template source: source only ever shows the literal `{{ }}` expression,
-    never what the guard decided for a given input, so a source-text
-    assertion cannot see any of these bugs.
+    The final guard treats "invalid" OR "empty string" as absent. All
+    seven rows of the input/output matrix are asserted on RENDERED output,
+    not template source: source only ever shows the literal `{{ }}`
+    expression, never what the guard decided for a given input, so a
+    source-text assertion cannot see any of these bugs.
     """
     # 1. Unset (normal path): values.yaml supplies the string default.
     default_script = _render_keycloak_poststart_script()
@@ -398,7 +408,25 @@ def test_smtp_port_and_starttls_survive_bare_boolean_and_null_overrides() -> Non
         "--set email.smtp.useTls=null must fall back to the default, not render '<nil>'"
     )
 
-    # 3. --set ...useTls=false (bare boolean): the case the plain `default`
+    # 3. --set ...= (empty string): the case `kindIs "invalid"` alone
+    #    still missed -- it has kind `string`, not `invalid`, so the bare
+    #    guard let it through verbatim as `smtpServer.starttls=`, which
+    #    Keycloak parses as false (STARTTLS silently disabled -- the
+    #    unsafe direction). Asserted explicitly on BOTH lines, distinct
+    #    from the null case above, since an empty string and a nil value
+    #    are different Go kinds and a fix for one does not imply the other.
+    empty_script = _render_keycloak_poststart_script(
+        "--set", "email.smtp.port=", "--set", "email.smtp.useTls="
+    )
+    assert "smtpServer.port=1025" in empty_script, (
+        "--set email.smtp.port= (empty string) must fall back to the default"
+    )
+    assert "smtpServer.starttls=true" in empty_script, (
+        "--set email.smtp.useTls= (empty string) must fall back to true, "
+        "not render empty (Keycloak parses '' as false -- TLS silently off)"
+    )
+
+    # 4. --set ...useTls=false (bare boolean): the case the plain `default`
     #    remedy silently broke. Asserted on its own, not folded into the
     #    --set-string case below.
     bare_bool_script = _render_keycloak_poststart_script("--set", "email.smtp.useTls=false")
@@ -406,10 +434,18 @@ def test_smtp_port_and_starttls_survive_bare_boolean_and_null_overrides() -> Non
         "a bare --set boolean false must render as false, not silently fall back to the default"
     )
 
-    # 4. --set-string ...useTls=false: worked before either fix; kept as a control.
+    # 5. --set-string ...useTls=false: worked before every fix; kept as a control.
     string_script = _render_keycloak_poststart_script("--set-string", "email.smtp.useTls=false")
     assert "smtpServer.starttls=false" in string_script
 
-    # 5. --set ...port=587: the ordinary configured-relay path this task exists for.
+    # 6. --set ...port=587: the ordinary configured-relay path this task exists for.
     port_script = _render_keycloak_poststart_script("--set", "email.smtp.port=587")
     assert "smtpServer.port=587" in port_script
+
+    # 7. --set ...port=0: a real (if impractical) int, not absent -- must
+    #    pass through literally and NOT be swallowed by the new
+    #    empty-string clause (toString(0) == "0", not "").
+    zero_port_script = _render_keycloak_poststart_script("--set", "email.smtp.port=0")
+    assert "smtpServer.port=0" in zero_port_script, (
+        "an explicit port=0 must render literally, not fall back to the default"
+    )
