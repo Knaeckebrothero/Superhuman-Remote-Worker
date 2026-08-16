@@ -19,10 +19,12 @@ Design: docs/features/session_wake_on_job_completion.md.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 USER_ID = str(uuid.uuid4())
 THREAD_ID = str(uuid.uuid4())
@@ -69,6 +71,24 @@ class TestPublicPathStripsThreadId:
             job.worktree_path,
             job.delegation_context,
         ) == (None, None, None, None, None)
+
+    def test_claim_identity_is_stripped_from_raw_job_context(self):
+        from main import JobCreate, _strip_raw_officer_claim_context
+
+        job = JobCreate(
+            description="d",
+            context={
+                "ordinary": "preserved",
+                "ticket_note_id": "forged",
+                "officer_admission": {"ticket_claim_source": "forged"},
+                "ticket_ready_at": "2099-01-01T00:00:00Z",
+                "ticket_claim_source": "forged",
+                "officer_slot": "line",
+            },
+        )
+        _strip_raw_officer_claim_context(job)
+
+        assert job.context == {"ordinary": "preserved", "officer_slot": "line"}
 
 
 # --------------------------------------------------------------------------
@@ -145,6 +165,70 @@ async def _create(db, fake_request, body):
 
 
 class TestLinkagePersistence:
+    @pytest.mark.asyncio
+    async def test_internal_job_context_cannot_bypass_ticket_admission(
+        self, linkage_db, fake_request
+    ):
+        from main import JobCreate
+
+        await _create(
+            linkage_db,
+            fake_request,
+            JobCreate(
+                description="internal bypass",
+                thread_id=THREAD_ID,
+                context={
+                    "ordinary": "preserved",
+                    "ticket_note_id": "forged",
+                    "officer_admission": {"ticket_ready_at": "2099-01-01T00:00:00Z"},
+                    "ticket_claim_source": "forged",
+                    "officer_slot": "line",
+                },
+            ),
+        )
+
+        context = linkage_db.create_job.await_args.kwargs["context"]
+        assert context["ordinary"] == "preserved"
+        assert context["officer_slot"] == "line"
+        assert "ticket_note_id" not in context
+        assert "officer_admission" not in context
+        assert "ticket_claim_source" not in context
+
+    @pytest.mark.asyncio
+    async def test_public_job_context_cannot_bypass_ticket_admission(
+        self, linkage_db, fake_request
+    ):
+        from main import JobCreate
+
+        fake_request.headers = {}
+        with patch(
+            "main.require_approved_user",
+            AsyncMock(return_value={"id": USER_ID, "is_admin": False}),
+        ):
+            await _create(
+                linkage_db,
+                fake_request,
+                JobCreate(
+                    description="public bypass",
+                    context={
+                        "ordinary": "preserved",
+                        "ticket_note_id": "forged",
+                        "officer_admission": {
+                            "ticket_ready_at": "2099-01-01T00:00:00Z"
+                        },
+                        "ready_generation_at": "2099-01-01T00:00:00Z",
+                        "claim_source": "forged",
+                    },
+                ),
+            )
+
+        context = linkage_db.create_job.await_args.kwargs["context"]
+        assert context["ordinary"] == "preserved"
+        assert "ticket_note_id" not in context
+        assert "officer_admission" not in context
+        assert "ready_generation_at" not in context
+        assert "claim_source" not in context
+
     @pytest.mark.asyncio
     async def test_session_created_job_carries_the_backref_and_opts_into_wake(
         self, linkage_db, fake_request
@@ -252,10 +336,23 @@ class TestLinkagePersistence:
         )
         prepare = AsyncMock(return_value=preparation)
         admit = AsyncMock(return_value={"id": JOB_ID, "status": "created"})
+        ready_at = datetime(2026, 8, 16, 7, 0, tzinfo=timezone.utc)
+        ticket_state = {
+            "project_id": project_id,
+            "note_id": "feature-proof",
+            "note_type": "feature",
+            "status": "active",
+            "tags": ["ready", "category:executor"],
+            "ready_at": ready_at,
+        }
 
         with (
             patch("services.officer_admission.prepare_officer_admission", prepare),
             patch("services.officer_admission.admit_and_create_job", admit),
+            patch(
+                "services.project_backlog.fetch_ticket_state",
+                AsyncMock(return_value=ticket_state),
+            ),
         ):
             await _create(
                 linkage_db,
@@ -277,7 +374,108 @@ class TestLinkagePersistence:
         admit.assert_awaited_once()
         assert admit.await_args.kwargs["preparation"] is preparation
         assert admit.await_args.kwargs["ticket_note_id"] == "feature-proof"
+        assert admit.await_args.kwargs["ticket_ready_at"] == ready_at
+        assert admit.await_args.kwargs["ticket_claim_source"] == "manual"
         assert (
             admit.await_args.kwargs["job_kwargs"]["created_by_thread_id"] == THREAD_ID
         )
         linkage_db.create_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "ticket_case",
+        ["missing", "wrong_project", "not_ready", "ambiguous", "inactive"],
+    )
+    async def test_manual_ticket_claim_fails_closed_on_untrusted_state(
+        self, linkage_db, fake_request, ticket_case
+    ):
+        from main import JobCreate
+        from services.officer_admission import OfficerAdmissionPreparation
+
+        project_id = str(uuid.uuid4())
+        linkage_db.get_thread.return_value = {
+            "id": THREAD_ID,
+            "user_id": USER_ID,
+            "project_id": project_id,
+            "status": "active",
+            "metadata": {
+                "config_override": {
+                    "officer": {
+                        "enabled": True,
+                        "slots": {"line": {"count": 1}},
+                    }
+                }
+            },
+        }
+        linkage_db.get_project.return_value = {
+            "id": project_id,
+            "default_config_override": None,
+            "default_config_name": None,
+        }
+        linkage_db.get_project_officer_lineage = AsyncMock(return_value=[THREAD_ID])
+        preparation = OfficerAdmissionPreparation(
+            project_id=project_id,
+            thread_id=THREAD_ID,
+            requested_slot="line",
+            slot_name="line",
+            slot_patch={},
+            category=None,
+            config_fingerprint="proof",
+            incarnation=0,
+            owner_user_id=USER_ID,
+            require_auto_pull=False,
+        )
+        ready_at = datetime(2026, 8, 16, 7, 0, tzinfo=timezone.utc)
+        ticket_state = {
+            "project_id": project_id,
+            "note_id": "feature-proof",
+            "note_type": "feature",
+            "status": "active",
+            "tags": ["ready", "category:executor"],
+            "ready_at": ready_at,
+        }
+        if ticket_case == "missing":
+            ticket_state = None
+        elif ticket_case == "wrong_project":
+            ticket_state["project_id"] = str(uuid.uuid4())
+        elif ticket_case == "not_ready":
+            ticket_state["ready_at"] = None
+        elif ticket_case == "ambiguous":
+            ticket_state["tags"] = [
+                "ready",
+                "category:executor",
+                "category:researcher",
+            ]
+        elif ticket_case == "inactive":
+            ticket_state["status"] = "resolved"
+
+        prepare = AsyncMock(return_value=preparation)
+        admit = AsyncMock(return_value={"id": JOB_ID, "status": "created"})
+        with (
+            patch("services.officer_admission.prepare_officer_admission", prepare),
+            patch("services.officer_admission.admit_and_create_job", admit),
+            patch(
+                "services.project_backlog.fetch_ticket_state",
+                AsyncMock(return_value=ticket_state),
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await _create(
+                    linkage_db,
+                    fake_request,
+                    JobCreate(
+                        description="forged manual claim",
+                        thread_id=THREAD_ID,
+                        context={"officer_slot": "line"},
+                        ticket="feature-proof",
+                    ),
+                )
+
+        assert exc.value.status_code == 409
+        admit.assert_not_awaited()
+
+    def test_ready_generation_is_not_model_selectable(self):
+        from main import JobCreate
+
+        assert "ready_at" not in JobCreate.model_fields
+        assert "ticket_ready_at" not in JobCreate.model_fields

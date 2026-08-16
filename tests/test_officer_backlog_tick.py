@@ -318,7 +318,13 @@ def _officer_row(**over):
     return row
 
 
-def _db(*, claims=None, slot_claims=None, locked_claim_at=None):
+def _db(
+    *,
+    claims=None,
+    slot_claims=None,
+    locked_claim_at=None,
+    locked_has_non_terminal=False,
+):
     """A doubled PostgresDB.
 
     ``locked_claim_at`` is what the in-transaction re-read of the claim ledger
@@ -326,15 +332,19 @@ def _db(*, claims=None, slot_claims=None, locked_claim_at=None):
     """
     db = AsyncMock()
     db.get_officer_capacity_lineage.return_value = [OFFICER_THREAD_ID]
-    db.newest_ticket_claims.return_value = claims or {}
+    db.ticket_claim_states.return_value = claims or {}
     db.list_officer_slot_claims.return_value = slot_claims or []
     db.merge_thread_officer_state.return_value = True
+    db.insert_officer_ticket_claim.return_value = {
+        "ticket_note_id": "feature-a",
+        "ready_generation_at": NOW,
+    }
 
     created = {}
 
     async def _create_job(**kwargs):
         created.update(kwargs)
-        return {"id": str(uuid.uuid4()), **kwargs}
+        return {"id": str(kwargs.get("job_id") or uuid.uuid4()), **kwargs}
 
     db.create_job.side_effect = _create_job
     db.created = created
@@ -390,10 +400,10 @@ def _db(*, claims=None, slot_claims=None, locked_claim_at=None):
             return post
         if "FROM threads" in query and "FOR UPDATE" in query:
             return thread
-        if "MAX(created_at) AS newest" in query:
+        if "MAX(claim.ready_generation_at) AS newest_generation" in query:
             return {
-                "newest": locked_claim_at,
-                "has_non_terminal": locked_claim_at is not None,
+                "newest_generation": locked_claim_at,
+                "has_non_terminal": locked_has_non_terminal,
             }
         raise AssertionError(query)
 
@@ -738,6 +748,7 @@ class TestExecutorSerialization:
             "status": "completed",
             "work_category": EXECUTOR,
             "ticket_note_id": "feature-old",
+            "ready_generation_at": NOW - timedelta(hours=2),
             "created_at": NOW - timedelta(hours=2),
             "updated_at": NOW - timedelta(hours=1),
         }
@@ -777,6 +788,7 @@ class TestExecutorSerialization:
             "status": "completed",
             "work_category": EXECUTOR,
             "ticket_note_id": "feature-old",
+            "ready_generation_at": NOW - timedelta(hours=2),
             "created_at": NOW - timedelta(hours=2),
             "updated_at": NOW - timedelta(hours=1),
         }
@@ -808,6 +820,7 @@ class TestExecutorSerialization:
             "status": "completed",
             "work_category": EXECUTOR,
             "ticket_note_id": "feature-old",
+            "ready_generation_at": NOW - timedelta(hours=2),
             "created_at": NOW - timedelta(hours=2),
             "updated_at": NOW - timedelta(hours=1),
         }
@@ -825,7 +838,7 @@ class TestExecutorSerialization:
             return_value={
                 "note_id": "feature-old",
                 "status": "active",
-                # Re-armed AFTER the previous job was created = reviewed.
+                # Re-armed AFTER the consumed ledger generation = reviewed.
                 "ready_at": NOW - timedelta(minutes=30),
             }
         )

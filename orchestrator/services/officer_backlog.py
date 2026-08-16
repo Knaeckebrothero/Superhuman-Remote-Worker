@@ -245,7 +245,7 @@ def stale_claims(
 
 def eligible_tickets(
     rows: Sequence[dict[str, Any]],
-    claims: dict[str, datetime],
+    claims: dict[str, Any],
     now: datetime,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Split ready tickets into (dispatchable, skip-reasons).
@@ -275,9 +275,23 @@ def eligible_tickets(
         if authorized_at is None:
             notes.append(f"{note_id}: ready tag with no ready_at (re-arm it)")
             continue
-        claimed_at = _aware(claims.get(note_id))
-        if claimed_at is not None and claimed_at >= authorized_at:
-            notes.append(f"{note_id}: claimed at {claimed_at.isoformat()}")
+        claim_state = claims.get(note_id)
+        if isinstance(claim_state, dict):
+            claimed_generation = _aware(claim_state.get("ready_generation_at"))
+            has_non_terminal = bool(claim_state.get("has_non_terminal"))
+        else:
+            # Compatibility for pure callers/tests using the former
+            # ``note_id -> datetime`` shape. Production reads the durable
+            # state mapping from PostgresDB.ticket_claim_states.
+            claimed_generation = _aware(claim_state)
+            has_non_terminal = False
+        if has_non_terminal:
+            notes.append(f"{note_id}: prior job is still non-terminal")
+            continue
+        if claimed_generation is not None and claimed_generation >= authorized_at:
+            notes.append(
+                f"{note_id}: generation claimed at {claimed_generation.isoformat()}"
+            )
             continue
         ready.append({**row, "classification": classification})
     return ready, notes
@@ -294,7 +308,7 @@ async def ready_depth_by_pool(
     """How many tickets each pool could actually take right now.
 
     Deliberately the tick's OWN read path — ``fetch_backlog`` →
-    ``newest_ticket_claims`` → :func:`eligible_tickets` — rather than a cheaper
+    ``ticket_claim_states`` → :func:`eligible_tickets` — rather than a cheaper
     count of everything wearing a ``ready`` tag. The officer steers by this
     number, and a "ready 4" that the tick reads as zero (because all four are
     claimed, or ambiguous, or lost their ``ready_at``) is worse than showing
@@ -316,7 +330,7 @@ async def ready_depth_by_pool(
                 require_tags=[READY_TAG, category_tag(category)],
                 limit=_READY_DEPTH_LIMIT,
             )
-            claims = await db.newest_ticket_claims(
+            claims = await db.ticket_claim_states(
                 project_id, [str(r.get("note_id")) for r in rows]
             )
         except Exception:
@@ -485,8 +499,8 @@ async def _executor_blocked(
     if ticket is None or ticket.get("status") != "active":
         return None  # closed — dispositioned
     re_armed = _aware(ticket.get("ready_at"))
-    created = _aware(previous.get("created_at"))
-    if re_armed and created and re_armed > created:
+    consumed_generation = _aware(previous.get("ready_generation_at"))
+    if re_armed and consumed_generation and re_armed > consumed_generation:
         return None  # explicitly re-readied — dispositioned
     return (
         f"previous executor ticket {ticket_id} is undispositioned "
@@ -583,6 +597,7 @@ async def _dispatch_one(
             preparation=preparation,
             ticket_note_id=note_id,
             ticket_ready_at=authorized_at,
+            ticket_claim_source="tick",
             job_kwargs={
                 "description": f"[{category}] {title}",
                 "config_name": expert,
@@ -781,7 +796,7 @@ async def tick_officer(
             counts["skipped"] += 1
             continue
 
-        claims = await db.newest_ticket_claims(
+        claims = await db.ticket_claim_states(
             project_id, [str(r.get("note_id")) for r in rows]
         )
         ready, notes = eligible_tickets(rows, claims, now)

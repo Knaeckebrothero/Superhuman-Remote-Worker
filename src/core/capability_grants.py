@@ -70,6 +70,27 @@ CATALOG: dict[str, dict[str, Any]] = {
     # context.pull_request, and none existed when the key was introduced.
     # Spec: docs/features/merged_pr_completion_grant.md
     "complete_unmerged_pr": {"type": "bool", "default": False, "restrict_only": True},
+    # The project self-improvement loop and the commissioned officer: the two
+    # surfaces that spawn jobs with no human in the loop. Deny-by-default and
+    # NOT backfilled — nobody held it before, and an unattended loop or officer
+    # is an unbounded token spend, which is the tier control a grant exists to
+    # be. ONE key rather than one each: officer scheduling is already a mode of
+    # the loop engine (loop_unified_engine.md, "Third mode added 2026-07-30")
+    # and the two surfaces are converging, so a split would have to be re-merged.
+    #
+    # Enforced on two paths, deliberately, because the two surfaces are reached
+    # differently:
+    #   - the officer half rides `evaluate` below, on `officer.enabled`. That
+    #     covers the commission endpoint AND a hand-rolled thread create with
+    #     the flag in `config_override` — and because sessions re-resolve grants
+    #     on every attach, revoking it stands a RUNNING officer down rather than
+    #     only blocking new ones.
+    #   - the loop half has no config fragment to evaluate, so it is read
+    #     directly at the endpoints and at the spawn choke point, via
+    #     `user_can_run_unattended_operations` (the same shape as
+    #     `complete_unmerged_pr` above).
+    # Spec: docs/features/unattended_operations_grant.md.
+    "unattended_operations": {"type": "bool", "default": False, "restrict_only": True},
     "datasource_tools": {"type": "bool", "default": True, "restrict_only": True},
     "browser": {"type": "bool", "default": True, "restrict_only": True},
     "model_selection": {"type": "list", "default": None, "restrict_only": True},
@@ -189,6 +210,7 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
     ws = fragment.get("workspace") or {}
     deleg = fragment.get("delegation") or {}
     inter = fragment.get("interactive") or {}
+    officer = fragment.get("officer") or {}
 
     if not grants.get("vm_workspace", False) and ws.get("backend") == "vm":
         v.append("vm_workspace: workspace.backend='vm' requires the vm_workspace grant")
@@ -206,6 +228,22 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
         v.append("datasource_tools: connector tools are not permitted")
     if not grants.get("browser", True) and _truthy(tools.get("browser_direct")):
         v.append("browser: tools.browser_direct is not permitted")
+    # Gates on `officer.enabled` only — the flag that makes a thread a live
+    # officer. Every other officer key (slots, sleep bounds, pools, conference)
+    # is inert configuration on a post nobody holds, so a user without the grant
+    # may still read and edit the durable kit; he just cannot raise anyone onto
+    # it. Mirrors main._officer_meta_enabled's truthy set rather than `_truthy`,
+    # which would read the string "false" as enabled.
+    if not grants.get("unattended_operations", False) and officer.get("enabled") in (
+        True,
+        "true",
+        "True",
+        1,
+    ):
+        v.append(
+            "unattended_operations: a commissioned officer requires the "
+            "unattended_operations grant"
+        )
     if not grants.get("catalog_authoring", False) and _truthy(
         tools.get("catalog_authoring")
     ):
@@ -259,18 +297,20 @@ def strip_to_grants(fragment: dict, grants: dict) -> tuple[dict, list[str]]:
     users. The other four expert-write routes are untouched and still refuse
     via `evaluate` + a 422.
 
-    One-for-one with `evaluate`'s nine rules, and kept beside it (rather than
+    One-for-one with `evaluate`'s ten rules, and kept beside it (rather than
     a second, route-side implementation) so the two cannot drift — `evaluate`
     is called here, on the ORIGINAL fragment, to find what to strip.
 
     Every rule deletes the offending key outright, never zeroes or replaces
     it: absent means "inherit the base", and the base is the conservative
-    floor. The one exception written into the shape rather than the value:
+    floor. Two exceptions written into the shape rather than the value:
     `delegation` removes `tools.delegation` and only the `.enabled` flag
     inside `delegation`, never the whole `delegation` settings dict —
     `evaluate` gates on `.enabled is True` or a non-empty `tools.delegation`,
     not on the settings dict merely existing, so deleting the dict would also
-    drop `max_depth`/`default_timeout`, which were never the violation.
+    drop `max_depth`/`default_timeout`, which were never the violation. For
+    the same reason `unattended_operations` drops only `officer.enabled` and
+    keeps the rest of the kit (slots, sleep bounds, pools).
 
     Never deletes an emptied PARENT dict (`tools: {}` is left as `{}`, not
     removed, if that is all that remains of it) and never mutates `fragment`
@@ -303,6 +343,9 @@ def strip_to_grants(fragment: dict, grants: dict) -> tuple[dict, list[str]]:
     if "catalog_authoring" in flagged:
         _drop_key(out.get("tools"), "catalog_authoring")
         dropped.append("catalog_authoring")
+    if "unattended_operations" in flagged:
+        _drop_key(out.get("officer"), "enabled")
+        dropped.append("unattended_operations")
     if "vm_workspace" in flagged:
         _drop_key(out.get("workspace"), "backend")
         dropped.append("vm_workspace")

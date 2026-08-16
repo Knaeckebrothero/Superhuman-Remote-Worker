@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -39,6 +42,14 @@ SCHEMA_FILE = (
     / "database"
     / "schema_current.sql"
 )
+CLAIM_MIGRATION_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "orchestrator"
+    / "database"
+    / "migrations"
+    / "app"
+    / "0162_officer_ticket_claims.sql"
+)
 
 DECOMMISSION_STEPS = (
     "post_locked",
@@ -53,6 +64,8 @@ DECOMMISSION_STEPS = (
     "post_unlinked",
     "thread_disabled",
 )
+
+READY_GENERATION = datetime(2026, 8, 16, 7, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture(scope="module")
@@ -213,6 +226,104 @@ async def _job_count(db: PostgresDB) -> int:
         return int(await conn.fetchval("SELECT COUNT(*) FROM jobs"))
 
 
+async def _claim_rows(
+    db: PostgresDB, project_id: str, ticket_note_id: str | None = None
+) -> list[dict]:
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT *
+              FROM officer_ticket_claims
+             WHERE project_id = $1
+               AND ($2::text IS NULL OR ticket_note_id = $2)
+             ORDER BY ready_generation_at, claimed_at, id
+            """,
+            UUID(project_id),
+            ticket_note_id,
+        )
+    return [dict(row) for row in rows]
+
+
+async def _remove_claim_migration_boundary(db: PostgresDB) -> None:
+    """Return the test database to the instant before migration 0162."""
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            DROP TRIGGER IF EXISTS officer_ticket_claim_job_integrity ON jobs;
+            DROP TRIGGER IF EXISTS officer_ticket_claim_job_delete_audit ON jobs;
+            DROP FUNCTION IF EXISTS enforce_officer_ticket_claim_job_integrity();
+            DROP FUNCTION IF EXISTS audit_officer_ticket_claim_job_delete();
+            DROP TABLE IF EXISTS officer_ticket_claims;
+            """
+        )
+
+
+def _historical_ticket_context(
+    seed: dict[str, str],
+    preparation,
+    *,
+    ticket: str,
+    generation: datetime | str,
+) -> dict:
+    """Trusted shape emitted by the deployed pre-0162 automatic admission."""
+
+    return {
+        "ticket_note_id": ticket,
+        "officer_slot": "line",
+        "work_category": "executor",
+        "officer_admission": {
+            "project_id": seed["project_id"],
+            "thread_id": seed["thread_id"],
+            "incarnation": preparation.incarnation,
+            "slot": "line",
+            "category": "executor",
+            "config_fingerprint": preparation.config_fingerprint,
+            "lineage_size": 1,
+            "ticket_ready_at": (
+                generation.isoformat()
+                if isinstance(generation, datetime)
+                else generation
+            ),
+        },
+    }
+
+
+async def _insert_old_writer_ticket_job(
+    conn,
+    seed: dict[str, str],
+    preparation,
+    *,
+    ticket: str,
+    generation: datetime | str,
+    status: str = "created",
+) -> dict:
+    """Issue the SQL shape an old replica used, bypassing new app stripping."""
+
+    row = await conn.fetchrow(
+        """
+        INSERT INTO jobs (
+            description, config_name, context, status, project_id,
+            created_by_thread_id
+        ) VALUES ($1, 'worker_base', $2::jsonb, $3, $4, $5)
+        RETURNING id, created_at, status
+        """,
+        f"historical {ticket}",
+        json.dumps(
+            _historical_ticket_context(
+                seed,
+                preparation,
+                ticket=ticket,
+                generation=generation,
+            )
+        ),
+        status,
+        UUID(seed["project_id"]),
+        UUID(seed["thread_id"]),
+    )
+    return dict(row)
+
+
 async def _seed_officer_job(
     db: PostgresDB,
     seed: dict[str, str],
@@ -262,18 +373,21 @@ async def test_two_manual_creates_race_for_one_remaining_slot(db):
             preparation=preparation,
             job_kwargs=_job_kwargs("manual A"),
             ticket_note_id="ticket-a",
+            ticket_ready_at=READY_GENERATION,
         ),
         lambda: admit_and_create_job(
             db,
             preparation=preparation,
             job_kwargs=_job_kwargs("manual B"),
             ticket_note_id="ticket-b",
+            ticket_ready_at=READY_GENERATION,
         ),
     )
 
     assert sum(isinstance(outcome, dict) for outcome in outcomes) == 1
     assert sum(isinstance(outcome, SlotAdmissionError) for outcome in outcomes) == 1
     assert await _job_count(db) == 1
+    assert len(await _claim_rows(db, seed["project_id"])) == 1
 
 
 @pytest.mark.asyncio
@@ -288,6 +402,7 @@ async def test_same_ticket_manual_manual_race_is_one_job_and_normal_conflict(db)
                 preparation=preparation,
                 job_kwargs=_job_kwargs(label),
                 ticket_note_id="same-ticket",
+                ticket_ready_at=READY_GENERATION,
             )
             for label in ("manual A", "manual B")
         )
@@ -298,6 +413,7 @@ async def test_same_ticket_manual_manual_race_is_one_job_and_normal_conflict(db)
     assert len(conflicts) == 1
     assert conflicts[0].code == "ticket_claimed"
     assert await _job_count(db) == 1
+    assert len(await _claim_rows(db, seed["project_id"], "same-ticket")) == 1
 
 
 @pytest.mark.asyncio
@@ -315,6 +431,7 @@ async def test_same_ticket_manual_tick_race_is_one_job_and_normal_conflict(db):
             preparation=manual,
             job_kwargs=_job_kwargs("manual"),
             ticket_note_id="manual-tick",
+            ticket_ready_at=ready_at,
         ),
         lambda: admit_and_create_job(
             db,
@@ -330,6 +447,799 @@ async def test_same_ticket_manual_tick_race_is_one_job_and_normal_conflict(db):
     assert len(conflicts) == 1
     assert conflicts[0].code == "ticket_claimed"
     assert await _job_count(db) == 1
+    claims = await _claim_rows(db, seed["project_id"], "manual-tick")
+    assert len(claims) == 1
+    assert claims[0]["source"] in {"manual", "tick"}
+
+
+@pytest.mark.asyncio
+async def test_claim_and_job_insert_roll_back_together(db, monkeypatch):
+    seed = await _seed_post(db)
+    preparation = await _prepare(db, seed)
+    observed = {}
+
+    async def fail_after_claim(**kwargs):
+        conn = kwargs["conn"]
+        observed["claims_inside"] = await conn.fetchval(
+            "SELECT COUNT(*) FROM officer_ticket_claims"
+        )
+        observed["jobs_inside"] = await conn.fetchval("SELECT COUNT(*) FROM jobs")
+        raise RuntimeError("fault between claim and job insert")
+
+    monkeypatch.setattr(db, "create_job", fail_after_claim)
+    with pytest.raises(RuntimeError, match="fault between claim and job insert"):
+        await admit_and_create_job(
+            db,
+            preparation=preparation,
+            job_kwargs=_job_kwargs("rollback proof"),
+            ticket_note_id="rollback-ticket",
+            ticket_ready_at=READY_GENERATION,
+        )
+
+    assert observed == {"claims_inside": 1, "jobs_inside": 0}
+    assert await _job_count(db) == 0
+    assert await _claim_rows(db, seed["project_id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_delete_retains_claim_and_equal_or_older_stays_ineligible(db):
+    seed = await _seed_post(db, count=2)
+    preparation = await _prepare(db, seed)
+    job = await admit_and_create_job(
+        db,
+        preparation=preparation,
+        job_kwargs=_job_kwargs("terminal deletion"),
+        ticket_note_id="delete-terminal",
+        ticket_ready_at=READY_GENERATION,
+    )
+    async with db.acquire() as conn:
+        await conn.execute("UPDATE jobs SET status='completed' WHERE id=$1", job["id"])
+
+    actor = str(uuid4())
+    assert await db.delete_job(
+        str(job["id"]),
+        deletion_actor_user_id=actor,
+        deletion_reason="acceptance_terminal_delete",
+    )
+    claim = (await _claim_rows(db, seed["project_id"], "delete-terminal"))[0]
+    assert claim["job_id"] == job["id"]
+    assert claim["job_deleted_at"] is not None
+    assert claim["job_status_at_delete"] == "completed"
+    assert str(claim["deletion_actor_user_id"]) == actor
+    assert claim["deletion_reason"] == "acceptance_terminal_delete"
+
+    for generation in (
+        READY_GENERATION - timedelta(seconds=1),
+        READY_GENERATION,
+    ):
+        with pytest.raises(OfficerAdmissionConflict) as exc:
+            await admit_and_create_job(
+                db,
+                preparation=await _prepare(db, seed),
+                job_kwargs=_job_kwargs("must remain claimed"),
+                ticket_note_id="delete-terminal",
+                ticket_ready_at=generation,
+            )
+        assert exc.value.code == "ticket_claimed"
+    assert await _job_count(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_nonterminal_delete_retains_claim_and_blocks_newer_generation(db):
+    seed = await _seed_post(db, count=2)
+    job = await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs=_job_kwargs("nonterminal deletion"),
+        ticket_note_id="delete-nonterminal",
+        ticket_ready_at=READY_GENERATION,
+    )
+    assert await db.delete_job(
+        str(job["id"]), deletion_reason="acceptance_nonterminal_delete"
+    )
+
+    claim = (await _claim_rows(db, seed["project_id"], "delete-nonterminal"))[0]
+    assert claim["job_status_at_delete"] == "created"
+    states = await db.ticket_claim_states(seed["project_id"], ["delete-nonterminal"])
+    assert states["delete-nonterminal"]["has_non_terminal"] is True
+    with pytest.raises(OfficerAdmissionConflict) as exc:
+        await admit_and_create_job(
+            db,
+            preparation=await _prepare(db, seed),
+            job_kwargs=_job_kwargs("new generation remains blocked"),
+            ticket_note_id="delete-nonterminal",
+            ticket_ready_at=READY_GENERATION + timedelta(minutes=1),
+        )
+    assert exc.value.code == "ticket_claimed"
+
+
+@pytest.mark.asyncio
+async def test_old_writer_terminal_delete_is_audited_and_does_not_wedge_re_ready(db):
+    seed = await _seed_post(db, count=2)
+    job = await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs=_job_kwargs("retention deletion"),
+        ticket_note_id="retention-ticket",
+        ticket_ready_at=READY_GENERATION,
+    )
+    async with db.acquire() as conn:
+        await conn.execute("UPDATE jobs SET status='completed' WHERE id=$1", job["id"])
+        # Simulate a legacy retention DELETE that knows nothing about BP-05.
+        # Migration 0162's BEFORE DELETE trigger must make terminality durable.
+        await conn.execute("DELETE FROM jobs WHERE id=$1", job["id"])
+
+    claim = (await _claim_rows(db, seed["project_id"], "retention-ticket"))[0]
+    assert claim["job_deleted_at"] is not None
+    assert claim["job_status_at_delete"] == "completed"
+    assert claim["deletion_reason"] == "database_delete_compatibility_trigger"
+    states = await db.ticket_claim_states(seed["project_id"], ["retention-ticket"])
+    assert states["retention-ticket"]["has_non_terminal"] is False
+    replacement = await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs=_job_kwargs("newer trusted generation"),
+        ticket_note_id="retention-ticket",
+        ticket_ready_at=READY_GENERATION + timedelta(minutes=1),
+    )
+    assert replacement["id"] != job["id"]
+
+
+@pytest.mark.asyncio
+async def test_old_writer_nonterminal_delete_is_audited_and_stays_blocked(db):
+    seed = await _seed_post(db, count=2)
+    job = await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs=_job_kwargs("old nonterminal delete"),
+        ticket_note_id="old-delete-live",
+        ticket_ready_at=READY_GENERATION,
+    )
+    async with db.acquire() as conn:
+        await conn.execute("DELETE FROM jobs WHERE id=$1", job["id"])
+
+    claim = (await _claim_rows(db, seed["project_id"], "old-delete-live"))[0]
+    assert claim["job_status_at_delete"] == "created"
+    assert claim["deletion_reason"] == "database_delete_compatibility_trigger"
+    states = await db.ticket_claim_states(seed["project_id"], ["old-delete-live"])
+    assert states["old-delete-live"]["has_non_terminal"] is True
+    with pytest.raises(OfficerAdmissionConflict):
+        await admit_and_create_job(
+            db,
+            preparation=await _prepare(db, seed),
+            job_kwargs=_job_kwargs("must remain blocked"),
+            ticket_note_id="old-delete-live",
+            ticket_ready_at=READY_GENERATION + timedelta(minutes=1),
+        )
+
+
+@pytest.mark.asyncio
+async def test_newer_generation_after_terminal_work_claims_exactly_once(db):
+    seed = await _seed_post(db, count=2)
+    first = await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs=_job_kwargs("first generation"),
+        ticket_note_id="re-ready-ticket",
+        ticket_ready_at=READY_GENERATION,
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET status='completed' WHERE id=$1", first["id"]
+        )
+
+    newer = READY_GENERATION + timedelta(minutes=1)
+    preparation = await _prepare(db, seed)
+    outcomes = await _race(
+        *(
+            lambda label=label: admit_and_create_job(
+                db,
+                preparation=preparation,
+                job_kwargs=_job_kwargs(label),
+                ticket_note_id="re-ready-ticket",
+                ticket_ready_at=newer,
+            )
+            for label in ("new generation A", "new generation B")
+        )
+    )
+    assert sum(isinstance(outcome, dict) for outcome in outcomes) == 1
+    assert (
+        sum(isinstance(outcome, OfficerAdmissionConflict) for outcome in outcomes) == 1
+    )
+    assert len(await _claim_rows(db, seed["project_id"], "re-ready-ticket")) == 2
+    assert await _job_count(db) == 2
+
+
+@pytest.mark.asyncio
+async def test_newer_generation_cannot_duplicate_still_nonterminal_work(db):
+    seed = await _seed_post(db, count=2)
+    await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs=_job_kwargs("live first generation"),
+        ticket_note_id="live-re-ready-ticket",
+        ticket_ready_at=READY_GENERATION,
+    )
+    with pytest.raises(OfficerAdmissionConflict) as exc:
+        await admit_and_create_job(
+            db,
+            preparation=await _prepare(db, seed),
+            job_kwargs=_job_kwargs("forbidden newer generation"),
+            ticket_note_id="live-re-ready-ticket",
+            ticket_ready_at=READY_GENERATION + timedelta(minutes=1),
+        )
+    assert exc.value.code == "ticket_claimed"
+    assert len(await _claim_rows(db, seed["project_id"], "live-re-ready-ticket")) == 1
+
+
+@pytest.mark.asyncio
+async def test_claims_are_project_scoped_and_survive_recommission(db):
+    first_seed = await _seed_post(db, count=2)
+    second_seed = await _seed_post(db, count=1)
+    for seed in (first_seed, second_seed):
+        job = await admit_and_create_job(
+            db,
+            preparation=await _prepare(db, seed),
+            job_kwargs=_job_kwargs("project-scoped generation"),
+            ticket_note_id="shared-slug",
+            ticket_ready_at=READY_GENERATION,
+        )
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET status='completed' WHERE id=$1", job["id"]
+            )
+
+    await db.decommission_project_officer(
+        first_seed["project_id"],
+        first_seed["thread_id"],
+        reason="claim continuity",
+        force=True,
+    )
+    successor = await _seed_successor(db, first_seed, count=2)
+    assert await db.register_project_officer_thread(first_seed["project_id"], successor)
+    successor_seed = {**first_seed, "thread_id": successor}
+    await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, successor_seed),
+        job_kwargs=_job_kwargs("successor generation"),
+        ticket_note_id="shared-slug",
+        ticket_ready_at=READY_GENERATION + timedelta(minutes=1),
+    )
+
+    first_claims = await _claim_rows(db, first_seed["project_id"], "shared-slug")
+    second_claims = await _claim_rows(db, second_seed["project_id"], "shared-slug")
+    assert [str(row["officer_thread_id"]) for row in first_claims] == [
+        first_seed["thread_id"],
+        successor,
+    ]
+    assert len(second_claims) == 1
+
+
+@pytest.mark.asyncio
+async def test_migration_backfill_is_idempotent_and_preserves_generations(db):
+    seed = await _seed_post(db, count=3)
+    preparation = await _prepare(db, seed)
+    older = READY_GENERATION - timedelta(hours=2)
+    newer = READY_GENERATION - timedelta(hours=1)
+    await _remove_claim_migration_boundary(db)
+    async with db.acquire() as conn:
+        first = await _insert_old_writer_ticket_job(
+            conn,
+            seed,
+            preparation,
+            ticket="backfill-ticket",
+            generation=older,
+            status="completed",
+        )
+        second = await _insert_old_writer_ticket_job(
+            conn,
+            seed,
+            preparation,
+            ticket="backfill-ticket",
+            generation=newer,
+            status="failed",
+        )
+    migration_sql = CLAIM_MIGRATION_FILE.read_text()
+    async with db.acquire() as conn:
+        await conn.execute(migration_sql)
+        start = migration_sql.index("DO $backfill$")
+        end = migration_sql.index("$backfill$;", start) + len("$backfill$;")
+        backfill_sql = migration_sql[start:end]
+        await conn.execute(backfill_sql)
+
+    claims = await _claim_rows(db, seed["project_id"])
+    assert len(claims) == 2
+    assert {row["source"] for row in claims} == {"backfill"}
+    ticket_generations = {
+        row["ready_generation_at"]
+        for row in claims
+        if row["ticket_note_id"] == "backfill-ticket"
+    }
+    assert ticket_generations == {older, newer}
+    assert {row["job_id"] for row in claims} == {first["id"], second["id"]}
+
+
+@pytest.mark.asyncio
+async def test_backfilled_job_accepts_unrelated_context_merge_but_not_claim_removal(db):
+    """Backfill preserves the source-less pre-0162 admission-stamp shape."""
+
+    seed = await _seed_post(db)
+    preparation = await _prepare(db, seed)
+    await _remove_claim_migration_boundary(db)
+    async with db.acquire() as conn:
+        historical = await _insert_old_writer_ticket_job(
+            conn,
+            seed,
+            preparation,
+            ticket="backfill-merge-ticket",
+            generation=READY_GENERATION,
+            status="completed",
+        )
+        await conn.execute(CLAIM_MIGRATION_FILE.read_text())
+
+    assert await db.merge_job_context(
+        str(historical["id"]), {"ordinary_runtime_update": "preserved"}
+    )
+    async with db.acquire() as conn:
+        context = _json(
+            await conn.fetchval(
+                "SELECT context FROM jobs WHERE id=$1", historical["id"]
+            )
+        )
+        source = await conn.fetchval(
+            "SELECT source FROM officer_ticket_claims WHERE job_id=$1",
+            historical["id"],
+        )
+    assert context["ordinary_runtime_update"] == "preserved"
+    assert "ticket_claim_source" not in context["officer_admission"]
+    assert source == "backfill"
+
+    with pytest.raises(asyncpg.CheckViolationError) as exc:
+        await db.delete_job_context_keys(str(historical["id"]), ["ticket_note_id"])
+    assert exc.value.constraint_name == "officer_ticket_claim_job_integrity"
+    assert "cannot remove" in str(exc.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    ["project_id", "thread_id", "ticket_ready_at", "incarnation", "lineage_size"],
+)
+async def test_migration_rejects_missing_historical_admission_identity(db, field):
+    seed = await _seed_post(db)
+    preparation = await _prepare(db, seed)
+    await _remove_claim_migration_boundary(db)
+    migration_sql = CLAIM_MIGRATION_FILE.read_text()
+    async with db.acquire() as conn:
+        historical = await _insert_old_writer_ticket_job(
+            conn,
+            seed,
+            preparation,
+            ticket=f"missing-{field}",
+            generation=READY_GENERATION,
+            status="completed",
+        )
+        await conn.execute(
+            """
+            UPDATE jobs
+               SET context = jsonb_set(
+                   context,
+                   '{officer_admission}',
+                   (context->'officer_admission') - $2::text
+               )
+             WHERE id = $1
+            """,
+            historical["id"],
+            field,
+        )
+
+    try:
+        async with db.acquire() as conn:
+            with pytest.raises(asyncpg.CheckViolationError) as exc:
+                await conn.execute(migration_sql)
+        assert str(historical["id"]) in str(exc.value)
+    finally:
+        async with db.acquire() as conn:
+            await conn.execute("DELETE FROM jobs WHERE id=$1", historical["id"])
+            await conn.execute(migration_sql)
+
+
+@pytest.mark.asyncio
+async def test_old_writer_ticket_insert_is_rejected_after_migration(db):
+    seed = await _seed_post(db)
+    preparation = await _prepare(db, seed)
+    context = _historical_ticket_context(
+        seed,
+        preparation,
+        ticket="post-migration-old-writer",
+        generation=READY_GENERATION,
+    )
+    attempted_id = uuid4()
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as exc:
+            await conn.execute(
+                """
+                INSERT INTO jobs (
+                    id, description, config_name, context, project_id,
+                    created_by_thread_id
+                ) VALUES ($1, 'old rolling replica', 'worker_base', $2::jsonb,
+                          $3, $4)
+                """,
+                attempted_id,
+                json.dumps(context),
+                UUID(seed["project_id"]),
+                UUID(seed["thread_id"]),
+            )
+        assert exc.value.constraint_name == "officer_ticket_claim_job_integrity"
+        assert "rolling upgrade" in str(exc.value)
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=$1)", attempted_id
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM officer_ticket_claims WHERE job_id=$1)",
+            attempted_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_writer_committed_before_migration_lock_is_backfilled(db):
+    seed = await _seed_post(db)
+    preparation = await _prepare(db, seed)
+    await _remove_claim_migration_boundary(db)
+    writer = await db._pool.acquire()
+    migrator = await db._pool.acquire()
+    transaction = writer.transaction()
+    await transaction.start()
+    committed = False
+    try:
+        historical = await _insert_old_writer_ticket_job(
+            writer,
+            seed,
+            preparation,
+            ticket="crossing-writer",
+            generation=READY_GENERATION,
+            status="completed",
+        )
+        migration_task = asyncio.create_task(
+            migrator.execute(CLAIM_MIGRATION_FILE.read_text())
+        )
+        await asyncio.sleep(0.05)
+        assert not migration_task.done(), "migration must wait for the old writer"
+        await transaction.commit()
+        committed = True
+        await asyncio.wait_for(migration_task, timeout=5)
+    finally:
+        if not committed:
+            await transaction.rollback()
+        await db._pool.release(writer)
+        await db._pool.release(migrator)
+
+    claim = (await _claim_rows(db, seed["project_id"], "crossing-writer"))[0]
+    assert claim["job_id"] == historical["id"]
+    assert claim["source"] == "backfill"
+
+
+@pytest.mark.asyncio
+async def test_migration_rejects_same_generation_historical_collision(db):
+    seed = await _seed_post(db, count=3)
+    preparation = await _prepare(db, seed)
+    await _remove_claim_migration_boundary(db)
+    async with db.acquire() as conn:
+        first = await _insert_old_writer_ticket_job(
+            conn,
+            seed,
+            preparation,
+            ticket="collision-ticket",
+            generation=READY_GENERATION,
+            status="completed",
+        )
+        second = await _insert_old_writer_ticket_job(
+            conn,
+            seed,
+            preparation,
+            ticket="collision-ticket",
+            generation=READY_GENERATION,
+            status="created",
+        )
+
+    migration_sql = CLAIM_MIGRATION_FILE.read_text()
+    try:
+        async with db.acquire() as conn:
+            with pytest.raises(asyncpg.UniqueViolationError) as exc:
+                await conn.execute(migration_sql)
+        message = str(exc.value)
+        assert "BP-05 backfill collision" in message
+        assert str(first["id"]) in message
+        assert str(second["id"]) in message
+        assert "completed" in message
+        assert "created" in message
+    finally:
+        async with db.acquire() as conn:
+            await conn.execute("DELETE FROM jobs WHERE id=$1", second["id"])
+            await conn.execute(migration_sql)
+
+
+@pytest.mark.asyncio
+async def test_migration_rejects_unverifiable_historical_claim_context(db):
+    seed = await _seed_post(db)
+    preparation = await _prepare(db, seed)
+    await _remove_claim_migration_boundary(db)
+    async with db.acquire() as conn:
+        forged = await _insert_old_writer_ticket_job(
+            conn,
+            seed,
+            preparation,
+            ticket="unverifiable-ticket",
+            generation="model-authored-garbage",
+            status="completed",
+        )
+
+    migration_sql = CLAIM_MIGRATION_FILE.read_text()
+    try:
+        async with db.acquire() as conn:
+            with pytest.raises(asyncpg.CheckViolationError) as exc:
+                await conn.execute(migration_sql)
+        assert str(forged["id"]) in str(exc.value)
+        assert "no job.created_at fallback" in str(exc.value)
+    finally:
+        async with db.acquire() as conn:
+            await conn.execute("DELETE FROM jobs WHERE id=$1", forged["id"])
+            await conn.execute(migration_sql)
+
+
+@pytest.mark.asyncio
+async def test_final_admission_overwrites_model_claim_provenance(db):
+    seed = await _seed_post(db)
+    forged_generation = "2099-01-01T00:00:00+00:00"
+    job = await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs={
+            **_job_kwargs("forged context"),
+            "context": {
+                "ticket_note_id": "other-project-ticket",
+                "officer_slot": "forged-slot",
+                "officer_admission": {
+                    "project_id": str(uuid4()),
+                    "thread_id": str(uuid4()),
+                    "ticket_ready_at": forged_generation,
+                },
+            },
+        },
+        ticket_note_id="authoritative-ticket",
+        ticket_ready_at=READY_GENERATION,
+    )
+
+    async with db.acquire() as conn:
+        context = await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job["id"])
+    context = _json(context)
+    assert context["ticket_note_id"] == "authoritative-ticket"
+    assert context["officer_slot"] == "line"
+    assert context["officer_admission"]["project_id"] == seed["project_id"]
+    assert context["officer_admission"]["thread_id"] == seed["thread_id"]
+    assert context["officer_admission"]["ticket_ready_at"] == (
+        READY_GENERATION.isoformat()
+    )
+    assert forged_generation not in json.dumps(context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    ["project_id", "thread_id", "ticket_ready_at", "incarnation", "lineage_size"],
+)
+async def test_claim_integrity_rejects_missing_admission_identity(db, field):
+    seed = await _seed_post(db)
+    job = await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs=_job_kwargs(f"protected {field}"),
+        ticket_note_id=f"protected-{field}",
+        ticket_ready_at=READY_GENERATION,
+    )
+
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as exc:
+            await conn.execute(
+                """
+                UPDATE jobs
+                   SET context = jsonb_set(
+                       context,
+                       '{officer_admission}',
+                       (context->'officer_admission') - $2::text
+                   )
+                 WHERE id = $1
+                """,
+                job["id"],
+                field,
+            )
+        assert exc.value.constraint_name == "officer_ticket_claim_job_integrity"
+        context = _json(
+            await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job["id"])
+        )
+    assert field in context["officer_admission"]
+
+
+@pytest.mark.asyncio
+async def test_database_funnel_strips_raw_claim_context_from_ordinary_jobs(db):
+    seed = await _seed_post(db)
+    job = await db.create_job(
+        description="ordinary raw context bypass",
+        project_id=seed["project_id"],
+        created_by_thread_id=seed["thread_id"],
+        context={
+            "ticket_note_id": "forged-ticket",
+            "officer_admission": {"ticket_ready_at": "2099-01-01T00:00:00Z"},
+            "ticket_ready_at": "2099-01-01T00:00:00Z",
+            "ticket_claim_source": "manual",
+            "officer_slot": "line",
+            "ordinary": "preserved",
+        },
+    )
+    async with db.acquire() as conn:
+        context = _json(
+            await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job["id"])
+        )
+    assert context["ordinary"] == "preserved"
+    assert context["officer_slot"] == "line"
+    assert not set(context) & {
+        "ticket_note_id",
+        "officer_admission",
+        "ticket_ready_at",
+        "ticket_claim_source",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("internal", [False, True], ids=["public", "internal"])
+async def test_http_creation_paths_cannot_persist_raw_claim_context(db, internal):
+    import security.access as access_module
+    from main import JobCreate, create_job
+
+    user_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (id, display_name, is_approved)
+            VALUES ($1, 'BP-05 raw context proof', true)
+            """,
+            user_id,
+        )
+
+    headers = {}
+    if internal:
+        headers = {
+            "X-Internal-Key": "bp05-test-key",
+            "X-MCP-User-Id": str(user_id),
+        }
+    request = SimpleNamespace(headers=headers, query_params={})
+    body = JobCreate(
+        description=f"{('internal' if internal else 'public')} raw bypass",
+        context={
+            "ordinary": "preserved",
+            "ticket_note_id": "forged-ticket",
+            "officer_admission": {"ticket_ready_at": "2099-01-01T00:00:00Z"},
+            "ready_generation_at": "2099-01-01T00:00:00Z",
+            "ticket_claim_source": "forged",
+            "officer_slot": "line",
+        },
+    )
+    principal = {"id": user_id, "is_admin": False}
+    patches = (
+        patch("main.postgres_db", db),
+        patch("main.require_approved_user", AsyncMock(return_value=principal)),
+        patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+        patch("main._require_job_project_access", AsyncMock(return_value=None)),
+        patch("main._is_experts_db_enabled", MagicMock(return_value=False)),
+        patch("main._inherit_parent_datasource_ids", AsyncMock(return_value=[])),
+        patch("main._authorize_thread_datasource_ids", AsyncMock(return_value=[])),
+        patch("main._enforce_job_create_grants", AsyncMock(return_value=None)),
+        patch("services.job_provisioning.provision_job_repo", AsyncMock()),
+        patch("main._spawn_scholar_subjob", AsyncMock(return_value=None)),
+        patch("main._trigger_dispatch", MagicMock()),
+    )
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(access_module, "_INTERNAL_KEY", "bp05-test-key")
+        )
+        for active_patch in patches:
+            stack.enter_context(active_patch)
+        result = await create_job(request, body)
+
+    async with db.acquire() as conn:
+        context = _json(
+            await conn.fetchval("SELECT context FROM jobs WHERE id=$1", result["id"])
+        )
+    assert context["ordinary"] == "preserved"
+    assert context["officer_slot"] == "line"
+    assert not set(context) & {
+        "ticket_note_id",
+        "officer_admission",
+        "ready_generation_at",
+        "ticket_claim_source",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claimed", [False, True], ids=["ordinary", "claimed"])
+async def test_delete_response_reports_only_an_actual_durable_claim(db, claimed):
+    from main import delete_job
+
+    seed = await _seed_post(db)
+    if claimed:
+        created = await admit_and_create_job(
+            db,
+            preparation=await _prepare(db, seed),
+            job_kwargs=_job_kwargs("claimed deletion response"),
+            ticket_note_id="deletion-response-ticket",
+            ticket_ready_at=READY_GENERATION,
+        )
+    else:
+        created = await db.create_job(
+            description="ordinary deletion response",
+            project_id=seed["project_id"],
+        )
+    job = await db.get_job(str(created["id"]))
+    admin = {"id": str(uuid4()), "is_admin": True}
+    gitea = MagicMock(is_initialized=False)
+    snapshots = MagicMock(is_available=False)
+    vector = MagicMock()
+    vector_conn = MagicMock()
+    vector_conn.execute = AsyncMock()
+    vector.acquire.return_value.__aenter__ = AsyncMock(return_value=vector_conn)
+    vector.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+    post_commit_lookup = AsyncMock(
+        side_effect=AssertionError("deletion must not perform a post-commit read")
+    )
+
+    with (
+        patch("main.postgres_db", db),
+        patch.object(db, "job_has_durable_ticket_claim", post_commit_lookup),
+        patch("main.require_job_access", AsyncMock(return_value=(admin, job))),
+        patch("main._archive_and_cleanup_workspace", AsyncMock(return_value=[])),
+        patch("main.gitea_client", gitea),
+        patch("main.snapshot_service", snapshots),
+        patch("main.vector_db", vector),
+    ):
+        result = await delete_job(
+            SimpleNamespace(headers={}, query_params={}), str(created["id"])
+        )
+
+    assert result["ticket_claim_retained"] is claimed
+    assert result["ticket_rearmed"] is False
+    assert ("remains durable" in result["message"]) is claimed
+    post_commit_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lineage_claim_query_has_a_supporting_index_plan(db):
+    seed = await _seed_post(db)
+    job = await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs=_job_kwargs("indexed lineage claim"),
+        ticket_note_id="indexed-lineage-ticket",
+        ticket_ready_at=READY_GENERATION,
+    )
+    async with db.acquire() as conn:
+        await conn.execute("SET enable_seqscan = off")
+        plan_rows = await conn.fetch(
+            """
+            EXPLAIN (COSTS OFF)
+            SELECT claim.job_id
+              FROM officer_ticket_claims claim
+              LEFT JOIN jobs live ON live.id = claim.job_id
+             WHERE claim.officer_thread_id = ANY($1::uuid[])
+               AND claim.officer_slot = $2
+             ORDER BY claim.claimed_at DESC
+             LIMIT 20
+            """,
+            [UUID(seed["thread_id"])],
+            "line",
+        )
+    plan = "\n".join(str(row[0]) for row in plan_rows)
+    assert "idx_officer_ticket_claims_lineage_slot_claimed" in plan
+    assert str(job["id"])
 
 
 @pytest.mark.asyncio
@@ -391,6 +1301,7 @@ async def test_final_boundary_rejects_lifecycle_or_roster_change(db, mutation):
             preparation=preparation,
             job_kwargs=_job_kwargs(mutation),
             ticket_note_id=f"ticket-{mutation}",
+            ticket_ready_at=READY_GENERATION,
         )
     assert await _job_count(db) == 0
 
@@ -404,6 +1315,7 @@ async def test_predecessor_job_occupies_successor_lineage_capacity(db):
         preparation=old_preparation,
         job_kwargs=_job_kwargs("predecessor work"),
         ticket_note_id="predecessor",
+        ticket_ready_at=READY_GENERATION,
     )
     await db.decommission_project_officer(
         seed["project_id"], seed["thread_id"], reason="rotate", force=True
@@ -419,6 +1331,7 @@ async def test_predecessor_job_occupies_successor_lineage_capacity(db):
             preparation=new_preparation,
             job_kwargs=_job_kwargs("successor work"),
             ticket_note_id="successor",
+            ticket_ready_at=READY_GENERATION,
         )
     assert await _job_count(db) == 1
 
@@ -464,6 +1377,7 @@ async def test_admission_wins_then_no_force_decommission_warns_and_keeps_post(db
                     preparation=preparation,
                     job_kwargs=_job_kwargs("admission wins"),
                     ticket_note_id="race-admission-wins",
+                    ticket_ready_at=READY_GENERATION,
                 )
                 inserted.set()
                 await allow_admission_commit.wait()
@@ -520,6 +1434,7 @@ async def test_no_force_decommission_wins_then_racing_admission_is_rejected(db):
             preparation=preparation,
             job_kwargs=_job_kwargs("handoff wins"),
             ticket_note_id="race-handoff-wins",
+            ticket_ready_at=READY_GENERATION,
         )
     )
     await asyncio.sleep(0.1)

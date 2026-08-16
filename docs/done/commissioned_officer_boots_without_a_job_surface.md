@@ -17,9 +17,9 @@ related:
 
 # A commissioned officer booted without any job surface — or the right to use it
 
-**Status:** FIXED 2026-08-15 (`5c2c5030`, `c62b8eae`). Two independent
-defects in the same request; recorded because the way they hid is more
-instructive than either one-line fix.
+**Status:** DONE — fixed 2026-08-15 (`5c2c5030`, `c62b8eae`) and verified through
+the supported endpoint on deployed dev 2026-08-16. Two independent defects in the same
+request; recorded because the way they hid is more instructive than either one-line fix.
 
 **The second one is the worse of the two.** With no `interactive` block on the
 post, commission fell to the create endpoint's `supervised` default. An
@@ -127,3 +127,27 @@ SELECT LEFT(id::text,8), config_name, permission_mode
 story. Reach for this before reading any agent logs — both defects are
 invisible in the pod's own output, which reports a healthy session doing
 nothing.
+
+## Post-deploy verification — 2026-08-16
+
+A uniquely named disposable project (`Codex Officer Gate 20260816T072759Z`, project
+`4e5fb287-f0d6-4e8d-9b4b-fe185bbf57ea`) commissioned Officer thread
+`77ab8ec2-9616-4e4f-9281-0989ff345f5c` through the supported project Officer endpoint with
+no interactive permission override. Independent API, database and runtime evidence agreed:
+
+- `threads.config_name = centurion` and effective permission mode `autonomous`;
+- the durable post linked exactly that active thread with `auto_pull=false`;
+- the runtime loaded the expected 49-tool Centurion surface, including create/list/get,
+  lifecycle, routing and evidence actions;
+- workspace and object-plane tools remained absent;
+- the commission wake executed tools, persisted separate matching `role=tool` rows,
+  produced useful output and filed its next durable wake; and
+- logs contained no unanswered permission gate, repeated tool-pairing 400, or silent
+  zero-tool turn.
+
+A tiny manual sandbox researcher dispatch also completed with ticket, post incarnation,
+slot/category and admission provenance. A controlled restart restored 59 messages and the
+next turn executed and persisted two paired inspection calls before filing a normal wake.
+All disposable project/post/thread/job/wake/message rows and both exact pods were removed
+after the gate. This verifies LF-6 and closes this issue; the narrower LF-5 exact orphan
+interruption/escalation contract remains open separately.

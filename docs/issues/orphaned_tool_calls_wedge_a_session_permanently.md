@@ -18,8 +18,28 @@ related:
 
 # An assistant message persisted without its tool results wedges the session forever
 
-**Status:** OPEN — P0 liveness. Found live 2026-08-15, five minutes after
-commissioning a fresh officer.
+**Status:** OPEN — P0 liveness. Found live 2026-08-15. A 2026-08-16 disposable
+post-deploy restart gate passed, but it did not land in the exact orphan window or prove
+bounded escalation for repeated provider 400s, so this issue is not closed.
+
+## Post-deploy evidence — restart passed; exact orphan fault remains unverified
+
+Fresh disposable Officer thread `77ab8ec2-9616-4e4f-9281-0989ff345f5c` booted as
+`centurion`/`autonomous`, executed tools and persisted matching `role=tool` rows. A watcher
+then deleted only its exact pod UID during a harmless four-tool inspection response. The
+four results committed milliseconds before process death, so this was a controlled
+mid-turn restart but **not** the acceptance fault “LLM response persisted, tool execution
+not yet begun.”
+
+The replacement pod had a different UID, restored 59 messages and completed the next turn
+with two paired inspection calls, useful output and a normal 60-minute wake. Logs contained
+no pairing 400, permission wait or zero-tool loop. This is useful restart/restore evidence
+and the earlier unexplained zero-tool-row symptom did not reproduce, but it cannot prove
+live-state orphan repair. The two still-open acceptance items are therefore explicit:
+
+- deterministically interrupt between the assistant tool-call response and tool execution;
+- prove repeated identical provider pairing errors self-repair or escalate loudly within a
+  bounded number of turns.
 
 ## Observed
 
@@ -69,7 +89,7 @@ live loop kept re-issuing a rejected request instead of repairing its own
 state, and that nothing escalated. Both are worth fixing — a session should
 not be able to spin silently on any cause — but neither is what broke the
 Resavio officer. See
-`docs/issues/commissioned_officer_boots_without_a_job_surface.md`.
+`docs/done/commissioned_officer_boots_without_a_job_surface.md`.
 
 ## Earlier correction — the orphan lives in MEMORY, not in durable history
 

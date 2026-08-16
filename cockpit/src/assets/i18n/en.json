@@ -592,7 +592,7 @@
   },
   "jobs": {
     "title": "Jobs",
-    "confirmDelete": "Delete this job permanently?",
+    "confirmDelete": "Delete this job permanently? Any backlog-ticket claim remains and is not re-armed.",
     "confirmCancel": "Cancel this job?",
     "confirmCancelHint": "You can resume it later from a checkpoint.",
     "confirmCancelDismiss": "Keep running",

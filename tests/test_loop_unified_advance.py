@@ -609,6 +609,96 @@ class TestParkThreading:
         assert create.await_args.kwargs["park_until"] == park
 
 
+class TestSpawnRequiresUnattendedOperationsGrant:
+    """Every loop spawn — the start endpoint's first stage, the rotation
+    advance, the campaign advance — funnels through ``_spawn_loop_stage``,
+    which is why the ``unattended_operations`` re-check lives there. Revoking
+    the grant under a running loop must HALT it at the next advance, not let it
+    keep spending unattended. docs/features/unattended_operations_grant.md.
+    """
+
+    @staticmethod
+    def _db(*, granted: bool, owner: dict | None = None):
+        db = AsyncMock()
+        db.get_user = AsyncMock(
+            return_value=owner if owner is not None else {"id": "u1"}
+        )
+        db.user_can_run_unattended_operations = AsyncMock(return_value=granted)
+        return db
+
+    @pytest.mark.asyncio
+    async def test_revoked_grant_halts_the_spawn(self):
+        loop = _loop(owner_id="u1", project_id="p1")
+        job = AsyncMock()
+        db = self._db(granted=False)
+        with ExitStack() as stack:
+            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("main._spawn_loop_job", job))
+            from main import _spawn_loop_stage
+
+            with pytest.raises(PermissionError) as exc:
+                await _spawn_loop_stage(
+                    loop, stage="scholar", seq_index=0, base_total=0, remaining=5
+                )
+
+        assert "unattended_operations" in str(exc.value)
+        job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_held_grant_spawns_normally(self):
+        loop = _loop(owner_id="u1", project_id="p1")
+        job = AsyncMock(return_value={"id": "j1"})
+        db = self._db(granted=True)
+        with ExitStack() as stack:
+            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("main._spawn_loop_job", job))
+            from main import _spawn_loop_stage
+
+            jobs, total = await _spawn_loop_stage(
+                loop, stage="scholar", seq_index=0, base_total=0, remaining=5
+            )
+
+        assert total == 1
+        assert jobs == [{"id": "j1"}]
+
+    @pytest.mark.asyncio
+    async def test_the_grant_is_read_for_the_owner_on_the_loops_project(self):
+        """The spawned jobs run as the OWNER, so the owner's grant is the one
+        that must still hold — not that of whoever originally clicked start."""
+        loop = _loop(owner_id="u7", project_id="p9")
+        db = self._db(granted=True, owner={"id": "u7"})
+        with ExitStack() as stack:
+            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("main._spawn_loop_job", AsyncMock()))
+            from main import _spawn_loop_stage
+
+            await _spawn_loop_stage(
+                loop, stage="scholar", seq_index=0, base_total=0, remaining=5
+            )
+
+        assert db.get_user.await_args.args == ("u7",)
+        user, project_id = db.user_can_run_unattended_operations.await_args.args
+        assert user == {"id": "u7"}
+        assert project_id == "p9"
+
+    @pytest.mark.asyncio
+    async def test_ownerless_loop_is_not_gated(self):
+        """A loop with no owner is a system child — there is no principal whose
+        grants to resolve, matching ``_enforce_job_create_grants``'s no-op."""
+        loop = _loop(project_id="p1")  # no owner_id
+        db = self._db(granted=False)
+        with ExitStack() as stack:
+            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("main._spawn_loop_job", AsyncMock()))
+            from main import _spawn_loop_stage
+
+            await _spawn_loop_stage(
+                loop, stage="scholar", seq_index=0, base_total=0, remaining=5
+            )
+
+        db.user_can_run_unattended_operations.assert_not_awaited()
+
+
 class TestTurnOutcomeReachesRotation:
     """The rotate must be told the TURN outcome, not one member's.
 

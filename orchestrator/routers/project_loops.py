@@ -37,6 +37,34 @@ router = APIRouter(prefix="/api/projects", tags=["Project Loops"])
 _LOOP_WORKSPACE_BACKENDS = frozenset({"sandbox", "vm", "virtual", "none"})
 
 
+async def _require_unattended_operations(
+    postgres_db, caller: dict[str, Any], project_id: str
+) -> None:
+    """403 unless the caller holds ``unattended_operations`` on this project.
+
+    Applied to the three verbs that put unattended work in motion — start,
+    resume, and convert-to-officer — and deliberately NOT to read, pause or
+    stop. Nobody should ever be locked out of *halting* a loop by a grant that
+    was revoked while it ran; the fail-closed direction here is "no new work",
+    not "no control". Admins bypass inside the DB helper.
+
+    The spawn choke point (``main._spawn_loop_stage``) re-reads the same grant,
+    so this is the loud, synchronous half of a gate that also holds against a
+    revocation landing mid-run. Spec:
+    docs/features/unattended_operations_grant.md.
+    """
+    if await postgres_db.user_can_run_unattended_operations(caller, project_id):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "Project loops require the unattended_operations capability grant. "
+            "Ask an administrator to grant it (Admin → Grants) for your user "
+            "or for this project."
+        ),
+    )
+
+
 class ProjectLoopStart(BaseModel):
     """Request body for ``POST /api/projects/{project_id}/loop``.
 
@@ -94,6 +122,7 @@ async def start_project_loop(
 
     caller = await require_approved_user(request, postgres_db)
     await require_project_member(request, postgres_db, project_id, min_role="editor")
+    await _require_unattended_operations(postgres_db, caller, project_id)
 
     # Budget: at least one stop axis must be set (hard floor under runaway) —
     # except officer scheduling, which is naturally unbounded: the centurion
@@ -319,8 +348,10 @@ async def resume_project_loop(request: Request, project_id: str) -> dict[str, An
     """Resume a paused loop, re-kicking the rotation if its job already finished."""
     from main import _resume_project_loop, postgres_db  # late import: avoid circular
 
-    await require_approved_user(request, postgres_db)
+    caller = await require_approved_user(request, postgres_db)
     await require_project_member(request, postgres_db, project_id, min_role="editor")
+    # Resume re-kicks the rotation, so it is a start, not a control action.
+    await _require_unattended_operations(postgres_db, caller, project_id)
     loop = await postgres_db.get_active_project_loop(project_id)
     if not loop:
         raise HTTPException(status_code=404, detail="No active loop for this project")
@@ -354,8 +385,9 @@ async def convert_project_loop_scheduling(
     from main import postgres_db  # late import: avoid circular
     from services.session_wake import kick_event_drain, notify_officer
 
-    await require_approved_user(request, postgres_db)
+    caller = await require_approved_user(request, postgres_db)
     await require_project_member(request, postgres_db, project_id, min_role="editor")
+    await _require_unattended_operations(postgres_db, caller, project_id)
 
     # Post commissioned? (officer_post.md §4 — row-backed via the flipped
     # lookup, which also requires the linked thread live.)

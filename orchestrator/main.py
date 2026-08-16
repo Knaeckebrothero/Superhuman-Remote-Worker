@@ -6936,6 +6936,16 @@ _PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
     "vm",
     "workspace_container",
 }
+_SERVER_OWNED_OFFICER_CONTEXT_KEYS = {
+    "ticket_note_id",
+    "officer_admission",
+    "ticket_ready_at",
+    "ready_generation_at",
+    "ticket_claim_source",
+    "claim_source",
+    "officer_thread_id",
+    "officer_incarnation",
+}
 _PUBLIC_JOB_CONFIG_RESERVED_KEYS = {
     "lifecycle_marker",
     "parent_job_id",
@@ -6972,6 +6982,23 @@ def _strip_public_job_reserved_markers(job: "JobCreate") -> None:
             key: value
             for key, value in job.config_override.items()
             if key not in _PUBLIC_JOB_CONFIG_RESERVED_KEYS
+        }
+
+
+def _strip_raw_officer_claim_context(job: "JobCreate") -> None:
+    """Remove claim identity/provenance from public and internal raw bodies.
+
+    ``ticket=`` is the sole caller-selectable claim input. The final Officer
+    admission transaction writes these context keys after resolving the ticket
+    and locking the post; internal transport authentication does not make a
+    model-authored context dictionary authoritative.
+    """
+
+    if isinstance(job.context, dict):
+        job.context = {
+            key: value
+            for key, value in job.context.items()
+            if key not in _SERVER_OWNED_OFFICER_CONTEXT_KEYS
         }
 
 
@@ -9293,10 +9320,10 @@ class JobCreate(BaseModel):
         None,
         description=(
             "Backlog ticket (knowledge-note slug) this job claims. Officer "
-            "dispatches only. Stamped into context.ticket_note_id, which is "
-            "the claim ledger the auto-pull tick reads — pass it when working "
-            "a ticket by hand so the tick does not dispatch a second job for "
-            "the same work on its next cycle."
+            "dispatches only. The server resolves its current ready generation "
+            "and atomically writes the durable claim plus job; the provenance "
+            "is also stamped into context.ticket_note_id. Pass it when working "
+            "a ticket by hand so the tick cannot dispatch duplicate work."
         ),
     )
     work_category: str | None = Field(
@@ -12363,6 +12390,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
     receives its own isolated repository. Subjobs branch within that root repo.
     """
     internal_call = is_internal_call(request)
+    _strip_raw_officer_claim_context(job)
     caller: dict[str, Any] | None = None
     if not internal_call:
         caller = await require_approved_user(request, postgres_db)
@@ -12552,6 +12580,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         # the post lock.
         officer_slot_name: str | None = None
         officer_admission_preparation = None
+        officer_ticket_ready_at: datetime | None = None
         _officer_admit_thread_id = (
             str(job.thread_id) if (job.thread_id and root_creation) else None
         )
@@ -12612,6 +12641,83 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 if job.ticket:
                     context["ticket_note_id"] = str(job.ticket)
 
+                    # ``ticket=`` selects a current ready backlog note; it
+                    # never supplies dispatch authority. Resolve the exact
+                    # project-scoped row and its database-owned generation
+                    # before the short app-Postgres transaction. The final
+                    # post lock consumes this value atomically with the claim
+                    # and job INSERTs. No ready_at field is model-selectable.
+                    from services.project_backlog import (
+                        BACKLOG_NOTE_TYPES,
+                        fetch_ticket_state,
+                    )
+                    from services.work_categories import classify_ticket
+
+                    try:
+                        ticket_state = await fetch_ticket_state(
+                            vector_db,
+                            str(project_id),
+                            str(job.ticket),
+                        )
+                    except Exception as exc:
+                        raise HTTPException(
+                            status_code=503,
+                            detail=(
+                                "Backlog ticket authority is unavailable; "
+                                "no claim or job was created."
+                            ),
+                        ) from exc
+                    if ticket_state is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Backlog ticket '{job.ticket}' does not exist "
+                                "in this Officer Post's project."
+                            ),
+                        )
+                    if str(ticket_state.get("project_id") or "") != str(project_id):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Backlog ticket belongs to a different project.",
+                        )
+                    if (
+                        str(ticket_state.get("status") or "") != "active"
+                        or str(ticket_state.get("note_type") or "")
+                        not in BACKLOG_NOTE_TYPES
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Backlog ticket '{job.ticket}' is not an "
+                                "active backlog ticket."
+                            ),
+                        )
+                    classification = classify_ticket(ticket_state.get("tags"))
+                    if classification.problems:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Backlog ticket '{job.ticket}' is ambiguous: "
+                                + "; ".join(classification.problems)
+                            ),
+                        )
+                    ready_value = ticket_state.get("ready_at")
+                    if not classification.ready or not isinstance(
+                        ready_value, datetime
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Backlog ticket '{job.ticket}' is not ready "
+                                "with trusted Officer provenance."
+                            ),
+                        )
+                    officer_ticket_ready_at = (
+                        ready_value
+                        if ready_value.tzinfo
+                        else ready_value.replace(tzinfo=timezone.utc)
+                    )
+
                 # Precedence law (§6): the SLOT's category decides the contract
                 # this worker is held to; the officer's explicit arguments win
                 # over the roster default. A cross-category dispatch — sending
@@ -12630,6 +12736,15 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                         slot=officer_slot_name,
                         thread_id=_officer_admit_thread_id,
                     )
+
+        if job.ticket and officer_admission_preparation is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Backlog ticket claims require the exact current commissioned "
+                    "Officer Post incarnation. Ad-hoc jobs must omit ticket."
+                ),
+            )
 
         # VM permission gate: refuse at submit time so the user gets a clear
         # 403 instead of a silent failure later in the dispatcher. The
@@ -12880,6 +12995,8 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     preparation=officer_admission_preparation,
                     job_kwargs=create_kwargs,
                     ticket_note_id=str(job.ticket) if job.ticket else None,
+                    ticket_ready_at=officer_ticket_ready_at,
+                    ticket_claim_source="manual",
                 )
             except (OfficerAdmissionConflict, SlotAdmissionError) as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -12938,7 +13055,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
 
 
 @app.delete("/api/jobs/{job_id}")
-async def delete_job(request: Request, job_id: str) -> dict[str, str]:
+async def delete_job(request: Request, job_id: str) -> dict[str, Any]:
     """Delete a job and its requirements.
 
     P4c: destructive. Caller must own the job OR be project-owner OR admin.
@@ -13067,17 +13184,44 @@ async def delete_job(request: Request, job_id: str) -> dict[str, str]:
             logger.warning(f"Failed to clean up vector DB tables for job {job_id}: {e}")
 
         if job.get("execution_lane") == "stateless":
-            success = await postgres_db.delete_job(
+            delete_result = await postgres_db.delete_job(
                 job_id,
                 prepared_stateless=True,
+                deletion_actor_user_id=str(caller["id"]),
+                deletion_reason="authorized_api_delete",
+                return_claim_state=True,
             )
         else:
             # Pinned deletion keeps its historical collaborator signature and
             # behavior; only stateless checkpoints need the queue fence above.
-            success = await postgres_db.delete_job(job_id)
+            delete_result = await postgres_db.delete_job(
+                job_id,
+                deletion_actor_user_id=str(caller["id"]),
+                deletion_reason="authorized_api_delete",
+                return_claim_state=True,
+            )
+        # ``return_claim_state`` is implemented by PostgresDB. Tolerating the
+        # historical boolean here keeps narrow test collaborators and rolling
+        # application adapters safe, but only the mapping can assert a claim.
+        if isinstance(delete_result, dict):
+            success = bool(delete_result.get("deleted"))
+            claim_retained = bool(delete_result.get("ticket_claim_retained"))
+        else:
+            success = bool(delete_result)
+            claim_retained = False
         if not success:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-        return {"status": "deleted"}
+        return {
+            "status": "deleted",
+            "ticket_claim_retained": claim_retained,
+            "ticket_rearmed": False,
+            "message": (
+                "Job deleted. Its backlog-ticket claim remains durable; "
+                "deletion does not re-arm the ticket."
+                if claim_retained
+                else "Job deleted. This job had no durable backlog-ticket claim."
+            ),
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -20627,8 +20771,28 @@ async def _spawn_loop_stage(
     ``remaining`` are stamped for the heal. Raises if any job fails to create
     (the caller marks the loop failed — a half-spawned stage with no barrier
     would wedge). docs/features/loop_parallel_stages.md.
+
+    Every loop spawn funnels through here — the start endpoint's first stage,
+    the rotation advance, and the campaign advance — which is why the
+    ``unattended_operations`` re-check lives here rather than at the three call
+    sites. Revoking the grant under a running loop therefore halts it at the
+    next advance instead of letting it spend unattended forever; both advance
+    callers catch this and stop the loop with the reason in ``last_error``.
     """
     from services.project_loops import normalize_stage
+
+    # Fail closed on a grant revoked mid-run. The owner is the principal the
+    # spawned jobs run as, so the owner's grant is the one that must still hold
+    # — not the grant of whoever originally clicked start.
+    owner_id = loop.get("owner_id")
+    owner = await postgres_db.get_user(str(owner_id)) if owner_id else None
+    if owner and not await postgres_db.user_can_run_unattended_operations(
+        owner, str(loop.get("project_id") or "") or None
+    ):
+        raise PermissionError(
+            "unattended_operations: the loop owner no longer holds the "
+            "unattended_operations grant"
+        )
 
     roles = normalize_stage(stage)
     new_total = int(base_total) + len(roles)
@@ -35527,7 +35691,22 @@ async def commission_project_officer(
                 "project knowledge base (officer_knowledge_plane.md §3.1)."
             ),
         )
-    _user, project = await require_project_owner(request, postgres_db, project_id)
+    user, project = await require_project_owner(request, postgres_db, project_id)
+
+    # Capability gate, BEFORE anything mutates. The config PDP would also catch
+    # this downstream (``evaluate`` refuses ``officer.enabled`` without the
+    # grant, which is what covers a hand-rolled thread create), but only after
+    # ``update_project_officer_post`` below has already written the kit — a 422
+    # on a half-applied commission. Fail here, loudly, with nothing touched.
+    if not await postgres_db.user_can_run_unattended_operations(user, project_id):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Commissioning an officer requires the unattended_operations "
+                "capability grant. Ask an administrator to grant it "
+                "(Admin → Grants) for your user or for this project."
+            ),
+        )
 
     standing = await postgres_db.get_officer_thread_for_project(project_id)
     if standing:

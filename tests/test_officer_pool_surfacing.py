@@ -217,7 +217,12 @@ class TestReadyDepth:
             },
         ]
         db = AsyncMock()
-        db.newest_ticket_claims.return_value = {"claimed": NOW - timedelta(hours=1)}
+        db.ticket_claim_states.return_value = {
+            "claimed": {
+                "ready_generation_at": NOW - timedelta(hours=1),
+                "has_non_terminal": False,
+            }
+        }
         depth = await ready_depth_by_pool(
             db,
             _vector_db(rows),

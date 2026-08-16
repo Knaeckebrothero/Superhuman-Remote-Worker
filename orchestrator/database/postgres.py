@@ -76,6 +76,23 @@ _DOCKER_INVENTORY_COLUMNS = (
     "host_key_fingerprint, quarantine_reason"
 )
 
+# These keys are not caller metadata. They are written only by the final
+# post-locked Officer admission transaction. Keeping the strip in the database
+# funnel covers REST, internal HTTP, tools, automations and future callers;
+# the jobs trigger installed by migration 0162 is the direct-writer backstop.
+_SERVER_OWNED_OFFICER_CONTEXT_KEYS = frozenset(
+    {
+        "ticket_note_id",
+        "officer_admission",
+        "ticket_ready_at",
+        "ready_generation_at",
+        "ticket_claim_source",
+        "claim_source",
+        "officer_thread_id",
+        "officer_incarnation",
+    }
+)
+
 
 def _completion_sweep_exclusion_clause(
     enabled: bool, *, job_alias: str = "jobs"
@@ -1661,6 +1678,8 @@ class PostgresDB:
         authority_user_id: str | None = None,
         authority_project_ids: list[str] | None = None,
         execution_lane: str | None = None,
+        job_id: str | UUID | None = None,
+        authoritative_officer_admission: bool = False,
         conn: Any = None,
     ) -> Dict[str, Any]:
         """Create a new job.
@@ -1708,6 +1727,13 @@ class PostgresDB:
                 memberships are required at the insertion linearization point.
             execution_lane: Explicit execution plane, or None to inherit an
                 authoritative parent job's lane. Root jobs default to pinned.
+            job_id: Optional preallocated UUID. Officer admission uses this to
+                write the durable ticket claim before the matching job INSERT
+                in the same transaction. Ordinary callers omit it.
+            authoritative_officer_admission: Preserve the server-owned Officer
+                claim/admission context stamped by the final admission helper.
+                Valid only with a caller-owned transaction; every ordinary
+                caller is stripped at this last common funnel.
             conn: Optional caller-owned connection ALREADY inside a transaction.
                 Officer admission needs its stable post lock, ticket-claim
                 check, lineage capacity count and this INSERT to be one atomic
@@ -1726,6 +1752,7 @@ class PostgresDB:
         if execution_lane not in (None, "pinned", "stateless"):
             raise ValueError(f"Unsupported job execution lane: {execution_lane!r}")
         thread_uuid = UUID(created_by_thread_id) if created_by_thread_id else None
+        job_uuid = UUID(str(job_id)) if job_id is not None else uuid4()
         datasource_uuids = _uuid_list(datasource_ids)
         authority_project_uuids = _uuid_list(authority_project_ids)
         policy_snapshot = _normalize_policy_revision_snapshot(
@@ -1746,6 +1773,15 @@ class PostgresDB:
         # connector fails the whole data contract instead of becoming a
         # silently reduced selection. Always stamp new jobs, including [].
         context = dict(context or {})
+        if authoritative_officer_admission:
+            if conn is None:
+                raise ValueError(
+                    "authoritative Officer admission requires a caller-owned "
+                    "transaction"
+                )
+        else:
+            for key in _SERVER_OWNED_OFFICER_CONTEXT_KEYS:
+                context.pop(key, None)
         safe_provenance = dict(datasource_selection_provenance or {})
         safe_provenance["datasource_ids"] = [
             str(datasource_id) for datasource_id in datasource_uuids
@@ -1778,7 +1814,7 @@ class PostgresDB:
             )
             written = await active_conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete, execution_lane)
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete, execution_lane, id)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
                         COALESCE(
                             $21::text,
@@ -1787,7 +1823,8 @@ class PostgresDB:
                               WHERE parent.id = $10
                               FOR SHARE),
                             'pinned'
-                        ))
+                        ),
+                        $22)
                 RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind, created_by_thread_id, wake_on_complete, execution_lane
                 """,
                 description,
@@ -1811,6 +1848,7 @@ class PostgresDB:
                 thread_uuid,
                 wake_on_complete,
                 execution_lane,
+                job_uuid,
             )
             if datasource_uuids:
                 await active_conn.executemany(
@@ -1844,20 +1882,36 @@ class PostgresDB:
         job_id: str,
         *,
         prepared_stateless: bool = False,
-    ) -> bool:
-        """Delete a job (cascades to requirements).
+        deletion_actor_user_id: str | None = None,
+        deletion_reason: str = "database_delete",
+        return_claim_state: bool = False,
+    ) -> bool | Dict[str, bool]:
+        """Delete a job while retaining and auditing any Officer claim.
 
         Args:
             job_id: Job UUID as string
+            deletion_actor_user_id: Already-authorized user performing the
+                deletion, when the caller has that identity.
+            deletion_reason: Stable deletion-path reason for the claim audit.
+            return_claim_state: Return the deletion result together with claim
+                retention truth captured inside this transaction. The default
+                preserves the historical boolean collaborator contract.
 
         Returns:
-            True if deleted, False if not found
+            A boolean by default. With ``return_claim_state``, a mapping with
+            ``deleted`` and ``ticket_claim_retained`` booleans.
         """
         try:
             uuid_val = UUID(job_id)
         except ValueError:
+            if return_claim_state:
+                return {"deleted": False, "ticket_claim_retained": False}
             return False
+        actor_uuid = (
+            UUID(str(deletion_actor_user_id)) if deletion_actor_user_id else None
+        )
 
+        claim_retained = False
         async with self.acquire() as conn:
             async with conn.transaction():
                 if prepared_stateless:
@@ -1929,6 +1983,36 @@ class PostgresDB:
                     """,
                     uuid_val,
                 )
+                deleting_job = await conn.fetchrow(
+                    "SELECT status FROM jobs WHERE id = $1 FOR UPDATE",
+                    uuid_val,
+                )
+                if deleting_job is not None:
+                    # Deletion is never a release. This update and the jobs
+                    # DELETE share the transaction, so a fault cannot leave an
+                    # audit tombstone for a job row that survived (or erase the
+                    # claim for one that did not).
+                    claim_retained = bool(
+                        await conn.fetchval(
+                            """
+                            UPDATE officer_ticket_claims
+                               SET job_deleted_at = COALESCE(job_deleted_at, now()),
+                                   job_status_at_delete = COALESCE(
+                                       job_status_at_delete, $2
+                                   ),
+                                   deletion_actor_user_id = COALESCE(
+                                       deletion_actor_user_id, $3
+                                   ),
+                                   deletion_reason = COALESCE(deletion_reason, $4)
+                             WHERE job_id = $1
+                         RETURNING TRUE
+                            """,
+                            uuid_val,
+                            str(deleting_job["status"]),
+                            actor_uuid,
+                            str(deletion_reason or "database_delete"),
+                        )
+                    )
                 if prepared_stateless:
                     queue_result = await conn.execute(
                         "DELETE FROM run_queue "
@@ -1957,7 +2041,37 @@ class PostgresDB:
                         uuid_val,
                     )
 
-        return result == "DELETE 1"
+        deleted = result == "DELETE 1"
+        if return_claim_state:
+            return {
+                "deleted": deleted,
+                "ticket_claim_retained": deleted and claim_retained,
+            }
+        return deleted
+
+    async def job_has_durable_ticket_claim(self, job_id: str) -> bool:
+        """Whether ``job_id`` has a retained Officer ticket claim.
+
+        This remains queryable after physical job deletion because the ledger
+        deliberately has no jobs FK. API deletion uses it for truthful response
+        metadata for inspection callers. Destructive API responses use the
+        claim state returned by :meth:`delete_job` from the deletion
+        transaction; they must not perform this second, fallible read after
+        commit.
+        """
+
+        try:
+            uuid_val = UUID(job_id)
+        except (ValueError, TypeError):
+            return False
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM officer_ticket_claims WHERE job_id = $1)",
+                    uuid_val,
+                )
+            )
 
     async def has_child_jobs(self, job_id: str) -> bool:
         """True if any job row (any status) has this job as its parent.
@@ -10920,21 +11034,17 @@ class PostgresDB:
         lineage = [str(r["tid"]) for r in rows]
         return lineage or [str(thread_uuid)]
 
-    async def newest_ticket_claims(
+    async def ticket_claim_states(
         self, project_id: str, note_ids: List[str]
-    ) -> Dict[str, datetime]:
-        """Newest claim timestamp per backlog ticket, in ANY job status.
+    ) -> Dict[str, Dict[str, Any]]:
+        """Durable claim/generation state for project-scoped backlog tickets.
 
-        The one-shot claim read (officer_backlog_pools.md §5.3). Terminal jobs
-        are deliberately included: disposition is asynchronous and officer-owned,
-        so a completed job still holds its ticket until the officer reviews the
-        outcome and re-readies it. Excluding them was the original design's
-        fatal bug — every finished ticket would be re-dispatched within a
-        minute, and every failing one re-burned at breaker cadence forever.
-
-        The caller compares each value against the ticket's ``ready_at``: an
-        authorization NEWER than the newest claim means the officer has re-armed
-        it since, and only then is the ticket eligible again.
+        Claims come from ``officer_ticket_claims``, never reconstructed from
+        the current jobs population. ``has_non_terminal`` is conservative:
+        an extant non-terminal job, a deleted job recorded non-terminal, or a
+        disappeared job with no deletion audit all block a newer generation.
+        That last case makes direct retention/SQL mistakes fail closed rather
+        than turning deletion into an implicit claim release.
         """
         if not note_ids:
             return {}
@@ -10945,17 +11055,108 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT context->>'ticket_note_id' AS note_id,
-                       MAX(created_at) AS newest
-                  FROM jobs
-                 WHERE project_id = $1
-                   AND context->>'ticket_note_id' = ANY($2::text[])
-                 GROUP BY 1
+                SELECT DISTINCT ON (claim.ticket_note_id)
+                       claim.ticket_note_id AS note_id,
+                       claim.ready_generation_at,
+                       claim.claimed_at,
+                       claim.job_id,
+                       claim.source,
+                       EXISTS (
+                           SELECT 1
+                             FROM officer_ticket_claims blocker
+                             LEFT JOIN jobs live ON live.id = blocker.job_id
+                            WHERE blocker.project_id = claim.project_id
+                              AND blocker.ticket_note_id = claim.ticket_note_id
+                              AND (
+                                  (live.id IS NOT NULL AND live.status NOT IN
+                                      ('completed', 'failed', 'cancelled'))
+                                  OR
+                                  (live.id IS NULL AND (
+                                      blocker.job_deleted_at IS NULL
+                                      OR blocker.job_status_at_delete IS NULL
+                                      OR blocker.job_status_at_delete NOT IN
+                                         ('completed', 'failed', 'cancelled')
+                                  ))
+                              )
+                       ) AS has_non_terminal
+                  FROM officer_ticket_claims claim
+                 WHERE claim.project_id = $1
+                   AND claim.ticket_note_id = ANY($2::text[])
+                 ORDER BY claim.ticket_note_id,
+                          claim.ready_generation_at DESC,
+                          claim.claimed_at DESC,
+                          claim.id DESC
                 """,
                 project_uuid,
                 list(note_ids),
             )
-        return {r["note_id"]: r["newest"] for r in rows if r["note_id"]}
+        return {str(row["note_id"]): dict(row) for row in rows if row["note_id"]}
+
+    async def newest_ticket_claims(
+        self, project_id: str, note_ids: List[str]
+    ) -> Dict[str, datetime]:
+        """Compatibility view: newest durable consumed generation per ticket."""
+
+        states = await self.ticket_claim_states(project_id, note_ids)
+        return {
+            note_id: state["ready_generation_at"]
+            for note_id, state in states.items()
+            if state.get("ready_generation_at") is not None
+        }
+
+    async def insert_officer_ticket_claim(
+        self,
+        *,
+        conn: Any,
+        project_id: str,
+        ticket_note_id: str,
+        ready_generation_at: datetime,
+        source: str,
+        officer_thread_id: str,
+        officer_incarnation: int,
+        officer_slot: str | None,
+        work_category: str | None,
+        admission_config_fingerprint: str,
+        admission_lineage_size: int,
+        job_id: str | UUID,
+    ) -> Dict[str, Any]:
+        """Insert one claim on the caller-owned admission transaction.
+
+        There is intentionally no acquire/transaction fallback: a claim that
+        can commit separately from capacity validation or the job row would
+        recreate BP-05 in a different table.
+        """
+
+        row = await conn.fetchrow(
+            """
+            INSERT INTO officer_ticket_claims (
+                project_id,
+                ticket_note_id,
+                ready_generation_at,
+                source,
+                officer_thread_id,
+                officer_incarnation,
+                officer_slot,
+                work_category,
+                admission_config_fingerprint,
+                admission_lineage_size,
+                job_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING *
+            """,
+            UUID(str(project_id)),
+            str(ticket_note_id),
+            ready_generation_at,
+            str(source),
+            UUID(str(officer_thread_id)),
+            int(officer_incarnation),
+            officer_slot,
+            work_category,
+            str(admission_config_fingerprint),
+            int(admission_lineage_size),
+            UUID(str(job_id)),
+        )
+        return dict(row)
 
     async def list_officer_slot_claims(
         self,
@@ -10965,37 +11166,55 @@ class PostgresDB:
         include_terminal: bool = False,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
-        """Ticket-claiming jobs from an officer post's lineage, newest first.
+        """Durable ticket claims from an officer post's lineage, newest first.
 
         Serves three of the tick's reads off one shape: the executor
         disposition gate (newest terminal executor claim), the pool circuit
         breaker (were the last two distinct-ticket outcomes failures), and
         stale-claim surfacing (how long has this claim sat without moving).
+        Deleted jobs remain visible from their claim audit fields.
         """
         if not capacity_lineage:
             return []
         clauses = [
-            "created_by_thread_id = ANY($1::uuid[])",
-            "context ? 'ticket_note_id'",
+            "claim.officer_thread_id = ANY($1::uuid[])",
         ]
         params: List[Any] = [[UUID(t) for t in capacity_lineage]]
         if slot is not None:
             params.append(slot)
-            clauses.append(f"context->>'officer_slot' = ${len(params)}")
+            clauses.append(f"claim.officer_slot = ${len(params)}")
         if not include_terminal:
-            clauses.append("status NOT IN ('completed', 'failed', 'cancelled')")
+            clauses.append(
+                "((live.id IS NOT NULL AND live.status NOT IN "
+                "('completed', 'failed', 'cancelled')) OR "
+                "(live.id IS NULL AND (claim.job_deleted_at IS NULL OR "
+                "claim.job_status_at_delete IS NULL OR "
+                "claim.job_status_at_delete NOT IN "
+                "('completed', 'failed', 'cancelled'))))"
+            )
         params.append(int(limit))
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT id, status, created_at, updated_at, completed_at,
-                       project_id, assigned_agent_id,
-                       context->>'ticket_note_id' AS ticket_note_id,
-                       context->>'officer_slot' AS officer_slot,
-                       context->>'work_category' AS work_category
-                  FROM jobs
+                SELECT claim.job_id AS id,
+                       COALESCE(live.status, claim.job_status_at_delete,
+                                'deleted_unknown') AS status,
+                       claim.claimed_at AS created_at,
+                       COALESCE(live.updated_at, claim.job_deleted_at,
+                                claim.claimed_at) AS updated_at,
+                       live.completed_at,
+                       claim.project_id,
+                       live.assigned_agent_id,
+                       claim.ticket_note_id,
+                       claim.officer_slot,
+                       claim.work_category,
+                       claim.ready_generation_at,
+                       claim.source AS claim_source,
+                       claim.job_deleted_at
+                  FROM officer_ticket_claims claim
+                  LEFT JOIN jobs live ON live.id = claim.job_id
                  WHERE {" AND ".join(clauses)}
-                 ORDER BY created_at DESC
+                 ORDER BY claim.claimed_at DESC
                  LIMIT ${len(params)}
                 """,
                 *params,
@@ -23991,6 +24210,45 @@ class PostgresDB:
         except Exception:
             logger.exception(
                 "complete_unmerged_pr grant read failed; denying completion"
+            )
+            return False
+
+    async def user_can_run_unattended_operations(
+        self, user: dict, project_id: str | None
+    ) -> bool:
+        """Effective unattended_operations grant (project loops + the officer).
+
+        Admins short-circuit to True. Mirrors user_can_complete_unmerged_pr,
+        including the project_id passthrough — a loop and an officer both live
+        ON a project, so the project scope is the axis an operator most wants
+        ("this team may run loops, that one may not") and dropping it would
+        silently reduce the key to a user-only capability.
+
+        Fail mode is CLOSED: a capability whose read failed is not a capability
+        the caller has, and the thing being gated is unbounded unattended
+        spend. This is the loop half of the gate only; the officer half also
+        rides the config PDP via `evaluate` on `officer.enabled`, which is what
+        covers a hand-rolled thread create and stands a running officer down on
+        revocation. Spec: docs/features/unattended_operations_grant.md.
+        """
+        if user.get("is_admin"):
+            return True
+        try:
+            scoped = await self.list_grants_for_scopes(
+                user_id=str(user["id"]),
+                project_ids=[str(project_id)] if project_id else [],
+            )
+            from src.core.capability_grants import resolve_grants
+
+            g = resolve_grants(
+                user_rows=scoped["user"],
+                project_rows=scoped["project"],
+                global_rows=scoped["global"],
+            )
+            return bool(g.get("unattended_operations"))
+        except Exception:
+            logger.exception(
+                "unattended_operations grant read failed; denying unattended work"
             )
             return False
 

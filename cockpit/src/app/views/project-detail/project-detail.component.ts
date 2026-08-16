@@ -111,7 +111,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
 
         <!-- Tabs -->
         <div class="tab-bar">
-          @for (t of tabList; track t.id) {
+          @for (t of tabList(); track t.id) {
             <button
               class="tab-btn"
               [class.active]="activeTab() === t.id"
@@ -811,12 +811,16 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           }
 
           <!-- SETTINGS TAB -->
-          @if (activeTab() === 'loop') {
+          <!-- Loop + Centurion are gated on unattended_operations. The tab
+               buttons are already filtered out below; these guards additionally
+               cover a grant revoked while the tab is open (capabilities reload)
+               so the surface disappears rather than lingering. -->
+          @if (activeTab() === 'loop' && canRunUnattendedOperations()) {
             <app-project-loop [projectId]="project()?.id ?? ''" />
             <app-project-backlog [projectId]="project()?.id ?? ''" />
           }
 
-          @if (activeTab() === 'centurion') {
+          @if (activeTab() === 'centurion' && canRunUnattendedOperations()) {
             <app-project-officer
               [projectId]="project()?.id ?? ''"
               [projectName]="project()?.name ?? ''"
@@ -1774,7 +1778,13 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly kbFilterType = signal('');
   readonly kbFilterStatus = signal('');
 
-  readonly tabList: { id: Tab; labelKey: string }[] = [
+  /** True when the caller may run project loops and commission an officer.
+   * Fails closed while capabilities load, so the two tabs appear only once
+   * entitlement is proven. */
+  readonly canRunUnattendedOperations = this.capabilities.canRunUnattendedOperations;
+
+  /** Tabs that are always available, in display order. */
+  private readonly baseTabs: { id: Tab; labelKey: string }[] = [
     { id: 'overview', labelKey: 'projectDetail.tabs.overview' },
     { id: 'jobs', labelKey: 'projectDetail.tabs.jobs' },
     { id: 'knowledge', labelKey: 'projectDetail.tabs.knowledge' },
@@ -1786,6 +1796,16 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     { id: 'centurion', labelKey: 'projectDetail.tabs.centurion' },
     { id: 'settings', labelKey: 'projectDetail.tabs.settings' },
   ];
+
+  /** `baseTabs` minus the unattended-operations surfaces when the caller lacks
+   * the grant. Hiding rather than disabling: there is nothing useful to show a
+   * user who cannot start either one, and the orchestrator refuses the writes
+   * either way. */
+  readonly tabList = computed(() =>
+    this.canRunUnattendedOperations()
+      ? this.baseTabs
+      : this.baseTabs.filter((t) => t.id !== 'loop' && t.id !== 'centurion'),
+  );
 
   private projectId = '';
   private refreshInterval: ReturnType<typeof setInterval> | null = null;

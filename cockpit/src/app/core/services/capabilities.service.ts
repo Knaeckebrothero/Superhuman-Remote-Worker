@@ -70,6 +70,21 @@ export class CapabilitiesService {
     return g['public_datasources'] === true;
   });
 
+  /** Whether the project Loop and Centurion tabs may render. FAILS CLOSED
+   * while loading and on fetch error, same posture as `canPublishDatasources`
+   * — an unattended loop or officer is unbounded token spend, so the surface
+   * stays hidden until a successful fetch proves entitlement. Hiding is UX
+   * only; the orchestrator refuses start/resume/convert/commission with 403
+   * and the config PDP refuses `officer.enabled` regardless of what renders.
+   * Spec: docs/features/unattended_operations_grant.md. */
+  readonly canRunUnattendedOperations = computed(() => {
+    if (this.loadFailed()) return false;
+    const g = this.grants();
+    if (g === null) return true; // admin/unrestricted
+    if (g === undefined) return false; // loading
+    return g['unattended_operations'] === true;
+  });
+
   /** permission_mode options at/below the user's ceiling (admin/loading ⇒ all). */
   readonly permissionModes = computed(() =>
     allowedEnumOptions(this.grants() ?? null, 'permission_mode', PERMISSION_MODES, this.catalog()),

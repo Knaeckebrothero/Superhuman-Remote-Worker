@@ -426,6 +426,10 @@ def db(monkeypatch):
     db.enqueue_session_wake_event = AsyncMock(return_value=True)
     db.confirm_project_officer_incarnation = AsyncMock(return_value=True)
     db.get_thread = AsyncMock(return_value=None)
+    # Commissioning is gated on unattended_operations; these tests are about
+    # lifecycle mechanics, so the grant is held. TestCommissionCapabilityGate
+    # below flips it to False and asserts the refusal.
+    db.user_can_run_unattended_operations = AsyncMock(return_value=True)
     monkeypatch.setattr(orch_main, "postgres_db", db)
     return db
 
@@ -677,6 +681,46 @@ class TestPatchEndpoint:
             MagicMock(), PROJECT_ID, {"slots": {"line": {"count": 0}}}
         )
         assert out["status"] == "updated"
+
+
+class TestCommissionCapabilityGate:
+    """Commissioning is gated on the `unattended_operations` capability grant
+    (docs/features/unattended_operations_grant.md). The config PDP refuses
+    `officer.enabled` downstream too, but only after the kit has been written —
+    so the point of this gate is that it fires FIRST and touches nothing."""
+
+    @pytest.mark.asyncio
+    async def test_missing_grant_403s_before_anything_mutates(
+        self, db, as_project_admin, quiet_side_channels, monkeypatch
+    ):
+        create = AsyncMock()
+        monkeypatch.setattr(orch_main, "create_thread", create)
+        db.user_can_run_unattended_operations = AsyncMock(return_value=False)
+
+        with pytest.raises(HTTPException) as exc:
+            await commission_project_officer(MagicMock(), PROJECT_ID, None)
+
+        assert exc.value.status_code == 403
+        assert "unattended_operations" in str(exc.value.detail)
+        create.assert_not_awaited()
+        db.update_project_officer_post.assert_not_awaited()
+        db.merge_project_officer_config.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_grant_is_resolved_against_this_project(
+        self, db, as_project_admin, quiet_side_channels, monkeypatch
+    ):
+        """Project scope is the axis an operator most wants ("this team may run
+        officers, that one may not"), so the project id must reach the read —
+        dropping it would silently reduce the key to a user-only capability."""
+        monkeypatch.setattr(orch_main, "create_thread", AsyncMock())
+        db.user_can_run_unattended_operations = AsyncMock(return_value=False)
+
+        with pytest.raises(HTTPException):
+            await commission_project_officer(MagicMock(), PROJECT_ID, None)
+
+        _user, project_id = db.user_can_run_unattended_operations.await_args.args
+        assert project_id == PROJECT_ID
 
 
 class TestCommissionEndpoint:

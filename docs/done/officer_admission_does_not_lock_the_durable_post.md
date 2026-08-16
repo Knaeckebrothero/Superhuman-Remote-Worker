@@ -89,16 +89,15 @@ and one connection, then:
 3. validates the exact live enabled/unheld incarnation (and `auto_pull`/category for the
    tick), post config, runtime roster, owner, and complete incarnation lineage;
 4. counts every non-terminal job across that lineage;
-5. validates the current job-row ticket claim/re-ready generation;
+5. validates the current durable ticket claim/re-ready generation;
 6. stamps authoritative slot/category/config/incarnation provenance; and
 7. calls `PostgresDB.create_job(conn=...)` before commit.
 
 Manual `POST /api/jobs` and automatic backlog dispatch both call
 `admit_and_create_job()`. Same-ticket contention is normalized to a retryable conflict,
-while `uq_jobs_active_ticket_claim` remains the fail-closed backstop for legacy/direct
-writers. The connection-aware inner helper is intentionally ready for BP-05 to add a
-durable claim INSERT later without another admission-funnel rewrite; no BP-05 ledger was
-added here.
+while `uq_jobs_active_ticket_claim` remains a secondary non-terminal backstop. BP-05 later
+used the connection-aware inner helper to add the durable claim INSERT to the same
+transaction without another admission-funnel rewrite.
 
 The tick now starts from the dedicated
 `list_commissioned_officer_posts_for_backlog()` query (`project_officers JOIN threads`),

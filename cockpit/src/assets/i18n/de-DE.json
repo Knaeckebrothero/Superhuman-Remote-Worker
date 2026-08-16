@@ -592,7 +592,7 @@
   },
   "jobs": {
     "title": "Aufträge",
-    "confirmDelete": "Diesen Job endgültig löschen?",
+    "confirmDelete": "Diesen Job endgültig löschen? Ein vorhandener Backlog-Ticket-Anspruch bleibt bestehen und wird nicht erneut freigegeben.",
     "confirmCancel": "Diesen Job abbrechen?",
     "confirmCancelHint": "Sie können ihn später von einem Checkpoint fortsetzen.",
     "confirmCancelDismiss": "Weiterlaufen lassen",
