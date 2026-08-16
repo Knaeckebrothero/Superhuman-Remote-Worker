@@ -107,6 +107,7 @@ GET    /api/agents/threads/{thread_id}/workspace                                
 DELETE /api/agents/{agent_id}                                                           admin:_require_admin
 GET    /api/agents/{agent_id}                                                           admin:_require_admin
 POST   /api/agents/{agent_id}/heartbeat                                                 internal:require_internal
+POST   /api/agents/{agent_id}/runtime-actor/session                                     internal:require_internal
 GET    /api/agents/{agent_id}/system-info                                               admin:_require_admin
 GET    /api/api-keys                                                                    gated:require_approved_user
 POST   /api/api-keys                                                                    gated:require_approved_user
