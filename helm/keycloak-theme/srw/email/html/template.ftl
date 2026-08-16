@@ -59,7 +59,7 @@
 <tr><td class="srw-body" style="padding:16px 32px 24px 32px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:15px;line-height:24px;color:#2a1d12;">
 <#nested>
 </td></tr>
-<tr><td style="padding:16px 32px 24px 32px;border-top:1px solid #dccfb6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:12px;line-height:18px;color:#8a7b66;">
+<tr><td style="padding:16px 32px 24px 32px;border-top:1px solid #dccfb6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:12px;line-height:18px;color:#5a4632;">
 ${_brand}
 </td></tr>
 </table>

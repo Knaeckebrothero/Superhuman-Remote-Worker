@@ -5,6 +5,7 @@ token in :where(), which has zero specificity, so putting dark values under
 :root or a media query loses to nothing and silently disables dark mode.
 """
 
+import functools
 import json
 import re
 import shutil
@@ -112,7 +113,11 @@ def test_dark_tokens_are_on_the_bare_class_not_root_or_media_query() -> None:
 
 
 def test_overrides_the_brandable_keycloak_variables() -> None:
-    css = LOGIN_CSS.read_text()
+    # Judges declarations, not raw text (see _css_rules). The header and the
+    # per-block comments name these tokens while explaining them -- mutation-
+    # proved: replacing the real `--keycloak-logo-url: url(...)` declaration
+    # with a comment mentioning it kept this test green.
+    css = _css_rules(LOGIN_CSS.read_text())
     for token in (
         "--pf-v5-global--primary-color--100",
         "--pf-v5-global--BackgroundColor--100",
@@ -127,10 +132,18 @@ def test_overrides_the_brandable_keycloak_variables() -> None:
 def test_header_wrapper_colour_is_forced() -> None:
     """keycloak.v2 sets #kc-header-wrapper colour with !important, relying on a
     dark background image we remove -- without countering it the header goes
-    white-on-cream."""
-    css = LOGIN_CSS.read_text()
-    assert "#kc-header-wrapper" in css
-    assert "!important" in css
+    white-on-cream.
+
+    Scoped to the rule block. A file-wide `"!important" in css` is satisfied by
+    any other rule that happens to carry one -- and one does: `.login-pf body`
+    forces the page ground a few lines above. Deleting the !important from THIS
+    rule (the whole subject of the test) then left it green. Routing through
+    _css_rules() alone is not enough for the same reason.
+    """
+    rules = _css_rules(LOGIN_CSS.read_text())
+    found = re.search(r"#kc-header-wrapper\s*\{[^}]*\}", rules)
+    assert found, "no #kc-header-wrapper rule block -- was the selector renamed?"
+    assert "!important" in found.group(0)
 
 
 def test_no_external_font_dependency() -> None:
@@ -172,6 +185,56 @@ def test_light_tokens_match_the_shared_brand_palette() -> None:
         )
 
 
+def test_dark_tokens_match_the_shared_senate_palette() -> None:
+    """The dark half of the login palette had no guard at all.
+
+    The light block is chained SCSS -> brand.py -> CSS by the test above, but
+    nothing tied .pf-v5-theme-dark to anything -- which is how Color--200 came
+    to hold Senate `text-muted` while its light counterpart holds
+    `text-secondary`, the same token mapped to two different roles. brand.py
+    deliberately carries only Travertine (the orchestrator renders no dark
+    surfaces), so this reads $senate-theme straight out of the SCSS.
+
+    Scoped to the .pf-v5-theme-dark block: a whole-file search would match the
+    :root declarations of the very same token names.
+    """
+    from services import brand
+
+    scss = (ROOT / brand.SCSS_TOKEN_SOURCE).read_text()
+    start = scss.index("$senate-theme: (")
+    senate = {
+        k: brand.normalize_hex(v)
+        for k, v in re.findall(
+            r"'([a-z0-9-]+)':\s*(#[0-9a-fA-F]{3,8})", scss[start : scss.index("\n);", start)]
+        )
+    }
+    assert len(senate) >= 20, (
+        f"only parsed {len(senate)} tokens from $senate-theme; fix the parser "
+        "before trusting this test"
+    )
+
+    rules = _css_rules(LOGIN_CSS.read_text())
+    block = re.search(r"\.pf-v5-theme-dark\s*\{[^}]*\}", rules)
+    assert block, "no .pf-v5-theme-dark rule block -- was the selector renamed?"
+
+    expected = {
+        "--pf-v5-global--primary-color--100": senate["accent-color"],
+        "--pf-v5-global--primary-color--200": senate["accent-hover"],
+        "--pf-v5-global--BackgroundColor--100": senate["panel-bg"],
+        "--pf-v5-global--BackgroundColor--200": senate["app-bg"],
+        "--pf-v5-global--Color--100": senate["text-primary"],
+        "--pf-v5-global--Color--200": senate["text-secondary"],
+        "--pf-v5-global--BorderColor--100": senate["border-color"],
+        "--keycloak-card-top-color": senate["accent-color"],
+    }
+    for token, want in expected.items():
+        found = re.search(rf"{re.escape(token)}:\s*(#[0-9a-fA-F]{{3,8}})", block.group(0))
+        assert found, f"{token} missing from the .pf-v5-theme-dark block"
+        assert brand.normalize_hex(found.group(1)) == want, (
+            f"{token} is {found.group(1)}, $senate-theme says {want}"
+        )
+
+
 KC = ROOT / "helm/templates/services/keycloak.yaml"
 
 
@@ -184,15 +247,21 @@ def test_configmap_enumerates_every_theme_file() -> None:
         assert f"path: {path}" in kc, f"{path} has no items[].path entry"
 
 
-def _render_theme_configmap_data() -> dict[str, str]:
-    """Render the real chart and return the `data` mapping the Kubernetes API
-    would actually see for the `keycloak-theme` ConfigMap.
+@functools.lru_cache(maxsize=1)
+def _render_theme_docs() -> tuple[dict[str, str], list[dict]]:
+    """Render the real chart once and return what the API server would see:
+    the `keycloak-theme` ConfigMap's `data` mapping, and the Deployment's
+    `keycloak-theme` volume `items` list.
 
     A regex over the *template source* can only ever match the literal
     `{{ $key }}` text -- never the templated-out key it produces -- so it
     finds nothing and passes vacuously even if the `replace "/" "_"` step is
     deleted entirely. Only the rendered output proves what key the API server
     receives. Mirrors the render helper in test_vm_chart_manifest_contract.py.
+
+    Both halves come from ONE render because the invariant that matters spans
+    them: an items[].key that no ConfigMap key satisfies is not a rendering
+    error, it is a pod that never starts (CreateContainerConfigError).
     """
     result = subprocess.run(
         [
@@ -213,14 +282,25 @@ def _render_theme_configmap_data() -> dict[str, str]:
     )
     assert result.returncode == 0, f"helm template failed:\n{result.stderr}"
 
+    data: dict[str, str] | None = None
+    items: list[dict] | None = None
     for doc in yaml.safe_load_all(result.stdout):
-        if (
-            doc
-            and doc.get("kind") == "ConfigMap"
-            and doc.get("metadata", {}).get("name", "").endswith("-keycloak-theme")
-        ):
-            return doc.get("data") or {}
-    raise AssertionError("no keycloak-theme ConfigMap in the render")
+        if not doc:
+            continue
+        name = doc.get("metadata", {}).get("name", "")
+        if doc.get("kind") == "ConfigMap" and name.endswith("-keycloak-theme"):
+            data = doc.get("data") or {}
+        elif doc.get("kind") == "Deployment" and name.endswith("-keycloak"):
+            for vol in doc["spec"]["template"]["spec"].get("volumes") or []:
+                if vol.get("name") == "keycloak-theme":
+                    items = (vol.get("configMap") or {}).get("items") or []
+    assert data is not None, "no keycloak-theme ConfigMap in the render"
+    assert items is not None, "no keycloak-theme volume on the keycloak Deployment"
+    return data, items
+
+
+def _render_theme_configmap_data() -> dict[str, str]:
+    return _render_theme_docs()[0]
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
@@ -235,6 +315,34 @@ def test_configmap_keys_have_no_slashes() -> None:
         assert "/" not in key, (
             f"{key!r} still contains '/' -- the API server would reject it"
         )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
+def test_volume_items_reference_keys_the_configmap_actually_has() -> None:
+    """Joins the two halves nothing else joined.
+
+    test_configmap_enumerates_every_theme_file checks items[].path against the
+    files on disk; test_configmap_keys_have_no_slashes checks the rendered
+    ConfigMap keys. Both stay green under two mutations that break the deploy:
+
+      * typo one items[].key -- kubelet cannot resolve it and the pod sits in
+        CreateContainerConfigError, while every `path:` assertion still matches;
+      * change the mangling in keycloak-theme-configmap.yaml (say `-` instead
+        of `_`) -- keys stay slash-free, paths are untouched, and every
+        hand-written items[].key goes stale at once.
+
+    Set equality in both directions: a missing key breaks the mount, and a
+    ConfigMap key with no items entry is a theme file that silently never
+    appears at the mount point.
+    """
+    data, items = _render_theme_docs()
+    assert data, "keycloak-theme ConfigMap rendered with an EMPTY data block"
+    assert items, "keycloak-theme volume rendered with NO items"
+    assert {i["key"] for i in items} == set(data), (
+        "items[].key and ConfigMap keys disagree.\n"
+        f"  keys with no items entry (never mounted): {sorted(set(data) - {i['key'] for i in items})}\n"
+        f"  items with no such key (pod will not start): {sorted({i['key'] for i in items} - set(data))}"
+    )
 
 
 def test_theme_is_mounted_at_the_themes_root() -> None:
@@ -314,6 +422,51 @@ def test_email_wrapper_sets_inline_fallbacks() -> None:
     ftl = _ftl_directives((THEME / "email/html/template.ftl").read_text())
     enclosing_td = ftl.split("<#nested>")[0].rsplit("<tr>", 1)[1]
     assert "font-family" in enclosing_td
+
+
+def test_email_wrapper_uses_no_unmanaged_colours() -> None:
+    """Extends the drift guard across the FOURTH copy of the palette.
+
+    SCSS -> brand.py -> login CSS are chained by tests above and by
+    tests/test_brand_palette.py, but template.ftl carried six literal hexes
+    under no guard at all -- and that is exactly how a `text-muted` footer
+    colour (3.82:1 on panel-bg, below the 4.5:1 AA floor the rest of this
+    feature exists to fix) reached the branch after the ruling that removed it
+    everywhere else. Judges directives, not raw text: the header comment must
+    stay free to name a colour it explains (see _ftl_directives).
+    """
+    from services import brand
+
+    ftl = _ftl_directives((THEME / "email/html/template.ftl").read_text())
+    managed = {brand.normalize_hex(v) for v in brand.TRAVERTINE.values()}
+    used = {brand.normalize_hex(h) for h in re.findall(r"#[0-9a-fA-F]{3,6}\b", ftl)}
+    assert used, "no hexes found in template.ftl -- the extractor is broken"
+    assert used <= managed, f"unmanaged colours: {sorted(used - managed)}"
+
+
+def test_email_wrapper_never_uses_text_muted() -> None:
+    """The membership guard above does NOT cover this, and that is the point.
+
+    `text-muted` is a member of brand.TRAVERTINE (the dict mirrors the SCSS
+    token map, and the drift guard checks every key), so a footer painted
+    #8a7b66 is perfectly "managed" -- and measures 3.82:1 on panel-bg, under
+    the 4.5:1 AA floor for the 12px text it was used on. That is precisely the
+    defect this branch shipped and then had to remove again. Membership
+    catches drift; only an explicit ban catches a wrong-but-managed token.
+
+    See tests/test_brand_palette.py for the contrast arithmetic and
+    tests/test_email_layout.py::test_footer_note_uses_text_secondary for the
+    same ban on the Python-rendered side.
+    """
+    from services import brand
+
+    ftl = _ftl_directives((THEME / "email/html/template.ftl").read_text())
+    used = {brand.normalize_hex(h) for h in re.findall(r"#[0-9a-fA-F]{3,6}\b", ftl)}
+    assert brand.TRAVERTINE["text-muted"] not in used, (
+        "template.ftl paints text with text-muted, which fails WCAG AA on every "
+        "Travertine surface -- footer/legal copy uses text-secondary (ruled "
+        "2026-08-16)"
+    )
 
 
 def test_both_realms_use_the_srw_email_theme() -> None:
