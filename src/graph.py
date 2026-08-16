@@ -131,6 +131,7 @@ from .core.workspace import WorkspaceManager
 from .core.workspace_backend import WorkspaceUnavailableError
 from .llm.exceptions import ContextOverflowError
 from .shared.job_steering import queued_reply_key
+from .shared.tool_arg_coercion import coerce_tool_args
 from .llm.response_guards import is_degenerate_response
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
 from .services.guardrails import format_nudge
@@ -4522,6 +4523,9 @@ def create_audited_tool_node(
     tool_node = ToolNode(
         tools, handle_tool_errors=_handle_tool_errors_reraise_workspace
     )
+    _tools_by_name = {
+        getattr(tool, "name", ""): tool for tool in tools if getattr(tool, "name", "")
+    }
 
     # Loop detection state: track recent tool calls as (name, args_hash) tuples
     import hashlib
@@ -4722,6 +4726,26 @@ def create_audited_tool_node(
             last_msg = messages[-1]
             if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
                 for tc in last_msg.tool_calls:
+                    # Repair array arguments a weak model encoded as a JSON
+                    # string or a wrapper object BEFORE ToolNode validates
+                    # them. Mutating the call on the message is deliberate:
+                    # ToolNode reads from the message, not from this copy.
+                    # Without it the model gets "Input should be a valid list",
+                    # retries with the other wrong shape, and eventually drops
+                    # the argument entirely — a silent wrong answer.
+                    tool_obj = _tools_by_name.get(tc.get("name", ""))
+                    if tool_obj is not None:
+                        coerced, repaired_fields = coerce_tool_args(
+                            getattr(tool_obj, "args_schema", None),
+                            tc.get("args", {}),
+                        )
+                        if repaired_fields:
+                            tc["args"] = coerced
+                            logger.info(
+                                "Repaired list argument(s) %s on %s",
+                                ", ".join(repaired_fields),
+                                tc.get("name", "unknown"),
+                            )
                     tool_calls_info.append(
                         {
                             "name": tc.get("name", "unknown"),

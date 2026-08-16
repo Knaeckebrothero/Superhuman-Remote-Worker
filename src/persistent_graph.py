@@ -40,6 +40,7 @@ from .core.llm_retry import _classify_llm_error, _extract_rate_limit_delay
 from .core.loader import with_current_date
 from .core.summarizer import count_text_tokens
 from .core.workspace_backend import WorkspaceUnavailableError
+from .shared.tool_arg_coercion import coerce_tool_args
 from .core.workspace_injection import find_tail_injection_anchor
 from .llm.exceptions import ContextOverflowError
 from .llm.reasoning_chat import (
@@ -2631,6 +2632,25 @@ async def _execute_turn(
             tool_name = tool_call["name"]
             tool_args = tool_call.get("args", {})
             tool_call_id = tool_call["id"]
+
+            # Repair array arguments a weak model encoded as a JSON string or a
+            # wrapper object. Done before the permission gate so the card and
+            # the audit record show the arguments that will actually run, and
+            # before ainvoke so pydantic sees a list. A commissioned officer on
+            # the default brain otherwise burns its whole wake alternating
+            # between the two wrong shapes and then silently drops the argument
+            # (observed 2026-08-16: eight failed kb_write/kb_update calls).
+            _tool_for_args = tool_map.get(tool_name)
+            if _tool_for_args is not None:
+                tool_args, _repaired = coerce_tool_args(
+                    getattr(_tool_for_args, "args_schema", None), tool_args
+                )
+                if _repaired:
+                    logger.info(
+                        "Repaired list argument(s) %s on %s",
+                        ", ".join(_repaired),
+                        tool_name,
+                    )
 
             # Resolve the tool BEFORE gating it. A name that binds to nothing
             # cannot run whichever way the user answers, so gating first spends
