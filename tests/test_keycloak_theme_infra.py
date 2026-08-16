@@ -149,7 +149,7 @@ def test_light_tokens_match_the_shared_brand_palette() -> None:
     ties the Keycloak CSS to brand.py, so all three move together or a test
     fails. Without it the login page is exactly the surface that silently rots.
     """
-    from orchestrator.services import brand
+    from services import brand
 
     css = LOGIN_CSS.read_text()
     rules = _css_rules(css)

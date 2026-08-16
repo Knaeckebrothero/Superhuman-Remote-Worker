@@ -15,7 +15,7 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from orchestrator.services.headless_notifications import (
+from services.headless_notifications import (
     claim_sent_notification,
     downgrade_sent_claim,
 )

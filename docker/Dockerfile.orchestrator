@@ -93,6 +93,12 @@ RUN python -c "import services.infrastructure_metering.compute_activation"
 # Fail the image build if the always-on session-memory drain accidentally
 # regains an agent-only import dependency.
 RUN python -c "import services.session_memory_executor"
+# The COPY above flattens orchestrator/ into /app, so there is no `orchestrator`
+# package at runtime: a `from orchestrator.services.X import ...` inside these
+# modules crash-loops the pod on the very first import. tests/conftest.py puts
+# BOTH the repo root and orchestrator/ on sys.path, so pytest resolves either
+# spelling and cannot see it. This import runs against the real flattened layout.
+RUN python -c "import services.email, services.headless_notifications"
 
 # Marker so get_project_root() finds /app (no .git in container)
 RUN touch /app/pyproject.toml && chown srw:srw /app/pyproject.toml

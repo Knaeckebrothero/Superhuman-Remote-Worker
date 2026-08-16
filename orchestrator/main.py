@@ -521,7 +521,7 @@ from services.ide_session import ide_session_service  # noqa: E402
 from services.ide_proxy import ide_proxy_service  # noqa: E402
 from services.email import email_service  # noqa: E402
 from services import headless_notifications  # noqa: E402
-from orchestrator.services.brand import TRAVERTINE as _BRAND  # noqa: E402
+from services.brand import TRAVERTINE as _BRAND  # noqa: E402
 from services.imap_poller import imap_poller  # noqa: E402
 from services.notification_service import notification_service  # noqa: E402
 import httpx  # noqa: E402
