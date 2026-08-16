@@ -307,3 +307,81 @@ def test_smtp_port_and_tls_come_from_values() -> None:
     assert 'smtpServer.port=1025' not in kc
     assert ".Values.email.smtp.port" in kc
     assert ".Values.email.smtp.useTls" in kc
+
+
+def _render_keycloak_poststart_script(*extra_args: str) -> str:
+    """Render the real chart and return the keycloak Deployment's postStart
+    shell script -- the text that actually runs `kcadm update ... smtpServer`.
+
+    A source-text assertion can only ever see the literal `{{ }}` expression,
+    never what Sprig's `default` actually decides at render time -- and that
+    decision is exactly what's under test here: `default` treats a Go-template
+    "empty" value (including the boolean `false`) as absent and substitutes
+    its fallback, so `.Values.email.smtp.useTls | default "true"` silently
+    re-enabled STARTTLS for an operator who explicitly passed
+    `--set email.smtp.useTls=false` (Helm's `--set` parses that as a real
+    bool). Only a rendered assertion proves the fix. Mirrors
+    _render_theme_configmap_data() above, but reads the Deployment
+    (kind == Deployment, name endswith "-keycloak") rather than the theme
+    ConfigMap, and drills into containers[].lifecycle.postStart instead of
+    .data.
+    """
+    result = subprocess.run(
+        [
+            "helm",
+            "template",
+            "srw",
+            str(ROOT / "helm"),
+            "-f",
+            str(ROOT / "helm/ci/test-values.yaml"),
+            "--set",
+            "keycloak.enabled=true",
+            "--set",
+            "keycloak.internal=true",
+            *extra_args,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, f"helm template failed:\n{result.stderr}"
+
+    for doc in yaml.safe_load_all(result.stdout):
+        if (
+            doc
+            and doc.get("kind") == "Deployment"
+            and doc.get("metadata", {}).get("name", "").endswith("-keycloak")
+        ):
+            containers = doc["spec"]["template"]["spec"]["containers"]
+            keycloak = next(c for c in containers if c["name"] == "keycloak")
+            return keycloak["lifecycle"]["postStart"]["exec"]["command"][-1]
+    raise AssertionError("no keycloak Deployment in the render")
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
+def test_smtp_starttls_survives_a_bare_boolean_override() -> None:
+    """Regression for the Sprig `default`-vs-boolean gotcha: `false` is
+    "empty" to `default`, so a bare `--set ...useTls=false` (parsed as a real
+    bool, not a string) used to silently fall back to "true" -- an operator
+    who explicitly disabled STARTTLS got it silently re-enabled. `toString`
+    before `default` fixes it: `false` becomes the non-empty string "false",
+    so `default` no longer fires, while a genuinely unset value still
+    toString()s to "" and correctly falls back.
+
+    All three cases are asserted on RENDERED output, not template source --
+    source only shows the `{{ }}` expression, never what `default` decided.
+    """
+    # Unset: falls back to the documented default, unchanged from before.
+    default_script = _render_keycloak_poststart_script()
+    assert "smtpServer.starttls=true" in default_script
+
+    # The regressing case: a bare boolean via --set. This is the one that
+    # silently broke -- asserted on its own, not folded into the string case.
+    bare_bool_script = _render_keycloak_poststart_script("--set", "email.smtp.useTls=false")
+    assert "smtpServer.starttls=false" in bare_bool_script, (
+        "a bare --set boolean false must render as false, not silently fall back to the default"
+    )
+
+    # The string case already worked before this fix; kept as a control.
+    string_script = _render_keycloak_poststart_script("--set-string", "email.smtp.useTls=false")
+    assert "smtpServer.starttls=false" in string_script
