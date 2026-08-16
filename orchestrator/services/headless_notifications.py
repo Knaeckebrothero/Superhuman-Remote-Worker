@@ -52,6 +52,9 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from orchestrator.services.brand import TRAVERTINE as _C
+from orchestrator.services.email_layout import Action, escape_text, render_email
+
 logger = logging.getLogger(__name__)
 
 
@@ -312,41 +315,29 @@ def _build_permission_email_bodies(
         f"This link expires in 30 minutes and can be used once.\n"
     )
 
-    # Escape HTML special chars in the args preview.
-    safe_args = (
-        tool_args_preview.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-    safe_tool = tool_name.replace("&", "&amp;").replace("<", "&lt;")
+    safe_args = escape_text(tool_args_preview)
+    safe_tool = escape_text(tool_name)
 
-    html_body = f"""\
-<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #cdd6f4; background: #1e1e2e;">
-  <div style="border: 1px solid #313244; border-radius: 12px; overflow: hidden;">
-    <div style="background: #181825; padding: 16px 20px; border-bottom: 1px solid #313244;">
-      <h2 style="margin: 0 0 4px 0; color: #cba6f7; font-size: 16px;">Permission requested</h2>
-      <p style="margin: 0; color: #a6adc8; font-size: 13px;">
-        Waiting ~{request_age_minutes} minute(s)
-      </p>
-    </div>
-    <div style="padding: 20px; font-size: 14px; line-height: 1.6; color: #cdd6f4;">
-      <p style="margin: 0 0 12px 0;">
-        The agent wants to call <code style="background: #181825; padding: 2px 6px; border-radius: 4px;">{safe_tool}</code>:
-      </p>
-      <pre style="background: #181825; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; color: #a6e3a1;">{safe_args}</pre>
-    </div>
-    <div style="background: #181825; padding: 16px 20px; border-top: 1px solid #313244; text-align: center;">
-      <a href="{approve_url}" style="display: inline-block; background: #a6e3a1; color: #1e1e2e; padding: 10px 24px; margin: 4px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 14px;">Approve</a>
-      <a href="{deny_url}" style="display: inline-block; background: #f38ba8; color: #1e1e2e; padding: 10px 24px; margin: 4px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 14px;">Deny</a>
-      <p style="margin: 16px 0 0 0; color: #6c7086; font-size: 12px;">
-        Or <a href="{cockpit_link}" style="color: #cba6f7;">open the cockpit</a> for full context.
-      </p>
-      <p style="margin: 8px 0 0 0; color: #6c7086; font-size: 11px;">
-        Links expire in 30 minutes and can be used once.
-      </p>
-    </div>
-  </div>
-</div>"""
+    body_html = (
+        f"<p style='margin:0 0 12px 0;'>The agent wants to call "
+        f"<code style=\"background:{_C['surface-0']};padding:2px 6px;"
+        f"font-family:monospace;\">{safe_tool}</code>:</p>"
+        f"<pre style=\"background:{_C['surface-0']};padding:12px;"
+        f"margin:0;overflow-x:auto;font-size:12px;line-height:18px;"
+        f"font-family:monospace;color:{_C['text-primary']};\">{safe_args}</pre>"
+    )
+
+    html_body = render_email(
+        title="Permission requested",
+        subtitle=f"Waiting {request_age_minutes} min for your decision.",
+        body_html=body_html,
+        actions=[
+            Action(label="Approve", url=approve_url, variant="approve"),
+            Action(label="Deny", url=deny_url, variant="deny"),
+        ],
+        footer_note="Open the cockpit for full context.",
+    )
+
     return text_body, html_body
 
 
