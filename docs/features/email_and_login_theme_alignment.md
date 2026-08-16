@@ -392,3 +392,41 @@ Fix: `{{ .Values.email.smtp.port | default "1025" }}`, with `smtpServer.starttls
 3. **Keycloak email theme + SMTP port fix.** Reuses slice 2's delivery; the port fix is what makes slice 3 observable outside dev.
 
 Given ~10 days to alpha and that slices 2–3 touch a chart with a known strategic-merge hazard, **slice 1 is the one to ship before alpha**; 2–3 can follow.
+
+---
+
+## Post-implementation status (2026-08-16)
+
+**Shipped on `develop`, unpushed:** commits `78434c92..a278c350`. All 12 planned tasks complete except the Task 10 live gate (below). 138 tests across eight suites.
+
+### Owed: the Keycloak live gate
+
+The theme is verified by `helm template`, a server-side `kubectl apply --dry-run`, unit tests, and Tilt applying it through the real deploy path — but never by a running Keycloak serving a login page. The local k3d cluster could not start new pods (cluster-wide egress failure: `dial tcp: lookup registry-1.docker.io`, 8 pods stuck in `Init`, a bare busybox pod also timing out). Unrelated to this work.
+
+**Do not run this gate against `--context main`** — that is the shared dev cluster. Local k3d (`--context k3d-srw -n srw`) or compose only.
+
+**The highest-consequence unverified item is that Keycloak parses `email/html/template.ftl` without a FreeMarker error.** If it does not, *every* Keycloak email silently fails to send — verify-address and password reset included. Nothing in the test suite can catch that; only Keycloak's own renderer can.
+
+`docker-compose.yaml` already carries everything needed: the theme bind-mount is in place and `docker/keycloak/realm-export.json` already selects `loginTheme`/`emailTheme` = `srw`. So:
+
+```bash
+docker compose up keycloak postgres-keycloak
+# then trigger a forgot-password from the login page
+```
+
+FreeMarker renders **before** SMTP is contacted, so the Keycloak log distinguishes a template error from a connection error even with no mail catcher running. Adding a mailpit service to compose would additionally surface the rendered email for visual inspection.
+
+Remaining unverified after that: `items[].key` correctness (now covered by a test binding keys to rendered ConfigMap data), theme resolution, the `styles=` parent chain, the `.kc-logo-text` logo hook, the `:where()` dark-mode claim, and gzip-cache staleness. All fail visibly or benignly; only the FreeMarker path fails silently.
+
+### Follow-ups worth ticketing (found during implementation, deliberately not fixed)
+
+1. **Shell injection on sibling fields of the same Keycloak postStart hook.** `helm/templates/services/keycloak.yaml` interpolates `.Values.keycloak.realm` and `.Values.email.smtp.from` raw into the same double-quoted shell word that this work hardened for `port`/`starttls`. Reproduced: `--set-string 'email.smtp.from=a"; id; echo "'` renders `smtpServer.from=a"; id; echo ""`. Pre-existing; both values are chart-owned, so this is hardening rather than a privilege boundary. The `srw.keycloak.smtp*` helpers in `helm/templates/_helpers.tpl` are a ready template — an anchored address regex for `from`/`envelopeFrom`, `^[A-Za-z0-9._-]+$` for the realm.
+2. **`orchestrator/main.py:19187`** — an unguarded `from orchestrator.database.postgres import …` inside the stateless-resume path. Same class as the blocker fixed here: unresolvable in the flattened runtime image, where `orchestrator/` contents are copied into `/app`. Pre-existing.
+3. **`orchestrator/init.py`** — module-level `orchestrator.`-prefixed imports make `import init` fail in-container. Reached unwrapped from `orchestrator/security/auth.py:401`; gated on `MCP_DEV_TOKEN`, unset in prod, so dev-only.
+4. **The Dockerfile smoke-import guard is build-time only** — inert unless CI actually builds the orchestrator image on the branch.
+
+### A pattern worth remembering
+
+Nine assertions on this feature passed while guarding nothing, in two recurring shapes: a string assertion run against a file whose content it cannot parse (regexing a Helm template's *source* for rendered values), and a presence/absence assertion satisfied by the file's **own comment** containing the literal being checked. The second is the nastier one — writing a precise warning comment is exactly what defeats the test enforcing it.
+
+`tests/test_keycloak_theme_infra.py` now carries `_css_rules()`, `_ftl_directives()`, `_properties_directives()` and `_template_directives()` to strip comments before content assertions. The general lesson: **assert against rendered or parsed output, not source text** — and mutation-test every guard by breaking the thing it names.
