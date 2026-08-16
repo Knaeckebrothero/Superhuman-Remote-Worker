@@ -16,7 +16,7 @@ PALETTE_HEXES = set(brand.TRAVERTINE.values())
 
 def test_escapes_title_and_subtitle_but_not_body() -> None:
     html = render_email(
-        title='Job <img src=x onerror=alert(1)>',
+        title="Job <img src=x onerror=alert(1)>",
         subtitle='Agent "><b>bold</b>',
         body_html="<p>trusted markup</p>",
     )
@@ -54,8 +54,8 @@ def test_deny_is_a_ghost_button_not_a_second_solid_fill() -> None:
             Action(label="Deny", url="https://e.test/n", variant="deny"),
         ],
     )
-    approve_cell = re.search(r'<td[^>]*>\s*<a[^>]*>Approve</a>', html, re.S)
-    deny_cell = re.search(r'<td[^>]*>\s*<a[^>]*>Deny</a>', html, re.S)
+    approve_cell = re.search(r"<td[^>]*>\s*<a[^>]*>Approve</a>", html, re.S)
+    deny_cell = re.search(r"<td[^>]*>\s*<a[^>]*>Deny</a>", html, re.S)
     assert approve_cell and deny_cell
     assert f"background-color:{brand.TRAVERTINE['success']}" in approve_cell.group(0)
     # Ghost: card-coloured fill + danger border, never a danger fill.
@@ -67,20 +67,22 @@ def test_buttons_are_padded_table_cells_not_padded_anchors() -> None:
     """Outlook Windows lacks `display`, so an <a> stays inline and vertical
     padding cannot expand the line."""
     html = render_email(
-        title="t", body_html="<p>b</p>",
+        title="t",
+        body_html="<p>b</p>",
         actions=[Action(label="Go", url="https://e.test/g")],
     )
-    anchor = re.search(r'<a [^>]*>Go</a>', html).group(0)
+    anchor = re.search(r"<a [^>]*>Go</a>", html).group(0)
     assert "padding" not in anchor
 
 
 def test_link_colour_is_inline_not_only_in_style_block() -> None:
     """GMX, WEB.DE, SFR and LaPoste strip <head><style> outright."""
     html = render_email(
-        title="t", body_html="<p>b</p>",
+        title="t",
+        body_html="<p>b</p>",
         actions=[Action(label="Go", url="https://e.test/g")],
     )
-    anchor = re.search(r'<a [^>]*>Go</a>', html).group(0)
+    anchor = re.search(r"<a [^>]*>Go</a>", html).group(0)
     assert "color:" in anchor
 
 
@@ -135,7 +137,9 @@ def test_footer_note_uses_text_secondary_not_text_muted() -> None:
 def test_uses_no_unmanaged_colours() -> None:
     """Catches the way drift actually starts: a one-off hex nobody notices."""
     html = render_email(
-        title="t", body_html="<p>b</p>", footer_note="n",
+        title="t",
+        body_html="<p>b</p>",
+        footer_note="n",
         actions=[
             Action(label="A", url="https://e.test/a", variant="approve"),
             Action(label="D", url="https://e.test/d", variant="deny"),

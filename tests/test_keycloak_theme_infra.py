@@ -205,7 +205,8 @@ def test_dark_tokens_match_the_shared_senate_palette() -> None:
     senate = {
         k: brand.normalize_hex(v)
         for k, v in re.findall(
-            r"'([a-z0-9-]+)':\s*(#[0-9a-fA-F]{3,8})", scss[start : scss.index("\n);", start)]
+            r"'([a-z0-9-]+)':\s*(#[0-9a-fA-F]{3,8})",
+            scss[start : scss.index("\n);", start)],
         )
     }
     assert len(senate) >= 20, (
@@ -228,7 +229,9 @@ def test_dark_tokens_match_the_shared_senate_palette() -> None:
         "--keycloak-card-top-color": senate["accent-color"],
     }
     for token, want in expected.items():
-        found = re.search(rf"{re.escape(token)}:\s*(#[0-9a-fA-F]{{3,8}})", block.group(0))
+        found = re.search(
+            rf"{re.escape(token)}:\s*(#[0-9a-fA-F]{{3,8}})", block.group(0)
+        )
         assert found, f"{token} missing from the .pf-v5-theme-dark block"
         assert brand.normalize_hex(found.group(1)) == want, (
             f"{token} is {found.group(1)}, $senate-theme says {want}"

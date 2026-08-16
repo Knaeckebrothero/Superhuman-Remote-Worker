@@ -17,8 +17,17 @@ import re
 from services import brand
 
 CATPPUCCIN = {
-    "#1e1e2e", "#181825", "#313244", "#cdd6f4", "#cba6f7",
-    "#a6e3a1", "#f38ba8", "#6c7086", "#a6adc8", "#89b4fa", "#f9e2af",
+    "#1e1e2e",
+    "#181825",
+    "#313244",
+    "#cdd6f4",
+    "#cba6f7",
+    "#a6e3a1",
+    "#f38ba8",
+    "#6c7086",
+    "#a6adc8",
+    "#89b4fa",
+    "#f9e2af",
 }
 
 

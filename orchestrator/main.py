@@ -44288,24 +44288,24 @@ def _magic_link_confirmation_page(
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>SRW — Confirm Decision</title></head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: {_BRAND['app-bg']}; color: {_BRAND['text-primary']}; padding: 40px 20px;">
-  <div style="max-width: 600px; margin: 0 auto; background: {_BRAND['panel-bg']}; border: 1px solid {_BRAND['border-color']}; overflow: hidden;">
-    <div style="background: {_BRAND['surface-0']}; padding: 16px 20px; border-bottom: 1px solid {_BRAND['border-color']};">
-      <h2 style="margin: 0; color: {_BRAND['accent-color']}; font-size: 16px;">Confirm tool decision</h2>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: {_BRAND["app-bg"]}; color: {_BRAND["text-primary"]}; padding: 40px 20px;">
+  <div style="max-width: 600px; margin: 0 auto; background: {_BRAND["panel-bg"]}; border: 1px solid {_BRAND["border-color"]}; overflow: hidden;">
+    <div style="background: {_BRAND["surface-0"]}; padding: 16px 20px; border-bottom: 1px solid {_BRAND["border-color"]};">
+      <h2 style="margin: 0; color: {_BRAND["accent-color"]}; font-size: 16px;">Confirm tool decision</h2>
     </div>
     <div style="padding: 20px; font-size: 14px; line-height: 1.6;">
       {extend_banner_html}
-      <p>The agent wants to call <code style="background: {_BRAND['surface-0']}; padding: 2px 6px;">{safe_tool}</code> with these arguments:</p>
-      <pre style="background: {_BRAND['surface-0']}; padding: 12px; overflow-x: auto; font-size: 12px; color: {_BRAND['success']};">{safe_args}</pre>
+      <p>The agent wants to call <code style="background: {_BRAND["surface-0"]}; padding: 2px 6px;">{safe_tool}</code> with these arguments:</p>
+      <pre style="background: {_BRAND["surface-0"]}; padding: 12px; overflow-x: auto; font-size: 12px; color: {_BRAND["success"]};">{safe_args}</pre>
     </div>
-    <div style="background: {_BRAND['surface-0']}; padding: 16px 20px; border-top: 1px solid {_BRAND['border-color']}; text-align: center;">
+    <div style="background: {_BRAND["surface-0"]}; padding: 16px 20px; border-top: 1px solid {_BRAND["border-color"]}; text-align: center;">
       <form method="POST" action="/magic/approve/{quoted_token}" style="display: inline;">
-        <button type="submit" style="background: {button_color}; color: {_BRAND['on-accent']}; padding: 10px 28px; border: 0; cursor: pointer; font-weight: 600; font-size: 14px;">{button_label}</button>
+        <button type="submit" style="background: {button_color}; color: {_BRAND["on-accent"]}; padding: 10px 28px; border: 0; cursor: pointer; font-weight: 600; font-size: 14px;">{button_label}</button>
       </form>
       <form method="POST" action="/magic/extend/{quoted_token}" style="display: inline; margin-left: 8px;">
         <button type="submit"{extend_disabled_attr} style="{extend_button_style}">I'm reviewing — extend 60min</button>
       </form>
-      <p style="margin: 16px 0 0 0; color: {_BRAND['text-secondary']}; font-size: 12px;">Approve link is single-use and expires in 30 minutes.</p>
+      <p style="margin: 16px 0 0 0; color: {_BRAND["text-secondary"]}; font-size: 12px;">Approve link is single-use and expires in 30 minutes.</p>
     </div>
   </div>
 </body></html>"""
@@ -44321,14 +44321,14 @@ def _magic_link_result_page(
     accent = _BRAND["danger"] if is_error else _BRAND["success"]
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>SRW — {title}</title></head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: {_BRAND['app-bg']}; color: {_BRAND['text-primary']}; padding: 40px 20px;">
-  <div style="max-width: 600px; margin: 0 auto; background: {_BRAND['panel-bg']}; border: 1px solid {_BRAND['border-color']}; overflow: hidden;">
-    <div style="background: {_BRAND['surface-0']}; padding: 16px 20px; border-bottom: 1px solid {_BRAND['border-color']};">
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: {_BRAND["app-bg"]}; color: {_BRAND["text-primary"]}; padding: 40px 20px;">
+  <div style="max-width: 600px; margin: 0 auto; background: {_BRAND["panel-bg"]}; border: 1px solid {_BRAND["border-color"]}; overflow: hidden;">
+    <div style="background: {_BRAND["surface-0"]}; padding: 16px 20px; border-bottom: 1px solid {_BRAND["border-color"]};">
       <h2 style="margin: 0; color: {accent}; font-size: 16px;">{title}</h2>
     </div>
     <div style="padding: 20px; font-size: 14px; line-height: 1.6;">
       <p>{body}</p>
-      <p style="margin-top: 16px;"><a href="{cockpit_url}" style="color: {_BRAND['accent-color']};">Open the cockpit</a></p>
+      <p style="margin-top: 16px;"><a href="{cockpit_url}" style="color: {_BRAND["accent-color"]};">Open the cockpit</a></p>
     </div>
   </div>
 </body></html>"""

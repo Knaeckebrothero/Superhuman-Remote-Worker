@@ -170,7 +170,7 @@ class EmailService:
         return render_email(
             title="Superhuman Remote Worker",
             body_html=f"<p style='margin:0 0 12px 0;'>Hello {greeting},</p>"
-                      f"<p style='margin:0;'>{body}</p>",
+            f"<p style='margin:0;'>{body}</p>",
             actions=[Action(label="Open Cockpit", url=cockpit_link)],
         )
 
@@ -188,7 +188,7 @@ class EmailService:
         subtitle = f"Job: {job_description[:80]} • Agent: {config_name} • {phase_str}"
         return render_email(
             title="SRW Agent Message",
-            subtitle=subtitle,          # escaped inside render_email
+            subtitle=subtitle,  # escaped inside render_email
             body_html=f"<p style='margin:0;'>{body}</p>",
             actions=[Action(label="Reply in Cockpit", url=cockpit_link)],
             footer_note="or reply directly to this email" if reply_to_addr else None,

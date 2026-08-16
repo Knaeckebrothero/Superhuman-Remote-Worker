@@ -608,6 +608,6 @@ def test_permission_email_uses_brand_palette_and_ghost_deny() -> None:
     assert "#1e1e2e" not in html and "#a6e3a1" not in html  # Catppuccin gone
     assert brand.TRAVERTINE["panel-bg"] in html
 
-    deny_cell = re.search(r'<td[^>]*>\s*<a[^>]*>Deny</a>', html, re.S).group(0)
+    deny_cell = re.search(r"<td[^>]*>\s*<a[^>]*>Deny</a>", html, re.S).group(0)
     assert f"background-color:{brand.TRAVERTINE['panel-bg']}" in deny_cell
     assert f"border:2px solid {brand.TRAVERTINE['danger']}" in deny_cell

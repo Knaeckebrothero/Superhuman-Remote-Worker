@@ -87,11 +87,11 @@ def _button_cell(action: Action) -> str:
         bg, fg, border = C["accent-color"], C["on-accent"], C["accent-color"]
     return (
         f'<td align="center" bgcolor="{bg}" style="background-color:{bg};'
-        f'border:2px solid {border};padding:12px 28px;'
+        f"border:2px solid {border};padding:12px 28px;"
         f"font-family:{_SANS};font-size:15px;font-weight:600;"
         f'mso-line-height-rule:exactly;line-height:20px;">'
         f'<a href="{url}" style="color:{fg};text-decoration:none;'
-        f'font-family:{_SANS};font-size:15px;font-weight:600;'
+        f"font-family:{_SANS};font-size:15px;font-weight:600;"
         f'letter-spacing:1px;text-transform:uppercase;">{label}</a></td>'
     )
 
@@ -144,7 +144,7 @@ def render_email(
 
     footer_row = (
         f'<tr><td style="padding:16px 32px 24px 32px;'
-        f'border-top:1px solid {C["border-color"]};font-family:{_SANS};'
+        f"border-top:1px solid {C['border-color']};font-family:{_SANS};"
         f'font-size:12px;line-height:18px;color:{C["text-secondary"]};">'
         f"{safe_footer}</td></tr>"
         if safe_footer
