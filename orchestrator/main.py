@@ -11949,8 +11949,9 @@ async def debug_email_index() -> str:
 
     Gated by ``EMAIL_PREVIEW_ENABLED`` (default off, same as
     ``CANVAS_LIVE_PREVIEW_ENABLED`` / ``COLLABORA_ENABLED``): disabled, it
-    404s the same way an unknown preview name does, so it is indistinguishable
-    from a route that does not exist.
+    raises a bare 404 with no detail, matching FastAPI's own default response
+    for an unmapped route exactly — not the ``"unknown email preview"`` detail
+    used below for a bad name, which would leak that the route exists.
     """
     if os.getenv("EMAIL_PREVIEW_ENABLED", "").strip().lower() not in {
         "1",
@@ -11958,7 +11959,7 @@ async def debug_email_index() -> str:
         "yes",
         "on",
     }:
-        raise HTTPException(status_code=404, detail="unknown email preview")
+        raise HTTPException(status_code=404)
     links = "".join(
         f'<li><a href="/debug/emails/{n}">{n}</a></li>'
         for n in ("system", "agent", "permission")
@@ -11970,7 +11971,8 @@ async def debug_email_index() -> str:
 async def debug_email_preview(name: str) -> str:
     """Render one transactional email through its real builder for inspection.
 
-    Gated by ``EMAIL_PREVIEW_ENABLED`` — see ``debug_email_index``.
+    Gated by ``EMAIL_PREVIEW_ENABLED`` — see ``debug_email_index`` for why
+    the disabled-state 404 has no detail.
     """
     if os.getenv("EMAIL_PREVIEW_ENABLED", "").strip().lower() not in {
         "1",
@@ -11978,7 +11980,7 @@ async def debug_email_preview(name: str) -> str:
         "yes",
         "on",
     }:
-        raise HTTPException(status_code=404, detail="unknown email preview")
+        raise HTTPException(status_code=404)
     link = "https://cockpit.example/preview"
     if name == "system":
         return email_service._build_system_notification_html(
