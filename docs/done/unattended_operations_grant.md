@@ -5,8 +5,9 @@ tags:
   - projects
   - self-improvement
   - orchestration
-status: approved
+status: done
 created: 2026-08-16
+completed: 2026-08-16
 related:
   - "[[project_self_improvement_loop]]"
   - "[[loop_unified_engine]]"
@@ -18,7 +19,14 @@ related:
 
 # Put project loops and the officer behind a capability grant
 
-**Status: implemented on develop, 2026-08-16. Not deployed.**
+**Status: implemented and committed on develop 2026-08-16. Unpushed, not deployed,
+no live exercise yet (see §6).**
+
+Landed inside `014fff49` ("Introduce durable Officer ticket claim ledger…") rather
+than a commit of its own — a whole-tree commit swept it up alongside the unrelated
+officer ticket-claim work, so the grant is invisible in the history under that
+title. Nothing was lost; only the attribution is wrong. Noted here because a
+future reader searching the log for this feature will not find it.
 
 ## 1. What and why
 
@@ -140,6 +148,14 @@ against a per-user `true`, which is the deployment-wide off-switch if one is eve
 
 ## 6. Tests
 
+**Verified 2026-08-16:** 221 Python tests green across the files below, plus 117 cockpit
+tests; `ruff check` and `ruff format --check` clean over `src/ orchestrator/ tests/`; cockpit
+`tsc -p tsconfig.app.json` clean. A wider filtered run (1783 tests matching
+loop/officer/grant/capabilit) was green except one pre-existing failure unrelated to this
+work — `test_mcp_capabilities.py::test_priority_job_project_and_connector_schema_drift_is_closed`,
+`datasource_ids` missing from the `create_job` MCP schema, which belongs to the connector
+work in `src/shared/orch_surface/jobs/control.py`.
+
 - `tests/test_capability_grants.py` — catalog shape; the `evaluate` rule (including that the
   string `"false"` is not read as enabled, matching `main._officer_meta_enabled`); the
   `strip_to_grants` branch; the completeness harness that fails if a future catalog key
@@ -150,6 +166,19 @@ against a per-user `true`, which is the deployment-wide off-switch if one is eve
 - `tests/test_loop_unified_advance.py` — the spawn choke point.
 - `tests/test_officer_lifecycle.py` — the commission 403 fires before anything mutates.
 
-Not covered by unit tests, and owed as a k3d exercise: the end-to-end UI path (tabs vanish
-for a non-admin, reappear after the grant is set) and a live revocation halting a running
-loop on the cluster.
+### Owed — the live exercise is NOT done
+
+This doc is filed under `done/` because the implementation is complete and unit-verified,
+not because it has been proven on a cluster. Three things have only ever run against mocks:
+
+1. **The UI path** — log in as a non-admin, confirm the Loop and Centurion tabs are absent,
+   set `unattended_operations = true` under Admin → Grants, reload, confirm both appear.
+2. **Live revocation halting a loop** — start a loop as a non-admin, revoke the grant while
+   it runs, confirm it stops at the next advance with `last_error` naming the grant (rather
+   than continuing, which is the failure this design's choke-point re-check exists to
+   prevent).
+3. **The officer stand-down on re-attach** — revoke while a commissioned officer is live and
+   confirm the next attach refuses via the PDP.
+
+(2) and (3) are the two claims in this document that unit tests can only assert about
+mocked seams. Treat them as designed-and-believed, not observed, until the k3d run happens.

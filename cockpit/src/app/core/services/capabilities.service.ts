@@ -76,7 +76,7 @@ export class CapabilitiesService {
    * stays hidden until a successful fetch proves entitlement. Hiding is UX
    * only; the orchestrator refuses start/resume/convert/commission with 403
    * and the config PDP refuses `officer.enabled` regardless of what renders.
-   * Spec: docs/features/unattended_operations_grant.md. */
+   * Spec: docs/done/unattended_operations_grant.md. */
   readonly canRunUnattendedOperations = computed(() => {
     if (this.loadFailed()) return false;
     const g = this.grants();

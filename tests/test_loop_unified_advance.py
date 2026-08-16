@@ -614,7 +614,7 @@ class TestSpawnRequiresUnattendedOperationsGrant:
     advance, the campaign advance — funnels through ``_spawn_loop_stage``,
     which is why the ``unattended_operations`` re-check lives there. Revoking
     the grant under a running loop must HALT it at the next advance, not let it
-    keep spending unattended. docs/features/unattended_operations_grant.md.
+    keep spending unattended. docs/done/unattended_operations_grant.md.
     """
 
     @staticmethod
