@@ -112,12 +112,13 @@ New `orchestrator/services/brand.py`, holding the Travertine palette as Python c
 | Code / args block | `surface-0` | `#ede4d2` |
 | Border | `border-color` | `#dccfb6` |
 | Body text | `text-primary` | `#2a1d12` |
-| Secondary text | `text-secondary` | `#5a4632` |
-| Muted / legal | `text-muted` | `#8a7b66` |
+| Secondary text, footer / legal | `text-secondary` | `#5a4632` |
 | Links, primary action | `accent-color` | `#9c2832` |
 | Approve action | `success` | `#446b3e` |
 | Deny action | `danger` | `#9c2832` |
 | Text on filled action | `on-accent` | `#ffffff` |
+
+**Why `text-secondary` and not `text-muted` for footer text.** `text-muted` `#8a7b66` fails WCAG AA on every Travertine surface at footer sizes — 3.26:1 on `surface-0`, 3.82:1 on `panel-bg`, 3.50:1 on `app-bg`, against the 4.5:1 normal-text threshold. `text-secondary` measures 7.06:1 and 8.27:1 respectively while staying visibly subordinate to `text-primary` body copy. Ruled 2026-08-16, during implementation: shipping a contrast failure inside a change whose headline is a WCAG 1.4.1 fix is incoherent. `text-muted` remains in the palette for non-text roles.
 
 Hardcoding is **required, not a compromise**: CSS custom properties sit at ~45% email support, and Gmail supports `var()` but not variable *declaration*. Colors must be literal hexes at render time. `docker/Dockerfile.orchestrator` also copies only `orchestrator/`, `src/`, `config/` — the runtime cannot read the SCSS even in principle.
 
