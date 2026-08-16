@@ -28,6 +28,20 @@ def _exact_pinned_permission_owner(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_announced_rows():
+    """The announce step writes into a module-global ledger. Tests that don't
+    patch it would otherwise hand their rows to the next file on this xdist
+    worker, where `_terminate_session_inner` tries to retire gates that belong
+    to a session that never existed."""
+
+    saved = dict(pa._announced_permission_rows)
+    pa._announced_permission_rows.clear()
+    yield
+    pa._announced_permission_rows.clear()
+    pa._announced_permission_rows.update(saved)
+
+
 def _mock_session(permission_mode: str = "supervised"):
     session = MagicMock()
     session.permission_mode = permission_mode
