@@ -158,12 +158,12 @@ export const TOOL_DESCRIPTORS: Record<string, ToolDescriptor> = {
     shell_read: {title: 'Read output', icon: 'terminal', category: 'shell', params: [], result: {kind: 'terminal'}},
 
     // Git
-    git_log: {title: 'View git history', icon: 'history', category: 'git', params: [], result: {kind: 'terminal'}},
-    git_show: {title: 'View commit', icon: 'history', category: 'git', params: [{key: 'ref', label: 'Ref', kind: 'text'}], result: {kind: 'terminal'}},
+    git_log: {title: 'View git history', icon: 'history', category: 'git', params: [{key: 'repo', label: 'Repo', kind: 'text'}], result: {kind: 'terminal'}},
+    git_show: {title: 'View commit', icon: 'history', category: 'git', params: [{key: 'ref', label: 'Ref', kind: 'text'}, {key: 'repo', label: 'Repo', kind: 'text'}], result: {kind: 'terminal'}},
     // git_diff output is already-formatted unified-diff text (not arg-derived
     // like edit/write), so render it as terminal text rather than 'diff'.
-    git_diff: {title: 'Compare changes', icon: 'difference', category: 'git', params: [], result: {kind: 'terminal'}},
-    git_status: {title: 'Check git status', icon: 'history', category: 'git', params: [], result: {kind: 'terminal'}},
+    git_diff: {title: 'Compare changes', icon: 'difference', category: 'git', params: [{key: 'repo', label: 'Repo', kind: 'text'}], result: {kind: 'terminal'}},
+    git_status: {title: 'Check git status', icon: 'history', category: 'git', params: [{key: 'repo', label: 'Repo', kind: 'text'}], result: {kind: 'terminal'}},
 
     // Research & web
     web_search: {title: 'Search the web', icon: 'public', category: 'research', params: [{key: ['query', 'q'], label: 'Query', kind: 'text'}], result: {kind: 'markdown'}, subtitle: (a) => pickArg(a, ['query', 'q'])},

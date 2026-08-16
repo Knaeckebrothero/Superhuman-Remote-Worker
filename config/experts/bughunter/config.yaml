@@ -51,12 +51,11 @@ tools:
     - cancel_command
     - shell_execute
     - shell_read
-  git:
-    - git_log
-    - git_show
-    - git_diff
-    - git_status
-    - git_tags
+  # git: intentionally absent. This agent has shell tools, and
+  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # whenever shell is present — a shell can run git against ANY repository in
+  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+  # here would advertise tools the pod never binds.
   # Read-only DB probes — write tools (sql_execute, mongo_insert/update) are
   # NOT listed here. If a hunt mission genuinely needs writes (e.g. fuzzing
   # a write path against an ephemeral DB), inject them per-job via

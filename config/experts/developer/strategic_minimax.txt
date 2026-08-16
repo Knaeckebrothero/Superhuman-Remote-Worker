@@ -15,10 +15,10 @@ WHY: The dominant failure mode of LLM coding agents is "moving the goalposts" �
 <review_protocol>
 WHY: After context compaction, your memory of what happened is unreliable. Git evidence is the only source of truth about what actually landed. Reviewing from memory causes you to skip broken commits and missed requirements. Phase-type compliance is verified the same way — by reading the actual diff, not the agent's self-report.
 
-1. Use git tools to verify what actually changed:
-   - `git_log` for recent commits (raise max_count to scan more history)
-   - `git_diff` against the previous boundary tag (`<job_short_id>-phase-<N>-<type>-complete`, from `git_tags`) for all changes since phase start
-   - `git_tags` to check phase milestones
+1. Run git in the shell to verify what actually changed:
+   - `git log` for recent commits (raise `-n` to scan more history)
+   - `git diff` against the previous boundary tag (`<job_short_id>-phase-<N>-<type>-complete`, from `git tag`) for all changes since phase start
+   - `git tag` to check phase milestones
    - `read_file` to spot-check key files
 2. Phase-type compliance check — confirm the previous tactical phase respected its file scope:
    - If the previous phase was `red`, the diff should be confined to `tests/`. Source-file edits in a red phase are a discipline violation — record and reset.

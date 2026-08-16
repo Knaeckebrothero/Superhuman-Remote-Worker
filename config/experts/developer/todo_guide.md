@@ -111,16 +111,16 @@ Purpose: Improve code quality while keeping all tests green.
 Example todos:
 - "Run full test suite (`pytest tests/ -x -v`) and record baseline — must be all green before refactoring. Save baseline output to archive/phase_N_baseline.txt."
 - "Extract <logic> from repo/src/<file> into repo/src/<new_file>. Update imports in callers. Run `pytest tests/ -x` — every previously-green test stays green."
-- "Verify via git_diff: only structural changes, no behavior changes, no edits under tests/."
+- "Verify via git diff: only structural changes, no behavior changes, no edits under tests/."
 
 ### 5. Integration Phase (PR / commit)
 
 Purpose: Package the work for review.
 
 Example todos:
-- "Review all changes via `git_diff` against the job's first commit (the \"[Phase 0 Seed]\" commit from `git_log`). Confirm scope matches spec.yaml feature and respects not_included."
+- "Review all changes via `git diff` against the job's first commit (the \"[Phase 0 Seed]\" commit from `git log`). Confirm scope matches spec.yaml feature and respects not_included."
 - "Stage and commit with message `feat: <feature> (AC-1, AC-2, ...)`. Push to origin <branch>."
-- "Verify via `git_log` and `git_status`: commit landed, branch clean."
+- "Verify via `git log` and `git status`: commit landed, branch clean."
 
 ### 6. Bug Fix Variant (red → green within one feature)
 
@@ -138,14 +138,14 @@ Every change must be independently verified before `todo_complete`.
 **Verification checklist per todo:**
 
 For RED phase:
-1. `git_diff` — only files under `tests/` changed? Anything in `src/`? STOP.
+1. `git diff` — only files under `tests/` changed? Anything in `src/`? STOP.
 2. Pytest output — does the new test ID appear in the failure list?
 3. Failure type — is it `AssertionError`/assertion mismatch? Or is it `ImportError`/`CollectionError`/`SyntaxError`?
 4. Forbidden test pattern check — search the diff for `assert True`, `pytest.skip`, `xfail`, empty bodies, tautologies, etc.
 5. Traceability — is the AC ID updated in `spec_lock.md`?
 
 For GREEN phase:
-1. `git_diff` — only files under `src/` (or config/migration paths) changed? Anything under `tests/`? STOP.
+1. `git diff` — only files under `src/` (or config/migration paths) changed? Anything under `tests/`? STOP.
 2. Pytest output — did the target test go from red to green?
 3. Full suite — did `done_when` commands pass? Any new failures elsewhere?
 4. Traceability — AC ID updated to `green`?

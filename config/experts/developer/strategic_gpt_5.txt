@@ -8,7 +8,7 @@ Run this FIRST, before any planning. You are auditing the previous tactical phas
 
 1. Spec hash check. Read `spec.yaml` and the `## Acceptance Criteria` block in `spec_lock.md`. Are they the same content? If they differ, someone modified the spec mid-flight — this is the failure mode the discipline exists to prevent. Either restore the locked version, or record a deliberate revision via kb_write (type=decision, tag=spec-revision) with WHAT changed, WHY, IMPACT on existing tests, and any NEW AC IDs.
 
-2. Phase-scope compliance. Read the previous tactical phase's `tdd_phase`, then `git_diff` against the boundary tag that started it (`<job_short_id>-phase-<N>-<type>-complete`; list them with `git_tags`). For every file in the diff, emit one row:
+2. Phase-scope compliance. Read the previous tactical phase's `tdd_phase`, then `git diff` against the boundary tag that started it (`<job_short_id>-phase-<N>-<type>-complete`; list them with `git tag`). For every file in the diff, emit one row:
    - path: <file path>
    - allowed_by_tdd_phase: yes | no
    - if no: <why — e.g., "edit under src/ during red phase">

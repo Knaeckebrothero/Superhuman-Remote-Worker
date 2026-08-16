@@ -5,7 +5,7 @@ tags:
   - git
   - datasources
   - tools
-status: open
+status: fixed
 priority: P1
 created: 2026-08-16
 aliases:
@@ -20,7 +20,8 @@ related:
 
 # The git read tools silently answer for the wrong repository, and attached repos have no read path at all
 
-**Status:** OPEN. Observed live on job `c4849fa1` (2026-08-16 08:24–09:24, project
+**Status:** **FIXED on develop 2026-08-16, not yet deployed.** Three changes, below
+under "What shipped". Observed live on job `c4849fa1` (2026-08-16 08:24–09:24, project
 Better Resavio), which paged the Legate claiming its workspace was broken.
 
 > **Correction (2026-08-16, same day).** The first revision of this document accepted the
@@ -108,6 +109,39 @@ It also produced the fourth instance of
 `deliverable_gate.passed: true` against
 `kb:reception-cockpit-demo-publication-report-2026-08-16`, a note explaining that nothing was
 published.
+
+## What shipped
+
+1. **The git read tools resolve per call instead of once at closure-creation.**
+   `git_log`, `git_show`, `git_diff`, `git_status`, and `git_tags` take an optional
+   `repo="<clone-dir>"` and read `workspace_manager.source_repos[repo]` when given it,
+   the job's own repo otherwise. No new capability was needed — `source_repos` already
+   held full `GitManager` instances with every method the tools call; they were simply
+   bound to the wrong one.
+2. **An unresolved ref now names the repos that might hold it.** A `fatal: bad object`
+   with attached repos present is appended with: *"This searched the job's OWN workspace
+   repository. Attached repository datasources are separate checkouts under repos/ and
+   are not searched by default: KurortEngine. Retry with `repo="KurortEngine"` to read
+   one of them."* That sentence is what would have ended this incident in one more tool
+   call rather than an hour and an operator page.
+3. **The git group is suppressed when the agent has shell tools**
+   (`ToolsConfig.__post_init__`, `src/core/loader.py`). A shell can run git against any
+   repository including `repos/<name>/`; granting both gave the agent two ways to ask
+   one question, the weaker of which answered about a different repo without saying so.
+   Suppression happens at config resolution, not in the tool registry, so
+   `resolved_config.agent.tools.git` matches what the pod actually binds. The eight
+   shell-having configs dropped their now-dead `git:` blocks, and the developer, scholar
+   and critic prompts were rewritten to run `git ...` through `run_command`.
+   `repo_*` is deliberately untouched: it carries the `read_only` enforcement on attached
+   datasources, which a shell cannot replace.
+
+Measured before the change, over the 500 most recent jobs: 83.0% had git **and** shell
+(pure redundancy), 16.4% had git with no attached repo (harmless), and **0.4% — 2 jobs —
+had git as the only read path with a repository attached.** Both were this project's.
+No job in the sample had shell without git.
+
+Not fixed here, and still open: the ticket named a branch and commit that a merged PR had
+already deleted. See "Re-anchor refs on merge" below.
 
 ## Direction
 

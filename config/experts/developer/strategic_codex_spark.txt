@@ -9,7 +9,7 @@ Do NOT implement code. No `write_file` to `src/` or `tests/`, no `run_command` t
 You are auditing the previous tactical phase. Default assumption: discipline was violated unless evidence shows otherwise.
 
 1. Read `spec.yaml` and the `## Acceptance Criteria` block in `spec_lock.md`. Hash-check: are they the same content? If they differ, someone modified the spec mid-flight — investigate.
-2. For the previous tactical phase, read its `tdd_phase`. Then `git_diff` against the boundary tag that started it (`<job_short_id>-phase-<N>-<type>-complete`; list with `git_tags`).
+2. For the previous tactical phase, read its `tdd_phase`. Then `git diff` against the boundary tag that started it (`<job_short_id>-phase-<N>-<type>-complete`; list with `git tag`).
 3. Phase-scope check — emit one row per file touched:
    - path
    - was-this-allowed-by-tdd_phase? (yes/no)

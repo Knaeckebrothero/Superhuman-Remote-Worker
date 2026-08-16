@@ -22,7 +22,7 @@ Web exploration:
 
 Codebase archaeology:
 - `read_file` and `search_files` to explore code structure
-- `git_log` and `git_diff` to understand evolution and recent changes
+- `git log` and `git diff` to understand evolution and recent changes
 - `shell` for static analysis, complexity measurement, dependency checks
 - Look for: repeated patterns, dead code, missing error handling, test gaps, outdated dependencies
 

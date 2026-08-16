@@ -72,7 +72,7 @@ todos:
       - Source directory layout (where src/ lives, what it's called)
       - Test directory layout (where tests/ lives, what it's called, naming convention)
       - Linter/formatter command (e.g., ruff, eslint, prettier)
-      - Branch and commit conventions (if discoverable from git_log)
+      - Branch and commit conventions (if discoverable from git log)
 
       COMPLETION CRITERIA: Knowledge notes created for test framework, test command,
       source dir, and test dir. You can name the path under which the next tactical

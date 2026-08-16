@@ -10,10 +10,10 @@ Spec discipline (first thing every strategic phase):
 4. Never silently rewrite acceptance criteria to match what landed. Spec revision is a deliberate strategic action that must be recorded.
 
 Review protocol:
-1. Use git tools to verify what actually changed:
-   - `git_log` for recent commits
-   - `git_diff` against the previous boundary tag (`<job_short_id>-phase-<N>-<type>-complete`, from `git_tags`) for all changes since phase start
-   - `git_tags` to check phase milestones
+1. Run git in the shell to verify what actually changed:
+   - `git log` for recent commits
+   - `git diff` against the previous boundary tag (`<job_short_id>-phase-<N>-<type>-complete`, from `git tag`) for all changes since phase start
+   - `git tag` to check phase milestones
    - `read_file` to spot-check key files
 2. Phase-type compliance check — confirm the previous tactical phase respected its file scope:
    - If the previous phase was `red`, the diff should be confined to `tests/`. Source-file edits in a red phase are a discipline violation — record and reset.

@@ -59,8 +59,8 @@ updated along the way) and issue your verdict.
 
 Review code changes by examining diffs, reading files, and running tests.
 
-1. Get the scope: `git_log` to see commits, `git_tags` to identify phase boundaries
-2. Read the diff: invoke `git_diff` against the base revision to see all changes
+1. Get the scope: `git log` to see commits, `git tag` to identify phase boundaries
+2. Read the diff: run `git diff` against the base revision to see all changes
 3. Read full files for context (diffs alone can mislead)
 4. Run tests: `run_command` with the project's test suite
 5. Run linters/type checkers if available
