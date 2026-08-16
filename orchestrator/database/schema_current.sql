@@ -6524,7 +6524,7 @@ CREATE TABLE public.project_officers (
     project_id uuid NOT NULL,
     thread_id uuid,
     config_override jsonb DEFAULT '{}'::jsonb NOT NULL,
-    communication_policy jsonb DEFAULT '{"worker_messages": "user_direct", "officer_response_minutes": 15}'::jsonb NOT NULL,
+    communication_policy jsonb DEFAULT '{"worker_messages": "officer_first", "officer_response_minutes": 15}'::jsonb NOT NULL,
     state jsonb DEFAULT '{}'::jsonb NOT NULL,
     incarnations jsonb DEFAULT '[]'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -6554,7 +6554,7 @@ COMMENT ON COLUMN public.project_officers.thread_id IS 'Current incarnation (thr
 -- Name: COLUMN project_officers.communication_policy; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.project_officers.communication_policy IS 'Legate-owned worker-message routing policy (officer_message_routing). Row-only: resolved server-side per message, never mirrored into thread metadata, not writable by the officer runtime.';
+COMMENT ON COLUMN public.project_officers.communication_policy IS 'Legate-owned worker-message routing policy (officer_message_routing). Row-only: resolved server-side per message, never mirrored into thread metadata, not writable by the officer runtime. Defaults to officer_first since 0163; effective policy is still user_direct while the post is vacant.';
 
 
 --
@@ -7317,7 +7317,7 @@ COMMENT ON TABLE public.runtime_actor_access_tokens IS 'Short-lived opaque acces
 
 CREATE TABLE public.runtime_actor_bootstraps (
     token_hash bytea NOT NULL,
-    thread_id uuid NOT NULL,
+    thread_id uuid,
     expires_at timestamp with time zone NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     last_used_at timestamp with time zone
@@ -7329,6 +7329,13 @@ CREATE TABLE public.runtime_actor_bootstraps (
 --
 
 COMMENT ON TABLE public.runtime_actor_bootstraps IS 'Short-lived per-pod bootstrap credentials used only by dedicated session registration; never shared with stateless workers.';
+
+
+--
+-- Name: COLUMN runtime_actor_bootstraps.thread_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.runtime_actor_bootstraps.thread_id IS 'Session this bootstrap may be exchanged for. NULL means pod-scoped: the holder is a warm pool agent and the thread is resolved at attach time from the durable agents.thread_id binding, never from the caller.';
 
 
 --

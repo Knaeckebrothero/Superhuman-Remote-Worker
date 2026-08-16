@@ -41,7 +41,8 @@ one-transaction blocking send (message + route + wake intent + freeze, all-or-no
 held/vacant/unreachable fallbacks with hold/decommission drains, the officer inbox
 (high-urgency `worker_message` wakes, sitrep section, reply/escalate/acknowledge tools
 with post-row actor guards), and the leader-gated SLA/total-timeout reconciler with CAS
-exactly-once semantics. Ratified defaults: DB `user_direct`, 15-min officer SLA,
+exactly-once semantics. Ratified defaults: DB `officer_first` (0163; `user_direct`
+through 0162), 15-min officer SLA,
 immediate-both for `officer_and_user`. M5 (route badges/thread actions) deferred — the
 O5 card already carries the policy selector. Live k3d walk proved reply-resume, SLA
 escalation, total-timeout resume, and the fail-closed guard. O6 subsequently released the
@@ -115,9 +116,12 @@ terminal fallback visible to the user.
 
 ### 2.1 Defaults and authority
 
-- Existing projects and vacant posts default to `user_direct` for backwards compatibility.
+- Posts default to `officer_first` (migration 0163). Vacant posts still *resolve* to
+  `user_direct` — the default is what the row stores, not what a question with no officer
+  gets.
 - The commission UI recommends `officer_first`; the Legate/project admin may choose any
-  policy.
+  policy. An explicit choice survives future default flips: 0163 only moved rows that were
+  still on `user_direct`.
 - Only a project admin/Legate can change the policy. Worker content, job config, the officer,
   or prompt-injected text cannot.
 - The effective policy is always `user_direct` when there is no commissioned officer.
@@ -320,9 +324,13 @@ capacity by design.
 
 ## 10. Open questions (Legate)
 
-1. **Commissioning default:** recommend `officer_first` in the UI while retaining
+1. ~~**Commissioning default:** recommend `officer_first` in the UI while retaining
    `user_direct` as the database/backfill default. Should new commissions opt in
-   automatically, or require an explicit selection?
+   automatically, or require an explicit selection?~~ **RESOLVED 2026-08-16 (Legate):
+   opt in automatically.** Migration 0163 flips the column DEFAULT to `officer_first`
+   and moves every existing row still on `user_direct` onto it. Rows carrying an explicit
+   `officer_and_user` were left untouched. The vacant-post collapse to `user_direct` is
+   unchanged, so this only bites where a live officer is commissioned.
 2. **Blocking officer SLA:** recommend 15 minutes, with immediate fallback while held or
    unreachable. Is 15 minutes right, or should the default align with the officer's
    configured `sleep_min`/wake cadence?
