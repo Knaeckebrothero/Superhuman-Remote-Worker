@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import orchestrator.services.headless_notifications as hn
+import services.headless_notifications as hn
 
 
 # ---------------------------------------------------------------------------
@@ -594,8 +594,8 @@ class TestPermissionNotifySweeperSQL:
 
 def test_permission_email_uses_brand_palette_and_ghost_deny() -> None:
     import re
-    from orchestrator.services import brand
-    from orchestrator.services import headless_notifications as hn
+    from services import brand
+    from services import headless_notifications as hn
 
     _text, html = hn._build_permission_email_bodies(
         tool_name="run_command",

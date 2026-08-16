@@ -24,7 +24,7 @@ import html
 from dataclasses import dataclass
 from typing import Sequence
 
-from orchestrator.services.brand import TRAVERTINE as C
+from services.brand import TRAVERTINE as C
 
 # Georgia is aliased to `serif` on Android (AOSP fonts.xml aliases both Georgia
 # and Times New Roman), so Gmail Android renders Noto Serif. Do not let layout

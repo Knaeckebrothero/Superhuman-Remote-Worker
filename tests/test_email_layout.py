@@ -6,8 +6,8 @@ accessibility requirement -- see docs/features/email_and_login_theme_alignment.m
 
 import re
 
-from orchestrator.services import brand
-from orchestrator.services.email_layout import Action, render_email
+from services import brand
+from services.email_layout import Action, render_email
 
 PALETTE_HEXES = set(brand.TRAVERTINE.values())
 

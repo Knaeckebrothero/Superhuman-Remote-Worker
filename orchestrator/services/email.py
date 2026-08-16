@@ -25,7 +25,7 @@ from email.mime.text import MIMEText
 
 import aiosmtplib
 
-from orchestrator.services.email_layout import Action, escape_text, render_email
+from services.email_layout import Action, escape_text, render_email
 
 logger = logging.getLogger(__name__)
 

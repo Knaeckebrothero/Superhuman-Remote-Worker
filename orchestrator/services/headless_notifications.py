@@ -52,8 +52,8 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from orchestrator.services.brand import TRAVERTINE as _C
-from orchestrator.services.email_layout import Action, escape_text, render_email
+from services.brand import TRAVERTINE as _C
+from services.email_layout import Action, escape_text, render_email
 
 logger = logging.getLogger(__name__)
 
