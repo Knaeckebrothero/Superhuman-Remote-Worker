@@ -1100,6 +1100,64 @@ class OrchestratorClient:
             logger.warning(f"Thread suspend request failed: {e}")
             return False
 
+    async def bind_pod_runtime_actor(self, thread_id: str) -> bool:
+        """Exchange this pod's thread-less bootstrap for the attached session.
+
+        Dedicated session pods get their actor inside ``register()`` because
+        the orchestrator knew the thread when it minted the pod. A warm pool
+        pod registers thread-less and learns its session later, so it has to
+        ask again — presenting the same kind of pod-unique secret, which the
+        orchestrator cross-checks against its own ``agents.thread_id`` binding.
+
+        Returns False when this pod holds no pod bootstrap (an older image, or
+        a pod the provisioner did not mint) or the exchange is refused. The
+        caller must treat that as a failed attach rather than continuing: a
+        session that runs without actor identity looks healthy and then denies
+        every machine-tag write several tool calls later.
+        """
+        if not self._client or not self.agent_id:
+            return False
+        bootstrap = os.environ.get("SRW_RUNTIME_ACTOR_POD_BOOTSTRAP", "").strip()
+        if not bootstrap:
+            logger.warning(
+                "No pod runtime actor bootstrap in env — this pod cannot take "
+                "a session that needs actor identity"
+            )
+            return False
+        url = (
+            f"{self.orchestrator_url}/api/agents/{self.agent_id}/runtime-actor/session"
+        )
+        try:
+            response = await self._client.post(
+                url,
+                json={"thread_id": str(thread_id)},
+                headers={RUNTIME_ACTOR_BOOTSTRAP_HEADER: bootstrap},
+            )
+        except Exception as e:
+            logger.warning(f"Pod runtime actor exchange failed: {e}")
+            return False
+        if response.status_code != 200:
+            logger.warning(
+                "Pod runtime actor exchange refused (%s): %s",
+                response.status_code,
+                response.text[:200],
+            )
+            return False
+        self.runtime_actor = RuntimeActorContext.from_payload(
+            response.json().get("runtime_actor")
+        )
+        logger.info(f"Runtime actor bound for thread {thread_id}")
+        return True
+
+    def clear_runtime_actor(self) -> None:
+        """Drop the actor when this pod stops serving its session.
+
+        A pool pod goes back into the idle pool and may be handed a different
+        thread — and a different project — next. Keeping the old actor would
+        leave a credential scoped to the previous session lying in memory.
+        """
+        self.runtime_actor = None
+
     async def release_thread_agent(self, thread_id: str) -> bool:
         """Clear threads.agent_id when this agent's session attach fails.
 

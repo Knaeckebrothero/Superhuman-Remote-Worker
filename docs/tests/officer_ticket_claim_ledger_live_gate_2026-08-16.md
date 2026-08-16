@@ -6,7 +6,7 @@ tags:
   - backlog
   - postgresql
   - live-gate
-status: run-1-failed
+status: run-2-blocked
 created: 2026-08-16
 related:
   - "[[deleting_a_job_releases_its_backlog_ticket_claim]]"
@@ -17,10 +17,15 @@ related:
 
 # Officer ticket-claim ledger — main-dev post-deployment smoke
 
-**Status: RUN 1 FAILED 2026-08-16 (Phase A).** BP-05 is **not deployed** on main dev:
-migration `0162_officer_ticket_claims.sql` fail-closed on real historical data, so the
-BP-05 orchestrator replica never became serving. Behavioral gates B3 and C1–C7 were never
-reached and no fixture was created. See [Run 1 result](#run-1-result-2026-08-16) below.
+**Status: RUN 2 BLOCKED 2026-08-16 (Phase C1).** BP-05 **is** deployed and Phases A and B
+pass in full — the corrected `0162_officer_ticket_claims.sql` applied in 43 ms, the ledger
+and both triggers are installed, all seven historical ticket jobs carry claims, and the
+rolled-back compatibility/integrity probe passes. C2–C7 are unreachable because a **newly
+commissioned officer cannot create a trusted `ready` ticket**: it is attached to a pooled
+`worker_base` job agent instead of a dedicated centurion session pod, so it receives no
+runtime actor credential and every machine-tag write is denied. See
+[Run 2 result](#run-2-result-2026-08-16) below. Run 1's Phase A failure is retained for
+history.
 
 This is the narrow live gate for BP-05 and app migration
 `0162_officer_ticket_claims.sql` after their main-dev deployment. It is not a general
@@ -72,7 +77,8 @@ Keep every Officer Post used by this run at `auto_pull=false`.
 
 ## Required evidence record
 
-Record the following without secrets:
+Record the following without secrets. **The table below is Run 1's;** Run 2's is in
+[Run 2 result](#run-2-result-2026-08-16).
 
 | Field | Value |
 |---|---|
@@ -171,12 +177,12 @@ First count extant terminal backfilled jobs:
 SELECT COUNT(*) AS probe_candidates
   FROM officer_ticket_claims AS claim
   JOIN jobs AS job ON job.id = claim.job_id
- WHERE claim.source = 'backfill'
+ WHERE claim.source = 'legacy_unversioned'
    AND claim.job_deleted_at IS NULL
    AND job.status IN ('completed', 'failed', 'cancelled');
 ```
 
-If the count is zero, record **NOT APPLICABLE — no extant backfilled job**. Do not fabricate
+If the count is zero, record **NOT APPLICABLE — no extant legacy-claimed job**. Do not fabricate
 one. The migration had no historical compatibility surface to exercise on this cluster.
 
 If at least one candidate exists, run the following logical probe using one terminal row.
@@ -197,7 +203,7 @@ BEGIN
       INTO target
       FROM officer_ticket_claims AS claim
       JOIN jobs AS job ON job.id = claim.job_id
-     WHERE claim.source = 'backfill'
+     WHERE claim.source = 'legacy_unversioned'
        AND claim.job_deleted_at IS NULL
        AND job.status IN ('completed', 'failed', 'cancelled')
      ORDER BY claim.claimed_at, claim.job_id
@@ -367,24 +373,27 @@ behavioral assertions passed. List exact non-secret IDs and the safe remediation
 
 ## Acceptance scorecard
 
+Run 2 (2026-08-16, deployed `sha-2974aed` → `sha-9cfd61e`). Run 1's column is preserved in
+[Run 1 result](#run-1-result-2026-08-16).
+
 | Gate | Required result | Result |
 |---|---|---|
-| A1 — artifact identity | Uniform intended orchestrator image, rollout complete | **FAIL** — mixed: 2 serving pods on pre-BP-05 `sha-2afbf95`; BP-05 `sha-20c9154` CrashLoopBackOff. Deployment `Progressing=False / ProgressDeadlineExceeded`. |
-| A2 — migration health | 0162 successful, zero dirty migrations, two triggers | **FAIL** — 0162 `success=false`; `dirty_migrations=1`; `ledger_exists=false`; `installed_job_triggers=0`. |
-| B1 — ledger completeness | Zero ticket jobs without claims | **NOT RUN** — vacuously violated: 7 ticket-bearing jobs exist, ledger table absent, so all 7 lack claims. |
-| B2 — deletion audit completeness | Zero absent jobs with unstamped deletion | **NOT RUN** — no ledger table. |
-| B3 — historical merge | PASS, or N/A only when candidate count is zero | **NOT RUN** — probe requires the ledger. Not recordable as N/A. |
-| B4 — provenance removal | Named check violation; rolled back | **NOT RUN** — integrity trigger not installed. |
-| C1 — trusted ticket | Ready/category ticket has server `ready_at` | **NOT RUN** — stopped at Phase A. |
-| C2 — first claim | One manual claim and one job | **NOT RUN** |
+| A1 — artifact identity | Uniform intended orchestrator image, rollout complete | **PASS** — 2/2 serving pods on one ReplicaSet, identical digest, 0 restarts, both in the Service, `Progressing=NewReplicaSetAvailable`. Re-verified after an unrelated docs-only rollout landed mid-run. |
+| A2 — migration health | 0162 successful, zero dirty migrations, two triggers | **PASS** — 0162 `success=true`, 43 ms, no error; `dirty_migrations=0`; `ledger_exists=true`; `installed_job_triggers=2`. In-image migration byte-identical to the committed fix (`sha256:3383746f…675d`). |
+| B1 — ledger completeness | Zero ticket jobs without claims | **PASS** — `ticket_jobs_without_claim=0`; all 7 historical rows claimed as `legacy_unversioned`. |
+| B2 — deletion audit completeness | Zero absent jobs with unstamped deletion | **PASS** — `deleted_claims_without_audit=0`. |
+| B3 — historical merge | PASS, or N/A only when candidate count is zero | **PASS (adapted)** — run against `source='legacy_unversioned'` (5 candidates); `backfill` is never emitted by the corrected migration. Ordinary context merge accepted on legacy job `2fbe1f99`. |
+| B4 — provenance removal | Named check violation; rolled back | **PASS** — removal of `ticket_note_id` refused with the named check violation; `leaked_probe_keys=0`. |
+| C1 — trusted ticket | Ready/category ticket has server `ready_at` | **BLOCKED** — machine-tag write denied: `Authorization denied [missing_credential] for machine_tags; actor=unresolved, project=none`. Note created but `tags=[]`, `ready_at=NULL`. |
+| C2 — first claim | One manual claim and one job | **NOT RUN** — no trusted ready generation exists to claim. |
 | C3 — duplicate refusal | Same generation creates nothing | **NOT RUN** |
 | C4 — claimed deletion | API true; job gone; audited claim retained | **NOT RUN** |
 | C5 — unchanged retry | Still refused after physical deletion | **NOT RUN** |
 | C6 — explicit re-ready | Newer generation wins exactly once | **NOT RUN** |
 | C7 — ordinary control | API false; no ledger claim | **NOT RUN** |
-| D1 — logs | No unexplained integrity/deletion errors | **FAIL (explained)** — the only orchestrator error is the repeated 0162 preflight abort; it is the root cause, not an unexplained one. No `CheckViolation` or deletion 500s observed. |
-| D2 — cleanup | No disposable residue | **PASS (vacuous)** — zero mutating operations performed. |
-| D3 — existing Officer | Unchanged, healthy, auto-pull off | **PASS** — post `a572e4a0…` / thread `6ce5bc4c…` still linked; `config_override.auto_pull` unset (default false). Observed only; never woken, messaged, or edited. |
+| D1 — logs | No unexplained integrity/deletion errors | **PASS** — both replicas: `startup_failed=0`, `dirty=0`, `checksum_err=0`, `preflight=0`, `lock_timeout=0`, `CheckViolation=0`. The one expected provenance-removal rejection is the rolled-back B4 probe. |
+| D2 — cleanup | No disposable residue | **PASS** — project, post, note, grants, claims all removed; 0 jobs were ever created. Both disposable threads are `ended` with `project_id=NULL` (the only supported disposition — `DELETE /api/persistent/threads/{id}` returns `{"status":"ended"}`); 3 residual wake rows are all `state=sent` with no `fire_at`. |
+| D3 — existing Officer | Unchanged, healthy, auto-pull off | **PASS** — post `a572e4a0…` / thread `6ce5bc4c…` still linked, `active`, dedicated pod `persistent-6ce5bc4c-b77` up 8h, `auto_pull` unset. Never messaged, woken, held, or edited; its turn counter advanced 66→67 on its own sleep timer. `auto_pull=true` count across all posts: 0. |
 
 ## Final verdict rules
 
@@ -522,3 +531,94 @@ The agent executing this document should:
 6. run `git diff --check` after documentation updates; and
 7. report the final scorecard, cleanup proof, remaining blockers, and whether any file is
    modified—but do not commit, push, deploy, or enable auto-pull.
+
+## Run 2 result (2026-08-16)
+
+**Verdict: BLOCKED — Phase C1.** BP-05 itself is proven on main dev: Phases A, B and D all
+pass. The gate stops because the *fixture* cannot be built through the supported path, not
+because any BP-05 assertion failed. Cleanup completed; the user's Officer was observed only.
+
+### Evidence record
+
+| Field | Value |
+|---|---|
+| Started/finished UTC | 2026-08-16 16:36Z / 2026-08-16 17:02Z |
+| Kubernetes context / namespace | `main` / `superhuman-remote-worker` (passed per call; global context left on `k3d-srw` because Tilt watches it) |
+| Deployed orchestrator image | `sha-2974aed` → `sha256:289219bb…8951` at start; an unrelated docs-only rollout to `sha-9cfd61e` → `sha256:db922122…9e32` landed mid-run and Phase A was re-verified against it |
+| Git revision represented | `2974aed2`, then `9cfd61e2`. Both contain `014fff49` (ledger), `1a43d9d7` (legacy-claim repair) and `27c1c5ac` (auto-pull connectors), verified by `git merge-base --is-ancestor`, and both ship 0162 byte-identical to the committed fix |
+| Orchestrator pods | `…-5f99ddc9c9-c2ftt`, `…-5f99ddc9c9-khg6r` — both Ready, 0 restarts, identical digest, both in the Service |
+| Migration 0162 applied_at / execution_ms | `2026-08-16 16:07:21.724004+00` / `43` ms — `success=true`, `error IS NULL` |
+| Disposable project ID | `316a0cc1-ccc2-48dc-94c9-30981689af08` (deleted) |
+| Disposable Officer thread IDs | `0b51d137…` (incarnation 0), `1a4ad75e…` (incarnation 1, re-brained) — both ended |
+| Ticket slug / ready generations | `bp05-live-gate-sentinel-ticket` — **never stamped**; `ready_at` stayed NULL |
+| Claimed job IDs | none — zero jobs were created in the disposable project |
+| Cleanup verification | `project_rows=0`, `post_rows=0`, `jobs=0`, `claims_for_project=0`, `notes_left=0`, `grants_left=0`; legacy claims still 7; `dirty_migrations=0` |
+| Final verdict | **BLOCKED — Phase C1 (no runtime actor credential for a new officer)** |
+
+### What BP-05 proved
+
+The migration repair holds against real data. All seven historical ticket jobs are claimed
+as `legacy_unversioned` with NULL generation — including `2fbe1f99` and `c4849fa1`, which
+share one ticket on project `a572e4a0` and would have collided under any single sentinel
+generation. The rolled-back probe confirmed both halves of the compatibility contract on a
+real legacy row: an ordinary `context` merge is **accepted**, and removing `ticket_note_id`
+is **refused** with the named check violation. That was the sharpest risk in the repair —
+two of the seven legacy jobs are `pending_review` and will be updated when they resolve.
+
+Note B3's deviation: the runbook's probe selects `source='backfill'`, which the corrected
+migration never emits. Recording it N/A would have skipped the only historical-compatibility
+surface that exists, so the probe was run against `source='legacy_unversioned'` instead.
+**Future runs should change B3/B4 to select `legacy_unversioned`.**
+
+### The blocker — a new officer has no runtime actor credential
+
+The pool/stateless lane is enabled on main dev for testing
+(`STATELESS_SESSION_ENABLED=true`, `STATELESS_WORKER_ENABLED=true`), so a freshly
+commissioned officer attaches to an **idle pooled dual-mode agent** (`srw-agent-j-…`)
+instead of getting a dedicated centurion session pod. Two independent problems surfaced:
+
+1. **No runtime actor identity (the blocker).** `kb_update(set_tags=[…])` is refused with
+   `Authorization denied [missing_credential] for machine_tags; actor=unresolved,
+   project=none`. `runtime_actor_grants` *does* hold an `officer` grant for the new thread,
+   but `runtime_actor_bootstraps` has **no row** — so the agent can never exchange for an
+   access token. `provision_or_assign.py` is the cause: the `_find_idle_persistent_agent()`
+   → `_send_session_attach(...)` branch never calls `issue_runtime_actor_bootstrap`, while
+   the fallback branch `provision_agent(purpose="session", thread_id=…)` does and explicitly
+   *"refuses to provision an identity-less pod"*. The guard exists on both provisioning
+   paths (`persistent_provisioner.py:223`, `agent_provisioner.py:376`); the pool path routes
+   around it by not creating a pod. **This makes officer identity nondeterministic** — it
+   depends on whether an idle agent existed at attach time. The live Officer `6ce5bc4c`
+   works only because none was free when it booted: it holds the dedicated pod
+   `persistent-6ce5bc4c-b77` with a bootstrap per pod start, all `last_used_at` non-null.
+   Any fix needs a new delivery channel, since the bootstrap currently rides the pod
+   manifest env and cannot be injected into a running pod; `_send_session_attach`'s HTTP
+   payload is the natural place.
+2. **The default officer brain cannot emit JSON arrays.** With no model pinned on the post,
+   `config/experts/centurion/config.yaml` falls back to what its own comment calls "a small
+   local model: fine for smoke". That model failed eight consecutive `kb_write`/`kb_update`
+   calls on pydantic validation, alternating between a quoted string `'["a","b"]'` and a
+   wrapped object `{'item': ['a','b']}`. Pinning `brain = gpt-5.6-sol`/`high` and respawning
+   fixed the shape immediately — the officer then emitted
+   `set_tags: ['category:researcher', 'ready', 'bp05-live-gate']` correctly and was stopped
+   by the credential denial instead. An officer commissioned without a pinned brain
+   therefore cannot write machine tags at all, before authorization is even reached.
+
+Reproduced on two independent commissions (incarnation 0 and 1); the second was a clean
+respawn, so this is not an artifact of the re-brain. One bounded remediation was attempted
+through the supported API — `POST /api/agents/threads/{id}/release-agent` — which returned
+`409 Thread workspace retirement is still in progress`. Per the authority rules the run then
+stopped rather than improvising around the authorization boundary. No SQL was used to forge
+tags, `ready_at`, or any claim.
+
+### Why this matters beyond the gate
+
+Machine tags are how `ready` and `category:*` reach a ticket, and ready tickets are the
+entire input to auto-pull. An officer that cannot tag cannot fill a pool. The live Officer
+is unaffected while its dedicated pod survives, but any officer commissioned today —
+including a replacement for the live one — lands in this state.
+
+### Not closed
+
+BP-05's *ledger* behaviour under a live manual claim/delete/re-ready cycle (C2–C7) remains
+unproven. The deployment checkpoint stays **open**. `auto_pull` is false on every post
+(verified: 0 posts with `auto_pull=true`).

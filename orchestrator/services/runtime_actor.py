@@ -31,6 +31,14 @@ REFRESH_TTL_SECONDS = int(os.environ.get("RUNTIME_ACTOR_REFRESH_TTL_SECONDS", "8
 BOOTSTRAP_TTL_SECONDS = int(
     os.environ.get("RUNTIME_ACTOR_BOOTSTRAP_TTL_SECONDS", "900")
 )
+# A dedicated session pod exchanges its bootstrap within seconds of booting, so
+# 15 minutes is generous. A warm pool pod holds its bootstrap for as long as it
+# sits idle waiting for a session, which is a pod lifetime — a short TTL there
+# would silently turn identity into a function of how busy the cluster is,
+# which is exactly the nondeterminism this credential exists to remove.
+POD_BOOTSTRAP_TTL_SECONDS = int(
+    os.environ.get("RUNTIME_ACTOR_POD_BOOTSTRAP_TTL_SECONDS", str(7 * 24 * 3600))
+)
 
 _TOKEN_RE = re.compile(r"^sr(?:a|r|b)_[A-Za-z0-9_-]{32,128}$")
 _SENSITIVE_ACTIONS = frozenset({"machine_tags", "charter"})
@@ -277,6 +285,86 @@ async def issue_runtime_actor_bootstrap(db: Any, thread_id: str) -> str:
             expires_at,
         )
     return token
+
+
+async def issue_runtime_actor_pod_bootstrap(db: Any) -> str:
+    """Create one pod-scoped bootstrap for a warm pool agent.
+
+    Thread-less by construction: the pod is provisioned before any session
+    exists, so there is nothing to bind to yet. The binding happens in
+    ``exchange_runtime_actor_pod_bootstrap``, which reads it from durable
+    server state instead of accepting it from the caller.
+    """
+
+    token = _token("srb")
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=POD_BOOTSTRAP_TTL_SECONDS
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO runtime_actor_bootstraps (token_hash, thread_id, expires_at)
+            VALUES ($1, NULL, $2)
+            """,
+            _digest(token),
+            expires_at,
+        )
+    return token
+
+
+async def exchange_runtime_actor_pod_bootstrap(
+    db: Any, *, agent_id: str, thread_id: str, bootstrap_token: str
+) -> RuntimeActorContext:
+    """Bind a warm pool pod's bootstrap to the session it was just given.
+
+    Two independent facts must hold, and neither is taken from the caller's
+    word: the presenter holds a secret that only exists inside one provisioned
+    pod, and the orchestrator's own ``agents`` row already says that pod is
+    the agent serving this thread. A pod that lies about ``thread_id`` gets
+    nothing, because the binding is read from the row, not the request.
+
+    Unlike the dedicated-pod exchange this is deliberately repeatable: one pool
+    pod serves a succession of sessions over its life, and each attach must
+    mint a fresh, correctly-scoped actor.
+    """
+
+    if not _valid_token(bootstrap_token, "srb"):
+        raise RuntimeActorCredentialError(
+            "malformed_bootstrap", "Runtime actor bootstrap is malformed."
+        )
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE runtime_actor_bootstraps
+               SET last_used_at = now()
+             WHERE token_hash = $1
+               AND thread_id IS NULL
+               AND expires_at > now()
+            RETURNING token_hash
+            """,
+            _digest(bootstrap_token),
+        )
+        if row is None:
+            raise RuntimeActorCredentialError(
+                "invalid_bootstrap",
+                "Runtime actor pod bootstrap is invalid or expired.",
+            )
+        bound = await conn.fetchrow(
+            """
+            SELECT 1
+              FROM agents
+             WHERE id = $1::uuid
+               AND thread_id = $2::uuid
+            """,
+            str(agent_id),
+            str(thread_id),
+        )
+    if bound is None:
+        raise RuntimeActorCredentialError(
+            "runtime_not_current",
+            "This agent is not the bound agent for the requested session.",
+        )
+    return await mint_thread_runtime_actor(db, thread_id=str(thread_id))
 
 
 async def exchange_runtime_actor_bootstrap(
