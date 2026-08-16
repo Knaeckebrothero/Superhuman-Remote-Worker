@@ -11939,6 +11939,53 @@ async def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/debug/emails", response_class=HTMLResponse)
+async def debug_email_index() -> str:
+    """Dev-only index of rendered transactional emails (Zulip's /emails idea).
+
+    Calls the real builders with fixture data — never fixtures rendered
+    independently of the code that ships — so this page cannot drift from
+    the emails users actually receive.
+    """
+    links = "".join(
+        f'<li><a href="/debug/emails/{n}">{n}</a></li>'
+        for n in ("system", "agent", "permission")
+    )
+    return f"<!DOCTYPE html><html><body><h1>Email previews</h1><ul>{links}</ul></body></html>"
+
+
+@app.get("/debug/emails/{name}", response_class=HTMLResponse)
+async def debug_email_preview(name: str) -> str:
+    """Render one transactional email through its real builder for inspection."""
+    link = "https://cockpit.example/preview"
+    if name == "system":
+        return email_service._build_system_notification_html(
+            to_name="Ada Lovelace",
+            body_md="Your automation was disabled after 3 consecutive failures.",
+            cockpit_link=link,
+        )
+    if name == "agent":
+        return email_service._build_agent_message_html(
+            message_md="Finished the migration.\nTwo files changed.",
+            job_description="Migrate the billing schema to the new ledger format",
+            config_name="developer",
+            phase_str="phase 2",
+            cockpit_link=link,
+            reply_to_addr="reply@example.com",
+        )
+    if name == "permission":
+        _text, html = headless_notifications._build_permission_email_bodies(
+            tool_name="run_command",
+            tool_args_preview='{"command": "rm -rf ./build"}',
+            approve_url=f"{link}/approve",
+            deny_url=f"{link}/deny",
+            cockpit_link=link,
+            request_age_minutes=4,
+        )
+        return html
+    raise HTTPException(status_code=404, detail="unknown email preview")
+
+
 @app.get("/api/workspace/status")
 async def workspace_status(request: Request) -> dict[str, Any]:
     """Get workspace configuration status for debugging.
