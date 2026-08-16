@@ -42,7 +42,8 @@ backfill and read flips/lineage capacity (`fa497666`), commission/decommission/h
 release + PATCH + finished GET (`9a3c3934`), the one-state cockpit card (`d7cfd716`).
 Locked decisions applied: project-admin authority, `line ×2 · sandbox` starter draft,
 brain-edit deferred with the "applies on next respawn" label; `communication_policy`
-shipped on the row (default `user_direct`) and is now live via [[officer_message_routing]]
+shipped on the row (default `user_direct`, flipped to `officer_first` by 0163) and is now
+live via [[officer_message_routing]]
 M1–M4. **At that implementation point, O6 (releasing the held Resavio officer through the
 new endpoint) was deliberately not performed** — it was sequenced behind the
 knowledge-plane/supervision/routing landings. O6 was subsequently released successfully
@@ -163,10 +164,11 @@ CREATE TABLE project_officers (
     config_override JSONB NOT NULL DEFAULT '{}'::jsonb,
     -- User-owned routing policy for worker messages. Kept on the post so it
     -- exists while vacant and cannot be rewritten by the officer runtime.
-    -- Existing/backfilled projects remain direct until explicitly changed;
+    -- Shipped as user_direct in 0157; 0163 flipped the DEFAULT to
+    -- officer_first and moved existing user_direct rows with it.
     -- 15 minutes is the proposed default pending message-routing Q2.
     communication_policy JSONB NOT NULL DEFAULT
-      '{"worker_messages":"user_direct","officer_response_minutes":15}'::jsonb,
+      '{"worker_messages":"officer_first","officer_response_minutes":15}'::jsonb,
     -- Harvested officer_state (digest ring, pages, sitrep fingerprints) from the
     -- last decommission, plus the while-vacant ledger (§5). Empty while
     -- commissioned — the live copy is on the thread.
@@ -504,3 +506,9 @@ mandatory and part of O1's definition of done.
   routing policy because it exists even while vacant. Existing/backfilled posts default to
   `user_direct`; the commissioning UI may recommend `officer_first`. Delivery, escalation,
   and timeout mechanics live in [[officer_message_routing]].
+- **2026-08-16 (Legate):** `officer_first` becomes the default rather than a
+  recommendation. Migration 0163 flips the column DEFAULT and moves every post still on
+  `user_direct` onto it; posts carrying an explicit `officer_and_user` are untouched, and
+  a post that wants direct routing back re-picks it in the officer tab. Vacant posts still
+  resolve to `user_direct` at delivery time, so the flip only bites where an officer is
+  commissioned. Resolves [[officer_message_routing]] Q1.

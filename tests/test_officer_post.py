@@ -274,8 +274,12 @@ class TestPostRowHelpers:
         assert post["thread_id"] is None
         assert post["config_override"] == {}
         assert post["incarnations"] == []
+        # officer_first since migration 0163 (was user_direct through 0162).
+        # This asserts what the COLUMN DEFAULT mints, not what a question
+        # actually gets — a vacant post still resolves to user_direct at
+        # delivery time (see test_officer_message_routing.py).
         assert post["communication_policy"] == {
-            "worker_messages": "user_direct",
+            "worker_messages": "officer_first",
             "officer_response_minutes": 15,
         }
 

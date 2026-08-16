@@ -36,7 +36,8 @@ from src.shared.content_redaction import sanitize
 logger = logging.getLogger(__name__)
 
 # Policy vocabulary (must match the PATCH validator in main.py and the
-# project_officers.communication_policy default from migration 0157).
+# project_officers.communication_policy default, officer_first since migration
+# 0163).
 POLICY_USER_DIRECT = "user_direct"
 POLICY_OFFICER_AND_USER = "officer_and_user"
 POLICY_OFFICER_FIRST = "officer_first"
@@ -202,6 +203,11 @@ async def resolve_effective_policy(
     policy = _as_dict(post.get("communication_policy"))
     requested = policy.get("worker_messages")
     if requested not in _POLICIES:
+        # Deliberately user_direct rather than the officer_first column default
+        # (0163). The column is NOT NULL and the PATCH validator rejects
+        # anything outside _POLICIES, so reaching here means the row was
+        # corrupted or hand-edited — and the fail-safe for a question with no
+        # trustworthy policy is the human, not a routing hop that could stall.
         requested = POLICY_USER_DIRECT
     minutes = _clamped_minutes(
         policy.get("officer_response_minutes", DEFAULT_OFFICER_RESPONSE_MINUTES)
