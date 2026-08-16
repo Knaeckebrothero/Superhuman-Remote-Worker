@@ -2,8 +2,9 @@
 
 Gated by EMAIL_PREVIEW_ENABLED (default off, same convention as
 CANVAS_LIVE_PREVIEW_ENABLED / COLLABORA_ENABLED): tests that exercise the
-rendered output opt the flag on via monkeypatch; a separate pair confirms
-the gate itself, so removing it would fail those two.
+rendered output opt the flag on via monkeypatch. A separate pair confirms the
+gate itself is both present and non-leaky — disabled, the response body must
+match a genuinely unmapped route's, not just its status code.
 """
 
 import pytest
@@ -42,10 +43,25 @@ def test_unknown_preview_is_404(client, preview_enabled) -> None:
 
 
 def test_preview_index_is_404_when_flag_unset(client, monkeypatch) -> None:
+    """Disabled must be indistinguishable from never-registered: same body.
+
+    Not just the same status code — a route-specific detail string (even an
+    innocuous one) is an oracle that tells a prober the feature exists but is
+    switched off. Compare against a genuinely unmapped path's own 404 rather
+    than hardcoding "Not Found", so this stays correct if FastAPI's default
+    ever changes.
+    """
     monkeypatch.delenv("EMAIL_PREVIEW_ENABLED", raising=False)
-    assert client.get("/debug/emails").status_code == 404
+    baseline = client.get("/definitely-not-a-route-xyz")
+    resp = client.get("/debug/emails")
+    assert resp.status_code == baseline.status_code == 404
+    assert resp.json() == baseline.json()
 
 
 def test_preview_route_is_404_when_flag_unset(client, monkeypatch) -> None:
+    """Same as above, for the /{name} route — see that test's docstring."""
     monkeypatch.delenv("EMAIL_PREVIEW_ENABLED", raising=False)
-    assert client.get("/debug/emails/system").status_code == 404
+    baseline = client.get("/definitely-not-a-route-xyz")
+    resp = client.get("/debug/emails/system")
+    assert resp.status_code == baseline.status_code == 404
+    assert resp.json() == baseline.json()
