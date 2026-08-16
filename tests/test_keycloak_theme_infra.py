@@ -29,8 +29,39 @@ def _css_rules(text: str) -> str:
     return re.sub(r"/\*.*?\*/", "", text, flags=re.S)
 
 
+def _ftl_directives(text: str) -> str:
+    """.ftl with <#-- ... --> comments removed.
+
+    template.ftl's header comment documents each version guard by name,
+    including the literal guard expression itself (e.g. "-> ltr!true" in its
+    prose). A raw-text assertion for that guard would keep passing even if
+    the real <#assign> below it were weakened to an unguarded reference,
+    because the comment alone satisfies the substring check. Strip
+    FreeMarker comments before judging directives -- the FTL analogue of
+    _css_rules() above.
+    """
+    return re.sub(r"<#--.*?-->", "", text, flags=re.S)
+
+
+def _properties_directives(text: str) -> str:
+    """.properties with comment (#...) and blank lines removed.
+
+    theme.properties headers routinely restate the exact key=value they are
+    explaining (e.g. email/theme.properties opens "# parent=base, NOT
+    parent=keycloak: ..."). A raw-text assertion for "parent=base" is
+    satisfied by that comment even if the real directive were edited to
+    something else. Strip comments before judging directives -- the
+    .properties analogue of _css_rules() above.
+    """
+    lines = (line for line in text.splitlines() if line.strip() and not line.strip().startswith("#"))
+    return "\n".join(lines)
+
+
 def test_login_theme_properties_are_correct() -> None:
-    props = (THEME / "login/theme.properties").read_text()
+    # The header comment restates "parent=keycloak.v2" verbatim while
+    # explaining it, so this must judge directives, not raw text (see
+    # _properties_directives).
+    props = _properties_directives((THEME / "login/theme.properties").read_text())
     assert "parent=keycloak.v2" in props
     # v1 is deprecated as of KC 26.0.
     assert "parent=keycloak\n" not in props
@@ -220,13 +251,23 @@ def test_display_name_html_carries_the_logo_hook() -> None:
 
 def test_email_theme_parents_base_not_keycloak() -> None:
     """keycloak/email/ holds only theme.properties today, so the layer is a
-    no-op that Red Hat can add files to in any patch release."""
-    props = (THEME / "email/theme.properties").read_text()
+    no-op that Red Hat can add files to in any patch release.
+
+    The header comment restates "parent=base" verbatim while explaining it,
+    so this must judge directives, not raw text (see _properties_directives).
+    """
+    props = _properties_directives((THEME / "email/theme.properties").read_text())
     assert "parent=base" in props
 
 
 def test_email_wrapper_guards_version_dependent_variables() -> None:
-    ftl = (THEME / "email/html/template.ftl").read_text()
+    # The header comment restates "ltr!true" verbatim while explaining the
+    # guard, so a raw-text presence check would keep passing even if the real
+    # <#assign> were weakened to an unguarded ${ltr}. Judge directives only
+    # (see _ftl_directives) -- and for the same reason, do it for the absence
+    # checks below too: a comment mentioning a forbidden token in passing
+    # must not be able to fail this test.
+    ftl = _ftl_directives((THEME / "email/html/template.ftl").read_text())
     # `ltr` only exists from KC 26.2; unguarded it makes EVERY email fail to send.
     assert "ltr!true" in ftl
     # Never reference theme resources for images: those URLs embed the migration
@@ -242,18 +283,18 @@ def test_email_wrapper_sets_inline_fallbacks() -> None:
     """Message bodies are inherited <p>/<a> fragments; clients that strip
     <head> must still get sane typography from the containing <td>.
 
-    Isolates the <tr> immediately preceding <#nested> rather than everything
-    since <body>: the fallback logo <span> above it also carries a
-    (unrelated) font-family, so a looser slice would still pass after the
-    containing <td>'s own font-family was deleted.
+    Strips FTL comments first (see _ftl_directives), then isolates the <tr>
+    immediately preceding <#nested> rather than everything since <body>: the
+    fallback logo <span> above it also carries a (unrelated) font-family, so
+    a looser slice would still pass after the containing <td>'s own
+    font-family was deleted.
     """
-    ftl = (THEME / "email/html/template.ftl").read_text()
+    ftl = _ftl_directives((THEME / "email/html/template.ftl").read_text())
     enclosing_td = ftl.split("<#nested>")[0].rsplit("<tr>", 1)[1]
     assert "font-family" in enclosing_td
 
 
 def test_both_realms_use_the_srw_email_theme() -> None:
-    import json
     assert '"emailTheme": "srw"' in KC.read_text()
     export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
     assert export["emailTheme"] == "srw"
