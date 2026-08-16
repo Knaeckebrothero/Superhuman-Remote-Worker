@@ -4,7 +4,7 @@
 (One sentence: what was this phase supposed to accomplish?)
 
 ## Accomplished
-(List concrete outcomes with file references from git_diff)
+(List concrete outcomes with file references from git diff)
 - Created X in `path/to/file.md`
 - Updated Y with Z changes
 - Processed N documents
@@ -23,7 +23,7 @@
 
 ## Metrics
 - Todos completed: X / Y planned
-- Key files changed: (list from git_diff)
+- Key files changed: (list from git diff)
 
 ## Failed Approaches
 (What was tried and did NOT work — preserve these so they are not retried)

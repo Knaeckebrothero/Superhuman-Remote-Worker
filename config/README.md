@@ -257,7 +257,15 @@ tools:
   # Enable in critic config for approve/return capabilities.
   evaluation: []
 
-  # Workspace version control (src/tools/git/)
+  # Version control (src/tools/git/) — reads the job's own repo by default and
+  # an attached repository datasource with repo="<clone-dir>".
+  #
+  # ONLY BOUND WHEN THE AGENT HAS NO SHELL TOOLS. If `shell` above is
+  # non-empty, ToolsConfig.__post_init__ (src/core/loader.py) drops this whole
+  # group: a shell can run git against any repository in the workspace, and
+  # granting both gives the agent two ways to ask one question — the weaker of
+  # which silently answers about a different repo. Shell-having agents should
+  # be told to run `git ...` (and `git -C repos/<name> ...`) instead.
   git:
     - git_log
     - git_show

@@ -1941,10 +1941,21 @@ class TestAgentLoaderBindsLoopCategory:
         sentinel = {name: [f"x_{name}"] for name in field_names}
         config = self._load(sentinel)
         for name in field_names:
+            # `git` is suppressed by ToolsConfig.__post_init__ because this
+            # sentinel also populates `shell`; its own round trip is asserted
+            # below so the field keeps its parity coverage.
+            if name == "git":
+                continue
             assert getattr(config.tools, name) == [f"x_{name}"], (
                 f"tools.{name} was dropped by the loader — add the kwarg to "
                 "both ToolsConfig(...) construction sites in src/core/loader.py"
             )
+
+        without_shell = dict(sentinel, shell=[])
+        assert self._load(without_shell).tools.git == ["x_git"], (
+            "tools.git was dropped by the loader — add the kwarg to both "
+            "ToolsConfig(...) construction sites in src/core/loader.py"
+        )
 
 
 # =============================================================================

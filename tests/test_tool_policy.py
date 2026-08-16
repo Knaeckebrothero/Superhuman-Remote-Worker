@@ -139,9 +139,12 @@ class TestPopulation:
         assert any("experts/centurion" in f for f in files)
         # 148 after job_control/job_inspection became descriptor-owned groups;
         # 149 with the Centurion's explicit knowledge grant
-        # (officer_knowledge_plane.md §3, K2).
-        assert len(_DECLARATIONS) == 149, (
-            f"expected 149 raw declarations, got {len(_DECLARATIONS)}"
+        # (officer_knowledge_plane.md §3, K2); 141 after the eight shell-having
+        # configs dropped their `git:` blocks — ToolsConfig.__post_init__
+        # suppresses that group whenever shell tools are present, so declaring
+        # it there advertised tools the pod never binds.
+        assert len(_DECLARATIONS) == 141, (
+            f"expected 141 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):
@@ -616,11 +619,20 @@ class TestCategoryVocabularyAgreement:
         names = {f.name: [f"probe_{f.name}"] for f in dataclasses.fields(ToolsConfig)}
         cfg = load_agent_config_from_dict(_minimal(tools=names))
         got = set(get_all_tool_names(cfg))
-        # run_command/shell_execute aliasing rewrites the shell probe; every
-        # other probe must survive verbatim.
-        assert {n for n in names if n != "shell"} <= {
+        # run_command/shell_execute aliasing rewrites the shell probe; `git` is
+        # suppressed by ToolsConfig.__post_init__ because this probe config also
+        # carries shell tools (asserted separately below, so the field keeps its
+        # plumbing coverage). Every other probe must survive verbatim.
+        assert {n for n in names if n not in ("shell", "git")} <= {
             g.removeprefix("probe_") for g in got
         }
+
+        # git still has to reach get_all_tool_names on the path where it is
+        # bound at all — otherwise this exemption would hide a broken field.
+        without_shell = dict(names)
+        without_shell["shell"] = []
+        cfg = load_agent_config_from_dict(_minimal(tools=without_shell))
+        assert "probe_git" in set(get_all_tool_names(cfg))
 
     def test_schema_json_tools_properties_match_the_registry(self):
         schema = json.loads((_REPO_ROOT / "config" / "schema.json").read_text())
@@ -850,3 +862,51 @@ class TestEnumerateOnlyMembersAreServable:
             "shell_execute",
             "shell_read",
         ]
+
+
+class TestGitToolsSuppressedWhenShellPresent:
+    """A shell can run git; the git_* tools cannot leave the job's own repo.
+
+    Granting both gives the agent two ways to ask the same question, one of
+    which silently answers about a different repository — the c4849fa1 failure.
+    Shell wins, and the resolved config must SAY so rather than claiming git
+    tools the pod will not bind.
+    """
+
+    GIT = ["git_log", "git_show", "git_diff", "git_status", "git_tags"]
+
+    def test_shell_suppresses_git(self):
+        cfg = ToolsConfig(git=list(self.GIT), shell=["run_command", "shell_read"])
+        assert cfg.git == []
+        assert cfg.shell == ["run_command", "shell_read"]
+
+    def test_any_shell_tool_suppresses_git(self):
+        assert ToolsConfig(git=list(self.GIT), shell=["shell_read"]).git == []
+        assert ToolsConfig(git=list(self.GIT), shell=["shell_execute"]).git == []
+
+    def test_git_kept_without_shell(self):
+        cfg = ToolsConfig(git=list(self.GIT), shell=[])
+        assert cfg.git == self.GIT
+
+    def test_no_shell_no_git_is_untouched(self):
+        assert ToolsConfig(git=[], shell=[]).git == []
+
+    def test_repo_tools_are_never_suppressed(self):
+        """repo_* carries the read_only enforcement — the shell cannot replace it."""
+        cfg = ToolsConfig(
+            git=list(self.GIT),
+            repo=["repo_commit", "repo_push"],
+            shell=["run_command"],
+        )
+        assert cfg.repo == ["repo_commit", "repo_push"]
+
+    def test_resolved_config_reports_the_suppression(self):
+        """The stored blob must match the pod, or the creation forms lie again."""
+        config = load_agent_config_from_dict(
+            {
+                "agent_id": "test",
+                "display_name": "Test",
+                "tools": {"git": list(self.GIT), "shell": ["run_command"]},
+            }
+        )
+        assert config.tools.git == []

@@ -59,11 +59,11 @@ tools:
     - request_replan
     - mark_complete
     - job_complete
-  git:
-    - git_log
-    - git_diff
-    - git_status
-    - git_tags
+  # git: intentionally absent. This agent has shell tools, and
+  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # whenever shell is present — a shell can run git against ANY repository in
+  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+  # here would advertise tools the pod never binds.
   # Websearch — a coder must be able to look things up (docs, APIs, error
   # messages). browser_direct (step-by-step Chromium) is inherited from worker_base.
   research:

@@ -87,7 +87,7 @@ Example todos:
 - "Map directory structure of src/tools/ — read each __init__.py to understand tool categories"
 - "Search for 'except Exception' across src/ — catalog overly broad exception handling"
 - "Read src/core/context.py and src/core/workspace_injection.py — look for optimization opportunities"
-- "Use the git_log tool (max_count=30) to identify most frequently changed files — check for code churn patterns"
+- "Run `git log -n 30` via run_command to identify most frequently changed files — check for code churn patterns"
 - "Run shell: ruff check src/ 2>&1 | head -50 — catalog lint issues by category"
 - "Write idea artifacts for each finding with specific file:line references"
 

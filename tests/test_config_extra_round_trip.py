@@ -68,6 +68,13 @@ def test_shell_mode_survives_the_round_trip():
         "shell_execute",
         "shell_read",
     ]
+    # Assigning the field directly bypasses ToolsConfig.__post_init__, which
+    # drops `git` whenever `shell` is present. The round trip below goes
+    # through the constructor and WOULD apply it, so mirror what a properly
+    # constructed shell-having config looks like — otherwise this test fails
+    # on the git suppression rather than on the shell-mode aliasing it exists
+    # to guard.
+    config.tools.git = []
 
     before = get_all_tool_names(config)
     after = get_all_tool_names(_round_trip(config))

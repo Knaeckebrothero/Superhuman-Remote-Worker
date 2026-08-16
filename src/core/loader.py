@@ -1618,6 +1618,31 @@ class ToolsConfig:
     product_help: List[str] = field(default_factory=list)
     session_task: List[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        # A shell can run git against every repository in the workspace,
+        # including repos/<name>/. The git_* tools now can too (they take
+        # `repo=`), which is exactly why granting both is wrong: two surfaces
+        # answering one question is how job c4849fa1 (2026-08-16) ended up
+        # reading `fatal: bad object` from git_show — then the job's own repo
+        # only — as proof that its attached repository was unusable, while the
+        # files it wanted sat in repos/KurortEngine/.
+        #
+        # Shell wins: it is strictly more capable. Suppressing here rather
+        # than in src/tools/registry keeps
+        # `resolved_config.agent.tools.git` honest: the stored blob and the
+        # creation forms must not advertise tools the pod will never bind.
+        # `repo` is deliberately untouched — repo_* carries the read_only
+        # enforcement on attached datasources, which a shell cannot replace.
+        if self.git and self.shell:
+            logger.debug(
+                "Suppressing %d git tool(s); this agent has shell tools "
+                "(%s), which can run git against any repository in the "
+                "workspace including repos/<name>/.",
+                len(self.git),
+                ", ".join(self.shell),
+            )
+            self.git = []
+
 
 @dataclass
 class ConnectionsConfig:
