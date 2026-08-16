@@ -18,6 +18,7 @@ related:
   - "[[multi_tenancy]]"
   - "[[admin_view_as_user]]"
   - "[[keycloak_self_registration_broken]]"
+  - "[[email_and_login_theme_alignment]]"
 ---
 
 # Cockpit-owned auth UI (login, register, social, magic-link)
@@ -25,6 +26,7 @@ related:
 > Replace Keycloak's themed login/register pages with cockpit-native forms. Keep Keycloak as the identity backend (users, password hashes, sessions, social IdP brokering) but never show its UI to end users. Adds three auth methods: username/email + password (default), social providers (Google/GitHub/Microsoft/etc.), and optional magic-link email-only sign-in. Email-only becomes the default register option with "use password instead" as a toggle.
 
 **Status:** Design only — no code yet. Captured 2026-05-28 during M1.B planning so we can come back later without re-litigating decisions.
+**Partially overtaken 2026-08-16:** this doc's option 2 ("Keycloak theme heavily customized") was rejected at ~3-5d because it assumed a FreeMarker rewrite. [[email_and_login_theme_alignment]] shipped a **CSS-only** child theme instead — no FreeMarker on the login side — which cost hours, not days. That does not overturn the decision below: the cockpit-owned UI is still the intended v1, and the `srw` login theme was built to be deleted when it lands. It does mean the "looks like Keycloak" argument for urgency is weaker than when this was written.
 **Triggered by:** M1.B planning surfaced that the quick Keycloak self-reg fix (~2h) is throwaway UI work; the cockpit-owned version is ~1–1.5d and is the real v1. User also wants social login (Google/GitHub) and email-only magic-link as part of the same effort. Today's Keycloak-themed pages look unprofessional and feel disjoint from the rest of the cockpit.
 **Scope:** Login form, register form, social-provider buttons, magic-link request + consume flow, email verification, password reset. **Does not** replace Keycloak as the identity store, does not implement MFA enrollment in our UI, does not touch the admin user-management page (already cockpit-native).
 

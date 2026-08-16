@@ -2,7 +2,7 @@
 
 Email is a restricted rendering target, not a small browser. Every rule below
 has a specific mechanism behind it; see
-docs/features/email_and_login_theme_alignment.md before relaxing any of them.
+docs/done/email_and_login_theme_alignment.md before relaxing any of them.
 
   * Tables, not divs -- Outlook renders via the Word engine, which does not
     support `width` on <div> at all. Microsoft supports classic Outlook until

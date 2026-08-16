@@ -8,7 +8,9 @@
 
 **Tech Stack:** Python 3.12 (orchestrator, FastAPI), pytest, Helm 3, Keycloak 26.2 (PatternFly v5 login theme, FreeMarker email templates), SCSS design tokens in `cockpit/src/styles/themes/_theme-config.scss`.
 
-**Spec:** `docs/features/email_and_login_theme_alignment.md`
+**Spec:** `docs/done/email_and_login_theme_alignment.md`
+
+**Status: COMPLETE.** All 12 tasks executed 2026-08-16 on `develop` (`78434c92..37f37ece`), each with a task review and fix rounds; final whole-branch review returned Ship. The live gate ran via docker-compose rather than k3d. Outcomes, follow-ups and the deviations from this plan are recorded in the spec, which is the document to read — this plan is kept as the execution record.
 
 ## Global Constraints
 
