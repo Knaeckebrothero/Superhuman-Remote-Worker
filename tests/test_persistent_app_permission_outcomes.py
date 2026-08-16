@@ -73,6 +73,39 @@ class TestPermissionCheckOutcomeMapping:
         assert session.tool_decisions["tc_1"] == "expired"
 
     @pytest.mark.asyncio
+    async def test_wait_failure_reports_no_answer_not_denied(self):
+        """Same bug, other trigger: when the wait itself fails (unreachable DB,
+        unexpected error) the user still said nothing. Reporting a refusal
+        would be doubly wrong — the row is left pending, so the transcript's
+        'declined' is contradicted by the DB it came from."""
+        session = _mock_session()
+        broadcast = MagicMock()
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(
+                pa, "_insert_permission_request", AsyncMock(return_value="req-9")
+            ),
+            patch.object(
+                pa,
+                "_wait_for_permission_resolution",
+                AsyncMock(return_value="unavailable"),
+            ),
+            patch.object(pa, "_broadcast", broadcast),
+        ):
+            outcome = await pa._loop_permission_check("web_search", {}, "tc_9")
+
+        assert outcome is PermissionOutcome.NO_ANSWER
+        # Audit distinguishes an infrastructure failure from a user's refusal
+        # and from an unanswered TTL.
+        assert session.tool_decisions["tc_9"] == "unavailable"
+        resolved = [
+            c for c in broadcast.call_args_list if c.args[0] == "permission.resolved"
+        ]
+        assert resolved and resolved[-1].args[1]["decision"] == "unavailable"
+
+    @pytest.mark.asyncio
     async def test_explicit_deny_reports_declined(self):
         session = _mock_session()
         with (

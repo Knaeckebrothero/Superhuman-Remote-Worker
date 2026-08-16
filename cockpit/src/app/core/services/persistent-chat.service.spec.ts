@@ -754,6 +754,55 @@ describe('PersistentChatService — connect()', () => {
     expect(thought.messageId).toBe('a1');
   });
 
+  it('rehydrates an unanswered gate as not-run, never as completed or denied', async () => {
+    // docs/done/supervised_parallel_gates_timeout_fabricates_denial.md — the
+    // backend settles an unanswered gate as 'expired' | 'interrupted' |
+    // 'unavailable'. History used to paint everything but 'denied'/'expired'
+    // as completed, so a reload claimed tools had run that never did.
+    const { service, mockHttp } = createService();
+    mockHttp.get.mockImplementation((url: string) => {
+      if (url.endsWith('/messages')) {
+        return of({
+          messages: [
+            {
+              id: 'a1',
+              role: 'ai',
+              content: null,
+              tool_calls: [
+                { name: 'web_search', args: {}, id: 'tc-ok' },
+                { name: 'web_search', args: {}, id: 'tc-yes', decision: 'approved' },
+                { name: 'web_search', args: {}, id: 'tc-no', decision: 'denied' },
+                { name: 'web_search', args: {}, id: 'tc-ttl', decision: 'expired' },
+                { name: 'web_search', args: {}, id: 'tc-stop', decision: 'interrupted' },
+                { name: 'web_search', args: {}, id: 'tc-err', decision: 'unavailable' },
+              ],
+              turn_number: 1,
+              created_at: '2026-05-15T08:00:01Z',
+            },
+          ],
+          total: 1,
+        });
+      }
+      return of({ status: 'active', total_turns: 1 });
+    });
+
+    await service.connect('thread-gates');
+
+    const assistant = service.turns().find(isAssistantTurn) as AssistantTurn;
+    const byId = new Map(
+      assistant.events.filter(isToolCall).map((e) => [e.id, e as ToolCallEvent]),
+    );
+    // Un-gated and approved calls really did run.
+    expect(byId.get('tc-ok')!.status).toBe('completed');
+    expect(byId.get('tc-yes')!.status).toBe('completed');
+    // A real refusal stays a refusal.
+    expect(byId.get('tc-no')!.status).toBe('denied');
+    // Every non-decision renders as not-run — and none of them as a denial.
+    for (const id of ['tc-ttl', 'tc-stop', 'tc-err']) {
+      expect(byId.get(id)!.status).toBe('expired');
+    }
+  });
+
   it('dedupes a replayed thinking frame against the rendered history bubble', async () => {
     // docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
     // After a cold connect paints the completed turn, the SSE replay cursor
