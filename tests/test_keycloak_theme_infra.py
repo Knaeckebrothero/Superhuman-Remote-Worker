@@ -298,3 +298,12 @@ def test_both_realms_use_the_srw_email_theme() -> None:
     assert '"emailTheme": "srw"' in KC.read_text()
     export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
     assert export["emailTheme"] == "srw"
+
+
+def test_smtp_port_and_tls_come_from_values() -> None:
+    """values.yaml exposes email.smtp.port but the bootstrap hardcoded 1025 --
+    a dev mail-catcher port -- so any real relay on 587 was unreachable."""
+    kc = KC.read_text()
+    assert 'smtpServer.port=1025' not in kc
+    assert ".Values.email.smtp.port" in kc
+    assert ".Values.email.smtp.useTls" in kc
