@@ -113,3 +113,43 @@ def test_light_tokens_match_the_shared_brand_palette() -> None:
         assert brand.normalize_hex(found.group(1)) == want, (
             f"{token} is {found.group(1)}, brand.py says {want}"
         )
+
+
+KC = ROOT / "helm/templates/services/keycloak.yaml"
+CM = ROOT / "helm/templates/services/keycloak-theme-configmap.yaml"
+
+
+def test_configmap_enumerates_every_theme_file() -> None:
+    """ConfigMap keys cannot contain '/', so the nested layout only exists via
+    items[].path. A file missing an items entry is a silent no-op -- and a
+    theme with no login/ directory simply never appears."""
+    kc = KC.read_text()
+    for path in sorted(p.relative_to(THEME) for p in THEME.rglob("*") if p.is_file()):
+        assert f"path: {path}" in kc, f"{path} has no items[].path entry"
+
+
+def test_configmap_keys_have_no_slashes() -> None:
+    cm = CM.read_text()
+    import re
+    for key in re.findall(r"^\s{2}([\w.\-]+):\s*\|", cm, re.M):
+        assert "/" not in key
+
+
+def test_theme_is_mounted_at_the_themes_root() -> None:
+    kc = KC.read_text()
+    assert "mountPath: /opt/keycloak/themes/srw" in kc
+
+
+def test_pod_template_has_a_theme_checksum_annotation() -> None:
+    """Three caches make theme edits invisible without a pod roll: cacheThemes,
+    cacheTemplates, and the gzip cache -- which writes a .gz on first request
+    and only regenerates if the file is ABSENT. Browsers send Accept-Encoding:
+    gzip and get stale CSS while curl shows it fresh."""
+    kc = KC.read_text()
+    assert "checksum/keycloak-theme:" in kc
+    assert "keycloak-theme-configmap.yaml" in kc
+
+
+def test_compose_bind_mounts_the_same_source() -> None:
+    compose = (ROOT / "docker-compose.yaml").read_text()
+    assert "./helm/keycloak-theme/srw:/opt/keycloak/themes/srw" in compose
