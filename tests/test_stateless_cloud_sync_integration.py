@@ -67,6 +67,25 @@ def _reset_pending_cloud_task():
     papp._pending_cloud_push_task = None
 
 
+@pytest.fixture(autouse=True)
+def _restore_loop_primitives():
+    """`_attach_session` installs loop primitives bound to *this* test's event
+    loop. Leaking them across tests hands a later test an `asyncio.Event` bound
+    to a dead loop, whose `wait()` then raises mid-await in whichever module
+    global consumer runs next (e.g. `_wait_for_permission_resolution`)."""
+
+    names = (
+        "_loop_user_queue",
+        "_loop_interrupt_flag",
+        "_loop_last_user_content",
+        "_hard_interrupt_event",
+    )
+    saved = {name: getattr(papp, name) for name in names}
+    yield
+    for name, value in saved.items():
+        setattr(papp, name, value)
+
+
 @pytest.mark.asyncio
 async def test_stateless_start_recovers_then_strict_pulls_then_arms(monkeypatch):
     order: list[str] = []
