@@ -916,6 +916,20 @@ spec:
                     # the realm cache after, the very first value Keycloak
                     # caches is the correct one — and Vault rotations on
                     # later boots are picked up immediately, no UI dance.
+                    # KNOWINGLY UNHARDENED: the three interpolations below —
+                    # .Values.keycloak.realm here, and .Values.email.smtp.from
+                    # twice — land raw inside this double-quoted shell word, so
+                    # a value carrying a double quote closes it and appends a
+                    # command. Verified live:
+                    #   --set-string 'email.smtp.from=a"; id; echo "'
+                    # port and starttls are safe because they go through
+                    # srw.keycloak.smtpPort / smtpStartTls, whose output
+                    # alphabet is closed; see helm/templates/_helpers.tpl for
+                    # the whitelist pattern these fields should adopt. Both
+                    # values are chart-owned (not user input), which is why
+                    # this is a pre-existing hardening item and not a live
+                    # vulnerability — do not read the helpers' comment as a
+                    # claim that the whole hook is covered.
                     if [ -n "$SMTP_HOST" ]; then
                       $KC update "realms/{{ .Values.keycloak.realm }}" \
                         -s "smtpServer.host=$SMTP_HOST" \

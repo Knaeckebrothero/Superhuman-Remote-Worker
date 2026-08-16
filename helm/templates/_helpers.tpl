@@ -761,10 +761,17 @@ STARTTLS silently and puts the SMTP password on the wire in cleartext. Only
 true/false -- any case, surrounding whitespace tolerated -- count as the
 operator asking; every other shape means "did not ask", and gets the default.
 
-The closed alphabet also settles a second exposure: this text is rendered
-inside a double-quoted shell word in the Keycloak postStart hook, so before
-the whitelist a value containing a double quote was command injection, and
-one containing a newline broke the rendered manifest outright.
+The closed alphabet also settles a second exposure FOR THESE TWO FIELDS: the
+text is rendered inside a double-quoted shell word in the Keycloak postStart
+hook, so before the whitelist a value containing a double quote was command
+injection, and one containing a newline broke the rendered manifest outright.
+
+Scope that claim to port and starttls only -- it says nothing about the hook.
+The same `$KC update` shell word also interpolates .Values.keycloak.realm and
+.Values.email.smtp.from raw, and those are still injectable today (verified:
+`--set-string 'email.smtp.from=a"; id; echo "'` renders a closing quote and a
+second command). Hardening them is a separate pre-existing item; these two
+helpers are the template for how, not evidence that it has been done.
 
 Two deliberate boundaries:
   - `--set-string email.smtp.useTls=null` now yields the default instead of
