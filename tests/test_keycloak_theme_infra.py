@@ -216,3 +216,37 @@ def test_display_name_html_carries_the_logo_hook() -> None:
     assert 'kc-logo-text' in KC.read_text()
     export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
     assert "kc-logo-text" in export["displayNameHtml"]
+
+
+def test_email_theme_parents_base_not_keycloak() -> None:
+    """keycloak/email/ holds only theme.properties today, so the layer is a
+    no-op that Red Hat can add files to in any patch release."""
+    props = (THEME / "email/theme.properties").read_text()
+    assert "parent=base" in props
+
+
+def test_email_wrapper_guards_version_dependent_variables() -> None:
+    ftl = (THEME / "email/html/template.ftl").read_text()
+    # `ltr` only exists from KC 26.2; unguarded it makes EVERY email fail to send.
+    assert "ltr!true" in ftl
+    # Never reference theme resources for images: those URLs embed the migration
+    # tag and 404 for every already-delivered email after an upgrade.
+    assert "url.resourcesUrl" not in ftl
+    assert "url.resourcesCommonUrl" not in ftl
+    # Per-type variables must not appear in a wrapper shared by all types.
+    for per_type in ("${link}", "${event}", "${code}"):
+        assert per_type not in ftl
+
+
+def test_email_wrapper_sets_inline_fallbacks() -> None:
+    """Message bodies are inherited <p>/<a> fragments; clients that strip
+    <head> must still get sane typography from the containing <td>."""
+    ftl = (THEME / "email/html/template.ftl").read_text()
+    assert "font-family" in ftl.split("<#nested>")[0].split("<body")[1]
+
+
+def test_both_realms_use_the_srw_email_theme() -> None:
+    import json
+    assert '"emailTheme": "srw"' in KC.read_text()
+    export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
+    assert export["emailTheme"] == "srw"
