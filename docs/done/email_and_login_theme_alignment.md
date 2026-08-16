@@ -23,7 +23,7 @@ related:
 
 > Bring the two remaining unbranded surfaces — transactional email and the Keycloak login page — onto the Imperial design system. Emails move off the retired Catppuccin palette onto Travertine via a shared layout module. Keycloak gets a CSS-only child theme (`srw`) covering both login and its own transactional email, delivered as a ConfigMap so we stay on the upstream image.
 
-**Status:** **SHIPPED** on `develop` 2026-08-16, commits `78434c92..37f37ece`. Designed 2026-08-11, revised the same day after a research pass, implemented across 12 tasks. Live gate passed via docker-compose. 138 tests green. See *Post-implementation status* at the foot of this document.
+**Status:** **SHIPPED** on `develop` 2026-08-16, commits `b11e06d7..36804e0e` at time of writing — but note `develop` is rebased by concurrent agents, so locate the range by its first and last commit *subjects* (`feat(brand): Travertine palette module …` through `docs(features): record the Keycloak live gate as PASSED`) rather than by these hashes. Designed 2026-08-11, revised the same day after a research pass, implemented across 12 tasks. Live gate passed via docker-compose. 138 tests green. See *Post-implementation status* at the foot of this document.
 **Triggered by:** Both surfaces still carry pre-Imperial design. The email templates use Catppuccin Mocha — the palette `cockpit/src/styles/README.md` calls "the Catppuccin era" and migrates localStorage away from. Keycloak still serves the stock, now-deprecated `keycloak` login theme.
 **Scope:** Three SRW application emails, a shared brand/palette module, an email layout module, a Keycloak `srw` login theme, a Keycloak `srw` email theme, the Catppuccin magic-link landing pages, and unpinning the hardcoded Keycloak SMTP port. **Does not** replace Keycloak's login pages with cockpit-native ones (see [[cockpit_owned_auth_ui]]), change email copy, brand plaintext email, or add MFA/registration flows.
 
@@ -397,7 +397,7 @@ All three slices shipped. Slice 1 was sequenced first because it touches no char
 
 ## Post-implementation status (2026-08-16)
 
-**Shipped on `develop`, unpushed:** commits `78434c92..a278c350`. All 12 planned tasks complete except the Task 10 live gate (below). 138 tests across eight suites.
+**Shipped on `develop`, unpushed:** commits `b11e06d7..2043c0f6` (hashes shift under concurrent rebases; match on commit subjects). All 12 planned tasks complete except the Task 10 live gate (below). 138 tests across eight suites.
 
 ### Live gate — PASSED via docker-compose (2026-08-16)
 

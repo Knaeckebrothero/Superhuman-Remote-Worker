@@ -10,7 +10,7 @@
 
 **Spec:** `docs/done/email_and_login_theme_alignment.md`
 
-**Status: COMPLETE.** All 12 tasks executed 2026-08-16 on `develop` (`78434c92..37f37ece`), each with a task review and fix rounds; final whole-branch review returned Ship. The live gate ran via docker-compose rather than k3d. Outcomes, follow-ups and the deviations from this plan are recorded in the spec, which is the document to read — this plan is kept as the execution record.
+**Status: COMPLETE.** All 12 tasks executed 2026-08-16 on `develop` (`b11e06d7..36804e0e`; hashes shift under concurrent rebases — match on commit subjects), each with a task review and fix rounds; final whole-branch review returned Ship. The live gate ran via docker-compose rather than k3d. Outcomes, follow-ups and the deviations from this plan are recorded in the spec, which is the document to read — this plan is kept as the execution record.
 
 ## Global Constraints
 
