@@ -126,7 +126,6 @@ async def create_job(
     description: str,
     config_name: str = "worker_base",
     expert_id: str | None = None,
-    datasource_ids: list[str] = None,  # type: ignore[assignment]
     instructions: str | None = None,
     kickoff_message: str | None = None,
     config_override: dict[str, Any] | None = None,
@@ -151,9 +150,6 @@ async def create_job(
         config_name: Base agent config (default: "worker_base")
         expert_id: Preferred database-backed expert UUID. When supplied, the
             orchestrator resolves that expert over the base config.
-        datasource_ids: Connector selection. Omit to inherit from an
-            authoritative parent or use root automatic defaults; pass [] to
-            attach none; pass IDs to request exactly those connectors.
         instructions: Additional inline markdown instructions
         kickoff_message: Opening task brief sent to the agent
         config_override: Per-job config overrides as JSON. To set the model,
@@ -211,7 +207,16 @@ async def create_job(
             description=description,
             config_name=config_name,
             expert_id=expert_id,
-            datasource_ids=datasource_ids,
+            # Deliberately not a parameter on this plane. The only callers are
+            # dispatchers (officer, session) with no basis for connector
+            # surgery, and the one thing the field ever did in anger was let a
+            # model pass [] — "attach none" — because the schema advertised an
+            # array and the empty one reads as the neutral value. None here
+            # makes the client send use_datasource_defaults, so the job gets
+            # the project's auto-attach defaults resolved at dispatch time.
+            # Narrowing still exists on the general surfaces (MCP, REST,
+            # cockpit), which is where a human reviews the choice.
+            datasource_ids=None,
             instructions=instructions,
             kickoff_message=kickoff_message,
             config_override=config_override,
