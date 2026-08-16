@@ -12,7 +12,7 @@ kind: ConfigMap
 metadata:
   name: {{ include "srw.fullname" . }}-keycloak-theme
   labels:
-    {{- include "srw.labels" . | nindent 4 }}
+    {{- include "srw.componentLabels" (dict "context" . "component" "keycloak") | nindent 4 }}
 data:
 {{- range $path, $_ := .Files.Glob "keycloak-theme/srw/**" }}
 {{- $key := $path | replace "keycloak-theme/srw/" "" | replace "/" "_" }}

@@ -6,7 +6,12 @@ token in :where(), which has zero specificity, so putting dark values under
 """
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 THEME = ROOT / "helm/keycloak-theme/srw"
@@ -116,7 +121,6 @@ def test_light_tokens_match_the_shared_brand_palette() -> None:
 
 
 KC = ROOT / "helm/templates/services/keycloak.yaml"
-CM = ROOT / "helm/templates/services/keycloak-theme-configmap.yaml"
 
 
 def test_configmap_enumerates_every_theme_file() -> None:
@@ -128,11 +132,55 @@ def test_configmap_enumerates_every_theme_file() -> None:
         assert f"path: {path}" in kc, f"{path} has no items[].path entry"
 
 
+def _render_theme_configmap_data() -> dict[str, str]:
+    """Render the real chart and return the `data` mapping the Kubernetes API
+    would actually see for the `keycloak-theme` ConfigMap.
+
+    A regex over the *template source* can only ever match the literal
+    `{{ $key }}` text -- never the templated-out key it produces -- so it
+    finds nothing and passes vacuously even if the `replace "/" "_"` step is
+    deleted entirely. Only the rendered output proves what key the API server
+    receives. Mirrors the render helper in test_vm_chart_manifest_contract.py.
+    """
+    result = subprocess.run(
+        [
+            "helm",
+            "template",
+            "srw",
+            str(ROOT / "helm"),
+            "-f",
+            str(ROOT / "helm/ci/test-values.yaml"),
+            "--set",
+            "keycloak.enabled=true",
+            "--set",
+            "keycloak.internal=true",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, f"helm template failed:\n{result.stderr}"
+
+    for doc in yaml.safe_load_all(result.stdout):
+        if (
+            doc
+            and doc.get("kind") == "ConfigMap"
+            and doc.get("metadata", {}).get("name", "").endswith("-keycloak-theme")
+        ):
+            return doc.get("data") or {}
+    raise AssertionError("no keycloak-theme ConfigMap in the render")
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
 def test_configmap_keys_have_no_slashes() -> None:
-    cm = CM.read_text()
-    import re
-    for key in re.findall(r"^\s{2}([\w.\-]+):\s*\|", cm, re.M):
-        assert "/" not in key
+    """A real API server rejects a ConfigMap key containing '/'. Assert on the
+    rendered `data` mapping, not the template source (see
+    _render_theme_configmap_data), and require at least one key so a render
+    that silently produced none fails loudly instead of passing vacuously."""
+    data = _render_theme_configmap_data()
+    assert data, "keycloak-theme ConfigMap rendered with an EMPTY data block"
+    for key in data:
+        assert "/" not in key, f"{key!r} still contains '/' -- the API server would reject it"
 
 
 def test_theme_is_mounted_at_the_themes_root() -> None:
