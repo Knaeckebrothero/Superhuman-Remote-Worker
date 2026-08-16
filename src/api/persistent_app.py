@@ -8046,8 +8046,11 @@ async def _wait_for_permission_resolution(
     request_id: str, timeout: float = _PERMISSION_TIMEOUT_S
 ) -> str:
     """Block until the row's status flips from pending. Returns the final
-    status string ('approved'/'denied'/'expired'/'interrupted'). On any
-    failure, returns 'denied' as the conservative default.
+    status string ('approved'/'denied'/'expired'/'interrupted'/'unavailable').
+
+    Only 'denied' means the user said no. Everything else is a *non-decision*
+    the caller maps to PermissionOutcome.NO_ANSWER: an unreachable DB or an
+    unexpected error must not be reported as a refusal the user never made.
 
     Re-SELECTs on short-lived pool acquisitions and sleeps without owning a
     connection between checks. This is deliberately polling-only: a stateless
@@ -8064,7 +8067,9 @@ async def _wait_for_permission_resolution(
     See docs/done/supervised_parallel_gates_timeout_fabricates_denial.md.
     """
     if _session is None or _session.postgres_conn is None:
-        return "denied"
+        # The session died mid-wait. Nothing can answer the question any more,
+        # but nobody refused it either — say so rather than inventing a click.
+        return "unavailable"
 
     postgres_conn = _session.postgres_conn
     base_timeout = max(0.0, float(timeout))
@@ -8255,7 +8260,11 @@ async def _wait_for_permission_resolution(
                         "SELECT status FROM thread_permission_requests WHERE id = $1",
                         request_id,
                     )
-                return str(final) if final is not None else "denied"
+                # No row means it was retired out from under the CAS. The
+                # question is gone unanswered, which is an expiry — reading it
+                # as a denial would put a refusal in the transcript that no
+                # user ever made.
+                return str(final) if final is not None else "expired"
 
             # Tethered: a client is watching, so keep the question open.
             # Re-read at the slice boundary in case the decision committed
@@ -8271,8 +8280,15 @@ async def _wait_for_permission_resolution(
         )
         return "interrupted"
     except Exception as e:
+        # An infrastructure failure is not a user decision. Reporting 'denied'
+        # here told the model the user refused a call they were never asked
+        # about — the same fabricated denial the TTL used to produce, and just
+        # as invisible: the row stays pending, so nothing in the DB records the
+        # refusal the transcript claims. Leave the row pending and report a
+        # non-decision; the caller parks the turn (NO_ANSWER) and the model
+        # re-decides on the next one.
         logger.warning("Permission resolution wait failed (id=%s): %s", request_id, e)
-        return "denied"
+        return "unavailable"
 
 
 async def _resolve_pending_permission(
@@ -8506,7 +8522,10 @@ async def _loop_permission_check(
             outcome = PermissionOutcome.APPROVED
         elif final_status == "denied":
             outcome = PermissionOutcome.DECLINED
-        else:  # 'expired' (or any unknown status) — unanswered, so park.
+        else:
+            # 'expired' / 'interrupted' / 'unavailable' — and any status a
+            # later change adds. Unanswered, so park. Only an explicit
+            # 'denied' may ever be reported to the model as a refusal.
             outcome = PermissionOutcome.NO_ANSWER
         if _session is not None:
             # Record the raw status so audit can tell a timeout from a refusal.

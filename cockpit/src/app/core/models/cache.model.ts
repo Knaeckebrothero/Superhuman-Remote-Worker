@@ -104,10 +104,12 @@ export interface CachedThreadMessage {
           name: string;
           args: Record<string, unknown>;
           id: string;
-          // 'expired' = the gate was never answered (TTL, or swept at turn
-          // end). Persisted distinctly so a reload cannot re-render it as a
-          // refusal the user never made.
-          decision?: 'approved' | 'denied' | 'expired';
+          // Raw backend status. Everything except 'denied' is a gate that
+          // was never answered — 'expired' (TTL, or swept at turn end),
+          // 'interrupted' (Stop), 'unavailable' (the wait itself failed).
+          // Persisted distinctly so a reload can render neither a refusal
+          // the user never made nor a call that never ran as completed.
+          decision?: string;
       }[]
     | null;
   turn_number: number | null;

@@ -372,14 +372,40 @@ class TestWaitForPermissionResolution:
         assert "SET status = 'expired'" in update_sql
 
     @pytest.mark.asyncio
-    async def test_returns_denied_on_db_error(self):
+    async def test_db_error_is_a_non_decision_not_a_denial(self):
+        """A read that blows up says nothing about what the user wanted, so it
+        must not come back as a refusal — the model would be told the user
+        declined a call they were never asked about."""
         import src.api.persistent_app as mod
 
         postgres = _make_postgres_conn()
         postgres._fake_conn.fetchval.side_effect = RuntimeError("status read failed")
         _install_session(postgres_conn=postgres)
         result = await mod._wait_for_permission_resolution("rid-4", timeout=0.1)
-        assert result == "denied"
+        assert result == "unavailable"
+        assert result != "denied"
+        # The row is left pending: no decision was made, so none is recorded.
+        assert postgres._fake_conn.execute.await_args_list == []
+
+    @pytest.mark.asyncio
+    async def test_dead_session_is_a_non_decision_not_a_denial(self):
+        import src.api.persistent_app as mod
+
+        mod._session = None
+        result = await mod._wait_for_permission_resolution("rid-6", timeout=0.1)
+        assert result == "unavailable"
+
+    @pytest.mark.asyncio
+    async def test_retired_row_reads_as_expired_not_denied(self):
+        """The untethered CAS found no row to re-read — the question is gone
+        unanswered, which is an expiry, not a refusal."""
+        import src.api.persistent_app as mod
+
+        postgres = _make_postgres_conn(select_status_sequence=["pending", None])
+        _install_session(postgres_conn=postgres)
+        mod._subscribers.clear()
+        result = await mod._wait_for_permission_resolution("rid-7", timeout=0.1)
+        assert result == "expired"
 
     @pytest.mark.asyncio
     async def test_short_poll_observes_resolution(self, monkeypatch):

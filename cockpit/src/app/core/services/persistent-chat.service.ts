@@ -5582,18 +5582,27 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     }
     if (m.tool_calls) {
       for (const tc of m.tool_calls) {
+        // Same three-way normalization the live permission.resolved path
+        // does, for the same reason: the backend settles an unanswered gate
+        // as 'expired', 'interrupted' or 'unavailable', and a client that
+        // collapses those into a boolean re-creates the fabricated denial it
+        // fixed. Here the wrong default was the mirror image — anything but
+        // 'denied'/'expired' rendered 'completed', telling the reader a tool
+        // ran that never did.
+        const decision =
+          tc.decision === 'approved' || tc.decision === 'denied'
+            ? tc.decision
+            : tc.decision
+              ? ('expired' as const)
+              : undefined;
         const event: ToolCallEvent = {
           kind: 'tool_call',
           id: tc.id || `${turn.id}.tc${turn.events.length}`,
           tool: tc.name || '',
           args: tc.args || {},
           status:
-            tc.decision === 'denied'
-              ? 'denied'
-              : tc.decision === 'expired'
-                ? 'expired'
-                : 'completed',
-          decision: tc.decision,
+            decision === 'denied' ? 'denied' : decision === 'expired' ? 'expired' : 'completed',
+          decision,
           // Keeps a replayed turn's folded chip reading
           // "19× citations · 12× searches" rather than "38× steps" —
           // the live SSE path sets this from the same registry.
@@ -5626,7 +5635,13 @@ interface HistoryMessage {
         name: string;
         args: Record<string, unknown>;
         id: string;
-        decision?: 'approved' | 'denied' | 'expired';
+        /**
+         * Raw backend status, not a UI state: 'approved' | 'denied' |
+         * 'expired' | 'interrupted' | 'unavailable', and whatever a future
+         * non-decision adds. Normalized to the card's three states at
+         * hydration — only 'denied' is a refusal.
+         */
+        decision?: string;
         category?: string;
       }[]
     | null;
