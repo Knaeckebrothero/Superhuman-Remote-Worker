@@ -11040,7 +11040,10 @@ class PostgresDB:
         """Durable claim/generation state for project-scoped backlog tickets.
 
         Claims come from ``officer_ticket_claims``, never reconstructed from
-        the current jobs population. ``has_non_terminal`` is conservative:
+        the current jobs population. ``legacy_rearm_after`` is the migration
+        cutover barrier for history whose ready generation could not be
+        proven; the Officer must explicitly re-ready strictly after it.
+        ``has_non_terminal`` is conservative:
         an extant non-terminal job, a deleted job recorded non-terminal, or a
         disappeared job with no deletion audit all block a newer generation.
         That last case makes direct retention/SQL mistakes fail closed rather
@@ -11055,37 +11058,47 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT DISTINCT ON (claim.ticket_note_id)
-                       claim.ticket_note_id AS note_id,
-                       claim.ready_generation_at,
-                       claim.claimed_at,
-                       claim.job_id,
-                       claim.source,
-                       EXISTS (
-                           SELECT 1
-                             FROM officer_ticket_claims blocker
-                             LEFT JOIN jobs live ON live.id = blocker.job_id
-                            WHERE blocker.project_id = claim.project_id
-                              AND blocker.ticket_note_id = claim.ticket_note_id
-                              AND (
-                                  (live.id IS NOT NULL AND live.status NOT IN
-                                      ('completed', 'failed', 'cancelled'))
-                                  OR
-                                  (live.id IS NULL AND (
-                                      blocker.job_deleted_at IS NULL
-                                      OR blocker.job_status_at_delete IS NULL
-                                      OR blocker.job_status_at_delete NOT IN
-                                         ('completed', 'failed', 'cancelled')
-                                  ))
-                              )
-                       ) AS has_non_terminal
-                  FROM officer_ticket_claims claim
-                 WHERE claim.project_id = $1
-                   AND claim.ticket_note_id = ANY($2::text[])
-                 ORDER BY claim.ticket_note_id,
-                          claim.ready_generation_at DESC,
-                          claim.claimed_at DESC,
-                          claim.id DESC
+                WITH scoped AS (
+                    SELECT claim.*,
+                           (
+                               (live.id IS NOT NULL AND live.status NOT IN
+                                   ('completed', 'failed', 'cancelled'))
+                               OR
+                               (live.id IS NULL AND (
+                                   claim.job_deleted_at IS NULL
+                                   OR claim.job_status_at_delete IS NULL
+                                   OR claim.job_status_at_delete NOT IN
+                                      ('completed', 'failed', 'cancelled')
+                               ))
+                           ) AS is_non_terminal
+                      FROM officer_ticket_claims claim
+                      LEFT JOIN jobs live ON live.id = claim.job_id
+                     WHERE claim.project_id = $1
+                       AND claim.ticket_note_id = ANY($2::text[])
+                )
+                SELECT ticket_note_id AS note_id,
+                       MAX(ready_generation_at) AS ready_generation_at,
+                       MAX(claimed_at) FILTER (
+                           WHERE source = 'legacy_unversioned'
+                       ) AS legacy_rearm_after,
+                       (array_agg(
+                           claimed_at
+                           ORDER BY ready_generation_at DESC NULLS LAST,
+                                    claimed_at DESC, id DESC
+                       ))[1] AS claimed_at,
+                       (array_agg(
+                           job_id
+                           ORDER BY ready_generation_at DESC NULLS LAST,
+                                    claimed_at DESC, id DESC
+                       ))[1] AS job_id,
+                       (array_agg(
+                           source
+                           ORDER BY ready_generation_at DESC NULLS LAST,
+                                    claimed_at DESC, id DESC
+                       ))[1] AS source,
+                       BOOL_OR(is_non_terminal) AS has_non_terminal
+                  FROM scoped
+                 GROUP BY ticket_note_id
                 """,
                 project_uuid,
                 list(note_ids),
@@ -11209,6 +11222,10 @@ class PostgresDB:
                        claim.officer_slot,
                        claim.work_category,
                        claim.ready_generation_at,
+                       CASE
+                           WHEN claim.source = 'legacy_unversioned'
+                           THEN claim.claimed_at
+                       END AS legacy_rearm_after,
                        claim.source AS claim_source,
                        claim.job_deleted_at
                   FROM officer_ticket_claims claim

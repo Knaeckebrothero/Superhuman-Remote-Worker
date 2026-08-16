@@ -18,10 +18,10 @@ related:
 
 # Deleting a job silently releases its one-shot backlog claim
 
-**Status:** DONE 2026-08-16 — closed again after independent-review repair of the
-rolling-upgrade boundary, historical-authority validation, collision diagnostics,
-raw-context ownership, deletion truth and lineage indexing. Audit finding **BP-05**. This
-local checkpoint is not deployed; it does not enable `auto_pull`.
+**Status:** DONE LOCALLY 2026-08-16 — repaired after the first main-dev gate proved that
+migration 0162's strict historical preflight rejects the genuine pre-ledger job shapes.
+Audit finding **BP-05**. The corrected migration is not deployed, the failed live gate
+must be rerun, and this does not enable `auto_pull`.
 
 ## Problem and semantic
 
@@ -36,6 +36,11 @@ The implemented semantic is:
 - Only a **newer server-observed Officer `ready_at` generation** re-arms the ticket. Equal
   or older generations remain consumed. A new generation is still refused while preceding
   work is non-terminal; cancel or finish it first.
+- Pre-ledger jobs whose ready generation cannot be proven become
+  `legacy_unversioned` claims at the migration cutover. Their `ready_generation_at` stays
+  NULL; the ledger's server timestamp is a re-arm barrier, not a guessed historical
+  generation. They remain consumed until the Officer explicitly re-readies the ticket
+  after cutover, and a non-terminal predecessor still blocks that newer generation.
 - `ticket=` means “claim this ready backlog ticket.” Ad-hoc work omits it. Manual and tick
   dispatch use the same post-locked claim/slot/job transaction.
 - The caller/model supplies only the ticket slug and optional slot. It never supplies
@@ -44,11 +49,14 @@ The implemented semantic is:
 
 ## Schema and authoritative transaction
 
-App migration `0162_officer_ticket_claims.sql` creates `officer_ticket_claims`. Each row
-records project/ticket/generation, claim timestamp/source, Officer
+App migration `0162_officer_ticket_claims.sql` creates `officer_ticket_claims`. A normal
+row records project/ticket/generation, claim timestamp/source, Officer
 thread/incarnation/slot/category/config-fingerprint/lineage provenance, and durable job
-identity without a jobs FK. Deletion audit retains timestamp, observed status, and the
-actor/reason when the deleting application has that authority.
+identity without a jobs FK. A `legacy_unversioned` row deliberately records only observed
+project/ticket/job/thread/slot/category data: generation and cryptographic admission
+provenance are NULL because inventing either would turn migration code into authority.
+Deletion audit retains timestamp, observed status, and the actor/reason when the deleting
+application has that authority.
 
 Unique backstops on `(project_id, ticket_note_id, ready_generation_at)` and `job_id`
 prevent two claims for one generation or two claims for one job. The existing partial
@@ -106,17 +114,26 @@ removal from any still-live claimed job, and uses explicit presence/type/range c
 which had no model-visible `ticket_claim_source`; unrelated later context merges therefore
 continue to work without weakening provenance immutability.
 
-Backfill accepts only verifiable pre-cutover Officer admission: exact project and creating
-thread, current/historical post incarnation, consistent lineage size, slot/category and
-configuration fingerprint, and a valid stamped `ticket_ready_at`. It never trusts a model
-timestamp or guesses from `job.created_at`. Questionable history aborts with its job ID and
-an operator reconciliation hint. Missing project/thread/generation/incarnation/lineage
-values are named preflight failures rather than nullable comparisons or downstream
-not-null errors.
+Backfill has two intentionally different outcomes:
 
-Idempotency is specifically `ON CONFLICT (job_id) DO NOTHING`. A collision on
-`(project_id, ticket_note_id, ready_generation_at)` stays loud; the migration reports the
-conflicting historical job IDs and statuses rather than choosing one.
+- A complete, internally consistent pre-cutover Officer stamp becomes a versioned
+  `backfill` claim after exact project/thread, current-or-historical incarnation, lineage,
+  slot/category, fingerprint and finite `ticket_ready_at` validation.
+- Every project-scoped, nonblank ticket job that cannot meet that proof becomes a
+  `legacy_unversioned` claim. It receives no generation and no inferred
+  incarnation/fingerprint. Its `claimed_at` is the database cutover timestamp and is used
+  only as a fail-closed re-arm barrier. A trusted `ready_at` must be strictly later.
+
+The migration never trusts a model timestamp or guesses from `job.created_at`. It still
+aborts rows that cannot be scoped at all (NULL project or blank ticket), because no safe
+project/ticket barrier can represent them.
+
+Idempotency is specifically `ON CONFLICT (job_id) DO NOTHING`. A collision between two
+fully verified rows on `(project_id, ticket_note_id, ready_generation_at)` stays loud; the
+migration reports the conflicting historical job IDs and statuses rather than choosing
+one. Multiple unversioned rows may coexist because NULL is not a fabricated shared
+generation; all of them participate in non-terminal blocking and share the cutover
+barrier.
 
 ## Server-owned context and deletion truth
 
@@ -136,7 +153,7 @@ itself—REST performs no fallible second lookup after commit—so the endpoint 
 
 ## Acceptance evidence
 
-Real PostgreSQL 15 coverage in
+The repaired real PostgreSQL 15 coverage in
 `tests/test_officer_post_transactions_real_postgres.py` proves:
 
 - manual/manual and manual/tick contention create one job and one claim;
@@ -147,10 +164,14 @@ Real PostgreSQL 15 coverage in
 - claims remain project-scoped across decommission/recommission;
 - a pre-migration job and a writer committed immediately before the migration lock are
   backfilled, while an old ticket INSERT after migration is atomically rejected;
-- strict backfill replay is idempotent by job ID; unverifiable history and a same-generation
-  terminal/non-terminal pair fail with actionable diagnostics;
-- missing nullable admission identity is rejected both during backfill and on later live-job
-  mutation; a claimed job cannot remove its ticket stamp;
+- strict backfill replay is idempotent by job ID; a same-generation pair of fully verified
+  rows fails with actionable diagnostics;
+- field-realistic stamp-less and partial-stamp rows become unversioned barriers without a
+  guessed generation, remain consumed at equal/older `ready_at`, and re-arm exactly once
+  only after a post-cutover trusted generation;
+- incomplete or malformed historical admission is quarantined rather than promoted, while
+  new/versioned claims still reject missing identity; a claimed job cannot remove its
+  ticket stamp;
 - historical backfilled jobs still accept unrelated atomic context merges without being
   forced to acquire provenance that the old application never wrote;
 - public and internal endpoints cannot persist raw claim context against real PostgreSQL;
@@ -176,13 +197,40 @@ Cockpit i18n (earlier checkpoint):                2530-key parity; no hardcoded 
 ruff check / format check / git diff --check:     clean
 ```
 
+Local field-history repair checkpoint on 2026-08-16:
+
+```text
+backlog eligibility/admission logic:               53 passed in 0.16s
+legacy migration/race subset:                      13 passed in 40.25s
+complete Officer Post PostgreSQL file:             66 passed in 141.84s
+expanded lifecycle/routing/admission checkpoint:  547 passed in 265.84s
+migration discovery/head/replay tests:             34 passed in 31.69s
+app migration replay + schema regeneration:        OK (136 transactional migrations)
+all app/vector/audit schema artifacts:              current
+Ruff check / format check / git diff --check:       clean
+```
+
+The repair fixture reproduces the observed main-dev population—six jobs with no
+`officer_admission` and one partial stamp without `ticket_ready_at`—instead of calling a
+fully versioned automatic-tick stamp “historical.” All seven become unversioned barriers
+with one server cutover timestamp and no inferred generation. Equal cutover time is
+consumed; a one-microsecond-newer trusted generation wins exactly once after terminal
+work. A directly deleted non-terminal legacy job remains blocked.
+
 The earlier checkpoint's repository fast suite reached **14,783 passed / 123 skipped**
 before its system-Python environment stopped on missing `arxiv`; the exact file passed
 under the project virtualenv (**22 passed**). The review repair used the proportionate
 662-test Officer set rather than repeating that environment-limited full run.
 
-This closes BP-05 only. BP-01, BP-06, BP-07, BP-08, BP-11, ES-01 and the remaining
-OC-05/OC-06 residues are unchanged; `auto_pull` remains false and unexposed.
+The dedicated main-dev post-deployment runbook is
+[[officer_ticket_claim_ledger_live_gate_2026-08-16]]. It validates the deployed migration,
+ledger completeness, rolled-back historical-context compatibility, one-shot deletion and
+re-ready behavior, an ordinary-job control, and complete disposable cleanup while keeping
+`auto_pull=false`.
+
+This closes the local BP-05 repair only. Its main-dev deployment checkpoint remains open.
+BP-01, BP-06, BP-07, BP-08, BP-11, ES-01 and the remaining OC-05/OC-06 residues are
+unchanged; `auto_pull` remains false and unexposed.
 
 ## Dependencies
 
