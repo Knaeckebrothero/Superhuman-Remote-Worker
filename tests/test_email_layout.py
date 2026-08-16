@@ -116,6 +116,20 @@ def test_layout_tables_are_presentational() -> None:
         assert 'role="presentation"' in table
 
 
+def test_footer_note_uses_text_secondary_not_text_muted() -> None:
+    """text-muted fails WCAG AA on every Travertine surface (see
+    tests/test_brand_palette.py); footer_note must render in text-secondary.
+    Scoped to the footer <td> specifically -- a whole-document check would
+    still pass if some other element happened to carry text-secondary while
+    the footer itself quietly reverted to text-muted.
+    """
+    html = render_email(title="t", body_html="<p>b</p>", footer_note="Sent by SRW.")
+    footer_cell = re.search(r"<tr><td[^>]*>Sent by SRW\.</td></tr>", html)
+    assert footer_cell, "footer_note did not render as an isolable <td>"
+    assert brand.TRAVERTINE["text-secondary"] in footer_cell.group(0)
+    assert brand.TRAVERTINE["text-muted"] not in footer_cell.group(0)
+
+
 def test_uses_no_unmanaged_colours() -> None:
     """Catches the way drift actually starts: a one-off hex nobody notices."""
     html = render_email(
