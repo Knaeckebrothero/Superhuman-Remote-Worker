@@ -404,6 +404,9 @@ async def _validate_ticket_claim(
     row = await conn.fetchrow(
         f"""
         SELECT MAX(claim.ready_generation_at) AS newest_generation,
+               MAX(claim.claimed_at) FILTER (
+                   WHERE claim.source = 'legacy_unversioned'
+               ) AS legacy_rearm_after,
                COALESCE(bool_or(
                    (live.id IS NOT NULL AND
                     live.status NOT IN {_TERMINAL_STATUSES_SQL})
@@ -424,10 +427,17 @@ async def _validate_ticket_claim(
         str(note_id),
     )
     newest = _aware(row["newest_generation"]) if row else None
+    legacy_rearm_after = _aware(row["legacy_rearm_after"]) if row else None
     if row and bool(row["has_non_terminal"]):
         raise _conflict(
             "ticket_claimed",
             f"Backlog ticket '{note_id}' already has a non-terminal job.",
+        )
+    if legacy_rearm_after is not None and legacy_rearm_after >= generation:
+        raise _conflict(
+            "ticket_claimed",
+            f"Backlog ticket '{note_id}' must be explicitly re-readied after "
+            "the durable-claim cutover.",
         )
     if newest is not None and newest >= generation:
         raise _conflict(

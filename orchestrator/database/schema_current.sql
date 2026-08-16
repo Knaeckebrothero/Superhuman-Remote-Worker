@@ -784,6 +784,35 @@ BEGIN
     END IF;
 
     admission := COALESCE(NEW.context, '{}'::jsonb)->'officer_admission';
+
+    -- These rows are a quarantine boundary, not recovered admission
+    -- authority. Preserve the observable job identity while allowing ordinary
+    -- context merges against genuine stamp-less/partial historical rows. Any
+    -- admission-looking JSON on such a job remains non-authoritative because
+    -- the immutable ledger source/generation shape, not jobs.context, governs
+    -- eligibility. Only a new post-locked claim can consume a post-cutover
+    -- ready_at.
+    IF durable_claim.source = 'legacy_unversioned' THEN
+        IF NEW.project_id IS NULL
+           OR durable_claim.project_id IS DISTINCT FROM NEW.project_id
+           OR durable_claim.ticket_note_id
+                  IS DISTINCT FROM NEW.context->>'ticket_note_id'
+           OR (
+               durable_claim.officer_thread_id IS NOT NULL
+               AND durable_claim.officer_thread_id
+                      IS DISTINCT FROM NEW.created_by_thread_id
+           )
+           OR durable_claim.officer_slot
+                  IS DISTINCT FROM NEW.context->>'officer_slot'
+           OR durable_claim.work_category
+                  IS DISTINCT FROM NEW.context->>'work_category' THEN
+            RAISE EXCEPTION 'legacy ticket-bearing job % does not match its durable cutover barrier', NEW.id
+                USING ERRCODE = 'check_violation',
+                      CONSTRAINT = 'officer_ticket_claim_job_integrity';
+        END IF;
+        RETURN NEW;
+    END IF;
+
     IF jsonb_typeof(admission) IS DISTINCT FROM 'object' THEN
         RAISE EXCEPTION 'ticket-bearing job % has no server Officer admission provenance', NEW.id
             USING ERRCODE = 'check_violation',
@@ -858,7 +887,7 @@ $$;
 -- Name: FUNCTION enforce_officer_ticket_claim_job_integrity(); Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON FUNCTION public.enforce_officer_ticket_claim_job_integrity() IS '0162 rolling-upgrade backstop: a ticket-bearing jobs row must match a durable claim already visible in the same transaction.';
+COMMENT ON FUNCTION public.enforce_officer_ticket_claim_job_integrity() IS '0162 rolling-upgrade backstop: a ticket-bearing jobs row must match a durable claim already visible in the same transaction; legacy_unversioned rows remain non-authoritative cutover barriers.';
 
 
 --
@@ -6221,23 +6250,25 @@ CREATE TABLE public.officer_ticket_claims (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     project_id uuid NOT NULL,
     ticket_note_id text NOT NULL,
-    ready_generation_at timestamp with time zone NOT NULL,
+    ready_generation_at timestamp with time zone,
     claimed_at timestamp with time zone DEFAULT now() NOT NULL,
     source text NOT NULL,
-    officer_thread_id uuid NOT NULL,
-    officer_incarnation integer NOT NULL,
+    officer_thread_id uuid,
+    officer_incarnation integer,
     officer_slot text,
     work_category text,
-    admission_config_fingerprint text NOT NULL,
-    admission_lineage_size integer NOT NULL,
+    admission_config_fingerprint text,
+    admission_lineage_size integer,
     job_id uuid NOT NULL,
     job_deleted_at timestamp with time zone,
     job_status_at_delete text,
     deletion_actor_user_id uuid,
     deletion_reason text,
-    CONSTRAINT officer_ticket_claim_fingerprint_valid CHECK ((admission_config_fingerprint ~ '^[0-9a-f]{64}$'::text)),
-    CONSTRAINT officer_ticket_claim_incarnation_valid CHECK ((officer_incarnation >= 0)),
-    CONSTRAINT officer_ticket_claim_lineage_size_valid CHECK ((admission_lineage_size = (officer_incarnation + 1))),
+    CONSTRAINT officer_ticket_claim_authority_shape CHECK ((((source = 'legacy_unversioned'::text) AND (ready_generation_at IS NULL) AND (officer_incarnation IS NULL) AND (admission_config_fingerprint IS NULL) AND (admission_lineage_size IS NULL)) OR ((source <> 'legacy_unversioned'::text) AND (ready_generation_at IS NOT NULL) AND (officer_thread_id IS NOT NULL) AND (officer_incarnation IS NOT NULL) AND (admission_config_fingerprint IS NOT NULL) AND (admission_lineage_size IS NOT NULL)))),
+    CONSTRAINT officer_ticket_claim_fingerprint_valid CHECK (((admission_config_fingerprint IS NULL) OR (admission_config_fingerprint ~ '^[0-9a-f]{64}$'::text))),
+    CONSTRAINT officer_ticket_claim_generation_finite CHECK (((ready_generation_at IS NULL) OR isfinite(ready_generation_at))),
+    CONSTRAINT officer_ticket_claim_incarnation_valid CHECK (((officer_incarnation IS NULL) OR (officer_incarnation >= 0))),
+    CONSTRAINT officer_ticket_claim_lineage_size_valid CHECK (((admission_lineage_size IS NULL) OR (admission_lineage_size = (officer_incarnation + 1)))),
     CONSTRAINT officer_ticket_claim_source_nonempty CHECK ((btrim(source) <> ''::text)),
     CONSTRAINT officer_ticket_claim_ticket_nonempty CHECK ((btrim(ticket_note_id) <> ''::text))
 );
@@ -6254,7 +6285,14 @@ COMMENT ON TABLE public.officer_ticket_claims IS 'Durable Officer backlog claim 
 -- Name: COLUMN officer_ticket_claims.ready_generation_at; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.officer_ticket_claims.ready_generation_at IS 'The server-resolved Officer ready_at generation consumed by this claim. Backfill accepts only a valid server admission stamp; it never trusts a model timestamp or guesses from job.created_at.';
+COMMENT ON COLUMN public.officer_ticket_claims.ready_generation_at IS 'The server-resolved Officer ready_at generation consumed by this claim. NULL only for source=legacy_unversioned: claimed_at is then the database cutover barrier and no historical generation is guessed.';
+
+
+--
+-- Name: COLUMN officer_ticket_claims.claimed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.officer_ticket_claims.claimed_at IS 'Claim time. For source=legacy_unversioned this is the server cutover timestamp and the ticket must be explicitly re-readied strictly later.';
 
 
 --

@@ -138,6 +138,37 @@ class TestEligibility:
         ready, _ = eligible_tickets(rows, claims, NOW)
         assert [t["note_id"] for t in ready] == ["feature-a"]
 
+    def test_legacy_claim_requires_an_explicit_post_cutover_rearm(self):
+        barrier = NOW - timedelta(hours=1)
+        claims = {
+            "feature-a": {
+                "ready_generation_at": None,
+                "legacy_rearm_after": barrier,
+                "has_non_terminal": False,
+            }
+        }
+        old_ready = [
+            _row(
+                "feature-a",
+                tags=["ready", "category:researcher"],
+                ready_at=barrier,
+            )
+        ]
+        ready, notes = eligible_tickets(old_ready, claims, NOW)
+        assert ready == []
+        assert "legacy claim requires re-ready" in notes[0]
+
+        rearmed = [
+            _row(
+                "feature-a",
+                tags=["ready", "category:researcher"],
+                ready_at=barrier + timedelta(microseconds=1),
+            )
+        ]
+        ready, notes = eligible_tickets(rearmed, claims, NOW)
+        assert [ticket["note_id"] for ticket in ready] == ["feature-a"]
+        assert notes == []
+
     def test_a_claim_exactly_at_the_arming_instant_counts_as_claimed(self):
         # Ties go to "claimed": dispatching twice costs a job, refusing costs
         # one tick of latency.
@@ -326,6 +357,7 @@ def _db(
     claims=None,
     slot_claims=None,
     locked_claim_at=None,
+    locked_legacy_rearm_after=None,
     locked_has_non_terminal=False,
     slots=None,
 ):
@@ -412,6 +444,7 @@ def _db(
         if "MAX(claim.ready_generation_at) AS newest_generation" in query:
             return {
                 "newest_generation": locked_claim_at,
+                "legacy_rearm_after": locked_legacy_rearm_after,
                 "has_non_terminal": locked_has_non_terminal,
             }
         raise AssertionError(query)
@@ -511,6 +544,22 @@ class TestTickOfficer:
     async def test_a_stale_claim_under_the_lock_does_not_block_a_re_armed_ticket(self):
         # The claim predates this arming, so the officer has re-readied since.
         db = _db(locked_claim_at=NOW - timedelta(hours=2))
+        rows = [_row("feature-a", tags=["ready", "category:researcher"], ready_at=NOW)]
+        counts = await tick_officer(db, _vector_db(rows), _officer_row(), now=NOW)
+        assert counts["dispatched"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_legacy_barrier_landing_under_the_lock_is_a_quiet_skip(self):
+        db = _db(locked_legacy_rearm_after=NOW)
+        rows = [_row("feature-a", tags=["ready", "category:researcher"], ready_at=NOW)]
+        counts = await tick_officer(db, _vector_db(rows), _officer_row(), now=NOW)
+        assert counts["dispatched"] == 0
+        assert counts["skipped"] == 1
+        db.create_job.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_cutover_rearm_passes_the_legacy_barrier_under_lock(self):
+        db = _db(locked_legacy_rearm_after=NOW - timedelta(microseconds=1))
         rows = [_row("feature-a", tags=["ready", "category:researcher"], ready_at=NOW)]
         counts = await tick_officer(db, _vector_db(rows), _officer_row(), now=NOW)
         assert counts["dispatched"] == 1
@@ -945,6 +994,43 @@ class TestExecutorSerialization:
                 "status": "active",
                 # Re-armed AFTER the consumed ledger generation = reviewed.
                 "ready_at": NOW - timedelta(minutes=30),
+            }
+        )
+
+        counts = await tick_officer(db, vector_db, row, now=NOW)
+        assert counts["dispatched"] == 1
+
+    @pytest.mark.asyncio
+    async def test_re_readied_legacy_ticket_releases_the_executor_lane(self):
+        row = _officer_row()
+        row["metadata"]["config_override"]["officer"]["slots"] = {
+            "executors": {"count": 1, "category": EXECUTOR}
+        }
+        barrier = NOW - timedelta(hours=1)
+        finished = {
+            "id": str(uuid.uuid4()),
+            "status": "completed",
+            "work_category": EXECUTOR,
+            "ticket_note_id": "feature-old",
+            "ready_generation_at": None,
+            "legacy_rearm_after": barrier,
+            "created_at": barrier,
+            "updated_at": barrier,
+        }
+        db = _db()
+
+        async def _claims(_lineage, *, slot=None, include_terminal=False, limit=20):
+            return [finished] if include_terminal else []
+
+        db.list_officer_slot_claims.side_effect = _claims
+        vector_db = _vector_db(
+            [_row("feature-a", tags=["ready", "category:executor"], ready_at=NOW)]
+        )
+        vector_db.acquire.return_value.__aenter__.return_value.fetchrow = AsyncMock(
+            return_value={
+                "note_id": "feature-old",
+                "status": "active",
+                "ready_at": barrier + timedelta(microseconds=1),
             }
         )
 

@@ -273,7 +273,7 @@ def eligible_tickets(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Split ready tickets into (dispatchable, skip-reasons).
 
-    Three ways a ready-tagged ticket is still not dispatchable, and each is
+    Four ways a ready-tagged ticket is still not dispatchable, and each is
     reported rather than silently dropped:
 
     * **Ambiguous** — two ``category:`` tags, or an expert pin that names no
@@ -285,6 +285,8 @@ def eligible_tickets(
       direction is the only defensible one for a dispatch authorization.
     * **Claimed** — a job already carries this ticket and the officer has not
       re-armed it since.
+    * **Legacy barrier** — a pre-ledger job had no provable generation, so the
+      Officer has not explicitly re-readied it after the migration cutover.
     """
     ready: list[dict[str, Any]] = []
     notes: list[str] = []
@@ -301,12 +303,14 @@ def eligible_tickets(
         claim_state = claims.get(note_id)
         if isinstance(claim_state, dict):
             claimed_generation = _aware(claim_state.get("ready_generation_at"))
+            legacy_rearm_after = _aware(claim_state.get("legacy_rearm_after"))
             has_non_terminal = bool(claim_state.get("has_non_terminal"))
         else:
             # Compatibility for pure callers/tests using the former
             # ``note_id -> datetime`` shape. Production reads the durable
             # state mapping from PostgresDB.ticket_claim_states.
             claimed_generation = _aware(claim_state)
+            legacy_rearm_after = None
             has_non_terminal = False
         if has_non_terminal:
             notes.append(f"{note_id}: prior job is still non-terminal")
@@ -314,6 +318,12 @@ def eligible_tickets(
         if claimed_generation is not None and claimed_generation >= authorized_at:
             notes.append(
                 f"{note_id}: generation claimed at {claimed_generation.isoformat()}"
+            )
+            continue
+        if legacy_rearm_after is not None and legacy_rearm_after >= authorized_at:
+            notes.append(
+                f"{note_id}: legacy claim requires re-ready after "
+                f"{legacy_rearm_after.isoformat()}"
             )
             continue
         ready.append({**row, "classification": classification})
@@ -523,6 +533,8 @@ async def _executor_blocked(
         return None  # closed — dispositioned
     re_armed = _aware(ticket.get("ready_at"))
     consumed_generation = _aware(previous.get("ready_generation_at"))
+    if consumed_generation is None:
+        consumed_generation = _aware(previous.get("legacy_rearm_after"))
     if re_armed and consumed_generation and re_armed > consumed_generation:
         return None  # explicitly re-readied — dispositioned
     return (

@@ -187,12 +187,14 @@ category, owner and full lineage. Real-PostgreSQL tests interleave hold, disable
 change, decommission and recommission immediately before INSERT and prove the stale request
 never creates a job.
 
-### BP-05 — durable claim ledger (**DONE 2026-08-16; not deployed**)
+### BP-05 — durable claim ledger (**DONE LOCALLY 2026-08-16; redeploy gate pending**)
 
 Migration 0162 creates `officer_ticket_claims`, unique per project/ticket/ready generation
-and per job identity, without a jobs FK. It backfills every verifiable extant ticket job,
-rejects questionable provenance and same-generation collisions, and preserves multiple
-legitimate re-ready generations. Manual and tick admission now insert
+and per job identity, without a jobs FK. It preserves every project-scoped extant ticket
+job: verifiable stamps retain their generations, while incomplete or questionable history
+becomes an unversioned cutover barrier rather than guessed authority. Verified
+same-generation collisions stay loud, and multiple legitimate re-ready generations remain
+preserved. Manual and tick admission now insert
 the durable claim and exact preallocated job UUID in the same post-locked transaction.
 Eligibility, ready depth, stale claims, breaker history and executor disposition read this
 ledger rather than reconstructing claims from current jobs.
@@ -218,6 +220,24 @@ queried after commit. Real PostgreSQL covers the lock boundary, old writers, col
 diagnostics, nullable/missing provenance, historical context merging, endpoint bypasses,
 atomic deletion response and the index plan. See
 [[deleting_a_job_releases_its_backlog_ticket_claim]].
+
+The first main-dev gate then exposed a field-history gap in that repair: all seven real
+ticket jobs lack a stamped ready generation, while the test fixture called “historical”
+already carried one. The migration rolled back cleanly but left the new replica unable to
+start. The reopened contract records each genuine pre-ledger row as a
+`legacy_unversioned` fail-closed barrier without inventing a generation or admission
+provenance. Only an explicit trusted re-ready strictly after the database cutover can
+supersede it, and non-terminal predecessors continue to block. Exact stamp-less and
+partial-stamp PostgreSQL fixtures are the repair's release gate.
+
+The local repair now satisfies that contract. Six stamp-less and one partial-stamp fixture
+become `legacy_unversioned` rows with NULL generation/provenance and one database cutover
+barrier; equality stays consumed, strict post-cutover re-ready wins once after terminal
+work, and deleted non-terminal history still blocks. The complete real-PostgreSQL Officer
+Post file passed 66 tests, the expanded Officer checkpoint passed 547, migration tests
+passed 34, and the from-zero app chain replayed through 0162. Main dev still has the failed
+old 0162 ledger row and old serving replicas, so BP-05 is not deployed until the documented
+recovery sequence and live gate pass.
 
 ### BP-06 — fixed pre-filter windows can starve valid work forever (**P0 liveness**)
 
@@ -523,3 +543,7 @@ exact file passes under the project virtualenv (**22 passed**). The review repai
 proportionate focused set rather than repeating that environment-limited full suite. BP-05
 remains uncommitted and not deployed. This evidence permits continued supervised manual/O6
 testing only with `auto_pull=false`; it does not authorize unattended backlog release.
+
+The post-deployment BP-05 smoke is specified separately in
+[[officer_ticket_claim_ledger_live_gate_2026-08-16]]. Its PASS updates deployment evidence
+only; it does not change this umbrella's open auto-pull verdict.

@@ -289,6 +289,33 @@ def _historical_ticket_context(
     }
 
 
+def _legacy_ticket_context(
+    seed: dict[str, str],
+    preparation,
+    *,
+    ticket: str,
+    partial_admission: bool = False,
+) -> dict:
+    """Field-observed manual history: no trusted ready generation."""
+
+    context = {
+        "ticket_note_id": ticket,
+        "officer_slot": "line",
+        "work_category": "executor",
+    }
+    if partial_admission:
+        context["officer_admission"] = {
+            "project_id": seed["project_id"],
+            "thread_id": seed["thread_id"],
+            "incarnation": preparation.incarnation,
+            "slot": "line",
+            "category": "executor",
+            "config_fingerprint": preparation.config_fingerprint,
+            "lineage_size": 1,
+        }
+    return context
+
+
 async def _insert_old_writer_ticket_job(
     conn,
     seed: dict[str, str],
@@ -315,6 +342,41 @@ async def _insert_old_writer_ticket_job(
                 preparation,
                 ticket=ticket,
                 generation=generation,
+            )
+        ),
+        status,
+        UUID(seed["project_id"]),
+        UUID(seed["thread_id"]),
+    )
+    return dict(row)
+
+
+async def _insert_legacy_ticket_job(
+    conn,
+    seed: dict[str, str],
+    preparation,
+    *,
+    ticket: str,
+    partial_admission: bool = False,
+    status: str = "completed",
+) -> dict:
+    """Insert the stamp-less/partial manual shapes observed on main dev."""
+
+    row = await conn.fetchrow(
+        """
+        INSERT INTO jobs (
+            description, config_name, context, status, project_id,
+            created_by_thread_id
+        ) VALUES ($1, 'worker_base', $2::jsonb, $3, $4, $5)
+        RETURNING id, created_at, status
+        """,
+        f"legacy {ticket}",
+        json.dumps(
+            _legacy_ticket_context(
+                seed,
+                preparation,
+                ticket=ticket,
+                partial_admission=partial_admission,
             )
         ),
         status,
@@ -801,15 +863,145 @@ async def test_backfilled_job_accepts_unrelated_context_merge_but_not_claim_remo
 
 
 @pytest.mark.asyncio
+async def test_migration_backfills_field_observed_legacy_shapes_as_rearm_barriers(db):
+    """Six stamp-less rows plus one partial stamp reproduce main-dev history."""
+
+    seed = await _seed_post(db, count=10)
+    preparation = await _prepare(db, seed)
+    await _remove_claim_migration_boundary(db)
+    async with db.acquire() as conn:
+        stamp_less = [
+            await _insert_legacy_ticket_job(
+                conn,
+                seed,
+                preparation,
+                ticket=f"legacy-stampless-{index}",
+            )
+            for index in range(6)
+        ]
+        partial = await _insert_legacy_ticket_job(
+            conn,
+            seed,
+            preparation,
+            ticket="legacy-partial",
+            partial_admission=True,
+        )
+        before_cutover = await conn.fetchval("SELECT clock_timestamp()")
+        await conn.execute(CLAIM_MIGRATION_FILE.read_text())
+        after_cutover = await conn.fetchval("SELECT clock_timestamp()")
+
+    claims = await _claim_rows(db, seed["project_id"])
+    assert len(claims) == 7
+    assert {row["job_id"] for row in claims} == {
+        *(row["id"] for row in stamp_less),
+        partial["id"],
+    }
+    assert {row["source"] for row in claims} == {"legacy_unversioned"}
+    assert {row["ready_generation_at"] for row in claims} == {None}
+    barriers = {row["claimed_at"] for row in claims}
+    assert len(barriers) == 1
+    barrier = barriers.pop()
+    assert before_cutover <= barrier <= after_cutover
+    assert {row["officer_incarnation"] for row in claims} == {None}
+    assert {row["admission_config_fingerprint"] for row in claims} == {None}
+    assert {row["admission_lineage_size"] for row in claims} == {None}
+
+    states = await db.ticket_claim_states(
+        seed["project_id"], ["legacy-stampless-0", "legacy-partial"]
+    )
+    assert states["legacy-stampless-0"]["ready_generation_at"] is None
+    assert states["legacy-stampless-0"]["legacy_rearm_after"] == barrier
+    assert states["legacy-stampless-0"]["has_non_terminal"] is False
+
+    with pytest.raises(OfficerAdmissionConflict) as exc:
+        await admit_and_create_job(
+            db,
+            preparation=await _prepare(db, seed),
+            job_kwargs=_job_kwargs("equal-to-cutover must stay consumed"),
+            ticket_note_id="legacy-stampless-0",
+            ticket_ready_at=barrier,
+        )
+    assert exc.value.code == "ticket_claimed"
+    assert "after the durable-claim cutover" in exc.value.detail
+
+    rearmed_at = barrier + timedelta(microseconds=1)
+    rearmed = await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs=_job_kwargs("explicitly re-readied after cutover"),
+        ticket_note_id="legacy-stampless-0",
+        ticket_ready_at=rearmed_at,
+    )
+    ticket_claims = await _claim_rows(db, seed["project_id"], "legacy-stampless-0")
+    assert {row["source"] for row in ticket_claims} == {
+        "legacy_unversioned",
+        "manual",
+    }
+    assert {row["ready_generation_at"] for row in ticket_claims} == {
+        None,
+        rearmed_at,
+    }
+    assert rearmed["id"] in {row["job_id"] for row in ticket_claims}
+
+    assert await db.merge_job_context(
+        str(partial["id"]), {"ordinary_runtime_update": "preserved"}
+    )
+    with pytest.raises(asyncpg.CheckViolationError) as removal:
+        await db.delete_job_context_keys(str(partial["id"]), ["ticket_note_id"])
+    assert removal.value.constraint_name == "officer_ticket_claim_job_integrity"
+
+
+@pytest.mark.asyncio
+async def test_deleted_nonterminal_legacy_barrier_still_blocks_newer_generation(db):
+    seed = await _seed_post(db, count=2)
+    preparation = await _prepare(db, seed)
+    await _remove_claim_migration_boundary(db)
+    async with db.acquire() as conn:
+        historical = await _insert_legacy_ticket_job(
+            conn,
+            seed,
+            preparation,
+            ticket="legacy-deleted-nonterminal",
+            status="created",
+        )
+        await conn.execute(CLAIM_MIGRATION_FILE.read_text())
+        barrier = await conn.fetchval(
+            "SELECT claimed_at FROM officer_ticket_claims WHERE job_id=$1",
+            historical["id"],
+        )
+        await conn.execute("DELETE FROM jobs WHERE id=$1", historical["id"])
+        audit = await conn.fetchrow(
+            """
+            SELECT job_deleted_at, job_status_at_delete
+              FROM officer_ticket_claims
+             WHERE job_id=$1
+            """,
+            historical["id"],
+        )
+
+    assert audit["job_deleted_at"] is not None
+    assert audit["job_status_at_delete"] == "created"
+    with pytest.raises(OfficerAdmissionConflict) as exc:
+        await admit_and_create_job(
+            db,
+            preparation=await _prepare(db, seed),
+            job_kwargs=_job_kwargs("must remain blocked"),
+            ticket_note_id="legacy-deleted-nonterminal",
+            ticket_ready_at=barrier + timedelta(seconds=1),
+        )
+    assert exc.value.code == "ticket_claimed"
+    assert "non-terminal" in exc.value.detail
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "field",
     ["project_id", "thread_id", "ticket_ready_at", "incarnation", "lineage_size"],
 )
-async def test_migration_rejects_missing_historical_admission_identity(db, field):
+async def test_migration_quarantines_incomplete_historical_admission(db, field):
     seed = await _seed_post(db)
     preparation = await _prepare(db, seed)
     await _remove_claim_migration_boundary(db)
-    migration_sql = CLAIM_MIGRATION_FILE.read_text()
     async with db.acquire() as conn:
         historical = await _insert_old_writer_ticket_job(
             conn,
@@ -832,16 +1024,17 @@ async def test_migration_rejects_missing_historical_admission_identity(db, field
             historical["id"],
             field,
         )
+        await conn.execute(CLAIM_MIGRATION_FILE.read_text())
+        claim = await conn.fetchrow(
+            "SELECT * FROM officer_ticket_claims WHERE job_id=$1",
+            historical["id"],
+        )
 
-    try:
-        async with db.acquire() as conn:
-            with pytest.raises(asyncpg.CheckViolationError) as exc:
-                await conn.execute(migration_sql)
-        assert str(historical["id"]) in str(exc.value)
-    finally:
-        async with db.acquire() as conn:
-            await conn.execute("DELETE FROM jobs WHERE id=$1", historical["id"])
-            await conn.execute(migration_sql)
+    assert claim["source"] == "legacy_unversioned"
+    assert claim["ready_generation_at"] is None
+    assert claim["officer_incarnation"] is None
+    assert claim["admission_config_fingerprint"] is None
+    assert claim["admission_lineage_size"] is None
 
 
 @pytest.mark.asyncio
@@ -960,7 +1153,7 @@ async def test_migration_rejects_same_generation_historical_collision(db):
 
 
 @pytest.mark.asyncio
-async def test_migration_rejects_unverifiable_historical_claim_context(db):
+async def test_migration_quarantines_unverifiable_historical_claim_context(db):
     seed = await _seed_post(db)
     preparation = await _prepare(db, seed)
     await _remove_claim_migration_boundary(db)
@@ -974,17 +1167,14 @@ async def test_migration_rejects_unverifiable_historical_claim_context(db):
             status="completed",
         )
 
-    migration_sql = CLAIM_MIGRATION_FILE.read_text()
-    try:
-        async with db.acquire() as conn:
-            with pytest.raises(asyncpg.CheckViolationError) as exc:
-                await conn.execute(migration_sql)
-        assert str(forged["id"]) in str(exc.value)
-        assert "no job.created_at fallback" in str(exc.value)
-    finally:
-        async with db.acquire() as conn:
-            await conn.execute("DELETE FROM jobs WHERE id=$1", forged["id"])
-            await conn.execute(migration_sql)
+    async with db.acquire() as conn:
+        await conn.execute(CLAIM_MIGRATION_FILE.read_text())
+        claim = await conn.fetchrow(
+            "SELECT * FROM officer_ticket_claims WHERE job_id=$1", forged["id"]
+        )
+    assert claim["source"] == "legacy_unversioned"
+    assert claim["ready_generation_at"] is None
+    assert claim["claimed_at"] > forged["created_at"]
 
 
 @pytest.mark.asyncio
