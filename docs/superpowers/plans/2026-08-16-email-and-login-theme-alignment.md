@@ -525,7 +525,7 @@ def render_email(
     footer_row = (
         f'<tr><td style="padding:16px 32px 24px 32px;'
         f'border-top:1px solid {C["border-color"]};font-family:{_SANS};'
-        f'font-size:12px;line-height:18px;color:{C["text-muted"]};">'
+        f'font-size:12px;line-height:18px;color:{C["text-secondary"]};">'
         f"{safe_footer}</td></tr>"
         if safe_footer
         else ""
@@ -938,7 +938,7 @@ In both functions, replace every Catppuccin literal with the corresponding token
 | `#313244` (border) | `_BRAND["border-color"]` |
 | `#cdd6f4` (body text) | `_BRAND["text-primary"]` |
 | `#a6adc8` (secondary text) | `_BRAND["text-secondary"]` |
-| `#6c7086` (muted text) | `_BRAND["text-muted"]` |
+| `#6c7086` (muted text) | `_BRAND["text-secondary"]` (see contrast ruling) |
 | `#cba6f7` (heading/primary) | `_BRAND["accent-color"]` |
 | `#a6e3a1` (approve/success) | `_BRAND["success"]` |
 | `#f38ba8` (deny/danger) | `_BRAND["danger"]` |
