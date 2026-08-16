@@ -51,7 +51,7 @@ async def _require_unattended_operations(
     The spawn choke point (``main._spawn_loop_stage``) re-reads the same grant,
     so this is the loud, synchronous half of a gate that also holds against a
     revocation landing mid-run. Spec:
-    docs/features/unattended_operations_grant.md.
+    docs/done/unattended_operations_grant.md.
     """
     if await postgres_db.user_can_run_unattended_operations(caller, project_id):
         return

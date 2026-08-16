@@ -89,7 +89,7 @@ CATALOG: dict[str, dict[str, Any]] = {
     #     directly at the endpoints and at the spawn choke point, via
     #     `user_can_run_unattended_operations` (the same shape as
     #     `complete_unmerged_pr` above).
-    # Spec: docs/features/unattended_operations_grant.md.
+    # Spec: docs/done/unattended_operations_grant.md.
     "unattended_operations": {"type": "bool", "default": False, "restrict_only": True},
     "datasource_tools": {"type": "bool", "default": True, "restrict_only": True},
     "browser": {"type": "bool", "default": True, "restrict_only": True},

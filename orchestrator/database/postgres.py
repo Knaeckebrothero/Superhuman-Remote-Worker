@@ -24229,7 +24229,7 @@ class PostgresDB:
         spend. This is the loop half of the gate only; the officer half also
         rides the config PDP via `evaluate` on `officer.enabled`, which is what
         covers a hand-rolled thread create and stands a running officer down on
-        revocation. Spec: docs/features/unattended_operations_grant.md.
+        revocation. Spec: docs/done/unattended_operations_grant.md.
         """
         if user.get("is_admin"):
             return True

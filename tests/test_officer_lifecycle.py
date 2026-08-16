@@ -685,7 +685,7 @@ class TestPatchEndpoint:
 
 class TestCommissionCapabilityGate:
     """Commissioning is gated on the `unattended_operations` capability grant
-    (docs/features/unattended_operations_grant.md). The config PDP refuses
+    (docs/done/unattended_operations_grant.md). The config PDP refuses
     `officer.enabled` downstream too, but only after the kit has been written —
     so the point of this gate is that it fires FIRST and touches nothing."""
 
