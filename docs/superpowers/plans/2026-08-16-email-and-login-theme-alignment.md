@@ -1626,14 +1626,14 @@ background image. Our <strong> markup had no such hook."
 - [ ] **Step 1: Deploy to local k3d**
 
 ```bash
-kubectl --context main -n superhuman-remote-worker rollout restart deploy/srw-keycloak
-kubectl --context main -n superhuman-remote-worker rollout status deploy/srw-keycloak --timeout=300s
+kubectl --context k3d-srw -n srw rollout restart deploy/srw-keycloak
+kubectl --context k3d-srw -n srw rollout status deploy/srw-keycloak --timeout=300s
 ```
 
 Verify the *running pod* picked up the theme volume, not just the Deployment spec:
 
 ```bash
-kubectl --context main -n superhuman-remote-worker exec deploy/srw-keycloak -- \
+kubectl --context k3d-srw -n srw exec deploy/srw-keycloak -- \
   ls -R /opt/keycloak/themes/srw
 ```
 Expected: `login/theme.properties`, `login/resources/css/srw.20260816.css`, `login/resources/img/srw-logo.svg`
@@ -1641,7 +1641,7 @@ Expected: `login/theme.properties`, `login/resources/css/srw.20260816.css`, `log
 - [ ] **Step 2: Assert the theme registered**
 
 ```bash
-kubectl --context main -n superhuman-remote-worker logs deploy/srw-keycloak \
+kubectl --context k3d-srw -n srw logs deploy/srw-keycloak \
   | grep -i "Failed to find .* theme" || echo "no theme-fallback errors"
 ```
 Expected: `no theme-fallback errors`
