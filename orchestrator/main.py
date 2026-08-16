@@ -481,6 +481,7 @@ from services.runtime_actor import (  # noqa: E402
     RuntimeActorCredentialError,
     authorize_runtime_actor_request,
     exchange_runtime_actor_bootstrap,
+    exchange_runtime_actor_pod_bootstrap,
     mint_thread_runtime_actor,
     mint_worker_runtime_actor,
     refresh_runtime_actor_request,
@@ -37547,6 +37548,76 @@ async def agent_save_message(
         return {"message_id": message_id, "status": "saved"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+class PodRuntimeActorRequest(BaseModel):
+    """Body for POST /api/agents/{agent_id}/runtime-actor/session."""
+
+    thread_id: str = Field(..., description="Thread this pod was just attached to")
+
+
+@app.post("/api/agents/{agent_id}/runtime-actor/session")
+async def agent_pod_runtime_actor(
+    request: Request, agent_id: str, body: PodRuntimeActorRequest
+) -> dict[str, Any]:
+    """Bind a warm pool pod's thread-less bootstrap to the session it just got.
+    **Internal** (P4b) — requires ``X-Internal-Key`` *and* the pod bootstrap
+    header. Ingress strips this path.
+
+    A dedicated session pod does this inside ``/api/agents/register``, where
+    the thread is known at provision time. A pool pod cannot: it registers
+    thread-less and is handed a session later over ``/session/attach``, and K8s
+    env is not patchable on a running pod. Without this route the pod runs the
+    session with no actor identity at all and every sensitive knowledge write
+    fails ``missing_credential`` — the failure BP-05's live gate hit.
+
+    The shared internal key is deliberately insufficient here, exactly as it is
+    at registration: the caller must also present the unique bootstrap injected
+    into its own pod, and the thread binding is read from the ``agents`` row
+    rather than believed from the body.
+    """
+    await require_internal(request)
+    try:
+        bootstrap = request_bootstrap_token(request)
+    except RuntimeActorCredentialError as exc:
+        await log_security_event(
+            postgres_db,
+            request=request,
+            event_type="runtime_actor_denied",
+            resource_type="runtime_actor_pod_bootstrap",
+            resource_id=body.thread_id,
+            detail=exc.code,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Runtime actor bootstrap is malformed or duplicated.",
+        ) from exc
+    if bootstrap is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Runtime actor pod bootstrap is required.",
+        )
+    try:
+        runtime_actor = await exchange_runtime_actor_pod_bootstrap(
+            postgres_db,
+            agent_id=agent_id,
+            thread_id=body.thread_id,
+            bootstrap_token=bootstrap,
+        )
+    except RuntimeActorCredentialError as exc:
+        await log_security_event(
+            postgres_db,
+            request=request,
+            event_type="runtime_actor_denied",
+            resource_type="runtime_actor_pod_bootstrap",
+            resource_id=body.thread_id,
+            detail=exc.code,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Runtime actor pod bootstrap is invalid or not bound.",
+        ) from exc
+    return {"runtime_actor": runtime_actor.to_payload()}
 
 
 @app.post("/api/agents/{agent_id}/heartbeat")

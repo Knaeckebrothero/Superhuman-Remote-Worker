@@ -640,6 +640,12 @@ async def _reset_to_idle(
         async with _state_lock:
             _pod_state = PodState.IDLE
 
+        # Back in the pool: the next session may belong to a different thread
+        # and a different project, so the actor scoped to the last one must not
+        # survive the transition.
+        if _orchestrator_client is not None:
+            _orchestrator_client.clear_runtime_actor()
+
         if _orchestrator_client and _orchestrator_client.agent_id:
             last_err: Optional[Exception] = None
             for attempt in range(3):
@@ -1337,6 +1343,32 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     status_code=409,
                 )
             _pod_state = PodState.SESSION
+
+        # Actor identity BEFORE any session setup, and synchronously, because
+        # the answer decides whether this pod may serve the session at all.
+        # A dedicated pod got its actor at registration; a pool pod has to bind
+        # its thread-less bootstrap now that it knows the thread. Refusing here
+        # is the whole point: provision_or_assign falls through to a dedicated
+        # pod, which is slower but correct. Continuing without identity gives a
+        # session that boots clean and then denies every machine-tag write —
+        # the silent failure that blocked the BP-05 live gate.
+        if _orchestrator_client is not None:
+            bound = await _orchestrator_client.bind_pod_runtime_actor(thread_id)
+            if not bound:
+                logger.error(
+                    "Refusing session %s: no runtime actor identity for this pod",
+                    thread_id,
+                )
+                async with _state_lock:
+                    _pod_state = PodState.IDLE
+                try:
+                    await _orchestrator_client.release_thread_agent(thread_id)
+                except Exception as e:
+                    logger.warning(f"Failed to release binding after refusal: {e}")
+                return JSONResponse(
+                    {"error": "pod cannot obtain runtime actor identity"},
+                    status_code=409,
+                )
 
         # Respond immediately — heavy setup (workspace polling, session init)
         # runs in the background. The /ready endpoint will report readiness

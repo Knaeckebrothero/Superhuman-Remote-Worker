@@ -23,7 +23,10 @@ from uuid import UUID, uuid4
 
 from src.core.loader import canonical_config_name
 
-from .runtime_actor import issue_runtime_actor_bootstrap
+from .runtime_actor import (
+    issue_runtime_actor_bootstrap,
+    issue_runtime_actor_pod_bootstrap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +374,7 @@ class AgentProvisioner:
                 return None
 
         runtime_actor_bootstrap: Optional[str] = None
+        runtime_actor_pod_bootstrap: Optional[str] = None
         if purpose == "session" and thread_id:
             try:
                 runtime_actor_bootstrap = await issue_runtime_actor_bootstrap(
@@ -381,6 +385,24 @@ class AgentProvisioner:
                     "Could not issue runtime actor bootstrap for session %s; "
                     "refusing to provision an identity-less pod",
                     thread_id,
+                )
+                return None
+        else:
+            # A job pod is also a future warm-pool session host: when it goes
+            # idle, provision_or_assign may hand it a thread instead of paying
+            # for a dedicated pod. That thread does not exist yet, so the pod
+            # gets a thread-less bootstrap it can bind at attach time. Without
+            # it the pod would attach with no actor identity and every machine
+            # tag / charter write on that session would be denied — silently,
+            # several tool calls later.
+            try:
+                runtime_actor_pod_bootstrap = await issue_runtime_actor_pod_bootstrap(
+                    self._db
+                )
+            except Exception:
+                logger.exception(
+                    "Could not issue pod runtime actor bootstrap; refusing to "
+                    "provision an identity-less pool pod"
                 )
                 return None
 
@@ -396,6 +418,7 @@ class AgentProvisioner:
             memory_limit=memory_limit,
             pvc_name=pvc_name,
             runtime_actor_bootstrap=runtime_actor_bootstrap,
+            runtime_actor_pod_bootstrap=runtime_actor_pod_bootstrap,
         )
 
         try:
@@ -1406,6 +1429,7 @@ class AgentProvisioner:
         expert_id: Optional[str] = None,
         pvc_name: Optional[str] = None,
         runtime_actor_bootstrap: Optional[str] = None,
+        runtime_actor_pod_bootstrap: Optional[str] = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for an agent.
 
@@ -1523,6 +1547,13 @@ class AgentProvisioner:
                     {
                         "name": "SRW_RUNTIME_ACTOR_BOOTSTRAP",
                         "value": runtime_actor_bootstrap or "",
+                    },
+                    # Thread-less twin of the above, carried by pool-eligible
+                    # pods and exchanged at /session/attach once the pod knows
+                    # which thread it is serving.
+                    {
+                        "name": "SRW_RUNTIME_ACTOR_POD_BOOTSTRAP",
+                        "value": runtime_actor_pod_bootstrap or "",
                     },
                     {
                         "name": "SESSION_JWT_SECRET",
