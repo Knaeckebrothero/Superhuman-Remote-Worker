@@ -143,7 +143,12 @@ const INHERIT = '__inherit__';
     </div>
   `,
   styles: [`
-    .admin-page { height: 100%; overflow-y: auto; }
+    /* The scroll container is the HOST, not an inner div: the shell's
+       .content-area is overflow:hidden, and a routed host with no height is
+       auto-height, so a child's height:100% resolved to auto and the tail of
+       the grants table (the newest capability rows) was clipped away with no
+       scrollbar. Same shape every other admin screen uses. */
+    :host { display: block; height: 100%; overflow: auto; }
     .admin-container { padding: 1rem 1.5rem; max-width: var(--content-max-width); margin: 0 auto; }
     .page-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; }
     .page-title { margin: 0; color: var(--text-primary); }
