@@ -1113,7 +1113,7 @@ what actually ships."
 - Test: `tests/test_keycloak_theme_infra.py` (create)
 
 **Interfaces:**
-- Consumes: nothing.
+- Consumes: `brand.TRAVERTINE` and `brand.normalize_hex` from Task 1 (the palette-consistency test imports them; the CSS itself has no runtime dependency).
 - Produces: a theme directory consumed by Task 8's ConfigMap.
 
 - [ ] **Step 1: Write the failing test**
@@ -1193,6 +1193,37 @@ def test_no_external_font_dependency() -> None:
     css = LOGIN_CSS.read_text()
     assert "fonts.googleapis.com" not in css
     assert "@import" not in css
+
+
+def test_light_tokens_match_the_shared_brand_palette() -> None:
+    """Extends the Python drift guard across the third copy of the palette.
+
+    brand.py is checked against the SCSS by tests/test_brand_palette.py; this
+    ties the Keycloak CSS to brand.py, so all three move together or a test
+    fails. Without it the login page is exactly the surface that silently rots.
+    """
+    import re
+
+    from orchestrator.services import brand
+
+    css = LOGIN_CSS.read_text()
+    root = css[css.index(":root {"): css.index(".pf-v5-theme-dark")]
+
+    expected = {
+        "--pf-v5-global--primary-color--100": brand.TRAVERTINE["accent-color"],
+        "--pf-v5-global--BackgroundColor--100": brand.TRAVERTINE["panel-bg"],
+        "--pf-v5-global--BackgroundColor--200": brand.TRAVERTINE["app-bg"],
+        "--pf-v5-global--Color--100": brand.TRAVERTINE["text-primary"],
+        "--pf-v5-global--Color--200": brand.TRAVERTINE["text-secondary"],
+        "--pf-v5-global--BorderColor--100": brand.TRAVERTINE["border-color"],
+        "--keycloak-card-top-color": brand.TRAVERTINE["accent-color"],
+    }
+    for token, want in expected.items():
+        found = re.search(rf"{re.escape(token)}:\s*(#[0-9a-fA-F]{{3,8}})", root)
+        assert found, f"{token} missing from the :root block"
+        assert brand.normalize_hex(found.group(1)) == want, (
+            f"{token} is {found.group(1)}, brand.py says {want}"
+        )
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1319,7 +1350,7 @@ styles=css/styles.css css/srw.20260816.css
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_keycloak_theme_infra.py -v`
-Expected: 6 passed
+Expected: 7 passed
 
 - [ ] **Step 5: Commit**
 
