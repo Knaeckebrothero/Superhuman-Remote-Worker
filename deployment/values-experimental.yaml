@@ -67,7 +67,7 @@ image:
   agent:
     tag: sha-20c9154
   cockpit:
-    tag: sha-20c9154
+    tag: sha-58322e5
   mcp:
     tag: sha-014fff4
     digest: sha256:e90d9a5630ada3c9a0f7f0b3a422eab085346abe393e653ef6ca69577baefc3c
@@ -85,8 +85,8 @@ provenance:
       sourceRevision: 20c9154681ef35c33d9894757c7627af926c91ec
       releaseVersion: "0.0.0-dev.sha-20c9154681ef35c33d9894757c7627af926c91ec"
     cockpit:
-      sourceRevision: 20c9154681ef35c33d9894757c7627af926c91ec
-      releaseVersion: "0.0.0-dev.sha-20c9154681ef35c33d9894757c7627af926c91ec"
+      sourceRevision: 58322e531e21f18297f1a63776e66a97942a45de
+      releaseVersion: "0.0.0-dev.sha-58322e531e21f18297f1a63776e66a97942a45de"
     mcp:
       sourceRevision: 014fff49dc0b38c9aa6db259ba92c27577200e43
       releaseVersion: "0.0.0-dev.sha-014fff49dc0b38c9aa6db259ba92c27577200e43"
