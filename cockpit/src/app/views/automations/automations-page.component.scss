@@ -1,3 +1,16 @@
+/* The host is a flex item in the shell's .content-area, which clips. Without a
+   definite height here, .automations-page's `height: 100%` has nothing to
+   resolve against, so the page grows to its content and its own `overflow-y`
+   never engages — the create form's Cancel/Create buttons ended up below the
+   viewport with no scrollbar anywhere. min-height:0 is the other half: a flex
+   item's automatic minimum size is its min-content height, which would push the
+   host back past the clip even with height:100% set. */
+:host {
+  display: block;
+  height: 100%;
+  min-height: 0;
+}
+
 .automations-page {
   padding: var(--space-6, 1.5rem);
   height: 100%;
