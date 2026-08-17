@@ -6,7 +6,7 @@ tags:
   - knowledge
   - data-integrity
   - git
-status: done-deployed-live-residue-open
+status: done-deployed-live-verified
 priority: P1
 created: 2026-08-15
 aliases:
@@ -20,9 +20,10 @@ related:
 
 # KB materialization failure can report a ticket as ready or closed
 
-**Status:** DEPLOYED 2026-08-17; FAILURE-TRUTH BOUNDARY LIVE-PASSED. BP-13's recovery
-residue is repaired locally and awaits its bounded main-dev rerun; truthful-write
-blocker/K4 remains closed.
+**Status:** DEPLOYED AND LIVE-VERIFIED 2026-08-17. The original failure-truth boundary
+passed, and BP-13's direct/retry recovery residue subsequently passed its bounded
+main-dev rerun. Truthful-write blocker/K4 remains closed; `auto_pull` stays off for the
+separate umbrella blockers.
 
 ## Problem
 
@@ -126,8 +127,10 @@ tags/readiness to `[]`/NULL. Those live/retry residues are tracked separately in
 [[officer_correctness_live_gate_2026-08-17]] for evidence and cleanup. `auto_pull`
 remained false fleet-wide.
 
-The local BP-13 follow-up now returns typed canonical metadata, rereads complete truth
-when another retry won, rejects incomplete snapshots, makes executor disposition consume
-the same status snapshot, and settles canonical intents after successful direct reindex.
-The direct and sweeper-won paths pass against the real migrated pgvector schema. This is
-not yet a live-pass claim; see [[knowledge_metadata_retry_commits_then_projection_fails]].
+The BP-13 follow-up returns typed canonical metadata, rereads complete truth when another
+retry won, rejects incomplete snapshots, makes executor disposition consume the same
+status snapshot, and settles canonical intents after successful direct reindex. The
+direct and sweeper-won paths pass against the real migrated pgvector schema. The deployed
+main-dev rerun then proved HTTP 200 direct READY, a fail-closed 409, one scoped retry
+commit, an idempotent 200 client retry, exact generation preservation, and complete
+fixture cleanup; see [[knowledge_metadata_retry_commits_then_projection_fails]].

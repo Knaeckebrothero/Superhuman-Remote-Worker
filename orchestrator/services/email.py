@@ -26,6 +26,7 @@ from email.mime.text import MIMEText
 import aiosmtplib
 
 from services.email_layout import Action, escape_text, render_email
+from services.email_markdown import render_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -165,12 +166,11 @@ class EmailService:
     def _build_system_notification_html(
         self, *, to_name: str, body_md: str, cockpit_link: str
     ) -> str:
-        body = escape_text(body_md).replace("\n", "<br>")
         greeting = escape_text(to_name)
         return render_email(
             title="Superhuman Remote Worker",
             body_html=f"<p style='margin:0 0 12px 0;'>Hello {greeting},</p>"
-            f"<p style='margin:0;'>{body}</p>",
+            f"{render_markdown(body_md)}",
             actions=[Action(label="Open Cockpit", url=cockpit_link)],
         )
 
@@ -184,12 +184,11 @@ class EmailService:
         cockpit_link: str,
         reply_to_addr: str | None,
     ) -> str:
-        body = escape_text(message_md).replace("\n", "<br>")
         subtitle = f"Job: {job_description[:80]} • Agent: {config_name} • {phase_str}"
         return render_email(
             title="SRW Agent Message",
             subtitle=subtitle,  # escaped inside render_email
-            body_html=f"<p style='margin:0;'>{body}</p>",
+            body_html=render_markdown(message_md),
             actions=[Action(label="Reply in Cockpit", url=cockpit_link)],
             footer_note="or reply directly to this email" if reply_to_addr else None,
         )
@@ -213,7 +212,7 @@ class EmailService:
             to: Recipient email address
             to_name: Recipient display name
             subject: Subject line (prefixed with [SRW])
-            body_md: Body in markdown (rendered as plain text in HTML)
+            body_md: Body in markdown (rendered to HTML by email_markdown)
             cockpit_path: Optional path appended to COCKPIT_EXTERNAL_URL
                 for the "Open Cockpit" link (e.g. "/automations").
 
@@ -264,7 +263,8 @@ class EmailService:
             to: Recipient email address
             to_name: Recipient display name
             subject: Email subject (will be prefixed with [SRW])
-            message_md: Message body in markdown (rendered as plain text)
+            message_md: Message body in markdown (rendered to HTML by
+                email_markdown; the text/plain leg carries the source as-is)
             job_id: Job UUID for context and deep links
             job_description: Job description for context
             config_name: Agent config name

@@ -12050,12 +12050,43 @@ async def debug_email_preview(name: str) -> str:
     if name == "system":
         return email_service._build_system_notification_html(
             to_name="Ada Lovelace",
-            body_md="Your automation was disabled after 3 consecutive failures.",
+            body_md=(
+                "Your automation **Nightly ledger sync** was disabled after "
+                "3 consecutive failures.\n\n"
+                "The last run failed in `reconcile.py` with:\n\n"
+                "```\nValueError: unbalanced ledger (delta 4.20)\n```\n\n"
+                "Re-enable it from [Automations](https://cockpit.example/automations) "
+                "once the job is fixed."
+            ),
             cockpit_link=link,
         )
     if name == "agent":
+        # The fixture deliberately exercises the markdown subset (headings,
+        # emphasis, code, lists, tables, quotes) — this page is the only place
+        # the rendering is looked at with human eyes before it reaches an inbox.
         return email_service._build_agent_message_html(
-            message_md="Finished the migration.\nTwo files changed.",
+            message_md=(
+                "**Job `5706c684`** (`developer`) has completed and is "
+                "awaiting review.\n\n"
+                "## Summary\n\n"
+                "Migrated the billing schema to the new ledger format. The "
+                "`amount_cents` column is now `NOT NULL`, and every historical "
+                "row was backfilled from `legacy_amount`.\n\n"
+                "> One caveat: 14 rows in 2019 had no legacy value and were "
+                "left at zero.\n\n"
+                "**Deliverables:**\n\n"
+                "- `migrations/app/0163_billing_ledger.sql`\n"
+                "- `orchestrator/services/billing.py`\n"
+                "  - new `LedgerEntry` dataclass\n"
+                "  - `reconcile()` now returns a diff\n\n"
+                "| Check | Result |\n"
+                "| --- | --- |\n"
+                "| `pytest tests/test_billing.py` | 42 passed |\n"
+                "| `ruff check` | clean |\n\n"
+                "Full diff: https://git.example/srw/compare/main...ledger\n\n"
+                "---\n\n"
+                "*Confidence: 92%*"
+            ),
             job_description="Migrate the billing schema to the new ledger format",
             config_name="developer",
             phase_str="phase 2",
@@ -36583,9 +36614,9 @@ async def _dispatch_officer_page(
 
     Appends a deep link to the officer's session so every page carries a way
     back. Deliberately a labeled bare URL, not a markdown ``[label](url)``:
-    the email leg (send_agent_message) HTML-escapes the body instead of
-    rendering markdown, and ntfy/Slack get the raw text — a bare URL is
-    clickable-or-copyable in every leg, brackets-and-parens in none.
+    the email leg renders markdown (services/email_markdown.py, which also
+    auto-links a bare URL) but ntfy/Slack get the raw text — a bare URL is
+    clickable-or-copyable in every leg, brackets-and-parens only in email.
     """
     user_id = thread.get("user_id")
     if not user_id:

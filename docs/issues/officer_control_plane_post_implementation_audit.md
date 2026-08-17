@@ -56,16 +56,16 @@ The result remains mixed, but the authority/atomicity baseline has materially ad
   by the still-open roster, evidence, authorization/liveness-policy, and operational
   residues listed below. BP-06's pre-filter starvation is closed. BP-07 and BP-10 now
   close the provisioning and floor-wake seams on main dev. BP-08's fail-closed write
-  boundary passed live. BP-13's REST retry/projection repair is green locally and awaits
-  its bounded main-dev rerun.
+  boundary and BP-13's repaired direct/retry projection path both passed their deployed
+  main-dev gates.
 
 “Implemented” in the feature docs therefore still does not mean unattended backlog release
 is safe. The earlier tranche was deployed and O6 was released successfully with
 `auto_pull=false`; the later lifecycle/configuration transaction checkpoint was also
 deployed and passed a bounded disposable Officer gate on 2026-08-16. BP-05, BP-06, and
 LF-5 are prior closed/deployed checkpoints. **BP-07/BP-08/BP-10 were deployed on
-2026-08-17; their bounded main-dev gate passed BP-07/BP-10 and failed BP-08 on the new
-BP-13 residue.** Nothing here authorizes `auto_pull=true` or
+2026-08-17; their first bounded main-dev gate passed BP-07/BP-10 and exposed BP-13. The
+deployed BP-13 rerun subsequently passed.** Nothing here authorizes `auto_pull=true` or
 unattended backlog release. The
 umbrella stays open until the remaining P0 live gates in
 [Release order and acceptance](#release-order-and-acceptance) pass.
@@ -101,9 +101,9 @@ recorded in [[officer_correctness_live_gate_2026-08-17]].
 | 13 | P1 | [[officer_card_ignores_viewer_authority_and_i18n]] | OC-10 | Make the management surface truthful for roles and locales. |
 | 14 | P1 | [[deleting_a_job_releases_its_backlog_ticket_claim]] | BP-05 | Persist claim retention independently of job retention. **DONE 2026-08-16 after rolling-upgrade/authority repair; local and not deployed.** |
 | 15 | P1 | [[auto_pull_jobs_are_dispatchable_before_provisioning]] | BP-07 | Add non-dispatchable preflight and honest failure causes. **DEPLOYED; MAIN-DEV LIVE GATE PASSED 2026-08-17.** |
-| 16 | P1 | [[kb_materialization_failure_reports_ready_or_closed]] | BP-08 | Stop authorization/disposition writes from reporting false success. **DEPLOYED; failure boundary passed, recovery residue BP-13 open.** |
+| 16 | P1 | [[kb_materialization_failure_reports_ready_or_closed]] | BP-08 | Stop authorization/disposition writes from reporting false success. **DONE; DEPLOYED MAIN-DEV LIVE GATE PASSED 2026-08-17, INCLUDING BP-13 RECOVERY.** |
 | 17 | P1 | [[backlog_floor_wake_failure_consumes_debounce]] | BP-10 | Debounce durable wake success, not an attempted call. **DEPLOYED; MAIN-DEV LIVE GATE PASSED 2026-08-17.** |
-| 18 | P0 | [[knowledge_metadata_retry_commits_then_projection_fails]] | BP-13 | Repair the canonical-retry timestamp codec and sweeper-won destructive defaults. **IMPLEMENTED LOCALLY; main-dev rerun pending.** |
+| 18 | P0 | [[knowledge_metadata_retry_commits_then_projection_fails]] | BP-13 | Repair the canonical-retry timestamp codec and sweeper-won destructive defaults. **DONE; DEPLOYED MAIN-DEV RERUN PASSED 2026-08-17.** |
 | 19 | P1 | [[officer_roster_patch_cannot_remove_or_drain_a_slot]] | BP-11 | Give the roster whole-map edits and its documented zero drain. |
 | 20 | P1 | [[headless_officer_cannot_read_screenshot_evidence]] | ES-01 | Either deliver bounded image content or make the tester fallback honest. |
 | 21 | P2 | [[unknown_work_category_fails_open_for_parallelism]] | OC-09 | Close the latent fail-open before the helper gains a caller. |
@@ -292,8 +292,8 @@ activated once, and cancelled before dispatch. Cleanup removed all disposable st
 
 ### BP-08 — failed KB materialization is reported as a successful ready/close (**P1 major**)
 
-**Core failure-truth boundary closed and deployed 2026-08-17; BP-13 recovery residue
-open.** Migration 0165's durable materialization ledger
+**Closed, deployed, and live-gated 2026-08-17, including BP-13 recovery.** Migration
+0165's durable materialization ledger
 makes the project knowledge Git repository canonical and pgvector its required
 search/eligibility projection. Every content/metadata mutation and backlog close persists
 intent, then crosses Git, then projection. Missing binding/repository, Git exception,
@@ -307,12 +307,11 @@ Tool/API/SITREP/Cockpit surfaces name canonical, pending-sync, failed, projectio
 retry, and projection outcomes. See [[kb_materialization_failure_reports_ready_or_closed]]
 in `docs/done`.
 
-The main-dev gate proved the failure half: 409 `pending_sync`, unchanged eligibility
-projection, and no reindex resurrection. The due retry then committed Git but the REST
-route passed its ISO `ready_at` string to asyncpg's datetime codec and returned 500. The
-same code audit found an `already-canonical` retry can default missing canonical tags and
-generation to `[]`/NULL. [[knowledge_metadata_retry_commits_then_projection_fails]] owns
-that release blocker.
+The first main-dev gate proved the failure half: 409 `pending_sync`, unchanged eligibility
+projection, and no reindex resurrection, but exposed the BP-13 retry/projection defect.
+The repaired rerun then proved 200 direct READY, fail-closed 409, one retry commit,
+idempotent 200 client projection with exact tags/generation, and complete cleanup.
+[[knowledge_metadata_retry_commits_then_projection_fails]] records that closed residue.
 
 ### BP-09 — “officer-only” readiness is actually persistent-session-only (**P0 security**)
 
@@ -352,29 +351,26 @@ episode, and queue/decommission leaves no live event or episode.
 
 ### BP-13 — canonical metadata retry commits, then REST projection fails (**P0 release**)
 
-**Implemented locally and k3d-gated 2026-08-17; main-dev rerun pending.** The
-deployed materializer parses `ready_at` from the canonical YAML as a string.
-`update_knowledge_note()` passes that value directly to an
-asyncpg `timestamptz` parameter, which rejects it after Git has committed. The route
-returns 500 and records projection failure until reindex plus scheduled settlement.
+**Closed, deployed, and main-dev verified 2026-08-17.** The first deployed materializer
+parsed `ready_at` from canonical YAML as a string and passed it directly to asyncpg's
+`timestamptz` parameter after Git had committed. The repaired boundary instead returns an
+aware `datetime` and rejects incomplete canonical snapshots before projection.
 
 If the scheduled sweep wins before a client retry, the durable intent's
 `already-canonical` result omits exact tags/readiness while the route defaults those values
 to empty/null. That arm can report synced projection while temporarily contradicting Git.
-Real-PostgreSQL codec and sweeper-won retry tests now pass locally. A disposable k3d run
-also crossed the real HTTP/Gitea/app-ledger/pgvector boundary and proved a 200 direct
-READY, fail-closed 409, single retry commit, exact post-sweep client projection, and full
-cleanup. That Tilt image came from the repaired working tree rather than a commit on
-`origin/develop`, so the repeat main-dev gate remains required. See
-[[knowledge_metadata_retry_commits_then_projection_fails]].
+Real-PostgreSQL codec and sweeper-won retry tests pass. Disposable k3d and deployed
+main-dev runs also crossed the real HTTP/Gitea/app-ledger/pgvector boundary and proved a
+200 direct READY, fail-closed 409, single retry commit, exact post-retry client projection,
+and full cleanup. See [[knowledge_metadata_retry_commits_then_projection_fails]].
 
 The local repair now parses canonical readiness into an aware `datetime`, rereads the
 complete current vault note when another retry already canonicalized the intent, and
 rejects incomplete snapshots without touching pgvector. Executor close uses the same
 canonical status snapshot, and successful manual/post-write reindex settles the newest
 canonical intent like the scheduled sweep. Direct and sweeper-won endpoint paths pass
-against the migrated real pgvector schema. The historical deployed failure remains open
-until the bounded BP-08 slice passes on the replacement image.
+against the migrated real pgvector schema. The replacement image's bounded BP-08 slice
+passed on two ready, zero-restart main-dev replicas.
 
 ### BP-11 — roster edits cannot remove one slot or set a zero-count drain (**P1 functional**)
 
@@ -448,9 +444,8 @@ sequence is:
    deployed main-dev gate passed. Claims survive retention, cross-store scans do not
    starve, and strict jobs remain non-dispatchable through mandatory provisioning. OC-08
    and OC-09 remain.
-4. **Truthful content and delivery:** BP-10's deployed main-dev gate passed. BP-08's
-   failure boundary passed; BP-13's successful-retry repair is local/k3d green and awaits
-   its main-dev rerun. OC-05–OC-07 and ES-01 remain; continue to redact before either
+4. **Truthful content and delivery:** BP-10 and BP-08/BP-13 passed their deployed
+   main-dev gates. OC-05–OC-07 and ES-01 remain; continue to redact before either
    audience and preserve the attempted/queued/delivered distinctions.
 5. **Supported operation:** BP-01, BP-11, BP-12, OC-10. Only after the invariants exist
    should the owner-facing enable switch and live card be treated as a release surface.
@@ -492,9 +487,9 @@ Remaining minimum regression/live gates before `auto_pull` leaves its safe defau
   from breaker history; real repository recovery activated once.
 - Attempt charter/`ready`/`parallel-safe` writes as worker, viewer session, editor session,
   owner session, conference, and commissioned officer.
-- Force KB materialization and notification dispatch failures; the notification/outbox/
-  debounce half passed on main dev. KB failure truth passed and BP-13 is repaired locally;
-  rerun its successful-retry half after deployment. UI truth remains to be exercised.
+- ~~Force KB materialization and notification dispatch failures.~~ **Backend paths passed
+  on main dev 2026-08-17:** notification/outbox/debounce and KB failure/retry truth now
+  converge. UI truth remains to be exercised with the owner/viewer card gate below.
 - Consume a real screenshot in a headless officer turn, not only through a Cockpit viewer.
 - Exercise the owner and viewer cards in both locales, including auto-pull enable/disable,
   one-slot removal, zero-count drain, spend ceilings, and a failed write.
@@ -701,5 +696,31 @@ to empty tags/null readiness.
 All disposable project/thread/job/claim/intent/episode/vector rows, managed repositories,
 cloud folder, and identity group were removed. Final counts were zero, the original
 commissioned-post set was unchanged, both serving replicas remained ready with zero
-restarts, and dirty migrations/`auto_pull=true` posts remained zero. The umbrella remains
-open; BP-13 must be repaired and its slice rerun before the later release gates proceed.
+restarts, and dirty migrations/`auto_pull=true` posts remained zero. At that checkpoint
+the umbrella remained open and BP-13 still required repair and a bounded rerun.
+
+### 2026-08-17 deployed BP-13 main-dev rerun
+
+Repair commit `51d822ba` subsequently reached two ready, zero-restart replicas as image
+`sha-51d822b`. A bounded follow-up used one disposable project and two notes across the
+real authenticated HTTP route, managed Gitea vault, app intent ledger, pgvector, and
+asyncpg codec:
+
+```text
+direct READY:                         PASS (HTTP 200)
+canonical/vector typed timestamp:     PASS (exact match)
+scoped forge fault:                   PASS (HTTP 409; no Git/vector drift)
+production retry handler:             PASS (one commit)
+client after retry:                   PASS (HTTP 200; no extra generation/commit)
+intent projection:                    PASS (canonical + synced)
+cleanup / Officer / auto-pull:        PASS
+replicas / migrations:                PASS (2 ready, 0 restarts, 0 dirty)
+```
+
+The fixture's Gitea repository, Keycloak group, Nextcloud folder, project, intent rows,
+and vector rows were removed. The durable-post baseline returned to 56 posts, one
+commissioned, and zero `auto_pull=true`. The periodic fleet-wide sweep was not accelerated;
+the exact retry handler was invoked under a lease scoped only to the disposable intent,
+while scheduled-claim and race behavior remains covered by real PostgreSQL. BP-13 and the
+BP-08 recovery residue are therefore closed. The umbrella remains open only for the
+separately listed supported-control, authority, evidence, and unattended live-fire gates.
