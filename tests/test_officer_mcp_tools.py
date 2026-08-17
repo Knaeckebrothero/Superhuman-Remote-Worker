@@ -115,11 +115,11 @@ async def test_the_note_tool_reports_the_delivery_it_actually_got():
     }
 
     with patch.object(_mcp_server_mod, "_get_client", return_value=client):
-        text = await _mcp_server_mod.send_officer_note(PROJECT_ID, "Cut the theme work.")
+        text = await _mcp_server_mod.send_officer_note(
+            PROJECT_ID, "Cut the theme work."
+        )
 
-    client.send_officer_note.assert_awaited_once_with(
-        PROJECT_ID, "Cut the theme work."
-    )
+    client.send_officer_note.assert_awaited_once_with(PROJECT_ID, "Cut the theme work.")
     assert "queued" in text.lower()
     assert "2026-08-17T09:30" in text
 

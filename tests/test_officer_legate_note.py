@@ -139,7 +139,8 @@ async def test_two_queued_notes_never_coalesce():
     await session_wake.deliver_officer_note(db, _thread(), "second")
 
     keys = {
-        call.kwargs["dedup_key"] for call in db.enqueue_session_wake_event.await_args_list
+        call.kwargs["dedup_key"]
+        for call in db.enqueue_session_wake_event.await_args_list
     }
     assert len(keys) == 2
 
@@ -161,7 +162,9 @@ async def test_a_maintenance_hold_still_lets_the_legate_through():
     db = _db(agent=_agent())
 
     assert (
-        await session_wake.deliver_officer_note(db, _thread(hold=MAINTENANCE_HOLD), NOTE)
+        await session_wake.deliver_officer_note(
+            db, _thread(hold=MAINTENANCE_HOLD), NOTE
+        )
         == "live"
     )
     assert _FakeAsyncClient.posts
@@ -173,7 +176,9 @@ async def test_a_held_officer_with_no_live_pod_is_reported_held_not_queued():
     db = _db(agent=None)
 
     assert (
-        await session_wake.deliver_officer_note(db, _thread(hold=MAINTENANCE_HOLD), NOTE)
+        await session_wake.deliver_officer_note(
+            db, _thread(hold=MAINTENANCE_HOLD), NOTE
+        )
         == "held"
     )
     db.enqueue_session_wake_event.assert_awaited_once()

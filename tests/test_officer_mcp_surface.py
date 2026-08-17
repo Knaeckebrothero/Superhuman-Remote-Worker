@@ -177,15 +177,24 @@ def test_the_post_renders_the_kit_with_its_floor_warning():
                 "model": "gpt-5.6-sol",
             },
             "kit": {
-                "build": {"count": 1, "in_flight": 0, "ready_depth": 0,
-                          "below_floor": True},
+                "build": {
+                    "count": 1,
+                    "in_flight": 0,
+                    "ready_depth": 0,
+                    "below_floor": True,
+                },
                 "test": {"count": 1, "in_flight": 1},
             },
             "next_wake_at": "2026-08-17T09:30:00+00:00",
             "pending_events": 3,
             "pages_today": {"used": 1, "budget": 3},
-            "digest": [{"at": "2026-08-17T05:00:00+00:00", "subject": "theme",
-                        "message": "no deployable UI yet"}],
+            "digest": [
+                {
+                    "at": "2026-08-17T05:00:00+00:00",
+                    "subject": "theme",
+                    "message": "no deployable UI yet",
+                }
+            ],
             "conference": None,
             "backlog": {"auto_pull": False},
         },
