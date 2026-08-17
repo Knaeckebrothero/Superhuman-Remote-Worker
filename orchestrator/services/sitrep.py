@@ -187,7 +187,7 @@ async def build_wake_message(
         lines += jobs_lines
         lines += await _pending_section(db, thread_id, project_id, now)
         lines += await _worker_messages_section(db, project_id, now)
-        lines += await _knowledge_section(vector_db, project_id)
+        lines += await _knowledge_section(db, vector_db, project_id)
         lines += await _capacity_section(
             db, thread, thread_id, vector_db, project_id, now
         )
@@ -506,7 +506,9 @@ async def _worker_messages_section(
     return lines
 
 
-async def _knowledge_section(vector_db: Any, project_id: Optional[str]) -> list[str]:
+async def _knowledge_section(
+    db: Any, vector_db: Any, project_id: Optional[str]
+) -> list[str]:
     """Knowledge-plane availability for the wake (officer_knowledge_plane.md
     §3.1, K1).
 
@@ -520,11 +522,37 @@ async def _knowledge_section(vector_db: Any, project_id: Optional[str]) -> list[
     closed during an outage instead of dispatching from a reconstructed
     queue.
     """
-    if not project_id or vector_db is None:
+    if not project_id:
+        return []
+    lines: list[str] = []
+    try:
+        health = await db.list_knowledge_materialization_health(project_id)
+        unresolved = [
+            row
+            for row in health
+            if row.get("canonical_state") != "canonical"
+            or row.get("projection_state") != "synced"
+        ]
+        if unresolved:
+            counts: dict[str, int] = {}
+            for row in unresolved:
+                state = f"{row.get('canonical_state')}/{row.get('projection_state')}"
+                counts[state] = counts.get(state, 0) + 1
+            summary = ", ".join(f"{count} {state}" for state, count in counts.items())
+            lines.append(
+                "Knowledge sync: "
+                f"{summary}; affected tickets remain ineligible until canonical "
+                "and projection converge."
+            )
+    except Exception:
+        logger.warning("sitrep: knowledge materialization query failed", exc_info=True)
+        lines.append("Knowledge sync: (materialization state unavailable)")
+
+    if vector_db is None:
         # No project (nothing to bind) or a deployment/test process without a
         # vector pool handle — absence of the handle is not evidence of an
         # outage, so stay silent rather than cry wolf on every wake.
-        return []
+        return lines
     try:
 
         async def _probe() -> None:
@@ -537,10 +565,10 @@ async def _knowledge_section(vector_db: Any, project_id: Optional[str]) -> list[
                 )
 
         await asyncio.wait_for(_probe(), timeout=_KNOWLEDGE_PROBE_TIMEOUT_SECONDS)
-        return []
+        return lines
     except Exception:
         logger.warning("sitrep: knowledge availability probe failed", exc_info=True)
-        return [
+        return lines + [
             "Knowledge: project knowledge unavailable — KB reads/writes and "
             "backlog-derived dispatch fail closed. Keep supervising jobs and "
             "page if urgent; do NOT reconstruct the backlog from memory or "
@@ -611,6 +639,47 @@ async def _capacity_section(
             )
         ]
         lines += pool_status_lines(officer_meta, officer_state, now)
+        if project_id:
+            try:
+                preflights = await db.list_officer_job_preflights(
+                    project_id=str(project_id), officer_thread_id=thread_id
+                )
+                if preflights:
+                    states: dict[str, int] = {}
+                    for row in preflights:
+                        state = str(
+                            _as_dict(row.get("context"))
+                            .get("provisioning_preflight", {})
+                            .get("state")
+                            or "unknown"
+                        )
+                        states[state] = states.get(state, 0) + 1
+                    rendered = ", ".join(
+                        f"{count} {state}" for state, count in states.items()
+                    )
+                    lines.append(
+                        "Provisioning: "
+                        f"{rendered}; these jobs hold capacity but are not dispatchable."
+                    )
+            except Exception:
+                logger.warning("sitrep: provisioning state unavailable", exc_info=True)
+                lines.append("Provisioning: (state unavailable)")
+            try:
+                wakes = await db.list_officer_floor_wake_outcomes(str(project_id))
+                if wakes:
+                    latest = wakes[0]
+                    state = latest.get("state") or "unknown"
+                    pool = latest.get("pool") or "unknown"
+                    lines.append(
+                        "Floor wake: "
+                        f"pool {pool} is {state}; attempted="
+                        f"{bool(latest.get('last_attempted_at'))}, queued="
+                        f"{bool(latest.get('last_queued_at'))}, delivered="
+                        f"{bool(latest.get('delivered_at'))}."
+                    )
+            except Exception:
+                logger.warning("sitrep: floor-wake state unavailable", exc_info=True)
+                lines.append("Floor wake: (state unavailable)")
         return lines
     except Exception:
         logger.warning("sitrep: capacity query failed", exc_info=True)

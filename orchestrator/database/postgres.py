@@ -2998,6 +2998,190 @@ class PostgresDB:
                 logger.debug("checkpoint prune skipped for %s: %s", job_id, e)
         return updated
 
+    async def claim_officer_job_preflight(
+        self, job_id: str, *, lease_seconds: int = 300
+    ) -> Optional[Dict[str, Any]]:
+        """Lease one born-paused Officer provisioning attempt."""
+        try:
+            job_uuid = UUID(job_id)
+        except (TypeError, ValueError):
+            return None
+        attempt_token = uuid4()
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                   SET context = jsonb_set(
+                           COALESCE(context, '{}'::jsonb),
+                           '{provisioning_preflight}',
+                           COALESCE(context->'provisioning_preflight', '{}'::jsonb)
+                           || jsonb_build_object(
+                               'state', 'in-progress',
+                               'attempt_token', $2::text,
+                               'attempts', COALESCE(
+                                   (context->'provisioning_preflight'->>'attempts')::int,
+                                   0) + 1,
+                               'last_attempted_at', now()::text,
+                               'lease_expires_at',
+                                   (now() + make_interval(secs => $3::double precision))::text,
+                               'next_retry_at', NULL,
+                               'failure_class', NULL,
+                               'error', NULL),
+                           true),
+                       updated_at = now()
+                 WHERE id = $1
+                   AND status = 'paused'
+                   AND assigned_agent_id IS NULL
+                   AND freeze_data->>'freeze_type' = 'officer_preflight'
+                   AND (
+                       context->'provisioning_preflight'->>'state'
+                           IN ('not-attempted', 'retryable-failed')
+                       OR (
+                           context->'provisioning_preflight'->>'state' = 'in-progress'
+                           AND COALESCE(NULLIF(
+                               context->'provisioning_preflight'->>'lease_expires_at',
+                               ''), 'epoch')::timestamptz <= now()
+                       )
+                   )
+                   AND (
+                       NULLIF(context->'provisioning_preflight'->>'next_retry_at', '')
+                           IS NULL
+                       OR (context->'provisioning_preflight'->>'next_retry_at')
+                           ::timestamptz <= now()
+                   )
+                RETURNING id, status, config_name, config_override, context,
+                          freeze_data, assigned_agent_id, user_id, project_id,
+                          parent_job_id, priority, runner_kind, execution_lane,
+                          branch_name, repo_name, created_at, updated_at,
+                          description
+                """,
+                job_uuid,
+                str(attempt_token),
+                float(lease_seconds),
+            )
+        if row is None:
+            return None
+        result = dict(row)
+        result["preflight_attempt_token"] = str(attempt_token)
+        return result
+
+    async def finish_officer_job_preflight(
+        self,
+        job_id: str,
+        *,
+        attempt_token: str,
+        activated: bool,
+        retryable: bool = True,
+        phase: str | None = None,
+        failure_class: str = "infrastructure",
+        error: str | None = None,
+        retry_after_seconds: int = 60,
+    ) -> bool:
+        """CAS one preflight attempt to activated or a truthful failure."""
+        try:
+            job_uuid = UUID(job_id)
+            token_uuid = UUID(str(attempt_token))
+        except (TypeError, ValueError):
+            return False
+        state = (
+            "activated"
+            if activated
+            else ("retryable-failed" if retryable else "permanent-failed")
+        )
+        next_retry = (
+            "(now() + make_interval(secs => $8::double precision))::text"
+            if (not activated and retryable)
+            else "NULL"
+        )
+        values: list[Any] = [
+            job_uuid,
+            str(token_uuid),
+            bool(activated),
+            state,
+            phase,
+            failure_class,
+            error,
+        ]
+        if not activated and retryable:
+            values.append(float(retry_after_seconds))
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE jobs
+                   SET status = CASE WHEN $3::boolean THEN 'created' ELSE status END,
+                       freeze_data = CASE WHEN $3::boolean THEN NULL ELSE freeze_data END,
+                       error_message = CASE WHEN $3::boolean THEN NULL ELSE $7 END,
+                       context = jsonb_set(
+                           COALESCE(context, '{{}}'::jsonb),
+                           '{{provisioning_preflight}}',
+                           COALESCE(context->'provisioning_preflight', '{{}}'::jsonb)
+                           || jsonb_build_object(
+                               'state', $4::text,
+                               'attempt_token', NULL,
+                               'lease_expires_at', NULL,
+                               'completed_at', CASE WHEN $3::boolean
+                                                   THEN now()::text ELSE NULL END,
+                               'failed_at', CASE WHEN $3::boolean
+                                                THEN NULL ELSE now()::text END,
+                               'next_retry_at', {next_retry},
+                               'phase', $5::text,
+                               'failure_class', CASE WHEN $3::boolean
+                                                    THEN NULL ELSE $6::text END,
+                               'error', CASE WHEN $3::boolean
+                                            THEN NULL ELSE $7::text END),
+                           true),
+                       updated_at = now()
+                 WHERE id = $1
+                   AND status = 'paused'
+                   AND assigned_agent_id IS NULL
+                   AND freeze_data->>'freeze_type' = 'officer_preflight'
+                   AND context->'provisioning_preflight'->>'state' = 'in-progress'
+                   AND context->'provisioning_preflight'->>'attempt_token' = $2::text
+                RETURNING id
+                """,
+                *values,
+            )
+        return row is not None
+
+    async def list_officer_job_preflights(
+        self,
+        *,
+        project_id: str,
+        officer_thread_id: str | None = None,
+        include_activated: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """List server-owned Officer provisioning states for recovery/surfacing."""
+        try:
+            project_uuid = UUID(project_id)
+            thread_uuid = UUID(officer_thread_id) if officer_thread_id else None
+        except (TypeError, ValueError):
+            return []
+        predicates = [
+            "project_id = $1",
+            "context->'provisioning_preflight'->>'required' = 'true'",
+        ]
+        values: list[Any] = [project_uuid]
+        if thread_uuid is not None:
+            values.append(thread_uuid)
+            predicates.append("created_by_thread_id = $2")
+        if not include_activated:
+            predicates.append(
+                "context->'provisioning_preflight'->>'state' <> 'activated'"
+            )
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT id, status, description, project_id, created_by_thread_id,
+                       assigned_agent_id, context, freeze_data, error_message,
+                       created_at, updated_at
+                  FROM jobs
+                 WHERE {" AND ".join(predicates)}
+                 ORDER BY created_at, id
+                """,
+                *values,
+            )
+        return [dict(row) for row in rows]
+
     async def clear_job_failure(
         self,
         job_id: str,
@@ -8453,6 +8637,7 @@ class PostgresDB:
                        -- unknown lanes instead of handing them to legacy pods.
                        AND execution_lane = 'pinned'
                        AND assigned_agent_id IS NULL
+                       AND freeze_data IS NULL
                        {status_guard}
                        {control_guard}
                     RETURNING id
@@ -8756,6 +8941,315 @@ class PostgresDB:
             "undeliverable": counts.get("undeliverable", 0),
         }
 
+    async def begin_knowledge_materialization(
+        self,
+        *,
+        project_id: str,
+        note_id: str,
+        content: str,
+        content_hash: str,
+        job_id: str | None = None,
+        operation: str | None = None,
+        lease_seconds: int = 300,
+    ) -> Dict[str, Any]:
+        """Persist and lease retry intent before the canonical git mutation."""
+        project_uuid = UUID(project_id)
+        job_uuid = UUID(job_id) if job_id else None
+        attempt_token = uuid4()
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    UPDATE knowledge_materialization_intents
+                       SET canonical_state = 'superseded', retry_state = 'none',
+                           attempt_token = NULL, lease_expires_at = NULL,
+                           next_retry_at = NULL, updated_at = now()
+                     WHERE project_id = $1 AND note_id = $2
+                       AND content_hash <> $3
+                       AND canonical_state IN ('pending_sync', 'failed')
+                    """,
+                    project_uuid,
+                    str(note_id),
+                    content_hash,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO knowledge_materialization_intents
+                        (project_id, note_id, content, content_hash, job_id,
+                         canonical_state, projection_state, retry_state,
+                         attempts, attempt_token, lease_expires_at,
+                         last_attempted_at, next_retry_at, operation, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, 'pending_sync', 'pending',
+                            'retryable', 1, $6,
+                            now() + make_interval(secs => $8::double precision),
+                            now(), now(), $7, now())
+                    ON CONFLICT (project_id, note_id, content_hash)
+                        WHERE canonical_state IN ('pending_sync', 'failed')
+                    DO NOTHING
+                    RETURNING *
+                    """,
+                    project_uuid,
+                    str(note_id),
+                    content,
+                    content_hash,
+                    job_uuid,
+                    attempt_token,
+                    operation,
+                    float(lease_seconds),
+                )
+                if row is None:
+                    row = await conn.fetchrow(
+                        """
+                        UPDATE knowledge_materialization_intents
+                           SET content = $3,
+                               job_id = COALESCE($5, job_id),
+                               operation = COALESCE($7, operation),
+                               attempts = attempts + 1,
+                               attempt_token = $6,
+                               lease_expires_at = now() + make_interval(
+                                   secs => $8::double precision),
+                               last_attempted_at = now(),
+                               next_retry_at = now(),
+                               updated_at = now()
+                         WHERE project_id = $1 AND note_id = $2
+                           AND content_hash = $4
+                           AND canonical_state IN ('pending_sync', 'failed')
+                           AND retry_state = 'retryable'
+                           AND COALESCE(next_retry_at, now()) <= now()
+                           AND COALESCE(lease_expires_at, 'epoch') <= now()
+                        RETURNING *
+                        """,
+                        project_uuid,
+                        str(note_id),
+                        content,
+                        content_hash,
+                        job_uuid,
+                        attempt_token,
+                        operation,
+                        float(lease_seconds),
+                    )
+                if row is None:
+                    row = await conn.fetchrow(
+                        """
+                        SELECT * FROM knowledge_materialization_intents
+                         WHERE project_id = $1 AND note_id = $2
+                           AND content_hash = $3
+                        """,
+                        project_uuid,
+                        str(note_id),
+                        content_hash,
+                    )
+        result = dict(row)
+        result["attempt_claimed"] = (
+            result.get("attempt_token") == attempt_token
+            and result.get("canonical_state") != "canonical"
+        )
+        return result
+
+    async def finish_knowledge_materialization(
+        self,
+        intent_id: str,
+        *,
+        canonical: bool,
+        permanent: bool = False,
+        reason: str | None = None,
+        error: str | None = None,
+        repo: str | None = None,
+        branch: str | None = None,
+        path: str | None = None,
+        operation: str | None = None,
+        retry_after_seconds: int = 60,
+        attempt_token: str | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        canonical_state = (
+            "canonical" if canonical else ("failed" if permanent else "pending_sync")
+        )
+        retry_state = (
+            "none" if canonical else ("permanent" if permanent else "retryable")
+        )
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE knowledge_materialization_intents
+                   SET canonical_state = $2,
+                       retry_state = $3,
+                       attempt_token = NULL,
+                       lease_expires_at = NULL,
+                       canonical_at = CASE WHEN $4 THEN COALESCE(canonical_at, now())
+                                           ELSE canonical_at END,
+                       next_retry_at = CASE
+                           WHEN $4 OR $5 THEN NULL
+                           ELSE now() + make_interval(secs => $12::double precision)
+                       END,
+                       last_error_class = CASE WHEN $4 THEN NULL ELSE $6 END,
+                       last_error = CASE WHEN $4 THEN NULL ELSE $7 END,
+                       repo = COALESCE($8, repo),
+                       branch = COALESCE($9, branch),
+                       path = COALESCE($10, path),
+                       operation = COALESCE(operation, $11),
+                       updated_at = now()
+                 WHERE id = $1
+                   AND ($13::uuid IS NULL OR attempt_token = $13::uuid)
+                RETURNING *
+                """,
+                UUID(intent_id),
+                canonical_state,
+                retry_state,
+                bool(canonical),
+                bool(permanent),
+                reason,
+                error or reason,
+                repo,
+                branch,
+                path,
+                operation,
+                float(retry_after_seconds),
+                UUID(attempt_token) if attempt_token else None,
+            )
+        return dict(row) if row else None
+
+    async def finish_knowledge_projection(
+        self,
+        intent_id: str,
+        *,
+        project_id: str | None = None,
+        synced: bool,
+        error: str | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE knowledge_materialization_intents
+                   SET projection_state = CASE WHEN $2 THEN 'synced'
+                                                ELSE 'failed' END,
+                       projected_at = CASE WHEN $2 THEN COALESCE(projected_at, now())
+                                           ELSE projected_at END,
+                       last_error_class = CASE WHEN $2 THEN NULL ELSE 'projection' END,
+                       last_error = CASE WHEN $2 THEN NULL ELSE $3 END,
+                       updated_at = now()
+                 WHERE id = $1 AND canonical_state = 'canonical'
+                   AND ($4::uuid IS NULL OR project_id = $4::uuid)
+                RETURNING *
+                """,
+                UUID(intent_id),
+                bool(synced),
+                error,
+                UUID(project_id) if project_id else None,
+            )
+        return dict(row) if row else None
+
+    async def list_knowledge_materialization_health(
+        self, project_id: str, *, limit: int | None = None
+    ) -> List[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT ON (note_id)
+                       id, project_id, note_id, canonical_state, projection_state,
+                       retry_state, attempts, last_attempted_at, next_retry_at,
+                       last_error_class, last_error, repo, branch, path,
+                       canonical_at, projected_at, created_at, updated_at
+                  FROM knowledge_materialization_intents
+                 WHERE project_id = $1
+                   AND canonical_state <> 'superseded'
+                 ORDER BY note_id, created_at DESC, id DESC
+                """,
+                UUID(project_id),
+            )
+        latest = [dict(row) for row in rows]
+        latest.sort(key=lambda row: row.get("created_at"), reverse=True)
+        if limit is None:
+            return latest
+        return latest[: max(0, int(limit))]
+
+    async def unresolved_knowledge_note_ids(
+        self, project_id: str, note_ids: List[str]
+    ) -> set[str]:
+        if not note_ids:
+            return set()
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH latest AS (
+                    SELECT DISTINCT ON (note_id)
+                           note_id, canonical_state, projection_state
+                      FROM knowledge_materialization_intents
+                     WHERE project_id = $1
+                       AND note_id = ANY($2::text[])
+                       AND canonical_state <> 'superseded'
+                     ORDER BY note_id, created_at DESC, id DESC
+                )
+                SELECT note_id FROM latest
+                 WHERE canonical_state <> 'canonical'
+                    OR projection_state <> 'synced'
+                """,
+                UUID(project_id),
+                [str(note_id) for note_id in note_ids],
+            )
+        return {str(row["note_id"]) for row in rows}
+
+    async def claim_due_knowledge_materializations(
+        self, *, limit: int = 20, lease_seconds: int = 300
+    ) -> List[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH due AS (
+                    SELECT id
+                      FROM knowledge_materialization_intents
+                     WHERE canonical_state = 'pending_sync'
+                       AND retry_state = 'retryable'
+                       AND COALESCE(next_retry_at, now()) <= now()
+                       AND COALESCE(lease_expires_at, 'epoch') <= now()
+                     ORDER BY next_retry_at NULLS FIRST, created_at, id
+                     FOR UPDATE SKIP LOCKED
+                     LIMIT $1
+                )
+                UPDATE knowledge_materialization_intents intent
+                   SET attempts = attempts + 1,
+                       attempt_token = uuid_generate_v4(),
+                       lease_expires_at = now() + make_interval(
+                           secs => $2::double precision),
+                       last_attempted_at = now(),
+                       updated_at = now()
+                  FROM due
+                 WHERE intent.id = due.id
+                RETURNING intent.*
+                """,
+                int(limit),
+                float(lease_seconds),
+            )
+        return [dict(row) for row in rows]
+
+    async def mark_knowledge_projections_synced(self, project_id: str) -> int:
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE knowledge_materialization_intents current
+                   SET projection_state = 'synced',
+                       projected_at = COALESCE(projected_at, now()),
+                       last_error_class = NULL,
+                       last_error = NULL,
+                       updated_at = now()
+                 WHERE project_id = $1
+                   AND canonical_state = 'canonical'
+                   AND projection_state <> 'synced'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM knowledge_materialization_intents newer
+                        WHERE newer.project_id = current.project_id
+                          AND newer.note_id = current.note_id
+                          AND (newer.created_at, newer.id)
+                              > (current.created_at, current.id)
+                          AND newer.canonical_state <> 'superseded'
+                   )
+                """,
+                UUID(project_id),
+            )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError, AttributeError):
+            return 0
+
     # --- Officer wake event outbox (centurion) -------------------------------
     #
     # General wake outbox for officer sessions: events + durable sleep timers
@@ -8862,6 +9356,285 @@ class PostgresDB:
             )
         return row is not None
 
+    async def queue_officer_floor_wake(
+        self,
+        project_id: str,
+        *,
+        expected_thread_id: str,
+        pool: str,
+        payload: Dict[str, Any],
+        policy_debounce_seconds: float,
+        retry_backoff_seconds: float = 60.0,
+        now: datetime | None = None,
+        notifier: Any = None,
+        fault_injector: Any = None,
+    ) -> Dict[str, Any]:
+        """Insert durable floor intent; only that insert starts policy debounce."""
+        project_uuid = UUID(project_id)
+        thread_uuid = UUID(expected_thread_id)
+        attempted_at = now or datetime.now(timezone.utc)
+
+        async def _fault(step: str) -> None:
+            if fault_injector is None:
+                return
+            result = fault_injector(step)
+            if hasattr(result, "__await__"):
+                await result
+
+        def _failure_class(exc: Exception) -> str:
+            detail = str(exc)
+            if detail == "missing-notifier":
+                return "missing_notifier"
+            if detail == "notifier-returned-false":
+                return "notifier_false"
+            if exc.__class__.__name__ == "DurableWakeOutboxError" or detail.startswith(
+                "outbox "
+            ):
+                return "outbox"
+            return "notifier_exception"
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                post = await conn.fetchrow(
+                    "SELECT thread_id FROM project_officers "
+                    "WHERE project_id = $1 FOR UPDATE",
+                    project_uuid,
+                )
+                if post is None or post["thread_id"] != thread_uuid:
+                    return {
+                        "attempted": False,
+                        "queued": False,
+                        "state": "stale_incarnation",
+                    }
+                thread = await conn.fetchrow(
+                    "SELECT id, status, metadata FROM threads WHERE id = $1 FOR UPDATE",
+                    thread_uuid,
+                )
+                if thread is None or thread["status"] == "ended":
+                    return {"attempted": False, "queued": False, "state": "unavailable"}
+                metadata = thread["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                officer_meta = (metadata.get("config_override") or {}).get(
+                    "officer"
+                ) or {}
+                if officer_meta.get("enabled") not in (True, "true", "True", 1):
+                    return {"attempted": False, "queued": False, "state": "unavailable"}
+                if officer_meta.get("hold"):
+                    return {"attempted": False, "queued": False, "state": "held"}
+
+                last_queued = await conn.fetchrow(
+                    """
+                    SELECT id, last_queued_at, delivered_at, state
+                      FROM officer_floor_wake_episodes
+                     WHERE project_id = $1
+                       AND officer_incarnation = $2
+                       AND pool = $3
+                       AND last_queued_at IS NOT NULL
+                     ORDER BY last_queued_at DESC, created_at DESC
+                     LIMIT 1
+                    """,
+                    project_uuid,
+                    thread_uuid,
+                    str(pool),
+                )
+                if last_queued is not None and last_queued["last_queued_at"] > (
+                    attempted_at - timedelta(seconds=float(policy_debounce_seconds))
+                ):
+                    return {
+                        "attempted": False,
+                        "queued": False,
+                        "state": "policy_debounce",
+                        "last_queued_at": last_queued["last_queued_at"],
+                        "delivered_at": last_queued["delivered_at"],
+                    }
+
+                episode = await conn.fetchrow(
+                    """
+                    SELECT * FROM officer_floor_wake_episodes
+                     WHERE project_id = $1
+                       AND officer_incarnation = $2
+                       AND pool = $3
+                       AND resolved_at IS NULL
+                     FOR UPDATE
+                    """,
+                    project_uuid,
+                    thread_uuid,
+                    str(pool),
+                )
+                if episode is not None and episode["next_retry_at"] is not None:
+                    if episode["next_retry_at"] > attempted_at:
+                        return {
+                            "attempted": False,
+                            "queued": False,
+                            "state": "retry_backoff",
+                            "next_retry_at": episode["next_retry_at"],
+                        }
+                if episode is None:
+                    episode_id = uuid4()
+                    dedup_key = (
+                        f"floor:{project_uuid}:{thread_uuid}:{pool}:{episode_id}"
+                    )
+                    episode = await conn.fetchrow(
+                        """
+                        INSERT INTO officer_floor_wake_episodes
+                            (id, project_id, officer_incarnation, pool, dedup_key)
+                        VALUES ($1, $2, $3, $4, $5)
+                        RETURNING *
+                        """,
+                        episode_id,
+                        project_uuid,
+                        thread_uuid,
+                        str(pool),
+                        dedup_key,
+                    )
+                episode_id = episode["id"]
+                dedup_key = str(episode["dedup_key"])
+                await conn.execute(
+                    """
+                    UPDATE officer_floor_wake_episodes
+                       SET attempt_count = attempt_count + 1,
+                           last_attempted_at = $2,
+                           failure_class = NULL,
+                           last_error = NULL,
+                           updated_at = now()
+                     WHERE id = $1
+                    """,
+                    episode_id,
+                    attempted_at,
+                )
+                await _fault("attempt_recorded")
+
+                try:
+                    async with conn.transaction():
+                        await _fault("before_outbox_insert")
+                        if notifier is None:
+                            raise RuntimeError("missing-notifier")
+                        notified = await notifier(
+                            self,
+                            str(project_uuid),
+                            source="backlog_floor_breach",
+                            dedup_key=dedup_key,
+                            payload=payload,
+                            _conn=conn,
+                            _thread_id=str(thread_uuid),
+                        )
+                        if not notified:
+                            raise RuntimeError("notifier-returned-false")
+                        event = await conn.fetchrow(
+                            """
+                            SELECT id FROM session_wake_events
+                             WHERE thread_id = $1
+                               AND source = 'backlog_floor_breach'
+                               AND dedup_key = $2
+                               AND state = 'pending'
+                             ORDER BY id DESC LIMIT 1
+                            """,
+                            thread_uuid,
+                            dedup_key,
+                        )
+                        if event is None:
+                            raise RuntimeError("outbox insert returned no durable row")
+                        await _fault("after_outbox_insert")
+                except Exception as exc:
+                    await conn.execute(
+                        """
+                        UPDATE officer_floor_wake_episodes
+                           SET state = 'retryable',
+                               failure_class = $5,
+                               last_error = $2,
+                               next_retry_at = $3::timestamptz + make_interval(
+                                   secs => $4::double precision),
+                               updated_at = now()
+                         WHERE id = $1
+                        """,
+                        episode_id,
+                        str(exc)[:1000],
+                        attempted_at,
+                        float(retry_backoff_seconds),
+                        _failure_class(exc),
+                    )
+                    return {
+                        "attempted": True,
+                        "queued": False,
+                        "state": "retryable",
+                        "error": str(exc)[:1000],
+                        "failure_class": _failure_class(exc),
+                        "next_retry_at": attempted_at
+                        + timedelta(seconds=float(retry_backoff_seconds)),
+                    }
+
+                await conn.execute(
+                    """
+                    UPDATE officer_floor_wake_episodes
+                       SET wake_event_id = $2,
+                           state = 'queued',
+                           last_queued_at = $3,
+                           next_retry_at = NULL,
+                           resolved_at = $3,
+                           updated_at = now()
+                     WHERE id = $1
+                    """,
+                    episode_id,
+                    int(event["id"]),
+                    attempted_at,
+                )
+                return {
+                    "attempted": True,
+                    "queued": True,
+                    "state": "queued",
+                    "episode_id": str(episode_id),
+                    "wake_event_id": int(event["id"]),
+                    "last_queued_at": attempted_at,
+                }
+
+    async def resolve_officer_floor_wake_retry(
+        self, project_id: str, *, expected_thread_id: str, pool: str
+    ) -> bool:
+        """Stop retrying a failed wake when its floor episode recovered."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE officer_floor_wake_episodes
+                   SET state = 'superseded', resolved_at = now(),
+                       next_retry_at = NULL, updated_at = now()
+                 WHERE project_id = $1
+                   AND officer_incarnation = $2
+                   AND pool = $3
+                   AND resolved_at IS NULL
+                   AND state = 'retryable'
+                """,
+                UUID(project_id),
+                UUID(expected_thread_id),
+                str(pool),
+            )
+        return result == "UPDATE 1"
+
+    async def list_officer_floor_wake_outcomes(
+        self, project_id: str, *, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, project_id, officer_incarnation, pool, state,
+                       attempt_count, last_attempted_at, last_queued_at,
+                       delivered_at, failure_class, last_error, next_retry_at,
+                       resolved_at, created_at, updated_at
+                  FROM officer_floor_wake_episodes
+                 WHERE project_id = $1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT $2
+                """,
+                UUID(project_id),
+                int(limit),
+            )
+        return [dict(row) for row in rows]
+
     async def claim_pending_session_wake_events(
         self,
         *,
@@ -8939,15 +9712,34 @@ class PostgresDB:
         if not event_ids:
             return
         async with self.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE session_wake_events
-                   SET state = 'sent', sent_at = NOW(), claimed_at = NULL
-                 WHERE id = ANY($1::bigint[])
-                   AND state = 'sending'
-                """,
-                event_ids,
-            )
+            async with conn.transaction():
+                delivered = await conn.fetch(
+                    """
+                    UPDATE session_wake_events
+                       SET state = 'sent', sent_at = NOW(), claimed_at = NULL
+                     WHERE id = ANY($1::bigint[])
+                       AND state = 'sending'
+                    RETURNING id, sent_at
+                    """,
+                    event_ids,
+                )
+                if delivered:
+                    await conn.execute(
+                        """
+                        UPDATE officer_floor_wake_episodes episode
+                           SET state = 'delivered',
+                               delivered_at = delivered.sent_at,
+                               failure_class = NULL,
+                               last_error = NULL,
+                               next_retry_at = NULL,
+                               updated_at = now()
+                          FROM unnest($1::bigint[], $2::timestamptz[])
+                               AS delivered(id, sent_at)
+                         WHERE episode.wake_event_id = delivered.id
+                        """,
+                        [int(row["id"]) for row in delivered],
+                        [row["sent_at"] for row in delivered],
+                    )
 
     async def release_session_wake_events(
         self, event_ids: List[int], *, max_attempts: int = 8
@@ -8956,18 +9748,38 @@ class PostgresDB:
         if not event_ids:
             return
         async with self.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE session_wake_events
-                   SET state = CASE WHEN attempts >= $2 THEN 'dead'
-                                    ELSE 'pending' END,
-                       claimed_at = NULL
-                 WHERE id = ANY($1::bigint[])
-                   AND state = 'sending'
-                """,
-                event_ids,
-                max_attempts,
-            )
+            async with conn.transaction():
+                released = await conn.fetch(
+                    """
+                    UPDATE session_wake_events
+                       SET state = CASE WHEN attempts >= $2 THEN 'dead'
+                                        ELSE 'pending' END,
+                           claimed_at = NULL
+                     WHERE id = ANY($1::bigint[])
+                       AND state = 'sending'
+                    RETURNING id, state
+                    """,
+                    event_ids,
+                    max_attempts,
+                )
+                for row in released:
+                    dead = str(row["state"]) == "dead"
+                    await conn.execute(
+                        """
+                        UPDATE officer_floor_wake_episodes
+                           SET state = CASE WHEN $2 THEN 'permanent_failed'
+                                            ELSE state END,
+                               failure_class = 'delivery',
+                               last_error = CASE WHEN $2
+                                   THEN 'wake delivery retry budget exhausted'
+                                   ELSE 'wake delivery failed; outbox retry pending' END,
+                               next_retry_at = NULL,
+                               updated_at = now()
+                         WHERE wake_event_id = $1
+                        """,
+                        int(row["id"]),
+                        dead,
+                    )
 
     async def defer_session_wake_events(
         self, event_ids: List[int], *, fire_at: datetime
@@ -10761,6 +11573,20 @@ class PostgresDB:
                 await _fault("wake_entries_folded")
                 if wake_rows:
                     await conn.execute(
+                        """
+                        UPDATE officer_floor_wake_episodes
+                           SET state = 'superseded',
+                               failure_class = 'officer_decommissioned',
+                               last_error = 'durable wake retired with Officer incarnation',
+                               next_retry_at = NULL,
+                               resolved_at = COALESCE(resolved_at, now()),
+                               updated_at = now()
+                         WHERE wake_event_id = ANY($1::bigint[])
+                           AND delivered_at IS NULL
+                        """,
+                        [int(row["id"]) for row in wake_rows],
+                    )
+                    await conn.execute(
                         "DELETE FROM session_wake_events WHERE id = ANY($1::bigint[])",
                         [int(row["id"]) for row in wake_rows],
                     )
@@ -11350,6 +12176,13 @@ class PostgresDB:
                        AND claim.officer_slot = $2
                        AND COALESCE(live.status, claim.job_status_at_delete)
                            IN ('completed', 'failed', 'cancelled')
+                       AND NOT (
+                           COALESCE(
+                               live.context->'provisioning_preflight'
+                                   ->>'failure_class',
+                               ''
+                           ) = 'infrastructure'
+                       )
                 ), latest_per_ticket AS (
                     SELECT DISTINCT ON (ticket_note_id) *
                       FROM terminal

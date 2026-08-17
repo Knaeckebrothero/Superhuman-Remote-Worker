@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services.job_provisioning import provision_job_repo
+from services.job_provisioning import JobProvisioningError, provision_job_repo
 
 
 class _AsyncCtx:
@@ -263,6 +263,42 @@ class TestProvisionJobRepo:
         )
         assert row["repo_name"] == "job-deadbeef"
         assert row["branch_name"] == "subjob/abcdef12/critic"
+
+    @pytest.mark.asyncio
+    async def test_strict_subjob_branch_failure_is_repository_preflight_failure(
+        self, patched_seed
+    ) -> None:
+        g = _make_gitea()
+        g.create_branch.return_value = False
+        parent = {
+            "id": uuid.uuid4(),
+            "repo_name": "job-deadbeef",
+            "branch_name": "main",
+            "context": {"git_remote_url": "http://x/job-deadbeef.git"},
+            "parent_job_id": None,
+            "project_id": None,
+        }
+        db = _make_db(parent=parent)
+        row = {
+            "id": uuid.uuid4(),
+            "parent_job_id": uuid.uuid4(),
+            "project_id": None,
+            "user_id": None,
+            "config_name": "critic",
+        }
+
+        with pytest.raises(JobProvisioningError) as exc:
+            await provision_job_repo(
+                job_row=row,
+                gitea_client=g,
+                postgres_db=db,
+                main_cloud_router=MagicMock(),
+                require_repository=True,
+            )
+
+        assert exc.value.phase == "repository"
+        assert exc.value.failure_class == "infrastructure"
+        assert "repo_name" not in row
         assert isinstance(db.get_job.await_args.args[0], str)
 
     @pytest.mark.asyncio

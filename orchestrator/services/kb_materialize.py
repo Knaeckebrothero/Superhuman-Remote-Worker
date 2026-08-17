@@ -14,21 +14,28 @@ Nothing downstream changes. Files stay canonical, the reindexer still ingests
 keep their ``path IS NOT NULL`` gate. Only the *writer* moved, from the agent's
 workspace checkout to a commit the orchestrator makes.
 
-By contract this **never raises for an expected condition**: the caller (the
-agent's ``kb_write``, via the orchestrator endpoint) must be able to
-log-and-continue exactly as the old non-fatal file write did. Every outcome —
-including "there is no repo" and "Gitea refused" — comes back as a status dict.
+By contract this **never raises for an expected condition**. Every outcome —
+including "there is no repo" and "Gitea refused" — comes back as a status dict,
+but mutation callers must fail closed unless that result proves the desired
+bytes crossed the canonical repository boundary. The durable intent ledger
+keeps a failed write visible and retryable instead of allowing an index-only
+success.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
+import yaml
+
 from services.kb_forge import kb_client_for_repo
+from src.tools.knowledge.gardener import parse_note_md
 
 # The vault prefix and the repo resolution are both owned by the reindexer:
 # the writer and the sweep MUST agree on repo and path or they silently
@@ -149,7 +156,7 @@ async def _path_exists(
     return False, None
 
 
-async def materialize_knowledge_note(
+async def _materialize_knowledge_note_once(
     *,
     postgres_db: Any,
     gitea_client: Any,
@@ -157,6 +164,8 @@ async def materialize_knowledge_note(
     slug: str,
     content: str,
     job_id: Optional[str] = None,
+    resolved_repo: Any = None,
+    repo_client: Any = None,
 ) -> dict[str, Any]:
     """Commit one rendered note to ``knowledge/<slug>.md`` in the project's KB repo.
 
@@ -185,10 +194,10 @@ async def materialize_knowledge_note(
           ``invalid-slug``, ``empty-content``, ``resolve-error``,
           ``commit-refused``, ``commit-error``.
 
-        Never raises. A ``failed`` result is the caller's cue to log and carry
-        on: the ``knowledge_index`` row is already written, and rewriting the
-        note re-attempts materialisation (§10 — the reindexer is idempotent,
-        so recovery is a rewrite, not repair tooling).
+        Never raises. A ``failed`` result means canonical durability was not
+        established; callers must not mutate the searchable projection or
+        report READY/updated/closed. The enclosing durable intent supplies the
+        retry path.
     """
     bad_slug = slug_error(slug)
     if bad_slug:
@@ -206,16 +215,18 @@ async def materialize_knowledge_note(
         )
         return _result(_STATUS_FAILED, reason="empty-content", path=path)
 
-    try:
-        resolved = await resolve_kb_repo(postgres_db, project_id)
-    except Exception as e:  # noqa: BLE001 — resolution is not the caller's problem
-        logger.error(
-            "kb-materialize: KB repo resolution failed for project %s: %r",
-            project_id,
-            e,
-            exc_info=True,
-        )
-        return _result(_STATUS_FAILED, reason="resolve-error", path=path)
+    resolved = resolved_repo
+    if resolved is None:
+        try:
+            resolved = await resolve_kb_repo(postgres_db, project_id)
+        except Exception as e:  # noqa: BLE001 — resolution is not the caller's problem
+            logger.error(
+                "kb-materialize: KB repo resolution failed for project %s: %r",
+                project_id,
+                e,
+                exc_info=True,
+            )
+            return _result(_STATUS_FAILED, reason="resolve-error", path=path)
 
     if not resolved:
         # No jobs repo and no knowledge repo — a repo-less project. The old
@@ -231,22 +242,23 @@ async def materialize_knowledge_note(
     branch = branch or "main"
     body = str(content).encode("utf-8")
 
-    try:
-        repo_client = await kb_client_for_repo(postgres_db, gitea_client, resolved)
-    except Exception:  # noqa: BLE001 — credential/config failures stay non-fatal
-        logger.error(
-            "kb-materialize: no usable %s client for project %s",
-            resolved.forge,
-            project_id,
-            exc_info=True,
-        )
-        return _result(
-            _STATUS_FAILED,
-            reason="client-error",
-            repo=repo_name,
-            branch=branch,
-            path=path,
-        )
+    if repo_client is None:
+        try:
+            repo_client = await kb_client_for_repo(postgres_db, gitea_client, resolved)
+        except Exception:  # noqa: BLE001 — credential/config failures stay non-fatal
+            logger.error(
+                "kb-materialize: no usable %s client for project %s",
+                resolved.forge,
+                project_id,
+                exc_info=True,
+            )
+            return _result(
+                _STATUS_FAILED,
+                reason="client-error",
+                repo=repo_name,
+                branch=branch,
+                path=path,
+            )
 
     exists, blob_sha = await _path_exists(repo_client, repo_name, branch, path)
     if exists and blob_sha and blob_sha == _git_blob_sha(body):
@@ -344,4 +356,440 @@ async def materialize_knowledge_note(
         branch=branch,
         path=path,
         operation=operation,
+    )
+
+
+async def _finish_attempt(
+    *,
+    postgres_db: Any,
+    intent: dict[str, Any],
+    outcome: dict[str, Any],
+    permanent: bool,
+) -> dict[str, Any]:
+    canonical = outcome.get("status") == _STATUS_COMMITTED or (
+        outcome.get("status") == _STATUS_SKIPPED
+        and outcome.get("reason") == "unchanged"
+    )
+    intent_id = str(intent["id"])
+    token = intent.get("attempt_token")
+    try:
+        recorded = await postgres_db.finish_knowledge_materialization(
+            intent_id,
+            canonical=canonical,
+            permanent=permanent,
+            reason=str(outcome.get("reason") or "") or None,
+            error=str(outcome.get("reason") or "") or None,
+            repo=outcome.get("repo"),
+            branch=outcome.get("branch"),
+            path=outcome.get("path"),
+            operation=outcome.get("operation"),
+            attempt_token=str(token) if token else None,
+        )
+    except Exception as exc:
+        logger.error(
+            "kb-materialize: result ledger update failed for intent %s: %r",
+            intent_id,
+            exc,
+            exc_info=True,
+        )
+        return {
+            **outcome,
+            "status": _STATUS_FAILED,
+            "reason": "intent-result-store-error",
+            "intent_id": intent_id,
+            "canonical_state": "pending_sync",
+            "projection_state": "projection_only",
+            "retry_state": "retryable",
+        }
+    if recorded is None:
+        return {
+            **outcome,
+            "status": _STATUS_FAILED,
+            "reason": "intent-lease-lost",
+            "intent_id": intent_id,
+            "canonical_state": "pending_sync",
+            "projection_state": "pending",
+            "retry_state": "retryable",
+        }
+    return {
+        **outcome,
+        "intent_id": intent_id,
+        "canonical_state": recorded.get("canonical_state")
+        or ("canonical" if canonical else "pending_sync"),
+        "projection_state": recorded.get("projection_state") or "pending",
+        "retry_state": recorded.get("retry_state")
+        or ("none" if canonical else "retryable"),
+    }
+
+
+async def _attempt_content_intent(
+    *,
+    postgres_db: Any,
+    gitea_client: Any,
+    intent: dict[str, Any],
+    project_id: str,
+    slug: str,
+    content: str,
+    job_id: Optional[str],
+) -> dict[str, Any]:
+    permanent_reason: str | None = None
+    if slug_error(slug):
+        permanent_reason = "invalid-slug"
+    elif not content.strip():
+        permanent_reason = "empty-content"
+    else:
+        try:
+            frontmatter, _ = parse_note_md(content)
+            if frontmatter is None:
+                permanent_reason = "malformed-frontmatter"
+            elif str(frontmatter.get("id") or "") != str(slug).strip():
+                permanent_reason = "frontmatter-id-mismatch"
+        except ValueError:
+            permanent_reason = "malformed-frontmatter"
+
+    if permanent_reason is not None:
+        outcome = _result(_STATUS_FAILED, reason=permanent_reason)
+    else:
+        try:
+            outcome = await _materialize_knowledge_note_once(
+                postgres_db=postgres_db,
+                gitea_client=gitea_client,
+                project_id=project_id,
+                slug=slug,
+                content=content,
+                job_id=job_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "kb-materialize: unexpected materializer exception for %s/%s: %r",
+                project_id,
+                slug,
+                exc,
+                exc_info=True,
+            )
+            outcome = _result(_STATUS_FAILED, reason="materializer-exception")
+    permanent = permanent_reason is not None or outcome.get("reason") in {
+        "invalid-slug",
+        "empty-content",
+    }
+    return await _finish_attempt(
+        postgres_db=postgres_db,
+        intent=intent,
+        outcome=outcome,
+        permanent=permanent,
+    )
+
+
+async def materialize_knowledge_note(
+    *,
+    postgres_db: Any,
+    gitea_client: Any,
+    project_id: str,
+    slug: str,
+    content: str,
+    job_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Persist intent, cross canonical git, and return both truth legs."""
+    content_text = str(content or "")
+    content_hash = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
+    try:
+        intent = await postgres_db.begin_knowledge_materialization(
+            project_id=project_id,
+            note_id=str(slug),
+            content=content_text,
+            content_hash=content_hash,
+            job_id=job_id,
+        )
+    except Exception as exc:
+        logger.error(
+            "kb-materialize: could not persist retry intent for %s/%s: %r",
+            project_id,
+            slug,
+            exc,
+            exc_info=True,
+        )
+        return {
+            **_result(_STATUS_FAILED, reason="intent-store-error"),
+            "canonical_state": "failed",
+            "projection_state": "projection_only",
+            "retry_state": "retryable",
+        }
+    intent_id = str(intent["id"])
+    if str(intent.get("canonical_state")) == "canonical":
+        return {
+            **_result(
+                _STATUS_SKIPPED,
+                reason="already-canonical",
+                repo=intent.get("repo"),
+                branch=intent.get("branch"),
+                path=intent.get("path"),
+                operation=intent.get("operation"),
+            ),
+            "intent_id": intent_id,
+            "canonical_state": "canonical",
+            "projection_state": intent.get("projection_state") or "pending",
+            "retry_state": "none",
+        }
+    if not intent.get("attempt_claimed"):
+        return {
+            **_result(_STATUS_SKIPPED, reason="attempt-in-progress"),
+            "intent_id": intent_id,
+            "canonical_state": intent.get("canonical_state") or "pending_sync",
+            "projection_state": intent.get("projection_state") or "pending",
+            "retry_state": intent.get("retry_state") or "retryable",
+        }
+    return await _attempt_content_intent(
+        postgres_db=postgres_db,
+        gitea_client=gitea_client,
+        intent=intent,
+        project_id=project_id,
+        slug=slug,
+        content=content_text,
+        job_id=job_id,
+    )
+
+
+def metadata_mutation_content(
+    *,
+    status: str | None = None,
+    add_tags: list[str] | None = None,
+    remove_tags: list[str] | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "status": status,
+            "add_tags": [str(tag) for tag in (add_tags or [])],
+            "remove_tags": [str(tag) for tag in (remove_tags or [])],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+async def _attempt_metadata_intent(
+    *,
+    postgres_db: Any,
+    gitea_client: Any,
+    intent: dict[str, Any],
+    project_id: str,
+    slug: str,
+    mutation: dict[str, Any],
+) -> dict[str, Any]:
+    status = mutation.get("status")
+    add_tags = mutation.get("add_tags") or []
+    remove_tags = mutation.get("remove_tags") or []
+    permanent = False
+    rendered: str | None = None
+    try:
+        resolved = await resolve_kb_repo(postgres_db, project_id)
+        if resolved is None:
+            outcome = _result(_STATUS_FAILED, reason="no-repo")
+        else:
+            repo_client = await kb_client_for_repo(postgres_db, gitea_client, resolved)
+            from .project_backlog import (
+                _ALREADY_SET,
+                _NOT_REWRITABLE,
+                _read_note_file,
+                _rewrite_status,
+            )
+
+            current, _ = await _read_note_file(
+                repo_client, resolved, note_repo_path(slug)
+            )
+            if current is None:
+                outcome = _result(_STATUS_FAILED, reason="canonical-file-missing")
+                permanent = True
+            else:
+                frontmatter, body = parse_note_md(current)
+                if frontmatter is None or str(frontmatter.get("id") or "") != slug:
+                    outcome = _result(_STATUS_FAILED, reason="malformed-frontmatter")
+                    permanent = True
+                else:
+                    if status is not None and not add_tags and not remove_tags:
+                        rendered, rewrite = _rewrite_status(current, str(status))
+                        if rewrite == _NOT_REWRITABLE:
+                            outcome = _result(
+                                _STATUS_FAILED, reason="malformed-frontmatter"
+                            )
+                            permanent = True
+                            rendered = current
+                        elif rewrite == _ALREADY_SET:
+                            outcome = _result(
+                                _STATUS_SKIPPED,
+                                reason="unchanged",
+                                repo=resolved.repo,
+                                branch=resolved.branch,
+                                path=note_repo_path(slug),
+                                operation="metadata-update",
+                            )
+                            rendered = current
+                        else:
+                            outcome = {}
+                    else:
+                        desired = dict(frontmatter)
+                        if status is not None:
+                            desired["status"] = status
+                        tags = [str(tag) for tag in (desired.get("tags") or [])]
+                        remove = {str(tag).strip().lower() for tag in remove_tags}
+                        tags = [
+                            tag for tag in tags if tag.strip().lower() not in remove
+                        ]
+                        existing = {tag.strip().lower() for tag in tags}
+                        for tag in add_tags:
+                            normalized = str(tag).strip().lower()
+                            if normalized and normalized not in existing:
+                                tags.append(normalized)
+                                existing.add(normalized)
+                        desired["tags"] = tags
+                        prior_tags = {
+                            str(tag).strip().lower()
+                            for tag in (frontmatter.get("tags") or [])
+                        }
+                        if "ready" in existing and "ready" not in prior_tags:
+                            desired["ready_at"] = datetime.now(timezone.utc).isoformat()
+                        elif "ready" not in existing:
+                            desired.pop("ready_at", None)
+                        rendered = (
+                            "---\n"
+                            + yaml.safe_dump(
+                                desired, sort_keys=False, allow_unicode=True
+                            ).rstrip()
+                            + "\n---\n"
+                            + body
+                        )
+                        outcome = {}
+                    if not outcome:
+                        outcome = await _materialize_knowledge_note_once(
+                            postgres_db=postgres_db,
+                            gitea_client=gitea_client,
+                            project_id=project_id,
+                            slug=slug,
+                            content=rendered,
+                            resolved_repo=resolved,
+                            repo_client=repo_client,
+                        )
+    except ValueError:
+        outcome = _result(_STATUS_FAILED, reason="malformed-frontmatter")
+        permanent = True
+    except Exception as exc:
+        logger.error(
+            "kb-materialize: canonical metadata mutation failed for %s/%s: %r",
+            project_id,
+            slug,
+            exc,
+            exc_info=True,
+        )
+        outcome = _result(_STATUS_FAILED, reason="canonical-read-error")
+    if rendered and (
+        outcome.get("status") == _STATUS_COMMITTED
+        or (
+            outcome.get("status") == _STATUS_SKIPPED
+            and outcome.get("reason") == "unchanged"
+        )
+    ):
+        try:
+            canonical_frontmatter, _ = parse_note_md(rendered)
+        except ValueError:
+            canonical_frontmatter = None
+        if canonical_frontmatter is not None:
+            outcome["canonical_status"] = canonical_frontmatter.get("status")
+            outcome["canonical_tags"] = [
+                str(tag) for tag in (canonical_frontmatter.get("tags") or [])
+            ]
+            outcome["canonical_ready_at"] = canonical_frontmatter.get("ready_at")
+    return await _finish_attempt(
+        postgres_db=postgres_db,
+        intent=intent,
+        outcome=outcome,
+        permanent=permanent,
+    )
+
+
+async def materialize_knowledge_metadata_update(
+    *,
+    postgres_db: Any,
+    gitea_client: Any,
+    project_id: str,
+    slug: str,
+    status: str | None = None,
+    add_tags: list[str] | None = None,
+    remove_tags: list[str] | None = None,
+) -> dict[str, Any]:
+    payload = metadata_mutation_content(
+        status=status, add_tags=add_tags, remove_tags=remove_tags
+    )
+    content_hash = "metadata:" + hashlib.sha256(payload.encode()).hexdigest()
+    try:
+        intent = await postgres_db.begin_knowledge_materialization(
+            project_id=project_id,
+            note_id=slug,
+            content=payload,
+            content_hash=content_hash,
+            operation="metadata-update",
+        )
+    except Exception as exc:
+        logger.error(
+            "kb-materialize: metadata retry intent failed for %s/%s: %r",
+            project_id,
+            slug,
+            exc,
+            exc_info=True,
+        )
+        return {
+            **_result(_STATUS_FAILED, reason="intent-store-error"),
+            "canonical_state": "failed",
+            "projection_state": "projection_only",
+            "retry_state": "retryable",
+        }
+    if str(intent.get("canonical_state")) == "canonical":
+        return {
+            **_result(_STATUS_SKIPPED, reason="already-canonical"),
+            "intent_id": str(intent["id"]),
+            "canonical_state": "canonical",
+            "projection_state": intent.get("projection_state") or "pending",
+            "retry_state": "none",
+        }
+    if not intent.get("attempt_claimed"):
+        return {
+            **_result(_STATUS_SKIPPED, reason="attempt-in-progress"),
+            "intent_id": str(intent["id"]),
+            "canonical_state": intent.get("canonical_state") or "pending_sync",
+            "projection_state": intent.get("projection_state") or "pending",
+            "retry_state": intent.get("retry_state") or "retryable",
+        }
+    return await _attempt_metadata_intent(
+        postgres_db=postgres_db,
+        gitea_client=gitea_client,
+        intent=intent,
+        project_id=project_id,
+        slug=slug,
+        mutation=json.loads(payload),
+    )
+
+
+async def retry_knowledge_materialization_intent(
+    *, postgres_db: Any, gitea_client: Any, intent: dict[str, Any]
+) -> dict[str, Any]:
+    operation = str(intent.get("operation") or "")
+    if operation == "metadata-update":
+        try:
+            mutation = json.loads(str(intent.get("content") or "{}"))
+        except (TypeError, ValueError):
+            mutation = {}
+        return await _attempt_metadata_intent(
+            postgres_db=postgres_db,
+            gitea_client=gitea_client,
+            intent=intent,
+            project_id=str(intent["project_id"]),
+            slug=str(intent["note_id"]),
+            mutation=mutation,
+        )
+    return await _attempt_content_intent(
+        postgres_db=postgres_db,
+        gitea_client=gitea_client,
+        intent=intent,
+        project_id=str(intent["project_id"]),
+        slug=str(intent["note_id"]),
+        content=str(intent["content"]),
+        job_id=str(intent["job_id"]) if intent.get("job_id") else None,
     )

@@ -6952,6 +6952,7 @@ _SERVER_OWNED_OFFICER_CONTEXT_KEYS = {
     "claim_source",
     "officer_thread_id",
     "officer_incarnation",
+    "provisioning_preflight",
 }
 _PUBLIC_JOB_CONFIG_RESERVED_KEYS = {
     "lifecycle_marker",
@@ -10142,6 +10143,13 @@ class KnowledgeMaterializeRequest(BaseModel):
     )
 
 
+class KnowledgeProjectionRequest(BaseModel):
+    """Internal report of the projection leg of a canonical mutation."""
+
+    synced: bool
+    error: str | None = None
+
+
 class CustomJSONEncoder(json.JSONEncoder):
     """JSON encoder that handles PostgreSQL types."""
 
@@ -13173,27 +13181,45 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     ticket_note_id=str(job.ticket) if job.ticket else None,
                     ticket_ready_at=officer_ticket_ready_at,
                     ticket_claim_source="manual",
+                    strict_provisioning=True,
                 )
             except (OfficerAdmissionConflict, SlotAdmissionError) as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         else:
             result = await postgres_db.create_job(**create_kwargs)
 
-        # Create Gitea repo/branch + grant creator access + seed the Mode A
-        # cloud baseline. Shared with the automation paths (cron + run-now)
-        # via services.job_provisioning so every job-creation path provisions
-        # identically. Mutates `result` in place (repo_name/branch_name).
-        from services.job_provisioning import provision_job_repo
+        officer_preflight_activated = True
+        if officer_admission_preparation is not None:
+            from services.officer_preflight import ensure_officer_job_activated
 
-        await provision_job_repo(
-            job_row=result,
-            gitea_client=gitea_client,
-            postgres_db=postgres_db,
-            main_cloud_router=main_cloud_router,
-        )
+            preflight = await ensure_officer_job_activated(
+                postgres_db,
+                result,
+                provision=_provision_officer_ticket_repo,
+                category=officer_admission_preparation.category,
+                trigger_dispatch=_trigger_dispatch,
+            )
+            officer_preflight_activated = preflight.activated
+            result = await postgres_db.get_job(str(result["id"])) or result
+            result["provisioning_preflight"] = {
+                "state": preflight.state,
+                "activated": preflight.activated,
+                "retryable": preflight.retryable,
+                "phase": preflight.phase,
+                "error": preflight.error,
+            }
+        else:
+            from services.job_provisioning import provision_job_repo
+
+            await provision_job_repo(
+                job_row=result,
+                gitea_client=gitea_client,
+                postgres_db=postgres_db,
+                main_cloud_router=main_cloud_router,
+            )
 
         # Spawn scholar subjob if enabled (root jobs only)
-        if not job.parent_job_id:
+        if not job.parent_job_id and officer_preflight_activated:
             try:
                 # Re-fetch the job so _spawn_scholar_subjob has repo_name etc.
                 fresh_job = await postgres_db.get_job(str(result["id"]))
@@ -13210,7 +13236,8 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 logger.warning(f"Failed to spawn scholar for job {result['id']}: {e}")
 
         # Trigger auto-assignment dispatcher (fire-and-forget)
-        _trigger_dispatch()
+        if officer_admission_preparation is None:
+            _trigger_dispatch()
 
         return result
     except DatasourceMaterializationAuthorizationError as exc:
@@ -20794,6 +20821,7 @@ async def _provision_officer_ticket_repo(
         postgres_db=postgres_db,
         main_cloud_router=main_cloud_router,
         loop_floor=(category == EXECUTOR),
+        require_repository=True,
     )
 
 
@@ -35259,6 +35287,13 @@ async def get_project_officer_summary(
     row_llm_cfg = (post.get("config_override") or {}).get("llm") or {}
     if not isinstance(row_llm_cfg, dict):
         row_llm_cfg = {}
+    provisioning_preflights = await postgres_db.list_officer_job_preflights(
+        project_id=project_id
+    )
+    knowledge_materialization = await postgres_db.list_knowledge_materialization_health(
+        project_id
+    )
+    floor_wakes = await postgres_db.list_officer_floor_wake_outcomes(project_id)
     post_block: dict[str, Any] = {
         # OC-03 read surface: commissioned means a LIVE thread holds the post,
         # not that the link column is non-null. ``officer`` comes from the
@@ -35283,6 +35318,9 @@ async def get_project_officer_summary(
             "worker_spend_ceiling_daily": row_officer_cfg.get(
                 "worker_spend_ceiling_daily"
             ),
+            "provisioning_preflights": provisioning_preflights,
+            "knowledge_materialization": knowledge_materialization,
+            "floor_wakes": floor_wakes,
         },
     }
 
@@ -35372,6 +35410,9 @@ async def get_project_officer_summary(
         },
         "stale_claims": officer_state.get("backlog_stale_claims") or [],
         "worker_spend_ceiling_daily": officer_meta.get("worker_spend_ceiling_daily"),
+        "provisioning_preflights": provisioning_preflights,
+        "knowledge_materialization": knowledge_materialization,
+        "floor_wakes": floor_wakes,
     }
 
     return {
@@ -54502,6 +54543,26 @@ async def materialize_knowledge_note(
     )
 
 
+@app.post("/api/projects/{project_id}/knowledge/materialize/{intent_id}/projection")
+async def record_knowledge_projection(
+    request: Request,
+    project_id: str,
+    intent_id: str,
+    body: KnowledgeProjectionRequest,
+) -> dict[str, Any]:
+    """Record projection truth after a canonical internal knowledge write."""
+    await require_internal(request)
+    result = await postgres_db.finish_knowledge_projection(
+        intent_id,
+        project_id=project_id,
+        synced=body.synced,
+        error=body.error,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="canonical intent not found")
+    return result
+
+
 @app.post("/api/projects/{project_id}/knowledge/search")
 async def search_knowledge(
     request: Request,
@@ -54566,7 +54627,7 @@ async def update_knowledge_note(
     project_id: str,
     note_id: str,
     body: KnowledgeNoteUpdate,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Update a knowledge note's status or tags. F5: member-only."""
     await require_project_member(request, postgres_db, project_id)
     valid_statuses = {"active", "resolved", "superseded", "archived"}
@@ -54576,8 +54637,13 @@ async def update_knowledge_note(
             detail=f"Invalid status '{body.status}'. Must be one of: {valid_statuses}",
         )
 
+    if not (body.status or body.add_tags or body.remove_tags):
+        return {"status": "no_changes"}
+
+    materialization: dict[str, Any] | None = None
     try:
-        # Update PostgreSQL search index (vector DB)
+        # The index proves the public note exists, but is never mutated before
+        # the canonical git boundary succeeds.
         async with vector_db.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT note_id FROM knowledge_index "
@@ -54591,38 +54657,60 @@ async def update_knowledge_note(
                     detail=f"Note '{note_id}' not found in project '{project_id}'",
                 )
 
+        from services.kb_materialize import materialize_knowledge_metadata_update
+
+        materialization = await materialize_knowledge_metadata_update(
+            postgres_db=postgres_db,
+            gitea_client=gitea_client,
+            project_id=project_id,
+            slug=note_id,
+            status=body.status,
+            add_tags=body.add_tags,
+            remove_tags=body.remove_tags,
+        )
+        if materialization.get("canonical_state") != "canonical":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "pending_sync",
+                    "reason": materialization.get("reason"),
+                    "retry_state": materialization.get("retry_state"),
+                    "intent_id": materialization.get("intent_id"),
+                },
+            )
+
+        async with vector_db.acquire() as conn:
             updates = []
             params: list[Any] = [project_id, note_id]
             idx = 3
 
             if body.status:
                 updates.append(f"status = ${idx}")
-                params.append(body.status)
+                params.append(materialization.get("canonical_status") or body.status)
                 idx += 1
 
-            if body.add_tags:
-                updates.append(f"tags = array_cat(tags, ${idx}::text[])")
-                params.append(body.add_tags)
+            if body.add_tags or body.remove_tags:
+                updates.append(f"tags = ${idx}::text[]")
+                params.append(materialization.get("canonical_tags") or [])
                 idx += 1
-
-            if body.remove_tags:
-                for rm_tag in body.remove_tags:
-                    updates.append(f"tags = array_remove(tags, ${idx})")
-                    params.append(rm_tag)
-                    idx += 1
-
-            if not updates:
-                return {"status": "no_changes"}
+                updates.append(f"ready_at = ${idx}::timestamptz")
+                params.append(materialization.get("canonical_ready_at"))
+                idx += 1
 
             updates.append("modified_at = NOW()")
             set_clause = ", ".join(updates)
-            await conn.execute(
+            projected = await conn.fetchval(
                 f"UPDATE knowledge_index SET {set_clause} "
-                f"WHERE project_id = $1 AND note_id = $2",
+                f"WHERE project_id = $1 AND note_id = $2 RETURNING note_id",
                 *params,
             )
+            if projected is None:
+                raise RuntimeError("knowledge projection row disappeared")
 
-        # Update Neo4j if available
+        # Neo4j is an optional derived graph. The durable projection leg is the
+        # pgvector index above because the canonical Git reindexer can rebuild
+        # it. Do not leave the intent permanently pending for an optional graph
+        # outage the reindexer cannot repair.
         kg = _get_knowledge_graph()
         if kg:
             try:
@@ -54631,15 +54719,41 @@ async def update_knowledge_note(
                     update_kwargs["status"] = body.status
                 if body.add_tags:
                     update_kwargs["add_tags"] = body.add_tags
+                if body.remove_tags:
+                    update_kwargs["remove_tags"] = body.remove_tags
                 if update_kwargs:
-                    kg.update_note(project_id, note_id, **update_kwargs)
+                    if not kg.update_note(project_id, note_id, **update_kwargs):
+                        raise RuntimeError("graph note disappeared during projection")
             except Exception as e:
-                logger.warning(f"Neo4j update failed for {note_id}: {e}")
+                logger.warning("Neo4j update failed for %s: %s", note_id, e)
 
-        return {"status": "updated"}
+        projection = await postgres_db.finish_knowledge_projection(
+            str(materialization["intent_id"]),
+            project_id=project_id,
+            synced=True,
+        )
+        if projection is None:
+            raise RuntimeError("knowledge projection ledger did not converge")
+
+        return {
+            "status": "updated",
+            "canonical_state": "canonical",
+            "projection_state": "synced",
+            "intent_id": materialization.get("intent_id"),
+        }
     except HTTPException:
         raise
     except Exception as e:
+        if materialization and materialization.get("intent_id"):
+            try:
+                await postgres_db.finish_knowledge_projection(
+                    str(materialization["intent_id"]),
+                    project_id=project_id,
+                    synced=False,
+                    error=str(e),
+                )
+            except Exception:
+                logger.exception("failed to persist knowledge projection failure")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

@@ -300,6 +300,7 @@ class TestLinkagePersistence:
         unlocked ``create_job`` after checking the slot."""
         from main import JobCreate
         from services.officer_admission import OfficerAdmissionPreparation
+        from services.officer_preflight import OfficerPreflightOutcome
 
         project_id = str(uuid.uuid4())
         linkage_db.get_thread.return_value = {
@@ -335,7 +336,17 @@ class TestLinkagePersistence:
             require_auto_pull=False,
         )
         prepare = AsyncMock(return_value=preparation)
-        admit = AsyncMock(return_value={"id": JOB_ID, "status": "created"})
+        admitted = {"id": JOB_ID, "status": "paused"}
+        admit = AsyncMock(return_value=admitted)
+        preflight = AsyncMock(
+            return_value=OfficerPreflightOutcome(
+                job_id=JOB_ID,
+                state="activated",
+                activated=True,
+                attempted=True,
+            )
+        )
+        linkage_db.get_job.return_value = {"id": JOB_ID, "status": "created"}
         ready_at = datetime(2026, 8, 16, 7, 0, tzinfo=timezone.utc)
         ticket_state = {
             "project_id": project_id,
@@ -349,6 +360,10 @@ class TestLinkagePersistence:
         with (
             patch("services.officer_admission.prepare_officer_admission", prepare),
             patch("services.officer_admission.admit_and_create_job", admit),
+            patch(
+                "services.officer_preflight.ensure_officer_job_activated",
+                preflight,
+            ),
             patch(
                 "services.project_backlog.fetch_ticket_state",
                 AsyncMock(return_value=ticket_state),
@@ -376,6 +391,9 @@ class TestLinkagePersistence:
         assert admit.await_args.kwargs["ticket_note_id"] == "feature-proof"
         assert admit.await_args.kwargs["ticket_ready_at"] == ready_at
         assert admit.await_args.kwargs["ticket_claim_source"] == "manual"
+        assert admit.await_args.kwargs["strict_provisioning"] is True
+        preflight.assert_awaited_once()
+        assert preflight.await_args.args[:2] == (linkage_db, admitted)
         assert (
             admit.await_args.kwargs["job_kwargs"]["created_by_thread_id"] == THREAD_ID
         )

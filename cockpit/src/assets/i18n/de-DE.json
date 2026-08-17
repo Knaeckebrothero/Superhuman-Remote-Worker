@@ -3171,6 +3171,18 @@
       "cloudSyncRecovered": "Die Cloud-Synchronisierung läuft jetzt für diese Sitzung."
     }
   },
+  "officerCorrectness": {
+    "provisioningLabel": "Bereitstellung",
+    "provisioningProblem": "{{count}} Job-Vorabprüfung(en) ausstehend oder fehlgeschlagen — sie belegen Anspruch und Kapazität, sind aber nicht ausführbar.",
+    "knowledgeLabel": "Wissensabgleich",
+    "knowledgeProblem": "{{count}} kanonische/Projektionsmutation(en) ungelöst — betroffene Tickets sind nicht zulässig.",
+    "floorWakeLabel": "Mindestbestand-Weckruf",
+    "poolFallback": "Pool",
+    "delivered": "zugestellt",
+    "durablyQueued": "dauerhaft eingereiht",
+    "deliveryFailed": "Zustellung fehlgeschlagen; Wiederholungsstatus beibehalten",
+    "notQueued": "nicht eingereiht"
+  },
   "pwa": {
     "splash": "Legion wird formiert…",
     "install": {

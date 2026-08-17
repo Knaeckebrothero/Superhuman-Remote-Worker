@@ -455,6 +455,7 @@ async def admit_and_create_job_in_transaction(
     ticket_note_id: str | None = None,
     ticket_ready_at: datetime | str | None = None,
     ticket_claim_source: str = "manual",
+    strict_provisioning: bool = False,
 ) -> dict[str, Any]:
     """Revalidate, count, claim-check and INSERT on ``conn``'s transaction."""
 
@@ -519,6 +520,7 @@ async def admit_and_create_job_in_transaction(
         "claim_source",
         "officer_thread_id",
         "officer_incarnation",
+        "provisioning_preflight",
     ):
         context.pop(key, None)
     if slot_name is not None:
@@ -542,6 +544,17 @@ async def admit_and_create_job_in_transaction(
     if ready_generation is not None:
         context["officer_admission"]["ticket_ready_at"] = ready_generation.isoformat()
         context["officer_admission"]["ticket_claim_source"] = str(ticket_claim_source)
+    if strict_provisioning:
+        from services.officer_preflight import (
+            initial_preflight_context,
+            initial_preflight_freeze,
+        )
+
+        context["provisioning_preflight"] = initial_preflight_context(
+            category=current.category
+        )
+        final_kwargs["status"] = "paused"
+        final_kwargs["freeze_data"] = initial_preflight_freeze()
     final_kwargs["context"] = context
     final_kwargs["config_override"] = _deep_merge(
         final_kwargs.get("config_override"), slot_patch
@@ -581,6 +594,7 @@ async def admit_and_create_job(
     ticket_note_id: str | None = None,
     ticket_ready_at: datetime | str | None = None,
     ticket_claim_source: str = "manual",
+    strict_provisioning: bool = False,
 ) -> dict[str, Any]:
     """Own the authoritative admission transaction and normalize contention."""
 
@@ -595,6 +609,7 @@ async def admit_and_create_job(
                     ticket_note_id=ticket_note_id,
                     ticket_ready_at=ticket_ready_at,
                     ticket_claim_source=ticket_claim_source,
+                    strict_provisioning=strict_provisioning,
                 )
     except OfficerAdmissionConflict:
         raise

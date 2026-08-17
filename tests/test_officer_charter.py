@@ -164,7 +164,12 @@ def _runtime_actor_pep():
         ),
         patch(
             "src.tools.knowledge.knowledge_tools._post_vault_file",
-            return_value={"status": "skipped", "reason": "test"},
+            return_value={
+                "status": "committed",
+                "canonical_state": "canonical",
+                "projection_state": "pending",
+                "retry_state": "none",
+            },
         ),
     ):
         yield
@@ -382,9 +387,10 @@ class TestSoleStoreWriteHonesty:
         result = _tool(ctx, "kb_write").func(
             title="State note", type="state", content="the century stands"
         )
-        assert "NOT saved" in result
+        assert "canonical" in result
+        assert "projection is pending sync" in result
 
-    def test_pgvector_failure_stays_nonfatal_with_git(self):
+    def test_pgvector_failure_fails_closed_even_with_git(self):
         ctx = _session_context()
         ctx.has_git = MagicMock(return_value=True)
         # Dual-write path needs a workspace write to succeed.
@@ -394,7 +400,7 @@ class TestSoleStoreWriteHonesty:
         result = _tool(ctx, "kb_write").func(
             title="State note", type="state", content="the century stands"
         )
-        assert "NOT saved" not in result
+        assert "projection is pending sync" in result
 
 
 # =============================================================================

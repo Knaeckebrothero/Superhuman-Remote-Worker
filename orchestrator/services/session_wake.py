@@ -59,13 +59,18 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 
 from services.session_lifecycle import probe_ready
 
 logger = logging.getLogger(__name__)
+
+
+class DurableWakeOutboxError(RuntimeError):
+    """The established wake route could not durably insert its outbox row."""
+
 
 # Statuses that owe the creating session a wake. 'pending_review' is included on
 # purpose: the job stopped and wants a decision, which is exactly the moment the
@@ -986,12 +991,32 @@ async def notify_officer(
     source: str,
     dedup_key: str,
     payload: Optional[dict[str, Any]] = None,
+    _conn: Any = None,
+    _thread_id: str | None = None,
 ) -> bool:
     """Enqueue a wake for the officer commanding ``project_id``.
 
     No-op (False) when the project has no enabled officer. Never raises — a
     transition path must not fail because a wake could not be enqueued.
     """
+    # BP-10: the floor-wake policy owns a larger transaction containing both
+    # its outcome ledger and this outbox insert. This internal seam lets that
+    # caller reuse the established route without opening a second connection.
+    # Errors intentionally escape so its savepoint can roll back and classify
+    # the attempt; ordinary callers retain the historical never-raises API.
+    if _conn is not None and _thread_id is not None:
+        try:
+            return await db._enqueue_session_wake_event_on_conn(
+                _conn,
+                UUID(str(_thread_id)),
+                source=source,
+                dedup_key=dedup_key,
+                payload_json=json.dumps(payload or {}),
+                project_uuid=UUID(str(project_id)),
+            )
+        except Exception as exc:
+            raise DurableWakeOutboxError(str(exc)) from exc
+
     try:
         officer = await db.get_officer_thread_for_project(str(project_id))
         if not officer:

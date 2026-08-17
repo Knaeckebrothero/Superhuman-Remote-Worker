@@ -1018,10 +1018,10 @@ def _materialize_note(
     authorship), and hands the markdown to the orchestrator, which owns the
     commit. No workspace and no git are required, and none is touched.
 
-    Non-fatal, mirroring the pgvector write-through: the ``knowledge_index``
-    row is already written and the tool must still succeed. Recovery is a
-    rewrite of the note (the reindexer is idempotent), not repair tooling —
-    hence the loud log rather than a raise.
+    The endpoint never raises for expected repository failures, but callers
+    must fail closed unless the returned state proves the canonical write.
+    Retry intent is persisted before the remote mutation, and the pgvector
+    projection is written only after canonical success.
 
     Returns the endpoint's status dict, for callers that want to report the
     outcome. ``status`` is ``committed`` / ``skipped`` / ``failed``.
@@ -1061,9 +1061,9 @@ def _materialize_note(
 
     if str(result.get("status")) == "failed":
         logger.error(
-            "%s note '%s' (project %s) was NOT materialised (%s) — the row is "
-            "in the knowledge index but no file backs it, so kb_read/kb_search "
-            "cannot see it until the note is written again",
+            "%s note '%s' (project %s) was NOT materialised (%s) — its durable "
+            "intent remains unresolved and callers must leave the searchable "
+            "projection unchanged",
             _MATERIALIZE_LOG,
             slug,
             project_id,
@@ -1079,6 +1079,79 @@ def _materialize_note(
             f" ({result.get('reason')})" if result.get("reason") else "",
         )
     return result
+
+
+def _canonical_materialization_succeeded(result: Dict[str, Any]) -> bool:
+    """Whether the result proves the desired bytes are canonical and durable."""
+    if result.get("canonical_state") == "canonical":
+        return True
+    return result.get("status") == "committed" or (
+        result.get("status") == "skipped"
+        and result.get("reason") in {"unchanged", "already-canonical"}
+    )
+
+
+def _canonical_materialization_error(slug: str, result: Dict[str, Any]) -> str:
+    state = result.get("canonical_state") or "failed"
+    reason = result.get("reason") or "unknown"
+    retry = result.get("retry_state") or "unknown"
+    return (
+        f"Error: canonical knowledge write for '{slug}' did not complete "
+        f"(state={state}, reason={reason}, retry={retry}). The mutation remains "
+        "unapplied/ineligible; retry or inspect the pending-sync ledger."
+    )
+
+
+def _canonical_ready_at(note: Dict[str, Any]) -> Optional[datetime]:
+    """Parse the READY timestamp just committed to the canonical note."""
+    value = note.get("ready_at")
+    if isinstance(value, datetime):
+        return value
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _report_projection(
+    project_id: str,
+    materialization: Dict[str, Any],
+    *,
+    synced: bool,
+    error: Optional[str] = None,
+) -> bool:
+    """Record projection truth for a durable canonical mutation."""
+    intent_id = materialization.get("intent_id")
+    if not intent_id:
+        return True
+    base_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085").rstrip("/")
+    headers: Dict[str, str] = {}
+    internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+    if internal_key:
+        headers["X-Internal-Key"] = internal_key
+    try:
+        with httpx.Client(
+            timeout=_MATERIALIZE_TIMEOUT_SECONDS, headers=headers
+        ) as client:
+            response = client.post(
+                f"{base_url}/api/projects/{project_id}/knowledge/materialize/"
+                f"{intent_id}/projection",
+                json={"synced": synced, "error": error},
+            )
+        if response.status_code != 200:
+            raise RuntimeError(f"http-{response.status_code}")
+        return True
+    except Exception as exc:  # noqa: BLE001 - canonical truth already persisted
+        logger.error(
+            "%s projection outcome for intent %s could not be recorded: %r",
+            _MATERIALIZE_LOG,
+            intent_id,
+            exc,
+            exc_info=True,
+        )
+        return False
 
 
 # The OKF vault root — the same prefix the reindexer scans and the
@@ -1529,7 +1602,9 @@ def create_kb_tools(
             if new_type in _TICKET_TYPES:
                 updated_note["priority"] = new_priority
             _apply_ready_frontmatter(updated_note, tag_change.ready, existing)
-            _materialize_note(context, note, updated_note)
+            materialization = _materialize_note(context, note, updated_note)
+            if not _canonical_materialization_succeeded(materialization):
+                return _canonical_materialization_error(note, materialization)
             try:
                 _run_async(
                     ks.upsert_note(
@@ -1547,10 +1622,24 @@ def create_kb_tools(
                         modified_at=datetime.now(timezone.utc),
                         priority=new_priority,
                         ready=tag_change.ready,
+                        ready_at=_canonical_ready_at(updated_note),
                     )
                 )
             except Exception as e:
-                logger.warning(f"pgvector write-through failed for {note}: {e}")
+                _report_projection(
+                    project_id, materialization, synced=False, error=str(e)
+                )
+                logger.error("knowledge projection failed for %s: %s", note, e)
+                return (
+                    f"Error: '{note}' is canonical but its searchable projection "
+                    "is pending sync; retry/reindex before treating it as Updated."
+                )
+            if not _report_projection(project_id, materialization, synced=True):
+                return (
+                    f"Error: '{note}' is canonical and searchable, but durable "
+                    "projection state remains pending; retry before treating it "
+                    "as Updated."
+                )
 
             changes = _describe_update(
                 content=content,
@@ -1563,6 +1652,7 @@ def create_kb_tools(
             return (
                 f"Updated **{note}**: {', '.join(changes)}"
                 f"{_dropped_tag_notice(tag_change.dropped)}"
+                " [canonical=canonical, projection=synced]"
             )
         except Exception as e:
             logger.error(f"kb_update failed: {e}")
@@ -1580,14 +1670,7 @@ def create_kb_tools(
         remove_tags: Optional[List[str]] = None,
         set_tags: Optional[List[str]] = None,
     ) -> str:
-        """Update an existing note: Neo4j + OKF file + pgvector write-through.
-
-        Shared by the ``kb_update`` tool and the verdict gate's UPDATE/SUPERSEDE
-        routing, so both apply an edit the same way. ``priority`` is
-        ``None`` for both internal callers (dedup redirect, supersede retire)
-        — correctly preserving the target's existing rank rather than
-        resetting it, since neither is a caller-directed priority change.
-        """
+        """Update canonical git first, then its graph/search projections."""
         if kg is None:
             return _update_existing_kgless(
                 note,
@@ -1606,32 +1689,28 @@ def create_kb_tools(
         if not project_id:
             return _write_scope_error(context)
 
+        if status is not None and status not in NOTE_STATUSES:
+            return f"Error: Invalid status: {status}"
+        if confidence is not None and confidence not in CONFIDENCE_LEVELS:
+            return f"Error: Invalid confidence: {confidence}"
+
         try:
-            # The charter trust boundary needs the durable type before ANY
-            # graph mutation. If it cannot be read, fail closed: falling
-            # through would let a transient read failure bypass charter auth.
             try:
-                _pre = kg.read_note(project_id, note)
+                existing = kg.read_note(project_id, note)
             except Exception as exc:
                 logger.warning("kb_update type pre-read failed: %s", exc)
                 return (
                     "Error: could not verify the note type before update; "
                     "refusing the write. No changes were made."
                 )
-            if not isinstance(_pre, dict):
+            if not isinstance(existing, dict):
                 return f"Error: Note '{note}' not found in project."
-            if (_pre.get("type") or "") == "charter":
+            if (existing.get("type") or "") == "charter":
                 denied = _charter_write_denied(context, project_id)
                 if denied:
                     return denied
 
-            # Resolve tags against the pre-read, then hand Neo4j the DIFF.
-            # ``set_tags`` has no Cypher equivalent — the graph only knows
-            # attach/detach — so all three mutation modes collapse to one
-            # add/remove pair here. When the pre-read failed, ``prior_tags`` is
-            # empty and the diff degrades to add-only: the same best-effort
-            # posture as the priority lookback below, and never a wrong removal.
-            prior_tags = _pre.get("tags")
+            prior_tags = existing.get("tags")
             machine_tags_authorized = False
             if _machine_tag_mutation_requested(
                 prior_tags,
@@ -1651,118 +1730,132 @@ def create_kb_tools(
                 officer_authority=machine_tags_authorized,
             )
             _prior_normalized = normalize_tags(prior_tags)
-            updated = kg.update_note(
-                project_id=project_id,
-                note_id=note,
-                content=content,
-                append=append,
-                status=status,
-                confidence=confidence,
-                add_tags=[t for t in tag_change.tags if t not in _prior_normalized],
-                add_links=add_links,
-                remove_tags=[t for t in _prior_normalized if t not in tag_change.tags],
+            if content is not None:
+                new_content = content
+            elif append is not None:
+                new_content = (existing.get("content") or "") + "\n\n" + append
+            else:
+                new_content = existing.get("content") or ""
+            new_type = existing.get("type") or "learning"
+            new_status = status or existing.get("status") or "active"
+            new_confidence = (
+                confidence if confidence is not None else existing.get("confidence")
             )
 
-            if not updated:
-                return f"Error: Note '{note}' not found in project."
+            prior_row: Optional[Dict[str, Any]] = None
+            new_priority: Optional[int] = None
+            if new_type in _TICKET_TYPES:
+                try:
+                    prior_row = _run_async(
+                        ks.get_note_by_slug(uuid.UUID(project_id), note)
+                    )
+                except Exception as exc:
+                    return (
+                        "Error: could not read the ticket's current READY/priority "
+                        f"state before canonical update ({exc.__class__.__name__})."
+                    )
+                new_priority = (
+                    priority
+                    if priority is not None
+                    else (prior_row or {}).get("priority", DEFAULT_PRIORITY_RANK)
+                )
 
-            # Write-through: re-read the note from Neo4j and upsert into pgvector
+            relationships = list(existing.get("relationships") or [])
+            relationships.extend(add_links or [])
+            desired = {
+                "id": note,
+                "type": new_type,
+                "title": existing.get("title") or note,
+                "description": existing.get("description"),
+                "content": new_content,
+                "tags": tag_change.tags,
+                "keywords": existing.get("keywords") or [],
+                "confidence": new_confidence,
+                "status": new_status,
+                "superseded_by": existing.get("superseded_by"),
+                "relationships": relationships,
+            }
+            if new_type in _TICKET_TYPES:
+                desired["priority"] = new_priority
+            _apply_ready_frontmatter(desired, tag_change.ready, prior_row)
+            materialization = _materialize_note(context, note, desired)
+            if not _canonical_materialization_succeeded(materialization):
+                return _canonical_materialization_error(note, materialization)
+
+            _jid = existing.get("job_id")
             try:
-                full_note = kg.read_note(project_id, note)
-                if full_note:
-                    new_type = full_note.get("type", "learning")
-                    # Priority only exists for backlog tickets — skip the
-                    # lookback entirely for every other type, both to save
-                    # the round-trip and to shrink the surface where a
-                    # lookback failure could matter at all.
-                    #
-                    # None is a real, load-bearing value here, not "no
-                    # opinion": it means "the current priority could not be
-                    # determined", and both ks.upsert_note (COALESCE against
-                    # the row's existing value) and the note dict below
-                    # (key omitted entirely) treat it as "leave unchanged" —
-                    # never as license to guess DEFAULT_PRIORITY_RANK, which
-                    # previously clobbered a real existing priority whenever
-                    # the lookback failed (fix round 1, Finding 1).
-                    new_priority: Optional[int] = None
-                    prior_row: Optional[Dict[str, Any]] = None
-                    if new_type in _TICKET_TYPES:
-                        # Neo4j holds neither priority nor ready_at (both live
-                        # only on the pgvector row), so one best-effort lookback
-                        # serves both. It runs whenever either value still needs
-                        # carrying over — a caller-supplied priority alone no
-                        # longer skips it, because the OKF file this write is
-                        # about to rewrite would otherwise silently drop the
-                        # ticket's dispatch authorization.
-                        if priority is not None and tag_change.ready is not None:
-                            new_priority = priority
-                        else:
-                            # A failed *or* not-found lookback leaves
-                            # new_priority at None: not-found means a fresh
-                            # pgvector row is about to be inserted (nothing to
-                            # preserve, 1 is an honest default there — see
-                            # upsert_note), and a failure must never be resolved
-                            # by guessing.
-                            try:
-                                prior_row = _run_async(
-                                    ks.get_note_by_slug(uuid.UUID(project_id), note)
-                                )
-                            except Exception as e:
-                                logger.warning(
-                                    f"priority lookback failed for {note}, "
-                                    f"leaving its priority unchanged: {e}"
-                                )
-                            if priority is not None:
-                                new_priority = priority
-                            elif prior_row:
-                                new_priority = prior_row.get(
-                                    "priority", DEFAULT_PRIORITY_RANK
-                                )
-                    # Files-canonical materialisation — before the
-                    # disposable-index upsert, so the canonical file lands even
-                    # if the pgvector write fails.
-                    full_note_dict = {
-                        "id": note,
-                        "type": new_type,
-                        "title": full_note.get("title", note),
-                        "description": full_note.get("description"),
-                        "content": full_note.get("content", ""),
-                        "tags": full_note.get("tags", []),
-                        "keywords": full_note.get("keywords", []),
-                        "confidence": full_note.get("confidence"),
-                        "status": full_note.get("status", "active"),
-                        "superseded_by": full_note.get("superseded_by"),
-                        "relationships": full_note.get("relationships", []),
-                    }
-                    if new_type in _TICKET_TYPES and new_priority is not None:
-                        full_note_dict["priority"] = new_priority
-                    _apply_ready_frontmatter(
-                        full_note_dict, tag_change.ready, prior_row
+                _run_async(
+                    ks.upsert_note(
+                        note_id=note,
+                        project_id=uuid.UUID(project_id),
+                        title=desired["title"],
+                        note_type=new_type,
+                        content=new_content,
+                        status=new_status,
+                        confidence=new_confidence,
+                        tags=tag_change.tags,
+                        keywords=desired["keywords"],
+                        job_id=uuid.UUID(_jid) if isinstance(_jid, str) else _jid,
+                        phase=existing.get("phase"),
+                        retrieval_messages=existing.get("retrieval_messages") or [],
+                        modified_at=datetime.now(timezone.utc),
+                        priority=new_priority,
+                        ready=tag_change.ready,
+                        ready_at=_canonical_ready_at(desired),
                     )
-                    _materialize_note(context, note, full_note_dict)
-                    _run_async(
-                        ks.upsert_note(
-                            note_id=note,
-                            project_id=uuid.UUID(project_id),
-                            title=full_note.get("title", ""),
-                            note_type=new_type,
-                            content=full_note.get("content", ""),
-                            status=full_note.get("status", "active"),
-                            confidence=full_note.get("confidence"),
-                            tags=full_note.get("tags", []),
-                            keywords=full_note.get("keywords", []),
-                            job_id=uuid.UUID(full_note["job_id"])
-                            if full_note.get("job_id")
-                            else None,
-                            phase=full_note.get("phase"),
-                            retrieval_messages=full_note.get("retrieval_messages", []),
-                            modified_at=datetime.now(timezone.utc),
-                            priority=new_priority,
-                            ready=tag_change.ready,
-                        )
-                    )
-            except Exception as e:
-                logger.warning(f"pgvector write-through failed for {note}: {e}")
+                )
+            except Exception as exc:
+                _report_projection(
+                    project_id, materialization, synced=False, error=str(exc)
+                )
+                logger.error("knowledge search projection failed for %s: %s", note, exc)
+                return (
+                    f"Error: '{note}' is canonical but its searchable projection "
+                    "is pending sync; retry/reindex before treating it as Updated."
+                )
+
+            # Neo4j is an optional derived graph, not the dispatch/search
+            # projection repaired by the canonical Git reindexer. Preserve its
+            # best-effort degradation contract without letting it falsify the
+            # durable Git/pgvector convergence ledger.
+            graph_error: Optional[Exception] = None
+            try:
+                updated = kg.update_note(
+                    project_id=project_id,
+                    note_id=note,
+                    content=new_content,
+                    append=None,
+                    status=new_status,
+                    confidence=new_confidence,
+                    add_tags=[
+                        tag for tag in tag_change.tags if tag not in _prior_normalized
+                    ],
+                    add_links=add_links,
+                    remove_tags=[
+                        tag for tag in _prior_normalized if tag not in tag_change.tags
+                    ],
+                )
+                if not updated:
+                    raise RuntimeError("graph note disappeared during projection")
+            except Exception as exc:
+                graph_error = exc
+                logger.warning(
+                    "optional knowledge graph projection failed for %s: %s",
+                    note,
+                    exc,
+                )
+            if not _report_projection(project_id, materialization, synced=True):
+                return (
+                    f"Error: '{note}' is canonical and searchable, but durable "
+                    "projection state remains pending; retry before treating it "
+                    "as Updated."
+                )
+            if graph_error is not None:
+                return (
+                    f"Error: '{note}' is canonical and searchable, but its optional "
+                    f"graph projection failed ({graph_error}); the mutation was not "
+                    "reported as Updated."
+                )
 
             changes = _describe_update(
                 content=content,
@@ -1776,10 +1869,9 @@ def create_kb_tools(
             return (
                 f"Updated **{note}**: {', '.join(changes)}"
                 f"{_dropped_tag_notice(tag_change.dropped)}"
+                " [canonical=canonical, projection=synced]"
             )
 
-        except ValueError as e:
-            return f"Error: {e}"
         except Exception as e:
             logger.error(f"kb_update failed: {e}")
             return f"Error updating note: {e}"
@@ -1942,52 +2034,43 @@ def create_kb_tools(
                 )
 
         try:
-            if kg is None:
-                # Validate up-front, exactly where kg.create_note would (the
-                # graph path raises ValueError here) — otherwise an invalid type
-                # slips through to a silent DB CHECK failure and the tool would
-                # misleadingly report "Created".
-                if type not in NOTE_TYPES:
-                    raise ValueError(
-                        f"Invalid note_type: {type}. Must be one of {NOTE_TYPES}"
-                    )
-                if confidence and confidence not in CONFIDENCE_LEVELS:
-                    raise ValueError(
-                        f"Invalid confidence: {confidence}. "
-                        f"Must be one of {CONFIDENCE_LEVELS}"
-                    )
-                # Neo4j-less: derive the slug ourselves (the graph normally does
-                # this). Base slug, or a deterministic content-hash fork when the
-                # base is taken by a *different* note (identical content already
-                # short-circuited above). Empty slug → deterministic fallback
-                # (content-hashed, not random, so re-writes converge).
-                if not candidate_slug:
-                    slug = f"note-{_content_hash(content)[:8]}"
-                elif isinstance(existing, dict):
-                    slug = f"{candidate_slug}-{_content_hash(content)[:6]}"
-                else:
-                    slug = candidate_slug
-            else:
-                slug = kg.create_note(
-                    project_id=project_id,
-                    title=title,
-                    note_type=type,
-                    content=content,
-                    tags=tags,
-                    keywords=keywords,
-                    confidence=confidence,
-                    job_id=context.job_id,
-                    phase=context.config.get("current_phase"),
-                    retrieval_messages=retrieval_messages,
-                    links=links,
+            if type not in NOTE_TYPES:
+                raise ValueError(
+                    f"Invalid note_type: {type}. Must be one of {NOTE_TYPES}"
                 )
+            if confidence and confidence not in CONFIDENCE_LEVELS:
+                raise ValueError(
+                    f"Invalid confidence: {confidence}. "
+                    f"Must be one of {CONFIDENCE_LEVELS}"
+                )
+            if not candidate_slug:
+                slug = f"note-{_content_hash(content)[:8]}"
+            elif isinstance(existing, dict):
+                slug = f"{candidate_slug}-{_content_hash(content)[:6]}"
+            else:
+                slug = candidate_slug
 
-            # Write to pgvector — the primary write when Neo4j-less, a
-            # write-through otherwise. Always persisted (harmless for
-            # non-ticket types — nothing reads/filters on it); only the OKF
-            # frontmatter below is gated to tickets.
             now = datetime.now(timezone.utc)
             rank = PRIORITY_RANKS[priority]
+            new_note = {
+                "id": slug,
+                "type": type,
+                "title": title,
+                "description": description,
+                "content": content,
+                "tags": tags,
+                "keywords": keywords,
+                "confidence": confidence,
+                "status": "active",
+                "relationships": links or [],
+            }
+            if type in _TICKET_TYPES:
+                new_note["priority"] = rank
+            _apply_ready_frontmatter(new_note, _new_tags.ready)
+            materialization = _materialize_note(context, slug, new_note)
+            if not _canonical_materialization_succeeded(materialization):
+                return _canonical_materialization_error(slug, materialization)
+
             try:
                 _run_async(
                     ks.upsert_note(
@@ -2006,72 +2089,86 @@ def create_kb_tools(
                         modified_at=now,
                         priority=rank,
                         ready=_new_tags.ready,
+                        ready_at=_canonical_ready_at(new_note),
                     )
                 )
-            except Exception as e:
-                if kg is None and not context.has_git():
-                    # Lite sessions (officer/conference, no git, no Neo4j):
-                    # the pgvector row is the write the caller can count on.
-                    # Materialisation below no longer needs git, so the note
-                    # may well still reach the KB repo — but that is a
-                    # *server-side* outcome this path cannot see yet, and
-                    # claiming "Created" on a failed store write would be
-                    # silent data loss for exactly the notes the officer's
-                    # judgment depends on (centurion_implementation_notes.md
-                    # risk 11). Fail loudly; a retry re-materialises
-                    # idempotently.
-                    logger.error(f"pgvector write failed for {slug} (sole store): {e}")
-                    return (
-                        # NB: `type` here is the note-type parameter, not the
-                        # builtin — hence __class__ for the exception name.
-                        f"Error: knowledge store write failed for '{slug}' — "
-                        f"the note was NOT saved. Retry, and escalate if this "
-                        f"persists. ({e.__class__.__name__}: {e})"
-                    )
-                logger.warning(f"pgvector write-through failed for {slug}: {e}")
-                # Durable truth is Neo4j (graph path) or the OKF file (kg-less);
-                # the reindexer can rebuild pgvector from either.
+            except Exception as exc:
+                _report_projection(
+                    project_id, materialization, synced=False, error=str(exc)
+                )
+                logger.error("knowledge search projection failed for %s: %s", slug, exc)
+                return (
+                    f"Error: '{slug}' is canonical but its searchable projection "
+                    "is pending sync; retry/reindex before treating it as Created."
+                )
 
-            # Files-canonical materialisation: commit knowledge/<slug>.md into
-            # the project's KB repo, server-side.
-            new_note = {
-                "id": slug,
-                "type": type,
-                "title": title,
-                "description": description,
-                "content": content,
-                "tags": tags,
-                "keywords": keywords,
-                "confidence": confidence,
-                "status": "active",
-                "relationships": links or [],
-            }
-            if type in _TICKET_TYPES:
-                # Only tickets show a priority line — _render_note_md omits it
-                # entirely when the key is absent, keeping non-ticket notes'
-                # frontmatter byte-identical (Global constraint).
-                new_note["priority"] = rank
-            _apply_ready_frontmatter(new_note, _new_tags.ready)
-            _materialize_note(context, slug, new_note)
+            graph_error: Optional[Exception] = None
+            if kg is not None:
+                try:
+                    kg.create_note(
+                        project_id=project_id,
+                        title=title,
+                        note_type=type,
+                        content=content,
+                        tags=tags,
+                        keywords=keywords,
+                        confidence=confidence,
+                        job_id=context.job_id,
+                        phase=context.config.get("current_phase"),
+                        retrieval_messages=retrieval_messages,
+                        links=links,
+                        note_id=slug,
+                    )
+                except Exception as exc:
+                    graph_error = exc
+                    logger.warning(
+                        "optional knowledge graph projection failed for %s: %s",
+                        slug,
+                        exc,
+                    )
+            if not _report_projection(project_id, materialization, synced=True):
+                return (
+                    f"Error: '{slug}' is canonical and searchable, but durable "
+                    "projection state remains pending; retry before treating it "
+                    "as Created."
+                )
+            if graph_error is not None:
+                return (
+                    f"Error: '{slug}' is canonical and searchable, but its optional "
+                    f"graph projection failed ({graph_error}); the mutation was not "
+                    "reported as Created."
+                )
 
             # Verdict SUPERSEDE: retire the stale note(s) the candidate replaces,
             # pointing them at the new note (status=superseded + SUPERSEDED_BY).
             if supersede_targets:
                 retired = []
+                retire_failures = []
                 for t in supersede_targets:
                     try:
-                        _update_existing(
+                        retire_result = _update_existing(
                             t.note_id,
                             status="superseded",
                             add_links=[{"target": slug, "type": "SUPERSEDED_BY"}],
                         )
-                        retired.append(t.note_id)
+                        if retire_result.startswith("Updated **"):
+                            retired.append(t.note_id)
+                        else:
+                            retire_failures.append(f"{t.note_id}: {retire_result}")
                     except Exception as e:
                         logger.warning(f"supersede retire failed for {t.note_id}: {e}")
+                        retire_failures.append(f"{t.note_id}: {e}")
+                if retire_failures:
+                    return (
+                        f"Error: '{slug}' is canonical and searchable, but its "
+                        "SUPERSEDE disposition did not converge: "
+                        + "; ".join(retire_failures)
+                    )
                 if retired:
                     return (
                         f"Created knowledge note: **{slug}** (type={type}) — "
-                        f"superseded {', '.join(retired)}{_tag_notice}"
+                        f"superseded {', '.join(retired)}{_tag_notice} "
+                        "[canonical=canonical, projection=synced]"
                     )
 
             link_info = ""
@@ -2080,7 +2177,7 @@ def create_kb_tools(
 
             return (
                 f"Created knowledge note: **{slug}** (type={type}{link_info})"
-                f"{_tag_notice}"
+                f"{_tag_notice} [canonical=canonical, projection=synced]"
             )
 
         except ValueError as e:

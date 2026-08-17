@@ -250,6 +250,13 @@ class TestReasoningLevelBridge:
             main._validated_reasoning_level("ultra")
 
 
+def _with_correctness_health(db):
+    db.list_officer_job_preflights = AsyncMock(return_value=[])
+    db.list_knowledge_materialization_health = AsyncMock(return_value=[])
+    db.list_officer_floor_wake_outcomes = AsyncMock(return_value=[])
+    return db
+
+
 class TestOfficerSummaryEndpoint:
     @pytest.mark.asyncio
     async def test_summary_shape(self, monkeypatch):
@@ -280,7 +287,7 @@ class TestOfficerSummaryEndpoint:
             "decommissioned_at": "2026-07-20T00:00:00Z",
             "reason": "retired",
         }
-        db = SimpleNamespace()
+        db = _with_correctness_health(SimpleNamespace())
         db.get_officer_thread_for_project = AsyncMock(return_value=officer)
         db.get_or_create_project_officer = AsyncMock(
             return_value={
@@ -329,7 +336,7 @@ class TestOfficerSummaryEndpoint:
 
     @pytest.mark.asyncio
     async def test_no_officer_renders_enable_prompt(self, monkeypatch):
-        db = SimpleNamespace()
+        db = _with_correctness_health(SimpleNamespace())
         db.get_officer_thread_for_project = AsyncMock(return_value=None)
         # A vacant post whose last incarnation left a kit behind: the card's
         # provision form seeds from it (officer_post.md §8).
@@ -385,7 +392,7 @@ class TestOfficerSummaryEndpoint:
         commissioned post the card could not render; commissioned must come
         from the live join, and the stale case renders exactly like vacancy.
         """
-        db = SimpleNamespace()
+        db = _with_correctness_health(SimpleNamespace())
         # The live join found nothing — the linked thread is ended or missing.
         db.get_officer_thread_for_project = AsyncMock(return_value=None)
         db.get_or_create_project_officer = AsyncMock(

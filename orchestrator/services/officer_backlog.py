@@ -51,6 +51,7 @@ from services.officer_admission import (
     prepare_officer_admission,
 )
 from services.officer_slots import roster_from_meta
+from services.officer_preflight import ensure_officer_job_activated
 from services.project_backlog import BacklogCursor, fetch_backlog, fetch_ticket_state
 from services.work_categories import (
     EXECUTOR,
@@ -387,15 +388,33 @@ async def _scan_eligible_tickets(
             return result
 
         try:
-            claims = await db.ticket_claim_states(
-                project_id, [str(row.get("note_id")) for row in rows]
+            note_ids = [str(row.get("note_id")) for row in rows]
+            claims = await db.ticket_claim_states(project_id, note_ids)
+            unresolved_reader = getattr(db, "unresolved_knowledge_note_ids", None)
+            unresolved_result = (
+                await unresolved_reader(project_id, note_ids)
+                if callable(unresolved_reader)
+                else set()
+            )
+            unresolved = (
+                {str(note_id) for note_id in unresolved_result}
+                if isinstance(unresolved_result, (set, list, tuple))
+                else set()
             )
         except Exception as exc:
             result.unavailable = True
-            result.error = f"claim-state read failed: {type(exc).__name__}"
+            result.error = f"app-state read failed: {type(exc).__name__}"
             return result
 
-        ready, notes = eligible_tickets(rows, claims, now)
+        eligible_rows = [
+            row for row in rows if str(row.get("note_id")) not in unresolved
+        ]
+        result.notes.extend(
+            f"{row.get('note_id')}: canonical knowledge sync unresolved"
+            for row in rows
+            if str(row.get("note_id")) in unresolved
+        )
+        ready, notes = eligible_tickets(eligible_rows, claims, now)
         result.tickets.extend(ready)
         result.notes.extend(notes)
         if target is not None and len(result.tickets) >= target:
@@ -758,6 +777,7 @@ async def _dispatch_one(
             ticket_note_id=note_id,
             ticket_ready_at=authorized_at,
             ticket_claim_source="tick",
+            strict_provisioning=True,
             job_kwargs={
                 "description": f"[{category}] {title}",
                 "config_name": expert,
@@ -796,34 +816,65 @@ async def _dispatch_one(
         )
         return None
 
-    if provision_repo is not None:
-        try:
-            await provision_repo(job, category=category)
-        except Exception:
-            logger.exception(
-                "officer backlog: repo provisioning failed for job %s — sealing",
-                str(job.get("id"))[:8],
-            )
+    outcome = await ensure_officer_job_activated(
+        db,
+        job,
+        provision=provision_repo,
+        category=category,
+        trigger_dispatch=trigger_dispatch,
+    )
+    if not outcome.activated:
+        logger.warning(
+            "officer backlog: job %s preflight=%s phase=%s error=%s",
+            str(job.get("id"))[:8],
+            outcome.state,
+            outcome.phase,
+            outcome.error,
+        )
+        return None
+    return await db.get_job(str(job["id"])) or job
+
+
+async def _recover_officer_preflights(
+    db: Any,
+    *,
+    project_id: str,
+    officer_thread_id: str,
+    provision_repo: Optional[ProvisionFn],
+    trigger_dispatch: Optional[Callable[[], None]],
+) -> int:
+    """Retry due preflights even if auto-pull was subsequently disabled."""
+
+    list_preflights = getattr(db, "list_officer_job_preflights", None)
+    if list_preflights is None:
+        return 0
+    rows = await list_preflights(
+        project_id=project_id,
+        officer_thread_id=officer_thread_id,
+    )
+    if not isinstance(rows, (list, tuple)):
+        return 0
+    activated = 0
+    for row in rows:
+        context = row.get("context") or {}
+        if isinstance(context, str):
+            import json
+
             try:
-                await db.update_job_status(
-                    str(job["id"]),
-                    status="failed",
-                    error_message="officer backlog: repo provisioning failed",
-                )
-            except Exception:
-                logger.exception(
-                    "officer backlog: could not seal unprovisioned job %s",
-                    str(job.get("id"))[:8],
-                )
-            raise
-
-    if trigger_dispatch is not None:
-        try:
-            trigger_dispatch()
-        except Exception:
-            logger.exception("officer backlog: dispatch nudge raised (non-fatal)")
-
-    return job
+                context = json.loads(context)
+            except (TypeError, ValueError):
+                context = {}
+        preflight = context.get("provisioning_preflight") or {}
+        outcome = await ensure_officer_job_activated(
+            db,
+            row,
+            provision=provision_repo,
+            category=preflight.get("category") or context.get("work_category"),
+            trigger_dispatch=trigger_dispatch,
+        )
+        if outcome.activated and outcome.attempted:
+            activated += 1
+    return activated
 
 
 async def tick_officer(
@@ -844,14 +895,26 @@ async def tick_officer(
 
     thread_id = str(officer_row.get("id") or "")
     project_id = str(officer_row.get("project_id") or "")
-    if not thread_id or not project_id or vector_db is None:
+    if not thread_id or not project_id:
         return counts
 
     meta = _officer_meta(officer_row)
-    if not auto_pull_enabled(meta):
-        return counts
     if officer_is_held(meta):
         logger.debug("officer backlog: %s held — skipping", thread_id[:8])
+        return counts
+
+    try:
+        counts["dispatched"] += await _recover_officer_preflights(
+            db,
+            project_id=project_id,
+            officer_thread_id=thread_id,
+            provision_repo=provision_repo,
+            trigger_dispatch=trigger_dispatch,
+        )
+    except Exception:
+        logger.exception("officer backlog: provisioning recovery failed")
+
+    if not auto_pull_enabled(meta) or vector_db is None:
         return counts
 
     pools = pools_from_meta(meta)
@@ -873,7 +936,6 @@ async def tick_officer(
 
     state_patch: dict[str, Any] = {}
     breakers = dict(state.get("backlog_breakers") or {})
-    floor_wakes = dict(state.get("backlog_floor_wakes") or {})
 
     # Stale claims: computed once for the whole post, recorded for the sitrep.
     open_claims = await db.list_stale_officer_claims(
@@ -975,31 +1037,37 @@ async def tick_officer(
         # lands at once, each must find a ticket waiting. The floor therefore
         # scales with the kit rather than needing its own knob.
         if scan.exhausted and len(ready) < floor:
-            last = _aware(floor_wakes.get(pool))
-            if last is None or (now - last) >= timedelta(
-                hours=FLOOR_WAKE_DEBOUNCE_HOURS
-            ):
-                if notify is not None:
-                    try:
-                        await notify(
-                            db,
-                            project_id,
-                            source="backlog_floor_breach",
-                            dedup_key=f"floor:{pool}",
-                            payload={
-                                "pool": pool,
-                                "category": category,
-                                "ready": len(ready),
-                                "floor": floor,
-                            },
-                        )
-                        counts["wakes"] += 1
-                    except Exception:
-                        logger.warning(
-                            "officer backlog: floor wake failed", exc_info=True
-                        )
-                floor_wakes[pool] = now.isoformat()
-                state_patch["backlog_floor_wakes"] = floor_wakes
+            try:
+                outcome = await db.queue_officer_floor_wake(
+                    project_id,
+                    expected_thread_id=thread_id,
+                    pool=pool,
+                    payload={
+                        "pool": pool,
+                        "category": category,
+                        "ready": len(ready),
+                        "floor": floor,
+                    },
+                    policy_debounce_seconds=FLOOR_WAKE_DEBOUNCE_HOURS * 3600,
+                    now=now,
+                    notifier=notify,
+                )
+                if isinstance(outcome, dict) and outcome.get("queued"):
+                    counts["wakes"] += 1
+            except Exception:
+                logger.warning("officer backlog: floor wake failed", exc_info=True)
+        elif scan.exhausted:
+            try:
+                await db.resolve_officer_floor_wake_retry(
+                    project_id,
+                    expected_thread_id=thread_id,
+                    pool=pool,
+                )
+            except Exception:
+                logger.warning(
+                    "officer backlog: floor wake recovery-state update failed",
+                    exc_info=True,
+                )
 
         if not ready:
             continue

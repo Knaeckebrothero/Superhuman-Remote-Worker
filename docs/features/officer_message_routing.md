@@ -67,6 +67,17 @@ is local and not deployed in the already-running O6 live-fire. The ordered audit
 [[officer_control_plane_post_implementation_audit]] because lower-priority OC-05/OC-06
 residues and unrelated unattended-backlog gates remain open.
 
+**2026-08-17 local, undeployed BP-10 checkpoint:** backlog-floor notifications now use the
+same durable wake/outbox authority rather than treating callback invocation as delivery.
+`officer_floor_wake_episodes` separates last attempted, durably queued, delivered, failure,
+and next-retry state. The six-hour floor policy debounce begins only when the existing
+session wake row is verifiably inserted; transient retry backoff is separate. Its dedup key
+is scoped to project, Officer-post incarnation, pool, and serialized floor episode, so
+replica races queue one intent. Hold keeps an already-durable event pending under the
+normal wake claim rules; decommission removes that obsolete event and supersedes the old
+episode while holding the established post -> thread -> wake lock order. SITREP and
+Cockpit surface attempted/queued/delivered/failed truth. No live delivery gate is claimed.
+
 Audit markers:
 
 - **[A-send]** `src/tools/communication/messaging.py::send_message` and

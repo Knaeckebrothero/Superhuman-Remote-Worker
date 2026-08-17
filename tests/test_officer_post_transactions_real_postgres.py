@@ -253,6 +253,454 @@ def _plan_index_names(node: dict) -> set[str]:
 
 
 @pytest.mark.asyncio
+async def test_bp07_strict_job_is_parked_then_concurrently_activated_once(db):
+    from services.officer_preflight import ensure_officer_job_activated
+
+    seed = await _seed_post(db)
+    job = await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs=_job_kwargs("BP-07 strict activation"),
+        ticket_note_id="bp07-ticket",
+        ticket_ready_at=READY_GENERATION,
+        strict_provisioning=True,
+    )
+    job = await db.get_job(str(job["id"]))
+    assert job["status"] == "paused"
+    assert _json(job["freeze_data"])["freeze_type"] == "officer_preflight"
+    assert await db.claim_job_for_agent(str(job["id"]), str(uuid4())) is False
+
+    provision_calls = 0
+
+    async def provision(_job, *, category=None):
+        nonlocal provision_calls
+        provision_calls += 1
+        await asyncio.sleep(0.05)
+
+    outcomes = await asyncio.gather(
+        ensure_officer_job_activated(db, job, provision=provision),
+        ensure_officer_job_activated(db, job, provision=provision),
+    )
+    stored = await db.get_job(str(job["id"]))
+    assert provision_calls == 1
+    assert stored["status"] == "created"
+    assert stored["freeze_data"] is None
+    assert sum(outcome.attempted for outcome in outcomes) == 1
+    assert await _job_count(db) == 1
+    assert len(await _claim_rows(db, seed["project_id"], "bp07-ticket")) == 1
+
+
+@pytest.mark.asyncio
+async def test_bp07_repository_and_cloud_preflights_never_enter_breaker_history(db):
+    from services.job_provisioning import JobProvisioningError
+    from services.officer_preflight import ensure_officer_job_activated
+
+    seed = await _seed_post(db, count=2)
+    jobs = []
+    for index, phase in enumerate(("repository", "cloud"), start=1):
+        job = await admit_and_create_job(
+            db,
+            preparation=await _prepare(db, seed),
+            job_kwargs=_job_kwargs(f"BP-07 {phase} failure"),
+            ticket_note_id=f"bp07-{phase}",
+            ticket_ready_at=READY_GENERATION + timedelta(seconds=index),
+            strict_provisioning=True,
+        )
+
+        async def fail(_job, *, category=None, _phase=phase):
+            raise JobProvisioningError(
+                f"{_phase} unavailable", phase=_phase, retryable=True
+            )
+
+        outcome = await ensure_officer_job_activated(db, job, provision=fail)
+        assert outcome.state == "retryable-failed"
+        jobs.append(job)
+
+    # This is the following-tick query, not an in-memory exception shortcut.
+    history = await db.list_officer_distinct_terminal_outcomes(
+        [seed["thread_id"]], slot="line", limit=2
+    )
+    assert history == []
+    assert await _job_count(db) == 2
+    assert len(await _claim_rows(db, seed["project_id"])) == 2
+
+
+@pytest.mark.asyncio
+async def test_bp07_real_pg_faults_before_and_after_activation_are_recoverable(db):
+    from services.officer_preflight import ensure_officer_job_activated
+
+    seed = await _seed_post(db, count=2)
+    durable_resources: set[str] = set()
+
+    async def provision(job, *, category=None):
+        # Models the production create-or-get repository/cloud provisioning:
+        # retrying the call cannot create a second durable resource.
+        durable_resources.add(str(job["id"]))
+
+    before = await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs=_job_kwargs("BP-07 crash before activation"),
+        ticket_note_id="bp07-before",
+        ticket_ready_at=READY_GENERATION,
+        strict_provisioning=True,
+    )
+
+    def crash_before(step):
+        if step == "after_provisioning_before_activation":
+            raise RuntimeError("crash-before-activation")
+
+    with pytest.raises(RuntimeError, match="crash-before-activation"):
+        await ensure_officer_job_activated(
+            db,
+            before,
+            provision=provision,
+            lease_seconds=0,
+            fault_injector=crash_before,
+        )
+    assert await db.claim_job_for_agent(str(before["id"]), str(uuid4())) is False
+    recovered = await ensure_officer_job_activated(
+        db, before, provision=provision, lease_seconds=0
+    )
+    assert recovered.activated is True
+
+    after = await admit_and_create_job(
+        db,
+        preparation=await _prepare(db, seed),
+        job_kwargs=_job_kwargs("BP-07 crash after activation"),
+        ticket_note_id="bp07-after",
+        ticket_ready_at=READY_GENERATION + timedelta(seconds=1),
+        strict_provisioning=True,
+    )
+
+    def crash_after(step):
+        if step == "after_activation":
+            raise RuntimeError("crash-after-activation")
+
+    with pytest.raises(RuntimeError, match="crash-after-activation"):
+        await ensure_officer_job_activated(
+            db, after, provision=provision, fault_injector=crash_after
+        )
+    calls_before_recovery = set(durable_resources)
+    recovered_after = await ensure_officer_job_activated(db, after, provision=provision)
+    assert recovered_after.activated is True
+    assert recovered_after.attempted is False
+    assert (
+        durable_resources
+        == calls_before_recovery
+        == {
+            str(before["id"]),
+            str(after["id"]),
+        }
+    )
+    assert await _job_count(db) == 2
+    assert len(await _claim_rows(db, seed["project_id"])) == 2
+
+
+@pytest.mark.asyncio
+async def test_bp08_materialization_lease_and_projection_converge_once(db):
+    seed = await _seed_post(db)
+    kwargs = {
+        "project_id": seed["project_id"],
+        "note_id": "bp08-ticket",
+        "content": "---\nid: bp08-ticket\ntype: feature\n---\n# Ticket\n",
+        "content_hash": "bp08-hash",
+    }
+    first, second = await asyncio.gather(
+        db.begin_knowledge_materialization(**kwargs),
+        db.begin_knowledge_materialization(**kwargs),
+    )
+    assert sum(bool(row["attempt_claimed"]) for row in (first, second)) == 1
+    owner = first if first["attempt_claimed"] else second
+    intent_id = str(owner["id"])
+    canonical = await db.finish_knowledge_materialization(
+        intent_id,
+        canonical=True,
+        attempt_token=str(owner["attempt_token"]),
+        path="knowledge/bp08-ticket.md",
+    )
+    assert canonical and canonical["canonical_state"] == "canonical"
+    assert await db.unresolved_knowledge_note_ids(
+        seed["project_id"], ["bp08-ticket"]
+    ) == {"bp08-ticket"}
+    projected = await db.finish_knowledge_projection(
+        intent_id, project_id=seed["project_id"], synced=True
+    )
+    projected_again = await db.finish_knowledge_projection(
+        intent_id, project_id=seed["project_id"], synced=True
+    )
+    assert projected["projected_at"] == projected_again["projected_at"]
+    assert (
+        await db.unresolved_knowledge_note_ids(seed["project_id"], ["bp08-ticket"])
+        == set()
+    )
+
+
+@pytest.mark.asyncio
+async def test_bp08_a_prior_canonical_payload_can_become_current_again(db):
+    seed = await _seed_post(db)
+
+    async def canonicalize(content_hash: str):
+        intent = await db.begin_knowledge_materialization(
+            project_id=seed["project_id"],
+            note_id="bp08-cycle",
+            content=content_hash,
+            content_hash=content_hash,
+        )
+        assert intent["attempt_claimed"] is True
+        return await db.finish_knowledge_materialization(
+            str(intent["id"]),
+            canonical=True,
+            attempt_token=str(intent["attempt_token"]),
+        )
+
+    first = await canonicalize("resolved")
+    await canonicalize("active")
+    repeated = await db.begin_knowledge_materialization(
+        project_id=seed["project_id"],
+        note_id="bp08-cycle",
+        content="resolved",
+        content_hash="resolved",
+    )
+
+    assert repeated["attempt_claimed"] is True
+    assert repeated["id"] != first["id"]
+
+
+@pytest.mark.asyncio
+async def test_bp10_duplicate_floor_ticks_queue_one_durable_wake(db):
+    from services.session_wake import notify_officer
+
+    seed = await _seed_post(db)
+    kwargs = {
+        "expected_thread_id": seed["thread_id"],
+        "pool": "line",
+        "payload": {"pool": "line", "ready": 0, "floor": 1},
+        "policy_debounce_seconds": 6 * 3600,
+        "notifier": notify_officer,
+    }
+    first, second = await asyncio.gather(
+        db.queue_officer_floor_wake(seed["project_id"], **kwargs),
+        db.queue_officer_floor_wake(seed["project_id"], **kwargs),
+    )
+    assert sum(bool(row["queued"]) for row in (first, second)) == 1, (first, second)
+    async with db.acquire() as conn:
+        assert await conn.fetchval("SELECT COUNT(*) FROM session_wake_events") == 1
+        assert (
+            await conn.fetchval("SELECT COUNT(*) FROM officer_floor_wake_episodes") == 1
+        )
+    debounced = await db.queue_officer_floor_wake(
+        seed["project_id"],
+        **kwargs,
+    )
+    assert debounced["state"] == "policy_debounce"
+    assert debounced["attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_bp10_outbox_rollback_retries_without_consuming_policy_debounce(db):
+    from services.session_wake import notify_officer
+
+    seed = await _seed_post(db)
+    now = datetime.now(timezone.utc)
+
+    def fail_after_insert(step):
+        if step == "after_outbox_insert":
+            raise RuntimeError("fault after insert")
+
+    failed = await db.queue_officer_floor_wake(
+        seed["project_id"],
+        expected_thread_id=seed["thread_id"],
+        pool="line",
+        payload={"pool": "line"},
+        policy_debounce_seconds=6 * 3600,
+        retry_backoff_seconds=60,
+        notifier=notify_officer,
+        now=now,
+        fault_injector=fail_after_insert,
+    )
+    assert failed["queued"] is False
+    async with db.acquire() as conn:
+        assert await conn.fetchval("SELECT COUNT(*) FROM session_wake_events") == 0
+        assert await conn.fetchval(
+            "SELECT last_queued_at IS NULL FROM officer_floor_wake_episodes"
+        )
+
+    retried = await db.queue_officer_floor_wake(
+        seed["project_id"],
+        expected_thread_id=seed["thread_id"],
+        pool="line",
+        payload={"pool": "line"},
+        policy_debounce_seconds=6 * 3600,
+        retry_backoff_seconds=60,
+        notifier=notify_officer,
+        now=now + timedelta(seconds=61),
+    )
+    assert retried["queued"] is True, retried
+    async with db.acquire() as conn:
+        assert await conn.fetchval("SELECT COUNT(*) FROM session_wake_events") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["missing", "false", "raises"])
+async def test_bp10_notifier_failures_do_not_queue_or_debounce(db, mode):
+    seed = await _seed_post(db)
+
+    async def notifier(*args, **kwargs):
+        if mode == "raises":
+            raise RuntimeError("notifier exploded")
+        return False
+
+    result = await db.queue_officer_floor_wake(
+        seed["project_id"],
+        expected_thread_id=seed["thread_id"],
+        pool="line",
+        payload={"pool": "line"},
+        policy_debounce_seconds=6 * 3600,
+        notifier=None if mode == "missing" else notifier,
+    )
+    assert result["attempted"] is True
+    assert result["queued"] is False
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT attempt_count, last_queued_at, failure_class "
+            "FROM officer_floor_wake_episodes"
+        )
+        assert row["attempt_count"] == 1
+        assert row["last_queued_at"] is None
+        assert (
+            row["failure_class"]
+            == {
+                "missing": "missing_notifier",
+                "false": "notifier_false",
+                "raises": "notifier_exception",
+            }[mode]
+        )
+        assert await conn.fetchval("SELECT COUNT(*) FROM session_wake_events") == 0
+
+
+@pytest.mark.asyncio
+async def test_bp10_delivery_updates_the_same_durable_episode(db):
+    from services.session_wake import notify_officer
+
+    seed = await _seed_post(db)
+    queued = await db.queue_officer_floor_wake(
+        seed["project_id"],
+        expected_thread_id=seed["thread_id"],
+        pool="line",
+        payload={"pool": "line"},
+        policy_debounce_seconds=6 * 3600,
+        notifier=notify_officer,
+    )
+    claimed = await db.claim_pending_session_wake_events(limit=10)
+    assert [row["id"] for row in claimed] == [queued["wake_event_id"]]
+    await db.finish_session_wake_events([queued["wake_event_id"]])
+
+    outcomes = await db.list_officer_floor_wake_outcomes(seed["project_id"])
+    assert outcomes[0]["state"] == "delivered"
+    assert outcomes[0]["last_attempted_at"] is not None
+    assert outcomes[0]["last_queued_at"] is not None
+    assert outcomes[0]["delivered_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_bp10_durable_intent_survives_hold_and_decommission_supersedes_it(db):
+    from services.session_wake import notify_officer
+
+    seed = await _seed_post(db)
+    queued = await db.queue_officer_floor_wake(
+        seed["project_id"],
+        expected_thread_id=seed["thread_id"],
+        pool="line",
+        payload={"pool": "line"},
+        policy_debounce_seconds=6 * 3600,
+        notifier=notify_officer,
+    )
+    assert queued["queued"] is True, queued
+    await db.set_project_officer_hold(
+        seed["project_id"],
+        expected_thread_id=seed["thread_id"],
+        hold={"kind": "maintenance", "since": "now", "note": "proof"},
+    )
+    assert await db.claim_pending_session_wake_events(limit=10) == []
+    async with db.acquire() as conn:
+        assert await conn.fetchval("SELECT state FROM session_wake_events") == "pending"
+
+    result = await db.decommission_project_officer(
+        seed["project_id"], seed["thread_id"], reason="BP-10 proof"
+    )
+    assert result["transitioned"] is True
+    async with db.acquire() as conn:
+        assert await conn.fetchval("SELECT COUNT(*) FROM session_wake_events") == 0
+        assert (
+            await conn.fetchval("SELECT state FROM officer_floor_wake_episodes")
+            == "superseded"
+        )
+
+
+@pytest.mark.asyncio
+async def test_bp10_decommission_racing_queue_leaves_no_orphaned_wake(db):
+    from services.session_wake import notify_officer
+
+    seed = await _seed_post(db)
+    queued, decommissioned = await asyncio.gather(
+        db.queue_officer_floor_wake(
+            seed["project_id"],
+            expected_thread_id=seed["thread_id"],
+            pool="line",
+            payload={"pool": "line"},
+            policy_debounce_seconds=6 * 3600,
+            notifier=notify_officer,
+        ),
+        db.decommission_project_officer(
+            seed["project_id"], seed["thread_id"], reason="BP-10 race proof"
+        ),
+    )
+    assert decommissioned["transitioned"] is True
+    assert queued["state"] in {"queued", "stale_incarnation", "unavailable"}
+    async with db.acquire() as conn:
+        assert await conn.fetchval("SELECT COUNT(*) FROM session_wake_events") == 0
+        active = await conn.fetchval(
+            "SELECT COUNT(*) FROM officer_floor_wake_episodes "
+            "WHERE state IN ('retryable', 'queued') AND resolved_at IS NULL"
+        )
+        assert active == 0
+
+
+@pytest.mark.asyncio
+async def test_bp10_hold_racing_queue_preserves_or_refuses_one_durable_intent(db):
+    from services.session_wake import notify_officer
+
+    seed = await _seed_post(db)
+    queued, held = await asyncio.gather(
+        db.queue_officer_floor_wake(
+            seed["project_id"],
+            expected_thread_id=seed["thread_id"],
+            pool="line",
+            payload={"pool": "line"},
+            policy_debounce_seconds=6 * 3600,
+            notifier=notify_officer,
+        ),
+        db.set_project_officer_hold(
+            seed["project_id"],
+            expected_thread_id=seed["thread_id"],
+            hold={"kind": "maintenance", "since": "now", "note": "race"},
+        ),
+    )
+    held_metadata = _json(held["thread"]["metadata"])
+    assert held_metadata["config_override"]["officer"]["hold"]["kind"] == (
+        "maintenance"
+    )
+    assert queued["state"] in {"queued", "held"}
+    async with db.acquire() as conn:
+        event_count = await conn.fetchval("SELECT COUNT(*) FROM session_wake_events")
+    assert event_count == (1 if queued["state"] == "queued" else 0)
+    # If queuing won the post lock, hold must keep the already-durable intent
+    # pending rather than deliver or discard it.
+    assert await db.claim_pending_session_wake_events(limit=10) == []
+
+
+@pytest.mark.asyncio
 async def test_bp06_distinct_breaker_and_stale_claim_queries_are_semantically_complete(
     db,
 ):

@@ -162,6 +162,7 @@ class KnowledgeGraphDB:
         phase: Optional[int] = None,
         retrieval_messages: Optional[List[str]] = None,
         links: Optional[List[Dict[str, str]]] = None,
+        note_id: Optional[str] = None,
     ) -> str:
         """Create a new knowledge note in Neo4j.
 
@@ -177,6 +178,9 @@ class KnowledgeGraphDB:
             phase: Phase number when created
             retrieval_messages: Synthetic queries for retrieval
             links: List of {"target": slug, "type": RELATIONSHIP_TYPE}
+            note_id: Server-derived canonical slug. When provided, creation is
+                idempotent for that exact note instead of deriving a second
+                collision suffix in the projection.
 
         Returns:
             The note's slug ID
@@ -193,7 +197,7 @@ class KnowledgeGraphDB:
                 f"Invalid confidence: {confidence}. Must be one of {CONFIDENCE_LEVELS}"
             )
 
-        slug = slugify(title)
+        slug = note_id or slugify(title)
         if not slug:
             slug = f"note-{secrets.token_hex(4)}"
 
@@ -205,6 +209,8 @@ class KnowledgeGraphDB:
             "MATCH (n:Note {project_id: $pid, id: $id}) RETURN n.id",
             {"pid": project_id, "id": slug},
         )
+        if existing and note_id is not None:
+            return slug
         if existing:
             digest = hashlib.sha256(content.encode()).hexdigest()[:6]
             slug = f"{slug}-{digest}"
