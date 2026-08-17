@@ -58,6 +58,12 @@ logger = logging.getLogger(__name__)
 # a no-op check one HEAD fetch + one watermark row per KB.
 SWEEP_TICK_SECONDS = int(os.getenv("KB_REINDEX_SWEEP_SECONDS", "900"))
 
+# Delay before the sweeper's FIRST pass, which doubles as crash recovery: an
+# in-process index dies with its orchestrator, and nothing else restarts it.
+# Short enough that a rollout costs seconds rather than a full tick, long enough
+# that startup (leader election, embedding-catalog resolution) has settled.
+FIRST_SWEEP_DELAY_SECONDS = int(os.getenv("KB_REINDEX_FIRST_SWEEP_SECONDS", "45"))
+
 # How often (in successfully stamped notes) to persist a progress counter during
 # a run. Coarse on purpose: bounds the extra watermark writes on a large first
 # index while keeping the Cockpit progress bar visibly moving.
@@ -759,6 +765,45 @@ async def _reindex_kb_unlocked(
 
     full = force_full or wm is None or wm.pipeline_version != current_version
 
+    # Turn the full-rebuild *decision* into durable per-row state before a single
+    # note is embedded. Left as a per-run flag it has to survive to completion:
+    # the fact behind it (pipeline_version) is written on success alone, so an
+    # interrupted rebuild re-derives full=True next time and re-embeds
+    # everything the dead run finished. Clearing the stamps and recording the
+    # pipeline version up front hands the work list to the per-row diff instead,
+    # which makes every subsequent run resume where this one stops.
+    plan_full = full
+    if full:
+        try:
+            cleared = await store.clear_note_stamps(kb_id)
+            await store.upsert_watermark(
+                kb_id=kb_id,
+                repo_name=source_label[:255],
+                branch=branch,
+                indexed_commit=previous_indexed_commit,
+                pipeline_version=current_version,
+                source_head=head,
+                status="indexing",
+                last_error=None,
+            )
+        except Exception as exc:
+            # Resumability is an optimization; correctness is not. If either
+            # write fails, fall back to the old per-run semantics rather than
+            # entering the loop with a work list that skips unstamped notes.
+            logger.warning(
+                "kb_reindex[%s]: rebuild invalidation skipped (%s) — "
+                "falling back to a non-resumable full pass",
+                kb_id,
+                exc,
+            )
+        else:
+            plan_full = False
+            logger.info(
+                "kb_reindex[%s]: full rebuild — cleared %d note stamp(s)",
+                kb_id,
+                cleared,
+            )
+
     await _set_reindex_status(
         store,
         kb_id,
@@ -781,6 +826,7 @@ async def _reindex_kb_unlocked(
                 embedding_stamp=embedding_stamp,
                 pipeline_version=current_version,
                 full=full,
+                plan_full=plan_full,
                 previous_indexed_commit=previous_indexed_commit,
             )
     except Exception as exc:
@@ -819,8 +865,20 @@ async def _reindex_snapshot(
     pipeline_version: str,
     full: bool,
     previous_indexed_commit: Optional[str],
+    plan_full: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """Index one immutable source snapshot, which owns all blob reads."""
+    """Index one immutable source snapshot, which owns all blob reads.
+
+    ``full`` describes the run for the caller's summary and logs; ``plan_full``
+    is the narrower question of whether the work list still has to be forced.
+    They diverge on the normal rebuild path, where the caller has already
+    cleared the note stamps: the per-row diff then selects the whole vault on
+    its own *and* keeps selecting whatever is left after an interruption, so
+    forcing it a second time would only discard that resumability. ``plan_full``
+    defaults to ``full`` so callers that never invalidate keep the old behavior.
+    """
+    if plan_full is None:
+        plan_full = full
 
     try:
         tree = await snapshot.list_tree()
@@ -848,7 +906,7 @@ async def _reindex_snapshot(
 
     current_map = knowledge_blob_map(tree, root_path)
     indexed_map = await store.get_indexed_blob_shas(kb_id)
-    upsert_paths, delete_paths = plan_reindex(indexed_map, current_map, full=full)
+    upsert_paths, delete_paths = plan_reindex(indexed_map, current_map, full=plan_full)
 
     # Bulk-fetch the snapshot as ONE archive download when the batch is big
     # enough to amortize it (full rebuilds, big backlogs). Small incremental
@@ -1295,13 +1353,25 @@ async def kb_reindex_sweeper_loop(
     no resolvable embedding service is skipped loudly — a keyless reindex could
     only write vectorless rows, and honesty beats coverage.
     """
-    logger.info("KB reindex sweeper started (tick=%ds)", SWEEP_TICK_SECONDS)
+    logger.info(
+        "KB reindex sweeper started (tick=%ds, first sweep in %ds)",
+        SWEEP_TICK_SECONDS,
+        FIRST_SWEEP_DELAY_SECONDS,
+    )
+    # The first sweep is deliberately not a full tick away. Indexing is an
+    # in-process task, so every orchestrator rollout kills whatever was running;
+    # this loop is the only thing that restarts it, and at one tick of latency a
+    # KB that a deploy interrupted stayed dead for 15 minutes. The short initial
+    # delay still lets startup settle (leader election, embedding catalog) before
+    # the first pass.
+    delay = FIRST_SWEEP_DELAY_SECONDS
     while not shutdown_event.is_set():
         try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=SWEEP_TICK_SECONDS)
+            await asyncio.wait_for(shutdown_event.wait(), timeout=delay)
             break  # shutdown requested
         except asyncio.TimeoutError:
             pass  # tick due
+        delay = SWEEP_TICK_SECONDS
         try:
             svc = await embedding_service_factory()
             if svc is None:
