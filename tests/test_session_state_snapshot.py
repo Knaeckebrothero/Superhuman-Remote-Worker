@@ -36,6 +36,7 @@ class _SnapshotConn:
         control_receipts: list[dict] | None = None,
         message_count: int = 0,
         live_turn_count: int = 0,
+        usage_events: list[dict] | None = None,
     ) -> None:
         self.thread = thread
         self.lifecycle = lifecycle
@@ -45,6 +46,11 @@ class _SnapshotConn:
         self.control_receipts = control_receipts or []
         self.message_count = message_count
         self.live_turn_count = live_turn_count
+        # Rows the production ``usage.updated`` SELECT would return: the
+        # frames of the newest turn carrying usage, oldest first. Each entry is
+        # ``{"seq": int, "payload": <dict or json str>}``; ``seq`` is unused by
+        # the builder and only present so fixtures read like the journal.
+        self.usage_events = usage_events or []
         self.calls: list[tuple[str, tuple]] = []
 
     def transaction(self, **kwargs):
@@ -76,6 +82,15 @@ class _SnapshotConn:
         if "FROM thread_session_tasks" in sql:
             assert "ORDER BY task_number ASC" in sql
             return self.tasks
+        if "'usage.updated'" in sql:
+            # Pin the two predicates the double-count contract rests on: the
+            # read is bounded by the same hwm that becomes ``event_cursor``
+            # (so the Cockpit's ``coveredBySnapshot`` partitions the journal
+            # on the identical seq), and it selects one turn, not one frame.
+            assert "event.seq <= $3" in sql
+            assert "IS NOT DISTINCT FROM latest.turn" in sql
+            assert args[2] == int(self.thread["events_seq_hwm"] or 0)
+            return self.usage_events
         if "FROM thread_control_requests" in sql:
             # Model the query's partial read rather than handing finalized
             # history to the snapshot builder. Keeping ``outcome`` on these
@@ -240,6 +255,10 @@ async def test_snapshot_has_full_lane_free_shape_and_normalizes_durable_rows():
             },
         ],
         "tasks": [],
+        # Explicit null, not an omitted key: presence is authoritative on the
+        # Cockpit side, so a thread with no usage history actively clears the
+        # panel rather than leaving the previous session's numbers on screen.
+        "usage": None,
         "event_cursor": {"epoch": 3, "seq": 41},
         "replay_cursor": {"epoch": 3, "seq": 38},
         "snapshot_source": "durable_journal",
@@ -465,6 +484,122 @@ async def test_snapshot_explicitly_clears_idle_runtime_and_pending_state():
     assert result["narration_mode"] == "auto"
     assert result["model"] is None
     assert result["temperature"] is None
+
+
+def _usage_event(seq: int, **payload) -> dict:
+    return {"seq": seq, "payload": payload}
+
+
+@pytest.mark.asyncio
+async def test_usage_accumulates_the_turns_calls_not_just_its_last_frame():
+    """A tool-using turn makes several LLM calls; the panel shows their sum.
+
+    Restoring only the newest frame would under-report OUTPUT by every call but
+    the last, which is the number the user watches to see what a turn cost.
+    """
+
+    conn = _SnapshotConn(
+        thread=_thread(),
+        lifecycle={
+            "latest_kind": "turn.completed",
+            "latest_turn_id": "6",
+            "latest_turn_start_seq": 30,
+        },
+        usage_events=[
+            _usage_event(
+                31,
+                turn=6,
+                input_tokens=40_000,
+                output_tokens=500,
+                reasoning_tokens=120,
+                ctx_limit_tokens=200_000,
+                compaction_threshold_tokens=160_000,
+            ),
+            _usage_event(35, turn=6, input_tokens=44_000, output_tokens=210),
+            _usage_event(
+                39, turn=6, input_tokens=47_500, output_tokens=90, reasoning_tokens=30
+            ),
+        ],
+    )
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["usage"] == {
+        "turn": 6,
+        # Latest wins: the newest call's prompt is the current context fill.
+        "input_tokens": 47_500,
+        # Accumulated across the turn's calls.
+        "output_tokens": 800,
+        "reasoning_tokens": 150,
+        "reasoning_estimated": False,
+        # Sticky: later frames omit the limits, so the first frame's survive.
+        "ctx_limit_tokens": 200_000,
+        "compaction_threshold_tokens": 160_000,
+    }
+
+
+@pytest.mark.asyncio
+async def test_usage_is_sticky_true_once_any_call_estimated_reasoning():
+    conn = _SnapshotConn(
+        thread=_thread(),
+        usage_events=[
+            _usage_event(
+                20,
+                turn=2,
+                input_tokens=9_000,
+                output_tokens=81,
+                reasoning_tokens=70,
+                reasoning_estimated=True,
+            ),
+            # Provider reported a real count on the follow-up call; the turn
+            # as a whole is still partly derived, so the panel keeps the ~.
+            _usage_event(24, turn=2, input_tokens=9_500, output_tokens=40),
+        ],
+    )
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["usage"]["reasoning_estimated"] is True
+    assert result["usage"]["reasoning_tokens"] == 70
+
+
+@pytest.mark.asyncio
+async def test_usage_tolerates_json_encoded_payloads_and_missing_fields():
+    """asyncpg may hand back jsonb as text, and old frames predate fields."""
+
+    conn = _SnapshotConn(
+        thread=_thread(),
+        usage_events=[
+            {"seq": 10, "payload": json.dumps({"turn": 1, "input_tokens": 5_000})},
+            {"seq": 11, "payload": json.dumps({"turn": 1, "output_tokens": 7})},
+        ],
+    )
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["usage"] == {
+        "turn": 1,
+        # The newest frame omits input entirely — the previous one still holds.
+        "input_tokens": 5_000,
+        "output_tokens": 7,
+        "reasoning_tokens": 0,
+        "reasoning_estimated": False,
+        "ctx_limit_tokens": None,
+        "compaction_threshold_tokens": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_usage_is_none_when_the_thread_never_reported_any():
+    conn = _SnapshotConn(thread=_thread(), usage_events=[])
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["usage"] is None
 
 
 @pytest.mark.asyncio

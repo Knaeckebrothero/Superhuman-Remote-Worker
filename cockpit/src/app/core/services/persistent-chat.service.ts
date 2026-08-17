@@ -335,6 +335,13 @@ export function describeAppliedConfig(
  * across the turn's calls. (docs/features/context_summarization_rework.md S5)
  */
 export interface UsageState {
+  /** The thread these numbers describe. The service is a root singleton, so
+   *  binding the value to its thread — rather than trusting every future
+   *  thread-transition path to remember a reset — is what makes a stale panel
+   *  structurally unrenderable. Read through `currentUsage`, never `usage`
+   *  directly. See
+   *  docs/done/session_usage_panel_leaks_previous_session_counters.md. */
+  threadId: string | null;
   turn: number | null;
   inputTokens: number | null;
   outputTokensTurn: number;
@@ -397,6 +404,19 @@ type ConnectionPayload =
       expires_at: null;
     };
 
+/** Server-aggregated token telemetry riding the durable `session.state`
+ *  snapshot. Wire shape mirrors a `usage.updated` frame, except that
+ *  output/reasoning are already summed across the turn's calls. */
+interface SessionStateUsage {
+  turn: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  reasoning_tokens: number | null;
+  reasoning_estimated: boolean;
+  ctx_limit_tokens: number | null;
+  compaction_threshold_tokens: number | null;
+}
+
 /** Durable REST twin of the agent's direct ``session.state`` welcome frame. */
 interface SessionStateSnapshot extends Record<string, unknown> {
   thread_id: string;
@@ -411,6 +431,10 @@ interface SessionStateSnapshot extends Record<string, unknown> {
   pending_permissions: unknown[];
   /** Present on task-aware servers; omitted by older rolling-deploy peers. */
   tasks?: SessionTask[];
+  /** Last known token telemetry, aggregated from the journal at
+   *  `event_cursor`. Explicit null = this thread has never reported usage.
+   *  Omitted entirely by older rolling-deploy peers. */
+  usage?: SessionStateUsage | null;
   event_cursor: { epoch: number; seq: number };
   /** Exclusive journal floor that reconstructs the latest logical turn. */
   replay_cursor: { epoch: number; seq: number };
@@ -616,9 +640,25 @@ export class PersistentChatService {
   readonly compaction = signal<CompactionProgressState | null>(null);
 
   // Live per-turn token telemetry (usage.updated frames); null until the
-  // first main-LLM call reports usage.
+  // first main-LLM call reports usage. Raw backing signal — UI reads
+  // `currentUsage`, which enforces the thread binding.
   readonly usage = signal<UsageState | null>(null);
   readonly threadId = signal<string | null>(null);
+  /**
+   * The usage panel's only sanctioned source: telemetry that provably belongs
+   * to the thread on screen.
+   *
+   * Anything else reads as null, so a value left over from a previous session
+   * cannot be rendered even if some future thread-transition path forgets to
+   * clear it — the leak this closes was precisely a missing reset. A null
+   * `threadId` (draft session, or a value from before this field existed)
+   * never matches, including against the null `threadId()` of a draft.
+   */
+  readonly currentUsage = computed<UsageState | null>(() => {
+    const u = this.usage();
+    if (!u || u.threadId == null) return null;
+    return u.threadId === this.threadId() ? u : null;
+  });
   /** Engine citations for this session, keyed by citation id (the agent emits
    *  the id as the inline `[N]` marker). Drives inline resolution +
    *  source popover (see CitationRefDirective). Loaded on connect + per turn. */
@@ -1006,6 +1046,12 @@ export class PersistentChatService {
   // snapshot reopens that retained turn and SSE resumes after the tab's last
   // folded frame instead of replaying/doubling the prefix.
   private snapshotJoinsPreservedTurn = false;
+  // True once the durable snapshot has hydrated `usage` for this connect.
+  // Only then may replayed `usage.updated` frames at/below the cursor be
+  // dropped as already-counted. A rolling-deploy peer that predates the
+  // snapshot's `usage` key seeds nothing, and dropping its covered frames
+  // would leave the panel blank after a reload until the next LLM call.
+  private snapshotSeededUsage = false;
   // Tab-local resume point. IndexedDB is shared by every tab, so consulting
   // it again after the snapshot lets another tab advance us past a state
   // change this tab has not applied. `undefined` means no snapshot supplied
@@ -1155,6 +1201,10 @@ export class PersistentChatService {
       this.modelName.set(null);
       this.temperature.set(0);
       this.turnCount.set(0);
+      // Token telemetry is per-thread. `currentUsage` would refuse to render
+      // the outgoing thread's numbers anyway; clearing here frees the value
+      // and keeps this list an honest inventory of what a switch resets.
+      this.usage.set(null);
       this.ncSessionFolder.set(null);
       this.cloudSessionUrl.set(null);
       this.tasks.set([]);
@@ -1221,6 +1271,7 @@ export class PersistentChatService {
     this.disconnect();
     this.dispatch({ type: 'reset', threadId: null });
     this.threadId.set(null);
+    this.usage.set(null);
     this.outbox.set([]);
     // Leaving a thread for the landing draft is a thread transition like
     // any other: the chips (and any eager upload behind them) belong to the
@@ -1332,6 +1383,7 @@ export class PersistentChatService {
     // again with the real thread id once the POST resolves.
     this.dispatch({ type: 'reset', threadId: null });
     this.threadId.set(null);
+    this.usage.set(null);
     this.isCreating.set(true);
     this.connectionState.set('connecting');
     this.startupPhase.set('creating');
@@ -1556,6 +1608,7 @@ export class PersistentChatService {
     this.sessionSnapshotFailed = false;
     this.sessionSnapshotCursor = null;
     this.snapshotJoinsPreservedTurn = false;
+    this.snapshotSeededUsage = false;
     this.sseReplayCursor = undefined;
     try {
       const snapshot = await firstValueFrom(
@@ -2796,6 +2849,7 @@ export class PersistentChatService {
     this.sessionSnapshotFailed = false;
     this.sessionSnapshotCursor = null;
     this.snapshotJoinsPreservedTurn = false;
+    this.snapshotSeededUsage = false;
     this.sseReplayCursor = undefined;
     this.intentionalClose = true;
     this.isCreating.set(false);
@@ -3816,6 +3870,27 @@ export class PersistentChatService {
     });
   }
 
+  /** Map the durable snapshot's aggregated token telemetry onto `UsageState`,
+   *  stamping the thread it was fetched for. Null in → null out, which is how
+   *  a thread with no usage history clears the panel.
+   *
+   *  The server already summed output/reasoning across the turn's calls, so
+   *  these land as totals rather than being accumulated again; the replay that
+   *  follows skips the frames this covers (see the `usage.updated` handler). */
+  private _usageFromSnapshot(raw: SessionStateUsage | null | undefined): UsageState | null {
+    if (!raw) return null;
+    return {
+      threadId: this.threadId(),
+      turn: raw.turn ?? null,
+      inputTokens: raw.input_tokens ?? null,
+      outputTokensTurn: raw.output_tokens ?? 0,
+      reasoningTokensTurn: raw.reasoning_tokens ?? 0,
+      reasoningEstimated: !!raw.reasoning_estimated,
+      ctxLimitTokens: raw.ctx_limit_tokens ?? null,
+      compactionThresholdTokens: raw.compaction_threshold_tokens ?? null,
+    };
+  }
+
   /** Map raw wire entries (snake_case `approval_id`) to `PermissionRequest`s
    *  (camelCase `approvalId`). Shared by `session.state`, `permission.request`,
    *  and `permission.request_batch` — an unmapped `approvalId` silently
@@ -4382,6 +4457,17 @@ export class PersistentChatService {
           const snapshotTasks = params['tasks'];
           this.tasks.set(Array.isArray(snapshotTasks) ? (snapshotTasks as SessionTask[]) : []);
         }
+        // Token telemetry, same presence discipline as tasks: an explicit
+        // null is authoritative and clears the panel (a never-answered thread
+        // reports null, which is what stops a previous session's numbers from
+        // being rendered here), while an older peer that omits the key leaves
+        // whatever replay has already rebuilt alone. Only the durable REST
+        // snapshot is trusted — the pinned WS welcome frame arrives after
+        // replay has run, so seeding from it could clobber live state.
+        if (durableSnapshot && 'usage' in params) {
+          this.usage.set(this._usageFromSnapshot(params['usage'] as SessionStateUsage | null));
+          this.snapshotSeededUsage = true;
+        }
         if (allowSessionReady) this.markSessionReady();
         break;
       }
@@ -4819,10 +4905,25 @@ export class PersistentChatService {
         break;
 
       case 'usage.updated': {
-        const prev = this.usage();
+        // The session-state snapshot already aggregated every frame at or
+        // below its cursor. Re-accumulating those on replay would double the
+        // latest turn's output/reasoning, so let the snapshot own them —
+        // but only when it actually seeded them (see snapshotSeededUsage).
+        if (coveredBySnapshot && this.snapshotSeededUsage) break;
+        const threadId = this.threadId();
+        const raw = this.usage();
+        // Every carry-over below — the per-turn accumulators AND the sticky
+        // "omitted field keeps its last value" fallbacks — is gated on this.
+        // Without it a frame that omits input_tokens or a limit would inherit
+        // the *previous session's* figure through the `??` chain, which is the
+        // leak wearing a different hat.
+        const prev = raw !== null && raw.threadId === threadId ? raw : null;
         const turn = (params['turn'] as number) ?? null;
+        // Turn numbers restart per session, so same-turn is only meaningful
+        // once same-thread is established above.
         const sameTurn = prev !== null && prev.turn === turn;
         this.usage.set({
+          threadId,
           turn,
           // Latest call's prompt size ≈ current context fill
           inputTokens: (params['input_tokens'] as number) ?? prev?.inputTokens ?? null,

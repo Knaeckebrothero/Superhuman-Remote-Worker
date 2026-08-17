@@ -31,6 +31,14 @@ Absorbs the issues deferred from `docs/issues/session_silent_failure_audit.md` t
 (tool-result caps), **#6** (keep-window elision), **#7** (aux-context
 clamping/chunking) — plus the compaction progress UI and live token counters.
 
+**S5 follow-up (2026-08-17):** the token panel this doc introduced (§4.6) shipped
+with its `usage` state unbound to any thread, so a new session rendered the
+*previous* session's counters until its first LLM call. Fixed and live-verified —
+the state is now thread-stamped and restorable from the durable `session.state`
+snapshot. See `docs/done/session_usage_panel_leaks_previous_session_counters.md`;
+§4.6's unbuilt `ctx_used_tokens` field is re-examined and deliberately still not
+built there.
+
 **Evidence base:** threads `1f39a5a6` (gpt-5.5 @ 1.05M main ctx, 951k-token
 conversation sent whole to a 131k summarizer) and `b60166ee` (gpt-5.3-codex-spark
 @ 128k, four giant PDF tool results → unrecoverable 234k-token request),

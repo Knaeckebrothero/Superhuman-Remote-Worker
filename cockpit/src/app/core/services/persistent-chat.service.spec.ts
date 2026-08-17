@@ -6451,6 +6451,258 @@ describe('PersistentChatService — usage.updated telemetry', () => {
     return { ...ctx, es };
   }
 
+  /** Connect-time GETs carrying a *valid* durable session-state snapshot, so
+   *  the snapshot path — and the `coveredBySnapshot` cursor derived from it —
+   *  is actually exercised. `setup()` above deliberately serves a malformed
+   *  one, which makes every frame uncovered. */
+  function snapshotGetMock(
+    threadId: string,
+    opts: { usage?: unknown; cursorSeq?: number; omitUsageKey?: boolean } = {},
+  ) {
+    const seq = opts.cursorSeq ?? 10;
+    return (url: string) => {
+      if (url.includes('/api/sessions/') && url.endsWith('/connection')) {
+        return of({
+          state: 'ready',
+          control_socket: 'none',
+          ws_url: null,
+          token: null,
+          expires_at: null,
+        });
+      }
+      if (url.endsWith('/messages')) return of({ messages: [], total: 0 });
+      if (url.endsWith('/state')) {
+        const snapshot: Record<string, unknown> = {
+          thread_id: threadId,
+          permission_mode: 'supervised',
+          narration_mode: 'auto',
+          turn_count: 1,
+          turn_in_flight: false,
+          message_count: 2,
+          model: null,
+          temperature: null,
+          running_tool: null,
+          pending_permissions: [],
+          event_cursor: { epoch: 1, seq },
+          replay_cursor: { epoch: 1, seq: 0 },
+          snapshot_source: 'durable_journal',
+        };
+        if (!opts.omitUsageKey) snapshot['usage'] = opts.usage ?? null;
+        return of(snapshot);
+      }
+      return of({ status: 'active', total_turns: 1 });
+    };
+  }
+
+  async function setupWithSnapshot(
+    threadId: string,
+    opts: { usage?: unknown; cursorSeq?: number; omitUsageKey?: boolean } = {},
+  ) {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(snapshotGetMock(threadId, opts));
+    await ctx.service.connect(threadId);
+    const es = ctx.sseInstances[0];
+    fireSseOpen(es);
+    return { ...ctx, es };
+  }
+
+  /** Connect, then report one turn's usage. The shape the leak came from. */
+  async function connectWithUsage(threadId: string, params: Record<string, unknown>) {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(() =>
+      of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
+    );
+    await ctx.service.connect(threadId);
+    fireSseOpen(ctx.sseInstances[0]);
+    fireSseMessage(ctx.sseInstances[0], { method: 'usage.updated', params }, '1:1');
+    return ctx;
+  }
+
+  // ── Thread isolation ───────────────────────────────────────────────────
+  // The service is a root singleton, so `usage` outlives any one session.
+  // Regression net for
+  // docs/done/session_usage_panel_leaks_previous_session_counters.md —
+  // a brand-new session rendered the previous one's 154.6k input at Turn 0.
+
+  it('does not render a previous session’s counters after a thread switch', async () => {
+    const ctx = await connectWithUsage('thread-old', {
+      turn: 4,
+      input_tokens: 154_600,
+      output_tokens: 118,
+      reasoning_tokens: 28,
+      ctx_limit_tokens: 320_000,
+      compaction_threshold_tokens: 320_000,
+    });
+    expect(ctx.service.currentUsage()!.inputTokens).toBe(154_600);
+
+    await ctx.service.connect('thread-new');
+    fireSseOpen(ctx.sseInstances[1]);
+
+    // Nothing to show yet on the new thread — and crucially not the old one's.
+    expect(ctx.service.currentUsage()).toBeNull();
+    expect(ctx.service.usage()).toBeNull();
+  });
+
+  it('refuses to render telemetry stamped with a different thread', async () => {
+    const { service } = await setup();
+    // The pre-fix residue, injected directly: a value some reset path missed.
+    // The thread binding has to make it unrenderable on its own.
+    service.usage.set({
+      threadId: 'some-other-thread',
+      turn: 9,
+      inputTokens: 154_600,
+      outputTokensTurn: 118,
+      reasoningTokensTurn: 28,
+      reasoningEstimated: false,
+      ctxLimitTokens: 320_000,
+      compactionThresholdTokens: 320_000,
+    });
+    expect(service.currentUsage()).toBeNull();
+  });
+
+  it('clears telemetry when leaving a session for the landing draft', async () => {
+    const ctx = await connectWithUsage('thread-old', {
+      turn: 1,
+      input_tokens: 10_000,
+      output_tokens: 40,
+    });
+    expect(ctx.service.currentUsage()).not.toBeNull();
+
+    ctx.service.enterDraftSession();
+
+    expect(ctx.service.threadId()).toBeNull();
+    expect(ctx.service.usage()).toBeNull();
+    // A null-threaded value must never match the draft's null threadId.
+    expect(ctx.service.currentUsage()).toBeNull();
+  });
+
+  it('starts a new thread’s accumulation from zero, not the old thread’s total', async () => {
+    const ctx = await connectWithUsage('thread-old', {
+      turn: 1,
+      input_tokens: 90_000,
+      output_tokens: 400,
+      ctx_limit_tokens: 200_000,
+    });
+    await ctx.service.connect('thread-new');
+    fireSseOpen(ctx.sseInstances[1]);
+    // Same turn number as the old thread, and it omits input + the limits:
+    // neither the accumulators nor the sticky `?? prev` fallbacks may reach
+    // across the thread boundary.
+    fireSseMessage(
+      ctx.sseInstances[1],
+      { method: 'usage.updated', params: { turn: 1, output_tokens: 25 } },
+      '1:1',
+    );
+    const u = ctx.service.currentUsage()!;
+    expect(u.threadId).toBe('thread-new');
+    expect(u.outputTokensTurn).toBe(25);
+    expect(u.inputTokens).toBeNull();
+    expect(u.ctxLimitTokens).toBeNull();
+  });
+
+  // ── Durable snapshot restore ───────────────────────────────────────────
+
+  it('seeds the panel from the durable session-state snapshot on reload', async () => {
+    const { service } = await setupWithSnapshot('thread-reload', {
+      usage: {
+        turn: 7,
+        input_tokens: 61_000,
+        output_tokens: 1_200,
+        reasoning_tokens: 300,
+        reasoning_estimated: true,
+        ctx_limit_tokens: 200_000,
+        compaction_threshold_tokens: 160_000,
+      },
+    });
+    const u = service.currentUsage()!;
+    expect(u.threadId).toBe('thread-reload');
+    expect(u.turn).toBe(7);
+    expect(u.inputTokens).toBe(61_000);
+    // Server-side totals land as totals — they are not re-accumulated.
+    expect(u.outputTokensTurn).toBe(1_200);
+    expect(u.reasoningTokensTurn).toBe(300);
+    expect(u.reasoningEstimated).toBe(true);
+    expect(u.compactionThresholdTokens).toBe(160_000);
+  });
+
+  it('treats an explicit null snapshot usage as authoritative', async () => {
+    const ctx = await connectWithUsage('thread-old', { turn: 1, input_tokens: 154_600 });
+    // Reconnect to a thread whose journal carries no usage at all.
+    ctx.mockHttp.get.mockImplementation(snapshotGetMock('thread-fresh', { usage: null }));
+    await ctx.service.connect('thread-fresh');
+    fireSseOpen(ctx.sseInstances[1]);
+    expect(ctx.service.usage()).toBeNull();
+    expect(ctx.service.currentUsage()).toBeNull();
+  });
+
+  it('does not double-count replayed frames the snapshot already aggregated', async () => {
+    const { service, es } = await setupWithSnapshot('thread-replay', {
+      cursorSeq: 10,
+      usage: {
+        turn: 3,
+        input_tokens: 50_000,
+        output_tokens: 900,
+        reasoning_tokens: 100,
+        reasoning_estimated: false,
+        ctx_limit_tokens: 200_000,
+        compaction_threshold_tokens: 160_000,
+      },
+    });
+    // Guard the guard: if the snapshot had failed to load, the assertions
+    // below would pass on coincidence (the replayed frames happen to sum to
+    // the same 900). `reasoning` is the discriminator — only seeding supplies
+    // it, since neither replayed frame carries a reasoning count.
+    expect(service.currentUsage()!.outputTokensTurn).toBe(900);
+    expect(service.currentUsage()!.reasoningTokensTurn).toBe(100);
+
+    // Replay re-delivers the very frames the snapshot summed (seq <= 10).
+    // Unskipped, these would drive the total to 1800.
+    fireSseMessage(
+      es,
+      { method: 'usage.updated', params: { turn: 3, input_tokens: 49_000, output_tokens: 600 } },
+      '1:9',
+    );
+    fireSseMessage(
+      es,
+      { method: 'usage.updated', params: { turn: 3, input_tokens: 50_000, output_tokens: 300 } },
+      '1:10',
+    );
+    let u = service.currentUsage()!;
+    expect(u.outputTokensTurn).toBe(900);
+    expect(u.reasoningTokensTurn).toBe(100);
+    expect(u.inputTokens).toBe(50_000);
+
+    // A genuinely newer frame (seq > cursor) still accumulates on top.
+    fireSseMessage(
+      es,
+      { method: 'usage.updated', params: { turn: 3, input_tokens: 52_000, output_tokens: 150 } },
+      '1:11',
+    );
+    u = service.currentUsage()!;
+    expect(u.outputTokensTurn).toBe(1_050);
+    expect(u.inputTokens).toBe(52_000);
+  });
+
+  it('rebuilds from replay when an older peer omits the usage key', async () => {
+    // Rolling deploy: an older orchestrator's snapshot has no `usage` key, so
+    // nothing is seeded. Its covered frames must therefore still accumulate —
+    // dropping them as "already counted" would leave the panel blank after a
+    // reload until the next LLM call.
+    const { service, es } = await setupWithSnapshot('thread-legacy', {
+      omitUsageKey: true,
+      cursorSeq: 10,
+    });
+    expect(service.currentUsage()).toBeNull();
+    // Below the snapshot cursor — covered, but uncounted by an old peer.
+    fireSseMessage(
+      es,
+      { method: 'usage.updated', params: { turn: 2, input_tokens: 33_000, output_tokens: 70 } },
+      '1:5',
+    );
+    expect(service.currentUsage()!.inputTokens).toBe(33_000);
+    expect(service.currentUsage()!.outputTokensTurn).toBe(70);
+  });
+
   it('accumulates output/reasoning within a turn, latest input wins', async () => {
     const { service, es } = await setup();
     fireSseMessage(

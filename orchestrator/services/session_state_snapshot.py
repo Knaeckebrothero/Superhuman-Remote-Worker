@@ -91,6 +91,53 @@ def _iso_timestamp(value: Any) -> str | None:
     return isoformat() if callable(isoformat) else str(value)
 
 
+def _usage_snapshot(rows: list[Any]) -> dict[str, Any] | None:
+    """Rebuild the Cockpit usage panel from one turn's ``usage.updated`` frames.
+
+    ``rows`` are the frames of the latest turn that carried usage, in seq order
+    (see the query in ``build_session_state_snapshot``).  The aggregation rule
+    mirrors the Cockpit handler exactly, because the two have to agree: input
+    and the limits are *latest wins* (sticky — a frame that omits one keeps the
+    previous value), while output and reasoning **accumulate across the turn's
+    calls**, and ``reasoning_estimated`` is sticky-true once any call estimated.
+
+    Restoring only the newest frame would under-report a tool-using turn's
+    output by every call but the last, which is why this aggregates rather than
+    just reading the tail.
+    """
+
+    payloads = [p for p in (_json_object(row["payload"]) for row in rows) if p]
+    if not payloads:
+        return None
+
+    def latest(key: str) -> int | None:
+        for payload in reversed(payloads):
+            value = _integer(payload.get(key))
+            if value is not None:
+                return value
+        return None
+
+    output_tokens = 0
+    reasoning_tokens = 0
+    reasoning_estimated = False
+    for payload in payloads:
+        output_tokens += _integer(payload.get("output_tokens")) or 0
+        reasoning_tokens += _integer(payload.get("reasoning_tokens")) or 0
+        reasoning_estimated = reasoning_estimated or bool(
+            payload.get("reasoning_estimated")
+        )
+
+    return {
+        "turn": latest("turn"),
+        "input_tokens": latest("input_tokens"),
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "reasoning_estimated": reasoning_estimated,
+        "ctx_limit_tokens": latest("ctx_limit_tokens"),
+        "compaction_threshold_tokens": latest("compaction_threshold_tokens"),
+    }
+
+
 def _session_task(row: Any) -> dict[str, Any]:
     """Map one migration-0133 row onto the stable Cockpit task shape."""
 
@@ -148,6 +195,7 @@ async def build_session_state_snapshot(
             thread_source = dict(thread)
 
             epoch = int(thread["events_epoch"] or 0)
+            hwm = int(thread_source.get("events_seq_hwm") or 0)
             message_count = int(
                 await conn.fetchval(
                     "SELECT COUNT(*) FROM thread_messages "
@@ -255,6 +303,40 @@ async def build_session_state_snapshot(
                 ORDER BY task_number ASC
                 """,
                 thread_id,
+            )
+            # Token telemetry for the composer's usage panel: every frame of
+            # the newest turn that reported usage, oldest first.
+            #
+            # Bounded by the same ``hwm`` that becomes ``event_cursor``, so
+            # "aggregated here" and the client's ``coveredBySnapshot`` test
+            # partition the journal on the identical seq. Frames at or below it
+            # are folded in below and the client drops them from replay; frames
+            # above it are replayed and accumulate on top. Without that exact
+            # agreement the latest turn's output would be counted twice.
+            usage_rows = await conn.fetch(
+                """
+                WITH latest AS (
+                    SELECT event.payload->>'turn' AS turn
+                    FROM thread_events AS event
+                    WHERE event.thread_id = $1
+                      AND event.epoch = $2
+                      AND event.kind = 'usage.updated'
+                      AND event.seq <= $3
+                    ORDER BY event.seq DESC
+                    LIMIT 1
+                )
+                SELECT event.payload
+                FROM thread_events AS event, latest
+                WHERE event.thread_id = $1
+                  AND event.epoch = $2
+                  AND event.kind = 'usage.updated'
+                  AND event.seq <= $3
+                  AND event.payload->>'turn' IS NOT DISTINCT FROM latest.turn
+                ORDER BY event.seq ASC
+                """,
+                thread_id,
+                epoch,
+                hwm,
             )
             # Normally owner finalization has already copied each applied
             # control into the first-class thread scalar. There is one
@@ -382,7 +464,6 @@ async def build_session_state_snapshot(
     latest_turn_start_seq = (
         _integer(lifecycle["latest_turn_start_seq"]) if lifecycle is not None else None
     )
-    hwm = int(thread_source.get("events_seq_hwm") or 0)
     # Exclusive floor for reconstructing the latest turn. It closes both a
     # cached-cursor-in-the-middle-of-a-token-stream gap and the race where a
     # turn finishes after REST history but before SSE chooses its floor.
@@ -406,6 +487,11 @@ async def build_session_state_snapshot(
         "running_tool": running_tool,
         "pending_permissions": pending_permissions,
         "tasks": [_session_task(row) for row in task_rows],
+        # Presence-authoritative, including an explicit null: a thread that has
+        # never reported usage actively clears whatever the panel was showing,
+        # which is the second, independent kill for the cross-session leak in
+        # docs/done/session_usage_panel_leaks_previous_session_counters.md.
+        "usage": _usage_snapshot(list(usage_rows)),
         "event_cursor": {
             "epoch": epoch,
             "seq": hwm,
