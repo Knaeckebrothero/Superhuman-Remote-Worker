@@ -6,7 +6,7 @@ tags:
   - backlog
   - knowledge
   - live-gate
-status: failed-release-blocker
+status: passed-after-repair
 created: 2026-08-17
 related:
   - "[[auto_pull_jobs_are_dispatchable_before_provisioning]]"
@@ -18,12 +18,11 @@ related:
 
 # Officer correctness tranche — main-dev live gate
 
-**Status: FAIL 2026-08-17. Keep `auto_pull=false`.** BP-07 and BP-10 passed their
-deployed live contracts. BP-08's failure boundary passed, but its recovery path exposed a
-real type error after the canonical Git commit: the public metadata endpoint passes the
-canonical ISO `ready_at` string directly to an asyncpg `timestamptz` parameter, returns
-HTTP 500, and leaves projection state failed. The narrow repair is tracked in
-[[knowledge_metadata_retry_commits_then_projection_fails]].
+**Status: PASS AFTER REPAIR RERUN 2026-08-17. Keep `auto_pull=false` for the remaining
+umbrella blockers.** The original full-tranche run passed BP-07 and BP-10 but failed
+BP-08's recovery path after its canonical Git commit. That historical failure remains
+recorded below. The repaired BP-08/BP-13 slice subsequently passed on the deployed
+replacement image and is tracked in [[knowledge_metadata_retry_commits_then_projection_fails]].
 
 **Local follow-up:** BP-13 was implemented and passed real-pgvector direct and
 sweeper-won retry tests later on 2026-08-17. It also passed a disposable end-to-end k3d
@@ -32,9 +31,34 @@ isolated forge fault returned 409 without projection drift, the production retry
 committed once, and the following client retry preserved the exact canonical generation.
 Cleanup removed every fixture and left the local Officer/auto-pull baseline unchanged.
 That Tilt image was built from the repaired working tree while `HEAD` and
-`origin/develop` still pointed to `7b638b09`; it is not main-dev evidence. This document
-therefore remains the truthful record of the deployed failed run until its BP-08 slice is
-rerun against the replacement main-dev image.
+`origin/develop` still pointed to `7b638b09`; it was not main-dev evidence. The deployed
+rerun below now supplies that missing boundary.
+
+## BP-13 deployed rerun — PASS
+
+| Field | Evidence |
+|---|---|
+| UTC run | 2026-08-17 17:02:17–17:02:34 |
+| Git/deploy revision | repair commit `51d822ba`; GitOps update `979a6323` |
+| Serving image | two ready `srw-orchestrator-96c785fcc-*` replicas on `sha-51d822b`, zero restarts |
+| Migration 0165 | successful; required retry/lease columns present; zero dirty migrations |
+| Disposable project | `69813842-304a-4ea7-82f6-08ce11137ba9` |
+| Safety baseline | 56 posts / one commissioned / zero `auto_pull=true`, unchanged after cleanup |
+
+The narrow rerun used two notes in one disposable managed Gitea vault:
+
+| Contract | Result | Deployed evidence |
+|---|---|---|
+| First READY | **PASS** | HTTP 200; exactly one metadata commit; canonical and pgvector tags plus aware `ready_at` matched; newest intent synced. |
+| Retryable fault | **PASS** | A binding fault scoped to the fixture returned HTTP 409; Git and pgvector stayed unchanged; intent remained retryable. |
+| Retry service wins | **PASS** | The exact production retry handler committed once under a lease for only the fixture intent. |
+| Client follows retry | **PASS** | HTTP 200; no additional commit or `ready_at`; complete tags and exact generation projected; newest intent synced. |
+| Cleanup/isolation | **PASS** | Repository, Keycloak group, Nextcloud folder, project, intent, and vector rows removed; Officer/auto-pull baseline unchanged. |
+
+The periodic 900-second fleet sweep was not accelerated because that would also inspect
+unrelated due intents. The gate explicitly leased only its disposable intent and invoked
+the same retry handler the sweep calls. Real-PostgreSQL coverage supplies the scheduled
+claim and sweeper/client race proof. Both replicas remained ready with zero restarts.
 
 ## Scope and safety
 
@@ -144,12 +168,8 @@ read. Neither calibration changed the product verdict.
 
 ## Release decision
 
-Do not enable auto-pull yet. BP-07 and BP-10 need no repair from this run. Repair the
-public metadata retry/projection boundary, add real-PostgreSQL coverage for the direct and
-sweeper-won retry paths, redeploy, and rerun only the BP-08 portion. A pass there returns
-the release decision to the remaining umbrella blockers; it does not by itself close
-BP-01, BP-11, ES-01, OC-07/OC-08/OC-10, or the remaining OC-05/OC-06 residues.
-
-The requested repair and local real-pgvector coverage are now complete. The remaining
-action from this failed run is deployment plus that bounded BP-08 rerun; `auto_pull` stays
-false until it passes.
+BP-07, BP-08/BP-13, and BP-10 now satisfy this tranche's deployed live contract. Keep
+auto-pull off for the remaining umbrella blockers: BP-01, BP-11, ES-01,
+OC-07/OC-08/OC-10, the remaining OC-05/OC-06 residues, and the later supported-operation
+and unattended live-fire gates. The historical initial failure above remains evidence of
+the defect the bounded rerun closed; it is no longer the release verdict for BP-13.

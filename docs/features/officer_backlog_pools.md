@@ -42,10 +42,10 @@ related:
 ## Status
 
 **BUILT BUT RELEASE-BLOCKED (updated 2026-08-17).** **B1–B7 have landed; BP-05/BP-06
-are closed, and the deployed BP-07/BP-08/BP-10 tranche passed BP-07/BP-10 but exposed
-BP-13 on BP-08's canonical-retry projection path. BP-13 is repaired locally with real
-pgvector coverage but still awaits its bounded main-dev rerun**, so the feature is not yet
-safe or operable end to end. The tick is built, mounted, dormant
+are closed, and the deployed BP-07/BP-08/BP-10 tranche plus BP-13's repair now pass their
+bounded main-dev gates.** The feature is still not safe or operable end to end because the
+separate supported-control, authority, evidence, and unattended live-fire blockers remain.
+The tick is built, mounted, dormant
 (`auto_pull` ships
 off) and verified on its happy path; the sitrep and
 the cockpit card both render capacity, ready depth, open breakers and stalled claims; a

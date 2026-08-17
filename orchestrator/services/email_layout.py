@@ -29,8 +29,13 @@ from services.brand import TRAVERTINE as C
 # Georgia is aliased to `serif` on Android (AOSP fonts.xml aliases both Georgia
 # and Times New Roman), so Gmail Android renders Noto Serif. Do not let layout
 # depend on Georgia's metrics.
-_SERIF = "Georgia, 'Times New Roman', serif"
-_SANS = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
+# Public because email_markdown.py styles body-level tags with the same stacks;
+# a second copy there would drift.
+SERIF = "Georgia, 'Times New Roman', serif"
+SANS = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
+# Consolas ships with Office, so the Word engine resolves it without falling
+# back to a proportional face the way a bare `monospace` can.
+MONO = "Consolas, 'Courier New', monospace"
 
 
 VARIANTS = ("primary", "approve", "deny")
@@ -88,10 +93,10 @@ def _button_cell(action: Action) -> str:
     return (
         f'<td align="center" bgcolor="{bg}" style="background-color:{bg};'
         f"border:2px solid {border};padding:12px 28px;"
-        f"font-family:{_SANS};font-size:15px;font-weight:600;"
+        f"font-family:{SANS};font-size:15px;font-weight:600;"
         f'mso-line-height-rule:exactly;line-height:20px;">'
         f'<a href="{url}" style="color:{fg};text-decoration:none;'
-        f"font-family:{_SANS};font-size:15px;font-weight:600;"
+        f"font-family:{SANS};font-size:15px;font-weight:600;"
         f'letter-spacing:1px;text-transform:uppercase;">{label}</a></td>'
     )
 
@@ -117,7 +122,7 @@ def render_email(
     safe_footer = html.escape(footer_note, quote=True) if footer_note else ""
 
     subtitle_row = (
-        f'<p style="margin:6px 0 0 0;font-family:{_SANS};font-size:13px;'
+        f'<p style="margin:6px 0 0 0;font-family:{SANS};font-size:13px;'
         f'line-height:18px;color:{C["text-secondary"]};">{safe_subtitle}</p>'
         if safe_subtitle
         else ""
@@ -144,7 +149,7 @@ def render_email(
 
     footer_row = (
         f'<tr><td style="padding:16px 32px 24px 32px;'
-        f"border-top:1px solid {C['border-color']};font-family:{_SANS};"
+        f"border-top:1px solid {C['border-color']};font-family:{SANS};"
         f'font-size:12px;line-height:18px;color:{C["text-secondary"]};">'
         f"{safe_footer}</td></tr>"
         if safe_footer
@@ -178,10 +183,10 @@ a {{ color:{C["accent-color"]}; }}
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="{C["panel-bg"]}" style="width:600px;max-width:600px;background-color:{C["panel-bg"]};border:1px solid {C["border-color"]};">
 <tr><td bgcolor="{C["accent-color"]}" style="background-color:{C["accent-color"]};height:4px;line-height:4px;font-size:0;">&nbsp;</td></tr>
 <tr><td style="padding:24px 32px 16px 32px;">
-<h1 style="margin:0;font-family:{_SERIF};font-size:20px;line-height:26px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:{C["text-primary"]};">{safe_title}</h1>
+<h1 style="margin:0;font-family:{SERIF};font-size:20px;line-height:26px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:{C["text-primary"]};">{safe_title}</h1>
 {subtitle_row}
 </td></tr>
-<tr><td style="padding:0 32px 20px 32px;font-family:{_SANS};font-size:15px;line-height:24px;color:{C["text-primary"]};">
+<tr><td style="padding:0 32px 20px 32px;font-family:{SANS};font-size:15px;line-height:24px;color:{C["text-primary"]};">
 {body_html}
 </td></tr>
 {actions_row}

@@ -6,7 +6,7 @@ tags:
   - knowledge
   - data-integrity
   - postgresql
-status: implemented-awaiting-live-verification
+status: resolved-deployed-live-verified
 priority: P0
 created: 2026-08-17
 aliases:
@@ -22,9 +22,9 @@ related:
 
 # Knowledge metadata retry commits, then projection fails
 
-**Status:** IMPLEMENTED LOCALLY 2026-08-17; main-dev verification pending. Audit finding
-**BP-13 / BP-08 live residue** remains a release blocker until the bounded BP-08 slice
-passes after deployment.
+**Status:** RESOLVED, DEPLOYED, AND MAIN-DEV VERIFIED 2026-08-17. Audit finding
+**BP-13 / BP-08 live residue** passed its bounded direct and retry gate on the repaired
+image with complete fixture cleanup.
 
 ## Problem
 
@@ -159,9 +159,37 @@ empty local tables and that exact local migration-ledger row were reset so the c
 migration could replay. This was disposable-cluster repair, not a production rollout
 procedure. The current 0165 migration then applied successfully.
 
-No shared-cluster mutation was performed for this repair or k3d follow-up. The historical
-main-dev failure remains truthful; its BP-08 subsection must be rerun after a committed
-deployment before this document moves to `docs/done`.
+At the end of the k3d follow-up no shared cluster had been mutated. The historical
+main-dev failure remains truthful; the successful deployed rerun is recorded below.
+
+### Main-dev deployed rerun — PASS 2026-08-17
+
+The bounded BP-08/BP-13 slice passed on Kubernetes context `main`, namespace
+`superhuman-remote-worker`, from 17:02:17Z through 17:02:34Z. Both orchestrator replicas
+were ready with zero restarts on repair image `sha-51d822b`. Migration 0165 was successful,
+its required retry/lease columns were present, and the dirty-migration count was zero.
+
+One disposable project (`69813842-304a-4ea7-82f6-08ce11137ba9`) and two notes exercised
+the real authenticated HTTP route, managed Gitea vault, app intent ledger, pgvector, and
+asyncpg codec:
+
+- first-attempt READY returned 200, made one metadata commit, and left the canonical tags
+  and aware `ready_at`, pgvector tags/timestamp, and newest intent exactly synchronized;
+- a repository fault scoped to only the disposable project returned 409, changed neither
+  Git nor pgvector, and retained a durable retryable intent;
+- after restoring the exact binding, that one intent was leased explicitly and passed to
+  the same production retry handler used by the periodic sweeper. It committed once; the
+  following client retry returned 200, made no extra commit or readiness generation, and
+  projected the complete canonical snapshot; and
+- supported project deletion removed the Gitea repository, Keycloak group, Nextcloud
+  folder, project row, intent rows, and vector rows. The Officer baseline returned to 56
+  durable posts, one commissioned post, and zero `auto_pull=true`; both replicas remained
+  ready with zero restarts, and no migration became dirty.
+
+The periodic 900-second fleet-wide sweep itself was not accelerated on the shared cluster;
+the run used its exact retry handler with a lease scoped to the disposable intent. Lease
+ownership, scheduled claiming, and sweeper/client races remain covered by the real
+PostgreSQL tests without making unrelated due intents part of this live gate.
 
 ## Acceptance
 
@@ -177,6 +205,6 @@ deployment before this document moves to `docs/done`.
   reindex settles the newest canonical intent rather than leaving eligibility blocked.
 - Mocked endpoint tests are supplemented by asyncpg codec coverage; a mock accepting a
   string for `timestamptz` is not sufficient.
-- **Pending:** the BP-08 slice of [[officer_correctness_live_gate_2026-08-17]] passes on
-  main dev after deployment, with `auto_pull=false` throughout and complete fixture
-  cleanup.
+- **Passed:** the BP-08 slice of [[officer_correctness_live_gate_2026-08-17]] returned the
+  expected 200/409/200 sequence on main dev, with `auto_pull=false` throughout and
+  complete fixture cleanup.
