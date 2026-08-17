@@ -942,12 +942,25 @@ def format_action_result(
     return "\n".join(lines)
 
 
-def format_created_job(result: dict[str, Any], config_name: str) -> str:
-    """Format the result of creating a new job."""
+def format_created_job(
+    result: dict[str, Any], config_name: str, *, expert: str | None = None
+) -> str:
+    """Format the result of creating a new job.
+
+    ``expert`` is the reference the caller actually selected. It is echoed
+    because ``Config:`` alone cannot report a database expert — that choice
+    lands on the ``worker_base`` base config, so the line would say
+    ``worker_base`` for every DB expert and the caller could not tell which
+    one it hired.
+    """
     job_id = result.get("id", "unknown")
     lines = [
         "Job created successfully.",
         f"Job ID: {job_id}",
+    ]
+    if expert:
+        lines.append(f"Expert: {expert}")
+    lines += [
         f"Config: {config_name}",
         f"Status: {result.get('status', 'created')}",
     ]

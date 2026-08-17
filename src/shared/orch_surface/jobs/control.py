@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...expert_reference import ExpertReferenceConflict, resolve_expert_selection
 from .. import formatters as fmt
 from ..client import AsyncCockpitClient
 from ._utils import format_action_error, resolve_job_id, short_id, transport_key_paths
@@ -136,6 +137,7 @@ async def create_job(
     client: AsyncCockpitClient,
     caller: CallerCtx,
     description: str,
+    expert: str | None = None,
     config_name: str = "worker_base",
     expert_id: str | None = None,
     instructions: str | None = None,
@@ -159,9 +161,17 @@ async def create_job(
 
     Args:
         description: Natural language task description
-        config_name: Base agent config (default: "worker_base")
-        expert_id: Preferred database-backed expert UUID. When supplied, the
-            orchestrator resolves that expert over the base config.
+        expert: Which expert runs this job — the worker profile that decides
+            its tools, prompts and model. Takes either form the catalogue
+            prints, so a bundled expert id ("developer") and a database expert
+            UUID are both valid here and you never need to know which store an
+            entry came from. Use the `list_experts` tool to discover valid
+            values and `get_expert` to inspect one before choosing. Omit to
+            accept this deployment's default worker.
+        config_name: DEPRECATED alias for `expert`, bundled experts only.
+            Kept working for existing callers; new calls should use `expert`.
+        expert_id: DEPRECATED alias for `expert`, database experts only.
+            Kept working for existing callers; new calls should use `expert`.
         instructions: Additional inline markdown instructions
         kickoff_message: Opening task brief sent to the agent
         config_override: Per-job config overrides as JSON. To set the model,
@@ -201,12 +211,18 @@ async def create_job(
             "resolved server-side from the model ID — pass "
             '{"llm": {"model": "<id>"}} and drop these keys.'
         )
-    if expert_id and config_name and config_name != "worker_base":
-        return (
-            "Refusing to create job: expert_id cannot be combined with "
-            f"config_name={config_name!r}. Pass expert_id alone (it selects "
-            "a DB expert) or config_name alone (a bundled one)."
+    # One catalogue, one selector. `expert` accepts a bundled slug or a DB
+    # UUID and resolves to the (base config, DB overlay) pair the funnel
+    # persists; the two deprecated aliases resolve through the same helper, so
+    # the mutual-exclusion refusal they need is stated once (see
+    # src/shared/expert_reference.py and
+    # docs/issues/experts_one_catalogue_two_selection_paths.md).
+    try:
+        choice = resolve_expert_selection(
+            expert=expert, config_name=config_name, expert_id=expert_id
         )
+    except ExpertReferenceConflict as conflict:
+        return f"Refusing to create job: {conflict}"
 
     merged_context = dict(context) if context is not None else None
     if merged_context is not None:
@@ -219,8 +235,8 @@ async def create_job(
     try:
         result = await client.create_job(
             description=description,
-            config_name=config_name,
-            expert_id=expert_id,
+            config_name=choice.config_name,
+            expert_id=choice.expert_id,
             # Deliberately not a parameter on this plane. The only callers are
             # dispatchers (officer, session) with no basis for connector
             # surgery, and the one thing the field ever did in anger was let a
@@ -247,7 +263,9 @@ async def create_job(
             ticket=ticket,
             work_category=work_category,
         )
-        return fmt.format_created_job(result, config_name)
+        return fmt.format_created_job(
+            result, choice.config_name, expert=choice.reference
+        )
     except Exception as error:
         return format_action_error("create", "N/A", error)
 

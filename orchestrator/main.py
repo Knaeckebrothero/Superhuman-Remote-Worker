@@ -501,6 +501,10 @@ from services.default_experts import (  # noqa: E402
     resolve_root_expert,
     seed_managed_default_experts,
 )
+from src.shared.expert_reference import (  # noqa: E402
+    ExpertReferenceConflict,
+    resolve_expert_selection,
+)
 from src.core.loader import (  # noqa: E402
     canonical_config_name,
     load_and_merge_config,
@@ -9252,13 +9256,28 @@ class JobCreate(BaseModel):
     document_dir: str | None = Field(
         None, description="Directory containing documents (deprecated)"
     )
-    config_name: str = Field("worker_base", description="Agent configuration name")
+    expert: str | None = Field(
+        None,
+        description=(
+            "Which expert runs this job. One selector for the whole catalogue: "
+            "either a bundled expert id ('developer') or a DB expert UUID, "
+            "exactly as GET /api/experts lists them. Omit to accept the "
+            "deployment's configured default worker. Supersedes config_name "
+            "and expert_id, which remain as deprecated single-store aliases."
+        ),
+    )
+    config_name: str = Field(
+        "worker_base",
+        description=(
+            "DEPRECATED alias for `expert` (bundled experts only). Also still "
+            "the way to name a non-catalogue deployment config."
+        ),
+    )
     expert_id: str | None = Field(
         None,
         description=(
-            "DB-backed expert UUID. Preferred over config_name for expert "
-            "selection — the orchestrator resolves it into the job's config. "
-            "config_name stays the base profile."
+            "DEPRECATED alias for `expert` (DB-backed expert UUID only). The "
+            "orchestrator resolves it over the worker_base profile."
         ),
     )
     config_override: dict[str, Any] | None = Field(
@@ -9946,11 +9965,26 @@ class UserSettingsUpdate(BaseModel):
 
 
 class ExternalKnowledgeBase(BaseModel):
-    """An existing private GitHub repo to use as a project's live vault."""
+    """An existing private GitHub repo to use as a project's live vault.
 
-    repo_url: str = Field(..., description="Existing GitHub repository URL")
+    Two ways to name that repo, and exactly one per request:
+
+    * ``datasource_id`` — adopt a ``kb`` connector created earlier, which
+      already holds the URL, branch and encrypted PAT. This is the cockpit's
+      only path: a connector is created first, then attached here.
+    * ``repo_url`` + ``token`` — the inline form, kept for MCP and other API
+      callers that have no connector to point at.
+    """
+
+    datasource_id: str | None = Field(
+        None,
+        description="Existing OKF Knowledge Base connector to adopt as the vault",
+    )
+    repo_url: str | None = Field(None, description="Existing GitHub repository URL")
     branch: str = Field("main", description="Writable vault branch")
-    token: SecretStr = Field(..., description="Fine-grained GitHub contents PAT")
+    token: SecretStr | None = Field(
+        None, description="Fine-grained GitHub contents PAT"
+    )
     forge: Literal["github"] | None = Field(
         None,
         description="Required for GitHub Enterprise; github.com is inferred",
@@ -9970,10 +10004,33 @@ class ExternalKnowledgeBase(BaseModel):
 
     @field_validator("token")
     @classmethod
-    def _valid_token(cls, value: SecretStr) -> SecretStr:
-        if not value.get_secret_value().strip():
+    def _valid_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and not value.get_secret_value().strip():
             raise ValueError("token must not be empty")
         return value
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> "ExternalKnowledgeBase":
+        """One vault, named one way.
+
+        A connector already carries branch, forge and credentials, so an inline
+        field alongside it is ambiguous rather than additive — the request is
+        rejected instead of silently preferring one side.
+        """
+        if self.datasource_id is not None:
+            conflicting = sorted(
+                {"repo_url", "token", "branch", "forge"} & self.model_fields_set
+            )
+            if conflicting:
+                raise ValueError(
+                    "datasource_id already carries the vault settings; remove "
+                    + ", ".join(conflicting)
+                )
+        elif not (self.repo_url and self.token):
+            raise ValueError(
+                "supply datasource_id, or both repo_url and token"
+            )
+        return self
 
 
 class ProjectCreate(BaseModel):
@@ -12564,8 +12621,43 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         # children/specialists keep their explicit/inherited selector and never
         # silently acquire a user's current default.
         project = None
-        config_name = canonical_config_name(job.config_name or "worker_base")
-        if job.expert_id and config_name != "worker_base":
+        # One catalogue, one selector: `expert` takes a bundled slug or a DB
+        # expert UUID and resolves to the (base config, DB overlay) pair this
+        # funnel persists. The deprecated aliases go through the same helper,
+        # so the "two experts in one call" refusal is stated once — see
+        # docs/issues/experts_one_catalogue_two_selection_paths.md.
+        try:
+            expert_choice = resolve_expert_selection(
+                expert=job.expert,
+                config_name=job.config_name,
+                expert_id=job.expert_id,
+            )
+        except ExpertReferenceConflict as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if expert_choice.kind == "bundled" and job.expert:
+            # `expert` means "an entry from the catalogue", so a slug that is
+            # not in it is a typo, not a deployment config. Refuse now: the
+            # alternative is a job that provisions and only fails when the
+            # agent cannot load its config. `config_name` keeps accepting
+            # non-catalogue deployment configs, unvalidated, as it always did.
+            global _experts_cache
+            if _experts_cache is None:
+                _experts_cache = _scan_experts()
+            if not any(e.id == expert_choice.config_name for e in _experts_cache):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Unknown expert '{expert_choice.config_name}'. Use "
+                        "list_experts (GET /api/experts) to see the selectable "
+                        "experts; pass a bundled expert id or a DB expert UUID."
+                    ),
+                )
+        explicit_expert_id = expert_choice.expert_id
+        config_name = canonical_config_name(expert_choice.config_name or "worker_base")
+        # The resolver can never emit both halves; assert it rather than trust
+        # it, because "a DB expert layered over someone else's bundled base"
+        # is a config nobody reviewed.
+        if explicit_expert_id and config_name != "worker_base":
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -12588,7 +12680,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     project_default_override = json.loads(project_default_override)
 
         config_override = project_default_override
-        resolved_expert_id = job.expert_id
+        resolved_expert_id = explicit_expert_id
         # A worker launched from an interactive thread is still a user-level
         # root job (the thread supplies scope/datasources, not a worker parent).
         # Only actual worker children/specialists carry parent_job_id.
@@ -12601,7 +12693,9 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             and await _user_experts_enabled()
         )
         should_validate_explicit = (
-            bool(job.expert_id) and bool(effective_user_id) and _is_experts_db_enabled()
+            bool(explicit_expert_id)
+            and bool(effective_user_id)
+            and _is_experts_db_enabled()
         )
         selection = None
         try:
@@ -12612,7 +12706,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     expert_type="worker",
                     user_id=str(effective_user_id),
                     project_id=project_id,
-                    explicit_expert_id=job.expert_id,
+                    explicit_expert_id=explicit_expert_id,
                     is_admin=bool((principal or {}).get("is_admin")),
                 )
                 resolved_expert_id = str(selection.expert["id"])
@@ -12639,6 +12733,16 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except DefaultExpertUnavailable as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        if selection is None and expert_choice.kind == "bundled":
+            # Same field the DB path stamps, so "who did this dispatcher pick,
+            # and did it pick at all?" has one answer whichever store the
+            # expert lives in. Reading exactly this key across eight jobs is
+            # how the two-path defect was diagnosed.
+            context["expert_selection"] = {
+                "source": "bundled",
+                "expert": expert_choice.reference,
+            }
 
         if request_config_override:
             config_override = _deep_merge_dicts(

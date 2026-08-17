@@ -39,6 +39,21 @@ def test_mcp_creation_signatures_expose_deliverable_contract():
     assert "required_deliverables" in argument_names
 
 
+def test_both_creation_tools_take_the_one_expert_selector():
+    """`expert` accepts a bundled slug or a DB UUID on either tool, so a
+    caller can pass any id `list_experts` printed without knowing which store
+    it came from. The single-store aliases stay for existing callers.
+    See docs/issues/experts_one_catalogue_two_selection_paths.md."""
+    signature = get_descriptor("create_job").public_signature.parameters
+    assert {"expert", "config_name", "expert_id"} <= set(signature)
+
+    tree = ast.parse(SERVER_PATH.read_text(encoding="utf-8"))
+    function = _async_function(tree, "create_project_job")
+    argument_names = {argument.arg for argument in function.args.args}
+    assert {"expert", "config_name", "expert_id"} <= argument_names
+    assert "list_experts" in (ast.get_docstring(function) or "")
+
+
 def test_workspace_reader_promises_committed_gitea_state():
     tree = ast.parse(SERVER_PATH.read_text(encoding="utf-8"))
     function = _async_function(tree, "get_workspace_file")

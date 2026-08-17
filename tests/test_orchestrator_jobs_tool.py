@@ -426,6 +426,10 @@ def test_create_job_schema_has_no_model_selectable_lineage() -> None:
     fields = set(schema["properties"])
     assert fields == {
         "description",
+        # One selector for the whole expert catalogue (bundled slug or DB
+        # UUID); config_name/expert_id remain as deprecated single-store
+        # aliases. tests/test_unified_expert_selection.py owns the contract.
+        "expert",
         "config_name",
         "expert_id",
         # datasource_ids is deliberately absent: connectors are resolved
