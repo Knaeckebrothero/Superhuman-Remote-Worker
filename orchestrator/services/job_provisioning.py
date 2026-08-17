@@ -32,6 +32,17 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+class JobProvisioningError(RuntimeError):
+    """Machine-readable mandatory provisioning failure."""
+
+    failure_class = "infrastructure"
+
+    def __init__(self, message: str, *, phase: str, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.phase = phase
+        self.retryable = retryable
+
+
 # Job-scoped scratch + framework scaffolding that should not be committed to an
 # isolated loop job's execution repo. Safe to ignore everywhere: todos
 # restore from the LangGraph checkpoint (not disk), plan.md/workspace.md are read
@@ -132,16 +143,17 @@ async def provision_job_repo(
     postgres_db: Any,
     main_cloud_router: Any,
     loop_floor: bool = False,
+    require_repository: bool = False,
     authority_check: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Provision a job's Gitea repo/branch, grant creator access, seed baseline.
 
     Mutates ``job_row`` in place (sets ``repo_name`` / ``branch_name``) and
     returns it. Ordinary jobs preserve the best-effort Gitea behavior: an
-    outage can leave them repo-less. ``loop_floor=True`` is deliberately
-    strict and raises unless both the isolated repository and complete project
-    cloud baseline are ready; an unattended file-producing loop must not run
-    against missing durable state. No-ops without Gitea only for ordinary jobs.
+    outage can leave them repo-less. ``require_repository=True`` makes the
+    isolated repository mandatory; ``loop_floor=True`` additionally requires
+    the complete project cloud baseline. No-ops without Gitea only for ordinary
+    jobs.
 
     Behaviour matches the block previously inlined in the ``POST /api/jobs``
     handler, with one improvement folded in: the creator access-grant now
@@ -151,9 +163,10 @@ async def provision_job_repo(
     """
     await _permit(authority_check)
     if not gitea_client.is_initialized:
-        if loop_floor:
-            raise RuntimeError(
-                "Gitea is unavailable; cannot provision isolated loop repo"
+        if loop_floor or require_repository:
+            raise JobProvisioningError(
+                "Gitea is unavailable; cannot provision isolated job repository",
+                phase="repository",
             )
         return job_row
 
@@ -205,6 +218,11 @@ async def provision_job_repo(
                     f"Failed to create branch '{branch_name}' from '{from_branch}' "
                     f"in '{parent_repo_name}' for subjob {job_id_str}"
                 )
+                if loop_floor or require_repository:
+                    raise JobProvisioningError(
+                        f"could not create isolated job branch {branch_name}",
+                        phase="repository",
+                    )
             await postgres_db.merge_job_context(
                 job_id_str,
                 {
@@ -225,6 +243,11 @@ async def provision_job_repo(
             await _permit(authority_check)
             job_row["branch_name"] = branch_name
             job_row["repo_name"] = parent_repo_name
+        elif loop_floor or require_repository:
+            raise JobProvisioningError(
+                "parent job is unavailable for isolated branch provisioning",
+                phase="repository",
+            )
     else:
         # Root job: always create an isolated repo. Project membership controls
         # shared resources (cloud, KB, source/reference attachments), never the
@@ -245,8 +268,9 @@ async def provision_job_repo(
                 repo_name,
                 **gitignore_kwargs,
             ):
-                raise RuntimeError(
-                    f"could not initialize isolated loop repository {repo_name}"
+                raise JobProvisioningError(
+                    f"could not initialize isolated job repository {repo_name}",
+                    phase="repository",
                 )
             await postgres_db.merge_job_context(
                 job_id_str,
@@ -264,8 +288,11 @@ async def provision_job_repo(
                 )
             await _permit(authority_check)
             job_row["repo_name"] = repo_name
-        elif loop_floor:
-            raise RuntimeError(f"could not create isolated loop repository {repo_name}")
+        elif loop_floor or require_repository:
+            raise JobProvisioningError(
+                f"could not create isolated job repository {repo_name}",
+                phase="repository",
+            )
 
     # Grant job creator read access to the Gitea repo. Pass username +
     # full_name + sub so grant_user_repo_access can pre-provision the Gitea
@@ -320,6 +347,11 @@ async def provision_job_repo(
 
                 if isinstance(exc, ProjectLoopHandoffAuthorityLost):
                     raise
+            if loop_floor:
+                raise JobProvisioningError(
+                    "project cloud configuration is unavailable",
+                    phase="cloud",
+                ) from exc
             project_row = None
         if project_row and project_row.get("main_cloud_folder_handle"):
             if loop_floor:
@@ -328,23 +360,37 @@ async def provision_job_repo(
                 baseline_kwargs: dict[str, Any] = {}
                 if authority_check is not None:
                     baseline_kwargs["authority_check"] = authority_check
-                await seed_project_folder_baseline(
-                    job_id=job_id_str,
-                    project=project_row,
-                    repo_name=job_row["repo_name"],
-                    branch=job_row.get("branch_name"),
-                    postgres_db=postgres_db,
-                    gitea_client=gitea_client,
-                    main_cloud_router=main_cloud_router,
-                    require_complete=True,
-                    **baseline_kwargs,
-                )
+                try:
+                    await seed_project_folder_baseline(
+                        job_id=job_id_str,
+                        project=project_row,
+                        repo_name=job_row["repo_name"],
+                        branch=job_row.get("branch_name"),
+                        postgres_db=postgres_db,
+                        gitea_client=gitea_client,
+                        main_cloud_router=main_cloud_router,
+                        require_complete=True,
+                        **baseline_kwargs,
+                    )
+                except Exception as exc:
+                    if authority_check is not None:
+                        from services.project_loop_atomic import (
+                            ProjectLoopHandoffAuthorityLost,
+                        )
+
+                        if isinstance(exc, ProjectLoopHandoffAuthorityLost):
+                            raise
+                    raise JobProvisioningError(
+                        "project cloud baseline could not be seeded completely",
+                        phase="cloud",
+                    ) from exc
                 await _permit(authority_check)
                 refreshed = await postgres_db.get_job(job_id_str)
                 await _permit(authority_check)
                 if not refreshed or not refreshed.get("cloud_diff_baseline_commit"):
-                    raise RuntimeError(
-                        "project cloud baseline could not be seeded completely"
+                    raise JobProvisioningError(
+                        "project cloud baseline could not be seeded completely",
+                        phase="cloud",
                     )
             else:
                 from services.job_cloud_baseline import fire_baseline_seed
@@ -359,6 +405,9 @@ async def provision_job_repo(
                     main_cloud_router=main_cloud_router,
                 )
         elif loop_floor:
-            raise RuntimeError("project loop requires a provisioned cloud folder")
+            raise JobProvisioningError(
+                "project loop requires a provisioned cloud folder",
+                phase="cloud",
+            )
 
     return job_row

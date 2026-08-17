@@ -1441,6 +1441,55 @@ class TestKbSweepTick:
         assert "knowledge" in str(postgres_db.fetch.call_args[0])
 
     @pytest.mark.asyncio
+    async def test_materialization_retry_precedes_reindex_and_projection_settlement(
+        self,
+    ):
+        postgres_db = self._db(
+            {
+                (project_id := uuid.uuid4()): {
+                    "jobs": [{"name": "project-retry-jobs", "branch": "main"}]
+                }
+            }
+        )
+        intent = {
+            "id": uuid.uuid4(),
+            "project_id": project_id,
+            "note_id": "bp08-retry",
+            "content": _note_md("bp08-retry"),
+            "attempt_token": uuid.uuid4(),
+        }
+        postgres_db.claim_due_knowledge_materializations.return_value = [intent]
+        order: list[str] = []
+
+        async def retry(**kwargs):
+            order.append("canonical-retry")
+            return {"canonical_state": "canonical"}
+
+        async def reindex(**kwargs):
+            order.append("reindex")
+            return {"status": "completed"}
+
+        async def settle(project):
+            assert str(project) == str(project_id)
+            order.append("projection-settled")
+            return 1
+
+        postgres_db.mark_knowledge_projections_synced.side_effect = settle
+        with patch(
+            "orchestrator.services.kb_materialize.retry_knowledge_materialization_intent",
+            side_effect=retry,
+        ):
+            await kb_sweep_tick(
+                postgres_db=postgres_db,
+                store=MagicMock(),
+                gitea_client=MagicMock(),
+                embedding_service=MagicMock(),
+                reindex_fn=reindex,
+            )
+
+        assert order == ["canonical-retry", "reindex", "projection-settled"]
+
+    @pytest.mark.asyncio
     async def test_sweep_only_enumerates_active_projects(self):
         postgres_db = self._db()
 

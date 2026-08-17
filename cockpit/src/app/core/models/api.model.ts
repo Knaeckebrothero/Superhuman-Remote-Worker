@@ -1279,12 +1279,54 @@ export interface OfficerStaleClaim {
   age_hours?: number;
 }
 
+export interface OfficerProvisioningPreflight {
+  id: string;
+  status?: string;
+  error_message?: string | null;
+  context?: {
+    provisioning_preflight?: {
+      state?: 'not-attempted' | 'in-progress' | 'retryable-failed' | 'permanent-failed' | 'activated';
+      phase?: string | null;
+      failure_class?: string | null;
+      error?: string | null;
+      next_retry_at?: string | null;
+    };
+  };
+}
+
+export interface OfficerKnowledgeMaterialization {
+  id: string;
+  note_id: string;
+  canonical_state: 'pending_sync' | 'canonical' | 'failed' | 'superseded';
+  projection_state: 'pending' | 'synced' | 'failed' | 'projection_only';
+  retry_state: 'none' | 'retryable' | 'permanent';
+  last_error_class?: string | null;
+  last_error?: string | null;
+  next_retry_at?: string | null;
+}
+
+export interface OfficerFloorWakeOutcome {
+  id: string;
+  pool: string;
+  state: 'pending' | 'retryable' | 'queued' | 'delivered' | 'permanent_failed' | 'superseded';
+  attempt_count: number;
+  last_attempted_at?: string | null;
+  last_queued_at?: string | null;
+  delivered_at?: string | null;
+  failure_class?: string | null;
+  last_error?: string | null;
+  next_retry_at?: string | null;
+}
+
 /** Backlog-pool policy state: what the tick enforces, made visible (§6). */
 export interface OfficerBacklogState {
   auto_pull: boolean;
   breakers: Record<string, OfficerPoolBreaker>;
   stale_claims: OfficerStaleClaim[];
   worker_spend_ceiling_daily?: number | null;
+  provisioning_preflights?: OfficerProvisioningPreflight[];
+  knowledge_materialization?: OfficerKnowledgeMaterialization[];
+  floor_wakes?: OfficerFloorWakeOutcome[];
 }
 
 /** Standing-down marker on a commissioned post (maintenance or conference). */

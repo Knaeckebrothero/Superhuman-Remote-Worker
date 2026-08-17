@@ -3171,6 +3171,18 @@
       "cloudSyncRecovered": "Cloud sync is now running for this session."
     }
   },
+  "officerCorrectness": {
+    "provisioningLabel": "Provisioning",
+    "provisioningProblem": "{{count}} job preflight(s) pending or failed — they hold claim and capacity but are not dispatchable.",
+    "knowledgeLabel": "Knowledge sync",
+    "knowledgeProblem": "{{count}} canonical/projection mutation(s) unresolved — affected tickets are ineligible.",
+    "floorWakeLabel": "Floor wake",
+    "poolFallback": "pool",
+    "delivered": "delivered",
+    "durablyQueued": "durably queued",
+    "deliveryFailed": "delivery failed; retry state retained",
+    "notQueued": "not queued"
+  },
   "pwa": {
     "splash": "Assembling legion…",
     "install": {

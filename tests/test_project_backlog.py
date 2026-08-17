@@ -83,7 +83,7 @@ def _no_materialization_http():
     """Keep these tests off the network — kb_write/kb_update POST now."""
     with patch(
         "src.tools.knowledge.knowledge_tools._post_vault_file",
-        return_value={"status": "skipped", "reason": "no-repo"},
+        return_value={"status": "committed", "path": "knowledge/test.md"},
     ):
         yield
 
@@ -323,7 +323,7 @@ class TestKbUpdatePriorityPreservationWithNeo4j:
         kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
         assert kwargs["priority"] == 0
 
-    def test_lookback_failure_leaves_priority_and_frontmatter_untouched(self):
+    def test_lookback_failure_rejects_before_canonical_mutation(self):
         """Fix round 1, Finding 1 repro: kg-enabled, get_note_by_slug raises,
         existing ticket is priority=high, kb_update omits priority.
 
@@ -353,27 +353,12 @@ class TestKbUpdatePriorityPreservationWithNeo4j:
                 {"note": "add-dark-mode", "status": "resolved"}
             )
 
-        # (c) a pgvector hiccup must not block the rest of the update.
-        assert "status → resolved" in result
+        assert result.startswith("Error: could not read")
+        assert rendered == {}
+        ctx.knowledge_graph.update_note.assert_not_called()
+        ctx.knowledge_store.upsert_note.assert_not_awaited()
 
-        # (a) nothing writes a priority that was neither supplied by the
-        # caller nor read from storage -- None reaches the persistence call,
-        # which is the sentinel knowledge_store.py's upsert_note COALESCEs
-        # against the row's real (unknown-to-us) current value instead of
-        # overwriting it. See TestUpsertNotePriorityCoalesceSentinel in
-        # test_knowledge_store.py for proof the SQL side honors it.
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["priority"] is None
-
-        # The frontmatter must not assert a value we don't actually know --
-        # _render_note_md omits the line entirely when the key is absent.
-        md = rendered["add-dark-mode"]
-        assert "priority:" not in md
-
-    def test_lookback_failure_is_logged_not_swallowed(self, caplog):
-        """Finding 1(b): the failure must be visible, not silently eaten."""
-        import logging
-
+    def test_lookback_failure_is_returned_not_swallowed(self):
         ctx = _kb_context_with_kg()
         ctx.knowledge_graph.update_note.return_value = True
         ctx.knowledge_graph.read_note.return_value = {
@@ -386,14 +371,10 @@ class TestKbUpdatePriorityPreservationWithNeo4j:
             side_effect=Exception("pgvector hiccup")
         )
         tools = _make_tools(ctx)
-        with caplog.at_level(
-            logging.WARNING, logger="src.tools.knowledge.knowledge_tools"
-        ):
-            tools["kb_update"].invoke({"note": "add-dark-mode", "status": "resolved"})
-        assert any(
-            "priority" in record.message and "pgvector hiccup" in record.message
-            for record in caplog.records
+        result = tools["kb_update"].invoke(
+            {"note": "add-dark-mode", "status": "resolved"}
         )
+        assert "READY/priority state" in result
 
 
 class TestKbListPriorityDisplay:
@@ -1097,6 +1078,33 @@ def _repo_db(**roles):
 
     db = AsyncMock()
     db.get_project_repositories.side_effect = _by_role
+    intent_id = uuid.uuid4()
+
+    async def _begin(**kwargs):
+        return {
+            "id": intent_id,
+            "project_id": kwargs["project_id"],
+            "note_id": kwargs["note_id"],
+            "canonical_state": "pending_sync",
+            "projection_state": "pending",
+            "retry_state": "retryable",
+            "attempt_claimed": True,
+            "attempt_token": uuid.uuid4(),
+        }
+
+    async def _finish(_intent_id, *, canonical, permanent, **kwargs):
+        return {
+            "id": intent_id,
+            "canonical_state": "canonical" if canonical else "failed",
+            "projection_state": "pending",
+            "retry_state": "none"
+            if canonical
+            else ("permanent" if permanent else "retryable"),
+        }
+
+    db.begin_knowledge_materialization.side_effect = _begin
+    db.finish_knowledge_materialization.side_effect = _finish
+    db.finish_knowledge_projection.return_value = {"id": intent_id}
     return db
 
 
@@ -1117,13 +1125,14 @@ class TestCloseBacklogTicket:
             return_value="---\nid: feature-x\ntype: feature\nstatus: active\n---\n# T\n"
         )
         gitea.create_or_update_file = AsyncMock(return_value=True)
+        gitea.change_files = AsyncMock(return_value=True)
         permits = 0
 
         async def authority_check():
             nonlocal permits
             permits += 1
-            # before resolve, after resolve, after read, before write, after write
-            if permits == 5:
+            # before canonical mutation, after canonical mutation
+            if permits == 2:
                 raise ProjectLoopHandoffAuthorityLost("test lease loss")
 
         with pytest.raises(ProjectLoopHandoffAuthorityLost, match="test lease loss"):
@@ -1137,7 +1146,7 @@ class TestCloseBacklogTicket:
                 authority_check=authority_check,
             )
 
-        gitea.create_or_update_file.assert_awaited_once()
+        gitea.change_files.assert_awaited_once()
         vector_db.acquire.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1166,6 +1175,7 @@ class TestCloseBacklogTicket:
             return_value="---\nid: feature-x\ntype: feature\nstatus: active\n---\n# T\n"
         )
         gitea.create_or_update_file = AsyncMock(return_value=True)
+        gitea.change_files = AsyncMock(return_value=True)
 
         ok = await close_backlog_ticket(
             vector_db,
@@ -1177,14 +1187,17 @@ class TestCloseBacklogTicket:
         )
 
         assert ok is True
-        written = gitea.create_or_update_file.await_args.args[2]
+        written = gitea.change_files.await_args.args[2][0]["content_b64"]
+        import base64
+
+        written = base64.b64decode(written).decode()
         assert "status: resolved" in written
         assert "status: active" not in written
         conn.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_gitea_failure_is_not_fatal(self):
-        """A disposition must never fail because a mirror write failed."""
+        """Repository failure is a recoverable false disposition, not a raise."""
         from unittest.mock import AsyncMock, MagicMock
 
         from orchestrator.services.project_backlog import close_backlog_ticket
@@ -1216,12 +1229,8 @@ class TestCloseBacklogTicket:
         assert ok is False
 
     @pytest.mark.asyncio
-    async def test_gitea_failure_still_updates_the_index(self):
-        """The two writes are independent. If a raised Gitea exception also
-        skipped the index update, a KB/Gitea hiccup would leave the ticket
-        sitting in the pool with no write anywhere to correct it until the
-        note file itself is fixed by hand -- worse than the plain best-effort
-        contract promises."""
+    async def test_gitea_failure_does_not_update_the_projection(self):
+        """A failed canonical close must leave the backlog projection open."""
         from unittest.mock import AsyncMock, MagicMock
 
         from orchestrator.services.project_backlog import close_backlog_ticket
@@ -1252,18 +1261,14 @@ class TestCloseBacklogTicket:
         )
 
         assert ok is False  # the durable (file) write did not happen
-        conn.execute.assert_awaited_once()
-        args = conn.execute.await_args.args
-        assert args[1] == "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a"  # project_id
-        assert args[2] == "feature-x"  # note_id
-        assert args[3] == "resolved"  # new_status
+        conn.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_missing_note_file_degrades_to_index_only(self, caplog):
+    async def test_missing_note_file_fails_closed_before_index_mutation(self, caplog):
         """get_file_content returning None (a 404, not an exception) is the
         "note file doesn't exist" case called out explicitly in the task
-        constraints. The index must still close -- only the durable write is
-        skipped -- and the skip must be logged, not silent."""
+        constraints. Neither canonical state nor its projection may claim a
+        close, and the refusal must be logged rather than silent."""
         import logging
         from unittest.mock import AsyncMock, MagicMock
 
@@ -1285,6 +1290,7 @@ class TestCloseBacklogTicket:
         gitea = MagicMock()
         gitea.get_file_content = AsyncMock(return_value=None)
         gitea.create_or_update_file = AsyncMock(return_value=True)
+        gitea.change_files = AsyncMock(return_value=True)
 
         with caplog.at_level(
             logging.INFO, logger="orchestrator.services.project_backlog"
@@ -1300,8 +1306,8 @@ class TestCloseBacklogTicket:
 
         assert ok is False
         gitea.create_or_update_file.assert_not_awaited()
-        conn.execute.assert_awaited_once()
-        assert any("index-only close" in r.message for r in caplog.records)
+        conn.execute.assert_not_awaited()
+        assert any("canonical close refused" in r.message for r in caplog.records)
 
     def test_no_status_line_gains_one(self):
         """A note that predates the status field (or never had one) must gain
@@ -1389,7 +1395,10 @@ class TestCloseBacklogTicket:
         vector_db.acquire = MagicMock(return_value=_CM())
 
         gitea = MagicMock()
-        gitea.get_file_content = AsyncMock(return_value=None)
+        gitea.get_file_content = AsyncMock(
+            return_value="---\nid: decision-verdict-1\ntype: decision\nstatus: active\n---\n# T\n"
+        )
+        gitea.change_files = AsyncMock(return_value=True)
 
         with caplog.at_level(
             logging.WARNING, logger="orchestrator.services.project_backlog"
@@ -1431,7 +1440,10 @@ class TestCloseBacklogTicket:
         vector_db.acquire = MagicMock(return_value=_CM())
 
         gitea = MagicMock()
-        gitea.get_file_content = AsyncMock(return_value=None)
+        gitea.get_file_content = AsyncMock(
+            return_value="---\nid: issue-real-ticket\ntype: issue\nstatus: active\n---\n# T\n"
+        )
+        gitea.change_files = AsyncMock(return_value=True)
 
         with caplog.at_level(
             logging.WARNING, logger="orchestrator.services.project_backlog"
@@ -1475,6 +1487,7 @@ class TestCloseBacklogTicket:
         # No frontmatter block -- _rewrite_status is a byte-identical passthrough.
         gitea.get_file_content = AsyncMock(return_value="# Just a heading\n\nbody\n")
         gitea.create_or_update_file = AsyncMock(return_value=True)
+        gitea.change_files = AsyncMock(return_value=True)
 
         ok = await close_backlog_ticket(
             vector_db,
@@ -1512,6 +1525,7 @@ class TestCloseBacklogTicket:
         gitea = MagicMock()
         gitea.get_file_content = AsyncMock(return_value="# Just a heading\n\nbody\n")
         gitea.create_or_update_file = AsyncMock(return_value=True)
+        gitea.change_files = AsyncMock(return_value=True)
 
         with caplog.at_level(
             logging.WARNING, logger="orchestrator.services.project_backlog"
@@ -1524,7 +1538,7 @@ class TestCloseBacklogTicket:
                 "resolved",
                 postgres_db=_repo_db(),
             )
-        assert any("no rewritable" in r.message for r in caplog.records)
+        assert any("malformed-frontmatter" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_unterminated_frontmatter_reports_failure_and_warns(self, caplog):
@@ -1558,6 +1572,7 @@ class TestCloseBacklogTicket:
             return_value="---\nid: feature-x\ntype: feature\nstatus: active\n# T\n"
         )
         gitea.create_or_update_file = AsyncMock(return_value=True)
+        gitea.change_files = AsyncMock(return_value=True)
 
         with caplog.at_level(
             logging.WARNING, logger="orchestrator.services.project_backlog"
@@ -1573,7 +1588,7 @@ class TestCloseBacklogTicket:
 
         assert ok is False
         gitea.create_or_update_file.assert_not_awaited()
-        assert any("no rewritable" in r.message for r in caplog.records)
+        assert any("malformed-frontmatter" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_idempotent_reclose_reports_success_without_writing(self):
@@ -1607,6 +1622,7 @@ class TestCloseBacklogTicket:
             return_value="---\nid: feature-x\ntype: feature\nstatus: resolved\n---\n# T\n"
         )
         gitea.create_or_update_file = AsyncMock(return_value=True)
+        gitea.change_files = AsyncMock(return_value=True)
 
         ok = await close_backlog_ticket(
             vector_db,
@@ -1653,6 +1669,7 @@ class TestCloseBacklogTicket:
             return_value="---\nid: feature-x\ntype: feature\nstatus: resolved\n---\n# T\n"
         )
         gitea.create_or_update_file = AsyncMock(return_value=True)
+        gitea.change_files = AsyncMock(return_value=True)
 
         with caplog.at_level(
             logging.DEBUG, logger="orchestrator.services.project_backlog"
@@ -1668,10 +1685,7 @@ class TestCloseBacklogTicket:
 
         assert not any("no rewritable" in r.message for r in caplog.records)
         assert not any(r.levelno >= logging.WARNING for r in caplog.records)
-        already = [r for r in caplog.records if "already at" in r.message]
-        assert already, "the no-op re-close must still say what it saw"
-        assert already[0].levelno == logging.DEBUG
-        assert "resolved" in already[0].getMessage()
+        assert gitea.change_files.await_count == 0
 
 
 # =============================================================================
@@ -1710,6 +1724,7 @@ class TestCloseBacklogTicketRepoResolution:
             return_value="---\nid: feature-x\ntype: feature\nstatus: active\n---\n# T\n"
         )
         gitea.create_or_update_file = AsyncMock(return_value=True)
+        gitea.change_files = AsyncMock(return_value=True)
         return vector_db, gitea, conn
 
     async def _close(self, postgres_db):
@@ -1738,7 +1753,7 @@ class TestCloseBacklogTicketRepoResolution:
             "project-68137e29-jobs",
             "knowledge/feature-x.md",
         )
-        assert gitea.create_or_update_file.await_args.args[0] == "project-68137e29-jobs"
+        assert gitea.change_files.await_args.args[0] == "project-68137e29-jobs"
 
     @pytest.mark.asyncio
     async def test_knowledge_repo_wins_when_the_project_has_one(self):
@@ -1750,10 +1765,7 @@ class TestCloseBacklogTicketRepoResolution:
         assert gitea.get_file_content.await_args.args[0] == (
             "project-68137e29-knowledge"
         )
-        assert (
-            gitea.create_or_update_file.await_args.args[0]
-            == "project-68137e29-knowledge"
-        )
+        assert gitea.change_files.await_args.args[0] == "project-68137e29-knowledge"
 
     @pytest.mark.asyncio
     async def test_github_repo_reads_snapshot_and_updates_with_blob_sha(self):
@@ -1803,11 +1815,11 @@ class TestCloseBacklogTicketRepoResolution:
 
         with (
             patch(
-                "orchestrator.services.project_backlog.kb_client_for_repo",
+                "services.kb_materialize.kb_client_for_repo",
                 AsyncMock(return_value=github),
             ) as select,
             patch(
-                "orchestrator.services.project_backlog.GiteaKnowledgeGitSource",
+                "services.project_backlog.GiteaKnowledgeGitSource",
                 return_value=Source(),
             ),
         ):
@@ -1816,7 +1828,15 @@ class TestCloseBacklogTicketRepoResolution:
         assert ok is True
         ref = await resolve_kb_repo(db, self.PROJECT_ID)
         assert ref is not None
-        select.assert_awaited_once_with(db, gitea, ref)
+        select.assert_awaited_once()
+        selected_db, selected_gitea, selected_ref = select.await_args.args
+        assert selected_db is db
+        assert selected_gitea is gitea
+        assert (selected_ref.forge, selected_ref.repo, selected_ref.branch) == (
+            ref.forge,
+            ref.repo,
+            ref.branch,
+        )
         gitea.get_file_content.assert_not_awaited()
         gitea.create_or_update_file.assert_not_awaited()
         github.change_files.assert_awaited_once()
@@ -1827,11 +1847,13 @@ class TestCloseBacklogTicketRepoResolution:
         assert files[0]["sha"] == "existing-blob"
 
     @pytest.mark.asyncio
-    async def test_repo_less_project_degrades_to_an_index_only_close(self, caplog):
-        """A project with neither repo has no file to mirror to. Gitea must
-        not be called at all (the old code would have asked for a repo whose
-        name it invented), the index close must still run, and the skip must
-        be logged rather than silent."""
+    async def test_repo_less_project_fails_closed_before_index_mutation(self, caplog):
+        """Without a canonical repository, closure stays unresolved.
+
+        The old code invented a repository name and could report an index-only
+        close. The authoritative-file contract now keeps the projection and
+        executor disposition untouched and records a durable retry outcome.
+        """
         import logging
 
         with caplog.at_level(
@@ -1842,8 +1864,8 @@ class TestCloseBacklogTicketRepoResolution:
         assert ok is False
         gitea.get_file_content.assert_not_awaited()
         gitea.create_or_update_file.assert_not_awaited()
-        conn.execute.assert_awaited_once()  # the index mirror is independent
-        assert any("no KB repo" in r.message for r in caplog.records)
+        conn.execute.assert_not_awaited()
+        assert any("canonical close refused" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_resolution_matches_the_reindexer_for_the_same_project(self):
@@ -1856,7 +1878,7 @@ class TestCloseBacklogTicketRepoResolution:
 
         resolved = await resolve_kb_repo(db, self.PROJECT_ID)
         assert resolved is not None
-        assert gitea.create_or_update_file.await_args.args[0] == resolved.repo
+        assert gitea.change_files.await_args.args[0] == resolved.repo
 
 
 # =============================================================================

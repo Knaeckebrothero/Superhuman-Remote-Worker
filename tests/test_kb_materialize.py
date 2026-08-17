@@ -3,10 +3,10 @@ docs/features/knowledge_base_repo_separation.md).
 
 ``materialize_knowledge_note`` replaces the agent's workspace write of
 ``knowledge/<slug>.md`` with a single Gitea commit into whichever repo
-``resolve_kb_repo`` picks for the project. The contract that matters to its
-caller is that it NEVER raises: a repo-less project, a refused commit and a
-raising client all come back as a status dict so ``kb_write`` can
-log-and-continue exactly as the old non-fatal file write did.
+``resolve_kb_repo`` picks for the project. The service reports expected
+failures as structured outcomes; mutation callers fail closed unless the
+result proves that the canonical boundary was crossed, while the durable
+intent remains available for retry.
 
 Gitea is mocked (pattern: tests/test_loop_merge.py). ``resolve_kb_repo`` is
 patched at this module's import site — it is the reindexer's function, and
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,6 +25,7 @@ from fastapi import HTTPException
 
 import security.access as access_module
 from services.kb_materialize import (
+    materialize_knowledge_metadata_update,
     materialize_knowledge_note,
     note_repo_path,
     slug_error,
@@ -99,10 +101,44 @@ def _ref(branch: str | None = "main") -> KbRepoRef:
     )
 
 
+def _ledger_db() -> AsyncMock:
+    db = AsyncMock()
+    intent_id = uuid.uuid4()
+
+    async def _begin(**kwargs):
+        return {
+            "id": intent_id,
+            "project_id": kwargs["project_id"],
+            "note_id": kwargs["note_id"],
+            "canonical_state": "pending_sync",
+            "projection_state": "pending",
+            "retry_state": "retryable",
+            "attempt_claimed": True,
+            "attempt_token": uuid.uuid4(),
+        }
+
+    async def _finish(_intent_id, *, canonical, permanent, **kwargs):
+        return {
+            "id": intent_id,
+            "canonical_state": "canonical"
+            if canonical
+            else ("failed" if permanent else "pending_sync"),
+            "projection_state": "pending",
+            "retry_state": "none"
+            if canonical
+            else ("permanent" if permanent else "retryable"),
+        }
+
+    db.begin_knowledge_materialization.side_effect = _begin
+    db.finish_knowledge_materialization.side_effect = _finish
+    db.finish_knowledge_projection.return_value = {"id": intent_id}
+    return db
+
+
 async def _run(gitea, *, slug=SLUG, content=BODY, job_id=JOB, resolved=None):
     if resolved is None:
         resolved = _ref()
-    db = AsyncMock()
+    db = _ledger_db()
     with _patch_resolve(resolved) as resolve:
         result = await materialize_knowledge_note(
             postgres_db=db,
@@ -254,7 +290,7 @@ class TestMaterializeUpdate:
             branch="main",
             credential_ref="55555555-6666-7777-8888-999999999999",
         )
-        db = AsyncMock()
+        db = _ledger_db()
         with (
             _patch_resolve(ref),
             patch(
@@ -341,7 +377,7 @@ class TestSkips:
         """A repo-less project: the equivalent of the old ``has_git()`` skip."""
         g = _make_gitea()
 
-        db = AsyncMock()
+        db = _ledger_db()
         with _patch_resolve(None):
             result = await materialize_knowledge_note(
                 postgres_db=db,
@@ -354,6 +390,8 @@ class TestSkips:
 
         assert result["status"] == "skipped"
         assert result["reason"] == "no-repo"
+        assert result["canonical_state"] == "pending_sync"
+        assert result["retry_state"] == "retryable"
         assert result["path"] == PATH
         assert result["repo"] is None
         g.list_tree.assert_not_awaited()
@@ -370,6 +408,132 @@ class TestSkips:
 
 
 class TestFailures:
+    @pytest.mark.asyncio
+    async def test_malformed_frontmatter_is_permanent_and_never_reaches_git(self):
+        g = _make_gitea()
+
+        result, _, db = await _run(
+            g,
+            content="---\nid: [unterminated\n---\n# Broken\n",
+        )
+
+        assert result["status"] == "failed"
+        assert result["reason"] == "malformed-frontmatter"
+        assert result["canonical_state"] == "failed"
+        assert result["retry_state"] == "permanent"
+        assert (
+            db.finish_knowledge_materialization.await_args.kwargs["permanent"] is True
+        )
+        g.change_files.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unexpected_materializer_exception_is_durable_and_retryable(self):
+        g = _make_gitea()
+        with patch(
+            "services.kb_materialize._materialize_knowledge_note_once",
+            AsyncMock(side_effect=RuntimeError("materializer exploded")),
+        ):
+            result, _, db = await _run(g)
+
+        assert result["status"] == "failed"
+        assert result["reason"] == "materializer-exception"
+        assert result["canonical_state"] == "pending_sync"
+        assert result["retry_state"] == "retryable"
+        assert (
+            db.finish_knowledge_materialization.await_args.kwargs["permanent"] is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_intent_store_failure_is_explicitly_projection_only(self):
+        db = _ledger_db()
+        db.begin_knowledge_materialization.side_effect = RuntimeError("ledger down")
+
+        with _patch_resolve(_ref()):
+            result = await materialize_knowledge_note(
+                postgres_db=db,
+                gitea_client=_make_gitea(),
+                project_id=PROJECT,
+                slug=SLUG,
+                content=BODY,
+                job_id=JOB,
+            )
+
+        assert result["status"] == "failed"
+        assert result["reason"] == "intent-store-error"
+        assert result["canonical_state"] == "failed"
+        assert result["projection_state"] == "projection_only"
+        assert result["retry_state"] == "retryable"
+
+    @pytest.mark.asyncio
+    async def test_retry_reuses_exact_canonical_ready_timestamp(self):
+        from services.kb_materialize import retry_knowledge_materialization_intent
+
+        ready_at = "2026-08-17T10:11:12+00:00"
+        g = _make_gitea()
+        content = (
+            "---\nid: bp08-ready\ntype: feature\nstatus: active\n"
+            f"tags: [ready]\nready_at: {ready_at}\n---\n# Ready\n"
+        )
+        db = _ledger_db()
+        seen: list[str] = []
+
+        async def _materialize_once(**kwargs):
+            seen.append(kwargs["content"])
+            return {
+                "status": "committed",
+                "reason": None,
+                "path": "knowledge/bp08-ready.md",
+            }
+
+        intent = {
+            "id": uuid.uuid4(),
+            "project_id": PROJECT,
+            "note_id": "bp08-ready",
+            "content": content,
+            "job_id": None,
+            "attempt_token": uuid.uuid4(),
+        }
+        with patch(
+            "services.kb_materialize._materialize_knowledge_note_once",
+            side_effect=_materialize_once,
+        ):
+            result = await retry_knowledge_materialization_intent(
+                postgres_db=db,
+                gitea_client=g,
+                intent=intent,
+            )
+
+        assert result["canonical_state"] == "canonical"
+        assert seen == [content]
+        assert seen[0].count(ready_at) == 1
+
+    @pytest.mark.asyncio
+    async def test_ready_metadata_returns_exact_canonical_projection_values(self):
+        current = (
+            "---\nid: chose-jwt-over-oauth\ntype: feature\nstatus: active\n"
+            "tags: [category:executor]\n---\n# Ready next\n"
+        )
+        g = _make_gitea(tree_paths={PATH: _blob_sha(current)})
+        g.get_file_content = AsyncMock(return_value=current)
+        db = _ledger_db()
+
+        with _patch_resolve(_ref()):
+            result = await materialize_knowledge_metadata_update(
+                postgres_db=db,
+                gitea_client=g,
+                project_id=PROJECT,
+                slug=SLUG,
+                add_tags=["ready"],
+            )
+
+        payload = g.change_files.await_args.args[2][0]
+        committed = base64.b64decode(payload["content_b64"]).decode()
+        assert result["canonical_state"] == "canonical"
+        assert result["canonical_tags"] == ["category:executor", "ready"]
+        assert result["canonical_ready_at"]
+        assert f"ready_at: '{result['canonical_ready_at']}'" in committed
+        assert committed.count("ready_at:") == 1
+
     @pytest.mark.asyncio
     async def test_both_operations_refused_reports_commit_refused(self):
         g = _make_gitea(change_results=[False, False])
@@ -394,7 +558,7 @@ class TestFailures:
     @pytest.mark.asyncio
     async def test_resolution_failure_is_not_fatal(self):
         g = _make_gitea()
-        db = AsyncMock()
+        db = _ledger_db()
         with patch(
             "services.kb_materialize.resolve_kb_repo",
             AsyncMock(side_effect=RuntimeError("db down")),
@@ -465,7 +629,7 @@ class TestMaterializeEndpoint:
         body = KnowledgeMaterializeRequest(slug=SLUG, content=BODY, job_id=JOB)
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", AsyncMock()),
+            patch("main.postgres_db", _ledger_db()),
             patch("main.gitea_client", g),
             _patch_resolve(_ref()),
         ):
@@ -477,8 +641,7 @@ class TestMaterializeEndpoint:
 
     @pytest.mark.asyncio
     async def test_failure_is_a_200_body_not_an_http_error(self, fake_request):
-        """The caller must be able to log-and-continue; a raise-for-status
-        client would otherwise turn a KB hiccup into a tool failure."""
+        """The internal transport returns structured retry truth to callers."""
         from main import KnowledgeMaterializeRequest, materialize_knowledge_note
 
         g = _make_gitea(change_raises=True)
@@ -486,7 +649,7 @@ class TestMaterializeEndpoint:
         body = KnowledgeMaterializeRequest(slug=SLUG, content=BODY, job_id=JOB)
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("main.postgres_db", AsyncMock()),
+            patch("main.postgres_db", _ledger_db()),
             patch("main.gitea_client", g),
             _patch_resolve(_ref()),
         ):
@@ -494,3 +657,172 @@ class TestMaterializeEndpoint:
 
         assert result["status"] == "failed"
         assert result["reason"] == "commit-error"
+
+
+class TestKnowledgeMutationEndpoint:
+    @staticmethod
+    def _vector(row=None, projected=SLUG):
+        conn = MagicMock()
+        conn.fetchrow = AsyncMock(return_value=row or {"note_id": SLUG})
+        conn.fetchval = AsyncMock(return_value=projected)
+        vector = MagicMock()
+        vector.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
+        vector.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+        return vector, conn
+
+    @pytest.mark.asyncio
+    async def test_authorization_precedes_any_materialization(self, fake_request):
+        from main import KnowledgeNoteUpdate, update_knowledge_note
+
+        materialize = AsyncMock()
+        with (
+            patch(
+                "main.require_project_member",
+                AsyncMock(side_effect=HTTPException(status_code=403)),
+            ),
+            patch(
+                "services.kb_materialize.materialize_knowledge_metadata_update",
+                materialize,
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await update_knowledge_note(
+                    fake_request,
+                    PROJECT,
+                    SLUG,
+                    KnowledgeNoteUpdate(status="resolved"),
+                )
+
+        assert exc.value.status_code == 403
+        materialize.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pending_canonical_write_returns_409_and_leaves_index_unchanged(
+        self, fake_request
+    ):
+        from main import KnowledgeNoteUpdate, update_knowledge_note
+
+        vector, conn = self._vector()
+        db = AsyncMock()
+        pending = {
+            "status": "failed",
+            "reason": "commit-error",
+            "intent_id": str(uuid.uuid4()),
+            "canonical_state": "pending_sync",
+            "projection_state": "pending",
+            "retry_state": "retryable",
+        }
+        with (
+            patch("main.require_project_member", AsyncMock()),
+            patch("main.vector_db", vector),
+            patch("main.postgres_db", db),
+            patch(
+                "services.kb_materialize.materialize_knowledge_metadata_update",
+                AsyncMock(return_value=pending),
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await update_knowledge_note(
+                    fake_request,
+                    PROJECT,
+                    SLUG,
+                    KnowledgeNoteUpdate(status="resolved"),
+                )
+
+        assert exc.value.status_code == 409
+        assert exc.value.detail["status"] == "pending_sync"
+        assert exc.value.detail["retry_state"] == "retryable"
+        conn.fetchval.assert_not_awaited()
+        db.finish_knowledge_projection.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_success_names_canonical_and_projection_truth(self, fake_request):
+        from main import KnowledgeNoteUpdate, update_knowledge_note
+
+        vector, conn = self._vector()
+        intent_id = str(uuid.uuid4())
+        db = AsyncMock()
+        db.finish_knowledge_projection.return_value = {
+            "id": intent_id,
+            "canonical_state": "canonical",
+            "projection_state": "synced",
+        }
+        canonical = {
+            "status": "committed",
+            "intent_id": intent_id,
+            "canonical_state": "canonical",
+            "projection_state": "pending",
+            "retry_state": "none",
+        }
+        with (
+            patch("main.require_project_member", AsyncMock()),
+            patch("main.vector_db", vector),
+            patch("main.postgres_db", db),
+            patch("main._get_knowledge_graph", return_value=None),
+            patch(
+                "services.kb_materialize.materialize_knowledge_metadata_update",
+                AsyncMock(return_value=canonical),
+            ),
+        ):
+            result = await update_knowledge_note(
+                fake_request,
+                PROJECT,
+                SLUG,
+                KnowledgeNoteUpdate(status="resolved"),
+            )
+
+        assert result == {
+            "status": "updated",
+            "canonical_state": "canonical",
+            "projection_state": "synced",
+            "intent_id": intent_id,
+        }
+        conn.fetchval.assert_awaited_once()
+        db.finish_knowledge_projection.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_tag_projection_uses_exact_canonical_tags_and_ready_time(
+        self, fake_request
+    ):
+        from main import KnowledgeNoteUpdate, update_knowledge_note
+
+        vector, conn = self._vector()
+        intent_id = str(uuid.uuid4())
+        ready_at = "2026-08-17T10:11:12+00:00"
+        db = AsyncMock()
+        db.finish_knowledge_projection.return_value = {
+            "id": intent_id,
+            "canonical_state": "canonical",
+            "projection_state": "synced",
+        }
+        canonical = {
+            "status": "committed",
+            "intent_id": intent_id,
+            "canonical_state": "canonical",
+            "projection_state": "pending",
+            "retry_state": "none",
+            "canonical_tags": ["category:executor", "ready"],
+            "canonical_ready_at": ready_at,
+        }
+        with (
+            patch("main.require_project_member", AsyncMock()),
+            patch("main.vector_db", vector),
+            patch("main.postgres_db", db),
+            patch("main._get_knowledge_graph", return_value=None),
+            patch(
+                "services.kb_materialize.materialize_knowledge_metadata_update",
+                AsyncMock(return_value=canonical),
+            ),
+        ):
+            result = await update_knowledge_note(
+                fake_request,
+                PROJECT,
+                SLUG,
+                KnowledgeNoteUpdate(add_tags=["ready"]),
+            )
+
+        assert result["projection_state"] == "synced"
+        assert conn.fetchval.await_args.args[3:] == (
+            ["category:executor", "ready"],
+            ready_at,
+        )

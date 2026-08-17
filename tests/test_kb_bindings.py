@@ -336,9 +336,13 @@ def test_write_targets_only_writable_native_binding():
     context.knowledge_graph.create_note.return_value = "native-note"
     context.knowledge_store.upsert_note.return_value = uuid.uuid4()
 
-    result = _tool(_tools(context), "kb_write").invoke(
-        {"title": "Native Note", "type": "learning", "content": "Body"}
-    )
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={"status": "committed", "path": "knowledge/native-note.md"},
+    ):
+        result = _tool(_tools(context), "kb_write").invoke(
+            {"title": "Native Note", "type": "learning", "content": "Body"}
+        )
 
     assert "native-note" in result
     assert context.knowledge_graph.create_note.call_args.kwargs["project_id"] == str(

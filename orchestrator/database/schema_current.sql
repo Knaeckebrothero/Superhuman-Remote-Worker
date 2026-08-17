@@ -6067,6 +6067,49 @@ CREATE VIEW public.job_summary AS
 
 
 --
+-- Name: knowledge_materialization_intents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.knowledge_materialization_intents (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    project_id uuid NOT NULL,
+    note_id text NOT NULL,
+    content text NOT NULL,
+    content_hash text NOT NULL,
+    job_id uuid,
+    canonical_state text DEFAULT 'pending_sync'::text NOT NULL,
+    projection_state text DEFAULT 'pending'::text NOT NULL,
+    retry_state text DEFAULT 'retryable'::text NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    attempt_token uuid,
+    lease_expires_at timestamp with time zone,
+    last_attempted_at timestamp with time zone,
+    next_retry_at timestamp with time zone,
+    last_error_class text,
+    last_error text,
+    repo text,
+    branch text,
+    path text,
+    operation text,
+    canonical_at timestamp with time zone,
+    projected_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT knowledge_materialization_intents_attempts_check CHECK ((attempts >= 0)),
+    CONSTRAINT knowledge_materialization_intents_canonical_state_check CHECK ((canonical_state = ANY (ARRAY['pending_sync'::text, 'canonical'::text, 'failed'::text, 'superseded'::text]))),
+    CONSTRAINT knowledge_materialization_intents_projection_state_check CHECK ((projection_state = ANY (ARRAY['pending'::text, 'synced'::text, 'projection_only'::text, 'failed'::text]))),
+    CONSTRAINT knowledge_materialization_intents_retry_state_check CHECK ((retry_state = ANY (ARRAY['none'::text, 'retryable'::text, 'permanent'::text])))
+);
+
+
+--
+-- Name: TABLE knowledge_materialization_intents; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.knowledge_materialization_intents IS 'BP-08 durable canonical-file and projection convergence ledger. The file in the project KB repository is authoritative; pending/failed rows are ineligible for backlog dispatch.';
+
+
+--
 -- Name: legacy_workspace_cutover_plan_events; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -6240,6 +6283,40 @@ CREATE TABLE public.notification_queue (
     queued_at timestamp with time zone DEFAULT now(),
     delivered_at timestamp with time zone
 );
+
+
+--
+-- Name: officer_floor_wake_episodes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.officer_floor_wake_episodes (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    project_id uuid NOT NULL,
+    officer_incarnation uuid NOT NULL,
+    pool text NOT NULL,
+    dedup_key text NOT NULL,
+    wake_event_id bigint,
+    state text DEFAULT 'retryable'::text NOT NULL,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    last_attempted_at timestamp with time zone,
+    last_queued_at timestamp with time zone,
+    delivered_at timestamp with time zone,
+    failure_class text,
+    last_error text,
+    next_retry_at timestamp with time zone,
+    resolved_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT officer_floor_wake_episodes_attempt_count_check CHECK ((attempt_count >= 0)),
+    CONSTRAINT officer_floor_wake_episodes_state_check CHECK ((state = ANY (ARRAY['retryable'::text, 'queued'::text, 'delivered'::text, 'permanent_failed'::text, 'superseded'::text])))
+);
+
+
+--
+-- Name: TABLE officer_floor_wake_episodes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.officer_floor_wake_episodes IS 'BP-10 durable backlog-floor wake policy outcomes. Policy debounce starts at last_queued_at; transient retry timing is next_retry_at.';
 
 
 --
@@ -9523,6 +9600,14 @@ ALTER TABLE ONLY public.jobs
 
 
 --
+-- Name: knowledge_materialization_intents knowledge_materialization_intents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.knowledge_materialization_intents
+    ADD CONSTRAINT knowledge_materialization_intents_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: legacy_workspace_cutover_plan_events legacy_workspace_cutover_plan_even_source_source_id_unit_ts_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -9616,6 +9701,22 @@ ALTER TABLE ONLY public.models
 
 ALTER TABLE ONLY public.notification_queue
     ADD CONSTRAINT notification_queue_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: officer_floor_wake_episodes officer_floor_wake_episodes_dedup_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.officer_floor_wake_episodes
+    ADD CONSTRAINT officer_floor_wake_episodes_dedup_key_key UNIQUE (dedup_key);
+
+
+--
+-- Name: officer_floor_wake_episodes officer_floor_wake_episodes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.officer_floor_wake_episodes
+    ADD CONSTRAINT officer_floor_wake_episodes_pkey PRIMARY KEY (id);
 
 
 --
@@ -11188,6 +11289,20 @@ CREATE INDEX idx_jobs_wake_pending ON public.jobs USING btree (updated_at) WHERE
 
 
 --
+-- Name: idx_knowledge_materialization_project_recent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_materialization_project_recent ON public.knowledge_materialization_intents USING btree (project_id, updated_at DESC);
+
+
+--
+-- Name: idx_knowledge_materialization_retry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_materialization_retry ON public.knowledge_materialization_intents USING btree (next_retry_at, lease_expires_at, created_at) WHERE ((canonical_state = 'pending_sync'::text) AND (retry_state = 'retryable'::text));
+
+
+--
 -- Name: idx_llm_endpoints_user; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -11283,6 +11398,20 @@ CREATE INDEX idx_models_provider ON public.models USING btree (provider_kind, pr
 --
 
 CREATE INDEX idx_notif_queue_pending ON public.notification_queue USING btree (user_id, queued_at) WHERE (delivered_at IS NULL);
+
+
+--
+-- Name: idx_officer_floor_wake_project_recent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_officer_floor_wake_project_recent ON public.officer_floor_wake_episodes USING btree (project_id, created_at DESC);
+
+
+--
+-- Name: idx_officer_floor_wake_retry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_officer_floor_wake_retry ON public.officer_floor_wake_episodes USING btree (next_retry_at, created_at) WHERE ((state = 'retryable'::text) AND (resolved_at IS NULL));
 
 
 --
@@ -12112,6 +12241,13 @@ CREATE UNIQUE INDEX uq_jobs_active_ticket_claim ON public.jobs USING btree (proj
 
 
 --
+-- Name: uq_knowledge_materialization_unresolved; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_knowledge_materialization_unresolved ON public.knowledge_materialization_intents USING btree (project_id, note_id, content_hash) WHERE (canonical_state = ANY (ARRAY['pending_sync'::text, 'failed'::text]));
+
+
+--
 -- Name: uq_llm_endpoint_label_system; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -12123,6 +12259,13 @@ CREATE UNIQUE INDEX uq_llm_endpoint_label_system ON public.llm_endpoints USING b
 --
 
 CREATE UNIQUE INDEX uq_llm_endpoint_label_user ON public.llm_endpoints USING btree (user_id, label) WHERE (user_id IS NOT NULL);
+
+
+--
+-- Name: uq_officer_floor_wake_active_episode; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_officer_floor_wake_active_episode ON public.officer_floor_wake_episodes USING btree (project_id, officer_incarnation, pool) WHERE (resolved_at IS NULL);
 
 
 --
@@ -13452,6 +13595,14 @@ ALTER TABLE ONLY public.jobs
 
 
 --
+-- Name: knowledge_materialization_intents knowledge_materialization_intents_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.knowledge_materialization_intents
+    ADD CONSTRAINT knowledge_materialization_intents_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
 -- Name: legacy_workspace_cutover_plan_events legacy_workspace_cutover_plan_events_plan_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -13537,6 +13688,22 @@ ALTER TABLE ONLY public.notification_queue
 
 ALTER TABLE ONLY public.notification_queue
     ADD CONSTRAINT notification_queue_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: officer_floor_wake_episodes officer_floor_wake_episodes_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.officer_floor_wake_episodes
+    ADD CONSTRAINT officer_floor_wake_episodes_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: officer_floor_wake_episodes officer_floor_wake_episodes_wake_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.officer_floor_wake_episodes
+    ADD CONSTRAINT officer_floor_wake_episodes_wake_event_id_fkey FOREIGN KEY (wake_event_id) REFERENCES public.session_wake_events(id) ON DELETE SET NULL;
 
 
 --

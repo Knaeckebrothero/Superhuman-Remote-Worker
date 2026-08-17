@@ -1139,6 +1139,29 @@ async def kb_sweep_tick(
     """
     worked = 0
 
+    try:
+        from .kb_materialize import retry_knowledge_materialization_intent
+
+        due = await postgres_db.claim_due_knowledge_materializations(limit=50)
+    except Exception:
+        logger.exception("kb_sweep: failed to enumerate materialization retries")
+        due = []
+    if not isinstance(due, (list, tuple)):
+        due = []
+    for intent in due:
+        try:
+            await retry_knowledge_materialization_intent(
+                postgres_db=postgres_db,
+                gitea_client=gitea_client,
+                intent=intent,
+            )
+        except Exception:
+            logger.exception(
+                "kb_sweep: materialization retry failed for %s/%s",
+                intent.get("project_id"),
+                intent.get("note_id"),
+            )
+
     # External KB datasources are indexed once under datasources.id, regardless
     # of how many projects/jobs select them. ``list_datasources`` decrypts the
     # credential field only inside this orchestrator process; the source keeps
@@ -1241,6 +1264,14 @@ async def kb_sweep_tick(
                 repo_name=resolved.repo,
                 branch=resolved.branch,
             )
+            if result.get("status") in ("completed", "up-to-date"):
+                try:
+                    await postgres_db.mark_knowledge_projections_synced(str(project_id))
+                except Exception:
+                    logger.exception(
+                        "kb_sweep: projection ledger update failed for project %s",
+                        project_id,
+                    )
             if result.get("status") not in ("up-to-date", "no-head"):
                 worked += 1
         except Exception:

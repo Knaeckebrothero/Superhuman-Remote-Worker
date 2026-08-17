@@ -277,6 +277,7 @@ class KnowledgeStore:
         modified_at: Optional[datetime] = None,
         priority: Optional[int] = 1,
         ready: Optional[bool] = None,
+        ready_at: Optional[datetime] = None,
     ) -> uuid.UUID:
         """Upsert a note into the search index (write-through from Neo4j).
 
@@ -318,6 +319,11 @@ class KnowledgeStore:
                 ordinary content edit would re-arm a ticket that is already
                 claimed, and the tick would dispatch a second job for work
                 already in flight.
+            ready_at: Canonical READY timestamp to project when ``ready`` is
+                true. Callers that just committed the canonical note pass the
+                timestamp parsed from that file so projection cannot create a
+                second logical authorization generation. Falls back to the
+                database clock for legacy callers.
 
         Returns:
             UUID of the upserted row
@@ -357,7 +363,7 @@ class KnowledgeStore:
                     indexed_at = NOW(), priority = COALESCE($13, priority),
                     ready_at = CASE
                         WHEN $14::boolean IS NULL THEN ready_at
-                        WHEN $14::boolean THEN NOW()
+                        WHEN $14::boolean THEN COALESCE($15, NOW())
                         ELSE NULL
                     END
                 WHERE project_id = $1 AND note_id = $2
@@ -377,6 +383,7 @@ class KnowledgeStore:
                 modified_at,
                 priority,
                 ready,
+                ready_at,
             )
             logger.debug(f"Updated knowledge index (metadata only): {note_id}")
             return row_id
@@ -442,7 +449,7 @@ class KnowledgeStore:
                 $7, $8, $9, $10, $11, $12,
                 $13, to_tsvector('english', $14), $15, $16, NOW(),
                 $17, $18, COALESCE($19, 1),
-                CASE WHEN $20::boolean THEN NOW() ELSE NULL END
+                CASE WHEN $20::boolean THEN COALESCE($21, NOW()) ELSE NULL END
             )
             ON CONFLICT (project_id, note_id) DO UPDATE SET
                 title = EXCLUDED.title,
@@ -463,7 +470,7 @@ class KnowledgeStore:
                 priority = COALESCE($19, knowledge_index.priority),
                 ready_at = CASE
                     WHEN $20::boolean IS NULL THEN knowledge_index.ready_at
-                    WHEN $20::boolean THEN NOW()
+                    WHEN $20::boolean THEN COALESCE($21, NOW())
                     ELSE NULL
                 END
             RETURNING id
@@ -488,6 +495,7 @@ class KnowledgeStore:
             ttl_value,
             priority,
             ready,
+            ready_at,
         )
 
         logger.debug(f"Upserted knowledge index: {note_id} (content changed)")

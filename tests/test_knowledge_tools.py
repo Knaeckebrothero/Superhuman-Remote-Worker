@@ -100,7 +100,7 @@ def _no_materialization_http():
     """
     with patch(
         "src.tools.knowledge.knowledge_tools._post_vault_file",
-        return_value={"status": "skipped", "reason": "no-repo"},
+        return_value={"status": "committed", "path": "knowledge/test.md"},
     ):
         yield
 
@@ -339,7 +339,7 @@ class TestKbWrite:
         assert "my-note" in result
         assert "learning" in result
 
-    def test_pgvector_failure_is_nonfatal(self):
+    def test_pgvector_failure_reports_pending_projection(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.create_note.return_value = "slug"
         ctx.knowledge_store.upsert_note = AsyncMock(side_effect=Exception("db error"))
@@ -354,7 +354,7 @@ class TestKbWrite:
                     "content": "x",
                 },
             )
-        assert "slug" in result  # Still returns success
+        assert "pending sync" in result
 
     def test_returns_error_on_value_error(self):
         """A ValueError out of the graph layer surfaces as an error string.
@@ -376,7 +376,7 @@ class TestKbWrite:
             },
         )
         assert "Error" in result
-        assert "Invalid note_type" in result
+        assert "optional graph projection failed" in result
 
     def test_returns_error_on_generic_exception(self):
         tools, ctx = _make_tools()
@@ -1787,7 +1787,7 @@ class TestKbWriteMaterialization:
         assert "branch:" not in calls[0]["content"]  # no git, no branch
         assert "from-a-session" in result
 
-    def test_materialization_failure_is_nonfatal(self):
+    def test_materialization_failure_fails_closed(self):
         ctx = _make_git_context()
         ctx.knowledge_graph.create_note.return_value = "n1"
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
@@ -1802,7 +1802,9 @@ class TestKbWriteMaterialization:
                 {"title": "T", "type": "decision", "content": "x"},
             )
         assert len(calls) == 1
-        assert "n1" in result  # a failed materialisation never fails the tool
+        assert result.startswith("Error: canonical knowledge write")
+        ctx.knowledge_graph.create_note.assert_not_called()
+        ctx.knowledge_store.upsert_note.assert_not_awaited()
 
     def test_failed_materialization_is_logged_as_an_error(self):
         # Sec.10: after this change a failed materialisation means the note is
@@ -1931,7 +1933,7 @@ class TestKbUpdateMaterialization:
         assert "brand new body" in calls[0]["content"]
         assert "Updated" in result
 
-    def test_materialization_failure_is_nonfatal(self):
+    def test_materialization_failure_fails_closed(self):
         ctx = self._kg_context()
         tools, _ = _make_tools(ctx)
 
@@ -1944,7 +1946,8 @@ class TestKbUpdateMaterialization:
                 {"note": "n1", "content": "x"},
             )
         assert len(calls) == 1
-        assert "Updated" in result
+        assert result.startswith("Error: canonical knowledge write")
+        ctx.knowledge_graph.update_note.assert_not_called()
 
 
 # =============================================================================
@@ -2164,7 +2167,8 @@ class TestKbWriteSlugDedup:
                 {"title": "Fresh", "type": "learning", "content": "x"},
             )
         kg.create_note.assert_called_once()
-        assert "fresh-slug" in result
+        assert "fresh" in result
+        assert ctx.knowledge_graph.create_note.call_args.kwargs["note_id"] == "fresh"
 
 
 # =============================================================================

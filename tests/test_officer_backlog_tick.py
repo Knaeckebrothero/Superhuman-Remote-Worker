@@ -30,7 +30,7 @@ from services.officer_backlog import (
     officer_backlog_tick_once,
     pools_from_meta,
     stale_claims,
-    tick_officer,
+    tick_officer as _tick_officer,
 )
 from services.work_categories import EXECUTOR, RESEARCHER
 
@@ -40,6 +40,16 @@ OFFICER_PROJECT_ID = "22222222-2222-2222-2222-222222222222"
 OWNER_ID = "33333333-3333-3333-3333-333333333333"
 KB_DS = "44444444-4444-4444-4444-444444444444"
 REPO_DS = "55555555-5555-5555-5555-555555555555"
+
+
+async def _noop_provision(_job, *, category=None):
+    return None
+
+
+async def tick_officer(*args, **kwargs):
+    """Unit default mirrors the lifespan's configured provisioner."""
+    kwargs.setdefault("provision_repo", _noop_provision)
+    return await _tick_officer(*args, **kwargs)
 
 
 def _row(note_id, *, tags, ready_at=None, title="T", note_type="feature"):
@@ -379,6 +389,7 @@ def _db(
     db.list_stale_officer_claims.return_value = []
     db.get_oldest_open_officer_claim.return_value = None
     db.merge_thread_officer_state.return_value = True
+    db.list_officer_job_preflights.return_value = []
     db.insert_officer_ticket_claim.return_value = {
         "ticket_note_id": "feature-a",
         "ready_generation_at": NOW,
@@ -392,6 +403,46 @@ def _db(
 
     db.create_job.side_effect = _create_job
     db.created = created
+
+    async def _claim_preflight(job_id, **kwargs):
+        return {
+            "id": job_id,
+            "context": {
+                "work_category": created.get("context", {}).get("work_category"),
+                "provisioning_preflight": {"state": "in-progress"},
+            },
+            "preflight_attempt_token": str(uuid.uuid4()),
+        }
+
+    db.claim_officer_job_preflight.side_effect = _claim_preflight
+    db.finish_officer_job_preflight.return_value = True
+    db.get_job.side_effect = lambda job_id: {
+        "id": job_id,
+        **created,
+        "context": {
+            **(created.get("context") or {}),
+            "provisioning_preflight": {"state": "activated"},
+        },
+    }
+
+    async def _floor_wake(project_id, *, notifier=None, **kwargs):
+        if notifier is None:
+            return {"attempted": True, "queued": False, "state": "retryable"}
+        result = await notifier(
+            db,
+            project_id,
+            source="backlog_floor_breach",
+            dedup_key=f"floor:{project_id}:{kwargs['pool']}:episode",
+            payload=kwargs.get("payload"),
+        )
+        return {
+            "attempted": True,
+            "queued": bool(result),
+            "state": "queued" if result else "retryable",
+        }
+
+    db.queue_officer_floor_wake.side_effect = _floor_wake
+    db.resolve_officer_floor_wake_retry.return_value = False
 
     conn = MagicMock()
     conn.execute = AsyncMock()
@@ -520,7 +571,32 @@ class TestTickOfficer:
         assert scan.unavailable is True
         assert scan.exhausted is False
         assert scan.tickets == []
-        assert "claim-state" in (scan.error or "")
+        assert "app-state" in (scan.error or "")
+
+    @pytest.mark.asyncio
+    async def test_pending_canonical_ready_write_is_ineligible(self):
+        db = _db()
+        db.unresolved_knowledge_note_ids.return_value = {"feature-pending"}
+        rows = [
+            _row(
+                "feature-pending",
+                tags=["ready", "category:researcher"],
+                ready_at=NOW,
+            )
+        ]
+
+        scan = await _scan_eligible_tickets(
+            db,
+            _vector_db(rows),
+            OFFICER_PROJECT_ID,
+            RESEARCHER,
+            NOW,
+            minimum=None,
+        )
+
+        assert scan.exhausted is True
+        assert scan.tickets == []
+        assert scan.notes == ["feature-pending: canonical knowledge sync unresolved"]
 
     @pytest.mark.asyncio
     async def test_exact_exhaustion_is_distinct_from_unavailable(self):
@@ -891,6 +967,12 @@ class TestTickOfficer:
     @pytest.mark.asyncio
     async def test_the_floor_wake_is_debounced(self):
         db = _db()
+        db.queue_officer_floor_wake.side_effect = None
+        db.queue_officer_floor_wake.return_value = {
+            "attempted": False,
+            "queued": False,
+            "state": "policy_debounce",
+        }
         woken = []
 
         async def _notify(_db, project_id, *, source, dedup_key, payload=None):
@@ -906,6 +988,32 @@ class TestTickOfficer:
         counts = await tick_officer(db, _vector_db([]), row, now=NOW, notify=_notify)
         assert counts["wakes"] == 0
         assert woken == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure_class", ["missing_notifier", "notifier_false", "outbox"]
+    )
+    async def test_failed_floor_wake_never_increments_success_metric(
+        self, failure_class
+    ):
+        db = _db()
+        db.queue_officer_floor_wake.side_effect = None
+        db.queue_officer_floor_wake.return_value = {
+            "attempted": True,
+            "queued": False,
+            "state": "retryable",
+            "failure_class": failure_class,
+        }
+
+        counts = await tick_officer(
+            db,
+            _vector_db([]),
+            _officer_row(),
+            now=NOW,
+            notify=None,
+        )
+
+        assert counts["wakes"] == 0
 
     @pytest.mark.asyncio
     async def test_grants_are_enforced_against_the_post_owner(self):
@@ -958,7 +1066,9 @@ class TestTickOfficer:
         )
         assert counts["dispatched"] == 0
         assert counts["skipped"] == 1
-        db.update_job_status.assert_awaited()
+        failed = db.finish_officer_job_preflight.await_args.kwargs
+        assert failed["activated"] is False
+        assert failed["failure_class"] == "infrastructure"
 
     @pytest.mark.asyncio
     async def test_state_is_persisted_to_officer_state_not_config(self):

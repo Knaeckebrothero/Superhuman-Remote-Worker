@@ -53,15 +53,17 @@ The result remains mixed, but the authority/atomicity baseline has materially ad
   raw claim context is server-owned, null/missing provenance fails closed, historical
   context merges remain compatible, and deletion truth comes from the delete transaction.
 - Unattended backlog release is still blocked by the supported enable-control gap followed
-  by the still-open provisioning, materialization, roster, evidence, and operational
-  residues listed below. BP-06's pre-filter starvation is closed locally.
+  by the still-open roster, evidence, authorization/liveness-policy, and operational
+  residues listed below. BP-06's pre-filter starvation is closed, and BP-07/BP-08/BP-10
+  now close the provisioning, canonical-write, and floor-wake correctness seams locally.
 
 “Implemented” in the feature docs therefore still does not mean unattended backlog release
 is safe. The earlier tranche was deployed and O6 was released successfully with
 `auto_pull=false`; the later lifecycle/configuration transaction checkpoint was also
-deployed and passed a bounded disposable Officer gate on 2026-08-16. BP-05 is committed in
-HEAD but has no claimed deployment gate; BP-06 is the current uncommitted, not-deployed
-checkpoint. Nothing here authorizes `auto_pull=true` or unattended backlog release. The
+deployed and passed a bounded disposable Officer gate on 2026-08-16. BP-05, BP-06, and
+LF-5 are prior closed/deployed checkpoints. **BP-07/BP-08/BP-10 are the current local,
+uncommitted, and undeployed checkpoint.** Nothing here authorizes `auto_pull=true` or
+unattended backlog release. The
 umbrella stays open until the remaining P0 live gates in
 [Release order and acceptance](#release-order-and-acceptance) pass.
 
@@ -76,7 +78,7 @@ change.
 closed 2026-08-15; deployed disposable gate passed 2026-08-16.** The earlier tranche
 reached dev and O6 was released successfully with `auto_pull=false`; the additional
 transaction/configuration checkpoint later reached dev and passed the bounded gate recorded
-in [[officer_backlog_pools_resavio_livefire]]. BP-05 and BP-06 below are local and not
+in [[officer_backlog_pools_resavio_livefire]]. BP-07/BP-08/BP-10 below are local and not
 deployed.
 
 | Order | Priority | Issue | Audit finding(s) | Why this boundary |
@@ -95,9 +97,9 @@ deployed.
 | 12 | P1 | [[job_liveness_defaults_disagree_across_surfaces]] | OC-08 | Give every supervision surface one liveness policy. |
 | 13 | P1 | [[officer_card_ignores_viewer_authority_and_i18n]] | OC-10 | Make the management surface truthful for roles and locales. |
 | 14 | P1 | [[deleting_a_job_releases_its_backlog_ticket_claim]] | BP-05 | Persist claim retention independently of job retention. **DONE 2026-08-16 after rolling-upgrade/authority repair; local and not deployed.** |
-| 15 | P1 | [[auto_pull_jobs_are_dispatchable_before_provisioning]] | BP-07 | Add non-dispatchable preflight and honest failure causes. |
-| 16 | P1 | [[kb_materialization_failure_reports_ready_or_closed]] | BP-08 | Stop authorization/disposition writes from reporting false success. |
-| 17 | P1 | [[backlog_floor_wake_failure_consumes_debounce]] | BP-10 | Debounce durable wake success, not an attempted call. |
+| 15 | P1 | [[auto_pull_jobs_are_dispatchable_before_provisioning]] | BP-07 | Add non-dispatchable preflight and honest failure causes. **DONE locally 2026-08-17; not deployed/live-fired.** |
+| 16 | P1 | [[kb_materialization_failure_reports_ready_or_closed]] | BP-08 | Stop authorization/disposition writes from reporting false success. **DONE locally 2026-08-17; not deployed/live-fired.** |
+| 17 | P1 | [[backlog_floor_wake_failure_consumes_debounce]] | BP-10 | Debounce durable wake success, not an attempted call. **DONE locally 2026-08-17; not deployed/live-fired.** |
 | 18 | P1 | [[officer_roster_patch_cannot_remove_or_drain_a_slot]] | BP-11 | Give the roster whole-map edits and its documented zero drain. |
 | 19 | P1 | [[headless_officer_cannot_read_screenshot_evidence]] | ES-01 | Either deliver bounded image content or make the tester fallback honest. |
 | 20 | P2 | [[unknown_work_category_fails_open_for_parallelism]] | OC-09 | Close the latent fail-open before the helper gains a caller. |
@@ -266,32 +268,35 @@ plan 0.03 ms), and the expanded 10k-ledger app query set measured 22.71 ms
 
 ### BP-07 — provisioning races dispatch and pollutes the failure breaker (**P1 major**)
 
-The tick commits a `created` job, then provisions repository/cloud state outside the
-transaction, and only afterwards nudges dispatch. The global dispatcher independently
-polls `created` jobs, so it can lease the job before strict provisioning completes. When
-provisioning raises, the tick changes the job to ordinary `failed`; a later breaker pass
-counts that as a job failure even though the design says infrastructure failures never
-feed breakers.
+**Closed locally 2026-08-17; undeployed.** Strict Officer admission now inserts one claim
+and a born-paused job with an `officer_preflight` freeze in the existing post-locked
+transaction. All dispatch lanes and their final claim CAS require `freeze_data IS NULL`.
+The jobs row carries the normalized `not-attempted -> in-progress -> activated` state plus
+retryable/permanent failure arms; a lease/token CAS changes `paused -> created` and clears
+the freeze only after repository and cloud provisioning finish.
 
-**Acceptance:** jobs are born in a non-dispatchable preflight state (or provisioning is
-otherwise completed before visibility), then atomically activated. Provisioning failures
-carry a machine-readable cause excluded from breaker outcomes. Test the next tick, not only
-the tick in which provisioning failed.
+Repository/cloud failures remain visible, capacity- and claim-holding, and classified as
+infrastructure. The distinct-ticket breaker query excludes them while genuine worker
+failures retain existing behavior. Tick and manual strict creation share the boundary;
+recovery and concurrent attempts provision/activate once. Deterministic before/after-
+activation faults and real-PostgreSQL races prove one job/claim and no early lease. See
+[[auto_pull_jobs_are_dispatchable_before_provisioning]] in `docs/done`.
 
 ### BP-08 — failed KB materialization is reported as a successful ready/close (**P1 major**)
 
-`knowledge_tools._materialize_note()` intentionally returns a failed result rather than
-raising. `kb_write`/`kb_update` paths ignore that result, continue updating projections,
-and return success text. An officer can therefore believe a ticket was readied or closed
-while the canonical OKF file was not changed. A later reindex can restore stale state or
-resurrect the ticket.
+**Closed locally 2026-08-17; undeployed.** Migration 0165's durable materialization ledger
+makes the project knowledge Git repository canonical and pgvector its required
+search/eligibility projection. Every content/metadata mutation and backlog close persists
+intent, then crosses Git, then projection. Missing binding/repository, Git exception,
+conflict refusal, malformed frontmatter, materializer exception, or projection failure can
+no longer return Created, Updated, READY, or closed.
 
-This is the still-open K4 availability requirement, now on the authorization and
-disposition path rather than merely a diagnostic nicety.
-
-**Acceptance:** mutation responses expose materialization status; readiness and closure
-fail closed or enter an explicit degraded/retry state. Tests inject git/materialization
-failure and prove no false “Updated/READY/closed” result is returned.
+Unresolved notes are excluded from backlog eligibility. Failed close leaves the executor
+disposition and projection open. Retry leases run before reindex, then reindex settles only
+the newest canonical intent; the exact canonical `ready_at` is reused rather than bumped.
+Tool/API/SITREP/Cockpit surfaces name canonical, pending-sync, failed, projection-only,
+retry, and projection outcomes. See [[kb_materialization_failure_reports_ready_or_closed]]
+in `docs/done`.
 
 ### BP-09 — “officer-only” readiness is actually persistent-session-only (**P0 security**)
 
@@ -312,13 +317,18 @@ Tests cover viewer, editor, owner, conference, commissioned officer, and worker 
 
 ### BP-10 — floor-wake debounce records attempts as deliveries (**P1**)
 
-When `notify` is absent, raises, or returns a false result, `tick_officer()` still stores
-`backlog_floor_wakes[pool]=now`; a false return also increments its wake count. A transient
-notification outage therefore suppresses the needed wake for six hours while metrics say
-it happened.
+**Closed locally 2026-08-17; undeployed.** Migration 0165's floor-episode ledger defines
+success as a verified insert into the existing durable session-wake outbox. Attempted,
+durably queued, delivered, failure, retry, and next retry are separate fields. Only
+`last_queued_at` starts the six-hour policy debounce; transient `next_retry_at` is an
+independent clock.
 
-**Acceptance:** write the debounce timestamp only after a durable outbox insert/positive
-delivery contract. Failed attempts remain retryable and have separate metrics.
+Project/incarnation/pool/episode deduplication and the post -> thread -> wake lock order
+make duplicate replicas converge on one intent. Missing/false/raising notifier and outbox
+rollback remain retryable and do not increment the success metric. Hold preserves a
+durably queued intent as pending; decommission deletes/supersedes it under the same post
+lock. Real PostgreSQL tests cover queue/decommission and queue/hold races. See
+[[backlog_floor_wake_failure_consumes_debounce]] in `docs/done`.
 
 ### BP-11 — roster edits cannot remove one slot or set a zero-count drain (**P1 functional**)
 
@@ -388,11 +398,13 @@ sequence is:
    now have transactional/CAS boundaries, including the full-lineage no-force gate,
    orphan-End decision, commission continuity, completion routing and commission config
    generation fence.
-3. **Durable eligibility and preflight:** BP-05 and BP-06 are completed locally; BP-07,
-   OC-08 and OC-09 remain. Claims survive retention and cross-store scans no longer starve;
-   a job must still not become dispatchable until its prerequisites are ready.
-4. **Truthful content and delivery:** OC-05–OC-07, BP-08, BP-10, ES-01. Redact before either
-   audience, distinguish attempted from delivered, and surface degraded canonical writes.
+3. **Durable eligibility and preflight:** BP-05, BP-06, and BP-07 are complete; the BP-07
+   checkpoint is local/undeployed. Claims survive retention, cross-store scans do not
+   starve, and strict jobs remain non-dispatchable through mandatory provisioning. OC-08
+   and OC-09 remain.
+4. **Truthful content and delivery:** BP-08 and BP-10 are complete locally/undeployed.
+   OC-05–OC-07 and ES-01 remain; continue to redact before either audience and preserve the
+   attempted/queued/delivered distinctions.
 5. **Supported operation:** BP-01, BP-11, BP-12, OC-10. Only after the invariants exist
    should the owner-facing enable switch and live card be treated as a release surface.
 6. **Live fire:** enable one non-executor pool with disposable tickets, inject notification,
@@ -413,6 +425,13 @@ Completed automated transaction gates (not a substitute for live fire):
   produce one claim/job; deletion, retention, re-ready and recommission preserve the
   project-scoped ledger contract.
 - Route A reply/timeout actors cannot resume a refrozen route B generation.
+- Strict Officer jobs are born paused/frozen, cannot be claimed during provisioning, and
+  recover across concurrent and before/after-activation faults with one job/claim/effect.
+  Repository/cloud failures remain outside distinct-ticket breaker history.
+- Canonical knowledge intent, required projection, retry/reindex settlement, and exact
+  readiness generation converge under injected Git/materializer/projection failures.
+- Duplicate floor ticks queue one durable wake; notifier/outbox failures do not debounce,
+  and hold/decommission races leave no deliverable orphan.
 
 Remaining minimum regression/live gates before `auto_pull` leaves its safe default:
 
@@ -509,7 +528,7 @@ passes alone (**24 passed**). These are explicit local-environment/test-isolatio
 officer checkpoint failures.
 
 The umbrella nevertheless remains open: this automated transaction evidence does not
-close BP-01/BP-07/BP-08/BP-11, ES-01, the remaining OC-05/OC-06 residues, or
+close BP-01/BP-11, ES-01, OC-07/OC-08/OC-10, the remaining OC-05/OC-06 residues, or
 the live background-officer image-consumption gate.
 
 ### 2026-08-16 deployed gate and local BP-05 checkpoint
@@ -557,3 +576,39 @@ it does not authorize unattended backlog release.
 The post-deployment BP-05 smoke is specified separately in
 [[officer_ticket_claim_ledger_live_gate_2026-08-16]]. Its PASS updates deployment evidence
 only; it does not change this umbrella's open auto-pull verdict.
+
+### 2026-08-17 local BP-07/BP-08/BP-10 correctness checkpoint
+
+This tranche is local, uncommitted, undeployed, and not live-fired. Migration 0165 adds the
+canonical-knowledge convergence and floor-wake episode ledgers; strict provisioning uses
+the existing paused/frozen jobs authority rather than adding a public status. The post ->
+thread -> jobs -> wake/routes lock order, migration 0162 claim barrier, project scoping,
+one-shot claim semantics, and `auto_pull=false` default remain intact.
+
+```text
+focused materialization/project/tool suite:            360 passed in 2.90s
+expanded knowledge/reindex/authorization suite:       1081 passed in 27.63s
+focused Officer/provision/dispatch/wake suite:         431 passed in 61.28s
+expanded Officer/admission/lifecycle/routing suite:    991 passed in 110.43s
+real PostgreSQL Officer/routing/pagination suite:       97 passed in 232.40s
+migration/schema contract suite:                       103 passed, 3 skipped in 62.05s
+from-zero schema replay/drift check:                    139 app / 16 vector / 5 audit, clean
+Cockpit Officer component:                              64 passed in 759ms
+Cockpit EN/DE parity + hardcoded-copy check:             2553 keys, clean
+Cockpit production build:                               passed in 7.55s (known budget/CommonJS warnings)
+changed-file Ruff check / format check:                  clean (26 Python files)
+git diff --check:                                        clean
+```
+
+The expanded and broad suites exposed and prompted repair of stale BP-08 success fixtures
+and Officer-summary health doubles. The final system-Python run reached **14,985 passed /
+123 skipped in 219.27 s**
+before the known undeclared local interpreter gap stopped it at
+`tests/tools/research/test_arxiv_client.py`: `/usr/bin/python -c "import arxiv"`
+reproduces `ModuleNotFoundError`. The exact file passes under the repository `.venv`
+(**22 passed in 0.12 s**).
+
+The three issue contracts are recorded in `docs/done`. No shared forge, notification
+channel, Officer, database, pod, or cluster was mutated, so this evidence does not claim a
+live provisioning, Git, wake-delivery, interruption, or unattended-dispatch gate. The
+umbrella remains open and `auto_pull` remains off and unexposed.

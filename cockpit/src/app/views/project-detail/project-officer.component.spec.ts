@@ -252,6 +252,92 @@ describe('backlogState (policy the officer can read, §6)', () => {
     expect(component.staleClaims()).toHaveLength(1);
     expect(component.staleClaims()[0].ticket_note_id).toBe('feature-a');
   });
+
+  it('keeps provisioning, knowledge sync, and floor-wake outcomes distinct', () => {
+    const {component, api} = createComponent();
+    api.getOfficerPost.mockReturnValue(
+      of(
+        withPools({
+          backlog: {
+            auto_pull: false,
+            breakers: {},
+            stale_claims: [],
+            provisioning_preflights: [
+              {
+                id: 'j-parked',
+                status: 'paused',
+                context: {provisioning_preflight: {state: 'retryable-failed', phase: 'cloud'}},
+              },
+            ],
+            knowledge_materialization: [
+              {
+                id: 'intent-1',
+                note_id: 'feature-a',
+                canonical_state: 'canonical',
+                projection_state: 'failed',
+                retry_state: 'retryable',
+              },
+              {
+                id: 'intent-2',
+                note_id: 'feature-b',
+                canonical_state: 'canonical',
+                projection_state: 'synced',
+                retry_state: 'none',
+              },
+            ],
+            floor_wakes: [
+              {id: 'wake-1', pool: 'researchers', state: 'retryable', attempt_count: 1},
+            ],
+          },
+        }),
+      ),
+    );
+    component.refresh();
+    expect(component.provisioningProblems()).toHaveLength(1);
+    expect(component.provisioningStateSummary()).toBe('retryable-failed');
+    expect(component.knowledgeProblems()).toHaveLength(1);
+    expect(component.knowledgeStateSummary()).toBe('canonical/failed');
+    expect(component.latestFloorWake()?.state).toBe('retryable');
+  });
+
+  it('keeps correctness outcomes visible even when no slot is a backlog pool', () => {
+    const {component, api} = createComponent();
+    api.getOfficerPost.mockReturnValue(
+      of(
+        commissionedPost({
+          backlog: {
+            auto_pull: false,
+            breakers: {},
+            stale_claims: [],
+            provisioning_preflights: [],
+            knowledge_materialization: [
+              {
+                id: 'projection-only',
+                note_id: 'legacy-ticket',
+                canonical_state: 'failed',
+                projection_state: 'projection_only',
+                retry_state: 'permanent',
+              },
+            ],
+            floor_wakes: [
+              {
+                id: 'attempted-not-queued',
+                pool: 'manual',
+                state: 'retryable',
+                attempt_count: 1,
+                failure_class: 'outbox',
+              },
+            ],
+          },
+        }),
+      ),
+    );
+    component.refresh();
+    expect(component.backlogState()).toBeNull();
+    expect(component.knowledgeProblems()[0].projection_state).toBe('projection_only');
+    expect(component.knowledgeStateSummary()).toBe('failed/projection_only');
+    expect(component.latestFloorWake()?.failure_class).toBe('outbox');
+  });
 });
 
 describe('kitChips — pools (B6 of officer_backlog_pools.md §6)', () => {

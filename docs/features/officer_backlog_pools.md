@@ -41,9 +41,10 @@ related:
 
 ## Status
 
-**BUILT BUT RELEASE-BLOCKED (updated 2026-08-16).** **B1–B7 have landed; BP-05 is
-complete locally, including rolling-upgrade and authority hardening**, and the feature is not
-yet safe or operable end to end. The tick is built, mounted, dormant (`auto_pull` ships
+**BUILT BUT RELEASE-BLOCKED (updated 2026-08-17).** **B1–B7 have landed; BP-05/BP-06
+and the BP-07/BP-08/BP-10 correctness tranche are complete locally and undeployed**, and
+the feature is not yet safe or operable end to end. The tick is built, mounted, dormant
+(`auto_pull` ships
 off) and verified on its happy path; the sitrep and
 the cockpit card both render capacity, ready depth, open breakers and stalled claims; a
 pool can be provisioned from the UI; and **every loop carries the category doctrine whether
@@ -410,7 +411,11 @@ Per commissioned officer with `auto_pull=true`:
    roster/category/lineage, checks all-non-terminal capacity and ticket generation, and
    performs `create_job(conn=...)` before commit. The tick then mirrors the loop spawn:
    `db.create_job(created_by_thread_id=<officer thread>, user_id=<thread owner>,
-   wake_on_complete=True)` + `provision_job_repo` + `_trigger_dispatch`, running
+   wake_on_complete=True)` as a born-paused strict-preflight job. The existing jobs row
+   carries `provisioning_preflight` and an `officer_preflight` freeze while repository and
+   cloud setup run. A lease/token CAS atomically changes it to `created` and clears the
+   freeze only after every mandatory step succeeds; only then may `_trigger_dispatch`
+   nudge the queue. Manual strict Officer creation uses the same boundary. This runs
    `_enforce_job_create_grants` against the owner explicitly. Tick jobs stamp
    `context.ticket_note_id`, `context.work_category`, `context.officer_slot` — and
    **autonomy `full`** **[X]**: on any non-full-autonomy project, completions otherwise
@@ -434,7 +439,8 @@ Per commissioned officer with `auto_pull=true`:
 6. **Pool circuit breaker**: 2 consecutive **job failures** (`status='failed'`) on
    *distinct tickets* in a pool open that pool's breaker for 30 min. Honest
    `goal_achieved=false` completions never count **[R-org]**; tick-side exceptions and
-   infra outages log and retry without counting **[X]**. An open breaker pauses **only its
+   infra outages remain paused with `failure_class=infrastructure` and are excluded by the
+   terminal-history query while retry/recovery remains visible **[X]**. An open breaker pauses **only its
    own pool** (the draft's "skip the officer entirely" contradicted its own acceptance
    criterion — fixed) **[X]**. Breaker and ramp state persist in the thread's
    `officer_state` (runtime plane), harvested to `project_officers.state` at decommission,
@@ -1043,8 +1049,12 @@ Nothing here is open. **B1 is cleared to build.**
 2. **The ready floor is the pool's slot count, not a constant** — 1-slot pool ⇒ ≥1 ready,
    10-slot pool ⇒ ≥10. The Legate's reasoning is the right one: if every agent in a pool
    lands at once, each must find a ticket waiting. The floor therefore scales with the kit
-   and needs no separate tuning knob; floor-breach wakes stay debounced to once per pool
-   per 6 h. Note for B6: because a bigger pool now demands a deeper queue, the
+   and needs no separate tuning knob. Floor-breach wakes use a durable episode plus the
+   existing session-wake outbox: attempted, durably queued, delivered, and failed are
+   separate outcomes. The per-pool six-hour policy debounce starts only at durable queue
+   success; transient retry backoff is independent, and project/incarnation/pool/episode
+   deduplication makes duplicate tick replicas converge on one outbox event. Note for B6:
+   because a bigger pool now demands a deeper queue, the
    self-filed-ticket ratio in the digest matters *more*, not less — the Goodhart pressure
    scales with the floor.
 3. **No spend ceiling by default, never required.** Optional per century, and optionally

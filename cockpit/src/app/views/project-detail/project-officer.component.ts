@@ -11,6 +11,7 @@ import {DatePipe, DecimalPipe} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
 import {Router, RouterLink} from '@angular/router';
 import {firstValueFrom} from 'rxjs';
+import {TranslocoPipe} from '@jsverse/transloco';
 
 import {environment} from '../../core/environment';
 import {ApiService} from '../../core/services/api.service';
@@ -359,6 +360,7 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
   imports: [
     DatePipe,
     DecimalPipe,
+    TranslocoPipe,
     RouterLink,
     AppButtonComponent,
     AppInputComponent,
@@ -492,6 +494,42 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
                     </span>
                   </div>
                 }
+              }
+              @if (provisioningProblems().length) {
+                <div class="officer-slots" data-testid="officer-provisioning-state">
+                  <span class="k">{{ 'officerCorrectness.provisioningLabel' | transloco }}</span>
+                  <span class="v officer-warn">
+                    {{ 'officerCorrectness.provisioningProblem' | transloco: {count: provisioningProblems().length} }}
+                    · {{ provisioningStateSummary() }}
+                  </span>
+                </div>
+              }
+              @if (knowledgeProblems().length) {
+                <div class="officer-slots" data-testid="officer-knowledge-sync">
+                  <span class="k">{{ 'officerCorrectness.knowledgeLabel' | transloco }}</span>
+                  <span class="v officer-warn">
+                    {{ 'officerCorrectness.knowledgeProblem' | transloco: {count: knowledgeProblems().length} }}
+                    · {{ knowledgeStateSummary() }}
+                  </span>
+                </div>
+              }
+              @if (latestFloorWake(); as wake) {
+                <div class="officer-slots" data-testid="officer-floor-wake">
+                  <span class="k">{{ 'officerCorrectness.floorWakeLabel' | transloco }}</span>
+                  <span class="v">
+                    {{ wake.pool || ('officerCorrectness.poolFallback' | transloco) }} ·
+                    @if (wake.delivered_at) {
+                      {{ 'officerCorrectness.delivered' | transloco }}
+                    } @else if (wake.last_queued_at) {
+                      {{ 'officerCorrectness.durablyQueued' | transloco }}
+                      @if (wake.failure_class) {
+                        · <span class="officer-warn">{{ 'officerCorrectness.deliveryFailed' | transloco }} · {{ wake.failure_class }}</span>
+                      }
+                    } @else {
+                      <span class="officer-warn">{{ 'officerCorrectness.notQueued' | transloco }} · {{ wake.failure_class || wake.state }}</span>
+                    }
+                  </span>
+                </div>
               }
             }
           }
@@ -1004,6 +1042,35 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     return hasPools ? (post?.backlog ?? null) : null;
   });
   readonly staleClaims = computed(() => this.backlogState()?.stale_claims ?? []);
+  readonly provisioningProblems = computed(
+    () => this.post()?.backlog?.provisioning_preflights ?? [],
+  );
+  readonly provisioningStateSummary = computed(() =>
+    [
+      ...new Set(
+        this.provisioningProblems().map(
+          (row) => row.context?.provisioning_preflight?.state ?? 'unknown',
+        ),
+      ),
+    ].join(', '),
+  );
+  readonly knowledgeProblems = computed(() =>
+    (this.post()?.backlog?.knowledge_materialization ?? []).filter(
+      (row) => row.canonical_state !== 'canonical' || row.projection_state !== 'synced',
+    ),
+  );
+  readonly knowledgeStateSummary = computed(() =>
+    [
+      ...new Set(
+        this.knowledgeProblems().map(
+          (row) => `${row.canonical_state}/${row.projection_state}`,
+        ),
+      ),
+    ].join(', '),
+  );
+  readonly latestFloorWake = computed(
+    () => this.post()?.backlog?.floor_wakes?.[0] ?? null,
+  );
   readonly spendCeiling = computed(
     () =>
       this.post()?.spend_today?.ceiling ??

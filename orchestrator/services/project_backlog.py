@@ -28,7 +28,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from .kb_forge import kb_client_for_repo
 from .kb_git_source import GiteaKnowledgeGitSource
 
 logger = logging.getLogger(__name__)
@@ -476,88 +475,54 @@ async def close_backlog_ticket(
 ) -> bool:
     """Mirror a ticket's closed status to the note file AND the index row.
 
-    The database (campaign + campaign_history) stays authoritative for what the
-    loop did; this only keeps the pool and the human-readable note in step.
-    Best-effort by contract: a disposition must never fail because a mirror
-    write failed. Returns True when the durable (file) mirror is *correct* —
-    the write landed, or the note already carried the target status and there
-    was nothing to write (an idempotent re-close, reachable through the
-    torn-advance heal window or a human editing the note first). It returns
-    False when there was no status line to rewrite at all (no frontmatter
-    block, or one with no closing ``---``): that file was never really
-    touched, and claiming success there would hide exactly the case that most
-    needs a human to look at the note by hand.
+    The canonical file is crossed first and the searchable index follows only
+    after that succeeds. Returns True only when both legs and their durable
+    convergence record succeed. A repository, frontmatter, projection, or
+    ledger failure therefore leaves executor disposition unresolved instead of
+    reporting a close that reindex could later resurrect.
 
     ``postgres_db`` is only needed to resolve which repo holds the vault (see
     ``_resolve_note_repo``); callers that have the handle should pass it, and
     it is late-bound off ``main`` when they don't.
     """
-    file_path = f"knowledge/{note_id}.md"
-    durable_ok = False
-    repo_name: str | None = None
 
     async def _permit() -> None:
         if authority_check is not None:
             await authority_check()
 
     await _permit()
+    if postgres_db is None:
+        from main import postgres_db as app_postgres_db
+
+        postgres_db = app_postgres_db
+
+    from services.kb_materialize import materialize_knowledge_metadata_update
+
     try:
-        repo_ref = await _resolve_note_repo(project_id, postgres_db)
+        materialization = await materialize_knowledge_metadata_update(
+            postgres_db=postgres_db,
+            gitea_client=gitea,
+            project_id=project_id,
+            slug=note_id,
+            status=new_status,
+        )
         await _permit()
-        if repo_ref is None:
-            logger.info(
-                "backlog: project %s has no KB repo — %s → %s is an index-only close",
-                project_id,
+        canonical_ok = materialization.get("canonical_state") == "canonical" or (
+            materialization.get("status") == "committed"
+            or (
+                materialization.get("status") == "skipped"
+                and materialization.get("reason") in {"unchanged", "already-canonical"}
+            )
+        )
+        if not canonical_ok:
+            logger.error(
+                "backlog: canonical close refused for %s (%s): state=%s reason=%s",
                 note_id,
                 new_status,
+                materialization.get("canonical_state"),
+                materialization.get("reason"),
             )
-            current, blob_sha = None, None
-            repo_client = None
-        else:
-            repo_name = repo_ref.repo
-            repo_client = await kb_client_for_repo(postgres_db, gitea, repo_ref)
-            current, blob_sha = await _read_note_file(repo_client, repo_ref, file_path)
-        await _permit()
-        if current:
-            updated, outcome = _rewrite_status(current, new_status)
-            if outcome == _ALREADY_SET:
-                # Not a failure and not a wrong cause: the mirror is already
-                # exactly what this close would have written.
-                logger.debug(
-                    "backlog: %s already at status: %s — durable mirror "
-                    "already correct, nothing to write",
-                    file_path,
-                    new_status,
-                )
-                durable_ok = True
-            elif outcome == _NOT_REWRITABLE:
-                logger.warning(
-                    "backlog: %s has no rewritable frontmatter status line "
-                    "(missing or malformed frontmatter) — %s → %s left the "
-                    "file untouched; index-only close",
-                    file_path,
-                    note_id,
-                    new_status,
-                )
-            else:  # _REWRITTEN — the only outcome whose text differs
-                await _permit()
-                durable_ok = bool(
-                    await _write_note_file(
-                        repo_client,
-                        repo_ref,
-                        file_path,
-                        updated,
-                        f"backlog: {note_id} → {new_status}",
-                        blob_sha,
-                    )
-                )
-                await _permit()
-        elif repo_name is not None:
-            logger.info(
-                "backlog: note file %s not found in %s — index-only close",
-                file_path,
-                repo_name,
-            )
+            return False
     except Exception as exc:
         if authority_check is not None:
             from services.project_loop_atomic import ProjectLoopHandoffAuthorityLost
@@ -565,12 +530,12 @@ async def close_backlog_ticket(
             if isinstance(exc, ProjectLoopHandoffAuthorityLost):
                 raise
         logger.warning(
-            "backlog: file mirror failed for %s (%s) — the next kb_reindex will "
-            "restore the pool entry and the overseer will see it again",
+            "backlog: canonical close failed for %s (%s); projection untouched",
             note_id,
             new_status,
             exc_info=True,
         )
+        return False
 
     try:
         await _permit()
@@ -612,6 +577,27 @@ async def close_backlog_ticket(
                     actual_type,
                     BACKLOG_NOTE_TYPES,
                 )
+                if materialization.get("intent_id"):
+                    await postgres_db.finish_knowledge_projection(
+                        str(materialization["intent_id"]),
+                        project_id=project_id,
+                        synced=False,
+                        error="index close matched no ticket row",
+                    )
+                return False
+        if materialization.get("intent_id"):
+            recorded = await postgres_db.finish_knowledge_projection(
+                str(materialization["intent_id"]),
+                project_id=project_id,
+                synced=True,
+            )
+            if recorded is None:
+                logger.error(
+                    "backlog: canonical/index close succeeded for %s but the "
+                    "projection ledger did not converge",
+                    note_id,
+                )
+                return False
     except Exception as exc:
         if authority_check is not None:
             from services.project_loop_atomic import ProjectLoopHandoffAuthorityLost
@@ -624,5 +610,16 @@ async def close_backlog_ticket(
             new_status,
             exc_info=True,
         )
+        try:
+            if materialization.get("intent_id"):
+                await postgres_db.finish_knowledge_projection(
+                    str(materialization["intent_id"]),
+                    project_id=project_id,
+                    synced=False,
+                    error=str(exc),
+                )
+        except Exception:
+            logger.exception("backlog: failed to record projection failure")
+        return False
 
-    return durable_ok
+    return True

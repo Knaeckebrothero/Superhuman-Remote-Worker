@@ -6,7 +6,7 @@ tags:
   - knowledge
   - memory
   - security
-status: implemented-K1-K3-audit-blocked
+status: implemented-K1-K4-audit-blocked
 created: 2026-08-14
 aliases:
   - officer memory
@@ -43,19 +43,26 @@ errors and the wake), the explicit nine-tool knowledge grant (kb_export absent),
 runtime capability ceiling (`registry.apply_officer_tool_ceiling`, strict
 `officer.enabled is True`, denies workspace/shell/git/browser/canvas/repo/webdav/cloud +
 `request_workspace_upgrade` under any override; conferences untouched). K5's doctrine
-line shipped inside the E5 persona section (`7bb1d331`). K4 remains open — the sitrep
-`_knowledge_section` probe is its hook. Original status for the record: The underlying stores and most KB tools already exist. The feature is
+line shipped inside the E5 persona section (`7bb1d331`). **K4's BP-08 truthful-write
+boundary is complete locally as of 2026-08-17 and is undeployed**; the sitrep
+`_knowledge_section` now exposes its durable state. Original status for the record: The underlying stores and most KB tools already exist. The feature is
 primarily an explicit capability contract, a fail-closed project binding, and removal of
 generic session affordances that accidentally undermine the officer's no-workspace role.
 
-**2026-08-15 post-implementation audit:** the object-plane ceiling holds, but the write
-authority and truth contract do not yet. Any persistent project session (including a
-viewer) is treated as officer-authorized for `ready`, `parallel-safe`, and charter writes,
-and failed canonical-file materialization can still return success. Track
-[[backlog_machine_tags_trust_any_persistent_session]] and
-[[kb_materialization_failure_reports_ready_or_closed]]; the ordered index is
-[[officer_control_plane_post_implementation_audit]]. These block unattended dispatch even
-though K1–K3 are present.
+**2026-08-17 post-implementation checkpoint:** the object-plane ceiling and write
+authority hold, and BP-08 now closes the truth contract locally. The project knowledge Git
+repository is canonical; pgvector is the required searchable/eligibility projection;
+Neo4j remains an optional derived graph. Migration 0165 persists every content or metadata
+mutation before the remote write and tracks canonical (`pending_sync`/`canonical`/
+`failed`), projection (`pending`/`synced`/`failed`/`projection_only`), and retry state.
+Callers may report Created, Updated, READY, or closed only after the canonical boundary and
+required projection succeed. Unresolved READY intents are ineligible, failed closes leave
+executor disposition open, and retry runs before reindex so projection converges to the
+newest canonical intent without inventing a second `ready_at`. Authorization remains
+checked before mutation. See [[kb_materialization_failure_reports_ready_or_closed]] in
+`docs/done`; the ordered release index remains
+[[officer_control_plane_post_implementation_audit]] because this checkpoint is undeployed
+and unrelated unattended-dispatch gates remain.
 
 The direction came from the Legate's officer/backlog discussion: a passive background
 manager must be able to own notes and tickets, but project-folder access would invite the

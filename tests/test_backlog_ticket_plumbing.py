@@ -135,7 +135,12 @@ def _no_materialization_http():
     with (
         patch(
             "src.tools.knowledge.knowledge_tools._post_vault_file",
-            return_value={"status": "skipped", "reason": "no-repo"},
+            return_value={
+                "status": "committed",
+                "canonical_state": "canonical",
+                "projection_state": "pending",
+                "retry_state": "none",
+            },
         ),
         patch(
             "src.tools.knowledge.knowledge_tools._request_runtime_actor_authorization",
@@ -150,7 +155,12 @@ def _capture_materialize():
 
     def _record(project_id, slug, content, job_id=None, **kw):
         calls.append({"slug": slug, "content": content})
-        return {"status": "ok"}
+        return {
+            "status": "committed",
+            "canonical_state": "canonical",
+            "projection_state": "pending",
+            "retry_state": "none",
+        }
 
     return (
         patch(
