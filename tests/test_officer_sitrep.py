@@ -55,8 +55,8 @@ def _fake_db(jobs=None, conn=None):
     return db
 
 
-def _officer_thread(prior_sitrep=None):
-    metadata = {"config_override": {"officer": {"enabled": True}}}
+def _officer_thread(prior_sitrep=None, **officer):
+    metadata = {"config_override": {"officer": {"enabled": True, **officer}}}
     if prior_sitrep is not None:
         metadata["officer_state"] = {"sitrep": prior_sitrep}
     return {"id": THREAD_ID, "project_id": PROJECT_ID, "metadata": metadata}
@@ -185,8 +185,8 @@ class TestSitrepBuild:
         assert "Fleet: (unavailable)" in text
         assert "file a sleep" in text
 
-    @pytest.mark.asyncio
-    async def test_budget_section_reads_ledger(self):
+    @staticmethod
+    def _ledger():
         ledger = SimpleNamespace()
         ledger.query_usage = AsyncMock(
             return_value={
@@ -197,10 +197,14 @@ class TestSitrepBuild:
                 "total_cost_usd": 2.5,
             }
         )
-        db = _fake_db(jobs=[])
+        return ledger
+
+    @pytest.mark.asyncio
+    async def test_budget_section_reads_ledger_when_the_legate_enables_it(self):
+        ledger = self._ledger()
         text, _ = await sitrep.build_wake_message(
-            db,
-            _officer_thread(),
+            _fake_db(jobs=[]),
+            _officer_thread(show_budget=True),
             [TIMER_ROW],
             audit_reader=None,
             usage_ledger=ledger,
@@ -208,6 +212,24 @@ class TestSitrepBuild:
         assert "Budget today (project): $2.50, 123,456 tokens." in text
         kwargs = ledger.query_usage.await_args.kwargs
         assert kwargs["scope_project_id"] == PROJECT_ID
+
+    @pytest.mark.asyncio
+    async def test_spend_is_invisible_until_the_legate_hands_it_over(self):
+        """Default OFF — and the ledger is not even consulted.
+
+        An officer shown a cost with no policy attached invents the policy.
+        See ``sitrep._budget_visible``.
+        """
+        ledger = self._ledger()
+        text, _ = await sitrep.build_wake_message(
+            _fake_db(jobs=[]),
+            _officer_thread(),
+            [TIMER_ROW],
+            audit_reader=None,
+            usage_ledger=ledger,
+        )
+        assert "Budget" not in text
+        ledger.query_usage.assert_not_awaited()
 
 
 class TestOfficerPredicates:
