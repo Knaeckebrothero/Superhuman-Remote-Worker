@@ -2011,3 +2011,62 @@ class TestPostJobReindexTriggerResolvesItsOwnRepo:
             "A caller is passing the job's execution repo into a KB reindex. "
             "Project KB resolution must win. See §10a."
         )
+
+
+class TestManualReindexProjectionSettlement:
+    """A successful direct reindex closes the same ledger as the sweep."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["completed", "up-to-date"])
+    async def test_success_settles_latest_canonical_intents(self, status):
+        from main import _reindex_project_kb
+
+        project_id = str(uuid.uuid4())
+        db = AsyncMock()
+        db.mark_knowledge_projections_synced.return_value = 2
+        reindex = AsyncMock(return_value={"status": status, "upserted": 1})
+        with (
+            patch("main.postgres_db", db),
+            patch("main.vector_db", MagicMock()),
+            patch(
+                "main._build_kb_embedding_service",
+                AsyncMock(return_value=MagicMock()),
+            ),
+            patch("services.kb_reindex.reindex_kb", reindex),
+        ):
+            result = await _reindex_project_kb(
+                project_id,
+                repo_name="project-knowledge",
+                branch="main",
+            )
+
+        assert result["status"] == status
+        assert result["projection_intents_synced"] == 2
+        db.mark_knowledge_projections_synced.assert_awaited_once_with(project_id)
+
+    @pytest.mark.asyncio
+    async def test_partial_reindex_does_not_claim_projection_convergence(self):
+        from main import _reindex_project_kb
+
+        project_id = str(uuid.uuid4())
+        db = AsyncMock()
+        with (
+            patch("main.postgres_db", db),
+            patch("main.vector_db", MagicMock()),
+            patch(
+                "main._build_kb_embedding_service",
+                AsyncMock(return_value=MagicMock()),
+            ),
+            patch(
+                "services.kb_reindex.reindex_kb",
+                AsyncMock(return_value={"status": "partial", "errors": 1}),
+            ),
+        ):
+            result = await _reindex_project_kb(
+                project_id,
+                repo_name="project-knowledge",
+                branch="main",
+            )
+
+        assert result == {"status": "partial", "errors": 1}
+        db.mark_knowledge_projections_synced.assert_not_awaited()

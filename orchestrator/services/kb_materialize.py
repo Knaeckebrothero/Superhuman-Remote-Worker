@@ -566,6 +566,103 @@ def metadata_mutation_content(
     )
 
 
+def _canonical_metadata_fields(content: str, slug: str) -> dict[str, Any]:
+    """Return the exact projection metadata encoded in canonical markdown.
+
+    Metadata mutation callers must project what Git contains, not reconstruct
+    it from the request that happened to create an intent.  ``ready_at`` is
+    normalized here so every projection consumer receives one typed contract
+    and no database adapter is asked to infer an ISO string's timestamp type.
+    """
+    frontmatter, _ = parse_note_md(content)
+    if frontmatter is None or str(frontmatter.get("id") or "") != slug:
+        raise ValueError("canonical note has invalid frontmatter")
+
+    raw_tags = frontmatter.get("tags") or []
+    if not isinstance(raw_tags, list):
+        raise ValueError("canonical note tags must be a list")
+
+    raw_ready_at = frontmatter.get("ready_at")
+    if raw_ready_at is None:
+        ready_at = None
+    elif isinstance(raw_ready_at, datetime):
+        ready_at = raw_ready_at
+    elif isinstance(raw_ready_at, str):
+        try:
+            ready_at = datetime.fromisoformat(raw_ready_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("canonical ready_at must be an ISO timestamp") from exc
+    else:
+        raise ValueError("canonical ready_at must be a timestamp")
+    if ready_at is not None and ready_at.tzinfo is None:
+        ready_at = ready_at.replace(tzinfo=timezone.utc)
+
+    status = frontmatter.get("status")
+    return {
+        "canonical_status": str(status) if status is not None else None,
+        "canonical_tags": [str(tag) for tag in raw_tags],
+        "canonical_ready_at": ready_at,
+        "canonical_metadata_complete": True,
+    }
+
+
+async def _read_canonical_metadata(
+    *,
+    postgres_db: Any,
+    gitea_client: Any,
+    project_id: str,
+    slug: str,
+) -> dict[str, Any]:
+    """Reread canonical truth for an intent another actor already committed.
+
+    A scheduled retry can win between a failed HTTP request and its client
+    retry.  The durable intent then proves the mutation crossed Git, but it
+    does not contain the complete, current tag set.  Reading the note avoids
+    destructive defaults such as ``tags=[]`` or ``ready_at=NULL`` and also
+    handles a later canonical mutation honestly.
+    """
+    try:
+        resolved = await resolve_kb_repo(postgres_db, project_id)
+        if resolved is None:
+            return _result(_STATUS_FAILED, reason="no-repo")
+        repo_client = await kb_client_for_repo(postgres_db, gitea_client, resolved)
+        from .project_backlog import _read_note_file
+
+        current, _ = await _read_note_file(repo_client, resolved, note_repo_path(slug))
+        if current is None:
+            return _result(
+                _STATUS_FAILED,
+                reason="canonical-file-missing",
+                repo=resolved.repo,
+                branch=resolved.branch,
+                path=note_repo_path(slug),
+                operation="metadata-update",
+            )
+        metadata = _canonical_metadata_fields(current, slug)
+        return {
+            **_result(
+                _STATUS_SKIPPED,
+                reason="already-canonical",
+                repo=resolved.repo,
+                branch=resolved.branch,
+                path=note_repo_path(slug),
+                operation="metadata-update",
+            ),
+            **metadata,
+        }
+    except ValueError:
+        return _result(_STATUS_FAILED, reason="malformed-frontmatter")
+    except Exception as exc:
+        logger.error(
+            "kb-materialize: canonical metadata reread failed for %s/%s: %r",
+            project_id,
+            slug,
+            exc,
+            exc_info=True,
+        )
+        return _result(_STATUS_FAILED, reason="canonical-read-error")
+
+
 async def _attempt_metadata_intent(
     *,
     postgres_db: Any,
@@ -688,15 +785,12 @@ async def _attempt_metadata_intent(
         )
     ):
         try:
-            canonical_frontmatter, _ = parse_note_md(rendered)
+            outcome.update(_canonical_metadata_fields(rendered, slug))
         except ValueError:
-            canonical_frontmatter = None
-        if canonical_frontmatter is not None:
-            outcome["canonical_status"] = canonical_frontmatter.get("status")
-            outcome["canonical_tags"] = [
-                str(tag) for tag in (canonical_frontmatter.get("tags") or [])
-            ]
-            outcome["canonical_ready_at"] = canonical_frontmatter.get("ready_at")
+            # The Git boundary may already have been crossed.  Preserve that
+            # canonical truth in the ledger, but never let a caller project
+            # guessed metadata from an incomplete result.
+            outcome["canonical_metadata_complete"] = False
     return await _finish_attempt(
         postgres_db=postgres_db,
         intent=intent,
@@ -742,8 +836,14 @@ async def materialize_knowledge_metadata_update(
             "retry_state": "retryable",
         }
     if str(intent.get("canonical_state")) == "canonical":
+        canonical = await _read_canonical_metadata(
+            postgres_db=postgres_db,
+            gitea_client=gitea_client,
+            project_id=project_id,
+            slug=slug,
+        )
         return {
-            **_result(_STATUS_SKIPPED, reason="already-canonical"),
+            **canonical,
             "intent_id": str(intent["id"]),
             "canonical_state": "canonical",
             "projection_state": intent.get("projection_state") or "pending",

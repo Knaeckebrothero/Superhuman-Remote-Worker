@@ -42,8 +42,10 @@ related:
 ## Status
 
 **BUILT BUT RELEASE-BLOCKED (updated 2026-08-17).** **B1–B7 have landed; BP-05/BP-06
-and the BP-07/BP-08/BP-10 correctness tranche are complete locally and undeployed**, and
-the feature is not yet safe or operable end to end. The tick is built, mounted, dormant
+are closed, and the deployed BP-07/BP-08/BP-10 tranche passed BP-07/BP-10 but exposed
+BP-13 on BP-08's canonical-retry projection path. BP-13 is repaired locally with real
+pgvector coverage but still awaits its bounded main-dev rerun**, so the feature is not yet
+safe or operable end to end. The tick is built, mounted, dormant
 (`auto_pull` ships
 off) and verified on its happy path; the sitrep and
 the cockpit card both render capacity, ready depth, open breakers and stalled claims; a
@@ -56,7 +58,8 @@ digest lines and completion of that acceptance run, including its outstanding hy
 live observations. More importantly, the supported post API cannot currently enable
 `auto_pull`, and the authority/atomicity/liveness findings in
 [[officer_control_plane_post_implementation_audit]] block doing so out of band. Keep the
-safe database default off until that audit's release gates pass.
+safe database default off until that audit's release gates pass. The exact main-dev result
+and cleanup are recorded in [[officer_correctness_live_gate_2026-08-17]].
 The six §13 defaults are **decided** — no open question, no pending approval. Two of those
 decisions changed the design: the ready floor scales with pool capacity rather than being a
 constant, and there are **no per-ticket budget caps** (the officer is the brake; §3 records

@@ -54,15 +54,18 @@ The result remains mixed, but the authority/atomicity baseline has materially ad
   context merges remain compatible, and deletion truth comes from the delete transaction.
 - Unattended backlog release is still blocked by the supported enable-control gap followed
   by the still-open roster, evidence, authorization/liveness-policy, and operational
-  residues listed below. BP-06's pre-filter starvation is closed, and BP-07/BP-08/BP-10
-  now close the provisioning, canonical-write, and floor-wake correctness seams locally.
+  residues listed below. BP-06's pre-filter starvation is closed. BP-07 and BP-10 now
+  close the provisioning and floor-wake seams on main dev. BP-08's fail-closed write
+  boundary passed live. BP-13's REST retry/projection repair is green locally and awaits
+  its bounded main-dev rerun.
 
 “Implemented” in the feature docs therefore still does not mean unattended backlog release
 is safe. The earlier tranche was deployed and O6 was released successfully with
 `auto_pull=false`; the later lifecycle/configuration transaction checkpoint was also
 deployed and passed a bounded disposable Officer gate on 2026-08-16. BP-05, BP-06, and
-LF-5 are prior closed/deployed checkpoints. **BP-07/BP-08/BP-10 are the current local,
-uncommitted, and undeployed checkpoint.** Nothing here authorizes `auto_pull=true` or
+LF-5 are prior closed/deployed checkpoints. **BP-07/BP-08/BP-10 were deployed on
+2026-08-17; their bounded main-dev gate passed BP-07/BP-10 and failed BP-08 on the new
+BP-13 residue.** Nothing here authorizes `auto_pull=true` or
 unattended backlog release. The
 umbrella stays open until the remaining P0 live gates in
 [Release order and acceptance](#release-order-and-acceptance) pass.
@@ -78,8 +81,8 @@ change.
 closed 2026-08-15; deployed disposable gate passed 2026-08-16.** The earlier tranche
 reached dev and O6 was released successfully with `auto_pull=false`; the additional
 transaction/configuration checkpoint later reached dev and passed the bounded gate recorded
-in [[officer_backlog_pools_resavio_livefire]]. BP-07/BP-08/BP-10 below are local and not
-deployed.
+in [[officer_backlog_pools_resavio_livefire]]. The BP-07/BP-08/BP-10 deployment gate is
+recorded in [[officer_correctness_live_gate_2026-08-17]].
 
 | Order | Priority | Issue | Audit finding(s) | Why this boundary |
 |---:|---|---|---|---|
@@ -97,13 +100,14 @@ deployed.
 | 12 | P1 | [[job_liveness_defaults_disagree_across_surfaces]] | OC-08 | Give every supervision surface one liveness policy. |
 | 13 | P1 | [[officer_card_ignores_viewer_authority_and_i18n]] | OC-10 | Make the management surface truthful for roles and locales. |
 | 14 | P1 | [[deleting_a_job_releases_its_backlog_ticket_claim]] | BP-05 | Persist claim retention independently of job retention. **DONE 2026-08-16 after rolling-upgrade/authority repair; local and not deployed.** |
-| 15 | P1 | [[auto_pull_jobs_are_dispatchable_before_provisioning]] | BP-07 | Add non-dispatchable preflight and honest failure causes. **DONE locally 2026-08-17; not deployed/live-fired.** |
-| 16 | P1 | [[kb_materialization_failure_reports_ready_or_closed]] | BP-08 | Stop authorization/disposition writes from reporting false success. **DONE locally 2026-08-17; not deployed/live-fired.** |
-| 17 | P1 | [[backlog_floor_wake_failure_consumes_debounce]] | BP-10 | Debounce durable wake success, not an attempted call. **DONE locally 2026-08-17; not deployed/live-fired.** |
-| 18 | P1 | [[officer_roster_patch_cannot_remove_or_drain_a_slot]] | BP-11 | Give the roster whole-map edits and its documented zero drain. |
-| 19 | P1 | [[headless_officer_cannot_read_screenshot_evidence]] | ES-01 | Either deliver bounded image content or make the tester fallback honest. |
-| 20 | P2 | [[unknown_work_category_fails_open_for_parallelism]] | OC-09 | Close the latent fail-open before the helper gains a caller. |
-| 21 | P2 | [[officer_ready_depth_poll_multiplies_backlog_queries]] | BP-12 | Optimize only after exact eligibility semantics are fixed. |
+| 15 | P1 | [[auto_pull_jobs_are_dispatchable_before_provisioning]] | BP-07 | Add non-dispatchable preflight and honest failure causes. **DEPLOYED; MAIN-DEV LIVE GATE PASSED 2026-08-17.** |
+| 16 | P1 | [[kb_materialization_failure_reports_ready_or_closed]] | BP-08 | Stop authorization/disposition writes from reporting false success. **DEPLOYED; failure boundary passed, recovery residue BP-13 open.** |
+| 17 | P1 | [[backlog_floor_wake_failure_consumes_debounce]] | BP-10 | Debounce durable wake success, not an attempted call. **DEPLOYED; MAIN-DEV LIVE GATE PASSED 2026-08-17.** |
+| 18 | P0 | [[knowledge_metadata_retry_commits_then_projection_fails]] | BP-13 | Repair the canonical-retry timestamp codec and sweeper-won destructive defaults. **IMPLEMENTED LOCALLY; main-dev rerun pending.** |
+| 19 | P1 | [[officer_roster_patch_cannot_remove_or_drain_a_slot]] | BP-11 | Give the roster whole-map edits and its documented zero drain. |
+| 20 | P1 | [[headless_officer_cannot_read_screenshot_evidence]] | ES-01 | Either deliver bounded image content or make the tester fallback honest. |
+| 21 | P2 | [[unknown_work_category_fails_open_for_parallelism]] | OC-09 | Close the latent fail-open before the helper gains a caller. |
+| 22 | P2 | [[officer_ready_depth_poll_multiplies_backlog_queries]] | BP-12 | Optimize only after exact eligibility semantics are fixed. |
 
 ## What B1–B6 genuinely fixed
 
@@ -268,7 +272,7 @@ plan 0.03 ms), and the expanded 10k-ledger app query set measured 22.71 ms
 
 ### BP-07 — provisioning races dispatch and pollutes the failure breaker (**P1 major**)
 
-**Closed locally 2026-08-17; undeployed.** Strict Officer admission now inserts one claim
+**Closed; deployed and live-gated 2026-08-17.** Strict Officer admission now inserts one claim
 and a born-paused job with an `officer_preflight` freeze in the existing post-locked
 transaction. All dispatch lanes and their final claim CAS require `freeze_data IS NULL`.
 The jobs row carries the normalized `not-attempted -> in-progress -> activated` state plus
@@ -282,9 +286,14 @@ recovery and concurrent attempts provision/activate once. Deterministic before/a
 activation faults and real-PostgreSQL races prove one job/claim and no early lease. See
 [[auto_pull_jobs_are_dispatchable_before_provisioning]] in `docs/done`.
 
+The main-dev gate crossed 35 seconds with the job paused/unassigned, recorded an injected
+repository failure outside breaker history, then provisioned a real isolated Gitea repo,
+activated once, and cancelled before dispatch. Cleanup removed all disposable state.
+
 ### BP-08 — failed KB materialization is reported as a successful ready/close (**P1 major**)
 
-**Closed locally 2026-08-17; undeployed.** Migration 0165's durable materialization ledger
+**Core failure-truth boundary closed and deployed 2026-08-17; BP-13 recovery residue
+open.** Migration 0165's durable materialization ledger
 makes the project knowledge Git repository canonical and pgvector its required
 search/eligibility projection. Every content/metadata mutation and backlog close persists
 intent, then crosses Git, then projection. Missing binding/repository, Git exception,
@@ -297,6 +306,13 @@ the newest canonical intent; the exact canonical `ready_at` is reused rather tha
 Tool/API/SITREP/Cockpit surfaces name canonical, pending-sync, failed, projection-only,
 retry, and projection outcomes. See [[kb_materialization_failure_reports_ready_or_closed]]
 in `docs/done`.
+
+The main-dev gate proved the failure half: 409 `pending_sync`, unchanged eligibility
+projection, and no reindex resurrection. The due retry then committed Git but the REST
+route passed its ISO `ready_at` string to asyncpg's datetime codec and returned 500. The
+same code audit found an `already-canonical` retry can default missing canonical tags and
+generation to `[]`/NULL. [[knowledge_metadata_retry_commits_then_projection_fails]] owns
+that release blocker.
 
 ### BP-09 — “officer-only” readiness is actually persistent-session-only (**P0 security**)
 
@@ -317,7 +333,7 @@ Tests cover viewer, editor, owner, conference, commissioned officer, and worker 
 
 ### BP-10 — floor-wake debounce records attempts as deliveries (**P1**)
 
-**Closed locally 2026-08-17; undeployed.** Migration 0165's floor-episode ledger defines
+**Closed; deployed and live-gated 2026-08-17.** Migration 0165's floor-episode ledger defines
 success as a verified insert into the existing durable session-wake outbox. Attempted,
 durably queued, delivered, failure, retry, and next retry are separate fields. Only
 `last_queued_at` starts the six-hour policy debounce; transient `next_retry_at` is an
@@ -329,6 +345,36 @@ rollback remain retryable and do not increment the success metric. Hold preserve
 durably queued intent as pending; decommission deletes/supersedes it under the same post
 lock. Real PostgreSQL tests cover queue/decommission and queue/hold races. See
 [[backlog_floor_wake_failure_consumes_debounce]] in `docs/done`.
+
+The main-dev gate proved rollback after the durable insert consumes no policy debounce,
+retry queues, concurrent replicas converge on one event, delivery updates the same
+episode, and queue/decommission leaves no live event or episode.
+
+### BP-13 — canonical metadata retry commits, then REST projection fails (**P0 release**)
+
+**Implemented locally and k3d-gated 2026-08-17; main-dev rerun pending.** The
+deployed materializer parses `ready_at` from the canonical YAML as a string.
+`update_knowledge_note()` passes that value directly to an
+asyncpg `timestamptz` parameter, which rejects it after Git has committed. The route
+returns 500 and records projection failure until reindex plus scheduled settlement.
+
+If the scheduled sweep wins before a client retry, the durable intent's
+`already-canonical` result omits exact tags/readiness while the route defaults those values
+to empty/null. That arm can report synced projection while temporarily contradicting Git.
+Real-PostgreSQL codec and sweeper-won retry tests now pass locally. A disposable k3d run
+also crossed the real HTTP/Gitea/app-ledger/pgvector boundary and proved a 200 direct
+READY, fail-closed 409, single retry commit, exact post-sweep client projection, and full
+cleanup. That Tilt image came from the repaired working tree rather than a commit on
+`origin/develop`, so the repeat main-dev gate remains required. See
+[[knowledge_metadata_retry_commits_then_projection_fails]].
+
+The local repair now parses canonical readiness into an aware `datetime`, rereads the
+complete current vault note when another retry already canonicalized the intent, and
+rejects incomplete snapshots without touching pgvector. Executor close uses the same
+canonical status snapshot, and successful manual/post-write reindex settles the newest
+canonical intent like the scheduled sweep. Direct and sweeper-won endpoint paths pass
+against the migrated real pgvector schema. The historical deployed failure remains open
+until the bounded BP-08 slice passes on the replacement image.
 
 ### BP-11 — roster edits cannot remove one slot or set a zero-count drain (**P1 functional**)
 
@@ -398,13 +444,14 @@ sequence is:
    now have transactional/CAS boundaries, including the full-lineage no-force gate,
    orphan-End decision, commission continuity, completion routing and commission config
    generation fence.
-3. **Durable eligibility and preflight:** BP-05, BP-06, and BP-07 are complete; the BP-07
-   checkpoint is local/undeployed. Claims survive retention, cross-store scans do not
+3. **Durable eligibility and preflight:** BP-05, BP-06, and BP-07 are complete; BP-07's
+   deployed main-dev gate passed. Claims survive retention, cross-store scans do not
    starve, and strict jobs remain non-dispatchable through mandatory provisioning. OC-08
    and OC-09 remain.
-4. **Truthful content and delivery:** BP-08 and BP-10 are complete locally/undeployed.
-   OC-05–OC-07 and ES-01 remain; continue to redact before either audience and preserve the
-   attempted/queued/delivered distinctions.
+4. **Truthful content and delivery:** BP-10's deployed main-dev gate passed. BP-08's
+   failure boundary passed; BP-13's successful-retry repair is local/k3d green and awaits
+   its main-dev rerun. OC-05–OC-07 and ES-01 remain; continue to redact before either
+   audience and preserve the attempted/queued/delivered distinctions.
 5. **Supported operation:** BP-01, BP-11, BP-12, OC-10. Only after the invariants exist
    should the owner-facing enable switch and live card be treated as a release surface.
 6. **Live fire:** enable one non-executor pool with disposable tickets, inject notification,
@@ -440,12 +487,14 @@ Remaining minimum regression/live gates before `auto_pull` leaves its safe defau
 - Put more than 10 claimed/invalid tickets ahead of an eligible ticket, more than 10 mixed
   breaker outcomes in a pool, and more than 50 open claims. The correct tail item/outcome/
   oldest stale claim remains visible.
-- Make repository/cloud provisioning fail and delay it beyond a dispatcher poll. No job
-  executes early and the infrastructure outcome does not trip the job-failure breaker.
+- ~~Make repository/cloud provisioning fail and delay it beyond a dispatcher poll.~~
+  **Passed on main dev 2026-08-17:** no early execution; infrastructure outcome absent
+  from breaker history; real repository recovery activated once.
 - Attempt charter/`ready`/`parallel-safe` writes as worker, viewer session, editor session,
   owner session, conference, and commissioned officer.
-- Force KB materialization and notification dispatch failures; the response, outbox,
-  debounce, retry state, and UI must all tell the same truth.
+- Force KB materialization and notification dispatch failures; the notification/outbox/
+  debounce half passed on main dev. KB failure truth passed and BP-13 is repaired locally;
+  rerun its successful-retry half after deployment. UI truth remains to be exercised.
 - Consume a real screenshot in a headless officer turn, not only through a Cockpit viewer.
 - Exercise the owner and viewer cards in both locales, including auto-pull enable/disable,
   one-slot removal, zero-count drain, spend ceilings, and a failed write.
@@ -612,3 +661,45 @@ The three issue contracts are recorded in `docs/done`. No shared forge, notifica
 channel, Officer, database, pod, or cluster was mutated, so this evidence does not claim a
 live provisioning, Git, wake-delivery, interruption, or unattended-dispatch gate. The
 umbrella remains open and `auto_pull` remains off and unexposed.
+
+### 2026-08-17 deployed BP-07/BP-08/BP-10 main-dev gate
+
+The tranche was subsequently committed, pushed, and deployed as image `sha-4d703be` on
+two ready, zero-restart replicas. App migration 0165 applied successfully in 27 ms. The
+bounded run in [[officer_correctness_live_gate_2026-08-17]] used one disposable project,
+synthetic Officer, real Gitea vault, ticket, strict job, and durable wake episodes while
+leaving the existing Officer untouched and every post at `auto_pull=false`.
+
+```text
+BP-07 strict provisioning:                         PASS
+  born paused/frozen; 35-second dispatcher window: PASS
+  infrastructure failure absent from breaker:     PASS
+  real Gitea recovery, one activation:             PASS
+
+BP-08 canonical failure truth:                     PASS
+  409 pending-sync; projection unchanged:          PASS
+  broken reindex invents no READY state:            PASS
+BP-08 canonical retry REST projection:             FAIL (BP-13)
+  Git commit:                                      PASS
+  stable single ready_at through two reindexes:    PASS
+  endpoint result:                                 HTTP 500, asyncpg str/datetime mismatch
+
+BP-10 failed insert/debounce truth:                 PASS
+  concurrent queue exactly once:                   PASS
+  delivery settlement and decommission race:       PASS
+cleanup / existing-post / auto-pull baseline:      PASS
+```
+
+The failed route supplied an ISO timestamp string to an asyncpg `timestamptz` parameter
+after the canonical Git update. The exception path correctly recorded projection failure;
+manual reindex restored the vector row without changing the canonical generation, and the
+scoped production settlement helper allowed the independent BP-07/BP-10 probes to finish.
+This continuation is evidence of recoverability, not a pass. BP-13 also records the
+unexercised sweeper-won retry arm where absent canonical result fields currently default
+to empty tags/null readiness.
+
+All disposable project/thread/job/claim/intent/episode/vector rows, managed repositories,
+cloud folder, and identity group were removed. Final counts were zero, the original
+commissioned-post set was unchanged, both serving replicas remained ready with zero
+restarts, and dirty migrations/`auto_pull=true` posts remained zero. The umbrella remains
+open; BP-13 must be repaired and its slice rerun before the later release gates proceed.

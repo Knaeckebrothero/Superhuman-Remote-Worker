@@ -6,7 +6,7 @@ tags:
   - provisioning
   - jobs
   - liveness
-status: done-local-undeployed
+status: done-deployed-live-gated
 priority: P1
 created: 2026-08-15
 aliases:
@@ -20,7 +20,8 @@ related:
 
 # Auto-pulled jobs become dispatchable before provisioning finishes
 
-**Status:** DONE LOCALLY 2026-08-17; UNDEPLOYED. Audit finding **BP-07**.
+**Status:** SHIPPED AND DEPLOYED; MAIN-DEV LIVE GATE PASSED 2026-08-17. Audit
+finding **BP-07**.
 
 ## Problem
 
@@ -107,6 +108,11 @@ job's model-authored context.
 - Real PostgreSQL Officer/routing/pagination suite: **97 passed** in **232.40 s**.
 - Cockpit Officer component: **64 passed** in **730 ms**.
 
-This is a local deterministic and real-database closure only. No deployment or shared-
-cluster interruption was performed, and no live gate is claimed. `auto_pull` remained
-false and unexposed.
+The local checkpoint above was subsequently deployed. The bounded main-dev gate in
+[[officer_correctness_live_gate_2026-08-17]] admitted a strict ticket job as paused and
+frozen, crossed 35 seconds including a catch-all dispatcher poll with no assignment,
+recorded an injected repository failure as retryable and absent from breaker history,
+then provisioned a real isolated Gitea repository and activated exactly once. A hook
+cancelled the job before dispatch; no worker turn ran. The job, claim (via project
+cleanup), repository, synthetic post/thread, and project were removed. `auto_pull`
+remained false fleet-wide.

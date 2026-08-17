@@ -507,12 +507,11 @@ async def close_backlog_ticket(
             status=new_status,
         )
         await _permit()
-        canonical_ok = materialization.get("canonical_state") == "canonical" or (
-            materialization.get("status") == "committed"
-            or (
-                materialization.get("status") == "skipped"
-                and materialization.get("reason") in {"unchanged", "already-canonical"}
-            )
+        canonical_status = materialization.get("canonical_status")
+        canonical_ok = (
+            materialization.get("canonical_state") == "canonical"
+            and materialization.get("canonical_metadata_complete") is True
+            and canonical_status is not None
         )
         if not canonical_ok:
             logger.error(
@@ -550,7 +549,7 @@ async def close_backlog_ticket(
                 """,
                 project_id,
                 note_id,
-                new_status,
+                str(canonical_status),
                 list(BACKLOG_NOTE_TYPES),
             )
             await _permit()

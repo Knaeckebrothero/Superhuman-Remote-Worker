@@ -1110,6 +1110,38 @@ def _repo_db(**roles):
 
 class TestCloseBacklogTicket:
     @pytest.mark.asyncio
+    async def test_already_canonical_without_snapshot_fails_before_projection(self):
+        """A retry may only mirror exact canonical metadata, never request defaults."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        vector_db = MagicMock()
+        materialization = {
+            "status": "skipped",
+            "reason": "already-canonical",
+            "intent_id": str(uuid.uuid4()),
+            "canonical_state": "canonical",
+            "projection_state": "pending",
+            "retry_state": "none",
+        }
+        with patch(
+            "services.kb_materialize.materialize_knowledge_metadata_update",
+            AsyncMock(return_value=materialization),
+        ):
+            ok = await close_backlog_ticket(
+                vector_db,
+                MagicMock(),
+                "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+                "feature-x",
+                "resolved",
+                postgres_db=_repo_db(),
+            )
+
+        assert ok is False
+        vector_db.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_handoff_lease_loss_after_file_mirror_skips_vector_follow_on(self):
         """A stale handoff owner may finish its in-flight Gitea write, but it
         must not start the independent vector consequence afterwards.

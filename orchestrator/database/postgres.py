@@ -9034,6 +9034,8 @@ class PostgresDB:
                         SELECT * FROM knowledge_materialization_intents
                          WHERE project_id = $1 AND note_id = $2
                            AND content_hash = $3
+                         ORDER BY created_at DESC, id DESC
+                         LIMIT 1
                         """,
                         project_uuid,
                         str(note_id),
