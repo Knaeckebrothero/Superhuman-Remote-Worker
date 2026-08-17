@@ -2234,22 +2234,21 @@ export class ApiService {
       .pipe(catchError(() => of(null)));
   }
 
+  /** Errors propagate: the create form shows the server's own refusal, which
+   *  for an external knowledge base names the exact thing to change. */
   createProject(body: ProjectCreateRequest): Observable<Project | null> {
-    return this.http.post<Project>(`${this.baseUrl}/projects`, body).pipe(
-      catchError(() => of(null)),
-    );
+    return this.http.post<Project>(`${this.baseUrl}/projects`, body);
   }
 
+  /** Errors propagate for the same reason as `createProject`. */
   attachProjectKnowledgeRepository(
     projectId: string,
     body: ExternalKnowledgeBaseRequest,
   ): Observable<Record<string, unknown> | null> {
-    return this.http
-      .post<Record<string, unknown>>(
-        `${this.baseUrl}/projects/${projectId}/knowledge/repository`,
-        body,
-      )
-      .pipe(catchError(() => of(null)));
+    return this.http.post<Record<string, unknown>>(
+      `${this.baseUrl}/projects/${projectId}/knowledge/repository`,
+      body,
+    );
   }
 
   updateProject(id: string, body: ProjectUpdateRequest): Observable<{ status: string } | null> {

@@ -48,6 +48,9 @@ function createComponent(policyAvailable = true) {
     getEligibleDatasources: vi.fn().mockReturnValue(of([])),
     getDatasources: vi.fn().mockReturnValue(of([])),
     linkProjectDatasource: vi.fn().mockReturnValue(of({status: 'linked'})),
+    getProjectRepositories: vi.fn().mockReturnValue(of([])),
+    attachProjectKnowledgeRepository: vi.fn().mockReturnValue(of({status: 'attached'})),
+    getKnowledgeSummary: vi.fn().mockReturnValue(of(null)),
   };
   const currentUser = signal({id: 'user-1', is_admin: false});
   const injector = Injector.create({
@@ -241,5 +244,88 @@ describe('ProjectDetailPageComponent connector candidates', () => {
       kb.id,
       {read_only: true},
     );
+  });
+});
+
+
+function kbConnector(id: string, overrides: Partial<Datasource> = {}): Datasource {
+  return datasource(id, {
+    type: 'kb',
+    connection_url: 'https://github.com/acme/vault.git',
+    default_branch: 'main',
+    config: {root_path: 'knowledge'},
+    ...overrides,
+  });
+}
+
+describe('ProjectDetailPageComponent external knowledge base', () => {
+  it('looks for attachable connectors only while the project has no vault', () => {
+    const {api, component} = createComponent();
+    api.getProjectRepositories.mockReturnValue(
+      of([{id: 'r1', role: 'knowledge', name: 'vault'}]),
+    );
+
+    component.loadRepos();
+
+    expect(component.hasKnowledgeRepo()).toBe(true);
+    // Replacing a vault is not supported, so there is nothing to offer.
+    expect(api.getDatasources).not.toHaveBeenCalled();
+  });
+
+  it('offers the knowledge connectors that no project has taken yet', () => {
+    const {api, component} = createComponent();
+    api.getProjectRepositories.mockReturnValue(of([{id: 'r1', role: 'source', name: 'code'}]));
+    api.getDatasources.mockReturnValue(
+      of([
+        kbConnector('free'),
+        kbConnector('taken', {
+          config: {root_path: 'knowledge', native_project_id: 'project-b'},
+        }),
+      ]),
+    );
+
+    component.loadRepos();
+
+    expect(api.getDatasources).toHaveBeenCalledWith(undefined, 'kb');
+    expect(component.hasKnowledgeRepo()).toBe(false);
+    expect(component.kbConnectors().map((c) => c.id)).toEqual(['free']);
+  });
+
+  it('attaches the chosen connector and reloads the repositories', () => {
+    const {api, component} = createComponent();
+    api.getProjectRepositories.mockReturnValue(of([]));
+    component.kbAttachSelection.set('free');
+
+    component.attachKnowledgeConnector();
+
+    expect(api.attachProjectKnowledgeRepository).toHaveBeenCalledWith('project-a', {
+      datasource_id: 'free',
+    });
+    // The repo list is the source of truth for "this project has a vault".
+    expect(api.getProjectRepositories).toHaveBeenCalled();
+    expect(component.kbAttachSelection()).toBe('');
+    expect(component.isAttachingKb()).toBe(false);
+  });
+
+  it('does nothing without a selected connector', () => {
+    const {api, component} = createComponent();
+    component.kbAttachSelection.set('');
+
+    component.attachKnowledgeConnector();
+
+    expect(api.attachProjectKnowledgeRepository).not.toHaveBeenCalled();
+  });
+
+  it("shows the server's reason when the attach is refused", () => {
+    const {api, component} = createComponent();
+    api.attachProjectKnowledgeRepository.mockReturnValue(
+      throwError(() => ({error: {detail: 'Set its note root to knowledge first'}})),
+    );
+    component.kbAttachSelection.set('free');
+
+    component.attachKnowledgeConnector();
+
+    expect(component.kbAttachError()).toBe('Set its note root to knowledge first');
+    expect(component.isAttachingKb()).toBe(false);
   });
 });

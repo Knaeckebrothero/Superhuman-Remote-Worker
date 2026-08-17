@@ -11,6 +11,9 @@ import {ViewportService} from '../../core/services/viewport.service';
 import {ActivatedRoute} from '@angular/router';
 import {DatasourceListComponent} from './datasource-list.component';
 
+// The real catalogue, so these specs also prove the keys they name exist.
+import en from '../../../assets/i18n/en.json';
+
 function emailDatasource(overrides: Partial<Datasource> = {}): Datasource {
   return {
     id: 'email-1',
@@ -986,5 +989,42 @@ describe('DatasourceListComponent availability policy', () => {
       ds.id,
       expect.objectContaining({policy_revision: 6, auto_attach: true}),
     );
+  });
+});
+
+
+describe('DatasourceListComponent token permission guidance', () => {
+  // A PAT with the wrong permissions fails at first use, in an agent run,
+  // with a forge error nobody sees. The form is where that is cheap to fix.
+  it('names the permissions a knowledge base token needs', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.type = 'kb';
+    component.gitAuthMethod = 'token';
+
+    expect(component.patScopeHintKey()).toBe('datasources.form.patScopesKb');
+    expect(en.datasources.form.patScopesKb).toBeTruthy();
+  });
+
+  it('names the permissions a repository token needs', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.type = 'repository';
+    component.gitAuthMethod = 'token';
+
+    expect(component.patScopeHintKey()).toBe('datasources.form.patScopesRepo');
+    expect(en.datasources.form.patScopesRepo).toBeTruthy();
+  });
+
+  it('stays quiet where no token is being collected', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.type = 'kb';
+    component.gitAuthMethod = 'ssh';
+    expect(component.patScopeHintKey()).toBe('');
+
+    component.formData.type = 'postgresql';
+    component.gitAuthMethod = 'token';
+    expect(component.patScopeHintKey()).toBe('');
   });
 });

@@ -664,6 +664,9 @@ type KeyValueRow = {key: string; value: string};
                   {{ 'datasources.form.credentialsRetainHint' | transloco }}
                 </div>
               }
+              @if (patScopeHintKey(); as scopeHint) {
+                <div class="form-hint">{{ scopeHint | transloco }}</div>
+              }
               <div class="form-hint">
                 {{ (formData.type === 'kb' ? 'datasources.form.kbHint' : 'datasources.form.repoHint') | transloco }}
               </div>
@@ -2536,6 +2539,19 @@ export class DatasourceListComponent implements OnInit {
 
   isGitBackedType(type: DatasourceType | string = this.formData.type): boolean {
     return type === 'repository' || type === 'kb';
+  }
+
+  /** Which token-permission disclaimer applies, if any.
+
+   *  A PAT with too few permissions fails at first use — inside an agent run,
+   *  as a forge error nobody is watching for — so the form says up front what
+   *  to grant. Empty when no token is being collected (SSH auth, or a type
+   *  that has no repository behind it). */
+  patScopeHintKey(): string {
+    if (!this.isGitBackedType() || this.gitAuthMethod !== 'token') return '';
+    return this.formData.type === 'kb'
+      ? 'datasources.form.patScopesKb'
+      : 'datasources.form.patScopesRepo';
   }
 
   /** A redacted REST URL represents an existing usable secret-bearing URL,

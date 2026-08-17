@@ -3,12 +3,21 @@ import {Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
 import {SessionService} from '../../core/services/session.service';
-import {Project, ProjectCreateRequest} from '../../core/models/api.model';
+import {Datasource, Project, ProjectCreateRequest} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {ViewportService} from '../../core/services/viewport.service';
+
+/** The API's own explanation, when it gave one. Connector refusals name the
+ *  fix ("unlink it first", "set its note root to knowledge"), which no generic
+ *  message can. */
+function errorDetail(err: unknown): string {
+  const detail = (err as {error?: {detail?: unknown}} | null)?.error?.detail;
+  return typeof detail === 'string' ? detail : '';
+}
+
 @Component({
   selector: 'app-project-list-page',
   standalone: true,
@@ -64,9 +73,10 @@ import {ViewportService} from '../../core/services/viewport.service';
             />
           </div>
           <!-- External knowledge base (opt-in): point the project's writable
-               vault at an existing private GitHub repo instead of the internal
-               forge. Collapsed by default — the default path is unchanged and
-               sends no external_kb key at all. -->
+               vault at a connector the user created for a private GitHub repo,
+               instead of the internal forge. Collapsed by default — the default
+               path is unchanged and sends no external_kb key at all. No
+               credential is collected here: the connector already holds it. -->
           <div class="form-row">
             <label class="form-toggle">
               <input
@@ -82,35 +92,35 @@ import {ViewportService} from '../../core/services/viewport.service';
           </div>
           @if (useExternalKb()) {
             <div class="form-row">
-              <input
-                class="form-input"
-                [placeholder]="'projects.externalKb.repoUrlPlaceholder' | transloco"
-                [value]="formKbRepoUrl()"
-                (input)="formKbRepoUrl.set(asInputValue($event))"
-              />
-            </div>
-            <div class="form-row">
-              <input
-                class="form-input"
-                [placeholder]="'projects.externalKb.branchPlaceholder' | transloco"
-                [value]="formKbBranch()"
-                (input)="formKbBranch.set(asInputValue($event))"
-              />
-            </div>
-            <div class="form-row">
-              <input
-                class="form-input"
-                type="password"
-                autocomplete="off"
-                spellcheck="false"
-                [placeholder]="'projects.externalKb.tokenPlaceholder' | transloco"
-                [value]="formKbToken()"
-                (input)="formKbToken.set(asInputValue($event))"
-              />
+              @if (isLoadingKbConnectors()) {
+                <p class="form-hint">{{ 'projects.externalKb.loading' | transloco }}</p>
+              } @else if (kbConnectors().length === 0) {
+                <p class="form-hint">{{ 'projects.externalKb.noConnectors' | transloco }}</p>
+                <button class="btn btn-ghost kb-connector-link" (click)="openConnectors()">
+                  {{ 'projects.externalKb.createConnector' | transloco }}
+                </button>
+              } @else {
+                <select
+                  class="form-input"
+                  (change)="formKbDatasourceId.set(asInputValue($event))"
+                >
+                  <option value="" [selected]="!formKbDatasourceId()">
+                    {{ 'projects.externalKb.selectPlaceholder' | transloco }}
+                  </option>
+                  @for (connector of kbConnectors(); track connector.id) {
+                    <option [value]="connector.id" [selected]="connector.id === formKbDatasourceId()">
+                      {{ connector.name }}
+                    </option>
+                  }
+                </select>
+                <p class="form-hint">{{ 'projects.externalKb.adoptHint' | transloco }}</p>
+              }
             </div>
           }
           @if (createFailed()) {
-            <div class="form-error" role="alert">{{ 'projects.createFailed' | transloco }}</div>
+            <div class="form-error" role="alert">
+              {{ createErrorDetail() || ('projects.createFailed' | transloco) }}
+            </div>
           }
           <div class="form-actions">
             <button
@@ -264,6 +274,10 @@ import {ViewportService} from '../../core/services/viewport.service';
 
     .form-input:focus { border-color: var(--accent-color, var(--accent-color)); }
 
+    select.form-input { cursor: pointer; }
+
+    .kb-connector-link { margin: 8px 0 0 24px; }
+
     .form-toggle {
       display: flex;
       align-items: center;
@@ -400,23 +414,25 @@ export class ProjectListPageComponent implements OnInit {
    *  Off ⇒ the create body carries no `external_kb` key at all and the backend
    *  provisions the internal forge repo exactly as before. */
   readonly useExternalKb = signal(false);
-  readonly formKbRepoUrl = signal('');
-  readonly formKbBranch = signal('');
-  /** The PAT. Lives only here, only while the form is open: never persisted,
-   *  never logged, never in a URL — and cleared on success, on collapsing the
-   *  section, and on closing the form. */
-  readonly formKbToken = signal('');
+  /** The chosen connector. The repository URL, branch and PAT all live on it
+   *  already, so this form never handles a credential of its own. */
+  readonly formKbDatasourceId = signal('');
+  readonly kbConnectors = signal<Datasource[]>([]);
+  readonly isLoadingKbConnectors = signal(false);
 
-  /** `createProject` on ApiService swallows HTTP errors into `null`, so a
-   *  failure is otherwise indistinguishable from a no-op. Surface it. */
+  /** `createProject` on ApiService reports a failure as `null`, so a failure is
+   *  otherwise indistinguishable from a no-op. Surface it. */
   readonly createFailed = signal(false);
+  /** The server's own words when it has better ones than "create failed" —
+   *  every connector refusal says what to change. */
+  readonly createErrorDetail = signal('');
 
   /** A name is always required; enabling the external KB additionally requires
-   *  a repo URL and a token (branch is optional — the backend defaults it). */
+   *  a connector to attach. */
   readonly canCreate = computed(() => {
     if (!this.formName().trim()) return false;
     if (!this.useExternalKb()) return true;
-    return !!this.formKbRepoUrl().trim() && !!this.formKbToken().trim();
+    return !!this.formKbDatasourceId();
   });
 
     constructor() {
@@ -448,29 +464,54 @@ export class ProjectListPageComponent implements OnInit {
     });
   }
 
-  /** Header button. Closing the form drops the PAT from memory — the secret
-   *  never outlives the form that collected it. */
   toggleCreateForm(): void {
     const next = !this.showCreateForm();
     this.showCreateForm.set(next);
     if (!next) {
       this.createFailed.set(false);
+      this.createErrorDetail.set('');
       this.resetExternalKbForm();
     }
   }
 
-  /** Collapsing the section also discards what was typed into it, so a hidden
-   *  URL/token pair can never be submitted by accident. */
+  /** Connectors are fetched only once the section is opened: the default path
+   *  creates an internal vault and has no use for the list. Collapsing the
+   *  section also drops the selection, so a hidden connector can never be
+   *  attached by accident. */
   setUseExternalKb(enabled: boolean): void {
     this.useExternalKb.set(enabled);
-    if (!enabled) this.resetExternalKbForm();
+    if (!enabled) {
+      this.resetExternalKbForm();
+      return;
+    }
+    this.loadKbConnectors();
+  }
+
+  private loadKbConnectors(): void {
+    this.isLoadingKbConnectors.set(true);
+    this.api.getDatasources(undefined, 'kb').subscribe({
+      next: (connectors) => {
+        // A connector carrying the server-owned marker is already some
+        // project's knowledge base; attaching it again can only ever 409.
+        this.kbConnectors.set(
+          connectors.filter((connector) => !connector.config?.native_project_id),
+        );
+        this.isLoadingKbConnectors.set(false);
+      },
+      error: () => {
+        this.kbConnectors.set([]);
+        this.isLoadingKbConnectors.set(false);
+      },
+    });
+  }
+
+  openConnectors(): void {
+    this.router.navigate(['/datasources']);
   }
 
   private resetExternalKbForm(): void {
     this.useExternalKb.set(false);
-    this.formKbRepoUrl.set('');
-    this.formKbBranch.set('');
-    this.formKbToken.set('');
+    this.formKbDatasourceId.set('');
   }
 
   createProject(): void {
@@ -488,18 +529,14 @@ export class ProjectListPageComponent implements OnInit {
       user_id: userId,
     };
     if (this.useExternalKb()) {
-      const branch = this.formKbBranch().trim();
-      body.external_kb = {
-        repo_url: this.formKbRepoUrl().trim(),
-        token: this.formKbToken().trim(),
-        // Omitted rather than nulled when blank: the API's `branch` is a
-        // non-nullable string that defaults to `main`, so an explicit null
-        // would be a 422.
-        ...(branch ? {branch} : {}),
-      };
+      // Nothing but the connector id: it already carries repository, branch,
+      // forge and credential, and the API rejects a request that names the
+      // vault twice.
+      body.external_kb = {datasource_id: this.formKbDatasourceId()};
     }
 
     this.createFailed.set(false);
+    this.createErrorDetail.set('');
     this.isCreating.set(true);
     this.api.createProject(body).subscribe({
       next: (result) => {
@@ -522,9 +559,10 @@ export class ProjectListPageComponent implements OnInit {
           this.createFailed.set(true);
         }
       },
-      error: () => {
+      error: (err: unknown) => {
         this.isCreating.set(false);
         this.createFailed.set(true);
+        this.createErrorDetail.set(errorDetail(err));
       },
     });
   }

@@ -10027,9 +10027,7 @@ class ExternalKnowledgeBase(BaseModel):
                     + ", ".join(conflicting)
                 )
         elif not (self.repo_url and self.token):
-            raise ValueError(
-                "supply datasource_id, or both repo_url and token"
-            )
+            raise ValueError("supply datasource_id, or both repo_url and token")
         return self
 
 
@@ -52258,26 +52256,45 @@ async def _provision_project_knowledge_repo(
     return datasource
 
 
-def _external_kb_values(
-    external_kb: ExternalKnowledgeBase,
-) -> tuple[str, str, str, str, str, dict[str, str], bool]:
-    """Validate an external live-vault request and return secret-bearing values.
+@dataclass(frozen=True, repr=False)
+class _KbVaultPlan:
+    """A validated live-vault target, ready to provision.
 
-    The tuple stays local to the provisioning call. It is never logged or
-    returned, and the PAT moves directly into ``datasources.credentials``.
+    It carries the PAT, so it stays local to the provisioning call: never
+    logged, never returned (hence the suppressed repr). ``datasource_id`` set
+    means an existing connector is being adopted in place instead of a new row
+    being created for the same repository.
     """
+
+    repo_url: str
+    branch: str
+    forge: str
+    owner: str
+    repo: str
+    credentials: dict[str, str]
+    explicit_forge: bool
+    datasource_id: str | None = None
+    policy_revision: int = 0
+
+
+def _kb_vault_plan(
+    repo_url: str | None,
+    branch: str,
+    credentials: dict[str, str],
+    forge_override: str | None,
+    *,
+    datasource_id: str | None = None,
+    policy_revision: int = 0,
+) -> _KbVaultPlan:
+    """Validate a writable-vault target's URL, transport auth and forge."""
     from src.services.forge import ForgeError, parse_owner_repo
 
-    repo_url = _validate_kb_repository_url(external_kb.repo_url)
-    credentials = {
-        "auth_method": "token",
-        "token": external_kb.token.get_secret_value().strip(),
-    }
-    _validate_kb_repository_auth(repo_url, credentials)
+    validated_url = _validate_kb_repository_url(repo_url)
+    _validate_kb_repository_auth(validated_url, credentials)
 
-    host = (urlparse(repo_url).hostname or "").lower().rstrip(".")
-    explicit = external_kb.forge is not None
-    forge = external_kb.forge or (
+    host = (urlparse(validated_url).hostname or "").lower().rstrip(".")
+    explicit = forge_override is not None
+    forge = forge_override or (
         "github" if host in {"github.com", "www.github.com"} else ""
     )
     if forge != "github":
@@ -52289,31 +52306,225 @@ def _external_kb_values(
             ),
         )
     try:
-        owner, repo = parse_owner_repo(repo_url)
+        owner, repo = parse_owner_repo(validated_url)
     except ForgeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return repo_url, external_kb.branch, forge, owner, repo, credentials, explicit
+    return _KbVaultPlan(
+        repo_url=validated_url,
+        branch=branch,
+        forge=forge,
+        owner=owner,
+        repo=repo,
+        credentials=credentials,
+        explicit_forge=explicit,
+        datasource_id=datasource_id,
+        policy_revision=policy_revision,
+    )
+
+
+async def _plan_kb_vault_from_connector(
+    datasource_id: str,
+    caller: dict[str, Any] | None,
+    project_id: str | None,
+) -> _KbVaultPlan:
+    """Check that an existing ``kb`` connector can become a project's vault.
+
+    Adoption converts the row (see ``_adopt_kb_connector_as_vault``), so every
+    reason it must not be converted is checked here, before anything is
+    created.
+    """
+    from services.kb_datasources import native_kb_project_id
+
+    datasource = await postgres_db.get_datasource(datasource_id)
+    if not datasource:
+        raise HTTPException(
+            status_code=404, detail=f"Connector '{datasource_id}' not found"
+        )
+    if str(datasource.get("type") or "") != "kb":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Only an OKF Knowledge Base connector can back a project knowledge base"
+            ),
+        )
+    is_owner = str(datasource.get("created_by") or "") == str(
+        (caller or {}).get("id") or ""
+    )
+    if not ((caller or {}).get("is_admin") or is_owner):
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to use this connector as a knowledge base",
+        )
+    if native_kb_project_id(datasource):
+        raise HTTPException(
+            status_code=409,
+            detail="This connector is already a project's knowledge base",
+        )
+    if datasource.get("is_global"):
+        # Adoption takes the row private and drops the index every other user
+        # was reading. Same reasoning as the project-link check below.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This connector is published to everyone; unpublish it before "
+                "using it as a project knowledge base"
+            ),
+        )
+    linked = await postgres_db.list_datasource_projects(datasource_id)
+    others = sorted(
+        {str(value) for value in (linked or [])}
+        - ({str(project_id)} if project_id else set())
+    )
+    if others:
+        # Adoption narrows the connector to exactly one project. Doing that
+        # silently would revoke every other project's reader access — and
+        # their agents would keep listing a KB whose index no longer exists.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This connector is shared with other projects; unlink it from "
+                "them before using it as a project knowledge base"
+            ),
+        )
+
+    config = datasource.get("config") or {}
+    if not isinstance(config, dict):
+        config = {}
+    root_path = str(config.get("root_path") or "").strip().strip("/")
+    if root_path not in ("", "knowledge"):
+        # kb_materialize commits every note to ``knowledge/<slug>.md``; any
+        # other root would read a different folder than the agent writes.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"A project knowledge base is written to 'knowledge/', but this "
+                f"connector reads '{root_path}/'. Set its note root to "
+                "'knowledge' first."
+            ),
+        )
+
+    credentials = datasource.get("credentials") or {}
+    if isinstance(credentials, str):
+        try:
+            credentials = json.loads(credentials)
+        except (json.JSONDecodeError, ValueError):
+            credentials = {}
+    token = (
+        str(credentials.get("token") or "").strip()
+        if isinstance(credentials, dict)
+        else ""
+    )
+    if not token:
+        # Reads clone over git; writes go through the GitHub contents API,
+        # which has no SSH equivalent. An SSH-only connector would index fine
+        # and fail on every single note write.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "A writable project knowledge base needs a token credential; "
+                "this connector has none (an SSH key cannot write notes)"
+            ),
+        )
+
+    return _kb_vault_plan(
+        datasource.get("connection_url"),
+        str(datasource.get("default_branch") or "main"),
+        {"auth_method": "token", "token": token},
+        str(config.get("forge") or "") or None,
+        datasource_id=str(datasource["id"]),
+        policy_revision=int(datasource.get("policy_revision") or 0),
+    )
+
+
+async def _plan_external_kb_vault(
+    external_kb: ExternalKnowledgeBase,
+    *,
+    caller: dict[str, Any] | None = None,
+    project_id: str | None = None,
+) -> _KbVaultPlan:
+    """Resolve either request mode into one validated plan.
+
+    Callers run this *before* creating anything, so a rejected vault cannot
+    leave a half-created project behind.
+    """
+    if external_kb.datasource_id:
+        return await _plan_kb_vault_from_connector(
+            external_kb.datasource_id, caller, project_id
+        )
+    return _kb_vault_plan(
+        external_kb.repo_url,
+        external_kb.branch,
+        {
+            "auth_method": "token",
+            "token": (
+                external_kb.token.get_secret_value().strip()
+                if external_kb.token
+                else ""
+            ),
+        },
+        external_kb.forge,
+    )
+
+
+async def _adopt_kb_connector_as_vault(
+    plan: _KbVaultPlan, project_id: str, config: dict[str, Any]
+) -> dict[str, Any]:
+    """Convert an existing connector into this project's vault row, in place.
+
+    Copying it into a second row would leave two connectors on one repository:
+    the copy indexed under the project id and the original still swept under
+    its own UUID, so every note would answer a search twice — the one failure
+    in docs/features/knowledge_base_repo_separation.md that corrupts search
+    rather than merely failing it.
+
+    Scope narrows to the adopting project because the row stops being an
+    external source the moment the marker lands: anyone else still holding a
+    link would bind a KB whose index no longer exists.
+    """
+    updated = await postgres_db.update_datasource_with_policy(
+        str(plan.datasource_id),
+        expected_policy_revision=plan.policy_revision,
+        scope_mode="projects",
+        auto_attach=True,
+        project_ids=[project_id],
+        config=config,
+    )
+    if updated is None:
+        raise RuntimeError("Knowledge connector disappeared during adoption")
+    return updated
 
 
 async def _provision_external_project_knowledge_repo(
     project: dict[str, Any],
     owner_id: str | None,
-    external_kb: ExternalKnowledgeBase,
+    plan: _KbVaultPlan,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Attach an existing GitHub repo and store its PAT on the native KB row."""
     from services.kb_datasources import NATIVE_PROJECT_CONFIG_KEY
 
-    (
-        repo_url,
-        branch,
-        forge,
-        _owner,
-        repo_name,
-        credentials,
-        explicit_forge,
-    ) = _external_kb_values(external_kb)
+    repo_url = plan.repo_url
+    branch = plan.branch
+    forge = plan.forge
+    repo_name = plan.repo
+    credentials = plan.credentials
     project_id = str(project["id"])
     id8 = project_id[:8]
+    datasource_ref = await postgres_db.get_native_project_kb_datasource_ref(project_id)
+    if (
+        plan.datasource_id
+        and datasource_ref
+        and str(datasource_ref.get("id") or "") != str(plan.datasource_id)
+    ):
+        # Two rows marked native to one project would make the credential
+        # lookup (oldest wins) resolve to a different repository than the one
+        # the vault reads and writes.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This project already has a knowledge connector; remove it "
+                "before attaching another"
+            ),
+        )
     repo_row = await postgres_db.add_project_repository(
         project_id=project_id,
         name=repo_name,
@@ -52324,14 +52535,13 @@ async def _provision_external_project_knowledge_repo(
         branch=branch,
     )
     config = {"root_path": "knowledge", NATIVE_PROJECT_CONFIG_KEY: project_id}
-    if explicit_forge:
+    if plan.explicit_forge:
         config["forge"] = forge
 
     try:
-        datasource_ref = await postgres_db.get_native_project_kb_datasource_ref(
-            project_id
-        )
-        if datasource_ref and datasource_ref.get("id"):
+        if plan.datasource_id:
+            datasource = await _adopt_kb_connector_as_vault(plan, project_id, config)
+        elif datasource_ref and datasource_ref.get("id"):
             datasource_id = str(datasource_ref["id"])
             updated = await postgres_db.update_datasource(
                 datasource_id,
@@ -52372,6 +52582,19 @@ async def _provision_external_project_knowledge_repo(
                 )
         raise
 
+    if plan.datasource_id:
+        # The marker is stored, so the sweep has already let go of this row.
+        # Whatever it indexed under its own UUID is now unreachable weight that
+        # would double every search hit if the row were ever detached again —
+        # disposable cleanup, never a reason to fail a provisioned project.
+        try:
+            await _purge_kb_datasource_index(str(plan.datasource_id))
+        except Exception:
+            logger.exception(
+                "Failed to purge the external index of adopted KB connector %s",
+                plan.datasource_id,
+            )
+
     logger.info(
         "Attached external %s knowledge repo '%s' + KB connector %s to project %s",
         forge,
@@ -52401,10 +52624,14 @@ async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any
     validated_project_override = _with_validated_tool_overrides(
         body.default_config_override
     )
-    # Validate the full URL/auth/forge tuple before creating the project so a
-    # rejected external-vault request cannot leave a half-created project.
-    if body.external_kb is not None:
-        _external_kb_values(body.external_kb)
+    # Resolve the full vault target — URL, auth, forge, and for a connector
+    # request every reason it may not be adopted — before creating the project,
+    # so a rejected external-vault request cannot leave a half-created one.
+    external_kb_plan = (
+        await _plan_external_kb_vault(body.external_kb, caller=user)
+        if body.external_kb is not None
+        else None
+    )
     try:
         project = await postgres_db.create_project(
             name=body.name,
@@ -52424,9 +52651,9 @@ async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any
         # Create only the dedicated KB vault. Root jobs get isolated repositories
         # when they are created; project membership never selects a shared
         # workspace. See project_jobs_repo_retirement.md.
-        if body.external_kb is not None:
+        if external_kb_plan is not None:
             await _provision_external_project_knowledge_repo(
-                project, owner_id, body.external_kb
+                project, owner_id, external_kb_plan
             )
         elif gitea_client.is_initialized:
             # The vault is written server-side and never cloned into a workspace.
@@ -52475,12 +52702,12 @@ async def attach_project_knowledge_repository(
                 "is not supported by this attach path"
             ),
         )
-    _external_kb_values(body)
+    plan = await _plan_external_kb_vault(body, caller=caller, project_id=project_id)
     try:
         repository, datasource = await _provision_external_project_knowledge_repo(
             project,
             str(caller["id"]) if caller.get("id") else None,
-            body,
+            plan,
         )
     except HTTPException:
         raise
@@ -54117,6 +54344,26 @@ async def _cancel_kb_datasource_reindexes(datasource_id: str) -> None:
         task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _purge_kb_datasource_index(datasource_id: str) -> None:
+    """Drop the chunk index a connector accumulated under its own UUID.
+
+    Deliberately not shared with ``_delete_kb_datasource_with_index``: that one
+    holds the claim across the index purge *and* the app-row delete to order
+    the two databases. Here the row survives — it has already been marked as a
+    project's own KB — so only the disposable index is dropped, under the same
+    per-KB claim so an in-flight sweeper cannot write chunks back afterwards.
+    """
+    from src.services.knowledge_store import KnowledgeStore
+
+    from services.kb_reindex import kb_index_lock
+
+    await _cancel_kb_datasource_reindexes(datasource_id)
+    kb_id = UUID(datasource_id)
+    store = KnowledgeStore(db=vector_db, embedding_service=None)
+    async with kb_index_lock(store, kb_id, wait=True) as lock_conn:
+        await store.delete_kb_index(kb_id, conn=lock_conn)
 
 
 async def _delete_kb_datasource_with_index(

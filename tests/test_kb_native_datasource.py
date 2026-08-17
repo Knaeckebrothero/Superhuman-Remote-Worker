@@ -20,12 +20,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from main import (
     DatasourceUpdate,
     ExternalKnowledgeBase,
     ProjectCreate,
     _normalize_kb_config,
+    _plan_external_kb_vault,
     _provision_external_project_knowledge_repo,
     _provision_project_knowledge_repo,
     attach_project_knowledge_repository,
@@ -329,7 +331,7 @@ class TestExternalProjectKnowledgeProvisioning(TestProjectCreationProvisioning):
             await _provision_external_project_knowledge_repo(
                 {"id": PROJECT_ID, "name": "Better Resavio"},
                 OWNER_ID,
-                self.EXTERNAL,
+                await _plan_external_kb_vault(self.EXTERNAL),
             )
 
         db.remove_project_repository.assert_awaited_once()
@@ -404,6 +406,404 @@ class TestAttachExternalProjectKnowledgeRepo(TestProjectCreationProvisioning):
 
 
 # =============================================================================
+# Adopting an existing connector as the vault —
+# docs/features/external_forge_knowledge_base.md §4.4
+# =============================================================================
+
+
+CONNECTOR_ID = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+OTHER_PROJECT_ID = "7d7d7d7d-1111-2222-3333-444444444444"
+
+
+def connector_row(**overrides) -> dict:
+    """A user-created external ``kb`` connector, eligible for adoption."""
+    row = {
+        "id": CONNECTOR_ID,
+        "type": "kb",
+        "name": "Design Vault",
+        "connection_url": "https://github.com/acme/design-vault.git",
+        "credentials": {
+            "auth_method": "token",
+            "token": "connector-pat-never-return",
+        },
+        "default_branch": "vault/main",
+        "config": {"root_path": "knowledge"},
+        "created_by": OWNER_ID,
+        "scope_mode": "all",
+        "auto_attach": False,
+        "policy_revision": 3,
+    }
+    row.update(overrides)
+    return row
+
+
+class TestAdoptConnectorAsProjectVault(TestProjectCreationProvisioning):
+    """A project may point its writable vault at a connector created earlier.
+
+    The connector is converted *in place* rather than copied: a second row for
+    the same repository would be swept as an ordinary external source and index
+    every note a second time under its own UUID.
+    """
+
+    ADOPT = ExternalKnowledgeBase(datasource_id=str(CONNECTOR_ID))
+
+    def _db(self, connector: dict | None = None) -> MagicMock:
+        db = super()._db()
+        db.get_datasource = AsyncMock(
+            return_value=connector if connector is not None else connector_row()
+        )
+        db.list_datasource_projects = AsyncMock(return_value=[])
+        db.update_datasource_with_policy = AsyncMock(
+            side_effect=lambda datasource_id, **kwargs: {
+                "id": CONNECTOR_ID,
+                "name": "Design Vault",
+                "type": "kb",
+                "config": kwargs.get("config"),
+            }
+        )
+        return db
+
+    async def _create_adopting(self, db, gitea, external_kb=None):
+        with patch("main._purge_kb_datasource_index", AsyncMock()):
+            return await self._create(db, gitea, external_kb=external_kb or self.ADOPT)
+
+    @pytest.mark.asyncio
+    async def test_no_second_connector_row_is_created_for_the_same_repo(self):
+        db, gitea = self._db(), self._gitea()
+
+        await self._create_adopting(db, gitea)
+
+        db.create_datasource.assert_not_awaited()
+        gitea.create_repo.assert_not_awaited()
+        db.update_datasource_with_policy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_adopted_connector_is_marked_native_to_the_new_project(self):
+        db, gitea = self._db(), self._gitea()
+
+        await self._create_adopting(db, gitea)
+
+        kwargs = db.update_datasource_with_policy.await_args.kwargs
+        assert kwargs["config"][NATIVE_PROJECT_CONFIG_KEY] == PROJECT_ID
+        assert kwargs["config"]["root_path"] == "knowledge"
+        assert kwargs["expected_policy_revision"] == 3
+
+    @pytest.mark.asyncio
+    async def test_adopted_connector_is_scoped_to_the_project_it_serves(self):
+        """Left available to other projects it would be bound as a read-only
+        source whose index no longer exists — a vault that silently reads
+        empty."""
+        db, gitea = self._db(), self._gitea()
+
+        await self._create_adopting(db, gitea)
+
+        kwargs = db.update_datasource_with_policy.await_args.kwargs
+        assert kwargs["scope_mode"] == "projects"
+        assert kwargs["auto_attach"] is True
+        assert kwargs["project_ids"] == [PROJECT_ID]
+
+    @pytest.mark.asyncio
+    async def test_vault_repository_row_takes_the_connectors_url_and_branch(self):
+        db, gitea = self._db(), self._gitea()
+
+        await self._create_adopting(db, gitea)
+
+        kwargs = db.add_project_repository.await_args.kwargs
+        assert kwargs["repo_url"] == "https://github.com/acme/design-vault.git"
+        assert kwargs["branch"] == "vault/main"
+        assert kwargs["role"] == "knowledge"
+        assert kwargs["is_managed"] is False
+
+    @pytest.mark.asyncio
+    async def test_stale_external_index_is_purged_after_the_marker_lands(self):
+        """Its notes are about to be indexed under the project id. Whatever it
+        accumulated under its own UUID would double every search hit."""
+        db, gitea = self._db(), self._gitea()
+
+        with patch("main._purge_kb_datasource_index", AsyncMock()) as purge:
+            await self._create(db, gitea, external_kb=self.ADOPT)
+
+        purge.assert_awaited_once_with(str(CONNECTOR_ID))
+        assert db.update_datasource_with_policy.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_purge_failure_does_not_fail_project_creation(self):
+        """The marker is already stored, so the row is out of the sweep; a
+        leftover index is disposable and the next sweep is not blocked."""
+        db, gitea = self._db(), self._gitea()
+
+        with patch(
+            "main._purge_kb_datasource_index",
+            AsyncMock(side_effect=RuntimeError("vector db down")),
+        ):
+            project = await self._create(db, gitea, external_kb=self.ADOPT)
+
+        assert project["id"] == PROJECT_ID
+
+    @pytest.mark.asyncio
+    async def test_connector_of_another_type_is_refused(self):
+        db, gitea = self._db(connector_row(type="repository")), self._gitea()
+
+        with pytest.raises(HTTPException) as exc:
+            await self._create_adopting(db, gitea)
+
+        assert exc.value.status_code == 400
+        db.create_project.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_connector_is_refused(self):
+        db, gitea = self._db(), self._gitea()
+        db.get_datasource = AsyncMock(return_value=None)
+
+        with pytest.raises(HTTPException) as exc:
+            await self._create_adopting(db, gitea)
+
+        assert exc.value.status_code == 404
+        db.create_project.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_connector_already_owned_by_a_project_is_refused(self):
+        db, gitea = (
+            self._db(
+                connector_row(
+                    config={
+                        "root_path": "knowledge",
+                        NATIVE_PROJECT_CONFIG_KEY: OTHER_PROJECT_ID,
+                    }
+                )
+            ),
+            self._gitea(),
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await self._create_adopting(db, gitea)
+
+        assert exc.value.status_code == 409
+        db.create_project.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_connector_linked_to_another_project_is_refused(self):
+        """Adoption narrows the connector to one project. Doing that silently
+        would revoke another project's reader access without telling anyone."""
+        db, gitea = self._db(), self._gitea()
+        db.list_datasource_projects = AsyncMock(return_value=[OTHER_PROJECT_ID])
+
+        with pytest.raises(HTTPException) as exc:
+            await self._create_adopting(db, gitea)
+
+        assert exc.value.status_code == 409
+        assert "unlink" in str(exc.value.detail).lower()
+
+    @pytest.mark.asyncio
+    async def test_published_connector_is_refused(self):
+        """Same reasoning as the shared-project check: adoption takes the row
+        private and drops the index everyone else was reading."""
+        db, gitea = self._db(connector_row(is_global=True)), self._gitea()
+
+        with pytest.raises(HTTPException) as exc:
+            await self._create_adopting(db, gitea)
+
+        assert exc.value.status_code == 409
+        db.create_project.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ssh_only_connector_is_refused(self):
+        """The vault is written through the GitHub contents API, which has no
+        SSH equivalent: it would clone fine and fail on every note write."""
+        db, gitea = (
+            self._db(
+                connector_row(
+                    credentials={"auth_method": "ssh", "ssh_key": "PRIVATE KEY"}
+                )
+            ),
+            self._gitea(),
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await self._create_adopting(db, gitea)
+
+        assert exc.value.status_code == 400
+        assert "token" in str(exc.value.detail).lower()
+
+    @pytest.mark.asyncio
+    async def test_non_github_connector_is_refused(self):
+        db, gitea = (
+            self._db(connector_row(connection_url="https://gitlab.com/acme/vault.git")),
+            self._gitea(),
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await self._create_adopting(db, gitea)
+
+        assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_connector_with_a_custom_note_root_is_refused(self):
+        """The write path commits to ``knowledge/<slug>.md`` unconditionally,
+        so any other root reads a different folder than it writes."""
+        db, gitea = (
+            self._db(connector_row(config={"root_path": "docs/vault"})),
+            self._gitea(),
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await self._create_adopting(db, gitea)
+
+        assert exc.value.status_code == 400
+        assert "knowledge" in str(exc.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_non_owner_cannot_adopt_someone_elses_connector(self):
+        db, gitea = (
+            self._db(connector_row(created_by=str(uuid.uuid4()))),
+            self._gitea(),
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await self._create_adopting(db, gitea)
+
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_repo_row_is_rolled_back_when_the_marker_write_fails(self):
+        db = self._db()
+        db.update_datasource_with_policy.side_effect = RuntimeError("db failure")
+        db.remove_project_repository = AsyncMock()
+
+        with (
+            patch("main.postgres_db", db),
+            patch("main._purge_kb_datasource_index", AsyncMock()) as purge,
+            pytest.raises(RuntimeError),
+        ):
+            await _provision_external_project_knowledge_repo(
+                {"id": PROJECT_ID, "name": "Better Resavio"},
+                OWNER_ID,
+                await _plan_external_kb_vault(
+                    self.ADOPT,
+                    caller={"id": OWNER_ID, "is_admin": False},
+                ),
+            )
+
+        db.remove_project_repository.assert_awaited_once()
+        purge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_connector_credentials_never_reach_the_response(self):
+        db, gitea = self._db(), self._gitea()
+        db.get_project_repositories = AsyncMock(return_value=[])
+
+        with (
+            patch(
+                "main.require_project_owner",
+                AsyncMock(
+                    return_value=(
+                        {"id": OWNER_ID, "is_admin": False},
+                        {"id": PROJECT_ID, "name": "Better Resavio"},
+                    )
+                ),
+            ),
+            patch("main.postgres_db", db),
+            patch("main.gitea_client", gitea),
+            patch("main._purge_kb_datasource_index", AsyncMock()),
+        ):
+            result = await attach_project_knowledge_repository(
+                object(), PROJECT_ID, self.ADOPT
+            )
+
+        assert result["status"] == "attached"
+        assert "connector-pat-never-return" not in repr(result)
+
+    @pytest.mark.asyncio
+    async def test_project_that_already_has_a_kb_connector_is_refused(self):
+        """Two rows marked native to one project make
+        ``get_native_project_kb_datasource_ref`` pick the older one, so the
+        vault would read credentials that belong to a different repository."""
+        db, gitea = self._db(), self._gitea()
+        db.get_project_repositories = AsyncMock(return_value=[])
+        db.get_native_project_kb_datasource_ref = AsyncMock(
+            return_value=native_kb_row()
+        )
+
+        with (
+            patch(
+                "main.require_project_owner",
+                AsyncMock(
+                    return_value=(
+                        {"id": OWNER_ID, "is_admin": False},
+                        {"id": PROJECT_ID, "name": "Better Resavio"},
+                    )
+                ),
+            ),
+            patch("main.postgres_db", db),
+            patch("main.gitea_client", gitea),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await attach_project_knowledge_repository(object(), PROJECT_ID, self.ADOPT)
+
+        assert exc.value.status_code == 409
+        db.add_project_repository.assert_not_awaited()
+        db.update_datasource_with_policy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_attach_allows_a_connector_already_linked_to_that_project(self):
+        """Its only link is the project doing the adopting — nobody loses
+        access."""
+        db, gitea = self._db(), self._gitea()
+        db.get_project_repositories = AsyncMock(return_value=[])
+        db.list_datasource_projects = AsyncMock(return_value=[PROJECT_ID])
+
+        with (
+            patch(
+                "main.require_project_owner",
+                AsyncMock(
+                    return_value=(
+                        {"id": OWNER_ID, "is_admin": False},
+                        {"id": PROJECT_ID, "name": "Better Resavio"},
+                    )
+                ),
+            ),
+            patch("main.postgres_db", db),
+            patch("main.gitea_client", gitea),
+            patch("main._purge_kb_datasource_index", AsyncMock()),
+        ):
+            result = await attach_project_knowledge_repository(
+                object(), PROJECT_ID, self.ADOPT
+            )
+
+        assert result["status"] == "attached"
+
+
+class TestExternalKnowledgeBaseRequestShape:
+    """One vault, named exactly one way."""
+
+    def test_connector_and_inline_credentials_are_mutually_exclusive(self):
+        with pytest.raises(ValidationError):
+            ExternalKnowledgeBase(
+                datasource_id=str(CONNECTOR_ID),
+                repo_url="https://github.com/acme/design-vault.git",
+                token="pat",
+            )
+
+    def test_a_branch_cannot_override_the_connectors_own(self):
+        with pytest.raises(ValidationError):
+            ExternalKnowledgeBase(
+                datasource_id=str(CONNECTOR_ID), branch="somewhere-else"
+            )
+
+    def test_inline_mode_still_requires_a_repo_url_and_token(self):
+        with pytest.raises(ValidationError):
+            ExternalKnowledgeBase(repo_url="https://github.com/acme/vault.git")
+        with pytest.raises(ValidationError):
+            ExternalKnowledgeBase()
+
+    def test_inline_mode_still_defaults_the_branch(self):
+        body = ExternalKnowledgeBase(
+            repo_url="https://github.com/acme/vault.git", token="pat"
+        )
+        assert body.branch == "main"
+
+
+# =============================================================================
 # The external sweep — criterion 5
 # =============================================================================
 
@@ -453,6 +853,37 @@ class TestExternalSweepSkipsNativeKb:
         assert worked == 1
         reindex_fn.assert_awaited_once()
         assert reindex_fn.await_args.kwargs["kb_id"] == uuid.UUID(str(external["id"]))
+
+    @pytest.mark.asyncio
+    async def test_liveness_check_fails_a_row_adopted_mid_sweep(self):
+        """A sweep that read the row before it became a project's vault must
+        not be allowed to commit its chunks afterwards — that is the double
+        index, arrived at through a race."""
+        captured = {}
+        adopted = native_kb_row(id=external_kb_row()["id"])
+
+        async def capture(datasource, **kwargs):
+            captured["is_active"] = kwargs["is_active"]
+            return {"status": "completed"}
+
+        postgres_db = AsyncMock()
+        postgres_db.fetch.return_value = []
+        postgres_db.list_datasources.return_value = [external_kb_row(id=adopted["id"])]
+        postgres_db.get_datasource.return_value = adopted
+
+        with patch(
+            "orchestrator.services.kb_datasources.reindex_kb_datasource",
+            AsyncMock(side_effect=capture),
+        ):
+            await kb_sweep_tick(
+                postgres_db=postgres_db,
+                store=MagicMock(),
+                gitea_client=MagicMock(),
+                embedding_service=MagicMock(),
+                reindex_fn=AsyncMock(),
+            )
+
+        assert await captured["is_active"]() is False
 
     @pytest.mark.asyncio
     async def test_reindexing_a_native_row_directly_is_refused(self):
