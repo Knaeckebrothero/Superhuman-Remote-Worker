@@ -233,4 +233,6 @@ BetterResavio-KB/
 # Separate repos checked out inside this working tree. Untracked is not enough —
 # one `git add -A` would publish a private repo into the public one.
 HomeLab/
+# Knowledge vault, cloned in as a plain nested repo (not a submodule).
+knowledge-base/
 srw-cloud/
