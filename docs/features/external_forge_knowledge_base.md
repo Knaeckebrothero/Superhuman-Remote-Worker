@@ -132,11 +132,49 @@ creation entirely** and records the external repo as the `knowledge`-role row �
 creating a Gitea repo and replacing it, which would leave an orphan. Existing projects get a
 separate attach path.
 
-Implemented request shape: `external_kb: {repo_url, branch, token, forge?}`. `forge` is inferred
-for `github.com` and is required as `github` for GitHub Enterprise. Existing repo-less projects
-attach through `POST /api/projects/{project_id}/knowledge/repository`. The attach route refuses
-to replace an existing `knowledge`-role repository: automatic content/history migration remains
-out of scope under §8.2.
+Implemented request shape — exactly one of two forms, enforced by the request model:
+
+* `external_kb: {datasource_id}` — **adopt an existing `kb` connector**. The connector already
+  holds the repository URL, branch, note root and encrypted PAT, so nothing else may be sent
+  alongside it. This is the only form the cockpit sends: the user creates the connector on the
+  Connectors page first, then attaches it here.
+* `external_kb: {repo_url, branch, token, forge?}` — the inline form, retained for MCP and other
+  API callers. `forge` is inferred for `github.com` and is required as `github` for GitHub
+  Enterprise.
+
+Existing repo-less projects attach through `POST /api/projects/{project_id}/knowledge/repository`,
+which takes the same two forms. The attach route refuses to replace an existing `knowledge`-role
+repository: automatic content/history migration remains out of scope under §8.2.
+
+### 4.5 Adoption converts the connector in place
+
+A connector named by `datasource_id` **becomes** the project's native KB row — the marker, the
+project link and the scope are written onto the existing row. It is deliberately not copied:
+two rows on one repository would mean the vault is indexed under the project id *and* swept under
+the connector UUID, and every note would answer a search twice (§6 of
+[[knowledge_base_repo_separation]]).
+
+Consequences, all checked before anything is created:
+
+| check | why |
+|---|---|
+| caller is the connector's creator or an admin | adoption repurposes a stored credential |
+| not already a project's KB | one vault per connector |
+| not published to everyone (`is_global`) | adoption takes the row private and drops the index other users were reading |
+| not linked to any other project | adoption narrows scope to one project; doing that silently would revoke another project's read access to an index that is about to disappear |
+| `credentials.token` present | writes go through the GitHub contents API, which has no SSH equivalent — an SSH-only connector would clone fine and fail on every note write |
+| note root empty or `knowledge` | `kb_materialize` commits to `knowledge/<slug>.md` unconditionally |
+| GitHub host (or explicit `forge: github`) | §4.1 |
+
+After the marker is stored, the index the connector accumulated under its own UUID is purged
+(`_purge_kb_datasource_index`, the same `delete_kb_index` primitive deletion uses). The purge is
+best-effort: the marker already took the row out of the sweep, so a failed purge leaves
+unreachable rows, not duplicate hits, and never fails a provisioned project. The sweep's own
+under-lock liveness check re-reads the marker, so a pass that started before adoption cannot
+commit its chunks afterwards.
+
+From then on the row is governed by the existing native-KB guards: it cannot be deleted,
+relinked, reindexed as an external source, or have its policy edited from the Connectors page.
 
 ## 5. Implementation order
 

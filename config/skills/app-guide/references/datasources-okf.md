@@ -73,3 +73,12 @@ for project knowledge. A selected external OKF connector is an additional,
 reusable read-only library: agents can search, list, and read its indexed notes,
 and results identify which knowledge base they came from, but agents cannot
 write changes back to its Git repository in this release.
+
+A connector can instead be **attached as one project's knowledge base**, on the
+project Knowledge tab or when creating the project. That converts it: the
+connector becomes that project's writable vault, is managed by the project
+(no delete, relink, or manual reindex from the Connectors page), and stops
+being available to anyone else. The connector must use token auth (writes go
+through the GitHub API), keep its notes under `knowledge/`, point at GitHub,
+and not be linked to any other project. Attaching is one-way and never
+replaces a vault a project already has.

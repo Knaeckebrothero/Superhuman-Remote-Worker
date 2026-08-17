@@ -440,10 +440,12 @@
     },
     "externalKb": {
       "toggle": "Externes Wissens-Repository verwenden",
-      "hint": "Die Wissensdatenbank dieses Projekts in einem vorhandenen privaten GitHub-Repository ablegen statt im integrierten. Legen Sie das Repository zuerst an; das Zugriffstoken benötigt Lese- und Schreibrechte auf dessen Inhalte.",
-      "repoUrlPlaceholder": "Repository-URL, z. B. https://github.com/org/vault (erforderlich)",
-      "branchPlaceholder": "Branch (optional, Standard: main)",
-      "tokenPlaceholder": "Zugriffstoken (erforderlich)"
+      "hint": "Die Wissensdatenbank dieses Projekts in einem eigenen privaten GitHub-Repository ablegen, indem Sie einen zuvor angelegten Wissensdatenbank-Konnektor anhängen.",
+      "selectPlaceholder": "Wissensdatenbank-Konnektor auswählen…",
+      "loading": "Konnektoren werden geladen…",
+      "adoptHint": "Der Konnektor wird zur Wissensdatenbank dieses Projekts: Er wird fortan vom Projekt verwaltet und steht anderen nicht mehr zur Verfügung.",
+      "noConnectors": "Sie haben noch keinen Wissensdatenbank-Konnektor. Legen Sie zuerst einen für das Repository an und hängen Sie ihn dann hier an.",
+      "createConnector": "Konnektor anlegen"
     }
   },
   "automations": {
@@ -1206,6 +1208,15 @@
       "colMerge": "Zustellung"
     },
     "knowledge": {
+      "attachTitle": "Externes Wissens-Repository",
+      "attachHint": "Dieses Projekt hat noch kein Wissens-Repository. Hängen Sie einen Wissensdatenbank-Konnektor an, um die Notizen in Ihrem eigenen privaten GitHub-Repository abzulegen.",
+      "attachSelectPlaceholder": "Wissensdatenbank-Konnektor auswählen…",
+      "attachNoConnectors": "Noch kein Wissensdatenbank-Konnektor vorhanden. Legen Sie zuerst einen für das Repository an und hängen Sie ihn dann hier an.",
+      "attachCreateConnector": "Konnektor anlegen",
+      "attachAdoptHint": "Der Konnektor wird zur Wissensdatenbank dieses Projekts: Er wird fortan vom Projekt verwaltet und steht anderen nicht mehr zur Verfügung.",
+      "attachSubmit": "Anhängen",
+      "attachSubmitting": "Wird angehängt…",
+      "attachFailed": "Der Konnektor konnte nicht angehängt werden.",
       "totalLabel": "Gesamt",
       "searchPlaceholder": "Wissen durchsuchen...",
       "search": "Suchen",
@@ -2027,6 +2038,8 @@
       "sshGenerateConfirm": "Aktuellen SSH-Schlüssel ersetzen?",
       "sshGenerateReplace": "Ersetzen",
       "repoHint": "Das Repository wird in den Arbeitsbereich geklont und Git-Anmeldeinformationen werden automatisch konfiguriert. Der Agent verwendet standardmäßige Git-Befehle — keine Einrichtung der Anmeldeinformationen erforderlich.",
+      "patScopesRepo": "Token-Berechtigungen: Contents (Inhalte) lesen und schreiben, zusätzlich Pull requests schreiben, wenn der Agent PRs öffnen soll. Beschränken Sie das Token nach Möglichkeit auf dieses eine Repository.",
+      "patScopesKb": "Token-Berechtigungen: Contents (Inhalte) lesen genügt zum Indexieren. Wird der Konnektor als Wissensdatenbank eines Projekts angehängt, wird zusätzlich Contents schreiben benötigt, da Agenten Notizen zurück ins Repository committen.",
       "kbHint": "Markdown-/OKF-Repository; zentral indiziert; in dieser Version für Agenten schreibgeschützt.",
       "credentialsRetainHint": "Token oder SSH-Schlüssel leer lassen, um die gespeicherten Anmeldedaten beizubehalten.",
       "visibilityLabel": "Sichtbarkeit",

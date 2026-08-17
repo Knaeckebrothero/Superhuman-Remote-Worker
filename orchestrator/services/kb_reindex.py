@@ -1169,7 +1169,15 @@ async def kb_sweep_tick(
                 datasource_id: Any = datasource_id,
             ) -> bool:
                 current = await postgres_db.get_datasource(str(datasource_id))
-                return bool(current and current.get("type") == "kb")
+                # The marker is re-read here, not just at enumeration: a row
+                # adopted as a project's vault mid-sweep must not have this
+                # pass's chunks committed under its datasource id afterwards.
+                # That is the double index, arrived at through a race.
+                return bool(
+                    current
+                    and current.get("type") == "kb"
+                    and not native_kb_project_id(current)
+                )
 
             result = await reindex_kb_datasource(
                 datasource,

@@ -1429,14 +1429,21 @@ export interface ProjectCreateRequest {
   user_id: string;
 }
 
-/** Existing private GitHub repository used as the writable project KB. */
-export interface ExternalKnowledgeBaseRequest {
-  repo_url: string;
-  branch?: string;
-  token: string;
-  /** Required for GitHub Enterprise; github.com is inferred. */
-  forge?: 'github';
-}
+/** Which private GitHub repository backs the writable project KB.
+ *
+ * Exactly one form per request: `datasource_id` adopts an existing `kb`
+ * connector (what the cockpit sends — the connector already holds the URL,
+ * branch and PAT), or the repository and token inline (API/MCP callers).
+ */
+export type ExternalKnowledgeBaseRequest =
+  | {datasource_id: string}
+  | {
+      repo_url: string;
+      branch?: string;
+      token: string;
+      /** Required for GitHub Enterprise; github.com is inferred. */
+      forge?: 'github';
+    };
 
 /**
  * Request body for updating a project.

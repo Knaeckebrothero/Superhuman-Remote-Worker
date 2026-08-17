@@ -2158,7 +2158,10 @@ class AsyncCockpitClient:
             goal: Project goal statement
             default_config_name: Default agent config for new jobs
             default_config_override: Default config overrides for new jobs
-            external_kb: Existing private GitHub repo + branch + PAT for the live KB
+            external_kb: The live KB's GitHub repo, either as
+                ``{"datasource_id": ...}`` naming an existing OKF Knowledge
+                Base connector to adopt, or ``{"repo_url", "token",
+                "branch"?, "forge"?}`` inline
 
         Returns:
             Created project record with ID

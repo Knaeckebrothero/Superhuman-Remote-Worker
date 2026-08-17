@@ -266,6 +266,60 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           <!-- KNOWLEDGE TAB -->
           @if (activeTab() === 'knowledge') {
             <div class="kb-section">
+              <!-- No vault yet: offer to point this project at a knowledge
+                   base connector. Replacing an existing vault is deliberately
+                   not offered — there is no approved note/history migration
+                   (external_forge_knowledge_base.md §8.2). -->
+              @if (!hasKnowledgeRepo()) {
+                <div class="kb-attach">
+                  <div class="kb-attach-title">
+                    {{ 'projectDetail.knowledge.attachTitle' | transloco }}
+                  </div>
+                  <p class="kb-attach-hint">
+                    {{ 'projectDetail.knowledge.attachHint' | transloco }}
+                  </p>
+                  @if (kbConnectors().length === 0) {
+                    <p class="kb-attach-hint">
+                      {{ 'projectDetail.knowledge.attachNoConnectors' | transloco }}
+                    </p>
+                    <app-button variant="secondary" size="sm" (clicked)="openConnectors()">
+                      {{ 'projectDetail.knowledge.attachCreateConnector' | transloco }}
+                    </app-button>
+                  } @else {
+                    <div class="kb-attach-row">
+                      <app-select
+                        size="sm"
+                        [fullWidth]="false"
+                        [value]="kbAttachSelection()"
+                        (changed)="kbAttachSelection.set($event ?? '')"
+                      >
+                        <option value="">
+                          {{ 'projectDetail.knowledge.attachSelectPlaceholder' | transloco }}
+                        </option>
+                        @for (connector of kbConnectors(); track connector.id) {
+                          <option [value]="connector.id">{{ connector.name }}</option>
+                        }
+                      </app-select>
+                      <app-button
+                        variant="primary"
+                        size="sm"
+                        [disabled]="!kbAttachSelection() || isAttachingKb()"
+                        (clicked)="attachKnowledgeConnector()"
+                      >
+                        {{ (isAttachingKb()
+                              ? 'projectDetail.knowledge.attachSubmitting'
+                              : 'projectDetail.knowledge.attachSubmit') | transloco }}
+                      </app-button>
+                    </div>
+                    <p class="kb-attach-hint">
+                      {{ 'projectDetail.knowledge.attachAdoptHint' | transloco }}
+                    </p>
+                  }
+                  @if (kbAttachError()) {
+                    <p class="kb-attach-error" role="alert">{{ kbAttachError() }}</p>
+                  }
+                </div>
+              }
               <!-- Stats + search/filters act on the list; on mobile, hide them while a
                    single note is open so the note isn't buried under chrome. Desktop
                    keeps them visible (master/detail, plenty of vertical room). -->
@@ -1380,6 +1434,31 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     /* Knowledge Base */
     .kb-section { display: flex; flex-direction: column; gap: 16px; }
 
+    .kb-attach {
+      display: flex; flex-direction: column; gap: 8px;
+      background: var(--panel-bg);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-surface);
+      padding: 14px;
+    }
+
+    .kb-attach-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+
+    .kb-attach-hint {
+      margin: 0;
+      font-size: 12px;
+      color: var(--text-muted);
+      line-height: 1.45;
+    }
+
+    .kb-attach-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+    .kb-attach-error {
+      margin: 0;
+      font-size: 12px;
+      color: var(--danger);
+    }
+
     .kb-stats-row {
       display: flex; gap: 12px; flex-wrap: wrap;
     }
@@ -1690,6 +1769,16 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly project = signal<Project | null>(null);
   readonly jobs = signal<Job[]>([]);
   readonly repos = signal<ProjectRepository[]>([]);
+  /** A project has at most one writable vault, and it is never replaced in
+   *  place, so this is what decides whether attaching is offered at all. */
+  readonly hasKnowledgeRepo = computed(() =>
+    this.repos().some((repo) => repo.role === 'knowledge'),
+  );
+  /** Knowledge base connectors this project could adopt as its vault. */
+  readonly kbConnectors = signal<Datasource[]>([]);
+  readonly kbAttachSelection = signal('');
+  readonly isAttachingKb = signal(false);
+  readonly kbAttachError = signal('');
   readonly members = signal<ProjectMember[]>([]);
   readonly isLoading = signal(false);
   readonly activeTab = signal<Tab>('overview');
@@ -1880,7 +1969,60 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   loadRepos(): void {
-    this.api.getProjectRepositories(this.projectId).subscribe((r) => this.repos.set(r));
+    this.api.getProjectRepositories(this.projectId).subscribe((r) => {
+      this.repos.set(r);
+      // Only a vault-less project can attach one, so the candidate list is
+      // fetched only for those.
+      if (!this.hasKnowledgeRepo()) this.loadKbConnectors();
+    });
+  }
+
+  private loadKbConnectors(): void {
+    this.api.getDatasources(undefined, 'kb').subscribe({
+      next: (connectors) => {
+        // The server-owned marker means some project already adopted it;
+        // offering it here could only ever produce a 409.
+        this.kbConnectors.set(
+          connectors.filter((connector) => !connector.config?.native_project_id),
+        );
+      },
+      error: () => this.kbConnectors.set([]),
+    });
+  }
+
+  openConnectors(): void {
+    this.router.navigate(['/datasources']);
+  }
+
+  /** Hand the selected connector to this project as its writable vault. The
+   *  connector already carries the repository, branch and PAT; the request
+   *  names nothing else. */
+  attachKnowledgeConnector(): void {
+    const datasourceId = this.kbAttachSelection();
+    if (!datasourceId || this.isAttachingKb()) return;
+    this.isAttachingKb.set(true);
+    this.kbAttachError.set('');
+    this.api.attachProjectKnowledgeRepository(this.projectId, {datasource_id: datasourceId}).subscribe({
+      next: (result) => {
+        this.isAttachingKb.set(false);
+        if (!result) {
+          this.kbAttachError.set(this.transloco.translate('projectDetail.knowledge.attachFailed'));
+          return;
+        }
+        this.kbAttachSelection.set('');
+        this.loadRepos();
+        this.loadKBSummary();
+      },
+      error: (err: unknown) => {
+        this.isAttachingKb.set(false);
+        const detail = (err as {error?: {detail?: unknown}} | null)?.error?.detail;
+        this.kbAttachError.set(
+          typeof detail === 'string' && detail
+            ? detail
+            : this.transloco.translate('projectDetail.knowledge.attachFailed'),
+        );
+      },
+    });
   }
 
   loadMembers(): void {

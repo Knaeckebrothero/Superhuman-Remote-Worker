@@ -87,9 +87,11 @@ on agents and users maintaining them.
 An **OKF Knowledge Base** connector indexes Markdown/OKF notes from an external
 Git repository. It is an additional, reusable, read-only library for agents in
 this release; its repository remains the source of truth. Linking or selecting
-one does not merge it into the writable native project knowledge base. Route
-connection, readiness, and reindexing questions to the focused **external OKF
-Knowledge Base** guide.
+one does not merge it into the writable native project knowledge base —
+though a connector can be *attached* as a project's knowledge base, which
+converts it into that project's writable vault. Route connection, readiness,
+attachment, and reindexing questions to the focused **external OKF Knowledge
+Base** guide.
 
 ## Where to put something important
 

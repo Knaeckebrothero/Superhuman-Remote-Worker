@@ -440,10 +440,12 @@
     },
     "externalKb": {
       "toggle": "Use an external knowledge repository",
-      "hint": "Keep this project's knowledge base in an existing private GitHub repository instead of the built-in one. Create the repository first; the access token needs read/write access to its contents.",
-      "repoUrlPlaceholder": "Repository URL, e.g. https://github.com/org/vault (required)",
-      "branchPlaceholder": "Branch (optional, defaults to main)",
-      "tokenPlaceholder": "Access token (required)"
+      "hint": "Keep this project's knowledge base in your own private GitHub repository by attaching a knowledge base connector you created earlier.",
+      "selectPlaceholder": "Choose a knowledge base connector…",
+      "loading": "Loading connectors…",
+      "adoptHint": "The connector becomes this project's knowledge base: it is managed by the project from then on and is no longer available to others.",
+      "noConnectors": "You don't have a knowledge base connector yet. Create one for the repository first, then attach it here.",
+      "createConnector": "Create a connector"
     }
   },
   "automations": {
@@ -1206,6 +1208,15 @@
       "colMerge": "Delivery"
     },
     "knowledge": {
+      "attachTitle": "External knowledge repository",
+      "attachHint": "This project has no knowledge repository yet. Attach a knowledge base connector to keep its notes in your own private GitHub repository.",
+      "attachSelectPlaceholder": "Choose a knowledge base connector…",
+      "attachNoConnectors": "No knowledge base connector yet. Create one for the repository first, then attach it here.",
+      "attachCreateConnector": "Create a connector",
+      "attachAdoptHint": "The connector becomes this project's knowledge base: it is managed by the project from then on and is no longer available to others.",
+      "attachSubmit": "Attach",
+      "attachSubmitting": "Attaching…",
+      "attachFailed": "Could not attach that connector.",
       "totalLabel": "Total",
       "searchPlaceholder": "Search knowledge...",
       "search": "Search",
@@ -2027,6 +2038,8 @@
       "sshGenerateConfirm": "Replace the current SSH key?",
       "sshGenerateReplace": "Replace",
       "repoHint": "The repository will be cloned into the workspace and git credentials configured automatically. The agent uses standard git commands — no credential setup required.",
+      "patScopesRepo": "Token permissions: Contents read and write, plus Pull requests write if the agent should open PRs. Scope the token to this repository alone wherever your forge allows it.",
+      "patScopesKb": "Token permissions: Contents read is enough to index the notes. Attaching this connector as a project's knowledge base also needs Contents write, because agents commit notes back to the repository.",
       "kbHint": "Markdown/OKF repository; centrally indexed; read-only to agents in this release.",
       "credentialsRetainHint": "Leave the token or SSH key blank to retain the stored credential.",
       "visibilityLabel": "Visibility",
