@@ -113,6 +113,32 @@ orchestrator:
   replicas: 2
   pdb:
     minAvailable: 1
+  # Gate 3 completion-command substrate ON for dev (chart default stays false).
+  # Reports become durable command rows with effects-as-rows and a
+  # leader-elected finalizer; `lifespan` additionally starts the finalizer and
+  # the queued-age alarm, and the two admin unpark/force-resolve endpoints go
+  # live. This is what makes §5.4.5 steps 2-5 real on dev — step 6 opened
+  # worker admission but the first probe (job 00c3d898, 12 rotations) ran the
+  # LEGACY completion path end to end, so none of that work was exercised and
+  # `cmds=0` was a null reading rather than a pass.
+  #
+  # NOT lane-scoped, and that is the point worth remembering: the flag gates 67
+  # sites across 34 functions and covers PINNED jobs too (main.py:13717), from
+  # the completion path through dispatch/resume, the human control verbs, the
+  # VM lifecycle and the autonomous status sweeps — including the project loop
+  # and the officer's routed messages.
+  #
+  # The transition is incremental rather than big-bang: most of those sites add
+  # `NOT EXISTS (job_completion_sweep_exclusions ...)` plus a completion-control
+  # context guard, and both are no-ops while no command rows exist. At flip time
+  # dev held 0 command rows, 0 exclusion rows, 0 processing and 0 created jobs —
+  # nothing mid-execution — so divergence starts one job at a time as jobs
+  # complete under the new path.
+  #
+  # Reorder stays OFF: `completionStatusReorderEnabled` hard-requires this flag
+  # (helm/templates/configmap.yaml:5 fails the render otherwise), so it is a
+  # separate, later decision rather than a free rider on this one.
+  completionCommandsEnabled: true
 # -----------------------------------------------------------------------------
 # Infrastructure allocation metering — Slice 1 inventory-only soak
 # -----------------------------------------------------------------------------
