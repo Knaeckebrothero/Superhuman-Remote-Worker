@@ -1,7 +1,7 @@
 """Unit tests for ``RemoteBackend.open_forward_channel``.
 
 This is the reusable tunnel primitive behind live-VM IDE access
-(docs/features/vm_snapshots_and_ide.md, "Live-VM IDE Access via the Agent"):
+(knowledge-base/knowledge/features/vm_snapshots_and_ide.md, "Live-VM IDE Access via the Agent"):
 the agent opens a ``direct-tcpip`` channel over its existing authenticated SSH
 transport to reach code-server on the VM's loopback, which is not exposed on
 the mesh network. These tests mock paramiko so no SSH/VM is required.

@@ -10,7 +10,7 @@ Mirrors tests/test_job_claim.py.
 Also locks the dispatcher-visibility contract: the claim must clear the
 delegation ``freeze_data`` blob, because ``get_dispatchable_jobs`` requires
 ``freeze_data IS NULL`` — a kept freeze hides the re-queued parent forever
-(docs/issues/delegation_freeze_lifecycle_gaps.md, Gap 1).
+(knowledge-base/knowledge/issues/delegation_freeze_lifecycle_gaps.md, Gap 1).
 """
 
 import asyncio
@@ -118,7 +118,7 @@ async def test_delegation_resume_clears_freeze_so_dispatcher_sees_parent(db):
     get_dispatchable_jobs requires ``freeze_data IS NULL`` (partial-index
     contract, 0046); every other frozen→paused transition in the codebase
     clears the freeze in the same statement. Regression for
-    docs/issues/delegation_freeze_lifecycle_gaps.md (Gap 1).
+    knowledge-base/knowledge/issues/delegation_freeze_lifecycle_gaps.md (Gap 1).
     """
     assert await db.claim_delegation_resume(JOB) is True
     async with db.acquire() as conn:

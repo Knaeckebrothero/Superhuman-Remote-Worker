@@ -12,7 +12,7 @@ attach won every time.
 two attach paths (``resume_thread._reprovision`` and the sessions router's
 ``_do_prepare``) await the in-flight task instead of racing it.
 
-docs/done/session_resume_cloud_sync_race_late_provision.md
+knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
 """
 
 import asyncio

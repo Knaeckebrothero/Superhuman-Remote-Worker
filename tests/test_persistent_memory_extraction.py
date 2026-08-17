@@ -1,6 +1,6 @@
 """Regression tests for B1 — persistent memory extraction broken three ways.
 
-See docs/issues/memory_bugs.md B1. The original bug: three call sites read
+See knowledge-base/knowledge/issues/memory_bugs.md B1. The original bug: three call sites read
 phantom attributes (``extraction_interval``, ``extraction_prompt``) off
 ``MemoryConfig``, which only survived in tests because MagicMock configs
 fabricate any attribute. Every test here that exercises extraction wiring

@@ -117,7 +117,7 @@ vmController:
   vmStorageClass: "local-path"
   vmDiskSize: "20Gi"
   # -- Golden-image boot acceleration
-  # (docs/features/vm_golden_image_boot_acceleration.md). Import the base image
+  # (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md). Import the base image
   # once into a shared golden PVC per digest; clone each VM root disk from it
   # (host-assisted local copy on local-path) instead of a per-VM registry
   # import. Off = byte-for-byte the current registry-per-VM behaviour.
@@ -129,7 +129,7 @@ vmController:
       enabled: true
       keep: 3            # keep the N newest image digests
       minAgeMinutes: 30  # don't GC a golden younger than this
-  # -- Persistent VM rootdisks (docs/features/vm_persistent_rootdisk.md).
+  # -- Persistent VM rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
   # Create each VM's root disk as a standalone DataVolume instead of via
   # spec.dataVolumeTemplates, so it is not cascade-deleted with the VM. A
   # recreate reattaches it by name: files survive a crash or a suspend, and the
@@ -266,7 +266,7 @@ headscale:
   # VM never registered a mesh IP and workspace-tier `*→vm` upgrades timed out.
   # (Single-use + ephemeral + tag:vm-scoped, so a longer registration window is a
   # minor trade-off. A golden-image clone — removing the import — lets this shrink
-  # again; see docs/features/workspace_tier_upgrade.md Q7.)
+  # again; see knowledge-base/knowledge/features/workspace_tier_upgrade.md Q7.)
   keyExpiryMinutes: 30
   # -- Provide EXACTLY ONE source (or leave both empty to fall back to
   # externalSecrets.vaultPath — see "Layout B" in external-secret.yaml):

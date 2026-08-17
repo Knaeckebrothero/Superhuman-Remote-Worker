@@ -1,4 +1,4 @@
-"""Officer (centurion) substrate tests — S1+S2 of docs/features/centurion.md.
+"""Officer (centurion) substrate tests — S1+S2 of knowledge-base/knowledge/features/centurion.md.
 
 Covers the config parse (shared helper, both loader paths), the ToolContext
 sleep slot, the sleep tool, the TurnResult flag, the officer branch of

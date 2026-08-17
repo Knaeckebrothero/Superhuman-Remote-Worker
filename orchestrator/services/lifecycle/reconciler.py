@@ -100,7 +100,7 @@ class InstanceLifecycleReconciler:
           3. For each instance failing ``is_healthy``, call ``delete``
              with grace=0 — the crash-recovery path. Closes the gap
              where ``Unknown``/``Failed`` workspace pods sat forever
-             (``docs/issues/stuck_thread_workspace_pods.md``).
+             (``knowledge-base/knowledge/issues/stuck_thread_workspace_pods.md``).
           4. For each drifted instance that is currently idle, call
              ``drain``. Drift on a busy instance is recorded in stats
              but not actuated — the in-pod drain-intent path (Phase 1c)

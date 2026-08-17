@@ -152,9 +152,9 @@ python agent.py --port 8001 --loop
 
 ## Docker Compose Deployment
 
-Deploy the complete system using containers. This is the simplest deployment option — no Kubernetes required. The orchestrator auto-detects the environment and uses static workspace pools instead of dynamic pod provisioning. See [`docs/docker_compose_mode.md`](docs/docker_compose_mode.md) for architecture details.
+Deploy the complete system using containers. This is the simplest deployment option — no Kubernetes required. The orchestrator auto-detects the environment and uses static workspace pools instead of dynamic pod provisioning. See [`knowledge-base/knowledge/docker_compose_mode.md`](knowledge-base/knowledge/docker_compose_mode.md) for architecture details.
 
-For Kubernetes deployment (recommended for production), see [`docs/deployment.md`](docs/deployment.md) and the `deployment/` or `deployment-local/` directories.
+For Kubernetes deployment (recommended for production), see [`knowledge-base/knowledge/deployment.md`](knowledge-base/knowledge/deployment.md) and the `deployment/` or `deployment-local/` directories.
 
 ### 1. Clone and Configure
 
@@ -399,7 +399,7 @@ Tilt watches the repo and live-syncs source files into the running pods (or rebu
 | MCP | `live_update` sync + `watchfiles` wrapper | ~10–15 s (watchfiles + Tilt debounce) |
 | Agent | full image rebuild + helm fan-out + Reloader bounce | ~50 s (~8 s warm docker build + orchestrator restart) |
 
-Tilt is opt-in but is now the **default development workflow**. The `helm install` path above still works standalone for people without Tilt installed. Design and rationale: [`docs/features/tilt_inner_loop_dev.md`](docs/features/tilt_inner_loop_dev.md).
+Tilt is opt-in but is now the **default development workflow**. The `helm install` path above still works standalone for people without Tilt installed. Design and rationale: [`knowledge-base/knowledge/features/tilt_inner_loop_dev.md`](knowledge-base/knowledge/features/tilt_inner_loop_dev.md).
 
 **One-time install** (binary to `~/.local/bin/`, no sudo):
 
@@ -438,7 +438,7 @@ Press Ctrl-C to stop Tilt (the cluster keeps running; use `k3d cluster stop srw`
 
 The point of having Tilt + a local prod-parity cluster is that **every change can be verified locally before it ships**. The loop:
 
-1. **Plan**: design doc under `docs/features/` or `docs/issues/` (whatever fits). Get alignment on scope + acceptance before you start editing.
+1. **Plan**: design doc under `knowledge-base/knowledge/features/` or `knowledge-base/knowledge/issues/` (whatever fits). Get alignment on scope + acceptance before you start editing.
 2. **Develop**: edit the relevant source. Tilt handles the rebuild/sync automatically — watch the Tilt UI at `https://localhost:10350` for the affected resource going green again.
 3. **Verify locally** — do not push until this passes:
    - **Unit/lint tests** at file granularity:

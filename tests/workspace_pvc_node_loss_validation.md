@@ -14,7 +14,7 @@ resuming the Postgres checkpoint (unpushed working-tree files lost). And the
 inverse: a *brief* outage (shorter than the timeout) reattaches with the data
 **preserved**, never discarding.
 
-**Design + code:** `docs/features/workspace_pvc_branch_a_implementation.md`
+**Design + code:** `knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md`
 (§Phase 3b). Fallback lives in `orchestrator/services/container_provisioner.py`
 `create_workspace` (`_create_pvc` status / `_pod_volume_attach_failing` /
 `_delete_pvc_and_wait` / the `fresh=True` recursion).

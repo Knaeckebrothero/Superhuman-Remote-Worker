@@ -1,4 +1,4 @@
-"""Officer sitrep + wake-routing tests — S3/S4 of docs/features/centurion.md.
+"""Officer sitrep + wake-routing tests — S3/S4 of knowledge-base/knowledge/features/centurion.md.
 
 Covers the computed-delta sitrep (fingerprint diff, no-progress flag,
 per-section degradation, baseline preservation on failure), the officer

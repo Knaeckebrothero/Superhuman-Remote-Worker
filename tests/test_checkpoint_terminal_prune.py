@@ -1,7 +1,7 @@
 """The terminal checkpoint prune must survive bloat and must not fail silently.
 
 Regression guard for Defect 6 of
-docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
+knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
 
 On 2026-07-27 the prune fired as one unbounded statement and was cancelled::
 

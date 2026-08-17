@@ -2959,7 +2959,7 @@ class AsyncCockpitClient:
         return resp.json()
 
     # =========================================================================
-    # Officers (the Legate's side — docs/features/officer_legate_channel.md)
+    # Officers (the Legate's side — knowledge-base/knowledge/features/officer_legate_channel.md)
     # =========================================================================
 
     async def list_officers(self) -> dict[str, Any]:

@@ -211,7 +211,7 @@ class ContainerProvisioner:
     cancelled job; a session only once its thread is genuinely done, since an
     ``ended`` thread is still resumable) and retained across idle reaps,
     suspend/restore and crash recovery.
-    See docs/features/workspace_pvc_branch_a_implementation.md.
+    See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
     """
 
     def __init__(self):
@@ -250,7 +250,7 @@ class ContainerProvisioner:
         # user reopens a session whose files silently vanished. The PVC name is
         # deterministic on the owner UUID (``_pvc_name_for``), so a recreated pod
         # reattaches the same volume; GC happens when the owning work is
-        # terminal. See docs/features/workspace_pvc_branch_a_implementation.md.
+        # terminal. See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
         self._pvc_enabled: bool = _env_flag("WORKSPACE_PVC_ENABLED", False)
         self._pvc_size: str = os.environ.get("WORKSPACE_PVC_SIZE", "10Gi")
         # Single-replica node-loss fallback (Phase 3b). A REATTACH gets this
@@ -3847,7 +3847,7 @@ class ContainerProvisioner:
         The pod IP changes on every recreate; the agent caches its SSH dial
         target, so a recreated pod (PVC reattach / crash recovery) leaves the
         agent dialing a dead IP and the work churns to fail-loud (see
-        docs/issues/workspace_reattach_ephemeral_ip_reconnect_churn.md). A
+        knowledge-base/knowledge/issues/workspace_reattach_ephemeral_ip_reconnect_churn.md). A
         headless Service named after the pod gives a stable address
         ``<pod_name>.<ns>.svc:30022`` that always resolves (selector-matched) to
         the *current* pod — so reattach/recovery reconnects with no IP
@@ -4096,10 +4096,10 @@ class ContainerProvisioner:
             owner.label_key: owner.id,
             "srw/component": owner.component_label,
             # Fleet-wide selector shared with KubeVirt VM workspaces.
-            # See docs/features/workspace_network_policy_unification.md
+            # See knowledge-base/knowledge/features/workspace_network_policy_unification.md
             "srw.io/component": "agent-workspace",
             # Per-project egress tier — selected by one NetworkPolicy per
-            # tier in helm. See docs/features/workspace_network_isolation.md §3.
+            # tier in helm. See knowledge-base/knowledge/features/workspace_network_isolation.md §3.
             "srw.io/network-tier": network_tier,
         }
         # Phase 2a: build SHA label parity with agent pods. Lets the

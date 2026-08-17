@@ -1,7 +1,7 @@
 """Engine-agnostic overlay-upperdir → diff enumerator.
 
 Walks an overlay upperdir (kernel overlayfs OR fuse-overlayfs — the two
-produce interchangeable-enough markers, see docs/design/cloud_access_
+produce interchangeable-enough markers, see knowledge-base/knowledge/design/cloud_access_
 unification.md §3.1) and yields one DiffEntry per changed path.
 
 Deletions surface as EITHER a char(0,0) device node at the deleted name
@@ -14,7 +14,7 @@ Everything else is a real added/modified path (reported as "present";
 add-vs-modify is resolved by the caller against the lower to avoid an
 rclone round-trip per file).
 
-Phase-0-spike finding (docs/design/cloud_access_unification.md §11.1 /
+Phase-0-spike finding (knowledge-base/knowledge/design/cloud_access_unification.md §11.1 /
 §11.6): a ``"deleted"`` ``DiffEntry`` for a directory does NOT imply the
 directory existed in the lower. fuse-overlayfs marks EVERY directory
 created through the merged view opaque — including brand-new,

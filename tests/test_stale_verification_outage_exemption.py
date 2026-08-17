@@ -7,7 +7,7 @@ budget) has an untouched row — it was being cancelled mid-pause. The staleness
 arm now exempts a critic that is ``paused`` with a live outage wake
 (``context.llm_outage.next_retry_at`` newer than a grace horizon); an overdue
 wake (outage sweeper broken) and the parent-terminal arm still reap.
-docs/features/llm_outage_subjob_resilience.md (#7).
+knowledge-base/knowledge/features/llm_outage_subjob_resilience.md (#7).
 
 Uses testcontainers (real Postgres) — the predicate's NULL semantics
 (critics without llm_outage state) can't be trusted to mocks.
@@ -169,7 +169,7 @@ async def test_created_stale_critic_unchanged(db):
 @pytest.mark.asyncio
 async def test_stale_waiting_critic_is_reaped(db):
     # Task 10: 'waiting' critics are orphans of the retired inter-round
-    # parking mechanism (docs/issues/stale_critic_waiting_status_escapes_
+    # parking mechanism (knowledge-base/knowledge/issues/stale_critic_waiting_status_escapes_
     # reaper.md) — nothing legitimately parks a critic in 'waiting' between
     # rounds any more (a fresh critic is spawned every round instead), so an
     # agentless 'waiting' critic past the staleness horizon must be reaped

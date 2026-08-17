@@ -18,7 +18,7 @@ stubs there to "restore consistency" would silently delete that test's entire
 subject and leave it passing with the kill switch removed. This file, not that
 one, is the PDP's home.
 
-2026-08-04 (docs/superpowers/plans/2026-08-04-expert-write-gate-holes.md,
+2026-08-04 (knowledge-base/knowledge/superpowers/plans/2026-08-04-expert-write-gate-holes.md,
 task 3): ``duplicate_expert``'s grants half changed from refuse-outright to
 strip-and-report — measured against the real PDP with default grants, refusing
 blocked 7 of the 11 shipped experts, including ``scholar``, the route's own
@@ -167,7 +167,7 @@ async def test_enforce_session_create_grants_raises_422_for_denied_mode(monkeypa
     # Session create/update PEP (Layer 2): a permission_mode above the owner's
     # ceiling (default 'supervised', no grant) → 422 with the violation, so a
     # never-startable session is rejected at the API instead of timing out at
-    # provisioning. docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+    # provisioning. knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md
     fake = AsyncMock()
     fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": False})
     fake.list_grants_for_scopes = AsyncMock(
@@ -287,7 +287,7 @@ async def test_enforce_job_create_grants_skips_userless_and_empty(monkeypatch):
 @pytest.mark.asyncio
 async def test_duplicate_expert_strips_an_ungranted_tool_and_reports_it(monkeypatch):
     """The grants half of the fifth expert-write route
-    (docs/issues/duplicate_expert_bypasses_user_experts_kill_switch.md), now
+    (knowledge-base/knowledge/issues/duplicate_expert_bypasses_user_experts_kill_switch.md), now
     strip-and-report rather than refuse (task 3 of the 2026-08-04 plan above):
     `duplicate` is the one route that forks a config someone else authored —
     visibility, not ownership, is the read check, so the source row's

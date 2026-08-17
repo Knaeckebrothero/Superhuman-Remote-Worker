@@ -128,7 +128,7 @@ class IdeSessionService:
             if ssh_host:
                 # Mesh VM (Tailscale ssh_host) the orchestrator cannot reach
                 # directly; live-VM IDE via the agent tunnel is not wired yet
-                # (docs/features/vm_snapshots_and_ide.md, "Live-VM IDE Access
+                # (knowledge-base/knowledge/features/vm_snapshots_and_ide.md, "Live-VM IDE Access
                 # via the Agent"). Surface unavailable instead of advertising a
                 # proxy URL that black-holes into a 504. Becomes "active" once
                 # the agent-routed transport lands.

@@ -14,7 +14,7 @@ identical on 16): ``CREATE TABLE (LIKE parent INCLUDING ALL)`` copies
 indexes/compression/checks, ATTACH matches them, per-leaf reloptions land, and a
 missing-partition insert fails loudly with SQLSTATE ``23514``.
 
-Design: ``docs/features/postgres_audit_store_implementation.md`` §4.
+Design: ``knowledge-base/knowledge/features/postgres_audit_store_implementation.md`` §4.
 
 **No-auto-deletion policy (owner decision 2026-07-02):** creation + ANALYZE +
 status/alarms + per-parent size reporting are live; **automatic retention is
@@ -27,7 +27,7 @@ DETACH-CONCURRENTLY recipe for that day; the ``PARENTS`` windows below are
 reference values, not enforced promises. Monthly partitions still earn their
 keep (query pruning + the natural unit for a future manual export). Revisit only
 if SaaS/GDPR makes deletion a compliance requirement. Design:
-``docs/features/database_roadmap.md`` Phase 6 (D-2).
+``knowledge-base/knowledge/features/database_roadmap.md`` Phase 6 (D-2).
 
 **Hard boundaries** (true regardless of the lean cut):
 - No DEFAULT partition, ever — it silently parks misrouted rows, then blocks
@@ -266,7 +266,7 @@ async def retire_partitions(
 ) -> dict:
     """Permanent no-op — automatic retention is rejected by POLICY, not deferred.
 
-    Owner decision 2026-07-02 (``docs/features/database_roadmap.md`` Phase 6 /
+    Owner decision 2026-07-02 (``knowledge-base/knowledge/features/database_roadmap.md`` Phase 6 /
     D-2): nothing deletes operational data on a timer. Deletion, if ever wanted,
     is MANUAL and export-first. This function stays as the home for the manual
     recipe rather than being wired into ``maintenance_pass``.

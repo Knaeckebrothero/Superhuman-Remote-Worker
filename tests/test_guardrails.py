@@ -294,7 +294,7 @@ class TestTodoListFooter:
     model its other bound tools are gone — proven root cause of the job
     1cab4b88 rewind loop (nine tactical phases burned to todo_rewind) and
     the job edd06963 "stale palette" memory spiral. See
-    docs/issues/agent_phase_guardrails_burn_legitimate_work.md.
+    knowledge-base/knowledge/issues/agent_phase_guardrails_burn_legitimate_work.md.
     """
 
     def test_no_family_enumerates_tool_surface(self):

@@ -2396,7 +2396,7 @@ export class SettingsComponent implements OnInit {
   readonly paModel = signal<string | null>(null);
   readonly paPermissionMode = signal<string | null>(null);
   // Default session workspace tier (null = track the resolved system default,
-  // which is "virtual" — see docs/features/instant_landing_session.md).
+  // which is "virtual" — see knowledge-base/knowledge/features/instant_landing_session.md).
   readonly paWorkspaceBackend = signal<string | null>(null);
   readonly paGreeting = signal('');
   readonly paIdleTimeout = signal<number | null>(null);

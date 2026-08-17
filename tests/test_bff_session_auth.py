@@ -11,7 +11,7 @@ They also lock in the outage posture: when Keycloak is merely unreachable or
 broken (network error, 5xx, ``invalid_client`` misconfig, malformed body),
 the session row is KEPT and the request fails with a retryable 503 — a KC
 outage must not permanently log every user out (HA checklist P0 in
-docs/features/high_availability_setup.md).
+knowledge-base/knowledge/features/high_availability_setup.md).
 
 Mirrors the AsyncMock + patch.object style of ``tests/test_mcp.py``. We call
 ``_resolve_from_cookie`` directly (it takes ``(session_id, db)``), patch

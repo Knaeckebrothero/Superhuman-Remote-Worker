@@ -30,7 +30,7 @@
 --                wrong answer. Date those from context.vm.last_heartbeat,
 --                lease_expires_at, and the agent_audit tail instead.
 --
---                docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md
+--                knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md
 --                (Defect 4).
 -- depends-on:    0071_jobs_wake_pending_idx.notx.sql
 -- expected:      < 1s. Bare ADD COLUMN of a nullable column with no default —
@@ -53,6 +53,6 @@ COMMENT ON COLUMN jobs.failed_at IS
     'gc_offline_agents, which rewrites updated_at to exactly 24h after the '
     'assigned agent''s last heartbeat. NULL on rows that failed before '
     'migration 0072 — the time is genuinely unknown, not zero. Design: '
-    'docs/superpowers/specs/2026-07-28-transient-infra-failure-handling-design.md.';
+    'knowledge-base/knowledge/superpowers/specs/2026-07-28-transient-infra-failure-handling-design.md.';
 
 COMMIT;

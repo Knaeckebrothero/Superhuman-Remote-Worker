@@ -587,7 +587,7 @@ async def _resolve_tts_params(model_id: str, postgres_db) -> dict:
 
 
 def _pick_voice(params: dict, language: str, user_voice: Optional[str]) -> str:
-    """Voice resolution priority (docs/features/voice_experience_roadmap.md):
+    """Voice resolution priority (knowledge-base/knowledge/features/voice_experience_roadmap.md):
     explicit user choice (``default_tts_voice``) → admin single ``voice`` →
     admin per-language ``voices`` map → built-in per-language default.
 
@@ -708,7 +708,7 @@ async def _formulate_for_speech(
 
 
 # ElevenLabs REST TTS (not OpenAI-compatible — own header/path/model ids). See
-# docs/features/tts_vendor_providers.md. mp3_44100_128 matches the mp3 the
+# knowledge-base/knowledge/features/tts_vendor_providers.md. mp3_44100_128 matches the mp3 the
 # OpenAI path returns, so the cache/metering/player upstream stay format-blind.
 _ELEVENLABS_BASE = "https://api.elevenlabs.io"
 _ELEVENLABS_OUTPUT_FORMAT = "mp3_44100_128"

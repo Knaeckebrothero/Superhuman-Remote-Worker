@@ -2778,7 +2778,7 @@ export class DatasourceListComponent implements OnInit {
   } = this.defaultEmailForm();
 
   /** Host/port/security presets for the app-password-capable providers
-   *  (docs/features/email_datasource.md "Provider reality"). */
+   *  (knowledge-base/knowledge/features/email_datasource.md "Provider reality"). */
   private readonly emailProviderPresets: Record<
     string,
     {
@@ -3147,7 +3147,7 @@ export class DatasourceListComponent implements OnInit {
     this.connectionUrlDirty = false;
     this.formProjectIds.set(new Set(ds.project_ids ?? []));
     this.scopeSelectionInitialized = (ds.project_ids?.length ?? 0) > 0;
-    // F3 (docs/multi_tenancy.md): credentials never come back from the
+    // F3 (knowledge-base/knowledge/multi_tenancy.md): credentials never come back from the
     // API. The user re-enters them only if they want to change the stored
     // value — submitting blank fields leaves the secret untouched.
     this.formCredentials = { username: '', password: '' };

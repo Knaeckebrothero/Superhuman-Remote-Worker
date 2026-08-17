@@ -402,7 +402,7 @@ class TestSupportedEfforts:
 
 class TestFamilyOptionsDriveClamp:
     """The matrix `reasoning.options` — not a hardcoded transport set — decide
-    what effort reaches the wire (docs/done/family_centered_reasoning.md)."""
+    what effort reaches the wire (knowledge-history/done/family_centered_reasoning.md)."""
 
     @patch("src.core.loader.ReasoningChatOpenAI")
     def test_deepseek_xhigh_survives_openai_factory(self, mock_chat):
@@ -691,7 +691,7 @@ class TestSupportsParallelToolCalls:
 
 class TestFamilyCenteredReasoning:
     """Family-driven reasoning capability + delivery
-    (docs/features/family_centered_reasoning.md)."""
+    (knowledge-base/knowledge/features/family_centered_reasoning.md)."""
 
     def test_capability_method_per_family(self):
         assert reasoning_capability("gemma-4-moe")["method"] == "binary_toggle"

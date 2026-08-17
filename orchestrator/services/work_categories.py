@@ -8,7 +8,7 @@ module. Nothing in the machinery said "an answer is a deliverable" or "a
 screenshot is evidence", so nothing produced them.
 
 This module supplies the missing half of the model
-(docs/features/officer_backlog_pools.md §2-§3):
+(knowledge-base/knowledge/features/officer_backlog_pools.md §2-§3):
 
     category = a property of the WORK  — what shape the deliverable takes,
                                           what counts as evidence, when to stop

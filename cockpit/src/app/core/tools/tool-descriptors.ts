@@ -23,7 +23,7 @@ import {
  * (workbench audit) maps. A generic fallback covers unregistered tools so a new
  * tool renders sanely with zero registry work.
  *
- * Design: `docs/features/unified_tool_cards.md`.
+ * Design: `knowledge-base/knowledge/features/unified_tool_cards.md`.
  */
 
 export type ToolCategory =

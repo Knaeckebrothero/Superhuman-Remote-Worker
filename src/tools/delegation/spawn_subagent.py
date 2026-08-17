@@ -20,7 +20,7 @@ range). Per call: acquire an isolated reader env (Phase 2) → build the reader 
 from the `llm.subagent` tier (Phase 0) → run the bounded ReAct loop (Phase 1) →
 release the env → return the result string. No freeze, no merge.
 
-See docs/issues/delegation_light_mode_missing.md for the design + plan.
+See knowledge-base/knowledge/issues/delegation_light_mode_missing.md for the design + plan.
 """
 
 import asyncio

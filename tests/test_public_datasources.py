@@ -1,6 +1,6 @@
 """Public datasources — grant-gated is_global publishing.
 
-Spec: docs/features/public_datasources.md. Covers the PostgresDB helper here;
+Spec: knowledge-base/knowledge/features/public_datasources.md. Covers the PostgresDB helper here;
 endpoint gates are covered in the classes added by later tasks.
 """
 

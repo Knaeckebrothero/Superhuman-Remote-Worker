@@ -5,7 +5,7 @@
 mutually-exclusive parameters for that one concept — ``config_name`` for a
 bundled slug, ``expert_id`` for a DB UUID — with nothing mapping the
 catalogue's ``source`` onto which one to use. The observable cost is in
-docs/issues/experts_one_catalogue_two_selection_paths.md: every job an officer
+knowledge-base/knowledge/issues/experts_one_catalogue_two_selection_paths.md: every job an officer
 dispatched for three days landed on the application default because the only
 call that looked safe was the one that named nobody.
 

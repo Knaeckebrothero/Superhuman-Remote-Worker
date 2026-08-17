@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 #
 # A dedicated marker replaces it: purpose-named, not agent-facing (so it adds
 # no agent surface), and unaffected by Slice 2.
-# See docs/features/virtual_directories.md.
+# See knowledge-base/knowledge/features/virtual_directories.md.
 # --------------------------------------------------------------------------
 
 SEEDED_MARKER = ".srw_seeded"
@@ -49,7 +49,7 @@ _LEGACY_SEEDED_SENTINEL = "task_brief.md"
 # and churn the workspace repo.
 _SEEDED_MARKER_BODY = (
     "Superhuman Remote Worker seeded this workspace.\n"
-    "Framework marker — do not edit. See docs/features/virtual_directories.md.\n"
+    "Framework marker — do not edit. See knowledge-base/knowledge/features/virtual_directories.md.\n"
 )
 
 
@@ -105,7 +105,7 @@ def reseed_missing_files(
     then the agent writes files on top (task_brief.md, bound skills). If the pod
     is torn down and re-provisioned mid-run, the clone comes back but the
     agent-written files do not, so the agent reconnects onto a workspace missing
-    them (docs/issues/reviewing_parent_pod_reaped_under_critic.md Issue 4). This
+    them (knowledge-base/knowledge/issues/reviewing_parent_pod_reaped_under_critic.md Issue 4). This
     restores exactly the agent-authored files that are currently absent.
 
     Write-if-absent, never clobber: a file that survived the re-provision may
@@ -177,7 +177,7 @@ def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
             # not abort a VM/sandbox swap. The cloud mount in particular is a
             # live rclone mount (not copyable); it is re-established separately
             # by the upgrade handler, which re-runs _setup_cloud_mount against
-            # the new backend (docs/issues/workspace_upgrade_drops_cloud_mount.md).
+            # the new backend (knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md).
             logger.warning("Seed: skipping unreadable entry %r: %s", rel, e)
             skipped.append(rel)
             continue

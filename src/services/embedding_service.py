@@ -102,7 +102,7 @@ class EmbeddingDimensionError(RuntimeError):
 
     Every memory/KB write and dense query would fail at INSERT/cast with a
     raw DB error swallowed per call site, so the service latches degraded
-    and fails fast instead (docs/issues/memory_bugs.md B4).
+    and fails fast instead (knowledge-base/knowledge/issues/memory_bugs.md B4).
     """
 
 
@@ -112,7 +112,7 @@ class EmbeddingInvalidVectorError(RuntimeError):
     pgvector rejects these at INSERT, and the generic per-caller swallow used
     to collapse them into the same "skipping" state as an oversized batch —
     preventing targeted recovery. Typed so callers can count/report them
-    separately (docs/issues/
+    separately (knowledge-base/knowledge/issues/
     embedding_batch_overflow_skips_citation_source_embeddings.md, fix 4).
     """
 
@@ -231,7 +231,7 @@ class EmbeddingService:
             "dense query would fail at INSERT, so the dense path is disabled "
             "loudly instead. Fix EMBEDDING_MODEL/EMBEDDING_BASE_URL (or set "
             "EMBEDDING_DIMENSIONS alongside a schema re-dimension) and "
-            "restart. See docs/issues/memory_bugs.md B4.",
+            "restart. See knowledge-base/knowledge/issues/memory_bugs.md B4.",
             self.degraded_reason,
         )
         raise EmbeddingDimensionError(self.degraded_reason)
@@ -311,7 +311,7 @@ class EmbeddingService:
     async def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings for multiple texts, splitting at the provider cap.
 
-        THE batching seam (docs/issues/
+        THE batching seam (knowledge-base/knowledge/issues/
         embedding_batch_overflow_skips_citation_source_embeddings.md): inputs
         are split into consecutive slices of at most ``max_batch_size`` so a
         whole-source chunk list (observed up to 1,458 chunks) can never hit a

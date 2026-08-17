@@ -3,9 +3,9 @@
 **Type:** unit (automated, done) + live cluster verification (manual, pending).
 **Status:** code implemented + unit-verified on `develop` (uncommitted at time of
 writing); live layers §2/§3/§4 not yet run.
-**Fix / root cause:** `docs/issues/openrouter_auxiliary_misrouted_to_openai.md`.
+**Fix / root cause:** `knowledge-base/knowledge/issues/openrouter_auxiliary_misrouted_to_openai.md`.
 **Sibling runbook (primary/dispatch path of the same bug class):**
-`docs/tests/openrouter_system_provider_routing_verification.md` — that one covers
+`knowledge-base/knowledge/tests/openrouter_system_provider_routing_verification.md` — that one covers
 `provider_kind='system'` *catalog* rows; **this** one covers the **auxiliary**
 LLM, whose `provider` was dropped at `AuxiliaryConfig` parse.
 

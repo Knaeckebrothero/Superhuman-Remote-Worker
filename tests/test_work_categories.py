@@ -1,4 +1,4 @@
-"""Work-category tests — B1 of docs/features/officer_backlog_pools.md.
+"""Work-category tests — B1 of knowledge-base/knowledge/features/officer_backlog_pools.md.
 
 Two pure modules, one model: ``src/shared/backlog_tags.py`` owns the SHAPE of a
 machine tag (both sides of the wire must agree on it, and neither may import the

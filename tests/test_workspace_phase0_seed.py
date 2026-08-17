@@ -1,6 +1,6 @@
 """Workspace seeding regressions: instructions clobber, job README, Phase 0 commit.
 
-instructions.md is now a virtual file (docs/features/virtual_directories.md):
+instructions.md is now a virtual file (knowledge-base/knowledge/features/virtual_directories.md):
 TestInstructionsClobber verifies the provider's inline > upload > template
 precedence — the direct descendant of a real historical bug where
 _deploy_instruction_files's guard called .exists() on a local Path for a path
@@ -435,7 +435,7 @@ class TestReseedFromSnapshotIfFresh:
     silently rewinds the job to the last phase boundary. The seeded-content
     marker is the only thing distinguishing the two cases, and probing a
     *virtual* task_brief.md would answer "unseeded" on every single resume.
-    See docs/features/virtual_directories.md.
+    See knowledge-base/knowledge/features/virtual_directories.md.
     """
 
     @staticmethod
@@ -544,7 +544,7 @@ class TestInstructionFilesAreNeverWritten:
 
     Writing them there is what dropped a critic's brief into the root its
     TARGET reads from, on every subjob that inherits its parent's workspace —
-    docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md.
+    knowledge-history/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md.
     That write path was the "off" position of VIRTUAL_DIRS_ENABLED; the flag
     and the path are both gone.
 
@@ -601,7 +601,7 @@ class TestInstructionFilesAreNeverWritten:
 
 class TestTaskBriefHydration:
     """Resume-lane brief starvation
-    (docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+    (knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
 
     JobResumeRequest ships no description/required_deliverables/kickoff, so
     the resume path must (1) serve the brief from LIVE ``_job_metadata`` — a

@@ -12,7 +12,7 @@
 --                yet" is a valid transient state and is never cached here.
 --                Written by services/cloud/identity.py (merge semantics via
 --                Database.merge_user_cloud_identity).
---                docs/issues/project_page_open_blocks_on_cloud_heal.md part 2.
+--                knowledge-base/knowledge/issues/project_page_open_blocks_on_cloud_heal.md part 2.
 -- depends-on:    0001_initial.sql
 -- expected:      < 1s (ADD COLUMN with static default, no table rewrite on PG15).
 -- locks:         Brief ACCESS EXCLUSIVE on users (metadata-only change).

@@ -15,9 +15,9 @@ if needed, and confirm `kubectl --context k3d-srw get nodes` shows Ready.
 
 **Source documents:**
 
-- `docs/issues/loop_advances_into_active_model_cooldown.md` — the incident,
+- `knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md` — the incident,
   design (Option A), and implementation status block.
-- `docs/features/llm_cooldown_pause_and_resume.md` — the outage park/sweep
+- `knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md` — the outage park/sweep
   machinery this rides, incl. the prior k3d harness notes (synthetic
   `model_cooldown` stub recipe).
 
@@ -58,7 +58,7 @@ this gate adds:
    (48h > the 12h pause budget → agent fail-fasts). Same recipe as the
    2026-07-16 cooldown-pause gate: a throwaway pod on the orchestrator image
    running a small `http.server` script; see the harness notes in
-   `docs/features/llm_cooldown_pause_and_resume.md`.
+   `knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md`.
 3. **Route a model at the stub:** seed an OpenAI-compatible catalog entry
    (e.g. name `stub-cool`, base_url = the stub service URL, any api_key) via
    the Admin models UI or the seed path — zero code needed. Alternative:
@@ -124,7 +124,7 @@ this gate adds:
 Delete the loop + its jobs, the stub pod/service, and the `stub-cool` catalog
 entry (or project override). Record results below and mirror the outcome into
 the issue doc's status block; when P0 is fully green, the feature is clear to
-commit/push and the issue doc moves toward `docs/done/`.
+commit/push and the issue doc moves toward `knowledge-history/done/`.
 
 ## Results log
 

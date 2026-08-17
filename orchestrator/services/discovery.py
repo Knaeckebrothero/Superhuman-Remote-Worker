@@ -8,7 +8,7 @@ that cache to render a confirmation dialog so the admin can pick which
 models actually become catalog rows — one source of truth, no automatic
 catalog growth.
 
-Provider sources match the table in ``docs/features/models_yaml_removal.md``:
+Provider sources match the table in ``knowledge-base/knowledge/features/models_yaml_removal.md``:
 
 | Provider   | Source                                                        |
 |------------|---------------------------------------------------------------|

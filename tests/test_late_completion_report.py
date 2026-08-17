@@ -1,7 +1,7 @@
 """A finished job must not stay failed because its report arrived late.
 
 Regression guard for Defect 2 of
-docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
+knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
 
 The ``/complete`` gate rejected any report on a terminal job *before* looking
 at it, which stranded two real cases on 2026-07-27:

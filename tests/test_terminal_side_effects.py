@@ -1,5 +1,5 @@
 """Tests for the §6.6 terminal-transition side effects
-(docs/features/workspace_and_change_records.md).
+(knowledge-base/knowledge/features/workspace_and_change_records.md).
 
 ``apply_terminal_job_side_effects`` is the ONE function both ordinary-job
 terminal paths call — the ``/complete`` handler's 5d2 hook and ``approve_job``.

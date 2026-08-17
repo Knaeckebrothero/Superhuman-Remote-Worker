@@ -21,7 +21,7 @@ That isolation only holds when `ephemeralStorageClass` is DEDICATED to
 workspaces: on prod `longhorn-ephemeral` already is; on single-node/local-path
 create a dedicated local-path-backed class (same provisioner, distinct name)
 and point `ephemeralStorageClass` at it. See the storage-substrate section of
-docs/features/workspace_pvc_branch_a_implementation.md.
+knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
 */ -}}
 {{- if and .Values.workspace.pvcEnabled .Values.workspace.resourceQuota.enabled }}
 {{- $sc := required "workspace.resourceQuota.enabled requires workspace.ephemeralStorageClass to be set — the capacity quota is keyed on that storage class" .Values.workspace.ephemeralStorageClass }}

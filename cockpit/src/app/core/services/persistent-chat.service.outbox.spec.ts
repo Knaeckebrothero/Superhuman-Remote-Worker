@@ -1,6 +1,6 @@
 /**
  * Phase 3 — the outbox: queued sends are user intent, not transport state.
- * (docs/features/session_reliability_and_transport_simplification.md)
+ * (knowledge-base/knowledge/features/session_reliability_and_transport_simplification.md)
  *
  * These tests cover the categorical fix for the "Creating thread" send-swallow:
  * a send committed by the user survives disconnect/reconnect/thread-creation,

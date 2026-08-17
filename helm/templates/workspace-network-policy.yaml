@@ -12,8 +12,8 @@
 # `projects.network_tier`). Tier `internet-only` is the default for pods
 # lacking the tier label; the other tiers are opted into per project.
 #
-# See docs/features/workspace_network_policy_unification.md for the full
-# unification rationale, and docs/features/workspace_network_isolation.md §3
+# See knowledge-base/knowledge/features/workspace_network_policy_unification.md for the full
+# unification rationale, and knowledge-base/knowledge/features/workspace_network_isolation.md §3
 # for the tier model.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

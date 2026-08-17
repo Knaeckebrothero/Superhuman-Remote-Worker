@@ -1,6 +1,6 @@
 """The streaming job path must preserve the workspace_unavailable error type.
 
-Regression guard for docs/issues/streaming_strips_workspace_unavailable_type.md:
+Regression guard for knowledge-base/knowledge/issues/streaming_strips_workspace_unavailable_type.md:
 a WorkspaceUnavailableError raised while the graph streams used to escape
 _process_job_streaming (try/finally, no except) into the app layer's generic
 ``except Exception``, which reported ``{"error": {"message": str(e)}}`` — the

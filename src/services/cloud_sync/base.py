@@ -192,7 +192,7 @@ class WorkspaceSyncBase(abc.ABC):
         # for the rest of the session". Doing it structurally, rather than by
         # extending SYNC_IGNORE_PATTERNS, means a future provider cannot
         # reintroduce either failure.
-        # See docs/features/virtual_directories.md.
+        # See knowledge-base/knowledge/features/virtual_directories.md.
         self._backend = unwrap_backend(workspace_backend) if workspace_backend else None
         # Workspace-relative path of this mount inside the backend's filesystem.
         # Empty string means "the whole workspace" (legacy single-folder mount).
@@ -217,7 +217,7 @@ class WorkspaceSyncBase(abc.ABC):
         # to know the cloud already held identical content. Set by the first
         # pull (whose listing doubles as the seed) or by _seed_remote_state
         # on a push that runs before any pull.
-        # docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+        # knowledge-base/knowledge/issues/session_turn_end_cloud_push_blocks_queued_input.md
         self._remote_seeded: bool = False
 
         self._poll_task: Optional[asyncio.Task] = None

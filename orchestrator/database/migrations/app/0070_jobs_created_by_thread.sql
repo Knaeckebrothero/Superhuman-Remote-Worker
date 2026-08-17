@@ -1,6 +1,6 @@
 -- migration:     0070_jobs_created_by_thread.sql
 -- description:   Session ↔ job backref + the wake outbox columns, Phase 1 of
---                docs/features/session_wake_on_job_completion.md.
+--                knowledge-base/knowledge/features/session_wake_on_job_completion.md.
 --
 --                `create_worker_job` already passes the creating thread id at
 --                creation, but it was only used to inherit user/project/
@@ -59,7 +59,7 @@ SET LOCAL lock_timeout                        = '2s';
 SET LOCAL statement_timeout                   = '15min';
 SET LOCAL idle_in_transaction_session_timeout = '5min';
 
--- Two-phase FK (NOT VALID then VALIDATE) per docs/db_migration.md — same shape
+-- Two-phase FK (NOT VALID then VALIDATE) per knowledge-base/knowledge/db_migration.md — same shape
 -- as jobs.expert_id in 0028_experts.sql.
 --
 -- ON DELETE SET NULL is not cosmetic: threads are genuinely hard-deleted
@@ -95,7 +95,7 @@ COMMENT ON COLUMN jobs.created_by_thread_id IS
     'Session thread that created this job (NULL for cockpit/automation/child '
     'jobs). Queryable backref powering the completion wake and the session''s '
     'own "my outstanding jobs" view. Design: '
-    'docs/features/session_wake_on_job_completion.md.';
+    'knowledge-base/knowledge/features/session_wake_on_job_completion.md.';
 COMMENT ON COLUMN jobs.wake_state IS
     'Wake outbox state: none|pending|sending|sent|dead. Claimed by an atomic '
     'UPDATE ... FOR UPDATE SKIP LOCKED before the (non-idempotent) send.';

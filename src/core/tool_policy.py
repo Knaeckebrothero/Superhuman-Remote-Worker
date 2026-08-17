@@ -12,7 +12,7 @@ self-describing and "on" inexpressible — re-enabling needs the full member
 list, which the caller looks for in the layer it is overriding, which says
 ``[]``.  Hence the shipped defect: the New Session form can disable a tool
 group and can never enable one
-(``docs/issues/session_create_tool_toggles_cannot_enable_a_group.md``).
+(``knowledge-base/knowledge/issues/session_create_tool_toggles_cannot_enable_a_group.md``).
 
 This module is the fix, and it is a **front-end, not a rewrite**.  Five
 authoring forms normalise down to the single ``list[str]`` representation the
@@ -60,7 +60,7 @@ the same kind of object, so they get the same answer to "is this a legal
 difference is only what a failure means: a config file raises at load, a
 request gets a 400.
 
-Design: ``docs/features/tool_config_policy_vs_membership.md``.
+Design: ``knowledge-base/knowledge/features/tool_config_policy_vs_membership.md``.
 """
 
 from __future__ import annotations
@@ -108,7 +108,7 @@ def _enumerate_only_error(category: str, form: str) -> "ToolPolicyError":
         f"or false. Both `true` and `except` auto-track the registry, so a tool "
         f"added to the {category} category later would land here with no diff "
         f"to review; for a code-execution category that is the wrong default. "
-        f"See docs/features/tool_config_policy_vs_membership.md, "
+        f"See knowledge-base/knowledge/features/tool_config_policy_vs_membership.md, "
         f"'`shell` accepts `only` and `false`'."
     )
 
@@ -327,7 +327,7 @@ def assert_tool_policy_canonical(tools_data: Any, *, where: str) -> None:
                 f"tools.{key} reached {where} as {type(value).__name__} "
                 f"({value!r}). Tool policy must be normalised before the "
                 f"dataclass — call normalize_tool_policy() on this fragment. "
-                f"See docs/features/tool_config_policy_vs_membership.md."
+                f"See knowledge-base/knowledge/features/tool_config_policy_vs_membership.md."
             )
 
 
@@ -368,7 +368,7 @@ def validate_tool_override_fragment(config_override: Any) -> dict[str, list[str]
     caller can assign it straight back over ``config_override["tools"]`` and
     know the PDP downstream reads canonical lists rather than raw policy
     values (see the ``_truthy`` table in
-    ``docs/features/tool_config_policy_vs_membership.md``).  A fragment with no
+    ``knowledge-base/knowledge/features/tool_config_policy_vs_membership.md``).  A fragment with no
     ``tools`` key returns ``{}``.
     """
     if not isinstance(config_override, dict) or "tools" not in config_override:

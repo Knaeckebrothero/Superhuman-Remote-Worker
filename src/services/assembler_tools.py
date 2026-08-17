@@ -8,7 +8,7 @@ The assembler reviews recent conversation and adjusts memory TTLs:
 These tools wrap RecallStore methods and are passed to the
 AssembleMemoriesTask (AuxAgentTask) for agent-mode execution.
 
-See docs/features/memory_light.md for architecture.
+See knowledge-base/knowledge/features/memory_light.md for architecture.
 """
 
 import logging

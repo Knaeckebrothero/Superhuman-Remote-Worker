@@ -1,4 +1,4 @@
-"""The Legate note channel — docs/features/officer_legate_channel.md.
+"""The Legate note channel — knowledge-base/knowledge/features/officer_legate_channel.md.
 
 A note is direction from the Legate reaching an officer from outside the
 cockpit. Two properties are load-bearing and each has a test here:

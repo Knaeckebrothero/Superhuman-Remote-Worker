@@ -6,7 +6,7 @@ Provides PostgreSQL operations:
 - SQL statement execution (INSERT, UPDATE, DELETE, DDL)
 
 These tools are injected automatically when a PostgreSQL connector is
-attached to a job. See docs/datasources.md.
+attached to a job. See knowledge-base/knowledge/datasources.md.
 """
 
 import json

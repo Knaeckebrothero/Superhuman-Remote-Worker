@@ -11,7 +11,7 @@ the persistent loop from a specific corruption: an interrupted or empty
 in the conversation history, makes ``langchain_openai._convert_message_to_dict``
 raise ``TypeError: Got unknown type ...`` on the *next* turn — surfaced to the
 user as "The assistant returned a malformed response." See
-``docs/issues/persistent_session_empty_chunk_history_corruption.md``.
+``knowledge-base/knowledge/issues/persistent_session_empty_chunk_history_corruption.md``.
 """
 
 from typing import Any, List, Optional

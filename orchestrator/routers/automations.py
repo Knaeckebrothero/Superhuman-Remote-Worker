@@ -8,7 +8,7 @@ is similarly late-imported by the few handlers that create jobs (run-now)
 so the new job is picked up by the auto-assign loop without waiting for
 its 30s tick.
 
-Spec: docs/features/automations_v0.md §Endpoints.
+Spec: knowledge-base/knowledge/features/automations_v0.md §Endpoints.
 """
 
 from __future__ import annotations

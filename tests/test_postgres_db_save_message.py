@@ -1,4 +1,4 @@
-"""Phase 1 of docs/issues/persistent_session_midturn_message_loss.md.
+"""Phase 1 of knowledge-base/knowledge/issues/persistent_session_midturn_message_loss.md.
 
 The persistent agent now writes thread_messages straight through its own pool
 (``PostgresDB.save_thread_message``) instead of hopping through the orchestrator

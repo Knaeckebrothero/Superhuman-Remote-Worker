@@ -5,7 +5,7 @@ Covers the aux-budgeted rolling-fold summarization engine
 (summarize_conversation / summarize_and_compact / ensure_within_limits),
 and the pre-request formatting/observation-masking helpers.
 
-Design: docs/features/context_summarization_rework.md.
+Design: knowledge-base/knowledge/features/context_summarization_rework.md.
 """
 
 import pytest
@@ -1570,7 +1570,7 @@ class TestOversizedMessageCompaction:
 
 
 # Tests for the compaction boundary marker that drives message-granular resume
-# (docs/issues/persistent_session_midturn_message_loss.md, Phase 3).
+# (knowledge-base/knowledge/issues/persistent_session_midturn_message_loss.md, Phase 3).
 class TestCompactionBoundaryId:
     """summarize_and_compact records the id of the last message its summary
     covers, so the persistent transport can store a message-level boundary_seq."""

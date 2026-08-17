@@ -11,7 +11,7 @@ by the cockpit todo view (cockpit/src/app/core/models/todo.model.ts); only
 the data source moved from the orchestrator-local ``WorkspaceService`` disk
 relic to Gitea. Staleness contract: committed state as of the worker's last
 phase-boundary push. See
-docs/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P0-B.
+knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P0-B.
 """
 
 import re

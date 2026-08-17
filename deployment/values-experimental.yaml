@@ -98,7 +98,7 @@ mcp:
   requireImageDigest: true
 # -----------------------------------------------------------------------------
 # Orchestrator HA — M1 leader-election go-live
-# (docs/operations/orchestrator_m1_go_live.md)
+# (knowledge-base/knowledge/operations/orchestrator_m1_go_live.md)
 #
 # replicas:2 is correctness-safe as of M1 (leader election + the dual-leader DB
 # claim guards): the ~9 singleton background loops run only on the elected
@@ -239,7 +239,7 @@ ingress:
 # until the exact `srwcanvas.works` private PSL rule has propagated and the
 # production browser matrix passes. The restricted DB role is provisioned
 # (2026-07-16) and its credential lives at the Vault path below.
-# Transport decision (2026-07-14, docs/issues/
+# Transport decision (2026-07-14, knowledge-base/knowledge/issues/
 # canvas_hosted_edge_use_cloudflare_tunnel.md): the wildcard rides the
 # existing Cloudflare Tunnel to the gateway Service — Cloudflare's
 # adjacent-slash normalization is an accepted, documented property of this
@@ -332,7 +332,7 @@ codexProxy:
 # data is migrated: the chart's preflight init container blocks a
 # Postgres-configured Gitea whose metadata is still an un-migrated SQLite file,
 # so the repos cannot be silently orphaned. Rollback is restoring this block.
-# Procedure: docs/operations/gitea_sqlite_to_postgres.md
+# Procedure: knowledge-base/knowledge/operations/gitea_sqlite_to_postgres.md
 # -----------------------------------------------------------------------------
 gitea: {}
 # -----------------------------------------------------------------------------
@@ -348,7 +348,7 @@ gitea: {}
 #
 # The old OpenCloud data/config PVCs carry `helm.sh/resource-policy: keep`,
 # so disabling the flag does NOT reclaim them; they were deleted by hand
-# after the data copy. Runbook: docs/operations/opencloud_to_nextcloud.md
+# after the data copy. Runbook: knowledge-base/knowledge/operations/opencloud_to_nextcloud.md
 #
 # replicas:1 — the chart default is 0 (the bundled Nextcloud is opt-in).
 # objectStore:true puts user files in MinIO rather than on the PVC, matching
@@ -385,7 +385,7 @@ nextcloud:
 s3:
   endpoint: "http://minio.minio.svc.cluster.local:9000"
 # -----------------------------------------------------------------------------
-# Virtual workspace tier (docs/features/no_workspace_agent_mode.md) — S3-backed
+# Virtual workspace tier (knowledge-base/knowledge/features/no_workspace_agent_mode.md) — S3-backed
 # file tools, no workspace pod. Enables the `virtual` backend; empty `rclone.type`
 # would disable it (jobs fail fast). The agent's scoped key
 # (VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID / _SECRET_ACCESS_KEY) is a *separate*,
@@ -404,7 +404,7 @@ virtualWorkspace:
 # LangGraph state in the app DB, pruned on terminal. This now matches the chart
 # default (postgres, flipped after the dev soak); kept explicit so the dev
 # overlay documents its own posture.
-# Docs: docs/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md
+# Docs: knowledge-history/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md
 # -----------------------------------------------------------------------------
 checkpointer:
   backend: "postgres"
@@ -486,7 +486,7 @@ databases:
   # few hundred MB against 16Gi. The KB sweep reindexed an ARCHIVED project's
   # 3.1k notes every tick for over a month, churning rows faster than
   # autovacuum could reclaim them — see
-  # docs/issues/kb_sweep_indexes_archived_projects_and_starves_connectors.md.
+  # knowledge-base/knowledge/issues/kb_sweep_indexes_archived_projects_and_starves_connectors.md.
   # So 32Gi buys headroom to recover and to VACUUM FULL; it is not the fix.
   # Without the sweep fix this refills, exactly as postgres did in ~4 days.
   vector:
@@ -580,7 +580,7 @@ workspace:
   # (present on this cluster, single replica). Rollback = set false (new pods
   # revert to emptyDir; existing PVC pods finish + GC normally — mixed fleet is
   # safe). Node-loss validation runbook: tests/workspace_pvc_node_loss_validation.md.
-  # Design: docs/features/workspace_pvc_branch_a_implementation.md.
+  # Design: knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
   #
   # 2026-08-04: this flag now covers SESSIONS as well as jobs — a session claims
   # `pvc-ws-thread-*` for its workspace pod and `pvc-agent-s-*` for its agent
@@ -696,7 +696,7 @@ llm:
         capability: chat
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
-# (docs/features/direct_session_websockets.md)
+# (knowledge-base/knowledge/features/direct_session_websockets.md)
 #
 # The HS256 signing key lives in the shared `srw` bundle Secret, populated by
 # ESO from Vault under the key `SESSION_JWT_SECRET`. Leaving `jwtSecret` empty
@@ -718,7 +718,7 @@ logLevel: "INFO"
 logFormat: "json"
 # -----------------------------------------------------------------------------
 # Persistent VM rootdisks — the ORCHESTRATOR's copy of the flag
-# (docs/features/vm_persistent_rootdisk.md).
+# (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
 #
 # This does NOT deploy an in-cluster vm-controller (vmController.enabled stays
 # false — dev's controller lives on the vm cluster, configured in
@@ -730,13 +730,13 @@ logFormat: "json"
 # For VM targets a snapshot can never be captured from the orchestrator (it
 # SSHes, and a VM workspace is only reachable over the tailnet), which is why
 # VM sessions and VM jobs never idle-suspended at all — see
-# docs/issues/vm_workspace_snapshot_unreachable_from_orchestrator.md.
+# knowledge-base/knowledge/issues/vm_workspace_snapshot_unreachable_from_orchestrator.md.
 #
 # MUST NOT be enabled before the vm-cluster controller has it: with the disk
 # still cascade-deleting, suspend would tear a workspace down believing the
 # files survive. Controller was enabled and live-gated first (steps 1-3 passed
 # 2026-07-29, run log in
-# docs/features/vm_workspace_persistence_reconciliation.md).
+# knowledge-base/knowledge/features/vm_workspace_persistence_reconciliation.md).
 # -----------------------------------------------------------------------------
 vmController:
   persistentRootdisk:

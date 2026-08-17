@@ -8,9 +8,9 @@
 --                (brand-new objects, no contention).
 -- transactional: yes
 --
--- Design: docs/features/observability_and_quotas.md — the *locked* usage_events
+-- Design: knowledge-base/knowledge/features/observability_and_quotas.md — the *locked* usage_events
 -- schema (its "The spine: one usage ledger" section). This is the ledger spine
--- that docs/features/usage_monitoring_and_rate_limiting.md Slice 4 implements,
+-- that knowledge-base/knowledge/features/usage_monitoring_and_rate_limiting.md Slice 4 implements,
 -- now gateway-sourced (LLM rows materialized from the LiteLLM spend log; compute
 -- rows emitted by the orchestrator at workspace open/close).
 --

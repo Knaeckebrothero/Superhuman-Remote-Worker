@@ -199,7 +199,7 @@ describe('JobListComponent utilities', () => {
   describe('jobCloudAction', () => {
     // Export and open are two clicks on purpose: the export outlives the ~5s
     // of transient user activation, so auto-opening from its callback is
-    // popup-blocked. See docs/issues/job_cloud_export_open_blocked.md.
+    // popup-blocked. See knowledge-base/knowledge/issues/job_cloud_export_open_blocked.md.
     function job(overrides: Partial<JobSummary> = {}): JobSummary {
       return {
         id: 'j1',

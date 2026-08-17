@@ -21,7 +21,7 @@ from .kb_reindex import knowledge_blob_map, record_reindex_source_failure, reind
 # indexed under their own datasource UUID; the native project KB is indexed
 # under ``project_id``. Index the same notes under both and every note appears
 # twice in search under two different ``kb_id``s — the one failure in
-# docs/features/knowledge_base_repo_separation.md that corrupts search rather
+# knowledge-base/knowledge/features/knowledge_base_repo_separation.md that corrupts search rather
 # than merely failing it (§6, §8 criterion 5).
 #
 # The agent image cannot import orchestrator code, so

@@ -476,7 +476,7 @@ class TestProjectWorkspacePrepopulatedRoot:
 
 class TestWorkspaceGetHeadCommit:
     """get_head_commit: the critic verdict tools' progress-detection heuristic
-    (docs/superpowers/plans/2026-07-27-verification-fail-closed.md, Task 5).
+    (knowledge-base/knowledge/superpowers/plans/2026-07-27-verification-fail-closed.md, Task 5).
 
     Must work even when workspace-level git versioning (``git_manager``) is
     disabled — a target repo can be checked out at the workspace root by other

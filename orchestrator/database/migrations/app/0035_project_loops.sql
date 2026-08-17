@@ -1,7 +1,7 @@
 -- migration:     0035_project_loops.sql
 -- description:   Create the project_loops table — the control row for the
 --                project self-improvement loop
---                (docs/features/project_self_improvement_loop.md).
+--                (knowledge-base/knowledge/features/project_self_improvement_loop.md).
 --
 --                One row = one continuous, budget-bounded loop attached to a
 --                project. The orchestrator advances it ONE job at a time: when
@@ -112,7 +112,7 @@ COMMENT ON TABLE project_loops IS
     'project advances one job at a time via the _advance_project_loop '
     'completion hook, bounded by max_iterations / run_until / '
     'max_consecutive_failures. Design: '
-    'docs/features/project_self_improvement_loop.md.';
+    'knowledge-base/knowledge/features/project_self_improvement_loop.md.';
 
 COMMENT ON COLUMN project_loops.acceptance_criteria IS
     'Definition of Done the Critic verifies against. Research: LLM '

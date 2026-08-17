@@ -1,7 +1,7 @@
 """Lightweight guardrails for rclone-backed cloud mounts.
 
 This is intentionally a preflight advisory/block, not the full hydration-budget
-system described in docs/features/rclone_cloud_mount.md. Runtime transfer
+system described in knowledge-base/knowledge/features/rclone_cloud_mount.md. Runtime transfer
 accounting still belongs in a later guard implementation.
 """
 

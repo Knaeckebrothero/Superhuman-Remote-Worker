@@ -23,7 +23,7 @@ capability. He then — correctly — de-armed the only actionable ticket and id
 all night rather than dispatch a tester against a candidate that could not exist.
 One absent field, a whole watch spent asleep.
 
-Related: docs/issues/commissioned_officer_boots_without_a_job_surface.md, which
+Related: knowledge-base/knowledge/issues/commissioned_officer_boots_without_a_job_surface.md, which
 is the same defect shape twice over (``config_name``, ``permission_mode``).
 """
 

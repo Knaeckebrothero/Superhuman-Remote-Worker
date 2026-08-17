@@ -14,7 +14,7 @@ import {AppNotification} from '../../core/models/api.model';
 
 /**
  * Officer-page card in the action center (F4 addendum,
- * docs/issues/officer_conference_live_fire_findings.md): a page from a
+ * knowledge-base/knowledge/issues/officer_conference_live_fire_findings.md): a page from a
  * persistent session has NO job behind it — the notification row is keyed by
  * the session thread UUID (REST rows carry job_id NULL, live SSE frames carry
  * job_id === thread_id). The card must render from the row alone, never fire

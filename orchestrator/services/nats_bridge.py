@@ -101,7 +101,7 @@ class NatsBridge:
         # Per-orchestrator scoping for vm.lifecycle.* subjects. When this is
         # blank we refuse to publish/subscribe to scoped subjects rather than
         # silently falling back to flat ones — flat subjects re-introduce
-        # cross-talk on a shared NATS hub (see docs/issues/nats_subject_acl_hardening.md).
+        # cross-talk on a shared NATS hub (see knowledge-base/knowledge/issues/nats_subject_acl_hardening.md).
         self._orchestrator_id = (os.getenv("ORCHESTRATOR_ID") or "").strip()
         self._nc: Optional[Any] = None
         self._db: Optional[Any] = None
@@ -220,7 +220,7 @@ class NatsBridge:
                 # the SSE feed after filtering. The defense-in-depth
                 # payload-level thread_id check guards against a misbehaving
                 # pod publishing for another thread. See
-                # docs/issues/nats_subject_acl_hardening.md.
+                # knowledge-base/knowledge/issues/nats_subject_acl_hardening.md.
                 await self._nc.subscribe(
                     f"session.events.{oid}.>", cb=self._on_session_event
                 )
@@ -501,7 +501,7 @@ class NatsBridge:
             # stream's publish-ack ({"stream": ..., "seq": ...}) — which races
             # ahead of (and beats) the VM controller's real reply. Never surface
             # that ack as VM status; treat it as no response. See
-            # docs/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
+            # knowledge-base/knowledge/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
             if (
                 isinstance(data, dict)
                 and "stream" in data
@@ -597,7 +597,7 @@ class NatsBridge:
             # Same JetStream-ack guard as query_vm_status: a stream shadowing
             # the request subject answers with its publish-ack before the
             # controller's real reply. See
-            # docs/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
+            # knowledge-base/knowledge/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
             if isinstance(data, dict) and "stream" in data and "seq" in data:
                 logger.warning(
                     "vm.lifecycle.list received a JetStream ack (%s) instead of "
@@ -836,7 +836,7 @@ class NatsBridge:
         once local sshd accepts connections AND the VM holds a tailnet IP. The
         orchestrator has NO route to the tailnet, so it cannot probe SSH from
         here — an orchestrator-vantage probe gate wedged 100% of VM jobs (see
-        docs/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
+        knowledge-base/knowledge/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
         The residual path-establishment window (agent sidecar peer session,
         O(seconds)) is covered by the agent's VM-sized first-connect budget.
 
@@ -980,7 +980,7 @@ class NatsBridge:
         if not orchestrator_can_reach(ssh_host):
             # Tailnet target — SSH from the orchestrator would black-hole.
             # Skip visibly instead of timing out quietly; IDE config seeding
-            # is not supported on the VM backend (see docs/issues/
+            # is not supported on the VM backend (see knowledge-base/knowledge/issues/
             # vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
             logger.info(
                 "Skipping IDE config seed for %s %s (%s:%d): orchestrator "
@@ -1078,7 +1078,7 @@ class NatsBridge:
         Defense-in-depth: the payload's claimed thread_id must match the
         subject's thread_id AND must resolve to an existing thread in DB.
         Tracked for transport-layer hardening in
-        docs/issues/nats_subject_acl_hardening.md.
+        knowledge-base/knowledge/issues/nats_subject_acl_hardening.md.
         """
         try:
             payload = json.loads(msg.data.decode("utf-8"))
@@ -1217,7 +1217,7 @@ class NatsBridge:
         ``ssh_host`` into a ``jobs`` row that does not exist — stranding the
         thread at ``status='created'`` forever (a coin flip per VM session, and
         lost entirely on any orchestrator restart).
-        docs/issues/session_vm_backend_never_attaches.md (Defect 4)
+        knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md (Defect 4)
 
         Callers must treat None as "do not write": guessing a table is exactly
         the failure mode this replaces.

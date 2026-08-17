@@ -115,7 +115,7 @@ const CONTROL_WS_WATCHDOG_TIMEOUT_MS = 45_000;
 // event of any kind has arrived in WATCHDOG_TIMEOUT_MS. This catches silent
 // TCP drops (Wi-Fi blip, captive portal, laptop sleep) that don't trip
 // `EventSource.onerror` until the OS-level keepalive eventually fires
-// hours later. See `docs/issues/persistent_chat_silent_disconnect.md`.
+// hours later. See `knowledge-base/knowledge/issues/persistent_chat_silent_disconnect.md`.
 const SSE_WATCHDOG_INTERVAL_MS = 5000;
 const SSE_WATCHDOG_TIMEOUT_MS = 45000;
 
@@ -332,7 +332,7 @@ export function describeAppliedConfig(
  * Live token telemetry for the current turn, driven by per-LLM-call
  * `usage.updated` frames. `inputTokens` is the latest call's prompt size —
  * effectively the current context fill — while output/reasoning accumulate
- * across the turn's calls. (docs/features/context_summarization_rework.md S5)
+ * across the turn's calls. (knowledge-base/knowledge/features/context_summarization_rework.md S5)
  */
 export interface UsageState {
   /** The thread these numbers describe. The service is a root singleton, so
@@ -340,7 +340,7 @@ export interface UsageState {
    *  thread-transition path to remember a reset — is what makes a stale panel
    *  structurally unrenderable. Read through `currentUsage`, never `usage`
    *  directly. See
-   *  docs/done/session_usage_panel_leaks_previous_session_counters.md. */
+   *  knowledge-history/done/session_usage_panel_leaks_previous_session_counters.md. */
   threadId: string | null;
   turn: number | null;
   inputTokens: number | null;
@@ -364,7 +364,7 @@ export interface UsageState {
  * `context.compacted` (success) or `compaction.failed`. Frames are journaled
  * server-side, so a reload mid-compaction reconstructs this from SSE replay
  * (possibly from a progress frame alone — all fields nullable-tolerant).
- * See docs/features/context_summarization_rework.md (S3).
+ * See knowledge-base/knowledge/features/context_summarization_rework.md (S3).
  */
 export interface CompactionProgressState {
   trigger: string;
@@ -487,7 +487,7 @@ export class PersistentChatService {
   private readonly canvas = inject(CanvasService);
   private readonly capabilities = inject(CapabilitiesService);
   /** Uploads started when a file was ATTACHED, before the user committed to
-   *  sending it (docs/features/session_attachment_send_flow.md §5.4). Owned
+   *  sending it (knowledge-base/knowledge/features/session_attachment_send_flow.md §5.4). Owned
    *  by a root service, not this one: an uncommitted upload has a different
    *  lifetime from the outbox, and must survive the chat page being
    *  destroyed by navigation. */
@@ -697,7 +697,7 @@ export class PersistentChatService {
   // (./turn-reducer.ts) maps wire-level SSE events to state mutations and
   // is keyed by stable ids so SSE replay is idempotent.
   //
-  // See `docs/features/session_turn_rendering.md` for the design.
+  // See `knowledge-base/knowledge/features/session_turn_rendering.md` for the design.
   readonly conversation = signal<ConversationState>(EMPTY_CONVERSATION);
   readonly turns = computed(() => this.conversation().turns);
   readonly currentStreamingTurn = computed<AssistantTurn | null>(() => {
@@ -749,7 +749,7 @@ export class PersistentChatService {
   readonly permissionMode = signal<PermissionMode>('supervised');
   /** Every gate currently awaiting a decision. A parallel tool batch puts
    *  all of its calls here at once so one card can list them —
-   *  docs/superpowers/specs/2026-08-01-batch-tool-approval-design.md. */
+   *  knowledge-base/knowledge/superpowers/specs/2026-08-01-batch-tool-approval-design.md. */
   readonly pendingPermissions = signal<PermissionRequest[]>([]);
   private readonly permissionResolutionFailures = new Set<string>();
 
@@ -876,7 +876,7 @@ export class PersistentChatService {
    * message: outbox empty, no active turn, composer back to idle/mic.
    * +1 per accepted POST (not the 409-duplicate path), −1 on
    * `turn.started` (clamped), zeroed by terminal frames and teardown.
-   * docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+   * knowledge-base/knowledge/issues/session_turn_end_cloud_push_blocks_queued_input.md
    */
   readonly pendingTurnCount = signal(0);
   /** True while an accepted send waits for its turn to start — drives the
@@ -931,7 +931,7 @@ export class PersistentChatService {
   // --- File undo ---
   readonly undoAvailable = signal(false);
 
-  // --- Rewind (docs/features/session_rewind.md) ---
+  // --- Rewind (knowledge-base/knowledge/features/session_rewind.md) ---
   /** Prompt text handed back by rewind.ack — the component moves it into
    *  the composer (edit-and-resend) and clears the signal. */
   readonly rewindPrefill = signal<string | null>(null);
@@ -942,7 +942,7 @@ export class PersistentChatService {
    * True when this session's initial cloud->workspace sync failed: the
    * workspace may be missing files from the cloud, and edits will NOT be
    * saved back to the cloud for the session's lifetime. Sticky for the
-   * session (reset on each (re)connect). See docs/issues/main_cloud.md
+   * session (reset on each (re)connect). See knowledge-base/knowledge/issues/main_cloud.md
    * Issue 13.
    */
   readonly cloudSyncDegraded = signal(false);
@@ -973,7 +973,7 @@ export class PersistentChatService {
   // --- Draft session (instant landing at `/`) ---
   // The composer is open but no thread exists yet; the first send creates
   // the session with a minimal body and the orchestrator resolves the
-  // owner's defaults (docs/features/instant_landing_session.md). Distinct
+  // owner's defaults (knowledge-base/knowledge/features/instant_landing_session.md). Distinct
   // from the composer's persisted text "draft" (localStorage).
   readonly isDraftSession = signal(false);
   // Default project prefetched on draft entry; attached to the create body
@@ -1142,7 +1142,7 @@ export class PersistentChatService {
    * Same-thread fast path: skip the reset + loadHistory, just refresh
    * transports. This preserves the in-flight assistant turn through
    * chat-page re-mounts and other reconnects against the same thread
-   * (docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
+   * (knowledge-base/knowledge/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
    * §Approach 1). loadHistory's GET /messages only returns *persisted*
    * rows; during streaming the AI message isn't fully in thread_messages
    * yet, so re-running it mid-turn would reset state and replace the
@@ -1448,7 +1448,7 @@ export class PersistentChatService {
    * AssistantTurn so the rendered bubble matches the live experience.
    * Thinking content is not persisted in `thread_messages` so historical
    * turns won't have thought events — known gap, see
-   * `docs/features/session_turn_rendering.md`.
+   * `knowledge-base/knowledge/features/session_turn_rendering.md`.
    */
   /**
    * Fetch the engine citations for this session (job_id == thread_id) and
@@ -2974,7 +2974,7 @@ export class PersistentChatService {
    * through to `_waitForLifecycleReady` driving `POST /prepare` against
    * the lifecycle SSE feed. The advisory lock in the orchestrator
    * serialises /resume's reprovision with /prepare's _do_prepare so we
-   * don't double-provision (docs/issues/persistent_thread_double_provisioning_race.md).
+   * don't double-provision (knowledge-base/knowledge/issues/persistent_thread_double_provisioning_race.md).
    *
    * /resume can also 428 if a connector/project/grant the thread depended
    * on has since disappeared (config drift). That surfaces on
@@ -3216,7 +3216,7 @@ export class PersistentChatService {
     // bypass, not below it: a *recognized* command (`/compact`) returns
     // inside the bypass, which used to leave the chips sitting in the
     // composer with no message and no error — the strand named in
-    // docs/features/session_attachment_send_flow.md §2. Refuse explicitly
+    // knowledge-base/knowledge/features/session_attachment_send_flow.md §2. Refuse explicitly
     // instead, so no slash path can silently swallow queued files.
     if (trimmed.startsWith('/') && queued.length > 0) {
       this.attachmentError.set(this.transloco.translate('chat.upload.slashCommandWithAttachments'));
@@ -3488,7 +3488,7 @@ export class PersistentChatService {
    * The upload goes through ApiService → HttpClient on purpose. A raw
    * XHR/fetch would miss auth.interceptor's `ngsw-bypass: 1` and the service
    * worker would corrupt the multipart body
-   * (docs/done/cockpit_service_worker_breaks_file_uploads.md) — and a SW that
+   * (knowledge-history/done/cockpit_service_worker_breaks_file_uploads.md) — and a SW that
    * answers with respondWith() also destroys the very upload-progress events
    * this stage now reports.
    *
@@ -4655,7 +4655,7 @@ export class PersistentChatService {
         // sweeps un-reached gates as 'expired' (and 'interrupted' on
         // Stop). Neither is a refusal — reporting them as 'denied'
         // recreates the fabricated-denial bug in the UI. See
-        // docs/done/supervised_parallel_gates_timeout_fabricates_denial.md
+        // knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md
         const rawDecision = params['decision'];
         const decision =
           rawDecision === 'approved'
@@ -5058,7 +5058,7 @@ export class PersistentChatService {
       case 'session.event':
         // A system notice was injected into the running session
         // (currently: a worker job this session created finished —
-        // docs/features/session_wake_on_job_completion.md). Required,
+        // knowledge-base/knowledge/features/session_wake_on_job_completion.md). Required,
         // not polish: /api/input broadcasts nothing on its own and no
         // frame carries user-message content, so without this the user
         // watches a turn start and stream a reply with no visible
@@ -5584,7 +5584,7 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     // only producer is the session-wake feature: a worker job this session
     // created reached a terminal state and the orchestrator injected the
     // notice via POST /api/input
-    // (docs/features/session_wake_on_job_completion.md).
+    // (knowledge-base/knowledge/features/session_wake_on_job_completion.md).
     //
     // The role exists precisely so this does NOT render as a user bubble —
     // the model was told something, but the user never said it, and a

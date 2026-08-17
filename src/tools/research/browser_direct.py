@@ -8,8 +8,8 @@ Execution model: every action is dispatched to the workspace-side
 Chrome's CDP stays on the workspace loopback — it never crosses the pod
 boundary — and page content is interpreted inside the NetworkPolicy-
 restricted workspace runtime. There is no in-pod (agent-side) browser
-execution path. See docs/features/browser_workspace_executor.md and
-docs/issues/remove_local_browser_fallback.md.
+execution path. See knowledge-base/knowledge/features/browser_workspace_executor.md and
+knowledge-base/knowledge/issues/remove_local_browser_fallback.md.
 
 This module keeps the agent-side logic — URL validation and content-nonce
 wrapping — and returns the page state to the LLM as a text block (URL,

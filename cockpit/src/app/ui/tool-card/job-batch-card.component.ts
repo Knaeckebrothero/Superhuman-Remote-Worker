@@ -34,7 +34,7 @@ import {JobToolCardPanelComponent} from './job-tool-card-panel.component';
  * a card that closed itself the moment the last job completed would slam shut
  * under someone mid-read.
  *
- * Design: docs/features/unified_tool_cards.md (slice 4, batch grouping).
+ * Design: knowledge-base/knowledge/features/unified_tool_cards.md (slice 4, batch grouping).
  */
 @Component({
     selector: 'app-job-batch-card',

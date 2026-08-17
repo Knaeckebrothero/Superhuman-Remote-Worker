@@ -3,7 +3,7 @@
 Exercises the control flow of ``_llm_outage_sweep_once`` — ceiling backstop and
 CAS-guarded re-dispatch — against a mocked ``postgres_db``.
 Live DB round-trips are covered by the k3d E2E in
-docs/features/llm_outage_pause_and_backoff_redispatch.md.
+knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md.
 """
 
 import sys
@@ -120,7 +120,7 @@ async def test_over_ceiling_fails_not_redispatched(wired):
 # Sweep-fail parent unblock — a fail_llm_outage_job write bypasses /complete,
 # so the subjob unblock handlers must run here or a ceiling-failed scholar
 # strands its 'waiting' parent forever
-# (docs/features/llm_outage_subjob_resilience.md, design #4).
+# (knowledge-base/knowledge/features/llm_outage_subjob_resilience.md, design #4).
 # ---------------------------------------------------------------------------
 
 
@@ -181,7 +181,7 @@ async def test_unblock_handler_error_does_not_break_sweep(wired, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Born-parked loop members (docs/issues/loop_advances_into_active_model_cooldown.md)
+# Born-parked loop members (knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md)
 # — created paused+frozen with NO first_failed_at, so the ceiling clock starts
 # at wake, not at creation. This test fails if anyone ever stamps
 # first_failed_at at park time: the whole park duration would read as elapsed

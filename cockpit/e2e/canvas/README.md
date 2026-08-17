@@ -88,7 +88,7 @@ green local run:
 - production HTTP framing, streaming/SSE, WebSocket/HMR, and multi-port routing
   once those proxy modes are enabled.
 
-Keep external results in the relevant `docs/tests/dynamic_canvas_*_verification.md`
+Keep external results in the relevant `knowledge-base/knowledge/tests/dynamic_canvas_*_verification.md`
 record together with browser/OS versions, deployment revision, and tested
 hostname. Do not weaken this harness to make a browser without the required
 Fetch Metadata or partitioned-storage behavior appear supported; that browser

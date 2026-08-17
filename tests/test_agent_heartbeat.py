@@ -161,7 +161,7 @@ class TestHeartbeatPreservesOffline:
 class TestHeartbeatAuxDegraded:
     """aux Phase 2: heartbeat persists the auxiliary-model degraded flag from
     the AuxHealth summary the agent carries in metrics.aux. See
-    docs/issues/surface_silent_aux_failures.md.
+    knowledge-base/knowledge/issues/surface_silent_aux_failures.md.
     """
 
     @pytest.mark.asyncio

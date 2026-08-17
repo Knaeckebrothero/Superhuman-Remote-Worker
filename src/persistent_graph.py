@@ -302,7 +302,7 @@ def _ensure_msg_id(msg: Any) -> Any:
     crash-resumed tail keeps the same ids. ``AIMessage`` already gets an id in
     ``_sanitize_ai_response``; ``HumanMessage``/``ToolMessage`` do not, so we
     stamp them here. Uses the same ``msg_`` prefix for a uniform id space.
-    See docs/issues/persistent_session_midturn_message_loss.md.
+    See knowledge-base/knowledge/issues/persistent_session_midturn_message_loss.md.
     """
     if getattr(msg, "id", None) is None:
         msg.id = f"msg_{_uuid.uuid4().hex[:24]}"
@@ -429,7 +429,7 @@ class PermissionOutcome(str, Enum):
     distinct state — collapsing it into DECLINED fabricates a refusal the
     user never made (the model then concludes it was denied and abandons
     real work). See
-    docs/done/supervised_parallel_gates_timeout_fabricates_denial.md.
+    knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md.
     """
 
     APPROVED = "approved"
@@ -479,7 +479,7 @@ class PersistentLoopCallbacks:
     # NO_ANSWER is NOT a denial: the gate was never answered (timed out, or
     # the approval card never reached the browser). The loop parks the turn
     # instead of telling the model the user refused — see
-    # docs/done/supervised_parallel_gates_timeout_fabricates_denial.md.
+    # knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md.
     permission_check: Callable[
         [str, Dict[str, Any], str], Awaitable[Union["PermissionOutcome", bool]]
     ]
@@ -570,7 +570,7 @@ class PersistentLoopCallbacks:
     # usage ({input_tokens, output_tokens, reasoning_tokens?, model?,
     # ctx_limit_tokens}). input_tokens of the latest call ≈ current context
     # size, which drives the cockpit's CTX gauge
-    # (docs/features/context_summarization_rework.md S5). Optional.
+    # (knowledge-base/knowledge/features/context_summarization_rework.md S5). Optional.
     on_usage: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
 
     # Set by the transport alongside a "hard" interrupt so the loop can cancel
@@ -591,14 +591,14 @@ class PersistentLoopCallbacks:
     # lingers until the next rerender (the persisted row is already the retry's,
     # so a reload is coherent regardless). Takes a ``message_id`` kwarg matching
     # the id on_thinking stamped on the reasoning frames. See
-    # docs/issues/session_empty_response_gpt5_codex_stop.md.
+    # knowledge-base/knowledge/issues/session_empty_response_gpt5_codex_stop.md.
     on_thinking_reset: Optional[Callable[..., Awaitable[None]]] = None
 
     # Announce a whole batch of tool calls for approval at once, before any
     # of them is gated. Lets the client render one card listing every call
     # instead of one card per finished tool. Optional: None ⇒ the per-call
     # gate path announces each call itself (previous behaviour).
-    # See docs/superpowers/specs/2026-08-01-batch-tool-approval-design.md.
+    # See knowledge-base/knowledge/superpowers/specs/2026-08-01-batch-tool-approval-design.md.
     announce_permission_batch: Optional[
         Callable[[List[Dict[str, Any]]], Awaitable[None]]
     ] = None
@@ -654,7 +654,7 @@ def _is_context_overflow(error: BaseException) -> bool:
     413 that `reasoning_chat` raises for a pre-flight overflow carries a status
     the classifier has no rule for — so it lands on that catch-all. Retrying it
     re-sends the identical oversized body, which is precisely the retry storm
-    docs/issues/session_silent_failure_audit.md #3 removed. Detected three ways
+    knowledge-base/knowledge/issues/session_silent_failure_audit.md #3 removed. Detected three ways
     because the overflow reaches us typed, wrapped, or as the synthetic 413.
     """
     for candidate in (error, getattr(error, "__cause__", None)):
@@ -883,7 +883,7 @@ async def run_persistent_loop(
             instead of only the tool binding.
         memory_extraction_prompt: Matrix-resolved prompt for the background
             memory-extraction task, threaded from session setup (MemoryConfig
-            carries no prompt attribute — docs/issues/memory_bugs.md B1).
+            carries no prompt attribute — knowledge-base/knowledge/issues/memory_bugs.md B1).
         memory_service: MemoryManager seam (src.services.memory) — when
             bound (memory.manager.enabled), the in-loop extraction and the
             per-turn retrieval/injection route through it instead of the
@@ -907,7 +907,7 @@ async def run_persistent_loop(
 
     # Memory extraction cadence. Deliberately a direct attribute read: a
     # getattr fallback here is what let the phantom `extraction_interval`
-    # key hide for months (docs/issues/memory_bugs.md B1c).
+    # key hide for months (knowledge-base/knowledge/issues/memory_bugs.md B1c).
     memory_config = getattr(config, "memory", None)
     extraction_interval = memory_config.observer_interval if memory_config else 5
     _last_extraction_turn = 0
@@ -1318,7 +1318,7 @@ async def _emit_reasoning_content(response, callbacks, *, message_id) -> bool:
     arrives and BEFORE its answer text is emitted, so the reasoning precedes
     the prose it produced (reasoning models never think after answering — a
     trailing frame is a broadcast artifact, see
-    docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md).
+    knowledge-base/knowledge/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md).
 
     ``reasoning_content`` is only ever set by the non-streaming capture path
     (``_post_process_result``), which also flattens the message content to a
@@ -1505,7 +1505,7 @@ async def _execute_turn(
             # Log the exception type so this stops being guesswork — bare
             # `e` for openai.APIConnectionError formats as "Connection error."
             # with no detail. See
-            # docs/issues/persistent_graph_misleading_embedding_connection_error.md
+            # knowledge-base/knowledge/issues/persistent_graph_misleading_embedding_connection_error.md
             logger.warning(
                 "Memory retrieval failed (non-fatal): %s: %s",
                 type(e).__name__,
@@ -1710,7 +1710,7 @@ async def _execute_turn(
         # Memory extraction before compaction (persistent): if this call is about
         # to summarize, snapshot the slice ensure_within_limits will evict and
         # mine it for durable memories before the lossy summary replaces it
-        # (docs/done/memory_extraction_before_compaction.md). Fire-and-forget
+        # (knowledge-history/done/memory_extraction_before_compaction.md). Fire-and-forget
         # so compaction latency is unchanged; no phase concept in a session →
         # phase=0 (matches the turn_end capture).
         if (
@@ -1869,7 +1869,7 @@ async def _execute_turn(
         # stable key with the thread_messages row it lands in. The client
         # dedupes a reasoning frame replayed after history already painted the
         # bubble by this id (gemma "reasoning duplicates on replay" bug). See
-        # docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+        # knowledge-base/knowledge/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
         ai_msg_id = f"msg_{_uuid.uuid4().hex[:24]}"
         # Set by the live reasoning sink below; gates the post-stream fallback
         # so each reasoning blob is emitted exactly once.
@@ -2423,7 +2423,7 @@ async def _execute_turn(
                 # via the Codex proxy occasionally streams finish_reason=stop with
                 # zero content deltas and no tool call — a rare (~0.7 %),
                 # non-deterministic upstream event we could not reproduce across
-                # ~1026 synthetic calls (docs/issues/
+                # ~1026 synthetic calls (knowledge-base/knowledge/issues/
                 # session_empty_response_gpt5_codex_stop.md). One ainvoke retry
                 # almost always succeeds and, being non-streaming, hits a
                 # different proxy/SDK translation path. Single attempt — a
@@ -2564,7 +2564,7 @@ async def _execute_turn(
 
         # Repair/scrub malformed tool-call arguments before the response
         # becomes durable state — a raw unparseable call in history poisons
-        # every later request (docs/features/outbound_message_hygiene.md).
+        # every later request (knowledge-base/knowledge/features/outbound_message_hygiene.md).
         response = repair_tool_call_arguments(response)
 
         # Add AI response to message history
@@ -2685,7 +2685,7 @@ async def _execute_turn(
             # Permission check. Three-state: an unanswered gate is neither
             # consent nor refusal — never fabricate a decision the user did
             # not make (see
-            # docs/done/supervised_parallel_gates_timeout_fabricates_denial.md).
+            # knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md).
             outcome = PermissionOutcome.coerce(
                 await callbacks.permission_check(tool_name, tool_args, tool_call_id)
             )

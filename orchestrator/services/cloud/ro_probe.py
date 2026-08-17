@@ -1,7 +1,7 @@
 """Fail-closed read-only verification for a protected-mount identity.
 
 Given credentials for the dedicated RO account (NOT agent-service — see
-docs/design/cloud_access_unification.md §3.3), attempt every mutating
+knowledge-base/knowledge/design/cloud_access_unification.md §3.3), attempt every mutating
 WebDAV verb AND the version/trash side channels that had real RO-bypass
 CVEs (Nextcloud GHSA-5mq8-738w-5942 / GHSA-2vrq-fhmf-c49m). Protected
 cloud mode must refuse to engage unless every one is rejected.
@@ -66,7 +66,7 @@ how it is cured:
   no real id for this canary) that probe falls back to the synthetic
   placeholder and stays inconclusive — fail-closed, curable by supplying
   the ref and/or the design's §6.4 live-probe run
-  (docs/design/cloud_access_unification.md §6 item 4 — "Live RO probe")
+  (knowledge-base/knowledge/design/cloud_access_unification.md §6 item 4 — "Live RO probe")
   tuning the status map from observed behavior. The uploads-finalize
   side channel is different: it can never be cured by an injectable ref
   (the URL is reader-namespaced), so ``probe_read_only`` instead
@@ -104,7 +104,7 @@ REJECTED_STATUSES = frozenset({403, 405})
 # rejection (see the module docstring for the cure).
 _INCONCLUSIVE_STATUSES = frozenset({404, 409})
 
-# Version floors from docs/design/cloud_access_unification.md §3.3: the
+# Version floors from knowledge-base/knowledge/design/cloud_access_unification.md §3.3: the
 # releases that fixed the RO-bypass CVEs this module probes for.
 #   nextcloud    >= 28.0.3  (GHSA-5mq8-738w-5942, versions-restore)
 #   groupfolders per-branch (GHSA-2vrq-fhmf-c49m, trash-restore) — see
@@ -653,7 +653,7 @@ def _capabilities_origin(base_url: str) -> str:
 async def check_version_floors(client, base_url: str, *, backend: str) -> RoProbeResult:
     """Runtime-check the version floors that fixed the RO-bypass CVEs.
 
-    docs/design/cloud_access_unification.md §3.3: Nextcloud server
+    knowledge-base/knowledge/design/cloud_access_unification.md §3.3: Nextcloud server
     >= 28.0.3; groupfolders >= the first patched release of its OWN
     branch (``GROUPFOLDERS_PATCHED`` — the advisory fixed every
     maintained branch, and each branch is pinned to one NC major). "The

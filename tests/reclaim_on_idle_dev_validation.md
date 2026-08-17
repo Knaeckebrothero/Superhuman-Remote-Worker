@@ -3,7 +3,7 @@
 **Purpose.** Validate the workspace-durability work (F1, C1a–d, C2, C3, reclaim-on-idle) on the **dev
 cluster**, focused on the one path that could NOT be exercised end-to-end on local k3d: the full
 **reclaim-on-idle cycle** (idle-suspend → snapshot verify → PVC reclaim → resume → **extract from S3**).
-Everything else is already validated on k3d (see `docs/features/workspace_durability_tiering.md` §Shipped);
+Everything else is already validated on k3d (see `knowledge-base/knowledge/features/workspace_durability_tiering.md` §Shipped);
 this runbook re-confirms the deploy and drives the destructive-but-fail-safe cycle safely.
 
 > **Dev E2E status (2026-08-08).** This runbook was run manually against the dev cluster and it did its job
@@ -30,7 +30,7 @@ this runbook re-confirms the deploy and drives the destructive-but-fail-safe cyc
 **Feature under test.** `WORKSPACE_RECLAIM_ON_IDLE` (default **off**): on idle-suspend of a session, once
 `verify_snapshot` confirms the S3 archive is restorable, the workspace PVC (`pvc-ws-thread-<id>`) is
 deleted; on the next touch, restore extracts from S3 (no reattach). Design + commit list:
-`docs/features/workspace_durability_tiering.md`.
+`knowledge-base/knowledge/features/workspace_durability_tiering.md`.
 
 **Environment.** Dev cluster, context `main`, namespace `superhuman-remote-worker` (adjust if different).
 Prereqs: the durability commits deployed (image built from `develop`), `WORKSPACE_PVC_ENABLED=true`,

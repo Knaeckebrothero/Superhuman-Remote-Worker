@@ -27,7 +27,7 @@ import os
 from typing import Any
 
 # Capabilities that *must* be ready before the cockpit releases. Aligns
-# with docs/features/models_yaml_removal.md §"Role-completeness gate".
+# with knowledge-base/knowledge/features/models_yaml_removal.md §"Role-completeness gate".
 REQUIRED_CAPABILITIES = ("chat", "embedding", "auxiliary")
 
 # Optional capabilities — surfaced in the readiness payload so the cockpit

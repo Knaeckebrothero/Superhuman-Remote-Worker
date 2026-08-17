@@ -14,7 +14,7 @@ and the officer names a slot per dispatch (``create_job(...,
 slot="heavy")``). The job-creation funnel stamps the slot's model/backend
 onto the job config server-side — the officer chooses WHICH troops to send,
 never what they are made of — and enforces the per-slot count under the
-durable Officer Post row lock (docs/features/centurion.md §6).
+durable Officer Post row lock (knowledge-base/knowledge/features/centurion.md §6).
 
 Pure module by design: validation and admission are plain functions over
 dicts so they unit-test without the FastAPI app. ``main.py`` owns the HTTP

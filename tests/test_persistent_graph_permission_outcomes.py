@@ -1,7 +1,7 @@
 """Supervised gate outcomes in the src/persistent_graph.py tool loop.
 
 Regression tests for
-docs/done/supervised_parallel_gates_timeout_fabricates_denial.md.
+knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md.
 
 A supervised gate is a *question to the user*, so the loop must
 distinguish three outcomes and never fabricate a decision the user did

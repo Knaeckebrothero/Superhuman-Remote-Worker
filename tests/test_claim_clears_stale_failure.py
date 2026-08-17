@@ -19,7 +19,7 @@ can display a stale failure, whichever route it took back to dispatchable.
 
 Related: ``clear_job_failure`` covers the different case of a late completion
 report re-resolving an already-failed job
-(docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md).
+(knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md).
 
 Mirrors tests/test_queue_job_for_resume.py.
 """

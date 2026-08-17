@@ -1,6 +1,6 @@
 """Scratch workspace backend — disposable agent-local tmpdir for ``none`` mode.
 
-The ``none`` tier (``docs/features/no_workspace_agent_mode.md`` §6) registers
+The ``none`` tier (``knowledge-base/knowledge/features/no_workspace_agent_mode.md`` §6) registers
 **no file tools at all**, but the graph's internal consumers (PlanManager, the
 TodoManager archive, optional ``task_brief.md`` reads, ``datasources.md``)
 still expect *a* backend. Rather than auditing every call site for

@@ -687,7 +687,7 @@ async def _seed_default_datasources(db) -> None:
     """Seed global datasources from DEFAULT_DS_* environment variables.
 
     Creates or updates global datasources (job_id=NULL) based on env vars.
-    See docs/datasources.md for the full design.
+    See knowledge-base/knowledge/datasources.md for the full design.
 
     Supported env var patterns:
         DEFAULT_DS_POSTGRESQL_URL, DEFAULT_DS_POSTGRESQL_NAME, DEFAULT_DS_POSTGRESQL_READ_ONLY
@@ -1097,7 +1097,7 @@ async def _backfill_cloud_folders(db) -> None:
                 # `webdav` datasource — it is cloned into job/session workspaces
                 # (Mode-A baseline / `projects/` sync mount), so a datasource here
                 # would double-expose the same files through the webdav_* tools.
-                # See docs/issues/main_cloud.md (Issue 1 / Issue 8).
+                # See knowledge-base/knowledge/issues/main_cloud.md (Issue 1 / Issue 8).
 
                 backfilled += 1
                 logger.info(

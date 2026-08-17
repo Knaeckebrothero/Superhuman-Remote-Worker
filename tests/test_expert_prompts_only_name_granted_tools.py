@@ -6,7 +6,7 @@ must exist in ``TOOL_REGISTRY``. That says nothing about prose. Ten prompt files
 across four experts went on instructing the model to call ``browse_website`` for
 months after it was removed from the registry — the tool lists were eventually
 cleaned, the prompts were not (see
-``docs/done/expert_prompts_instruct_a_removed_browser_tool.md``).
+``knowledge-history/done/expert_prompts_instruct_a_removed_browser_tool.md``).
 
 Being told to call a tool you do not have is not free. At best the instruction
 is ignored; at worst the model spends a turn on a call that cannot resolve and

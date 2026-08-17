@@ -1,6 +1,6 @@
 -- migration:     0122_thread_cloud_sync_generations.sql
 -- description:   Per-mount durable cloud-sync generations for stateless
---                session handoff (docs/features/stateless_agents.md §5.3.5).
+--                session handoff (knowledge-base/knowledge/features/stateless_agents.md §5.3.5).
 --                A queue-fenced owner advances required_generation before
 --                starting push(N). The cloud resource receives a separate
 --                commit marker after the bytes land; the next claimant must

@@ -6,7 +6,7 @@ project KB, a `repository` datasource, this repo's own `docs/`). The thin
 `kb_lint` / `kb_index` tools in ``knowledge_tools.py`` read files via the
 workspace backend and delegate here.
 
-See docs/features/okf_knowledge_base.md §7 (toolset) and §11 (slice 2).
+See knowledge-base/knowledge/features/okf_knowledge_base.md §7 (toolset) and §11 (slice 2).
 """
 
 from __future__ import annotations

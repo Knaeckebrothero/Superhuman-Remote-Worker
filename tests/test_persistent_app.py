@@ -2214,7 +2214,7 @@ class TestPollWorkspaceReady:
     async def test_vm_provisioning_extends_budget_past_base_timeout(self):
         """A VM in flight self-extends the poll deadline to the VM budget, so a
         cold boot that outlasts the sandbox `timeout` still attaches
-        (docs/features/session_create_on_vm.md)."""
+        (knowledge-base/knowledge/features/session_create_on_vm.md)."""
         call_count = 0
 
         async def _get_workspace(tid, **kwargs):
@@ -2249,7 +2249,7 @@ class TestPollWorkspaceReady:
         that happens to be ready. The container wins the race by minutes (8s vs
         a multi-minute KubeVirt boot), so without this the session silently runs
         on the wrong tier while its VM is orphaned.
-        docs/issues/session_vm_backend_never_attaches.md"""
+        knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md"""
         client = AsyncMock()
         client.get_thread_workspace.return_value = {
             # Exactly the incident state: VM still booting, container ready.
@@ -3208,7 +3208,7 @@ class TestHandleWorkspaceUpgradeVm:
         """A successful sandbox→vm upgrade re-fetches the fresh (vm-ready)
         cloud_mount and re-mounts it on the new backend — the rclone mount is
         per-host and doesn't follow the swap.
-        docs/issues/workspace_upgrade_drops_cloud_mount.md."""
+        knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md."""
         import sys
 
         ws = AsyncMock()
@@ -3472,7 +3472,7 @@ class TestWsSend:
 
 class TestSubscriberFanout:
     """Tests for the subscriber-list broadcast hub that decouples the loop
-    from any single WebSocket. See docs/features/headless_persistent_sessions.md."""
+    from any single WebSocket. See knowledge-base/knowledge/features/headless_persistent_sessions.md."""
 
     def setup_method(self):
         import src.api.persistent_app as mod
@@ -5114,7 +5114,7 @@ class TestHandleConfigUpdateEnrichmentGate:
     regression that reverts to chat-only silently breaks custom-endpoint
     routing for auxiliary and embedding (the ``Untitled Session`` and
     missing-memory bug documented in
-    ``docs/hardcoded_model_defaults.md``). Mocking the full async call
+    ``knowledge-base/knowledge/hardcoded_model_defaults.md``). Mocking the full async call
     chain here is brittle because of internal imports; pinning the
     source-level shape is the cheapest reliable regression catch.
     """
@@ -5689,7 +5689,7 @@ class TestThreadStatusWatchdog:
         # state set by the agent's own loop. The watchdog previously treated
         # it as terminal and killed the pod in ~60s, which collapsed the
         # untethered-survival behaviour Phase 1 + Phase 5 were built for.
-        # See docs/issues/persistent_session_watchdog_kills_awaiting_user.md.
+        # See knowledge-base/knowledge/issues/persistent_session_watchdog_kills_awaiting_user.md.
         import asyncio
 
         from src.api import persistent_app as pa
@@ -6075,7 +6075,7 @@ class TestSessionBackendIsLite:
 
 # ---------------------------------------------------------------------------
 # _session_backend_is_vm() — VM-tier boot detection
-# (docs/issues/session_vm_backend_never_attaches.md Defect 2)
+# (knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md Defect 2)
 # ---------------------------------------------------------------------------
 
 

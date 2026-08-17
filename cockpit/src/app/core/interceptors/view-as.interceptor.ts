@@ -32,7 +32,7 @@ import {ViewModeService} from '../services/view-mode.service';
  * Must register AFTER `authInterceptor` in `app.config.ts`: cookies +
  * CSRF first, then the view-mode header.
  *
- * Design: `docs/features/admin_view_as_user.md`.
+ * Design: `knowledge-base/knowledge/features/admin_view_as_user.md`.
  */
 export const VIEW_AS_HEADER = 'X-Admin-View-As';
 export const VIEW_AS_USER = 'user';

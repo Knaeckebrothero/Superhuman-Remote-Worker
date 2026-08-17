@@ -3,7 +3,7 @@
 # This chart previously had no ci/ directory at all, so it was never linted,
 # rendered, or kubeconform'd by CI — only packaged. That is why its VM template
 # and helm/'s drifted apart unnoticed (see
-# docs/issues/vm_reliability_assessment.md, P1-10).
+# knowledge-base/knowledge/issues/vm_reliability_assessment.md, P1-10).
 #
 # Everything below is a placeholder chosen only to satisfy a required-value gate.
 # Nothing here is a real endpoint or a real key.

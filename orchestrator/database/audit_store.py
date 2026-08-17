@@ -4,7 +4,7 @@ Counterpart to the agent's :class:`~src.database.audit_writer.SyncAuditWriter`.
 Emits the exact wire shape the audit endpoints and cockpit consume, so the read
 path stays fixed and endpoint/cockpit code is unchanged.
 
-Design: ``docs/features/postgres_audit_store_implementation.md`` §5. The two
+Design: ``knowledge-base/knowledge/features/postgres_audit_store_implementation.md`` §5. The two
 load-bearing translations:
 - **Logical-row stitch (D3):** ``agent_audit`` is append-only (pre row at
   dispatch, post row at completion). Every read returns ONE row per ``pre`` row

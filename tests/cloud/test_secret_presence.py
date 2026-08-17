@@ -7,7 +7,7 @@ reports exactly which required secret env vars are unset, mirroring the loader's
 resolution precedence (``credentials_ref`` > legacy env fallbacks) without ever
 reading a secret value or falling back to a dev default.
 
-See ``docs/issues/main_cloud.md`` Issue 5.
+See ``knowledge-base/knowledge/issues/main_cloud.md`` Issue 5.
 """
 
 from __future__ import annotations

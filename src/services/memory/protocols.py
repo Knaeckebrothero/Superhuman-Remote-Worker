@@ -1,6 +1,6 @@
 """Plugin protocols for the MemoryManager pipeline.
 
-Design: docs/features/agent_memory_overhaul.md §2.1. Plugins are bound by
+Design: knowledge-base/knowledge/features/agent_memory_overhaul.md §2.1. Plugins are bound by
 ``MemoryManager.from_config()`` from the registry (registry.py); each
 factory receives the shared ``MemoryRuntime`` and returns an object
 satisfying one of these protocols.

@@ -424,7 +424,7 @@ class TestEvaluationToolMetadata:
 # but the critic strategic prompt told the agent "Do NOT render verdicts during
 # strategic phases" — leaving no phase where the agent could both call the tool
 # AND believe it was allowed to. The agent looped forever via todo_rewind.
-# See docs/tests/critic_verdict_deadlock_verification.md.
+# See knowledge-base/knowledge/tests/critic_verdict_deadlock_verification.md.
 
 CRITIC_PROMPT_DIR = project_root / "config" / "experts" / "critic"
 
@@ -709,7 +709,7 @@ class TestStrategicPhaseWithVerdict:
 # =============================================================================
 # Verdict durability: tools must persist through the orchestrator BEFORE
 # returning to the model (journal-before-observe). Task 5 of the fail-closed
-# verification plan — see docs/superpowers/plans/2026-07-27-verification-fail-closed.md.
+# verification plan — see knowledge-base/knowledge/superpowers/plans/2026-07-27-verification-fail-closed.md.
 # =============================================================================
 
 
@@ -894,7 +894,7 @@ class TestVerdictDurability:
         cap reached, target already sent to manual review), returning the
         usual "must be corrected and resubmitted" string is the livelock —
         the model obeys it forever (189 iterations / 105 min live).
-        docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
+        knowledge-history/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
         """
         from unittest.mock import AsyncMock
 

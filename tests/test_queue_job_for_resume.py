@@ -11,7 +11,7 @@ again and nothing else was scheduled to change its state.
 For the blocking-message arm the freeze is a PRECONDITION (the reply router
 only resumes when ``freeze_data.thread_id`` matches), so every reply to a
 blocking message wedged its job. Mirrors tests/test_delegation_resume_claim.py.
-See docs/issues/blocking_message_reply_keeps_freeze_data.md.
+See knowledge-base/knowledge/issues/blocking_message_reply_keeps_freeze_data.md.
 """
 
 import json
@@ -159,7 +159,7 @@ async def test_critic_returned_resume_clears_freeze_so_dispatcher_sees_job(db):
     same write. The parent always arrives frozen (``job_complete`` freeze from
     its own completion), so keeping the blob would park it paused-but-invisible
     after every review round-trip on non-full autonomy.
-    See docs/done/critic_feedback_resume_parent_freeze_data_wedge.md.
+    See knowledge-history/done/critic_feedback_resume_parent_freeze_data_wedge.md.
     """
     async with db.acquire() as conn:
         await conn.execute(
@@ -238,7 +238,7 @@ async def test_feedback_resume_voids_completion_decision(db):
     """A resume that demands NEW work must drop the journaled decision — the
     round-2 agent's hydration would otherwise re-seed round 1's decision and
     finalize the new round with the old report.
-    See docs/issues/job_finalization_decisions_held_only_in_process_memory.md.
+    See knowledge-base/knowledge/issues/job_finalization_decisions_held_only_in_process_memory.md.
     """
     assert await db.set_completion_decision(JOB, DECISION)
 

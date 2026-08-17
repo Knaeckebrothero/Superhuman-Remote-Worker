@@ -710,7 +710,7 @@ describe('uploadOneToThread', () => {
   });
 });
 
-describe('ApiService officer post endpoints (docs/features/officer_post.md)', () => {
+describe('ApiService officer post endpoints (knowledge-base/knowledge/features/officer_post.md)', () => {
   let api: ApiService;
   let httpMock: HttpTestingController;
 

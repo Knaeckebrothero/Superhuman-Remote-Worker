@@ -58,7 +58,7 @@ def setup_logging():
     When LOG_LEVEL=DEBUG, only app loggers (src.*, orchestrator.*) get DEBUG;
     the root stays at INFO to suppress noisy third-party libraries. Set
     DEBUG_ALL=1 to also include third-party debug output.
-    See docs/features/centralized_logging.md.
+    See knowledge-base/knowledge/features/centralized_logging.md.
     """
     configure_logging(component="agent", app_namespaces=("src", "orchestrator"))
 
@@ -136,7 +136,7 @@ def run_server(config_path: str, host: str, port: int):
         port=port,
         log_level="info",
         # Defer to our root JSON handler so uvicorn's own access/error logs are
-        # JSON too, not plain text (see docs/features/centralized_logging.md).
+        # JSON too, not plain text (see knowledge-base/knowledge/features/centralized_logging.md).
         log_config=None,
     )
 
@@ -163,7 +163,7 @@ def run_persistent_server(
         port=port,
         log_level="info",
         # Defer to our root JSON handler so uvicorn's own access/error logs are
-        # JSON too, not plain text (see docs/features/centralized_logging.md).
+        # JSON too, not plain text (see knowledge-base/knowledge/features/centralized_logging.md).
         log_config=None,
     )
 
@@ -193,7 +193,7 @@ def run_stateless_server(config_path: str, host: str, port: int):
         port=port,
         log_level="info",
         # Defer to our root JSON handler so uvicorn's own access/error logs are
-        # JSON too, not plain text (see docs/features/centralized_logging.md).
+        # JSON too, not plain text (see knowledge-base/knowledge/features/centralized_logging.md).
         log_config=None,
     )
 
@@ -219,7 +219,7 @@ def run_dual_server(config_path: str, host: str, port: int):
         port=port,
         log_level="info",
         # Defer to our root JSON handler so uvicorn's own access/error logs are
-        # JSON too, not plain text (see docs/features/centralized_logging.md).
+        # JSON too, not plain text (see knowledge-base/knowledge/features/centralized_logging.md).
         log_config=None,
     )
 

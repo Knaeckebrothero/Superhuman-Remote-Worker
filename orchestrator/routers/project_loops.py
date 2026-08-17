@@ -10,7 +10,7 @@ Mirrors ``routers/automations.py`` conventions: handlers reach ``postgres_db``
 (and the loop spawn helpers) via late ``from main import ...`` to dodge the
 circular import at module load; ACL via ``require_project_member``.
 
-Spec: docs/features/project_self_improvement_loop.md.
+Spec: knowledge-base/knowledge/features/project_self_improvement_loop.md.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ async def _require_unattended_operations(
     The spawn choke point (``main._spawn_loop_stage``) re-reads the same grant,
     so this is the loud, synchronous half of a gate that also holds against a
     revocation landing mid-run. Spec:
-    docs/done/unattended_operations_grant.md.
+    knowledge-history/done/unattended_operations_grant.md.
     """
     if await postgres_db.user_can_run_unattended_operations(caller, project_id):
         return
@@ -95,7 +95,7 @@ class ProjectLoopStart(BaseModel):
     # wakes the project's centurion, who decides what runs next; requires an
     # enabled officer thread; role_sequence and iteration budgets are ignored).
     # Start-time only; a live loop converts via POST .../loop/scheduling.
-    # docs/features/loop_unified_engine.md.
+    # knowledge-base/knowledge/features/loop_unified_engine.md.
     scheduling: str = Field("standard", pattern="^(standard|campaign|officer)$")
     # Optional per-loop campaign guardrail overrides ({max_stages,
     # max_extensions, abort_failures}); values above the config hard ceilings

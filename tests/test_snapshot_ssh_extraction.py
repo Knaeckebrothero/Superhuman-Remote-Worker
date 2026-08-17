@@ -8,7 +8,7 @@ stdin file descriptor. The global ``asyncio.create_subprocess_exec`` is patched,
 so no real SSH is spawned.
 
 Also guards the capture-side accept gate (``SnapshotService.capture_vm_snapshot``,
-see docs/features/workspace_durability_tiering.md §C1/C1b): a shell pipeline
+see knowledge-base/knowledge/features/workspace_durability_tiering.md §C1/C1b): a shell pipeline
 (``tar | zstd``) only surfaces the LAST stage's exit code, so a truncated/failing
 ``tar`` upstream is masked and a partial archive gets accepted as good — unless
 the remote command is rewritten to discriminate the two stages via ``PIPESTATUS``.
@@ -562,7 +562,7 @@ class TestCaptureVmSnapshotAcceptGate:
     it") is a routine warning on a live workspace, not a failure — rejecting
     every nonzero rc would fail capture constantly. The honest rule: accept
     rc in {0, 1}; reject rc >= 2 or an empty byte stream. See
-    docs/features/workspace_durability_tiering.md §C1 (C1b block).
+    knowledge-base/knowledge/features/workspace_durability_tiering.md §C1 (C1b block).
     """
 
     @pytest.fixture
@@ -708,7 +708,7 @@ class TestCaptureVmSnapshotAcceptGate:
         tail = body[body.index(anchor) + len(anchor) :]
 
         # (tar_rc, zstd_rc) -> honest mapped exit code (0 clean, 1 tar
-        # warned/accept, 2 fatal) per docs/features/workspace_durability_
+        # warned/accept, 2 fatal) per knowledge-base/knowledge/features/workspace_durability_
         # tiering.md §C1 (C1b): accept tar rc in {0,1}; reject tar rc>=2 or
         # any zstd failure — zstd failing must dominate regardless of tar's
         # own code.
@@ -747,7 +747,7 @@ class TestCaptureVmSnapshotAcceptGate:
         never complete and reclaim-on-idle can never fire. Confirmed on the dev
         cluster: ``tar: /home/agent-host/lost+found: Cannot open: Permission
         denied`` was the sole cause of a real capture rc=2. See
-        docs/features/workspace_durability_tiering.md §C1.
+        knowledge-base/knowledge/features/workspace_durability_tiering.md §C1.
         """
         fake = _fake_capture_proc(returncode=0)
         with patch(

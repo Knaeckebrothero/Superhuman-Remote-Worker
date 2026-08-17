@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 # a live critic pins it, and by the time the critic ends the parent has moved to
 # pending_review/completed — so the guard also avoids churning the VM's
 # expensive ~3-min disk re-clone, see srw_vm_dispatcher_reconciler_churn.)
-# See docs/issues/reviewing_parent_pod_reaped_under_critic.md.
+# See knowledge-base/knowledge/issues/reviewing_parent_pod_reaped_under_critic.md.
 _IDLE_JOB_STATUSES = frozenset(
     {"paused", "pending_review", "reviewing", "waiting_for_reply"}
 )
@@ -314,7 +314,7 @@ class VMInstanceManager:
         Guard: a VM shared by a live child job (a critic SSHed into the parent's
         VM) is never reapable, regardless of the parent's own status. See
         ``_live_shared_child_exists`` and
-        docs/issues/reviewing_parent_pod_reaped_under_critic.md.
+        knowledge-base/knowledge/issues/reviewing_parent_pod_reaped_under_critic.md.
         """
         if _is_stateless_instance(inst):
             return False
@@ -418,7 +418,7 @@ class VMInstanceManager:
         # max_attempts × tick (~5 min observed) while the dead VM holds cluster
         # capacity. Skip straight to exhausted. Honors the
         # ORCHESTRATOR_HAS_TAILNET_ROUTE escape hatch via orchestrator_can_reach
-        # (see docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md §C
+        # (see knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md §C
         # and vm_ssh_readiness_probe_unroutable_from_orchestrator.md §F4).
         host = inst.metadata.get("ssh_host")
         if host and not orchestrator_can_reach(host):
@@ -567,7 +567,7 @@ class VMInstanceManager:
         holds state we could not snapshot, so the disk is the only surviving
         copy — the next create reattaches it by name and the files come back.
         (Before persistent rootdisks this was a force-delete that destroyed
-        them; see docs/features/vm_persistent_rootdisk.md D2.)
+        them; see knowledge-base/knowledge/features/vm_persistent_rootdisk.md D2.)
 
         Requires the controller's ``VM_PERSISTENT_ROOTDISK``: without it the
         disk is still a dataVolumeTemplate the VM owns and cascade-deletes, so
@@ -803,7 +803,7 @@ class VMInstanceManager:
 
         Delete-path coverage for VMs lives in ``delete_job`` (release while
         the row exists); this sweep closes the crash/failure window. See
-        docs/done/deleted_job_orphans_workspace_pod.md.
+        knowledge-history/done/deleted_job_orphans_workspace_pod.md.
         """
         if not self._provisioner_available() or self._db is None:
             return 0
@@ -905,7 +905,7 @@ class VMInstanceManager:
     async def purge_kept_disks(self) -> int:
         """Reclaim rootdisks kept for a recovery that is never coming.
 
-        Layer 2 of the rootdisk GC (docs/features/vm_persistent_rootdisk.md
+        Layer 2 of the rootdisk GC (knowledge-base/knowledge/features/vm_persistent_rootdisk.md
         D4). The normal lifecycle is covered by layer 1: a terminal
         release/delete purges the disk with its VM. This catches the gap —
         a job that was crash-recovered (disk kept) and then cancelled or

@@ -671,7 +671,7 @@ class TestPureInternalEndpoints:
         )
         # The legacy keys are the back-compat contract for older agent builds.
         # `job_status` was added alongside them (Defect 3 of
-        # docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md) and
+        # knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md) and
         # is additive, so assert on the contract rather than exact equality —
         # here it degrades to None because the fake db has no get_job.
         assert result["status"] == "ok"
@@ -684,7 +684,7 @@ class TestPureInternalEndpoints:
 
         Job c6dd288d streamed for 21 more minutes after being failed
         out-of-band because the heartbeat carried nothing back.
-        docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
+        knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
         """
         from main import AgentHeartbeat, agent_heartbeat
 

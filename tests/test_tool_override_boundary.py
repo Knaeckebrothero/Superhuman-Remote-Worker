@@ -47,7 +47,7 @@ What this validator is NOT: an authorization gate. Capability grants
 (``src/core/capability_grants.py``) remain the single PDP, and
 ``TestTheGateIsNotThePDP`` pins that separation.
 
-Design: docs/features/tool_config_policy_vs_membership.md.
+Design: knowledge-base/knowledge/features/tool_config_policy_vs_membership.md.
 """
 
 from __future__ import annotations
@@ -1844,7 +1844,7 @@ class TestExpertWriteBoundary:
     # The kill switch, pinned across the class rather than the instance
     # -------------------------------------------------------------------------
     #
-    # docs/issues/duplicate_expert_bypasses_user_experts_kill_switch.md: five
+    # knowledge-base/knowledge/issues/duplicate_expert_bypasses_user_experts_kill_switch.md: five
     # routes write an expert, and until now `duplicate` was the only one with
     # no save-time gate at all — an administrator's `user_experts` switch did
     # not hold there. But the issue doc's own "Verification owed" section is

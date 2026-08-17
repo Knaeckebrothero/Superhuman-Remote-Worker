@@ -3,7 +3,7 @@
 Regression coverage for the MCP `list_knowledge_notes` crash: confidence is a
 Postgres enum string (`'high'`/`'medium'`/`'low'`), but the formatters applied a
 `%` float format spec, raising `Unknown format code '%' for object of type 'str'`.
-See docs/issues/mcp_knowledge_notes_confidence_percent_format_crash.md.
+See knowledge-base/knowledge/issues/mcp_knowledge_notes_confidence_percent_format_crash.md.
 """
 
 import pytest

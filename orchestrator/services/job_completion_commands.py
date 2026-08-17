@@ -1,7 +1,7 @@
 """Durable admission for agent job-completion reports.
 
 The short accept transaction is the ownership boundary described by
-``docs/features/stateless_agents.md`` section 5.4.5.  It deliberately performs
+``knowledge-base/knowledge/features/stateless_agents.md`` section 5.4.5.  It deliberately performs
 no completion side effects: it validates the lane-specific fence, records the
 immutable command as its first write, advances the per-job commit-order cursor,
 and closes a stateless worker lease before committing.

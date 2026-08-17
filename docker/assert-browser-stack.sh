@@ -12,7 +12,7 @@
 # that no agent could reach: browser-exec and browser-use were added to the
 # container only. Nothing asserted the images agreed, so every VM-backed job
 # silently degraded to "No renderer available" static-only verification.
-# See docs/issues/vm_workspace_missing_browser_exec.md.
+# See knowledge-base/knowledge/issues/vm_workspace_missing_browser_exec.md.
 #
 # A per-image assertion would not have caught that — adding a capability to one
 # image and its own private assert leaves the other image silently short. A
@@ -60,7 +60,7 @@ echo "Asserting workspace browser stack:"
 
 # The only sanctioned browser entry point. The agent invokes it over SSH
 # (src/tools/context.py) and has no local fallback by design — the in-pod
-# browser was removed deliberately (docs/issues/remove_local_browser_fallback.md).
+# browser was removed deliberately (knowledge-base/knowledge/issues/remove_local_browser_fallback.md).
 # If browser-exec is absent the tool returns an opaque empty-stdout error and the
 # agent concludes no renderer exists anywhere.
 _check "browser-exec on PATH"      command -v browser-exec

@@ -6,7 +6,7 @@ as the workspace pod, which sessions delete on idle. This module keeps one
 copy of the last published bytes so the stage survives its workspace.
 
 Design and the signed-off architectural departure this represents:
-``docs/features/canvas_durable_presentation.md``.
+``knowledge-base/knowledge/features/canvas_durable_presentation.md``.
 
 Two rules govern everything here:
 

@@ -58,7 +58,7 @@ from urllib.parse import quote, unquote, urlparse
 
 SOCKET_PATH = os.environ.get("BROWSER_EXEC_SOCKET", "/tmp/browser-exec.sock")
 # Default under the agent-host home (not /tmp) so the workspace snapshot captures
-# it — snapshots exclude /tmp/*. See docs/features/centralized_logging.md.
+# it — snapshots exclude /tmp/*. See knowledge-base/knowledge/features/centralized_logging.md.
 DAEMON_LOG = os.environ.get(
     "BROWSER_EXEC_LOG", str(Path.home() / ".cache" / "srw" / "browser-exec.log")
 )
@@ -74,7 +74,7 @@ PROFILE_DIR = os.environ.get(
 # resolution deterministic: browser-use never has to auto-detect the binary and
 # so never falls back to auto-installing one via ``uvx playwright install``
 # (which isn't on the image, and which every browser-use >=0.13 CDP build reaches
-# for when it can't find a browser). See docs/features/browser_workspace_executor.md §5.1.
+# for when it can't find a browser). See knowledge-base/knowledge/features/browser_workspace_executor.md §5.1.
 CHROMIUM_PATH = os.environ.get("BROWSER_EXEC_CHROMIUM", "/usr/local/bin/agent-chromium")
 # Headful rendering under a virtual X server (see _ensure_display).
 #
@@ -132,7 +132,7 @@ VALID_ACTIONS = {
 }
 
 # ─────────────────────────────────────────────────────────────────────
-# Shared-browser streaming (docs/features/shared_browser.md, Piece 1)
+# Shared-browser streaming (knowledge-base/knowledge/features/shared_browser.md, Piece 1)
 # ─────────────────────────────────────────────────────────────────────
 
 # Loopback-only stream listener. Covered by sshd `PermitOpen 127.0.0.1:*`;
@@ -271,7 +271,7 @@ class StreamHub:
     """Shared-browser stream state: viewers, baton, browser generation.
 
     Owned by the daemon; the single authority for who is driving. See
-    docs/features/shared_browser.md (Piece 1).
+    knowledge-base/knowledge/features/shared_browser.md (Piece 1).
     """
 
     def __init__(self) -> None:
@@ -424,7 +424,7 @@ class ScreencastCdp:
 
     Uses browser-use's own attached CDP client; no debugging port and no
     second connection. The call forms were verified in
-    docs/superpowers/plans/notes-browseruse-cdp-api.md.
+    knowledge-base/knowledge/superpowers/plans/notes-browseruse-cdp-api.md.
     """
 
     def __init__(self, session, hub) -> None:
@@ -707,7 +707,7 @@ class LocalFileServer:
     So ``file://`` is refused on every workspace backend and no setting turns it
     off. Since every mockup an agent writes is a local file, the practical effect
     was that agents could not look at their own work — they'd conclude no
-    renderer existed at all. See docs/issues/vm_workspace_missing_browser_exec.md.
+    renderer existed at all. See knowledge-base/knowledge/issues/vm_workspace_missing_browser_exec.md.
 
     Why serve over HTTP instead of patching the watchdog: patching a vendored
     library's security control is fragile across upgrades, and browser-use is

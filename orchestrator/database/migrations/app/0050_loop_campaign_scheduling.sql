@@ -5,7 +5,7 @@
 --                slot as a multi-job campaign (K sequential stages toward one
 --                initiative) instead of the fixed one-job rotation. A loop
 --                left on the default `rotation` is byte-identical to today.
---                docs/features/loop_campaign_scheduling.md (P0).
+--                knowledge-base/knowledge/features/loop_campaign_scheduling.md (P0).
 -- depends-on:    0048_loop_parallel_stages.sql
 -- expected:      < 1s (ADD COLUMN with constant/NULL defaults; metadata-only,
 --                no table rewrite on PG11+).
@@ -65,7 +65,7 @@ COMMENT ON COLUMN project_loops.scheduling IS
     'Execution-slot scheduling mode: rotation (fixed one-job slot, the '
     'default — byte-identical to pre-0050 behavior) or planner (a checkpoint '
     'Critic may expand the slot into a multi-stage campaign via a filed '
-    'plan). Start-time-only. docs/features/loop_campaign_scheduling.md.';
+    'plan). Start-time-only. knowledge-base/knowledge/features/loop_campaign_scheduling.md.';
 
 COMMENT ON COLUMN project_loops.campaign IS
     'Active campaign control state (planner loops only): stages, cursor, '

@@ -1,6 +1,6 @@
 """Data vocabulary for the MemoryManager seam.
 
-Design: docs/features/agent_memory_overhaul.md §2.1 (this module is the
+Design: knowledge-base/knowledge/features/agent_memory_overhaul.md §2.1 (this module is the
 "Phase 1 refines" of that sketch). The types here are deliberately
 behaviour-free — they carry data between the two graphs and the plugin
 pipeline; all logic lives in the manager and the registered plugins.
@@ -31,7 +31,7 @@ class MemoryPipelineError(RuntimeError):
     the kernel backstop so the caller fails the turn loud rather than serving a
     half-working memory context. Retriever/policy stages keep containment (a
     transient DB blip yields fewer candidates, not a half-working session). See
-    docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+    knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
     """
 
 
@@ -44,7 +44,7 @@ class TransientScorerError(RuntimeError):
     one turn, keep the job alive) from "the scorer is structurally broken"
     (wrong route/auth/response shape → ``MemoryPipelineError``, job-fatal).
     A single reranker ReadTimeout used to discard multi-hour jobs — see
-    docs/issues/reranker_transient_fault_hard_fails_job.md.
+    knowledge-base/knowledge/issues/reranker_transient_fault_hard_fails_job.md.
     """
 
 

@@ -7,7 +7,7 @@ ran the plain authorize-or-403 helpers (``_revalidate_thread_project_ids`` /
 ``_revalidate_thread_datasource_ids``, the latter deleted outright by Task 13
 once this feature left it with no production caller), so a single drifted
 item made the session permanently un-resumable with no way back (the live
-incident behind docs/done/session_config_drift_resume.md). Now it
+incident behind knowledge-history/done/session_config_drift_resume.md). Now it
 reports every drifted item as 428 and accepts an ``acknowledge`` list naming
 the ids the caller accepts losing.
 

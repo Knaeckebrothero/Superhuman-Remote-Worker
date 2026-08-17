@@ -18,7 +18,7 @@ langchain-text-splitters>=0.0.1  # For document chunking in document_tools
 # Exact pin: checkpoint serialization is shared across rotating worker pods;
 # version drift here is persisted-data drift, not a pod-local implementation detail.
 langgraph-checkpoint-postgres==3.1.1
-mcp>=1.9,<2.0  # MCP client SDK (stdio/streamable-http/sse transports) — spec docs/features/mcp_datasources.md
+mcp>=1.9,<2.0  # MCP client SDK (stdio/streamable-http/sse transports) — spec knowledge-base/knowledge/features/mcp_datasources.md
 langchain-mcp-adapters>=0.1.9,<0.2  # load_mcp_tools: MCP tool -> LangChain BaseTool
 langgraph-checkpoint-sqlite>=2.0.0  # SQLite checkpointer for LangGraph
 aiosqlite>=0.19.0  # Async SQLite driver for LangGraph checkpointing

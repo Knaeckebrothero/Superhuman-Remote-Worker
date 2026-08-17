@@ -2,7 +2,7 @@
 
 Backlog tickets are ordinary ``knowledge_index`` notes; category, expert pin and
 dispatch authorization ride their existing ``tags TEXT[]`` rather than new
-columns (docs/features/officer_backlog_pools.md §4). Four tag shapes are
+columns (knowledge-base/knowledge/features/officer_backlog_pools.md §4). Four tag shapes are
 therefore *machine* vocabulary rather than human labels::
 
     ready              dispatch authorization — officer provenance only

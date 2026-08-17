@@ -249,7 +249,7 @@ class TestMessageCountGateNeverBinds:
     past ``message_count_threshold`` compacted at 40% of the window — half the
     intended headroom, on a lossy summarize. The floor must never sit below the
     token gate, so the message-count branch can never be the binding
-    constraint. See docs/done/ + session 1930dec9 (328 msgs, 162.0k/400.0k).
+    constraint. See knowledge-history/done/ + session 1930dec9 (328 msgs, 162.0k/400.0k).
     """
 
     WINDOW = 400_000
@@ -376,7 +376,7 @@ class TestEvidencePreservation:
     """Tests that write-type and error-bearing tool results survive recency
     clearing so the strategic phase audit can cite them verbatim.
 
-    See docs/features/phase_audit_protocol.md.
+    See knowledge-base/knowledge/features/phase_audit_protocol.md.
     """
 
     def test_write_file_result_preserved_when_old(self, mgr):
@@ -724,7 +724,7 @@ class TestContextConfigDefaults:
 
 class TestUpdateLimits:
     """Model hot-swap rebinds thresholds on the EXISTING manager, preserving
-    accumulated state (docs/issues/
+    accumulated state (knowledge-base/knowledge/issues/
     session_model_switch_stale_context_manager_empty_response.md)."""
 
     def test_thresholds_swap_and_state_survives(self):
@@ -766,7 +766,7 @@ class TestUpdateLimits:
 
 # =============================================================================
 # repair_tool_call_arguments / scrub_history_tool_call_arguments
-# (docs/features/outbound_message_hygiene.md — the 2026-07-11 `6a186c76`
+# (knowledge-base/knowledge/features/outbound_message_hygiene.md — the 2026-07-11 `6a186c76`
 #  poisoned-checkpoint incident)
 # =============================================================================
 

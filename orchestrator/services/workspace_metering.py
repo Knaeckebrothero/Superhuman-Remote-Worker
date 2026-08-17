@@ -11,7 +11,7 @@ bounds leaked opens. Keeping the mutable open-interval bookkeeping in the app DB
 and only the finalized rows in the auditdb ledger keeps the ledger append-only
 and keeps the provisioner (no auditdb handle) decoupled.
 
-Design: ``docs/features/observability_and_quotas.md`` ("Compute cost" +
+Design: ``knowledge-base/knowledge/features/observability_and_quotas.md`` ("Compute cost" +
 "open-interval reconciler"). **Non-load-bearing:** every emit is best-effort — a
 metering failure must never break provisioning. v1 meters **container (sandbox)**
 workspaces; VM-tier emits are an additive follow-up (the table + loop are

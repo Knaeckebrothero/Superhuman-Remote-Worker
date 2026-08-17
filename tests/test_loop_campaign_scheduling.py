@@ -1,6 +1,6 @@
 """Unit tests for loop campaign scheduling — the Critic as planner (P0).
 
-Covers the three layers docs/features/loop_campaign_scheduling.md ships dark:
+Covers the three layers knowledge-base/knowledge/features/loop_campaign_scheduling.md ships dark:
 
 1. **Validation** (services/project_loops.py): planner template grammar
    (``planner_slots``), cap overrides (``validate_campaign_caps`` /
@@ -1491,7 +1491,7 @@ class TestLoopNotifications:
 
 class TestDispositionClosesBacklogTicket:
     """Task 6: the critic's verdict mirrors onto the ticket the campaign was
-    built from. ship/kill close it (docs/superpowers/specs/
+    built from. ship/kill close it (knowledge-base/knowledge/superpowers/specs/
     2026-07-26-project-backlog-pipeline-design.md); extend must NOT -- the
     continuing campaign still owns it, and getting this wrong would close a
     ticket that is still being worked. close_backlog_ticket itself (its

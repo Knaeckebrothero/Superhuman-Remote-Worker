@@ -319,7 +319,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
             // updateActiveTurn (recovered === true), promote it to the real
             // id before closing — otherwise the streaming bubble would
             // hang forever (see
-            // docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
+            // knowledge-base/knowledge/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
             // §Approach 2).
             const activeId = state.activeAssistantTurnId;
             const activeTurn =
@@ -700,7 +700,7 @@ function closeOpenEvents(events: TurnEvent[], timestamp: number): TurnEvent[] {
  * real `turn.completed` (or `turn.interrupted`) finally arrives, the
  * placeholder is promoted to the real turn id and closed — see the
  * `turn_completed` case above. See
- * docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
+ * knowledge-base/knowledge/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
  * §Approach 2.
  */
 function ensurePlaceholderTurn(
@@ -738,7 +738,7 @@ function ensurePlaceholderTurn(
  * for the in-flight message keep appending. Frames without a messageId (older
  * rows, interleaved Anthropic/Responses thinking) fall back to adjacency-only
  * behaviour, exactly as before. See
- * docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+ * knowledge-base/knowledge/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
  */
 function appendThought(
     state: ConversationState,

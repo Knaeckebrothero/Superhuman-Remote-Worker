@@ -8,7 +8,7 @@ src/tools/registry.py.
 Phase-1 transplant slices land the legacy current-behaviour plugins here
 (two-tier recall retriever, KB hybrid-search retriever, the extraction/
 curation writers); Phase 3+ adds the measured improvements (reranker,
-gate, bounded core). See docs/features/agent_memory_overhaul.md §5.
+gate, bounded core). See knowledge-base/knowledge/features/agent_memory_overhaul.md §5.
 """
 
 from . import bounded  # noqa: F401  (import-time registration)

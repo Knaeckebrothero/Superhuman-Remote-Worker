@@ -13,7 +13,7 @@ value gets there is a security boundary, not bookkeeping:
   POSTed into it — ``/api/input`` on the agent pod has no authentication of any
   kind. Hence the strip, and hence these tests.
 
-Design: docs/features/session_wake_on_job_completion.md.
+Design: knowledge-base/knowledge/features/session_wake_on_job_completion.md.
 """
 
 from __future__ import annotations

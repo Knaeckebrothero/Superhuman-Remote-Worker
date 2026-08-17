@@ -6,8 +6,8 @@ agent pod: ShellManager requires a workspace backend that declares
 tmux on the workspace over SSH). The former local-libtmux execution path was
 removed — it served a bare-metal dev posture that is deprecated, and a
 dormant in-pod execution path is a liability (same rationale as
-docs/issues/remove_local_browser_fallback.md; see
-docs/features/no_workspace_agent_mode.md §9).
+knowledge-base/knowledge/issues/remove_local_browser_fallback.md; see
+knowledge-base/knowledge/features/no_workspace_agent_mode.md §9).
 
 What remains agent-side:
   * sudo interception and blocked-command gating (must fire before any
@@ -350,7 +350,7 @@ class ShellManager:
                 "ShellManager requires a workspace backend with shell support "
                 "(backend.supports_shell=True). Local in-pod tmux execution was "
                 "removed — shells run only on the workspace. See "
-                "docs/features/no_workspace_agent_mode.md §9."
+                "knowledge-base/knowledge/features/no_workspace_agent_mode.md §9."
             )
 
         self.job_id = job_id

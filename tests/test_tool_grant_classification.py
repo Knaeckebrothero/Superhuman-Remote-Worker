@@ -3,7 +3,7 @@
 ``TOOL_REGISTRY`` entries may carry ``grant`` (``"code"`` / ``"explicit"``) and
 ``gate``.  Nothing reads them yet — the category-level ``true`` expansion that
 will consume them lands separately
-(docs/features/tool_config_policy_vs_membership.md, "Step A: classify code-only
+(knowledge-base/knowledge/features/tool_config_policy_vs_membership.md, "Step A: classify code-only
 tools in the registry").  Metadata with no reader is exactly the kind of thing
 that rots invisibly, so these tests do two jobs:
 

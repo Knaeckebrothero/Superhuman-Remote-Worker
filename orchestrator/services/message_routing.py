@@ -1,6 +1,6 @@
 """Officer-aware routing for worker→human messages.
 
-Implements the policy/route layer of ``docs/features/officer_message_routing.md``:
+Implements the policy/route layer of ``knowledge-base/knowledge/features/officer_message_routing.md``:
 
 * **M1** — :func:`resolve_effective_policy`: the server-side, per-message
   resolver from a job to its project's ``project_officers.communication_policy``.

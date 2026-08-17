@@ -12,7 +12,7 @@ loop's explicit Scholar→Critic→Execution rotation IS the cycle and the
 auto-hooks don't fight it. State is shared between iterations through the
 project knowledge base (a blackboard), not this row.
 
-Design: docs/features/project_self_improvement_loop.md.
+Design: knowledge-base/knowledge/features/project_self_improvement_loop.md.
 """
 
 from __future__ import annotations
@@ -62,19 +62,19 @@ class TerminalMergeReconciliationError(RuntimeError):
 # analysis roles coordinate through the KB, so no file change is normal. The
 # execution slot is swappable (developer / default / a future writer), so
 # analysis is the closed set and everything else is treated as execution.
-# See docs/features/project_jobs_repo_retirement.md.
+# See knowledge-base/knowledge/features/project_jobs_repo_retirement.md.
 #
 # product-qa audits the SHIPPED product (missing UI, broken setup, integration
 # gaps) and files issue candidates as KB notes — it never touches `repo/`, so an
 # `empty` merge is normal, not lost work. It coordinates through the KB exactly
-# like scholar/critic. Wiring per docs/features/loop_parallel_stages.md (Phase 0).
+# like scholar/critic. Wiring per knowledge-base/knowledge/features/loop_parallel_stages.md (Phase 0).
 LOOP_ANALYSIS_ROLES: frozenset[str] = frozenset({"scholar", "critic", "product-qa"})
 
 # Ceiling on how long a born-parked loop member may wait for a model-cooldown
 # reset. A pathological upstream reset_at must not park a loop for a year; an
 # early wake self-heals (the member re-hits the remaining cooldown → in-job
 # pause if ≤12h, else fail-fast → the next member re-parks on a fresh reset).
-# docs/issues/loop_advances_into_active_model_cooldown.md
+# knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md
 LOOP_COOLDOWN_PARK_CAP_SECONDS: int = 14 * 24 * 3600
 
 
@@ -129,7 +129,7 @@ def job_loop_id(job: dict[str, Any]) -> str | None:
 def normalize_stage(entry: Any) -> list[str]:
     """Normalize one ``role_sequence`` entry to its list of concurrent roles.
 
-    The loop grammar (docs/features/loop_parallel_stages.md, Phase 1) lets an
+    The loop grammar (knowledge-base/knowledge/features/loop_parallel_stages.md, Phase 1) lets an
     entry be either a single role name (``"scholar"`` — a one-job stage) or a
     list of role names (``["scholar", "product-qa"]`` — a fan-out stage whose
     jobs run concurrently and barrier before the loop rotates). This collapses
@@ -179,7 +179,7 @@ def validate_role_sequence(role_sequence: list[Any]) -> None:
                 )
 
 
-# --- Campaign scheduling (docs/features/loop_campaign_scheduling.md, P0) ---
+# --- Campaign scheduling (knowledge-base/knowledge/features/loop_campaign_scheduling.md, P0) ---
 #
 # Guardrail defaults for planner-mode loops. Per-loop overrides live in the
 # loop row's `campaign_caps` and are validated against the hard ceilings at
@@ -473,7 +473,7 @@ def validate_loop_plan(plan: Any, loop: dict[str, Any]) -> dict[str, Any]:
 
 
 # Loop roles that get a WORK-CATEGORY contract prepended to their identity block
-# (docs/features/officer_backlog_pools.md §7). The contract says what shape the
+# (knowledge-base/knowledge/features/officer_backlog_pools.md §7). The contract says what shape the
 # deliverable takes and what counts as evidence; the identity block below says
 # who this agent is within the loop's rotation.
 #
@@ -729,7 +729,7 @@ def _format_budget(remaining: int | None, run_until: Any) -> str:
 def _planner_critic_block(loop: dict[str, Any], budget_line: str) -> str:
     """Planner duties appended to a checkpoint critic's kickoff.
 
-    docs/features/loop_campaign_scheduling.md (P1). Covers: the loop_plan verb
+    knowledge-base/knowledge/features/loop_campaign_scheduling.md (P1). Covers: the loop_plan verb
     + budget arithmetic, the disposition duty when a campaign awaits review,
     why campaigns exist (multi-job investments beat horizon-1 selection), and
     the no-fictional-stakeholders rule the Better Resavio audit earned.
@@ -937,7 +937,7 @@ def build_loop_kickoff(
         "look for it.",
     ]
 
-    # Campaign-scheduled loops (docs/features/loop_campaign_scheduling.md):
+    # Campaign-scheduled loops (knowledge-base/knowledge/features/loop_campaign_scheduling.md):
     # campaign context for members, planner duties for the checkpoint critic.
     if (loop.get("scheduling") or "standard") == "campaign":
         stamps = extra_context or {}
@@ -999,7 +999,7 @@ async def create_loop_job(
     (the same lever ``session_base.yaml`` uses) rather than by editing the
     ``memory.pipeline.writers`` list — a scalar deep-merge that leaves the
     append-only extractors, the KB curator, and the writers list untouched. See
-    docs/features/loop_parallel_stages.md and [[project_kb_convergence_f13]].
+    knowledge-base/knowledge/features/loop_parallel_stages.md and [[project_kb_convergence_f13]].
 
     ``backlog_block`` is threaded straight through to ``build_loop_kickoff`` —
     this function does no fetching itself, it just carries the caller's
@@ -1014,7 +1014,7 @@ async def create_loop_job(
     # Curation is the exception: it is the inline KB extractor/assembler aux pass
     # (not a competing job rotation), and it is what makes the loop's knowledge
     # compound and converge across cycles, so the loop turns it ON.
-    # See docs/features/kb_convergence_ttl_reverification.md.
+    # See knowledge-base/knowledge/features/kb_convergence_ttl_reverification.md.
     config_override: dict[str, Any] = {
         "verification": {"enabled": False},
         "scholar": {"enabled": False},
@@ -1024,7 +1024,7 @@ async def create_loop_job(
         # memory, while durable files hand off through project cloud delivery.
         # A step that loses its embedding-backed stores must pause for
         # re-dispatch rather than run blind (see
-        # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md).
+        # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md).
         "memory": {"required": True},
     }
     model = loop.get("model")
@@ -1095,7 +1095,7 @@ async def create_loop_job(
         context["loop_seq_index"] = int(seq_index)
         context["loop_remaining"] = remaining_iterations
 
-    # Born parked (docs/issues/loop_advances_into_active_model_cooldown.md): the
+    # Born parked (knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md): the
     # previous turn failed on a model cooldown that outlives the pause budget, so
     # this member is created paused-with-freeze instead of dispatched —
     # freeze_data non-NULL hides it from the dispatcher and the existing
@@ -1253,7 +1253,7 @@ async def merge_loop_job_branch(
                          job that worked directly on ``main`` (its push
                          already landed) completing after the v2 deploy.
 
-    Design: docs/features/loop_repo_compounding_v2.md.
+    Design: knowledge-base/knowledge/features/loop_repo_compounding_v2.md.
     """
     repo_name = job.get("repo_name")
     branch = job.get("branch_name")
@@ -1465,7 +1465,7 @@ async def merge_loop_job_contribution(
     """Land a completed loop job's contribution on ``main`` — curated when
     the job carries a file-deliverable contract, full squash-merge otherwise.
 
-    The §6.4 change (docs/features/workspace_and_change_records.md): a job
+    The §6.4 change (knowledge-base/knowledge/features/workspace_and_change_records.md): a job
     with ``required_deliverables`` naming at least one FILE gets a **curated
     merge** — the contracted files are copied from the branch head onto
     ``main`` as ONE commit and *nothing else merges*. The branch becomes a

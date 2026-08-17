@@ -6,7 +6,7 @@ Single entry point for main-cloud backends. The orchestrator imports
 backend instance. Individual backends live in siblings of this module
 (``nextcloud.py`` today; ``opencloud.py`` / ``ms365.py`` in later phases).
 
-See ``docs/features/main_cloud_abstraction.md`` for the full design.
+See ``knowledge-base/knowledge/features/main_cloud_abstraction.md`` for the full design.
 """
 
 from __future__ import annotations
@@ -133,7 +133,7 @@ class MainCloudRouter:
         Call sites should NOT read this directly to act on a resource —
         resolve through ``for_project`` / ``for_thread`` / ``for_owner`` so a
         live backend swap can't land an operation on the wrong cloud
-        (Issue 16, docs/issues/main_cloud.md). ``active`` is for the admin
+        (Issue 16, knowledge-base/knowledge/issues/main_cloud.md). ``active`` is for the admin
         config surface (reporting / editing *which* backend is active) and is
         the value those seams return today.
         """
@@ -184,7 +184,7 @@ class MainCloudRouter:
         resolution (owner → org → backend) under multi-tenancy; today every
         owner resolves to the single global active backend. Adding the
         parameter now means multi-tenancy later is "fill in the key" here,
-        not a call-site refactor. See Issue 16 in docs/issues/main_cloud.md.
+        not a call-site refactor. See Issue 16 in knowledge-base/knowledge/issues/main_cloud.md.
         """
         return self._active
 

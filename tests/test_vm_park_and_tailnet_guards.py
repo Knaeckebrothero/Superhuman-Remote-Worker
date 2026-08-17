@@ -1,6 +1,6 @@
 """VM park fails the job + orchestrator-vantage tailnet guards.
 
-Covers the fix for docs/issues/
+Covers the fix for knowledge-base/knowledge/issues/
 vm_ssh_readiness_probe_unroutable_from_orchestrator.md:
 
 - ``_fail_vm_parked_job`` (main.py): a terminally-parked VM job must go

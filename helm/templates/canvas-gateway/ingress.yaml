@@ -9,7 +9,7 @@
 # validates the exact UUID host and owns all security headers itself; an
 # ordinary normalizing ingress in front is a supported edge (adjacent-slash
 # merging is an accepted, documented limitation of this mode — see
-# docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). Deployments
+# knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). Deployments
 # fronted by a Cloudflare tunnel or an operator-owned edge leave this off
 # and route to the ClusterIP Service directly.
 apiVersion: networking.k8s.io/v1

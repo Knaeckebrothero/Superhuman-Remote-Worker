@@ -11,7 +11,7 @@ resume path, which performs the full dispatch-time injection — so these tests
 pin (a) that the shared path injects before POSTing, and (b) that the endpoint
 actually delegates to it and falls back to queue-for-dispatch on decline.
 
-See docs/issues/job_resume_direct_path_skips_credential_injection.md.
+See knowledge-base/knowledge/issues/job_resume_direct_path_skips_credential_injection.md.
 """
 
 from __future__ import annotations
@@ -805,7 +805,7 @@ class TestResumePayloadGitRemote:
     (``metadata["git_remote_url"]`` gate in ``_setup_job_workspace``) can
     never fire, so a resume onto a fresh workspace with no snapshot silently
     restarts from a blank tree
-    (docs/issues/resume_fresh_workspace_no_clone_fallback.md).
+    (knowledge-base/knowledge/issues/resume_fresh_workspace_no_clone_fallback.md).
     """
 
     @pytest.mark.asyncio

@@ -8,7 +8,7 @@ endpoint (tests/test_officer_lifecycle.py); the spawn choke point is covered in
 tests/test_loop_unified_advance.py. This file covers the loop ROUTER: which
 verbs are gated, which deliberately are not, and the shape of the refusal.
 
-Spec: docs/done/unattended_operations_grant.md.
+Spec: knowledge-history/done/unattended_operations_grant.md.
 """
 
 from __future__ import annotations

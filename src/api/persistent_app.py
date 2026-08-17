@@ -145,7 +145,7 @@ _termination_task: Optional[asyncio.Task[None]] = None
 # cancels and awaits it before nulling _session, so out-of-band callers
 # (heartbeat intents, thread-status watchdog, drain) can't race the in-flight
 # turn into a NoneType.permission_mode crash. See
-# docs/issues/persistent_session_permission_check_race.md.
+# knowledge-base/knowledge/issues/persistent_session_permission_check_race.md.
 #
 # Headless sessions (chunk 1): the loop now outlives any single WebSocket. It is
 # only cancelled by _terminate_session, never by WS close.
@@ -312,7 +312,7 @@ _turn_event_open: bool = False
 # guarded by ``if _session.workspace_sync:`` and nothing ever rebuilds it — so a
 # few-seconds-late sync target (or a transient WebDAV blip) cost the user every
 # push and pull of the session.
-# docs/done/session_resume_cloud_sync_race_late_provision.md
+# knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
 _cloud_sync_retry_pending: bool = False
 
 # The turn-end cloud push runs as a background task so the loop can park —
@@ -323,7 +323,7 @@ _cloud_sync_retry_pending: bool = False
 # the same dedup state) and by every teardown path before the final
 # push_all/aclose. At most one task is pending at a time: the only spawner
 # runs after the previous turn's task was awaited.
-# docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+# knowledge-base/knowledge/issues/session_turn_end_cloud_push_blocks_queued_input.md
 _pending_cloud_push_task: Optional[asyncio.Task] = None
 
 # M3 full-turn-settlement seam for the stateless executor (turn_executor.py): a
@@ -437,7 +437,7 @@ _NOTIFICATION_METHODS = frozenset(
 
 # Roles POST /api/input may request. 'human' is the normal path; 'event' is a
 # system-injected notice (currently: a worker job this session created reached a
-# terminal state — docs/features/session_wake_on_job_completion.md).
+# terminal state — knowledge-base/knowledge/features/session_wake_on_job_completion.md).
 #
 # An allow-list rather than a passthrough because /api/input has NO
 # authentication of any kind (no session token, no internal key; the agent
@@ -563,7 +563,7 @@ async def _ensure_nats_client():
 def _officer_cfg():
     """Return this session's OfficerConfig when officer.enabled, else None.
 
-    Centurion sessions (docs/features/centurion.md): the flag decides the
+    Centurion sessions (knowledge-base/knowledge/features/centurion.md): the flag decides the
     officer branches in the input wait, the natural-pause flips, the boot
     self-wake, and the ready-mirror suppression.
     """
@@ -626,7 +626,7 @@ def _turn_in_flight() -> bool:
     Exposed via the agent's ``/status`` and ``/session/status`` so the
     orchestrator's ``end_thread`` can refuse to tear down a session that is
     mid-turn without an explicit ``force``
-    (docs/issues/session_silent_failure_audit.md #11).
+    (knowledge-base/knowledge/issues/session_silent_failure_audit.md #11).
     """
     return _loop_task is not None and not _loop_task.done() and not _awaiting_input
 
@@ -634,7 +634,7 @@ def _turn_in_flight() -> bool:
 def _session_toolset_report() -> dict:
     """The toolset this session ACTUALLY bound, for the orchestrator to serve.
 
-    D6 (``docs/issues/tool_configuration_defects_and_fix_roadmap.md``): the
+    D6 (``knowledge-base/knowledge/issues/tool_configuration_defects_and_fix_roadmap.md``): the
     resolved answer comes from the agent, not from an orchestrator-side
     re-implementation.  Everything that decides the final set happens HERE and
     only here — the runtime injection layer (``_load_tools_for_backend``
@@ -841,7 +841,7 @@ async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
 
     Idempotent: fires once per process; later heartbeats observing the same
     intent are no-ops. See
-    docs/issues/session_agent_drift_drain_kills_idle_sessions.md.
+    knowledge-base/knowledge/issues/session_agent_drift_drain_kills_idle_sessions.md.
     """
     global _drain_intent_handled, _drain_deferred_logged
     if _drain_intent_handled:
@@ -1212,7 +1212,7 @@ async def _exit_grant_denied(thread_id: str, exc: Exception) -> NoReturn:
     a transient workspace problem — a rebind hits the identical denial — so we do
     NOT claim the orchestrator will recover it. The cockpit re-surfaces the
     reason on its next create/prepare via the grant pre-flight (Layers 1/2).
-    See docs/issues/session_permission_mode_grant_denied_ready_timeout.md.
+    See knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md.
     """
     logger.error(
         "Session attach denied for thread %s by capability grants (%s) — exiting "
@@ -1244,7 +1244,7 @@ async def _exit_memory_unavailable(thread_id: str, exc: Exception) -> NoReturn:
     crash-looping. The cockpit re-surfaces the reason on its next create/prepare
     via the orchestrator's endpoint pre-flight (which validates the same roles
     before spawning a pod). See
-    docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+    knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
     """
     logger.error(
         "Session attach failed for thread %s — required memory unavailable (%s) "
@@ -1391,7 +1391,7 @@ async def lifespan(app: FastAPI):
                 # clause below exits this pod cleanly so it leaves the
                 # per-session Service endpoints instead of black-holing
                 # connections. See
-                # docs/done/persistent_thread_double_provisioning_race.md.
+                # knowledge-history/done/persistent_thread_double_provisioning_race.md.
                 # A False return here is a *different*, transient failure
                 # (network / 5xx): keep the pod up but session-less.
                 dedicated_register_ok = await _orchestrator_client.register(
@@ -1551,7 +1551,7 @@ def _build_sync_coordinator(
 
     Handles both v1 (flat ``{backend, webdav_url, auth}``) and v2
     (``{version: 2, session_folder, mounts: [...]}``). Phase 1 of
-    ``docs/features/cloud_collaboration_model.md`` §9.
+    ``knowledge-base/knowledge/features/cloud_collaboration_model.md`` §9.
 
     The legacy session folder (v2 ``session_folder``, or the whole v1
     payload) is mounted at the workspace root. Project mounts (and, in
@@ -1657,7 +1657,7 @@ def _load_expert_config(config_name: str):
     as a worker ('defaults') can serve a session under the thread's own
     config — post-cutover the memory pipeline (and the whole session
     profile) is a per-mode YAML choice
-    (docs/issues/session_config_name_plumbing.md, hole B).
+    (knowledge-base/knowledge/issues/session_config_name_plumbing.md, hole B).
 
     Raises on unknown names: the attach endpoint turns that into a 500 and
     the orchestrator falls back to provisioning a dedicated pod with the
@@ -1716,7 +1716,7 @@ def _session_backend_is_vm(config: Optional[Dict[str, Any]]) -> bool:
     accept ONLY that VM: a sandbox container is ready in seconds while a cold VM
     boot takes minutes, so a container that exists for any reason would always
     win the race and silently attach the session to the wrong tier
-    (docs/issues/session_vm_backend_never_attaches.md Defect 2).
+    (knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md Defect 2).
 
     Same dual-shape contract as :func:`_session_backend_is_lite`.
     """
@@ -2569,7 +2569,7 @@ async def _attach_session(
             # Drop-in fallback to the main session model when the dedicated aux
             # model is unreachable — keeps compaction/memory/titles alive instead
             # of crashing the session. See
-            # docs/issues/openrouter_auxiliary_misrouted_to_openai.md.
+            # knowledge-base/knowledge/issues/openrouter_auxiliary_misrouted_to_openai.md.
             fallback_llm=llm,
             fallback_structured_output_method=fallback_settings.get(
                 "structured_output_method", "json_schema"
@@ -2727,7 +2727,7 @@ async def _attach_session(
 
     # Clone repository datasources into the workspace (deferred from above).
     # All clone/auth operations run on the workspace backend — there is no
-    # agent-local clone path (docs/features/no_workspace_agent_mode.md §9.4).
+    # agent-local clone path (knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4).
     if repo_datasources and _session.workspace_manager:
         from ..core.datasource_setup import clone_repository_datasources
 
@@ -2863,7 +2863,7 @@ async def _attach_session(
             # was swallowed to a warning and the session then ran unsynced for
             # its entire life with no signal — the exact mechanism behind the
             # prod-private "files didn't clone, but I saw no error" incident
-            # (docs/issues/main_cloud.md Issue 13). Surface it to the cockpit
+            # (knowledge-base/knowledge/issues/main_cloud.md Issue 13). Surface it to the cockpit
             # over the same workspace_sync.error channel the turn-loop uses
             # (_resilient_cloud_sync), so the operator sees a degraded-sync
             # state instead of silence.
@@ -2884,7 +2884,7 @@ async def _attach_session(
         # thread (session-folder provisioning failed upstream, so nc_session_folder
         # and the project mounts are all empty). Surface the same degraded-sync
         # state the failed-initial-pull path uses, instead of running silently
-        # unsynced for the session's whole life (docs/issues/main_cloud.md Issue 13).
+        # unsynced for the session's whole life (knowledge-base/knowledge/issues/main_cloud.md Issue 13).
         logger.warning(
             "Thread %s: main cloud is up but no sync target resolved — "
             "session will run unsynced.",
@@ -3441,7 +3441,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             project_ids (list[str], optional): Project IDs for scoping
             config_name (str, optional): Thread's config — used as the session
                 base instead of this pod's boot config (pool pods boot as
-                workers; see docs/issues/session_config_name_plumbing.md)
+                workers; see knowledge-base/knowledge/issues/session_config_name_plumbing.md)
         """
         if _stateless_mode():
             # The executor owns attach/detach on this pod — an out-of-band
@@ -3600,7 +3600,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 #     then delegates here).
 #
 # Mirror of the /ws/chat consolidation; same rationale, see
-# docs/issues/persistent_session_dual_mode_phase1_gap.md.
+# knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md.
 
 
 async def _accept_user_input(content: str, *, role: str = "human") -> str:
@@ -3956,7 +3956,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
       - dual_app.ws_chat (dual mode — adds pod-state pre-checks then
         delegates here). Sharing this body is what closes the Phase-1
         gap described in
-        docs/issues/persistent_session_dual_mode_phase1_gap.md.
+        knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md.
     """
     import uuid
 
@@ -4018,7 +4018,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
     # waiting on an answer. The durable row survives, but REST history does
     # not carry it, so without this a reload (or a dropped live stream) leaves
     # the approval card unrenderable and the gate unanswerable — the failure
-    # in docs/done/supervised_parallel_gates_timeout_fabricates_denial.md.
+    # in knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md.
     running_tool = inflight_tool_call(_session.messages) if _tool_inflight else None
     if running_tool is not None:
         running_tool = {
@@ -7998,7 +7998,7 @@ async def _pending_permission_requests() -> List[Dict[str, Any]]:
     re-render an approval card it never received — or received and then lost
     when the live stream dropped. REST history does not carry pending gates,
     so without this a reload leaves the gate stranded and the user has no way
-    to answer it (docs/done/supervised_parallel_gates_timeout_fabricates_denial.md).
+    to answer it (knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md).
 
     Soft-fails to ``[]``: a welcome frame must still go out if this lookup
     breaks.
@@ -8064,7 +8064,7 @@ async def _wait_for_permission_resolution(
     run). Only when untethered — nobody is there to answer — does the slice
     CAS-expire the row so the loop can't hang on a client that isn't coming
     back. A hard interrupt (Stop) always breaks the wait promptly.
-    See docs/done/supervised_parallel_gates_timeout_fabricates_denial.md.
+    See knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md.
     """
     if _session is None or _session.postgres_conn is None:
         # The session died mid-wait. Nothing can answer the question any more,
@@ -8348,7 +8348,7 @@ async def _loop_permission_check(
                   gone / the DB can't hold a gate), so the call really is off.
       NO_ANSWER — the gate was never answered. NOT a refusal: the loop parks
                   the turn instead of telling the model the user denied it
-                  (docs/done/supervised_parallel_gates_timeout_fabricates_denial.md).
+                  (knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md).
 
     The race-fix from commit 3a1d265: if _terminate_session nulled _session
     while permission_check was being scheduled, this DECLINEs — the session is
@@ -8865,7 +8865,7 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
     Silent by design after the first failure — the degraded toast was already
     raised at attach, and re-broadcasting it every turn would be noise. Only
     the transition back to working is announced.
-    docs/done/session_resume_cloud_sync_race_late_provision.md
+    knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
     """
     global _cloud_sync_retry_pending
 
@@ -9020,7 +9020,7 @@ def _wire_session_aux_archiver() -> None:
     Idempotent and cheap (just assigns three fields); fire-and-forget. Uses
     ``job_id=_thread_id`` + ``agent_type="persistent"`` to match the session
     main-call archiving in ``_loop_archive_llm_call``. See
-    docs/issues/surface_silent_aux_failures.md (Phase 1.6).
+    knowledge-base/knowledge/issues/surface_silent_aux_failures.md (Phase 1.6).
     """
     if _session is None or getattr(_session, "auxiliary_llm", None) is None:
         return
@@ -9208,7 +9208,7 @@ async def _loop_on_turn_complete_body(
     # before its pull, preserving push→pull ordering per mount; teardown
     # awaits it before the final sync. Retry + workspace_sync.* broadcasts
     # are unchanged inside _run_turn_end_cloud_push.
-    # docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+    # knowledge-base/knowledge/issues/session_turn_end_cloud_push_blocks_queued_input.md
     if _session.workspace_sync:
         global _pending_cloud_push_task
         # Only reachable with no task pending (turn start awaited it), but a
@@ -9450,7 +9450,7 @@ async def _record_compaction(
     }
     # Completion stats from the summarization engine (n_passes, duration_ms,
     # before/after tokens) — extends context.compacted per
-    # docs/features/context_summarization_rework.md.
+    # knowledge-base/knowledge/features/context_summarization_rework.md.
     ctx_mgr_stats = getattr(
         getattr(_session, "context_manager", None),
         "_last_summarization_stats",
@@ -9516,7 +9516,7 @@ async def _loop_compaction_progress(event: str, params: Dict[str, Any]) -> None:
     emitted by ``_record_compaction``). ``_broadcast`` stamps ``(epoch, seq)``
     and journals into ``thread_events``, so a reload mid-compaction
     reconstructs the progress UI from SSE replay.
-    See docs/features/context_summarization_rework.md (S3).
+    See knowledge-base/knowledge/features/context_summarization_rework.md (S3).
     """
     _broadcast(event, params)
 
@@ -10211,7 +10211,7 @@ async def _save_turn_ai_messages(
 async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
     """Rewind the session to just before an earlier user message.
 
-    docs/features/session_rewind.md §Flow — attached. Order is load-bearing:
+    knowledge-base/knowledge/features/session_rewind.md §Flow — attached. Order is load-bearing:
     resolve+validate target (a pure validation error must not disturb an
     in-flight turn or queued input) → interrupt+wait → drain queue → git
     forward-restore (fallible, gates everything) → DB sweep+ledger →
@@ -11115,7 +11115,7 @@ async def _handle_config_update(
         # window after a model switch — a downswitch (e.g. gpt-5.5 → codex
         # spark) then never compacts and every turn dead-ends in "empty
         # response" once the history exceeds the new model's window. See
-        # docs/done/session_model_switch_stale_context_manager_empty_response.md.
+        # knowledge-history/done/session_model_switch_stale_context_manager_empty_response.md.
         _session.refresh_context_limits()
 
         # Rebuild auxiliary LLM if auxiliary settings changed. Symmetric to
@@ -11570,7 +11570,7 @@ async def _poll_workspace_ready(
     a cold KubeVirt boot (CDI import + guest boot) routinely runs minutes past
     the sandbox-container ``timeout`` default, so the deadline self-extends
     rather than declaring a still-booting VM "not ready"
-    (docs/features/session_create_on_vm.md).
+    (knowledge-base/knowledge/features/session_create_on_vm.md).
 
     ``require_vm`` makes the VM the ONLY acceptable answer: a ready sandbox
     container is refused (and logged as a provisioning leak) instead of being
@@ -11579,7 +11579,7 @@ async def _poll_workspace_ready(
     and since a container is ready in ~8 s against a multi-minute VM boot it wins
     that race every time. Callers pass this when the thread's resolved tier is
     ``vm``; the sandbox-upgrade caller deliberately does not
-    (docs/issues/session_vm_backend_never_attaches.md Defect 2).
+    (knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md Defect 2).
 
     Returns:
         Workspace config dict {"backend": "remote", "remote": {host, port, ...}}
@@ -12021,7 +12021,7 @@ async def _handle_workspace_upgrade(
         #     for a vm runtime) and remount BEFORE retooling, since
         #     srw_cloud_status exposure is gated on an active mount. Best-effort:
         #     a remount failure must not abort the otherwise-successful upgrade.
-        #     See docs/issues/workspace_upgrade_drops_cloud_mount.md.
+        #     See knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md.
         try:
             _ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             _fresh_cloud_mount = _ws_info.get("cloud_mount") if _ws_info else None

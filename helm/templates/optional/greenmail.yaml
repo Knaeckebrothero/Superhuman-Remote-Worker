@@ -2,7 +2,7 @@
 GreenMail — test-only mail server for the `email` datasource.
 
 Disposable IMAP+IMAPS+SMTP(+S) server backing the email datasource
-integration tests (docs/features/email_datasource.md §Testing). Auth is
+integration tests (knowledge-base/knowledge/features/email_datasource.md §Testing). Auth is
 disabled: any user/password pair works and mailboxes are created on first
 use; all state is in-memory (no PVC — a pod restart wipes it, which is the
 point). Seed folders + fixture mails with scripts/seed_greenmail.py, e.g.

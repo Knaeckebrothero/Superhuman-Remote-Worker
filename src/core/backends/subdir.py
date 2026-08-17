@@ -22,7 +22,7 @@ session); teardown uses ``close_reader_tabs()`` to close only this reader's tabs
 
 Used by the light-subagent reader environment so each reader's file/git/shell
 tools operate inside its own worktree while sharing the parent's connection.
-See docs/issues/delegation_light_mode_missing.md (Phase 2).
+See knowledge-base/knowledge/issues/delegation_light_mode_missing.md (Phase 2).
 """
 
 import logging

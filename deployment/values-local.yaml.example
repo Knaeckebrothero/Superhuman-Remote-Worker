@@ -94,7 +94,7 @@ secrets:
     # stays orchestrator-side (TTS is orchestrator-only, never fanned out to
     # agents). Leave blank to skip — Kokoro/OpenAI still work. Get a key at
     # https://elevenlabs.io, then `helm upgrade`. See
-    # docs/features/tts_vendor_providers.md for registering the voice model row.
+    # knowledge-base/knowledge/features/tts_vendor_providers.md for registering the voice model row.
     ELEVENLABS_API_KEY: ""
 
     # App DBs (dev passwords, never rotate locally)
@@ -395,5 +395,5 @@ opencloud:
 
 logLevel: "DEBUG"
 # Local k3d keeps human-readable logs ("json" once Loki lands — see
-# docs/features/centralized_logging.md).
+# knowledge-base/knowledge/features/centralized_logging.md).
 logFormat: "text"

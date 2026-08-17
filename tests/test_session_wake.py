@@ -1,6 +1,6 @@
 """Session wake on job completion — Phase 1.
 
-Covers the delivery half (docs/features/session_wake_on_job_completion.md):
+Covers the delivery half (knowledge-base/knowledge/features/session_wake_on_job_completion.md):
 enqueue guards, the claim/settle contract, live inject vs the durable branch,
 the liveness predicate, and the payload. The DB is faked at the methods the
 service touches; the SQL guards themselves (per-status dedup, SKIP LOCKED

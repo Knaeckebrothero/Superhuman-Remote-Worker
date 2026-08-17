@@ -120,7 +120,7 @@ spec:
                 secretKeyRef:
                   name: srw-secrets
                   key: KEYCLOAK_ADMIN_PASSWORD
-            # Cookie BFF (see docs/features/auth_bff_and_api_tokens.md)
+            # Cookie BFF (see knowledge-base/knowledge/features/auth_bff_and_api_tokens.md)
             - name: KEYCLOAK_CLIENT_ID
               valueFrom:
                 configMapKeyRef:

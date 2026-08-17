@@ -19,7 +19,7 @@ legacy spellings are already canonical (``[names]`` is
 resolved tool set anywhere and the eight ``== []`` consumers keep working
 untouched.
 
-Design: ``docs/features/tool_config_policy_vs_membership.md``.
+Design: ``knowledge-base/knowledge/features/tool_config_policy_vs_membership.md``.
 """
 
 from __future__ import annotations

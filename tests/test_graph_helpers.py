@@ -730,7 +730,7 @@ class TestClassifyLlmError:
         providers say 'invalid_request_error'. The 2026-07-11 wedge: a
         deterministic "invalid function arguments json string" 400 was
         classified transient and pause/backoff-looped forever — see
-        docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md
+        knowledge-history/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md
         (Finding 3)."""
         err = _make_sdk_error(
             "BadRequestError",
@@ -899,7 +899,7 @@ class TestClassifyLlmError:
     def test_429_insufficient_quota_is_quota_exhausted(self):
         """OpenAI's insufficient_quota billing wall (a 429) must fail fast, not
         pause for hours on the outage backoff path — no wait fixes a spend cap.
-        See docs/features/llm_outage_pause_and_backoff_redispatch.md."""
+        See knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md."""
         err = _make_sdk_error(
             "RateLimitError",
             429,
@@ -1189,7 +1189,7 @@ class TestIsOutputTruncated:
 
 # =============================================================================
 # _cooldown_failfast_error — structured payload for the cooldown fail-fast
-# (docs/issues/loop_advances_into_active_model_cooldown.md)
+# (knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md)
 # =============================================================================
 
 
@@ -1215,7 +1215,7 @@ class TestCooldownFailfastError:
 
 # =============================================================================
 # _cooldown_within_pause_budget — the pause-vs-fail-fast cutoff for a cooldown
-# (docs/features/llm_cooldown_pause_and_resume.md)
+# (knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md)
 # =============================================================================
 
 

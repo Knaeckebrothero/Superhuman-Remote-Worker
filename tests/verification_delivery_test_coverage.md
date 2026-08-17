@@ -1,7 +1,7 @@
 # Verification + delivery-failure — test coverage map (what's covered vs what isn't)
 
-Companion to `docs/issues/verification_fail_closed_followups.md` and
-`docs/done/git_push_fails_silently_via_workspace_backend.md`. Records what is
+Companion to `knowledge-base/knowledge/issues/verification_fail_closed_followups.md` and
+`knowledge-history/done/git_push_fails_silently_via_workspace_backend.md`. Records what is
 pinned, by which mechanism, and — the point of this file — **what is not**, why
 it is safe today, and how to close it.
 
@@ -154,7 +154,7 @@ Nothing here is a known defect. Each is a missing pin.
   changing that reasoning first.
 - **The critic's own workspace sharing.** Nothing runs two agents against one
   filesystem, which is why
-  `docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md`
+  `knowledge-history/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md`
   surfaced only on a real two-round run. A unit test cannot reach it; this is
   live-gate territory.
 
@@ -168,18 +168,18 @@ Two attempts died before round 2 on unrelated infrastructure. No unit test can
 substitute — the failures both times were in the seams between real components.
 
 Before a third attempt, see the "what a third run needs" table in
-`docs/issues/verification_fail_closed_followups.md`. Both infrastructure
+`knowledge-base/knowledge/issues/verification_fail_closed_followups.md`. Both infrastructure
 blockers are now closed; **the fixture itself is still defective** and must be
 rewritten first — the agent read "omit X now, add it when returned" as a script
 to run internally rather than as two rounds, so round 1 had no gap to find.
 
 ## 4. Related
 
-- `docs/issues/verification_fail_closed_followups.md` — open follow-ups, the
+- `knowledge-base/knowledge/issues/verification_fail_closed_followups.md` — open follow-ups, the
   settled-questions record, and the live-gate results
-- `docs/issues/verification_round_reset_spawns_blind_critic.md` — the incident
+- `knowledge-base/knowledge/issues/verification_round_reset_spawns_blind_critic.md` — the incident
   analysis and design rationale
-- `docs/done/git_push_fails_silently_via_workspace_backend.md` — the delivery
+- `knowledge-history/done/git_push_fails_silently_via_workspace_backend.md` — the delivery
   chain and why each layer handles it the way it does
 - `tests/virtual_directories_test_coverage.md` — the overlay that serves
   `instructions.md`, whose kill switch §1.5 replaced

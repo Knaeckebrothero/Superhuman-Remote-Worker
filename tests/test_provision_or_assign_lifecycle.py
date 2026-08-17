@@ -359,7 +359,7 @@ async def test_grant_denied_fails_fast_without_pool_or_pod(monkeypatch):
     pool agent / spawn NO dedicated pod. Otherwise a doomed pod boots, 403s at
     the workspace endpoint, exits, and the cockpit polls /connection until its
     ~5m40s ready timeout.
-    docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+    knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md
     """
     fake_main = _install_fake_main(monkeypatch)
     fake_main.postgres_db.get_thread = AsyncMock(
@@ -406,7 +406,7 @@ async def test_endpoint_denied_fails_fast_without_pool_or_pod(monkeypatch):
     emit provisioning→failed with the real reason, spawn NO pod. Otherwise the
     agent crashes at startup, the workspace is released, and the cockpit hangs
     on /connection.
-    docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
+    knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
     """
     fake_main = _install_fake_main(monkeypatch)
     fake_main.postgres_db.get_thread = AsyncMock(

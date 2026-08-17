@@ -10,7 +10,7 @@ The point: a session/role that can never start (a chat model whose provider
 factory will raise for a missing key, or an embedding endpoint the memory
 reranker rides but can't reach) should be rejected BEFORE a pod is spawned,
 with an actionable reason — not crash the agent at startup and hang the UI.
-See docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+See knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
 
 Per-provider base_url / api_key behaviour, from the loader factories:
 

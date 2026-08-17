@@ -1,5 +1,5 @@
 # Superhuman Remote Worker — Helm Chart Values
-# See docs/helm_migration.md for architecture overview.
+# See knowledge-base/knowledge/helm_migration.md for architecture overview.
 
 # -- Override chart name in resource names
 nameOverride: ""
@@ -419,13 +419,13 @@ agent:
   datasourceScopeAutoAttachV1Enabled: "false"
   # -- Enable protected cloud mode: RO-reader provisioning + capture overlay.
   # Default OFF (prod-safe); the dev/experimental values file turns it on.
-  # See docs/design/cloud_access_unification.md §8 Phase 1.
+  # See knowledge-base/knowledge/design/cloud_access_unification.md §8 Phase 1.
   protectedCloudModeEnabled: "false"
   # -- Effective context ceiling (tokens) for models routed via the system codex
   # proxy, whose ChatGPT-OAuth backend caps context ~400K regardless of the
   # model's true API window. Compaction fires at 80% of this. Set 0 to disable
   # (e.g. once OpenAI ships 1M-for-Codex). See
-  # docs/issues/codex_proxy_context_window_cap.md.
+  # knowledge-base/knowledge/issues/codex_proxy_context_window_cap.md.
   codexContextWindowCap: 400000
   resources:
     requests:
@@ -457,7 +457,7 @@ agent:
     # wildcard out of the box, but a deployment whose LLM, Keycloak, or cloud
     # lives on an RFC1918 address (in-cluster other-namespace, or the home LAN)
     # MUST add an `extraEgress` carve-out before enabling, or agents lose model
-    # access. See docs/issues/agent_egress_networkpolicy_enablement.md.
+    # access. See knowledge-base/knowledge/issues/agent_egress_networkpolicy_enablement.md.
     enabled: false
     # -- CIDRs subtracted from the 0.0.0.0/0 internet egress allow. Cluster
     # CIDRs + home LAN + link-local/metadata denied by default (prod-safe,
@@ -502,7 +502,7 @@ agent:
     app:
       min: "1"
       max: "3"
-  # -- Stateless executor Deployment (docs/features/stateless_agents.md §5.8;
+  # -- Stateless executor Deployment (knowledge-base/knowledge/features/stateless_agents.md §5.8;
   # templates/agent/stateless-deployment.yaml). A static pool of generic agent
   # processes running `--mode stateless` that PULL work units from the
   # run_queue, replacing per-thread provisioning for queue-lane threads
@@ -574,13 +574,13 @@ cockpit:
   # `GET /api/models`, which is the authoritative source (system endpoints
   # seeded via `llm.seed.systemEndpoints` + user endpoints). Empty catalogs
   # render a role-aware empty-state banner pointing operators to
-  # Admin → Providers. See docs/features/db_backed_llm_config.md.
+  # Admin → Providers. See knowledge-base/knowledge/features/db_backed_llm_config.md.
 
 # =============================================================================
 # Dynamic Canvas
 # =============================================================================
 canvas:
-  # Shared browser (docs/features/shared_browser.md): stream the workspace
+  # Shared browser (knowledge-base/knowledge/features/shared_browser.md): stream the workspace
   # Chromium into the Canvas. Dark by default; the dev profile enables it.
   sharedBrowser:
     enabled: false
@@ -602,7 +602,7 @@ canvas:
     # HTTP proxy in front (Cloudflare tunnel/proxy, an ordinary ingress
     # controller) is a supported edge: adjacent-slash merging is an accepted,
     # documented limitation of that mode, not a security regression (see
-    # docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). Production
+    # knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). Production
     # operators must still supply the restricted database role/Secret and the
     # PSL-boundary attestation.
     viewer:
@@ -789,7 +789,7 @@ collabora:
 # Auth — cockpit cookie BFF + (future) PAT system
 # =============================================================================
 # Knobs for the orchestrator's cookie-backed session layer for the cockpit.
-# See docs/features/auth_bff_and_api_tokens.md. The cookie domain defaults
+# See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md. The cookie domain defaults
 # to a leading-dot prefix of global.domain so the cookie rides on both the
 # cockpit and api subdomains; override below for non-shared parents.
 auth:
@@ -896,7 +896,7 @@ ingress:
   # (Cloudflare Tunnel, Tailscale Funnel, Ngrok, etc.) — Traefik never
   # sees the request, so the middleware would be dead code. Add the
   # equivalent path rule at your tunnel/edge instead. See
-  # docs/multi_tenancy.md for the cloudflared example.
+  # knowledge-base/knowledge/multi_tenancy.md for the cloudflared example.
   internalPathBlock:
     enabled: false
 
@@ -959,14 +959,14 @@ headscale:
 #
 # Cutover caveat: at the flip, any in-flight job still holding a sqlite-only
 # checkpoint has no PG checkpoint yet, so it cold-starts ONCE, then runs on PG.
-# Docs: docs/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md
+# Docs: knowledge-history/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md
 checkpointer:
   # -- Worker checkpointer backend: "postgres" (shared, cross-pod — default) or "sqlite" (pod-local, legacy)
   backend: "postgres"
 
 # LLM-outage / cooldown resilience. Docs:
-# docs/features/llm_outage_pause_and_backoff_redispatch.md +
-# docs/features/llm_cooldown_pause_and_resume.md.
+# knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md +
+# knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md.
 # This single ceiling is read by BOTH the orchestrator (give-up: fail a job
 # loudly after this much continuous outage) AND every agent pod (cutoff: a quota
 # cooldown whose provider-stated reset fits inside this budget PAUSES + resumes
@@ -997,7 +997,7 @@ databases:
     # Postgres advisory lock, which silently breaks behind a TRANSACTION-mode
     # connection pooler (PgBouncer/pgcat/RDS-Proxy in txn mode — the lock leaks
     # and can stall autovacuum). Point externalHost at a direct or session-mode
-    # Postgres endpoint. See docs/researches/orchestrator_leader_election.md.
+    # Postgres endpoint. See knowledge-history/researches/orchestrator_leader_election.md.
     externalHost: ""
     externalPort: 5432
     externalDb: "srw"
@@ -1224,7 +1224,7 @@ gitea:
   # empty Postgres yields a Gitea that believes it is a fresh install while
   # hundreds of repos sit orphaned on disk. A preflight init container refuses
   # to start in exactly that situation; run the migration first:
-  # docs/operations/gitea_sqlite_to_postgres.md
+  # knowledge-base/knowledge/operations/gitea_sqlite_to_postgres.md
   database:
     type: postgres
   storageClass: ""
@@ -1561,7 +1561,7 @@ workspace:
   # Mixed fleets are safe — the reaper reads each pod's actual volume mode — so
   # this is a rolling flip, not a cutover; flipping it back off leaves existing
   # PVCs to drain as their work finishes.
-  # See docs/features/workspace_pvc_branch_a_implementation.md.
+  # See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
   pvcEnabled: false
   # -- Size of each workspace PVC (only used when pvcEnabled). Applies to every
   # claim: job workspace, session workspace, and session agent.
@@ -1585,7 +1585,7 @@ workspace:
   # recently-crashed sessions instead of every retained thread ever. Fail-
   # safe: an unverifiable snapshot always keeps the PVC. Default off = keep
   # today's retain-on-idle behavior. See
-  # docs/features/workspace_durability_tiering.md §D3.
+  # knowledge-base/knowledge/features/workspace_durability_tiering.md §D3.
   reclaimOnIdle: false
   # -- Capacity guard for PVC-backed workspaces (Phase 3a). Renders a
   # namespaced ResourceQuota keyed on `ephemeralStorageClass` that caps BOTH the
@@ -1598,7 +1598,7 @@ workspace:
   # is already dedicated; on single-node/local-path make a dedicated
   # local-path-backed class (same provisioner, distinct name) and point
   # `ephemeralStorageClass` at it. See the storage-substrate section of
-  # docs/features/workspace_pvc_branch_a_implementation.md.
+  # knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
   #
   # ONE BUCKET FOR BOTH KINDS. The quota is keyed on the storage class, and jobs
   # and sessions share that class — there is no per-kind split. A backlog of
@@ -1630,7 +1630,7 @@ workspace:
   # that enforces NetworkPolicy: Calico, Cilium, OVN-Kubernetes, and Antrea
   # enforce natively; K3s ships Flannel paired with the embedded kube-router
   # network-policy controller, which enforces by default (Flannel alone
-  # does not). See docs/features/workspace_network_policy_unification.md.
+  # does not). See knowledge-base/knowledge/features/workspace_network_policy_unification.md.
   #
   # PR 3 (per-project tiering): one NetworkPolicy is rendered per entry
   # in `tiers` below. Each policy selects pods carrying the matching
@@ -1638,7 +1638,7 @@ workspace:
   # ContainerProvisioner, derived from `projects.network_tier`). The
   # default tier `internet-only` MUST exist — pre-PR-3 pods and pods
   # whose project has no resolvable tier inherit it. See
-  # docs/features/workspace_network_isolation.md §3.
+  # knowledge-base/knowledge/features/workspace_network_isolation.md §3.
   networkPolicy:
     enabled: true
     # If set, the orchestrator init seeder bumps this user's default
@@ -1747,7 +1747,7 @@ codexProxy:
   # instant `503 auth_unavailable`, which reads as a dead token and takes out
   # unrelated jobs on the same proxy. v7.2.110 adds IsRequestScoped() and is a
   # strict descendant of that fix. Dev has run it since 2026-07-30.
-  # docs/done/codex_stream_disconnect_shape_nudge.md
+  # knowledge-history/done/codex_stream_disconnect_shape_nudge.md
   image: docker.io/eceasy/cli-proxy-api:v7.2.110
   storageSize: "1Gi"
   # Retries INSIDE the proxy, on 403/408/500/502/503/504. An unset key yields 0
@@ -1784,7 +1784,7 @@ codexProxy:
 # OFF by default and must stay off on production overlays.
 test:
   # -- GreenMail — disposable IMAP+IMAPS+SMTP(+S) mail server for the `email`
-  # datasource integration tests (docs/features/email_datasource.md §Testing).
+  # datasource integration tests (knowledge-base/knowledge/features/email_datasource.md §Testing).
   # Auth disabled (any credentials work), state is in-memory only. Enable on
   # local k3d / CI overlays; seed fixtures with scripts/seed_greenmail.py.
   greenmail:
@@ -1822,8 +1822,8 @@ llm:
   # are admin-curated catalog rows now (system_api_keys + llm_endpoints
   # tables, plus default-model pins via Admin → Providers → Defaults).
   # The orchestrator resolves them at runtime through the model registry.
-  # See docs/features/db_backed_llm_config.md and
-  # docs/features/models_yaml_removal.md for the migration rationale.
+  # See knowledge-base/knowledge/features/db_backed_llm_config.md and
+  # knowledge-base/knowledge/features/models_yaml_removal.md for the migration rationale.
   #
   # Removed in chunk 7 of models_yaml_removal:
   #   visionModel, embeddingModel, embeddingBaseUrl, codexBaseUrl,
@@ -1837,7 +1837,7 @@ llm:
   # whether the CLIProxyAPI proxy forwards input_tokens_details.cached_tokens.
   # Default off (verbose + disk); flip in values-local.yaml for k3d testing,
   # then start a FRESH session so a new agent pod inherits the ConfigMap value.
-  # See docs/issues/codex_cached_tokens_not_metered.md.
+  # See knowledge-base/knowledge/issues/codex_cached_tokens_not_metered.md.
   debugCodexRawResponse: "0"
   codexRawDumpDir: "/app/logs/codex-raw"
 
@@ -1959,7 +1959,7 @@ llm:
 # for embeddings — no separate citation DB, role, or embedding config.
 # `llmUrl` / `llmModel` / `reasoningLevel` for the verifier are passed via job
 # `config_override` at dispatch (default set in Admin → Models). See
-# docs/done/citation_engine_integration.md.
+# knowledge-history/done/citation_engine_integration.md.
 
 # =============================================================================
 # Email / Notifications
@@ -2021,7 +2021,7 @@ garage:
   #
   # Auto rather than a plain `false` default because every consumer degrades
   # SILENTLY without a store: canvas presentations stop surviving their
-  # workspace (docs/features/canvas_durable_presentation.md), workspace
+  # workspace (knowledge-base/knowledge/features/canvas_durable_presentation.md), workspace
   # snapshots never capture, and the virtual tier stays unwired. An operator who
   # configures nothing should get a store that works, not a deployment that
   # looks healthy and quietly forgets things.
@@ -2099,7 +2099,7 @@ ide:
 
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
-# (docs/features/direct_session_websockets.md)
+# (knowledge-base/knowledge/features/direct_session_websockets.md)
 # -----------------------------------------------------------------------------
 sessionRouter:
   # Tier-1 ingress controller — tested in CI + dev cluster.
@@ -2238,7 +2238,7 @@ vmController:
   vmStorageClass: local-path
   vmDiskSize: 20Gi
   # -- Golden-image boot acceleration
-  # (docs/features/vm_golden_image_boot_acceleration.md). Import the base image
+  # (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md). Import the base image
   # once into a shared golden PVC per digest; clone each VM root disk from it
   # (host-assisted local copy on local-path) instead of a per-VM registry
   # import. Off = byte-for-byte the current registry-per-VM behaviour.
@@ -2250,7 +2250,7 @@ vmController:
       enabled: true
       keep: 3            # keep the N newest image digests
       minAgeMinutes: 30  # don't GC a golden younger than this
-  # -- Persistent VM rootdisks (docs/features/vm_persistent_rootdisk.md).
+  # -- Persistent VM rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
   # Create each VM's root disk as a standalone DataVolume instead of via
   # spec.dataVolumeTemplates, so it is not cascade-deleted with the VM. A
   # recreate reattaches it by name: files survive a crash or a suspend, and the
@@ -2278,7 +2278,7 @@ vmController:
     # within this window of key mint (at VM-create); it must exceed worst-case
     # create→join, which includes the cold per-VM image import — not just boot.
     # 10 (old default) expired mid-import for tier upgrades. See
-    # docs/features/workspace_tier_upgrade.md Q7.
+    # knowledge-base/knowledge/features/workspace_tier_upgrade.md Q7.
     keyExpiryMinutes: 30
   resources:
     requests:
@@ -2293,5 +2293,5 @@ vmController:
 # =============================================================================
 logLevel: "DEBUG"
 # Log output format: "json" (structured, for the Alloy -> Loki pipeline) or
-# "text" (human-readable). See docs/features/centralized_logging.md.
+# "text" (human-readable). See knowledge-base/knowledge/features/centralized_logging.md.
 logFormat: "json"

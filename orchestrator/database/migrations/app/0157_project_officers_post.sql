@@ -3,7 +3,7 @@
 --                project (thread_id NULL = the post is vacant), plus a
 --                pure-SQL backfill that adopts each project's live officer
 --                thread and folds already-retired officers into incarnation
---                history. docs/features/officer_post.md §3.
+--                history. knowledge-base/knowledge/features/officer_post.md §3.
 -- depends-on:    0156_unified_job_tool_names.sql
 -- expected:      < 5s. One CREATE TABLE + three backfill statements; scans
 --                projects once and threads twice (dev: hundreds of rows).

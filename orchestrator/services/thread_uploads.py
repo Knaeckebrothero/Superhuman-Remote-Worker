@@ -531,7 +531,7 @@ def _expand_payloads_for_extraction(
     alongside explaining why, because the stored bytes alone don't say
     extraction was attempted and refused — see the module-level comment on
     that constant. Never a half-extracted result, never a vanished upload
-    (docs/issues/session_uploads_never_extract_archives.md).
+    (knowledge-base/knowledge/issues/session_uploads_never_extract_archives.md).
 
     Entry count and uncompressed bytes are capped *per call* (i.e. per
     upload request — this runs once per ``upload_files_to_thread_workspace``
@@ -1412,7 +1412,7 @@ def _virtual_purge_prefix(
 # when the message is sent) makes "remove this attachment" a request that can
 # arrive *after* the bytes have already landed. Without a delete, cancelling
 # is a lie and attach/remove cycles pile up `_1`/`_2` copies in a directory
-# the agent can list and read. See docs/features/session_attachment_send_flow.md
+# the agent can list and read. See knowledge-base/knowledge/features/session_attachment_send_flow.md
 # §9.1.
 # =============================================================================
 

@@ -2,7 +2,7 @@
 
 Mirrors memory_injection.py. Renders pending supervisor guidance (the
 non-destructive steer lane, P1-A of
-docs/issues/officer_blind_reads_and_worker_bureaucracy.md) as a fake
+knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md) as a fake
 ``supervisor_guidance`` tool-call result so the worker sees mid-run steering
 on its very next LLM turn — without a kill, a compaction, or a re-plan.
 

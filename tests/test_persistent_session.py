@@ -1163,7 +1163,7 @@ class TestAttachExistingWorkspaceGuard:
     """The session attach guard ported from the job path.
 
     Regression pins for
-    docs/issues/session_workspace_wiped_by_agent_clone_on_attach.md: an
+    knowledge-base/knowledge/issues/session_workspace_wiped_by_agent_clone_on_attach.md: an
     attach onto a content-bearing PVC must never reach ``initialize()``'s
     ``rm -rf`` + re-clone.
     """
@@ -2727,7 +2727,7 @@ class TestSetupMemory:
     def test_required_recall_store_failure_raises(self):
         """memory.required + RecallStore init failure → MemoryUnavailableError
         (fail loud, don't run the session half-working). Regression for
-        docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+        knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
         """
         from src.api.persistent_session import MemoryUnavailableError
 
@@ -3040,7 +3040,7 @@ class TestSwapBackend:
 
         Not a direct ``_backend`` assignment: that unwraps the virtual overlay
         and 404s every virtual path afterwards
-        (docs/features/virtual_directories.md).
+        (knowledge-base/knowledge/features/virtual_directories.md).
         """
         session = _make_session()
         mock_wm = MagicMock()
@@ -3089,7 +3089,7 @@ class TestSwapBackend:
 
 # ---------------------------------------------------------------------------
 # 2.10b resetup_tools_for_backend() — S1: live tool re-derivation after a swap
-# (docs/features/workspace_tier_upgrade.md §4.2)
+# (knowledge-base/knowledge/features/workspace_tier_upgrade.md §4.2)
 # ---------------------------------------------------------------------------
 
 
@@ -3262,7 +3262,7 @@ class TestConfiguredButUnboundToolsAreReported:
     The bind filter is an intersection: a name survives only if it is BOTH
     configured and produced by its category factory. When the two disagree a
     category can empty itself with nothing in the log — that is how
-    ``docs/issues/live_config_update_buries_extra_and_empties_the_shell_group.md``
+    ``knowledge-base/knowledge/issues/live_config_update_buries_extra_and_empties_the_shell_group.md``
     stayed invisible while the shell group silently bound only ``shell_read``.
     Backend-filtered names are excluded on purpose: dropping shell on a
     no-shell tier is the capability gate working, not an anomaly.
@@ -3713,7 +3713,7 @@ class TestRefreshContextLimits:
     """A model hot-swap must re-derive compaction thresholds IN PLACE on the
     existing manager — the running loop holds a reference to it, and the
     provider-usage anchor must survive so a downswitch compacts on the next
-    turn (docs/issues/session_model_switch_stale_context_manager_empty_response.md)."""
+    turn (knowledge-base/knowledge/issues/session_model_switch_stale_context_manager_empty_response.md)."""
 
     def _cfg_with_limits(self, model, base):
         cfg = _make_config(model=model)

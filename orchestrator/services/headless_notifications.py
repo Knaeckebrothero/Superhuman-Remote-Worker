@@ -1,7 +1,7 @@
 """Email magic-link generation + outbound notification dispatch for
 headless persistent sessions.
 
-Phase 4 of docs/features/headless_persistent_sessions.md. When the agent's
+Phase 4 of knowledge-base/knowledge/features/headless_persistent_sessions.md. When the agent's
 permission_check inserts a row into thread_permission_requests and no
 client has been attached for >30s, the permission-pending watcher
 (orchestrator/main.py) calls send_permission_pending_email() here. We:

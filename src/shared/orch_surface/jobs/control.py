@@ -216,7 +216,7 @@ async def create_job(
     # persists; the two deprecated aliases resolve through the same helper, so
     # the mutual-exclusion refusal they need is stated once (see
     # src/shared/expert_reference.py and
-    # docs/issues/experts_one_catalogue_two_selection_paths.md).
+    # knowledge-base/knowledge/issues/experts_one_catalogue_two_selection_paths.md).
     try:
         choice = resolve_expert_selection(
             expert=expert, config_name=config_name, expert_id=expert_id

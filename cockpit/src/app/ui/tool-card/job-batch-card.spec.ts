@@ -17,7 +17,7 @@ import {JobBatchCardComponent} from './job-batch-card.component';
  * real one throws NG0950 and takes this render down with it. See the stub's
  * docstring; the panel has its own spec and a k3d gate.
  *
- * Design: docs/features/unified_tool_cards.md (slice 4, batch grouping).
+ * Design: knowledge-base/knowledge/features/unified_tool_cards.md (slice 4, batch grouping).
  */
 vi.mock('./job-tool-card-panel.component', () => import('./job-tool-card-panel.stub'));
 

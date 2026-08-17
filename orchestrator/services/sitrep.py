@@ -3,7 +3,7 @@
 The minimal ``[SITREP]`` renderer in ``session_wake._format_officer_wake``
 listed the wake *reasons*; this module answers the officer's standing question
 — "what changed since I last looked?" — so a wake starts from facts instead of
-a fan-out of list/get tool calls (docs/features/centurion.md §4, S3).
+a fan-out of list/get tool calls (knowledge-base/knowledge/features/centurion.md §4, S3).
 
 Delta, not dashboard
 --------------------

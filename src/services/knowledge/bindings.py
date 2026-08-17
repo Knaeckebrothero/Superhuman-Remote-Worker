@@ -86,7 +86,7 @@ def build_knowledge_bindings(
     the project. So when it is selected alongside its own project it collapses
     into the native binding already emitted above, which keeps the project's
     knowledge base writable and stops the same KB being offered twice under
-    two aliases (docs/features/knowledge_base_repo_separation.md §6).
+    two aliases (knowledge-base/knowledge/features/knowledge_base_repo_separation.md §6).
     """
     bindings: list[KnowledgeBinding] = []
     used: set[str] = set()

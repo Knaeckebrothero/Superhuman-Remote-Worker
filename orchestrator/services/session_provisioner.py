@@ -1,5 +1,5 @@
 """Session-side workspace provisioning + reconcile — the dispatcher-equivalent
-for persistent sessions. See docs/done/unified_workspace_provisioning.md.
+for persistent sessions. See knowledge-history/done/unified_workspace_provisioning.md.
 
 Jobs get workspace reconcile from the main dispatcher loop; sessions never did,
 so a workspace wedged at 'failed'/missing for an active session never recovered.
@@ -138,7 +138,7 @@ async def ensure_session_workspace(
         # trigger: _setup_gitea writes workspace_container={git_remote_url,
         # repo_name} for every thread including vm-tier ones, and that
         # status-less entry matches list_threads_needing_workspace's filter.
-        # docs/issues/session_vm_backend_never_attaches.md (Defect 1)
+        # knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md (Defect 1)
         logger.debug(
             "session %s is vm-tier — workspace is the VM, no container to provision",
             thread_id,

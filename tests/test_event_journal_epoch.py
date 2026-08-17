@@ -1,6 +1,6 @@
 """Stateless agents M2 — conditional epoch reuse, fenced writer, system frames.
 
-Covers the docs/features/stateless_agents.md §5.3.2 redesign:
+Covers the knowledge-base/knowledge/features/stateless_agents.md §5.3.2 redesign:
   - _resolve_event_journal_epoch returns (epoch, seq_seed): REUSE on clean
     reattach with seed = GREATEST(events_seq_hwm, MAX(seq)); BUMP on terminal
     status / terminal lifecycle frame / beyond-retention epoch / probe failure.

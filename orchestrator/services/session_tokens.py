@@ -9,7 +9,7 @@ authenticate user→orchestrator. This authenticates orchestrator→pod for a
 specific session handshake, so we can hand the pod a narrowly-scoped trust
 without giving it the BFF signing key.
 
-See `docs/features/direct_session_websockets.md` §Component details.
+See `knowledge-base/knowledge/features/direct_session_websockets.md` §Component details.
 """
 
 from __future__ import annotations

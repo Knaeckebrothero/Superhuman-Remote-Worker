@@ -1,5 +1,5 @@
 -- migration:     0006_bitemporal_memory.sql
--- description:   Agent memory overhaul Phase 4 (docs/features/agent_memory_overhaul.md
+-- description:   Agent memory overhaul Phase 4 (knowledge-base/knowledge/features/agent_memory_overhaul.md
 --                §5 Phase 4) — bi-temporal supersede on the `memories` table.
 --                Adds the columns the supersede lifecycle reads/writes and
 --                teaches default retrieval to serve only currently-valid rows.

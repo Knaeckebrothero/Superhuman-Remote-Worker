@@ -741,7 +741,7 @@ class TestCockpitDelegationFields:
 
 # ===========================================================================
 # TestSpawnSubagentScaffolding — Phase 0 of the light-delegation plan
-# (docs/issues/delegation_light_mode_missing.md). One agent-facing tool name
+# (knowledge-base/knowledge/issues/delegation_light_mode_missing.md). One agent-facing tool name
 # with the backend selected by delegation.mode; no behavior yet — both
 # backends return a clear stub.
 # ===========================================================================
@@ -890,7 +890,7 @@ class TestResumeChildFreezeTimeout:
     ``_check_delegation_timeouts`` falls back to ``freeze.get("timeout",
     7200)`` — omitting the key silently resets a longer delegation deadline
     to the 2h default after any child resume. Regression for
-    docs/issues/delegation_freeze_lifecycle_gaps.md (Gap 2).
+    knowledge-base/knowledge/issues/delegation_freeze_lifecycle_gaps.md (Gap 2).
     """
 
     def _real_context(self):

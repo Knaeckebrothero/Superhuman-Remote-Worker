@@ -13,7 +13,7 @@ Provides two execution modes for background/support LLM tasks:
 
 All tasks use `with_structured_output()` for reliable structured returns.
 
-See docs/features/auxiliary.md for the full design document.
+See knowledge-base/knowledge/features/auxiliary.md for the full design document.
 """
 
 import asyncio
@@ -668,7 +668,7 @@ class AssembleKnowledgeTask(AuxAgentTask):
     kb_update (status=superseded/archived, or merge-then-supersede); the runner
     resets the TTL of the survivors afterwards. Uses kb_search/kb_read/kb_update.
 
-    See docs/features/kb_convergence_ttl_reverification.md.
+    See knowledge-base/knowledge/features/kb_convergence_ttl_reverification.md.
     """
 
     def __init__(
@@ -816,7 +816,7 @@ class AuxHealth:
     exposes a snapshot via the agent status endpoint. It never changes control
     flow — callers still swallow and continue — and is itself best-effort.
 
-    See docs/issues/surface_silent_aux_failures.md.
+    See knowledge-base/knowledge/issues/surface_silent_aux_failures.md.
     """
 
     #: Consecutive failures (across any task) before the degraded ERROR fires.
@@ -993,7 +993,7 @@ class AuxInputTooLarge(Exception):
     shrink). Summarization avoids this via the SummarizationEngine's
     chunk planning; other aux tasks (memory extraction, titles) fail fast
     here instead of overflowing at the HTTP transport.
-    See docs/features/context_summarization_rework.md (S1).
+    See knowledge-base/knowledge/features/context_summarization_rework.md (S1).
     """
 
     def __init__(self, tokens: int, limit: int, task_name: str = "unknown"):
@@ -1076,7 +1076,7 @@ class AuxiliaryLLM:
         #: task retries here so the session keeps running instead of crashing on
         #: the next compaction. None when the aux model already IS the main model
         #: (no separate fallback to fall back to). See
-        #: docs/issues/openrouter_auxiliary_misrouted_to_openai.md.
+        #: knowledge-base/knowledge/issues/openrouter_auxiliary_misrouted_to_openai.md.
         primary_name = _get_model_name(llm)
         fallback_name = (
             _get_model_name(fallback_llm) if fallback_llm is not None else None
@@ -1910,7 +1910,7 @@ async def assemble_and_converge_knowledge(
     aux-LLM call. Survivors (stale notes the agent left ``active``) have their TTL
     reset by the store afterwards, so the queue drains.
 
-    See docs/features/kb_convergence_ttl_reverification.md.
+    See knowledge-base/knowledge/features/kb_convergence_ttl_reverification.md.
 
     Args:
         auxiliary_llm: AuxiliaryLLM instance

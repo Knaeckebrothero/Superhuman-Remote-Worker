@@ -14,7 +14,7 @@ live inline in ``orchestrator/main.py``'s ``persistent_ws_proxy``.
     immediately admission-ready and explicitly reports that it has no control
     socket. Stateless control transport is not implemented in this slice.
 
-Spec: docs/features/direct_session_websockets.md §Component details.
+Spec: knowledge-base/knowledge/features/direct_session_websockets.md §Component details.
 Pattern: late imports of postgres_db (and other singletons) inside handler
 bodies to avoid circular imports at module load time — same pattern as
 orchestrator/routers/automations.py.
@@ -210,7 +210,7 @@ async def _do_prepare(
     # and never re-reads. Emitted "provisioning" already, so the cockpit's
     # progress card covers the wait. Deliberately OUTSIDE the advisory lock —
     # this can take seconds and the fresh pod's /register needs the same lock.
-    # docs/done/session_resume_cloud_sync_race_late_provision.md
+    # knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
     from main import _await_late_cloud_setup  # late import: avoid circular
 
     await _await_late_cloud_setup(thread_id)
@@ -245,7 +245,7 @@ async def _do_prepare(
                 # that 403s at the workspace endpoint and exits, leaving the
                 # cockpit to poll /connection until its ~5m40s ready timeout. Fail
                 # fast with the real reason instead.
-                # docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+                # knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md
                 from main import (  # type: ignore
                     _endpoint_violations_detail,
                     _grant_violations_detail,
@@ -266,7 +266,7 @@ async def _do_prepare(
                 # Same fail-fast for unusable model-role transports (e.g. the
                 # memory reranker with no reachable embedding endpoint) — reject
                 # before reconciling a workspace + booting a doomed pod.
-                # docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
+                # knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
                 _ep_violations = await _session_endpoint_violations(thread)
                 if _ep_violations:
                     logger.warning(
@@ -332,7 +332,7 @@ async def _do_prepare(
         # Readiness probe. A VM-backed thread pays a cold KubeVirt boot far
         # beyond the sandbox default; size the budget from the thread's stored
         # backend and tag the lifecycle event so the cockpit shows the VM copy.
-        # (docs/features/session_create_on_vm.md)
+        # (knowledge-base/knowledge/features/session_create_on_vm.md)
         from main import (  # type: ignore
             _session_ready_timeout_s,
             _thread_workspace_backend,

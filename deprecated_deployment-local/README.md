@@ -200,6 +200,6 @@ kubectl exec -it srw-postgres-0 -n superhuman-remote-worker -- psql -U srw -c "
 
 ## Related
 
-- `docs/deployment.md` — Deployment strategy and Kustomize vs Helm comparison
+- `knowledge-base/knowledge/deployment.md` — Deployment strategy and Kustomize vs Helm comparison
 - `deployment/` — Production base manifests (Fleet/GitOps)
 - `.env.example` — Full environment variable documentation

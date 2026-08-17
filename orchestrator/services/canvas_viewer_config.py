@@ -207,7 +207,7 @@ def canvas_viewer_config() -> CanvasViewerConfig:
     # normalizing proxy (Cloudflare tunnel, ordinary ingress) in front of the
     # gateway canonicalizes before the security boundary, which is the safe
     # direction — the gateway checks and forwards the same string. See
-    # docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md.
+    # knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md.
     if profile == "production":
         if cookie_mode != "psl-isolated":
             raise CanvasViewerConfigurationError(

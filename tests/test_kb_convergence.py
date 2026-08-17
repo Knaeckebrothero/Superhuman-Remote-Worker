@@ -1,6 +1,6 @@
 """Tests for KB convergence — TTL re-verification.
 
-Design: docs/features/kb_convergence_ttl_reverification.md (loop_review F13).
+Design: knowledge-base/knowledge/features/kb_convergence_ttl_reverification.md (loop_review F13).
 
 Covers:
   - KnowledgeStore TTL: _ttl_for_note_type, upsert TTL assignment (INSERT only),

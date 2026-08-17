@@ -641,7 +641,7 @@
     },
     "verification": {
       "type": "object",
-      "description": "Verification phase: auto-spawn a critic job after job_complete to review deliverables. The critic either approves the job or resumes it with feedback. See docs/features/verification_phase.md.",
+      "description": "Verification phase: auto-spawn a critic job after job_complete to review deliverables. The critic either approves the job or resumes it with feedback. See knowledge-base/knowledge/features/verification_phase.md.",
       "properties": {
         "enabled": {
           "type": "boolean",

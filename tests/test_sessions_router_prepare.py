@@ -33,7 +33,7 @@ def _fake_main() -> MagicMock:
     """
     m = MagicMock()
     # Attach gate: lets in-flight cloud session-folder provisioning land
-    # before an agent binds (docs/issues/
+    # before an agent binds (knowledge-base/knowledge/issues/
     # session_resume_cloud_sync_race_late_provision.md).
     m._await_late_cloud_setup = AsyncMock(return_value=None)
     return m
@@ -559,7 +559,7 @@ async def test_do_prepare_waits_for_cloud_folder_before_binding_an_agent(monkeyp
     re-reads, so binding ahead of in-flight session-folder provisioning leaves
     the session with workspace_sync=None for its whole life. Ordering — gate
     first, THEN provision — is the contract.
-    docs/done/session_resume_cloud_sync_race_late_provision.md
+    knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
     """
     from orchestrator.routers import sessions as sessions_mod
 
@@ -655,7 +655,7 @@ async def test_do_prepare_grant_denied_fails_fast_without_provisioning(monkeypat
     grants fails fast: emit provisioning→failed with the violation, and kick off
     NEITHER workspace reconciliation NOR agent provisioning. Prevents the doomed
     pod that 403s at the workspace endpoint and the cockpit's ~5m40s timeout.
-    docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+    knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md
     """
     from orchestrator.routers import sessions as sessions_mod
 

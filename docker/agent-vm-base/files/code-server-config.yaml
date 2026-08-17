@@ -1,7 +1,7 @@
 # code-server configuration for agent VMs — live-VM Web IDE.
 #
 # Reached ONLY through the agent's authenticated SSH direct-tcpip channel to
-# guest loopback (see docs/features/vm_snapshots_and_ide.md, "Live-VM IDE
+# guest loopback (see knowledge-base/knowledge/features/vm_snapshots_and_ide.md, "Live-VM IDE
 # Access via the Agent"). The SSH transport plus the orchestrator's IDE auth
 # gate (require_approved_user + user_can_access_ide_entity) are the trust
 # boundary, so code-server binds loopback with auth disabled — the same model

@@ -1,4 +1,4 @@
-"""S9 — conference embodiment + hold + brief wake (docs/features/centurion.md §2/§4).
+"""S9 — conference embodiment + hold + brief wake (knowledge-base/knowledge/features/centurion.md §2/§4).
 
 A conference is an ordinary interactive session wearing the officer's
 identity (officer.conference; enabled stays false). While one is open the

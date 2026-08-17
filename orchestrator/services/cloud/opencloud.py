@@ -14,7 +14,7 @@ The adapter is fully async, built on raw ``httpx.AsyncClient`` (no
 ``msgraph-sdk``), and hits roughly the same error-mapping and telemetry
 patterns as ``NextcloudBackend``.
 
-See §5.2 of ``docs/features/main_cloud_abstraction.md`` for the full
+See §5.2 of ``knowledge-base/knowledge/features/main_cloud_abstraction.md`` for the full
 design, and §13.2 for the underlying research references.
 """
 
@@ -180,7 +180,7 @@ class OpenCloudBackend:
         shared ``KeycloakTokenClient`` and feed them to rclone via a
         runtime-local ``bearer_token_command`` helper — the workspace host
         only ever sees the short-lived access token, never the client
-        secret. See docs/features/rclone_cloud_mount.md §11.
+        secret. See knowledge-base/knowledge/features/rclone_cloud_mount.md §11.
 
         User-home mounts (Personal Spaces) use
         ``auth.type = "keycloak_user_impersonation"``: the agent exchanges
@@ -231,7 +231,7 @@ class OpenCloudBackend:
         # (srw-opencloud:9200) — swap to the public edge, which the VM egress
         # NetworkPolicy permits (443). Same-cluster pods keep the internal URL
         # (no hairpin, works on local k3d). See
-        # docs/issues/workspace_upgrade_drops_cloud_mount.md.
+        # knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md.
         if (
             prefer_public_url
             and webdav_url

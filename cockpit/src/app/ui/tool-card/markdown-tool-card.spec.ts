@@ -27,7 +27,7 @@ vi.mock('../icon-button', () => import('./icon-button.stub'));
 /**
  * A `read_file` on a markdown file renders as prose, with a Rendered|Raw
  * toggle back to the exact bytes the model saw — line numbers included.
- * See docs/superpowers/specs/2026-08-03-tool-card-markdown-rendering-design.md.
+ * See knowledge-base/knowledge/superpowers/specs/2026-08-03-tool-card-markdown-rendering-design.md.
  */
 
 /** `read_file` output shape: `f"{i:6}\t{line}"` (src/tools/workspace/files.py:502). */

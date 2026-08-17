@@ -8,7 +8,7 @@ of the work.
 
 That is not hypothetical. A parser regression made *every* push fail for a
 whole job, 26 times, and the incident was invisible for a day:
-docs/done/git_push_fails_silently_via_workspace_backend.md (dev job
+knowledge-history/done/git_push_fails_silently_via_workspace_backend.md (dev job
 `40efbb39`). The push bug itself is fixed; this pins the consequence-handling,
 so the next such regression is loud even though the cause will be different.
 

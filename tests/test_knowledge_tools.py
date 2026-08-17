@@ -1291,7 +1291,9 @@ class TestKbLint:
         ctx = _make_context()
         ctx.has_workspace.return_value = True
         ws, _ = _fake_kb_workspace(
-            {"docs/a.md": '---\nid: a\ntype: note\ndescription: "d"\n---\n\n# A\n'}
+            {
+                "docs/a.md": '---\nid: a\ntype: note\ndescription: "d"\n---\n\n# A\n'
+            }
         )
         ctx.workspace_manager = ws
         tools, _ = _make_tools(ctx)
@@ -1399,7 +1401,9 @@ class TestKbIndex:
         ctx = _make_context()
         ctx.has_workspace.return_value = True
         ws, writes = _fake_kb_workspace(
-            {"docs/a.md": '---\nid: a\ntype: note\ndescription: "d"\n---\n\n# A\n'}
+            {
+                "docs/a.md": '---\nid: a\ntype: note\ndescription: "d"\n---\n\n# A\n'
+            }
         )
         ctx.workspace_manager = ws
         tools, _ = _make_tools(ctx)
@@ -1618,7 +1622,7 @@ class TestRenderNoteMd:
 
 # =============================================================================
 # Server-side materialisation of knowledge/<slug>.md
-# (docs/features/knowledge_base_repo_separation.md §7 step 4)
+# (knowledge-base/knowledge/features/knowledge_base_repo_separation.md §7 step 4)
 #
 # The note file used to be a second write into the agent's own workspace
 # checkout, guarded on has_git(). It is a POST to the orchestrator now, which

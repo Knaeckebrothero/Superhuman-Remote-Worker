@@ -26,7 +26,7 @@ def create_research_tools(context: ToolContext) -> List[Any]:
 
     # Autonomous browser tools (browse_website / download_from_website) were
     # deprecated; the main agent drives the browser via the direct browser_*
-    # tools instead. See docs/features/browser_workspace_executor.md.
+    # tools instead. See knowledge-base/knowledge/features/browser_workspace_executor.md.
     tools = []
     tools.extend(create_web_tools(context))
     tools.extend(create_paper_tools(context))

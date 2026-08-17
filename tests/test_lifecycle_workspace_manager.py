@@ -557,7 +557,7 @@ class TestIsIdle:
     async def test_paused_job_is_idle_after_grace(self):
         # 'paused' is idle only once the warm grace has passed — a fresh pause
         # is often a human-wait (sudo/VM approval) and must stay warm. See
-        # docs/issues/vm_upgrade_pause_workspace_reaped_before_approval.md.
+        # knowledge-base/knowledge/issues/vm_upgrade_pause_workspace_reaped_before_approval.md.
         mgr, *_ = _make_manager()
         inst = Instance(
             kind="workspace",
@@ -1228,7 +1228,7 @@ class TestIsReapable:
         # non-terminal critic must NOT be reaped, whatever its own status.
         # Reaping (snapshot→delete) strands the headless Service → the critic's
         # next SSH is NXDOMAIN → the whole review fails. Keyed on the live child,
-        # not on job_status. See docs/issues/reviewing_parent_pod_reaped_under_critic.md.
+        # not on job_status. See knowledge-base/knowledge/issues/reviewing_parent_pod_reaped_under_critic.md.
         mgr, *_ = _make_manager()
         for status in ("reviewing", "pending_review", "paused"):
             inst = Instance(
@@ -1273,7 +1273,7 @@ class TestMissingRowOrphan:
     orphan: reapable once past the grace age, clean (nothing to snapshot),
     terminal (PVC/Service reclaimed). A *failed* lookup must never be
     mistaken for a missing row. See
-    docs/done/deleted_job_orphans_workspace_pod.md."""
+    knowledge-history/done/deleted_job_orphans_workspace_pod.md."""
 
     @staticmethod
     def _orphan_pod(job_id: str = "jgone", age_hours: float = 2.0):

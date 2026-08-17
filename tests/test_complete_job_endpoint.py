@@ -181,7 +181,7 @@ class TestCompleteJobStatusDetermination:
 class TestMemoryUnavailableStatus:
     """memory/KB-unavailable freeze → bounded pause-then-fail.
 
-    docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
+    knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md
     """
 
     def _result(self, freeze_type="memory_unavailable"):
@@ -1022,7 +1022,7 @@ class TestOrchestratorClientReportCompletion:
 
 
 # =============================================================================
-# Structured cooldown fail-fast error (docs/issues/loop_advances_into_active_model_cooldown.md)
+# Structured cooldown fail-fast error (knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md)
 # =============================================================================
 
 

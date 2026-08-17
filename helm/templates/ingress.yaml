@@ -210,7 +210,7 @@ spec:
 # (Cloudflare Tunnel, Tailscale Funnel, Ngrok, etc.), Traefik never sees
 # the request and this middleware never fires — leave the toggle off and
 # put the equivalent path rule at your tunnel/edge instead. See
-# `docs/multi_tenancy.md` for the cloudflared example.
+# `knowledge-base/knowledge/multi_tenancy.md` for the cloudflared example.
 #
 # Layer 2 (app-layer ``require_internal`` checking the ``X-Internal-Key``
 # header) is the primary defense and is always on regardless of this toggle.

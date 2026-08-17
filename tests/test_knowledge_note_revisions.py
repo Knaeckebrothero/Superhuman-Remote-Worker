@@ -1,6 +1,6 @@
 """Attributable knowledge history — vector migration 0016 + KnowledgeStore.get_note_revisions.
 
-Guards docs/features/workspace_and_change_records.md §6.2: ``knowledge_index``
+Guards knowledge-base/knowledge/features/workspace_and_change_records.md §6.2: ``knowledge_index``
 is one row per note and both write paths overwrite the body in place
 (``upsert_note``'s ``ON CONFLICT ... content = EXCLUDED.content`` and
 ``upsert_kb_note``'s ``(kb_id, path)`` branch), so prior content was

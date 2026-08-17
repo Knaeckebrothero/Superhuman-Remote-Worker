@@ -260,7 +260,7 @@
       }
     },
     "tools": {
-      "description": "Tool configuration by category: one field per TOOL_REGISTRY category, plus mcp. Each value is POLICY, not membership: true / false / {only: [...]} / {except: [...]}, or the legacy spellings (a bare list = only; [] = false). See docs/features/tool_config_policy_vs_membership.md.",
+      "description": "Tool configuration by category: one field per TOOL_REGISTRY category, plus mcp. Each value is POLICY, not membership: true / false / {only: [...]} / {except: [...]}, or the legacy spellings (a bare list = only; [] = false). See knowledge-base/knowledge/features/tool_config_policy_vs_membership.md.",
       "type": "object",
       "required": [
         "workspace",
@@ -2200,7 +2200,7 @@
     },
     "verification": {
       "type": "object",
-      "description": "Verification phase: auto-spawn a critic job after job_complete to review deliverables. The critic either approves the job or resumes it with feedback. See docs/features/verification_phase.md.",
+      "description": "Verification phase: auto-spawn a critic job after job_complete to review deliverables. The critic either approves the job or resumes it with feedback. See knowledge-base/knowledge/features/verification_phase.md.",
       "properties": {
         "enabled": {
           "type": "boolean",
@@ -2240,7 +2240,7 @@
     },
     "delegation": {
       "type": "object",
-      "description": "Subagent delegation: let agents spawn child jobs that branch off the workspace. Children inherit the parent's workspace as a git branch and work in parallel via git worktrees. See docs/features/subagent_delegation.md.",
+      "description": "Subagent delegation: let agents spawn child jobs that branch off the workspace. Children inherit the parent's workspace as a git branch and work in parallel via git worktrees. See knowledge-base/knowledge/features/subagent_delegation.md.",
       "properties": {
         "enabled": {
           "type": "boolean",

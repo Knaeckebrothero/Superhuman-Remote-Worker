@@ -1,7 +1,7 @@
 """A dropped backing-service connection must not be a terminal job failure.
 
 Regression guard for Defect 1 of
-docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
+knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
 
 On 2026-07-27 psycopg raised ``the connection is closed`` while the LangGraph
 checkpointer wrote. The taxonomy was binary — ``WorkspaceUnavailableError`` was

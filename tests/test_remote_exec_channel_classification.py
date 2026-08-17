@@ -1,6 +1,6 @@
 """Unit tests for ``RemoteBackend._exec`` SSH-failure classification.
 
-docs/issues/maxsessions_parallel_tools_false_workspace_death.md (slice B): a
+knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md (slice B): a
 ``ChannelException`` on a *live* transport is a per-connection session-limit
 refusal from sshd (MaxSessions), not workspace death. It must be retried and,
 if it persists, surface as an ordinary tool error — never as

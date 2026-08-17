@@ -10,7 +10,7 @@ The dispatch also persists the notification-center row (``message_log`` is the
 bell's backing store): job_id NULL — there is no job behind a page, and the
 jobs FK forbids the thread UUID — with thread_id carrying the session UUID so
 the cockpit's action center can route "Open session log" (F4 addendum in
-docs/issues/officer_conference_live_fire_findings.md).
+knowledge-base/knowledge/issues/officer_conference_live_fire_findings.md).
 """
 
 import uuid

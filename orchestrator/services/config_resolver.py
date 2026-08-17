@@ -3,7 +3,7 @@
 Composes ``src/core/loader`` steps so the orchestrator produces the full, frozen
 config blob the agent hydrates. Reused by job dispatch AND session attach —
 identical resolution; only timing/delivery differ. See
-``docs/superpowers/specs/2026-06-17-orchestrator-resolved-config-design.md``.
+``knowledge-base/knowledge/superpowers/specs/2026-06-17-orchestrator-resolved-config-design.md``.
 
 Pure + synchronous: no DB, no network. The caller fetches the expert row and
 passes it in; injects credentials into the *delivery* copy afterwards (the

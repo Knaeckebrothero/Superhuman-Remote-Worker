@@ -1,7 +1,7 @@
 """Execute every background-sweep query against a REAL Postgres server.
 
 Regression guard for the 2026-07-11 incident
-(docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md):
+(knowledge-history/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md):
 a bind-type bug (`($1 || ' minutes')::INTERVAL` typed $1 as text, caller
 passed int) shipped because the unit tests mock ``conn.execute`` — asyncpg's
 parameter typing is only exercised against a real server. Running each sweep
@@ -163,7 +163,7 @@ async def test_all_sweeps_prepare_and_bind_against_real_postgres():
 
 @pytest.mark.asyncio
 async def test_job_execution_lease_lifecycle_against_real_postgres():
-    """Semantic check of the lease (docs/features/job_execution_lease.md):
+    """Semantic check of the lease (knowledge-base/knowledge/features/job_execution_lease.md):
     claim sets a pickup lease; an expired lease recovers to paused/unassigned;
     NULL-lease (pre-deploy) rows are left to the legacy sweep."""
     import asyncpg

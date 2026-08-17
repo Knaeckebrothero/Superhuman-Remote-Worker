@@ -1,5 +1,5 @@
 -- migration:     0110_session_rewind_foundations.sql
--- description:   Session rewind (docs/features/session_rewind.md, decided
+-- description:   Session rewind (knowledge-base/knowledge/features/session_rewind.md, decided
 --                2026-08-07): tombstone marker on thread_messages, the
 --                thread_rewinds audit ledger, and the thread_turn_commits
 --                turn→workspace-commit map. Nothing is ever deleted: a rewind
@@ -23,7 +23,7 @@ ALTER TABLE thread_messages
 COMMENT ON COLUMN thread_messages.rewound_at IS
     'Set when a session rewind supersedes this row (seq >= the rewind''s '
     'from_seq). Live conversation readers filter rewound_at IS NULL; the row '
-    'itself is never deleted. See docs/features/session_rewind.md.';
+    'itself is never deleted. See knowledge-base/knowledge/features/session_rewind.md.';
 
 CREATE TABLE thread_rewinds (
     id                 UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

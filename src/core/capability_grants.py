@@ -3,7 +3,7 @@
 framework imports — hermetically unit-testable (the security boundary). Async DB
 glue is in orchestrator/services/grants_service.py.
 
-Spec: docs/done/global_expert_management.md (decisions 8, 9, 19, 21-23).
+Spec: knowledge-history/done/global_expert_management.md (decisions 8, 9, 19, 21-23).
 Restrict-only (decision 22): a more-specific scope may only narrow an inherited
 value. Deny-by-default for security keys; existing users grandfathered by the
 0030 migration backfill (shell_tools, delegation)."""
@@ -42,12 +42,12 @@ CATALOG: dict[str, dict[str, Any]] = {
     "delegation": {"type": "bool", "default": False, "restrict_only": True},
     # Publish datasources org-wide (is_global). Deny-by-default: publishing
     # hands the publisher's stored credentials to every user's agents.
-    # Spec: docs/features/public_datasources.md
+    # Spec: knowledge-base/knowledge/features/public_datasources.md
     "public_datasources": {"type": "bool", "default": False, "restrict_only": True},
     # Unattended email send: allows setting unattended_send=true on an email
     # datasource, which skips the human send-approval freeze on email_send.
     # Deny-by-default and re-checked fail-closed at dispatch (a revoked grant
-    # forces the flag back off). Spec: docs/features/email_datasource.md
+    # forces the flag back off). Spec: knowledge-base/knowledge/features/email_datasource.md
     "email_autonomous_send": {"type": "bool", "default": False, "restrict_only": True},
     # Agent-authored catalogue entries: lets a session's agent create or update
     # experts, skills and automations on the user's behalf (tools.catalog_authoring).
@@ -57,7 +57,7 @@ CATALOG: dict[str, dict[str, Any]] = {
     # Deny-by-default is also what makes it a tier control: the writes themselves
     # are owner-scoped by the endpoints they call, but an enabled automation
     # creates jobs on a schedule, so this grant bounds token spend as much as
-    # permissions. Spec: docs/features/agent_authored_catalog_entries.md
+    # permissions. Spec: knowledge-base/knowledge/features/agent_authored_catalog_entries.md
     "catalog_authoring": {"type": "bool", "default": False, "restrict_only": True},
     # Sealing a job whose delivered pull request is not merged. A job whose
     # deliverable is a PR is done when that PR lands, not when the branch is
@@ -68,7 +68,7 @@ CATALOG: dict[str, dict[str, Any]] = {
     # is no config fragment involved, only live forge state. Deny-by-default and
     # NOT backfilled — the gate can only fire on a job carrying a recorded
     # context.pull_request, and none existed when the key was introduced.
-    # Spec: docs/features/merged_pr_completion_grant.md
+    # Spec: knowledge-base/knowledge/features/merged_pr_completion_grant.md
     "complete_unmerged_pr": {"type": "bool", "default": False, "restrict_only": True},
     # The project self-improvement loop and the commissioned officer: the two
     # surfaces that spawn jobs with no human in the loop. Deny-by-default and
@@ -89,7 +89,7 @@ CATALOG: dict[str, dict[str, Any]] = {
     #     directly at the endpoints and at the spawn choke point, via
     #     `user_can_run_unattended_operations` (the same shape as
     #     `complete_unmerged_pr` above).
-    # Spec: docs/done/unattended_operations_grant.md.
+    # Spec: knowledge-history/done/unattended_operations_grant.md.
     "unattended_operations": {"type": "bool", "default": False, "restrict_only": True},
     "datasource_tools": {"type": "bool", "default": True, "restrict_only": True},
     "browser": {"type": "bool", "default": True, "restrict_only": True},
@@ -108,7 +108,7 @@ CATALOG: dict[str, dict[str, Any]] = {
         # separately gated by `shell_tools`. autonomous (fully unattended) still
         # requires an explicit permission_mode grant. A global-scope grant can
         # restrict back to supervised if ever needed.
-        # docs/issues/session_permission_mode_grant_denied_ready_timeout.md (Phase 5).
+        # knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md (Phase 5).
         "default": "auto_accept",
         "restrict_only": True,
         "order": _PERMISSION_ORDER,
@@ -289,7 +289,7 @@ def strip_to_grants(fragment: dict, grants: dict) -> tuple[dict, list[str]]:
     """Return (fragment minus what `grants` forbids, the grant keys dropped).
 
     For `duplicate_expert` only (2026-08-04 decision,
-    docs/superpowers/plans/2026-08-04-expert-write-gate-holes.md, task 3): a
+    knowledge-base/knowledge/superpowers/plans/2026-08-04-expert-write-gate-holes.md, task 3): a
     source config exceeding the copier's grants is stripped to what they can
     have rather than refused outright, because the route exists to fork a
     config the copier likely intends to edit anyway ("start from scholar") —

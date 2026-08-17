@@ -212,7 +212,7 @@ class TestReasoningCapturingClient:
 
         Raising from inside send() got wrapped into a retryable
         APIConnectionError by the OpenAI SDK (retry storm + misleading
-        "Connection error."); see docs/issues/session_silent_failure_audit.md #3.
+        "Connection error."); see knowledge-base/knowledge/issues/session_silent_failure_audit.md #3.
         """
         # Use a very small limit to trigger overflow
         client = ReasoningCapturingClient(max_context_tokens=100)

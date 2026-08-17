@@ -582,7 +582,7 @@ class TestScaleDownIdle:
         Regression for the warm-pool/scale-down thrash: with 3 busy + 1 idle
         and buffer=1, the old active-vs-min check (4 > 2) killed the idle pod
         that ensure_warm_pool had just created — one pod/minute churn for
-        hours (docs/issues/session_silent_failure_audit.md #12).
+        hours (knowledge-base/knowledge/issues/session_silent_failure_audit.md #12).
         """
         p, conn = _make_provisioner(min_agents=2)
         p._agent_buffer = 1
@@ -1445,7 +1445,7 @@ class TestTailscaleSidecar:
 
 
 # =============================================================================
-# _archive_pod_logs — post-mortem log archive (docs/features/job_log_archive.md)
+# _archive_pod_logs — post-mortem log archive (knowledge-base/knowledge/features/job_log_archive.md)
 # =============================================================================
 
 

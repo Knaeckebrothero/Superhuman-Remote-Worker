@@ -1,4 +1,4 @@
-"""Officer auto-pull tick — B3 of docs/features/officer_backlog_pools.md.
+"""Officer auto-pull tick — B3 of knowledge-base/knowledge/features/officer_backlog_pools.md.
 
 The tick spends money and creates work unattended, so the tests that matter
 here are the ones about NOT dispatching. In rough order of how expensive the

@@ -1,6 +1,6 @@
 """Workspace/shell tools must let WorkspaceUnavailableError propagate (not
 flatten it into a string result), so a dead workspace freezes the job cleanly.
-Regression guard for docs/issues/agent_fast_freeze_on_dead_workspace.md."""
+Regression guard for knowledge-base/knowledge/issues/agent_fast_freeze_on_dead_workspace.md."""
 
 import pytest
 

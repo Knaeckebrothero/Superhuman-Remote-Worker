@@ -103,7 +103,7 @@ build {
   # (docker/Dockerfile.workspace). A copy under files/ would reintroduce the
   # hand-maintained duplication that let the VM image ship for ~5 weeks without
   # browser-exec at all — a working Chromium no agent could reach. See
-  # docs/issues/vm_workspace_missing_browser_exec.md.
+  # knowledge-base/knowledge/issues/vm_workspace_missing_browser_exec.md.
   provisioner "file" {
     sources = [
       "files/management-daemon.py",

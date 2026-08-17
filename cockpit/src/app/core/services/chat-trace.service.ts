@@ -18,7 +18,7 @@ import { ChatEntry } from '../models/chat.model';
  * `/api/jobs/{id}/chat/entry/{id}` and swaps it into `rows` in place — same
  * lean-list + detail-fetch split as the audit trace.
  *
- * See docs/features/debug_audit_view_refactor.md (Phase 2c / P3).
+ * See knowledge-base/knowledge/features/debug_audit_view_refactor.md (Phase 2c / P3).
  */
 @Injectable({ providedIn: 'root' })
 export class ChatTraceService {

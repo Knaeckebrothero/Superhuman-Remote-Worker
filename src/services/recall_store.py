@@ -3,7 +3,7 @@
 Provides hybrid search (dense vector + sparse keyword + recency) over
 agent memories stored in PostgreSQL with pgvector.
 
-See docs/features/memory_light.md for full architecture.
+See knowledge-base/knowledge/features/memory_light.md for full architecture.
 
 Usage:
     ```python
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # ``memory_type`` is LLM-authored (the extractor's ``mem.type``), so it is
 # untrusted input: job c6dd288d lost an extraction to
 # ``CheckViolationError: valid_memory_type`` on the value "factial" — a typo for
-# "factual". docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md
+# "factual". knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md
 # (Defect 7).
 #
 # Deliberately NOT fuzzy nearest-match: "factial" is obviously "factual", but
@@ -275,7 +275,7 @@ class MemoryHealth:
 
     Concurrent same-project jobs deadlock on the shared memory rows (138
     contained retrieval deadlocks in one five-job batch — see
-    docs/issues/project_scoped_memory_deadlocks_under_parallel_jobs.md).
+    knowledge-base/knowledge/issues/project_scoped_memory_deadlocks_under_parallel_jobs.md).
     Containment keeps the jobs alive but was visible only in pod logs; these
     counters ride the agent heartbeat into ``agents.metadata`` so contained
     degradation reaches operator telemetry. Counting only — never control flow.

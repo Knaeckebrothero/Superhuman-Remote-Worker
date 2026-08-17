@@ -157,7 +157,7 @@ class TestReadFileBinaryAndArchiveHandling:
     """read_file must diagnose binary content honestly instead of leaking a
     raw UTF-8 codec error.
 
-    Regression coverage for docs/issues/session_uploads_never_extract_archives.md:
+    Regression coverage for knowledge-base/knowledge/issues/session_uploads_never_extract_archives.md:
     a zip attached to a session was unreadable because read_file's only
     fallback for undecodable bytes was `f"Error: {str(e)}"` — the bare
     UnicodeDecodeError message.

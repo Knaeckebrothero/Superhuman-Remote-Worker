@@ -1,6 +1,6 @@
 """Batch tool-call approval — announce step.
 
-docs/superpowers/specs/2026-08-01-batch-tool-approval-design.md
+knowledge-base/knowledge/superpowers/specs/2026-08-01-batch-tool-approval-design.md
 """
 
 from __future__ import annotations

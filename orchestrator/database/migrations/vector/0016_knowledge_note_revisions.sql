@@ -1,5 +1,5 @@
 -- migration:     0016_knowledge_note_revisions.sql
--- description:   Attributable knowledge history (docs/features/workspace_and_change_records.md
+-- description:   Attributable knowledge history (knowledge-base/knowledge/features/workspace_and_change_records.md
 --                §6.2). knowledge_index is one row per note and BOTH write paths
 --                overwrite the body in place — upsert_note's
 --                `ON CONFLICT (project_id, note_id) DO UPDATE SET ... content =

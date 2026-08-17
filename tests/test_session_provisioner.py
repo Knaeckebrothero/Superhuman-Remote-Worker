@@ -264,7 +264,7 @@ async def test_suspended_workspace_status_fires_restore():
 async def test_ensure_skips_vm_backend_thread():
     """A vm-tier session's workspace IS the VM (metadata.vm, owned by
     vm_provisioner) — ensure must not provision a sandbox container alongside it
-    (docs/issues/session_vm_backend_never_attaches.md, Defect 1)."""
+    (knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md, Defect 1)."""
     db = AsyncMock()
     db.get_thread = AsyncMock(
         return_value={
@@ -354,7 +354,7 @@ async def test_ensure_skips_vm_thread_with_gitea_workspace_container():
 
 # ---------------------------------------------------------------------------
 # Suspended VM sessions must be restored on reconnect
-# (docs/features/vm_workspace_persistence_reconciliation.md, live-gate step 4)
+# (knowledge-base/knowledge/features/vm_workspace_persistence_reconciliation.md, live-gate step 4)
 # ---------------------------------------------------------------------------
 
 

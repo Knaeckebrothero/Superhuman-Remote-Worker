@@ -1,7 +1,7 @@
 """Guardrails resolution and injection for model-family-specific surface forms.
 
 This module is the runtime side of the guardrails matrix design
-(``docs/design/guardrails_matrix.md``). It does three things:
+(``knowledge-base/knowledge/design/guardrails_matrix.md``). It does three things:
 
 1. **Tool docstring injection** — ``apply_guardrails_to_tools`` rewrites the
    ``Examples:`` block in each bound tool's description so the model sees

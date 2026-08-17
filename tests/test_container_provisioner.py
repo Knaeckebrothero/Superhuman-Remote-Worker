@@ -1188,7 +1188,7 @@ class TestSecurityHardening:
     """Tests verifying workspace container security hardening (Phase 1).
 
     These tests ensure the pod manifest and container image enforce
-    the security posture described in docs/features/hardened_container.md.
+    the security posture described in knowledge-base/knowledge/features/hardened_container.md.
     """
 
     @staticmethod

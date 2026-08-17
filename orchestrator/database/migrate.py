@@ -2,7 +2,7 @@
 
 Apply versioned SQL files from ``orchestrator/database/migrations/{app,vector}/``
 in lexicographic order, tracked in a ``schema_migrations`` table on each DB.
-Design rationale and operational runbook live in ``docs/db_migration.md``.
+Design rationale and operational runbook live in ``knowledge-base/knowledge/db_migration.md``.
 """
 
 from __future__ import annotations
@@ -354,7 +354,7 @@ async def run_migrations(
                 f"{sorted(missing)}; this is most likely a legacy table "
                 f"from before the migration runner. Drop it manually "
                 f"(DROP TABLE schema_migrations) and let the runner "
-                f"recreate it. See docs/db_migration.md §Operational "
+                f"recreate it. See knowledge-base/knowledge/db_migration.md §Operational "
                 f"runbook."
             )
 
@@ -375,7 +375,7 @@ async def run_migrations(
                     raise RuntimeError(
                         f"dirty migration {dirty['filename']!r}: "
                         f"{dirty['error']!s}; manual repair required "
-                        f"(see docs/db_migration.md §Operational runbook)"
+                        f"(see knowledge-base/knowledge/db_migration.md §Operational runbook)"
                     )
                 for dirty in dirty_rows:
                     path = next(

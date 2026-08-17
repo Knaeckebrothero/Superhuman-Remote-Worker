@@ -1,7 +1,7 @@
 """Auxiliary provider routing + main-model fallback.
 
 Covers the two-part fix for
-docs/issues/openrouter_auxiliary_misrouted_to_openai.md:
+knowledge-base/knowledge/issues/openrouter_auxiliary_misrouted_to_openai.md:
 
 Part A — an OpenRouter auxiliary must not be silently routed to api.openai.com.
 The provider is threaded from AuxiliaryConfig into create_llm, and create_llm
@@ -226,7 +226,7 @@ class TestAuxRetryBeforeFallback:
     Before this, aux had no retry, so the fallback was doing retry's job: one
     transient blip on the cheap aux model instantly rerouted the call to the
     expensive main model and lit the aux-degraded heartbeat flag.
-    docs/done/llm_retry_and_fallback_reimplemented_per_call_site.md
+    knowledge-history/done/llm_retry_and_fallback_reimplemented_per_call_site.md
     """
 
     @pytest.mark.asyncio

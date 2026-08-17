@@ -18,7 +18,7 @@ secondary hardenings from the same incident: idempotent VM-create 409, and
 instant orphan force-delete for unroutable tailnet VMs.
 
 **Design + incident forensics:**
-`docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md` (§Chosen fix).
+`knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md` (§Chosen fix).
 Code: `vm/controller/controller.py` (`_golden_state_nowait`, `_do_create`,
 idempotent 409) · `orchestrator/services/dispatch_guards.py`
 (`VM_GOLDEN_POLL`/`VM_PARK_GOLDEN`) · `orchestrator/main.py` (dispatcher
@@ -153,6 +153,6 @@ or can be cancelled normally.
 
 ### On success
 
-Update `docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md` (drop the
+Update `knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md` (drop the
 live-verification caveat) and this doc's **Status** header; move the checked
 rows of §What-is-NOT-yet-verified into §Live evidence with the log excerpts.

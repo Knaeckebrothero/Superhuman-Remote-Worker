@@ -1,4 +1,4 @@
-"""S7 — charter + officer KB note types (docs/features/centurion.md §5).
+"""S7 — charter + officer KB note types (knowledge-base/knowledge/features/centurion.md §5).
 
 Covers:
   1. Note-type vocabulary lockstep: NOTE_TYPES / reindexer / vector migration

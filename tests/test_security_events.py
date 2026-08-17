@@ -3,7 +3,7 @@
 Every 403 raised by a ``security/access.py`` gate (plus ``_require_admin``
 and the IDE proxy denials in main.py) must leave a trace: a structured
 WARNING line + a best-effort ``security_events`` row. Design in
-``docs/features/security_event_log.md``.
+``knowledge-base/knowledge/features/security_event_log.md``.
 
 What's covered here:
 

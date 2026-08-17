@@ -1121,7 +1121,7 @@ class TestLifecycleIntegration:
         latched ``_available = False`` forever — so every VM created
         afterwards booted with no tailnet key, heartbeated from the QEMU-NAT
         address, and was unreachable until someone manually restarted the
-        controller. See docs/issues/
+        controller. See knowledge-base/knowledge/issues/
         vm_controller_headscale_latch_kills_provisioning.md.
         """
         from vm.controller.headscale_client import HeadscaleClient

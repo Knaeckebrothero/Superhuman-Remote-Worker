@@ -824,7 +824,7 @@ export class SessionsPageComponent implements OnInit {
 
     goToDraft(): void {
         // Instant landing: `/` is an open draft chat — type first, the
-        // session is created on send (docs/features/instant_landing_session.md).
+        // session is created on send (knowledge-base/knowledge/features/instant_landing_session.md).
         this.router.navigate(['/']);
     }
 

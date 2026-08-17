@@ -379,12 +379,12 @@ data:
   # cooldown pause-vs-fail-fast cutoff (src/graph.py _COOLDOWN_MAX_PAUSE_SECONDS)
   # — they MUST agree, so both read this one ConfigMap key. Agents inherit via
   # envFrom; the orchestrator references it explicitly (see
-  # orchestrator/deployment.yaml). docs/features/llm_cooldown_pause_and_resume.md
+  # orchestrator/deployment.yaml). knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md
   LLM_OUTAGE_CEILING_SECONDS: {{ .Values.llmOutage.ceilingSeconds | default 43200 | quote }}
 
   # (Citations live in the vector store — srw_vector — reached through the
   # agent's shared VECTOR_POSTGRES_* pool. No separate citation DB/role/DSN.
-  # See docs/done/citation_engine_integration.md.)
+  # See knowledge-history/done/citation_engine_integration.md.)
 
   # Gitea
   GITEA_URL: {{ include "srw.gitUrl" . | quote }}
@@ -409,7 +409,7 @@ data:
   # Reclaim-on-idle (Task 7, opt-in, fail-safe): drop a session's workspace
   # PVC on idle-suspend once its S3 snapshot verifies restorable. Default off
   # keeps today's retain-on-idle behavior. See workspace_suspension.py and
-  # docs/features/workspace_durability_tiering.md §D3.
+  # knowledge-base/knowledge/features/workspace_durability_tiering.md §D3.
   WORKSPACE_RECLAIM_ON_IDLE: {{ .Values.workspace.reclaimOnIdle | default false | quote }}
 
   # Agent
@@ -502,7 +502,7 @@ data:
   # models' true API windows and rejects larger inputs with `context_too_large`.
   # Read by src/core/model_registry.py (_cap_context_window) at dispatch. Set 0 to
   # disable the day OpenAI ships 1M-for-Codex. New sessions only (agents read env
-  # at pod start). See docs/issues/codex_proxy_context_window_cap.md.
+  # at pod start). See knowledge-base/knowledge/issues/codex_proxy_context_window_cap.md.
   CODEX_CONTEXT_WINDOW_CAP: {{ .Values.agent.codexContextWindowCap | default 400000 | quote }}
 
   # OIDC / SSO — works with internal Keycloak or external OIDC provider
@@ -518,7 +518,7 @@ data:
   {{- end }}
 
   # Cookie BFF — orchestrator-issued sessions for the cockpit.
-  # See docs/features/auth_bff_and_api_tokens.md.
+  # See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md.
   # When sameOriginApi=true, the BFF redirect lives on the cockpit origin
   # (path-routed to the orchestrator) so the OIDC callback and the cockpit
   # share an origin and the session cookie is first-party.
@@ -552,12 +552,12 @@ data:
   #   - default_llm_models → admin-pinned per-capability defaults
   # Removed in chunk 7 of models_yaml_removal: VISION_MODEL, EMBEDDING_MODEL,
   # EMBEDDING_BASE_URL, CODEX_BASE_URL, BUILDER_LLM_PROVIDER. See
-  # docs/features/models_yaml_removal.md.
+  # knowledge-base/knowledge/features/models_yaml_removal.md.
   KEY_COOLDOWN_SECONDS: {{ .Values.llm.keyCooldownSeconds | quote }}
 
   # (Citation embeddings now share SRW's EMBEDDING_* service — same 4096-dim
   # qwen3-embedding-8b model that backs memory/KB — so there is no separate
-  # CITATION_EMBEDDING_* stack. See docs/done/citation_engine_integration.md.)
+  # CITATION_EMBEDDING_* stack. See knowledge-history/done/citation_engine_integration.md.)
 
   # Codex raw-response diagnostic capture. Agent pods inherit this via envFrom,
   # so flipping llm.debugCodexRawResponse in values(-local).yaml enables the
@@ -740,7 +740,7 @@ data:
   VM_CONTROLLER_URL: {{ include "srw.vmControllerUrl" . | quote }}
   VM_NAMESPACE: {{ include "srw.vmControllerNamespace" . | quote }}
 
-  # -- Persistent VM rootdisks (docs/features/vm_persistent_rootdisk.md).
+  # -- Persistent VM rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
   # MUST mirror the VM controller's own vmController.persistentRootdisk.enabled
   # (which may live in the separate helm-vm-cluster chart). The orchestrator
   # reads this to decide whether a VM's files survive a teardown — notably
@@ -783,7 +783,7 @@ data:
   # Logging
   LOG_LEVEL: {{ .Values.logLevel | quote }}
   # JSON structured logs for the aggregation pipeline (Alloy -> Loki); "text"
-  # for human-readable output. See docs/features/centralized_logging.md.
+  # for human-readable output. See knowledge-base/knowledge/features/centralized_logging.md.
   LOG_FORMAT: {{ .Values.logFormat | default "text" | quote }}
 
   # License acceptance (enforced at runtime by orchestrator)

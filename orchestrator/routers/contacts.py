@@ -1,4 +1,4 @@
-"""/api/contacts — cross-channel contact registry (docs/done/contacts_registry.md).
+"""/api/contacts — cross-channel contact registry (knowledge-history/done/contacts_registry.md).
 
 Owner mutates; project editors link/unlink; members read. Channel addresses
 are normalized here (emails lowercased, whatsapp to E.164) so the DB only

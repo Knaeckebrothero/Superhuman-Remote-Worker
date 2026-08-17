@@ -40,7 +40,7 @@ data:
   # to authenticate at the /token endpoint during code exchange + refresh.
   KEYCLOAK_CLIENT_ID: "cockpit"
 
-  # Cookie BFF (see docs/features/auth_bff_and_api_tokens.md)
+  # Cookie BFF (see knowledge-base/knowledge/features/auth_bff_and_api_tokens.md)
   SRW_BFF_REDIRECT_URI: "https://api.superhuman-remote-worker.com/auth/callback"
   SRW_SPA_BASE_URL: "https://superhuman-remote-worker.com"
   SRW_COOKIE_DOMAIN: ".superhuman-remote-worker.com"
@@ -90,7 +90,7 @@ data:
   # Set DEBUG_CODEX_RAW_RESPONSE to "1" to dump every /v1/responses
   # request+response pair to CODEX_RAW_DUMP_DIR. Default off — flip on
   # only while investigating the empty-response bug, then flip back.
-  # See docs/issues/langchain_responses_api_streaming.md.
+  # See knowledge-base/knowledge/issues/langchain_responses_api_streaming.md.
   DEBUG_CODEX_RAW_RESPONSE: "0"
   CODEX_RAW_DUMP_DIR: "/app/logs/codex-raw"
 

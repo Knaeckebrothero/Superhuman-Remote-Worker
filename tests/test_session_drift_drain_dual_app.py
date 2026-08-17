@@ -9,7 +9,7 @@ roll and served a full day on a stale build.
 
 The session leg (June's clean drain-suspend, built in persistent_app) is
 delegated, not re-implemented — see
-docs/issues/dual_app_persistent_app_redundancy.md for why that distinction
+knowledge-base/knowledge/issues/dual_app_persistent_app_redundancy.md for why that distinction
 is load-bearing. These tests drive ``_handle_heartbeat_intents``, the
 callback actually registered with the heartbeat loop.
 """

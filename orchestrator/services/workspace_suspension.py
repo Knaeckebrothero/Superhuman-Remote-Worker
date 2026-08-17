@@ -160,7 +160,7 @@ def _reclaim_on_idle_enabled() -> bool:
     PVC is dropped only after ``verify_snapshot`` confirms the S3 archive is
     restorable — see the call site in ``suspend_thread_workspace``.
     Truthy-token parsing mirrors ``canvas_snapshots.snapshots_enabled()``.
-    See docs/features/workspace_durability_tiering.md §D3.
+    See knowledge-base/knowledge/features/workspace_durability_tiering.md §D3.
     """
     return os.environ.get("WORKSPACE_RECLAIM_ON_IDLE", "false").strip().lower() in (
         "true",
@@ -180,7 +180,7 @@ def _thread_is_vm_tier(metadata: dict, ws_ctx: dict, vm_ctx: dict) -> bool:
     presence made every VM session look pod-tier, which made
     ``suspend_thread_workspace`` bail before doing anything — VM sessions could
     never be suspended and their VMs ran until the session ended.
-    docs/issues/workspace_suspension_infers_tier_from_metadata_presence.md
+    knowledge-base/knowledge/issues/workspace_suspension_infers_tier_from_metadata_presence.md
 
     Jobs are deliberately NOT covered by this: a job's
     ``context.workspace_container`` is written only by container provisioning
@@ -772,7 +772,7 @@ class WorkspaceSuspensionService:
         ``scoped_home=True`` to extract only ``home/agent-host`` (the pod image
         already supplies ``/usr/local``), matching the proven
         ``ide_session`` k8s-pod path. VMs (root, the snapshot IS the disk) keep
-        the full extract. See docs/features/workspace_durability_tiering.md §C1.
+        the full extract. See knowledge-base/knowledge/features/workspace_durability_tiering.md §C1.
 
         Returns:
             True when the snapshot was downloaded AND unpacked cleanly; False
@@ -944,7 +944,7 @@ class WorkspaceSuspensionService:
             # this thread. Returning False here made the caller's fallback
             # path log "suspend unavailable or failed" and delete the agent
             # pod a second time right after a successful suspend
-            # (docs/issues/session_silent_failure_audit.md #13).
+            # (knowledge-base/knowledge/issues/session_silent_failure_audit.md #13).
             logger.info(
                 "Workspace for thread %s already %s — skipping duplicate suspend",
                 thread_id,
@@ -1049,7 +1049,7 @@ class WorkspaceSuspensionService:
                 await self._container_provisioner.delete_workspace(owner)
                 # Reclaim-on-idle (opt-in, fail-safe): drop the hot-cache PVC
                 # once the snapshot is confirmed restorable, so idle sessions
-                # stop pinning volumes (docs/features/
+                # stop pinning volumes (knowledge-base/knowledge/features/
                 # workspace_durability_tiering.md §D3). If the archive can't
                 # be verified, KEEP the PVC — deleting it would risk the only
                 # copy of the live working tree. A delete failure (return

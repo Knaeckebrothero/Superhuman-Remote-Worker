@@ -85,7 +85,7 @@ export const appConfig: ApplicationConfig = {
     // hydration markers). If SSR is ever switched on, app.config.server.ts's
     // provideServerRendering() supplies XhrFactory → ServerXhr, which is exactly
     // what an XHR-backed HttpClient needs off-browser.
-    // docs/features/session_attachment_send_flow.md §9.2
+    // knowledge-base/knowledge/features/session_attachment_send_flow.md §9.2
     provideHttpClient(withInterceptors([authInterceptor, viewAsInterceptor])),
     provideTransloco({
       config: {

@@ -56,7 +56,7 @@ services:
       - postgres_dev_data:/var/lib/postgresql/data
       # App schema is built from the migration chain (orchestrator startup +
       # `python init.py`), not an initdb snapshot — the frozen schema.sql
-      # drifted from migrations. See docs/features/database_roadmap.md Phase 2b.
+      # drifted from migrations. See knowledge-base/knowledge/features/database_roadmap.md Phase 2b.
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
@@ -90,7 +90,7 @@ services:
     volumes:
       - postgres_vector_dev_data:/var/lib/postgresql/data
       # Vector schema is built from the migration chain, not an initdb snapshot.
-      # See docs/features/database_roadmap.md Phase 2b.
+      # See knowledge-base/knowledge/features/database_roadmap.md Phase 2b.
     ports:
       - "${VECTOR_POSTGRES_PORT:-5433}:5432"
     healthcheck:
@@ -306,7 +306,7 @@ services:
   #   ./docker/keycloak/setup-opencloud-client.sh
   # That script creates `opencloud-web` + `opencloud-orchestrator` and adds
   # the service account to the `opencloud-admin` group. It is idempotent
-  # and safe to re-run. See docs/operations/opencloud-bootstrap.md.
+  # and safe to re-run. See knowledge-base/knowledge/operations/opencloud-bootstrap.md.
   opencloud:
     image: docker.io/opencloudeu/opencloud:latest
     container_name: srw-opencloud
@@ -340,7 +340,7 @@ services:
       # orchestrator + browser both reach it via host loopback.
       PROXY_HTTP_ADDR: "127.0.0.1:9200"
       PROXY_ENABLE_BASIC_AUTH: "false"
-      # CRITICAL: sub-claim is required (see docs/operations/opencloud-bootstrap.md §4).
+      # CRITICAL: sub-claim is required (see knowledge-base/knowledge/operations/opencloud-bootstrap.md §4).
       PROXY_USER_OIDC_CLAIM: "sub"
       # External IdP (Keycloak) — disables the internal IDP.
       OC_EXCLUDE_RUN_SERVICES: "idp"
@@ -415,7 +415,7 @@ services:
   # GreenMail — test-only mail server for the `email` datasource
   # ---------------------------------------------------------------------------
   # Disposable IMAP+IMAPS+SMTP(+S) server backing the email datasource
-  # integration tests (docs/features/email_datasource.md §Testing). Auth is
+  # integration tests (knowledge-base/knowledge/features/email_datasource.md §Testing). Auth is
   # disabled: any user/password pair works and mailboxes are created on first
   # use; all state is in-memory (a restart wipes it). Seed folders + fixture
   # mails with: python scripts/seed_greenmail.py

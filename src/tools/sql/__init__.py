@@ -5,7 +5,7 @@ Provides PostgreSQL tools when a PostgreSQL datasource is attached to a job:
 - Schema inspection
 - SQL statement execution (write)
 
-See docs/datasources.md for the datasource connector system.
+See knowledge-base/knowledge/datasources.md for the datasource connector system.
 """
 
 from typing import Any, Dict, List

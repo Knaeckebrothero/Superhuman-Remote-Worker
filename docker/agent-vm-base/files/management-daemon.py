@@ -14,7 +14,7 @@ Configuration (written by cloud-init at VM creation):
   /etc/default/management-daemon  — NATS_URL, JOB_ID (sourced by systemd)
   /run/agent/job-config.json      — full job config (job_id, agent_config, etc.)
 
-See docs/features/nats.md for the NATS subject design.
+See knowledge-base/knowledge/features/nats.md for the NATS subject design.
 """
 
 import asyncio
@@ -144,7 +144,7 @@ def check_ssh_ready(ip: str) -> bool:
     address (100.64.x.y) — the only address agent pods can route to. Reported
     to the orchestrator as ``ssh_ready`` in the register payload; the
     orchestrator itself has no tailnet route and cannot probe this (see
-    docs/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
+    knowledge-base/knowledge/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
     """
     try:
         if ipaddress.ip_address(ip) not in TAILNET_NET:

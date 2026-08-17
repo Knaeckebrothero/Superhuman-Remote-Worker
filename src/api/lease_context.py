@@ -1,6 +1,6 @@
 """Run-queue lease context shared by the stateless executor and fenced writers.
 
-M3 of the stateless-agents S1 spine (docs/features/stateless_agents.md §5.2):
+M3 of the stateless-agents S1 spine (knowledge-base/knowledge/features/stateless_agents.md §5.2):
 while the stateless turn executor drives a claimed ``session_turn`` unit, every
 persist to a *fenced* store (``thread_messages`` rows, the compaction
 checkpoint row, the ``thread_events`` journal) must present the claim's

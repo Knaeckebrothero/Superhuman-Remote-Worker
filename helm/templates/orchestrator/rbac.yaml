@@ -51,7 +51,7 @@ rules:
     verbs: ["create", "delete", "get", "list", "patch", "update"]
   # Session router: per-session Service + Ingress lifecycle managed by
   # SessionRouterService when a thread binds to an agent. See
-  # docs/features/direct_session_websockets.md §RBAC changes.
+  # knowledge-base/knowledge/features/direct_session_websockets.md §RBAC changes.
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "create", "delete", "patch"]

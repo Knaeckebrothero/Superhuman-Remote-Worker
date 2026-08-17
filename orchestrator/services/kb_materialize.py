@@ -1,6 +1,6 @@
 """Server-side materialisation of ONE knowledge note into a project's KB repo.
 
-Step 3 of ``docs/features/knowledge_base_repo_separation.md``. The agent used
+Step 3 of ``knowledge-base/knowledge/features/knowledge_base_repo_separation.md``. The agent used
 to materialise every note as ``knowledge/<slug>.md`` inside its own workspace
 checkout (``_dual_write_note``), which welded the vault to the jobs repo and,
 because it was guarded on ``has_git()``, skipped entirely for anything without

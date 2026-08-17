@@ -5,7 +5,7 @@ This module provides completion signaling tools:
 - job_complete: Marks the phase as final, job completes after remaining todos are done
 
 The job_complete tool implements a final phase pattern (journal-before-observe,
-docs/issues/job_finalization_decisions_held_only_in_process_memory.md):
+knowledge-base/knowledge/issues/job_finalization_decisions_held_only_in_process_memory.md):
 1. Rejects if called from tactical phase (must be in strategic phase)
 2. Durably journals the decision on the job row (orchestrator POST, idempotent
    on (job_id, tool_call_id)) BEFORE returning to the model
@@ -210,7 +210,7 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             # or extra `repo/` prefix (or `./`) must never fail a seal when the
             # file exists under either spelling — that exact rejection forced a
             # COMPLETE job (58027ee7) into a 0.45 honest-floor seal.
-            # docs/issues/officer_blind_reads_and_worker_bureaucracy.md
+            # knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md
             from ...core.deliverables import (
                 KB_DELIVERABLE_PREFIX,
                 resolve_workspace_deliverable,
@@ -354,7 +354,7 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             # five times over 13 minutes against an already-deleted VM before an
             # unrelated tool finally let the exception propagate. Re-raise so the
             # fast-freeze path classifies it.
-            # docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 8)
+            # knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 8)
             raise
         except Exception as e:
             logger.error(f"Failed to mark job as final: {e}")

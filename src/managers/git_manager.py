@@ -1324,7 +1324,7 @@ class GitManager:
         which is how job bbce4bed lost a deliverable: every phase-boundary push
         returned False across 8 phases and left no trace anywhere, because five
         of the six call sites also discard the return value. See
-        docs/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md.
+        knowledge-base/knowledge/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md.
 
         Tag delivery is normally per-ref via push_ref() so one rejected
         historical tag can't spoil every subsequent push; tags=True remains
@@ -1912,7 +1912,7 @@ class GitManager:
             # That is how push() came to invoke
             # `git push -u origin "CWD: /…\n--- stdout ---\nmain"`, failing with
             # `invalid refspec` on every phase boundary. See
-            # docs/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md
+            # knowledge-base/knowledge/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md
             stdout_marker = "--- stdout ---\n"
             marker_at = rest.find(stdout_marker)
             if marker_at != -1:

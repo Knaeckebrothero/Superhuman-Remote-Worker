@@ -44,7 +44,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       # App schema is built from the migration chain by the orchestrator on
       # startup, not an initdb snapshot — the frozen schema.sql drifted from
-      # migrations. See docs/features/database_roadmap.md Phase 2b.
+      # migrations. See knowledge-base/knowledge/features/database_roadmap.md Phase 2b.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-srw}"]
       interval: 5s
@@ -80,7 +80,7 @@ services:
     volumes:
       - postgres_vector_data:/var/lib/postgresql/data
       # Vector schema is built from the migration chain by the orchestrator on
-      # startup, not an initdb snapshot. See docs/features/database_roadmap.md Phase 2b.
+      # startup, not an initdb snapshot. See knowledge-base/knowledge/features/database_roadmap.md Phase 2b.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${VECTOR_POSTGRES_USER:-srw}"]
       interval: 5s
@@ -242,7 +242,7 @@ services:
   #
   # Depends on a Keycloak client named `opencloud-orchestrator` with
   # serviceAccountsEnabled=true — see docker/opencloud/setup-opencloud.sh
-  # and docs/operations/opencloud-bootstrap.md.
+  # and knowledge-base/knowledge/operations/opencloud-bootstrap.md.
   opencloud:
     image: docker.io/opencloudeu/opencloud:latest
     container_name: srw-opencloud
@@ -255,7 +255,7 @@ services:
       OC_URL: "${OPENCLOUD_URL:-http://localhost:9200}"
       OC_INSECURE: "true"
       PROXY_ENABLE_BASIC_AUTH: "false"
-      # CRITICAL: sub-claim is required (see docs/operations/opencloud-bootstrap.md §4).
+      # CRITICAL: sub-claim is required (see knowledge-base/knowledge/operations/opencloud-bootstrap.md §4).
       PROXY_USER_OIDC_CLAIM: "sub"
       # External IdP (Keycloak) — disables the internal IDP.
       OC_EXCLUDE_RUN_SERVICES: "idp"

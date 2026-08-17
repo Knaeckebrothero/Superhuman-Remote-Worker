@@ -4,7 +4,7 @@ Defines the contract for workspace storage backends. All file paths are
 relative to the workspace root. Implementations handle the transport
 (local filesystem, SSH/SFTP, etc.) while managers provide higher-level logic.
 
-See docs/features/vm_backend.md for the full design.
+See knowledge-base/knowledge/features/vm_backend.md for the full design.
 """
 
 from abc import ABC, abstractmethod
@@ -42,7 +42,7 @@ class WorkspaceAuthenticationError(Exception):
 # but the deny-list below is checked FIRST, so the failure mode of an accidental
 # match is "stays terminal", never "a real bug becomes an infinite retry".
 #
-# docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 1)
+# knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 1)
 
 # Real bugs. These must never be retried — retrying a constraint violation or a
 # missing column just burns the attempt ceiling and hides the defect.
@@ -157,10 +157,10 @@ def completion_error_payload(exc: BaseException) -> Dict[str, Any]:
       * ``workspace_authentication`` — SSH credentials/config are invalid;
         terminal without workspace recovery.
       * ``workspace_unavailable`` — the VM/pod is gone; pause, reprovision,
-        resume (docs/issues/streaming_strips_workspace_unavailable_type.md).
+        resume (knowledge-base/knowledge/issues/streaming_strips_workspace_unavailable_type.md).
       * ``infra_transient`` — a backing service blipped; pause, KEEP the
         workspace, retry with backoff
-        (docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md).
+        (knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md).
       * ``job_error`` — the job itself failed. Terminal.
 
     Order matters: deterministic authentication and dead-workspace errors are
@@ -190,7 +190,7 @@ class RemoteCommandTimeoutError(Exception):
     dead workspace and must not trip the fast-freeze path — it surfaces to
     the model as an ordinary tool error instead. If the workspace is truly
     gone, the next operation's connect path classifies that and freezes.
-    See docs/issues/remote_backend_indefinite_wait_deadlock.md.
+    See knowledge-base/knowledge/issues/remote_backend_indefinite_wait_deadlock.md.
     """
 
     pass
@@ -203,7 +203,7 @@ class RemoteChannelBusyError(Exception):
     limit (OpenSSH MaxSessions) is a transient concurrency condition, not a
     dead workspace — misclassifying it triggers destructive pod recovery
     against a healthy pod. Surfaces to the model as an ordinary tool error.
-    docs/issues/maxsessions_parallel_tools_false_workspace_death.md.
+    knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md.
     """
 
     pass

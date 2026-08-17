@@ -19,7 +19,7 @@ Design contract: **fail-open**. If an image cannot be decoded (unknown
 format, corrupt bytes, missing Pillow) the original bytes are returned
 unchanged — image delivery must never break because of the size guard.
 
-See `docs/issues/session_turn_hard_fails_on_transient_llm_outage.md`
+See `knowledge-base/knowledge/issues/session_turn_hard_fails_on_transient_llm_outage.md`
 (Track 1) for the incident and the tier design.
 """
 

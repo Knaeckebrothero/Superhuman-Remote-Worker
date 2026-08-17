@@ -6,7 +6,7 @@ Provides Neo4j graph operations:
 - Schema inspection
 
 These tools are injected automatically when a Neo4j datasource is
-attached to a job. See docs/datasources.md.
+attached to a job. See knowledge-base/knowledge/datasources.md.
 """
 
 import logging

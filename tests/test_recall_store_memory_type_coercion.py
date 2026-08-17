@@ -1,7 +1,7 @@
 """An LLM-authored memory_type must never discard the memory.
 
 Regression guard for Defect 7 of
-docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
+knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
 
 Job c6dd288d's extractor emitted ``factial`` (a typo for ``factual``) and the
 whole extraction was lost to::

@@ -2,7 +2,7 @@
 
 Deliberately free of FastAPI and of policy decisions: callers hand in verdicts
 already produced by the code that *enforces* them, so this module can never
-drift from the enforcer. See docs/done/session_config_drift_resume.md.
+drift from the enforcer. See knowledge-history/done/session_config_drift_resume.md.
 """
 
 from __future__ import annotations

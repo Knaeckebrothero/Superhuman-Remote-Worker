@@ -28,11 +28,11 @@ Two failure directions are both real, and the classifier is calibrated between
 them — bias for retry, but do not retry blindly:
 
 * over-eager ``permanent`` destroys finished work
-  (docs/done/transient_408_stream_disconnect_misclassified_as_permanent.md)
+  (knowledge-history/done/transient_408_stream_disconnect_misclassified_as_permanent.md)
 * over-eager ``transient`` loops forever
-  (docs/done/agent_infinite_retry_on_permanent_llm_errors.md)
+  (knowledge-history/done/agent_infinite_retry_on_permanent_llm_errors.md)
 
-See docs/done/llm_retry_and_fallback_reimplemented_per_call_site.md.
+See knowledge-history/done/llm_retry_and_fallback_reimplemented_per_call_site.md.
 """
 
 import asyncio
@@ -186,7 +186,7 @@ def _is_codex_proxy_error(exc: BaseException) -> bool:
 # A 429 whose reset window exceeds this is treated as a quota COOLDOWN (fail
 # fast), not a per-minute rate limit (retry): retrying within the window is
 # futile. Anything at/under it is a normal rate limit. See Defect C in
-# docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+# knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
 _COOLDOWN_MIN_RESET_SECONDS = 300.0
 
 # The pause-vs-fail-fast cutoff for a quota cooldown: a cooldown whose
@@ -197,7 +197,7 @@ _COOLDOWN_MIN_RESET_SECONDS = 300.0
 # LLM_OUTAGE_CEILING_SECONDS env var so pause-admission (agent-side, here) and
 # give-up (orchestrator-side) can never disagree — keep the 43_200 (12h) default
 # in sync with orchestrator/services/completion.py (a different pod reads it).
-# docs/features/llm_cooldown_pause_and_resume.md
+# knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md
 try:
     _COOLDOWN_MAX_PAUSE_SECONDS = float(
         os.getenv("LLM_OUTAGE_CEILING_SECONDS") or 43200
@@ -277,7 +277,7 @@ def _cooldown_failfast_error(
     frozen model. ``reset_at`` is ABSOLUTE epoch seconds — the payload is read
     by the loop advance minutes later and by the heal path hours later, so a
     relative ``reset_seconds`` would rot; ``None`` when the provider stated no
-    reset. docs/issues/loop_advances_into_active_model_cooldown.md
+    reset. knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md
     """
     return {
         "message": message,
@@ -415,9 +415,9 @@ def _classify_llm_error(error: Exception) -> str:
     Drives the retry decision in ``create_execute_node`` so non-retriable
     failures (404 model-not-found, 401/403 auth, 400 invalid_request) fail
     the job fast instead of looping forever — see
-    docs/done/agent_infinite_retry_on_permanent_llm_errors.md for the
+    knowledge-history/done/agent_infinite_retry_on_permanent_llm_errors.md for the
     incident this prevents, and
-    docs/done/transient_408_stream_disconnect_misclassified_as_permanent.md
+    knowledge-history/done/transient_408_stream_disconnect_misclassified_as_permanent.md
     for the inverse failure (an over-eager ``permanent`` verdict destroying
     3.5h of work) that the status gate in the text fallback guards against.
     Both directions are real: bias for retry, but do not retry blindly.
@@ -512,7 +512,7 @@ def _classify_llm_error(error: Exception) -> str:
                     # retryable. A genuine model-not-found 404 carries a JSON
                     # error body and stays permanent. Incident: the 2026-07-17
                     # MiniMax edge outage hard-failed two jobs on attempt 1
-                    # (docs/issues/llm_infra_404_misclassified_permanent_kills_jobs.md).
+                    # (knowledge-base/knowledge/issues/llm_infra_404_misclassified_permanent_kills_jobs.md).
                     return "transient"
                 return "permanent"
             if 500 <= status_code < 600:
@@ -646,7 +646,7 @@ def initial_error_freeze_fields(
 # with four different backoff schedules, and two of them (the light subagent
 # readers and the auxiliary tasks) had no loop at all — a single transient 408
 # killed both readers of a parallel fan-out on critic job 37c418d2.
-# docs/done/llm_retry_and_fallback_reimplemented_per_call_site.md
+# knowledge-history/done/llm_retry_and_fallback_reimplemented_per_call_site.md
 # ---------------------------------------------------------------------------
 
 # Verdicts that another identical attempt could plausibly clear. `permanent`,

@@ -3,7 +3,7 @@
 Hermetic — no live IMAP/SMTP server. The imap_tools seam is replaced by a
 FakeMailBox transport injected through ``EmailConnection._new_mailbox``; SMTP
 is replaced by a FakeSMTP via ``EmailConnection.open_smtp``. The semantic
-cases from docs/features/email_datasource.md "Testing" are covered:
+cases from knowledge-base/knowledge/features/email_datasource.md "Testing" are covered:
 
 - folder allowlist (subtree + non-'/' delimiter + INBOX case + move src/dest)
 - tier backup gate (tool callable but tier refuses)

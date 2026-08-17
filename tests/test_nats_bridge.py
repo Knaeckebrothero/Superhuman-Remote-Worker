@@ -645,7 +645,7 @@ class TestQueryVmStatus:
         # If a JetStream stream's subjects ever cover vm.lifecycle.get.*, the
         # request inbox receives the stream's publish-ack instead of the
         # controller reply. That ack must never be surfaced as VM status.
-        # See docs/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
+        # See knowledge-base/knowledge/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
         ack = MagicMock()
         ack.data = json.dumps({"stream": "VM_EVENTS", "seq": 42}).encode()
         mock_nc.request = AsyncMock(return_value=ack)
@@ -1026,7 +1026,7 @@ class TestOnDaemonRegister:
     Readiness evidence is daemon-supplied (``ssh_ready``) or, for legacy
     golden images that omit the field, inferred from a tailnet ``ssh_host``.
     There is NO orchestrator-side SSH probe — the orchestrator has no route
-    to the tailnet, so a probe gate can never pass (see docs/issues/
+    to the tailnet, so a probe gate can never pass (see knowledge-base/knowledge/issues/
     vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
     """
 
@@ -1399,7 +1399,7 @@ class TestOnDaemonRegister:
 
 # =============================================================================
 # Test: thread-vs-job routing is durable, not process-local (Defect 4)
-# docs/issues/session_vm_backend_never_attaches.md
+# knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md
 # =============================================================================
 
 
@@ -2224,7 +2224,7 @@ class TestRootdiskDispositionIsRecorded:
     A controller without VM_PERSISTENT_ROOTDISK cascade-deletes the disk
     whatever purge_disk said, so context.vm.rootdisk must reflect what came
     back — the kept-disk GC sweep keys off it.
-    docs/features/vm_persistent_rootdisk.md D2/D4.
+    knowledge-base/knowledge/features/vm_persistent_rootdisk.md D2/D4.
     """
 
     @pytest.mark.asyncio

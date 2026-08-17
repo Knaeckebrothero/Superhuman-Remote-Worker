@@ -1,6 +1,6 @@
 """Tests for the pod workspace-recovery arm (probe / counter reset / no-leak).
 
-docs/issues/maxsessions_parallel_tools_false_workspace_death.md (slice D):
+knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md (slice D):
 
 1. Probe before punch — on a ``workspace_unavailable`` report the orchestrator
    TCP-probes the workspace sshd; a listening pod is NOT deleted (the report
@@ -419,7 +419,7 @@ class TestHandlePodWorkspaceRecovery:
         A bare pause_job keeps any row-level freeze_data, and paused +
         freeze_data set is invisible to get_dispatchable_jobs — the job
         `52949749` wedge. The arm must route through the stash-and-clear
-        pause (docs/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
+        pause (knowledge-base/knowledge/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
         """
         db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
         job = _job()

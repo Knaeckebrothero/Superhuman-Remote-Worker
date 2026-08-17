@@ -10,7 +10,7 @@
 # highest-value exfiltration/SSRF target in the system. This policy is the
 # companion control to the local-execution-fallback removals (in-pod browser,
 # local libtmux, local git-clone) — see no_workspace_agent_mode.md §9.1 and
-# docs/issues/remove_local_browser_fallback.md.
+# knowledge-base/knowledge/issues/remove_local_browser_fallback.md.
 #
 # Shape mirrors the workspace `internet-only` tier: in-cluster dependencies
 # are allowed by podSelector; public internet is allowed on TCP 80/443/22 with
@@ -23,7 +23,7 @@
 # over the 443 wildcard out of the box — but a deployment whose LLM, Keycloak,
 # or cloud lives on an RFC1918 address (in-cluster other-namespace, or the
 # home LAN) MUST add an `extraEgress` carve-out before enabling, or agents
-# lose model access. See docs/issues/agent_egress_networkpolicy_enablement.md
+# lose model access. See knowledge-base/knowledge/issues/agent_egress_networkpolicy_enablement.md
 # for the discovery recipe + checklist.
 #
 # Single policy (no per-tier model): agent pods are control plane, not the

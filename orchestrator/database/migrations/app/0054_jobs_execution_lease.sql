@@ -1,6 +1,6 @@
 -- migration:     0054_jobs_execution_lease.sql
 -- description:   Job execution lease — liveness by renewal, not inference
---                (docs/features/job_execution_lease.md). claim_job_for_agent
+--                (knowledge-base/knowledge/features/job_execution_lease.md). claim_job_for_agent
 --                sets a short pickup lease; agent heartbeats renew it; an
 --                expired lease IS the definition of an orphaned job, with no
 --                dependency on the agents table or sweep ordering (the

@@ -13,7 +13,7 @@ climbs while every artifact an observer reads says nothing has happened.
 That combination is worse than a visible stall, because it reads as
 *evidence of no work* rather than as missing evidence, and it is what
 produced the night-2 false convictions
-(``docs/issues/`` — officer findings F7/F8).
+(``knowledge-base/knowledge/issues/`` — officer findings F7/F8).
 
 This module decouples durability from phase structure using two triggers:
 

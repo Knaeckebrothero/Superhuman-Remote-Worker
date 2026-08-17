@@ -397,7 +397,7 @@ class TestResolvedConfigSerialization:
         """Blob path (the production dispatch/session path): on the default gemma
         model, an expert shipping only persona.txt gets ITS persona in the blob,
         not the framework persona_gemma.txt. Regression cover for
-        docs/issues/expert_prompts_shadowed_by_family_variants.md."""
+        knowledge-base/knowledge/issues/expert_prompts_shadowed_by_family_variants.md."""
         expert_dir = tmp_path / "expert"
         expert_dir.mkdir()
         (expert_dir / "persona.txt").write_text("expert base persona")

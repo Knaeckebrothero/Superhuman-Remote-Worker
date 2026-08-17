@@ -14,7 +14,7 @@
 #   kubectl apply -f deployment/41-headscale-bootstrap.yaml
 # Then store the generated keys in Vault (see bootstrap job comments).
 #
-# See docs/features/headscale_mesh.md for the full design.
+# See knowledge-base/knowledge/features/headscale_mesh.md for the full design.
 
 ---
 apiVersion: v1

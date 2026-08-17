@@ -1,6 +1,6 @@
 """Real-Postgres concurrency tests for RecallStore's deadlock containment.
 
-Guards docs/issues/project_scoped_memory_deadlocks_under_parallel_jobs.md: five
+Guards knowledge-base/knowledge/issues/project_scoped_memory_deadlocks_under_parallel_jobs.md: five
 same-project jobs racing ``decrement_ttl`` (scope-wide UPDATE) against the
 access-stat write (``id = ANY(...)`` UPDATE in RRF-score order) produced 138
 contained retrieval deadlocks — PostgreSQL acquired the overlapping tuple locks

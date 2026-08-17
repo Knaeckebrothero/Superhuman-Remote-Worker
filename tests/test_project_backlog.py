@@ -1,5 +1,5 @@
 """Project backlog / idea pipeline — spec:
-docs/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md
+knowledge-base/knowledge/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md
 """
 
 import uuid
@@ -62,7 +62,7 @@ def _capture_materialize():
     """Patch the server-side materialisation seam and record the rendered notes.
 
     The OKF file is a Gitea commit the orchestrator makes now, not a workspace
-    write (docs/features/knowledge_base_repo_separation.md §7 step 4), so the
+    write (knowledge-base/knowledge/features/knowledge_base_repo_separation.md §7 step 4), so the
     frontmatter these tests assert on is in the POST body.
     Returns ``(patcher, rendered)`` with ``rendered`` keyed by note slug.
     """
@@ -1580,7 +1580,7 @@ class TestCloseBacklogTicket:
         block to rewrite it inside, so this stays a genuine no-op: warn, no
         write, False. Only the missing-frontmatter case was covered before,
         which is how these three came to be conflated
-        (docs/done/backlog_close_mislabels_idempotent_reclose.md)."""
+        (knowledge-history/done/backlog_close_mislabels_idempotent_reclose.md)."""
         import logging
         from unittest.mock import AsyncMock, MagicMock
 
@@ -1722,7 +1722,7 @@ class TestCloseBacklogTicket:
 
 # =============================================================================
 # KB repo separation step 2: the mirror resolves its repo, it doesn't guess
-# (docs/features/knowledge_base_repo_separation.md §5, §5a)
+# (knowledge-base/knowledge/features/knowledge_base_repo_separation.md §5, §5a)
 # =============================================================================
 
 

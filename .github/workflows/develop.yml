@@ -727,7 +727,7 @@ jobs:
           # (see Dockerfile.workspace §2c), so changes to it must rebuild the
           # workspace image. Missing this path caused a0ce92d2's browser-exec
           # fix to sit unbuilt while sha-310acc2 (the broken first cut) stayed
-          # deployed. See docs/features/browser_workspace_executor.md.
+          # deployed. See knowledge-base/knowledge/features/browser_workspace_executor.md.
           WORKSPACE_PATHS=(docker/Dockerfile.workspace
             docker/workspace-entrypoint.sh
             docker/browser-exec docker/check-browser-stream.py
@@ -1834,7 +1834,7 @@ jobs:
           COMPONENT_SHA: ${{ needs.changes.outputs.orchestrator-sha }}
         run: |
           : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — docs/issues/ci_deploy_race_reverts_image_tags.md.
+          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
           # Overlapping runs each derive this identity from their own checkout, so
           # the run that finishes LAST can otherwise write an older sha over a
           # newer one and silently revert a verified deploy. Skip only when the
@@ -1867,7 +1867,7 @@ jobs:
           COMPONENT_SHA: ${{ needs.changes.outputs.agent-sha }}
         run: |
           : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — docs/issues/ci_deploy_race_reverts_image_tags.md.
+          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
           # Overlapping runs each derive this identity from their own checkout, so
           # the run that finishes LAST can otherwise write an older sha over a
           # newer one and silently revert a verified deploy. Skip only when the
@@ -1895,7 +1895,7 @@ jobs:
           COMPONENT_SHA: ${{ needs.changes.outputs.cockpit-sha }}
         run: |
           : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — docs/issues/ci_deploy_race_reverts_image_tags.md.
+          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
           # Overlapping runs each derive this identity from their own checkout, so
           # the run that finishes LAST can otherwise write an older sha over a
           # newer one and silently revert a verified deploy. Skip only when the
@@ -1924,7 +1924,7 @@ jobs:
           COMPONENT_DIGEST: ${{ needs.build-mcp.outputs.digest }}
         run: |
           : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — docs/issues/ci_deploy_race_reverts_image_tags.md.
+          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
           # Overlapping runs each derive this identity from their own checkout, so
           # the run that finishes LAST can otherwise write an older sha over a
           # newer one and silently revert a verified deploy. Skip only when the
@@ -1955,7 +1955,7 @@ jobs:
           COMPONENT_SHA: ${{ needs.changes.outputs.workspace-sha }}
         run: |
           : "${COMPONENT_SHA:=$GITHUB_SHA}"
-          # Staleness guard — docs/issues/ci_deploy_race_reverts_image_tags.md.
+          # Staleness guard — knowledge-base/knowledge/issues/ci_deploy_race_reverts_image_tags.md.
           # Overlapping runs each derive this identity from their own checkout, so
           # the run that finishes LAST can otherwise write an older sha over a
           # newer one and silently revert a verified deploy. Skip only when the

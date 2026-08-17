@@ -1,6 +1,6 @@
 /**
  * Task 8 — cockpit service surface for session rewind
- * (docs/features/session_rewind.md).
+ * (knowledge-base/knowledge/features/session_rewind.md).
  *
  * rewind()/summarizeUpTo() only touch _sendControl, so this harness skips the
  * EventSource/WebSocket constructor mocks and connect() flow that

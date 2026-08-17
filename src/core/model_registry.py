@@ -60,7 +60,7 @@ class ModelMeta:
     # Per-model output cap (Admin → Models, stored in models.params_json). Seeded
     # into dispatch the same way context_window is, then it overrides the family
     # settings.max_output_tokens before _resolve_max_output_tokens clamps to the
-    # context backstop. See docs/features/reasoning_aware_max_output_tokens.md §5.2.
+    # context backstop. See knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md §5.2.
     max_output_tokens: Optional[int] = None
     reasoning_level: Optional[str] = None
     origin: str = "catalog"

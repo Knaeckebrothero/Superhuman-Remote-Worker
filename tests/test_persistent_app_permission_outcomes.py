@@ -1,7 +1,7 @@
 """Transport-side supervised gate semantics in src/api/persistent_app.py.
 
 Companion to tests/test_persistent_graph_permission_outcomes.py, covering
-docs/done/supervised_parallel_gates_timeout_fabricates_denial.md:
+knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md:
 
 * Fix 1 — ``_loop_permission_check`` must report a *three-state* outcome.
   An expired/unanswered gate is NO_ANSWER, never DECLINED: collapsing the

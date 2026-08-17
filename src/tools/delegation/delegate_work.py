@@ -40,7 +40,7 @@ DELEGATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "named outright in a tools.delegation list. No config has granted "
             "the heavy delegation pair since 57430a2a emptied worker_base on "
             "2026-07-22; whether to restore it is an open decision "
-            "(docs/issues/registered_tools_no_config_can_grant.md §3b) and "
+            "(knowledge-base/knowledge/issues/registered_tools_no_config_can_grant.md §3b) and "
             "`delegation: true` must not be the thing that takes it"
         ),
     },
@@ -437,7 +437,7 @@ def create_delegation_tools(context: ToolContext) -> List[Any]:
 
         # Mirror delegate_work's cap — the re-suspend freeze carries this
         # timeout, and the timeout sweeper falls back to 7200s if absent
-        # (docs/issues/delegation_freeze_lifecycle_gaps.md, Gap 2).
+        # (knowledge-base/knowledge/issues/delegation_freeze_lifecycle_gaps.md, Gap 2).
         max_timeout = tool_context.config.get("delegation", {}).get(
             "max_timeout", 14400
         )
@@ -489,7 +489,7 @@ def create_delegation_tools(context: ToolContext) -> List[Any]:
         # Re-suspend: request freeze so parent goes back to waiting. Must
         # carry `timeout` — the timeout sweeper falls back to 7200s when the
         # key is absent, silently shrinking longer delegation deadlines
-        # (docs/issues/delegation_freeze_lifecycle_gaps.md, Gap 2).
+        # (knowledge-base/knowledge/issues/delegation_freeze_lifecycle_gaps.md, Gap 2).
         tool_context.request_freeze(
             {
                 "freeze_type": "delegation",

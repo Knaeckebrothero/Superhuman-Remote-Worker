@@ -86,8 +86,8 @@ def _serialize_payload(obj: Any) -> Any:
 # audit read materializes the whole pile and OOM-kills the orchestrator. These
 # already live once per job in ``jobs.resolved_config`` / ``config_override`` /
 # ``datasources`` / ``repositories``, so they must never be persisted per row.
-# See docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md and
-# docs/features/debug_audit_view_refactor.md (Phase 0).
+# See knowledge-base/knowledge/issues/audit_metadata_config_duplication_ooms_orchestrator.md and
+# knowledge-base/knowledge/features/debug_audit_view_refactor.md (Phase 0).
 _HEAVY_JOB_METADATA_KEYS = (
     "resolved_config",
     "config_override",
@@ -419,7 +419,7 @@ class LLMArchiver:
         — this is how a degraded auxiliary model becomes visible in the debug
         view. Fire-and-forget: never raises.
 
-        See docs/issues/surface_silent_aux_failures.md.
+        See knowledge-base/knowledge/issues/surface_silent_aux_failures.md.
         """
         if not self._ensure_connected():
             return None
@@ -1006,7 +1006,7 @@ def audit_unavailable(
     an audit step with a custom ``step_type`` (e.g. ``memory_unavailable`` /
     ``kb_unavailable``) so the degradation is visible in the cockpit audit trail
     instead of living only in a pod-log WARNING (see
-    docs/done/embedding_key_missing_silently_disables_memory_and_kb.md).
+    knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md).
     """
     arch = get_archiver()
     if arch is None:

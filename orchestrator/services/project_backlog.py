@@ -5,7 +5,7 @@ the current open backlog" and there was no backlog: each agent re-derived one
 by similarity search, every job. This module makes the pool a deterministic,
 indexed listing that the orchestrator hands over verbatim.
 
-Two buckets (docs/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md):
+Two buckets (knowledge-base/knowledge/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md):
 
 * **pool** — notes of type feature/issue/idea with ``status='active'``,
   ordered by priority then age.
@@ -309,7 +309,7 @@ _STATUS_LINE = re.compile(r"^status:.*$", re.MULTILINE)
 # _rewrite_status outcomes. All three can hand back byte-identical markdown, so
 # the returned text alone cannot tell them apart — which is exactly how an
 # idempotent re-close came to be logged as malformed frontmatter
-# (docs/done/backlog_close_mislabels_idempotent_reclose.md).
+# (knowledge-history/done/backlog_close_mislabels_idempotent_reclose.md).
 _REWRITTEN = "rewritten"  # the status line changed (or one was inserted)
 _ALREADY_SET = "already_set"  # the line was found and already holds the target
 _NOT_REWRITABLE = "not_rewritable"  # no frontmatter, or no closing `---`
@@ -365,7 +365,7 @@ async def _resolve_note_repo(project_id: str, postgres_db: Any) -> Any | None:
     jobs-repo name from the project id here. A second copy of that rule is
     exactly how the mirror and the reindexer come to target different repos
     once a project has its own ``knowledge`` repo, and that divergence is
-    silent (docs/features/knowledge_base_repo_separation.md §5a, §10).
+    silent (knowledge-base/knowledge/features/knowledge_base_repo_separation.md §5a, §10).
 
     ``postgres_db`` is late-bound off ``main`` when the caller passes none: it
     is a module global built during orchestrator startup, and importing

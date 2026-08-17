@@ -5,7 +5,7 @@ Connects to a VM over SSH for file operations (SFTP) and shell execution
 detection as the local ShellManager, but over SSH channels.
 
 Requires: paramiko (pip install paramiko)
-See docs/features/vm_backend.md for the full design.
+See knowledge-base/knowledge/features/vm_backend.md for the full design.
 """
 
 import base64
@@ -80,7 +80,7 @@ _EXEC_POLL_SECONDS = 0.05
 # Session-channel opens refused by sshd on a LIVE transport (MaxSessions) are
 # transient concurrency refusals, not workspace death: retry briefly, then
 # surface as RemoteChannelBusyError (an ordinary tool error).
-# docs/issues/maxsessions_parallel_tools_false_workspace_death.md
+# knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md
 _CHANNEL_OPEN_RETRIES = 3
 _CHANNEL_OPEN_BACKOFF_SECONDS = 0.25
 
@@ -554,7 +554,7 @@ class RemoteBackend(WorkspaceBackend):
         # limit (excess execs queue for the next free slot). Long-lived
         # channels (persistent SFTP, shell tabs) are the headroom between this
         # cap and MaxSessions.
-        # docs/issues/maxsessions_parallel_tools_false_workspace_death.md
+        # knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md
         self._channel_slots = threading.Semaphore(
             max(1, int(os.environ.get("WORKSPACE_SSH_MAX_CONCURRENT_CHANNELS", "10")))
         )
@@ -564,7 +564,7 @@ class RemoteBackend(WorkspaceBackend):
         # top of the pod's git clone (task_brief.md, bound skills) that a pod
         # tear-down + re-provision would have dropped. Kept generic — the backend
         # knows nothing about *what* gets re-seeded. See
-        # docs/issues/reviewing_parent_pod_reaped_under_critic.md (Issue 4).
+        # knowledge-base/knowledge/issues/reviewing_parent_pod_reaped_under_critic.md (Issue 4).
         self._on_reconnect: Optional[Callable[[], None]] = None
         self._reseeding = False  # re-entrancy guard: the hook writes via us
 
@@ -1093,7 +1093,7 @@ __SRW_PROCESS_ZERO_PY__
         Returns a paramiko ``Channel`` (socket-like) tunnelled over the existing
         authenticated SSH transport, for reaching a guest-loopback service that
         is not exposed on the pod/VM network — e.g. code-server for a live-VM
-        IDE session (docs/features/vm_snapshots_and_ide.md, "Live-VM IDE Access
+        IDE session (knowledge-base/knowledge/features/vm_snapshots_and_ide.md, "Live-VM IDE Access
         via the Agent"). The workspace sshd permits exactly this via
         ``AllowTcpForwarding local`` + ``PermitOpen 127.0.0.1:*``.
 
@@ -1138,7 +1138,7 @@ __SRW_PROCESS_ZERO_PY__
         SSHD readiness, but classifies the failure (``_classify_connect_error``)
         so a workspace that is *gone* (DNS won't resolve / no route) fails fast
         instead of burning the full boot-window budget.
-        See docs/issues/agent_fast_freeze_on_dead_workspace.md.
+        See knowledge-base/knowledge/issues/agent_fast_freeze_on_dead_workspace.md.
         """
         fingerprint = _validate_private_key(self._key_path)
         logger.info(
@@ -1371,7 +1371,7 @@ __SRW_PROCESS_ZERO_PY__
         classification). This method must NOT wrap it in a second retry loop —
         the nested loops multiplied the budget to max_retries² and turned a
         dead-workspace call into a ~15-min stall.
-        See docs/issues/agent_fast_freeze_on_dead_workspace.md.
+        See knowledge-base/knowledge/issues/agent_fast_freeze_on_dead_workspace.md.
         """
         if self._retired:
             raise WorkspaceUnavailableError(
@@ -1427,14 +1427,14 @@ __SRW_PROCESS_ZERO_PY__
 
         Drains stdout AND stderr while waiting for the exit status, so output
         larger than the SSH channel window cannot deadlock the command
-        (docs/issues/remote_backend_indefinite_wait_deadlock.md), and enforces
+        (knowledge-base/knowledge/issues/remote_backend_indefinite_wait_deadlock.md), and enforces
         ``timeout`` as a wall-clock deadline on the whole command.
 
         Raises WorkspaceUnavailableError on connection failure,
         RemoteCommandTimeoutError when the deadline expires, and
         RemoteChannelBusyError when sshd keeps refusing session channels on a
         live transport (MaxSessions saturation — NOT workspace death; see
-        docs/issues/maxsessions_parallel_tools_false_workspace_death.md).
+        knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md).
         """
         output, _ = self._exec_with_status(command, timeout=timeout)
         return output

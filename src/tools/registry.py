@@ -111,7 +111,7 @@ TOOL_REGISTRY.update(get_delegation_metadata())
 # tool's name into the list passed to* ``load_tools``?  They are METADATA ONLY
 # — nothing reads them yet.  The category-level ``true`` expansion that will
 # consume them is a separate change
-# (docs/features/tool_config_policy_vs_membership.md, "Step A: classify
+# (knowledge-base/knowledge/features/tool_config_policy_vs_membership.md, "Step A: classify
 # code-only tools in the registry").
 #
 # ``grant``
@@ -333,7 +333,7 @@ def filter_tools_by_backend(tool_names: List[str], backend: Any) -> List[str]:
     """Drop tools the workspace backend can't support (capability gate).
 
     Enforcement-by-construction for the lite tiers
-    (``docs/features/no_workspace_agent_mode.md`` §3.2/§7): instead of trusting
+    (``knowledge-base/knowledge/features/no_workspace_agent_mode.md`` §3.2/§7): instead of trusting
     each config's tool lists to omit them, tools are removed whenever the
     backend doesn't declare the matching capability —
 
@@ -386,7 +386,7 @@ def filter_tools_by_backend(tool_names: List[str], backend: Any) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Background-officer capability ceiling (docs/features/officer_knowledge_plane.md §4)
+# Background-officer capability ceiling (knowledge-base/knowledge/features/officer_knowledge_plane.md §4)
 # ---------------------------------------------------------------------------
 # A commissioned background officer owns the project's knowledge plane and its
 # control plane, but never the object plane. These sets deny every

@@ -6,7 +6,7 @@ result is a stable fact — the user's cloud account id. This module fronts it
 with a per-backend cache persisted on ``users.cloud_identity`` (migration
 0051) so the price is paid once per user per backend, not per page view.
 
-Caching rules (docs/issues/project_page_open_blocks_on_cloud_heal.md part 2):
+Caching rules (knowledge-base/knowledge/issues/project_page_open_blocks_on_cloud_heal.md part 2):
 
 * **Positive results persist indefinitely** — a cloud account id is stable.
   A backend switch is a cache miss (entries are keyed by ``backend_id``),

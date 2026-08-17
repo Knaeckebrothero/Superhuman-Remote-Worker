@@ -1,6 +1,6 @@
 """Structured logging for the agent.
 
-Slice 0 of ``docs/features/centralized_logging.md``: emit JSON logs carrying
+Slice 0 of ``knowledge-base/knowledge/features/centralized_logging.md``: emit JSON logs carrying
 correlation ids (agent_id / job_id / thread_id) with secret redaction, so the
 future log-aggregation pipeline (Grafana Alloy -> Loki) can index and query
 them — and so ``kubectl logs`` is greppable by ``job_id`` today.

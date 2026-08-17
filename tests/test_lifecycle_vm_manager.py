@@ -841,7 +841,7 @@ class TestAttemptsExhausted:
     vm_ssh_readiness_probe_unroutable_from_orchestrator.md), so waiting out
     max_attempts × tick (~5 min observed) only delays the force-delete while
     a dead VM holds shared cluster capacity. See
-    docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md §C.
+    knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md §C.
     """
 
     @pytest.mark.asyncio
@@ -1193,7 +1193,7 @@ class TestIsReapable:
     async def test_status_with_live_shared_child_is_not_reapable(self):
         # Regression (VM tier, the P0 bug): a VM shared by a non-terminal critic
         # must NOT be reaped, whatever the parent's own status — reaping strands
-        # the critic's SSH. See docs/issues/reviewing_parent_pod_reaped_under_critic.md.
+        # the critic's SSH. See knowledge-base/knowledge/issues/reviewing_parent_pod_reaped_under_critic.md.
         mgr, *_ = _make_manager()
         for status in ("reviewing", "pending_review", "paused"):
             inst = Instance(
@@ -1393,7 +1393,7 @@ class TestAttemptCounter:
 class TestGiveUp:
     """give_up fires on dirty + unreachable + snapshot-exhausted — exactly the
     state whose files we must not destroy. The kept rootdisk IS the recovery
-    artifact. docs/features/vm_persistent_rootdisk.md D2.
+    artifact. knowledge-base/knowledge/features/vm_persistent_rootdisk.md D2.
     """
 
     @pytest.mark.asyncio
@@ -1524,7 +1524,7 @@ class TestReapOrphans:
     (list_instances reads FROM the rows), so only the backend inventory
     (provisioner.list_vms) can find it. The sweep reaps it age-gated; a row
     of any status, a DB error, an unknown age, or a non-UUID name spares it.
-    See docs/done/deleted_job_orphans_workspace_pod.md."""
+    See knowledge-history/done/deleted_job_orphans_workspace_pod.md."""
 
     ORPHAN_ID = "deadbeef-dead-4bad-8bad-feedfacef00d"
 

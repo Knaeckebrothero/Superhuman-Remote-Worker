@@ -36,7 +36,7 @@ describe('isBundled', () => {
 
 // Fix round 1 (task 3, 2026-08-04 plan): duplicate's response can carry
 // `dropped` — capability grants the copier lacked, stripped rather than
-// refusing the fork. This must reach the user (docs/done/
+// refusing the fork. This must reach the user (knowledge-history/done/
 // global_expert_management.md decision 9: a silent capability downgrade
 // burns debugging time), so the message shown differs from the plain
 // "duplicated" toast whenever anything was actually removed.

@@ -61,7 +61,7 @@ spec:
               # publish-ack, which beats the real responder and breaks live VM
               # status queries. Keep this stream to genuine fire-and-forget
               # events only. See
-              # docs/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
+              # knowledge-base/knowledge/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
               # (the dead `vm.status.>` subject, which has no producer, is also
               # dropped here). add||edit so subject changes apply on upgrade.
               VM_EVENTS_SUBJECTS="vm.lifecycle.create.>,vm.lifecycle.delete.>,vm.lifecycle.status.>"

@@ -90,10 +90,10 @@ export function rejectBodyKeyFor(mode: 'job' | 'thread'): string {
  * Mode A / protected-cloud-mode diff review.
  *
  * Job mode (`jobId` bound): project-attached jobs in `pending_review`,
- * diffed against the Gitea baseline commit (docs/done/job_cloud_export.md
+ * diffed against the Gitea baseline commit (knowledge-history/done/job_cloud_export.md
  * §3.4–§3.6). Thread mode (`threadId` bound): a persistent session's staged
  * protected-cloud overlay diff (Slice C, Task 8/10 — see
- * docs/design/cloud_access_unification.md §5/§11). Both modes share this
+ * knowledge-base/knowledge/design/cloud_access_unification.md §5/§11). Both modes share this
  * file tree (left) + Monaco diff editor (right) + accept/reject actions
  * (footer) shell; `diffApiFor` picks the backend calls per mode. Handles the
  * external-mod 409 (both modes) and the epoch-stale 409 (thread mode only)

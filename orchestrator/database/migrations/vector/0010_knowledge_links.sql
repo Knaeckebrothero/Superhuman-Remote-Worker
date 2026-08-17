@@ -1,5 +1,5 @@
 -- migration:     0010_knowledge_links.sql
--- description:   OKF files-canonical KB — slice 3 PR4c (docs/features/okf_knowledge_base.md
+-- description:   OKF files-canonical KB — slice 3 PR4c (knowledge-base/knowledge/features/okf_knowledge_base.md
 --                §7 / §8 / §11 slice-3 PR4). The link edge set that lets the
 --                graph query tools (kb_related, and the 1-hop provenance degrade)
 --                work WITHOUT Neo4j — the "1-hop link-table queries" the Full tier

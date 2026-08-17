@@ -160,7 +160,7 @@ class BenchStore:
         the SAME held connection — ``PostgresDB.fetchval`` acquires a fresh
         pooled connection per call, which would unlock a different session.
         asyncpg's pool reset backstops a lost release when the connection is
-        returned. See docs/issues/bench_sweeper_multi_replica_race.md.
+        returned. See knowledge-base/knowledge/issues/bench_sweeper_multi_replica_race.md.
         """
         async with self.db.acquire() as conn:
             claimed = bool(
@@ -525,7 +525,7 @@ async def sweep_tick(store: BenchStore, create_job_fn: CreateJobFn) -> int:
     sweeps; the loser skips the whole tick and retries next tick. Two
     orchestrator replicas both ran this loop and double-submitted
     (task, arm, replicate) pairs 2-5 ms apart — see
-    docs/issues/bench_sweeper_multi_replica_race.md.
+    knowledge-base/knowledge/issues/bench_sweeper_multi_replica_race.md.
     """
 
     async with _try_sweep_lock(store) as claimed:

@@ -88,7 +88,7 @@ async def test_step_failure_does_not_block_downstream_recovery():
     Regression for the 2026-07-11 incident: a bind-type crash in the
     graph-progress sweep aborted the shared try block and silently disabled
     recover_orphaned_jobs (and every other downstream step) for ~36h. See
-    docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
+    knowledge-history/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
     """
     shutdown_event = asyncio.Event()
     db = _mock_db(shutdown_event)
@@ -123,7 +123,7 @@ async def test_step_failure_does_not_block_downstream_recovery():
 @pytest.mark.asyncio
 async def test_lease_expiry_recovery_runs_and_triggers_dispatch():
     """Expired-lease jobs are recovered and re-dispatched, independent of the
-    agents-table sweeps (docs/features/job_execution_lease.md)."""
+    agents-table sweeps (knowledge-base/knowledge/features/job_execution_lease.md)."""
     shutdown_event = asyncio.Event()
     db = _mock_db(shutdown_event)
     db.recover_expired_lease_jobs = AsyncMock(return_value=["job-a", "job-b"])

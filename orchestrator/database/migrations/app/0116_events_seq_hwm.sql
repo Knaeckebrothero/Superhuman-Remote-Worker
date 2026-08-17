@@ -1,6 +1,6 @@
 -- migration:     0116_events_seq_hwm.sql
 -- description:   Per-epoch seq high-water mark for the thread event journal
---                (stateless agents M2, docs/features/stateless_agents.md
+--                (stateless agents M2, knowledge-base/knowledge/features/stateless_agents.md
 --                §5.3.2). events_seq_hwm records the highest seq ever
 --                allocated in the thread's CURRENT events_epoch and survives
 --                retention pruning of the thread_events rows themselves, so
@@ -43,11 +43,11 @@ SET events_seq_hwm = COALESCE(
 );
 
 COMMENT ON COLUMN threads.events_seq_hwm IS
-    'Highest seq ever allocated in the CURRENT events_epoch. Survives retention pruning of the thread_events rows themselves; reset to 0 atomically on every epoch bump. Maintained by the agent journal writer''s fenced flush (GREATEST over the batch in the same statement) and pre-incremented by the system-frame allocator (src/shared/event_journal). Attach seeds its in-process counter from GREATEST(events_seq_hwm, MAX(seq) of the epoch). See docs/features/stateless_agents.md §5.3.2.';
+    'Highest seq ever allocated in the CURRENT events_epoch. Survives retention pruning of the thread_events rows themselves; reset to 0 atomically on every epoch bump. Maintained by the agent journal writer''s fenced flush (GREATEST over the batch in the same statement) and pre-incremented by the system-frame allocator (src/shared/event_journal). Attach seeds its in-process counter from GREATEST(events_seq_hwm, MAX(seq) of the epoch). See knowledge-base/knowledge/features/stateless_agents.md §5.3.2.';
 
 -- Refresh the events_epoch semantics comment (last set in 0060): allocation
 -- is no longer unconditional per attach.
 COMMENT ON COLUMN threads.events_epoch IS
-    'Current event-log writer generation (client-visible). Bumped only deliberately: rewind, a reaper/steal takeover, or an attach that finds the previous session life terminal (terminal thread status, a terminal lifecycle frame in the epoch, or the epoch wholly beyond retention). Clean reattaches REUSE the epoch so cached client cursors stay valid; an older-epoch cursor triggers authoritative re-sync (gone_beyond_horizon). See docs/features/stateless_agents.md §5.3.2.';
+    'Current event-log writer generation (client-visible). Bumped only deliberately: rewind, a reaper/steal takeover, or an attach that finds the previous session life terminal (terminal thread status, a terminal lifecycle frame in the epoch, or the epoch wholly beyond retention). Clean reattaches REUSE the epoch so cached client cursors stay valid; an older-epoch cursor triggers authoritative re-sync (gone_beyond_horizon). See knowledge-base/knowledge/features/stateless_agents.md §5.3.2.';
 
 COMMIT;

@@ -1,6 +1,6 @@
 """Tests for the project-loop safety-net sweeper, including torn-advance heal.
 
-The sweeper recovers ONE wedge shape (docs/issues/loop_advance_nonatomic_wedges_loop.md):
+The sweeper recovers ONE wedge shape (knowledge-base/knowledge/issues/loop_advance_nonatomic_wedges_loop.md):
 ``current_job_id IS NULL AND current_stage_jobs='[]'`` — both pointer columns
 empty, regardless of the in-flight turn's width (width 1 included). That
 shape is either a torn advance whose write-back was lost (heal restores the

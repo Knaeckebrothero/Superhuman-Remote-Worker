@@ -36,7 +36,7 @@ COMMENT ON TABLE cloud_ro_mounts IS
 -- One live grant per thread; a re-provision upserts in place.
 -- These indexes are built on a brand-new, empty table inside this transactional
 -- migration: CONCURRENTLY cannot run in a transaction and buys nothing on zero
--- rows (docs/db_migration.md: "Add table/index -> direct CREATE IF NOT EXISTS").
+-- rows (knowledge-base/knowledge/db_migration.md: "Add table/index -> direct CREATE IF NOT EXISTS").
 -- squawk-ignore require-concurrent-index-creation
 CREATE UNIQUE INDEX IF NOT EXISTS cloud_ro_mounts_thread_idx ON cloud_ro_mounts (thread_id);
 -- Reconciler sweep scans active rows.

@@ -95,7 +95,7 @@ def workspace_private_key_fingerprint(key_path: Optional[str]) -> str:
 # them on emptyDir, but opaque markers and some rootfs variants need them.
 # `bash -c 'set -o pipefail; ...'` so a masked `zstd -d` decompression
 # failure on a corrupt/truncated archive is no longer hidden by `tar` (the
-# last stage) exiting 0 — see docs/features/workspace_durability_tiering.md
+# last stage) exiting 0 — see knowledge-base/knowledge/features/workspace_durability_tiering.md
 # §C1 (C1c). `tar` is already the last stage, so its own rc handling is
 # unchanged (including the benign full-extract rc==2 below); `pipefail` only
 # adds "an earlier stage failing also fails the pipeline." Plain `pipefail`
@@ -149,7 +149,7 @@ def orchestrator_can_reach(host: Optional[str]) -> bool:
 
     The orchestrator pod is NOT a tailnet member — it has no route to
     100.64.0.0/10, so SSH to VM workspaces from here black-holes (see
-    docs/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
+    knowledge-base/knowledge/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
     Callers must skip tailnet targets visibly instead of timing out quietly.
 
     Escape hatch: set ORCHESTRATOR_HAS_TAILNET_ROUTE=true on deployments that
@@ -333,7 +333,7 @@ async def stream_extract_snapshot(
     if not orchestrator_can_reach(ssh_host):
         # Tailnet target — SSH from the orchestrator would black-hole. Fail
         # fast and visibly instead of hanging on a doomed connect (see
-        # docs/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
+        # knowledge-base/knowledge/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
         logger.info(
             "Skipping snapshot restore to %s:%d: orchestrator has no route "
             "to tailnet targets",

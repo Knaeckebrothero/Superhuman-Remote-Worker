@@ -144,7 +144,7 @@ class TestCodexContextWindowCap:
     to the Codex surface cap (the ChatGPT-OAuth backend caps context ~400K and
     rejects larger inputs with ``context_too_large``). Keyed on the resolved
     *provider*, not the family — so the same model over the real API keeps its
-    full window. See docs/issues/codex_proxy_context_window_cap.md.
+    full window. See knowledge-base/knowledge/issues/codex_proxy_context_window_cap.md.
     """
 
     def _codex_endpoint_row(self, context_window):

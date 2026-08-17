@@ -27,12 +27,12 @@ Drafted 2026-08-13. Current as of **2026-08-17**.
 - Deleted `deployment/deploy.sh` and `design/asset-pack/` (28 files) — both dead or duplicate.
 - Cleared the root directory: 6.0 MB of Playwright dumps, a fake PDF, two bundled mockups and a
   scratch script. Root is now five markdown files, all of which belong there.
-- Filed three root files that were **not** detritus into `researches/` and `docs/features/`,
+- Filed three root files that were **not** detritus into `researches/` and `knowledge-base/knowledge/features/`,
   with all six citations repointed.
 - `.kateproject` untracked and gitignored, kept on disk.
 - Resolved Phase 5's open directory triage: three of the five candidates were documents wearing
-  a root-folder costume and moved into `docs/` (`docs/research/skills/`,
-  `docs/research/ai_memory/`, `docs/design/cockpit/`); `eval/` and `bench/` stay because they are
+  a root-folder costume and moved into `docs/` (`knowledge-base/knowledge/research/skills/`,
+  `knowledge-base/knowledge/research/ai_memory/`, `knowledge-base/knowledge/design/cockpit/`); `eval/` and `bench/` stay because they are
   code. **The repo root now holds 17 directories, down from 20.**
 
 **The one thing to read before scheduling anything: Phase 3 is bigger than it looks.** It was
@@ -268,7 +268,7 @@ origin — splitting them across repos would have meant two images and a Traefik
       `GITHUB_TOKEN` cannot push to the `knaeckebrothero` namespace).
 - [x] `HomeLab/deployments_managed/srw-sales-page/10-deployment.yaml` repointed; live and
       verified (`/`, `/configure`, `/generator.mjs`, `/og-image.png` all 200).
-- [ ] Move `[removed]/` into `srw-cloud`. **Deferred** — folded into the wider `docs/`
+- [ ] Move `knowledge-base/knowledge/strategy/` into `srw-cloud`. **Deferred** — folded into the wider `docs/`
       decision in Phase 5, which is being handled separately.
 
 **The package is PRIVATE, and that cost more than expected.** A GitHub App with `packages:read`
@@ -340,12 +340,12 @@ All ordinary, reviewable, revertible commits. The public repo's root directory i
       - `Subagent Delegation Interface Design.md` → `researches/subagent-delegation.report.md`.
         No prompt file was ever filed for this one, so it is the folder's lone unpaired report;
         its header now says so. Its header also carries forward the caveat already on record in
-        `docs/done/loop_subagent_forensics.md` — the report contains **known-synthetic** figures
+        `knowledge-history/done/loop_subagent_forensics.md` — the report contains **known-synthetic** figures
         (DeepSeek "128 parallel calls", Kimi "300 subagents"), so its direction is usable and its
         numbers are not. The real decision record is the reconciliation section in
-        `docs/issues/delegation_light_mode_missing.md`.
-- [x] `Officers.md` → `docs/features/officers.md`, **done 2026-08-17.** Not root detritus either:
-      `docs/features/centurion.md` cites it in Sources as the consolidated officer notes. It was an
+        `knowledge-base/knowledge/issues/delegation_light_mode_missing.md`.
+- [x] `Officers.md` → `knowledge-base/knowledge/features/officers.md`, **done 2026-08-17.** Not root detritus either:
+      `knowledge-base/knowledge/features/centurion.md` cites it in Sources as the consolidated officer notes. It was an
       Obsidian note with frontmatter sitting outside the vault; it now rides along with whatever
       `docs/` decision gets made below. Both citations in `centurion.md` repointed.
 - [x] **`design/asset-pack/` deleted 2026-08-17** (28 files, 228 KB). It was a second copy of the
@@ -361,13 +361,13 @@ All ordinary, reviewable, revertible commits. The public repo's root directory i
       premise: that being cited somewhere was a reason to leave a folder at the repo root. It is
       a reason to update the citation. The real test is product vs. working knowledge, and the
       file types answer it — the three that moved contain **zero code** between them:
-      - `researches/` (14 `.md`) → **`docs/research/skills/`**. Skill-authoring evidence base.
-      - `ai-memory-research/` (11 `.md` + 5 `.json`) → **`docs/research/ai_memory/`**.
+      - `researches/` (14 `.md`) → **`knowledge-base/knowledge/research/skills/`**. Skill-authoring evidence base.
+      - `ai-memory-research/` (11 `.md` + 5 `.json`) → **`knowledge-base/knowledge/research/ai_memory/`**.
       - `design/` (2 `.md` + 3 `.reference.*` files that nothing in the cockpit build imports) →
-        **`docs/design/cockpit/`**.
+        **`knowledge-base/knowledge/design/cockpit/`**.
 
-      Two of these were merging into folders that **already existed** — `docs/research/` and
-      `docs/design/` — so the root copies were a navigational trap independent of this release.
+      Two of these were merging into folders that **already existed** — `knowledge-base/knowledge/research/` and
+      `knowledge-base/knowledge/design/` — so the root copies were a navigational trap independent of this release.
       All inbound citations rewritten across 8 files, plus the relative links inside the moved
       trees (their depth changed by two levels); every link verified to resolve.
 
@@ -395,22 +395,22 @@ tail: **676 tracked files outside `docs/` reference `docs/` paths**, 385 of them
 
 - [ ] Pick one and note it here before executing:
       (a) move all of `docs/` and accept/fix 676 dangling references;
-      (b) move only what should not be public (`[removed]/`, session logs in `docs/issues/`)
-          and keep what code cites — `docs/db_migration.md`, `docs/api_key_resolution.md`,
-          `docs/features/*` referenced from source comments;
-      (c) move all, then add a stub `docs/README.md` pointing at the private location.
+      (b) move only what should not be public (`knowledge-base/knowledge/strategy/`, session logs in `knowledge-base/knowledge/issues/`)
+          and keep what code cites — `knowledge-base/knowledge/db_migration.md`, `knowledge-base/knowledge/api_key_resolution.md`,
+          `knowledge-base/knowledge/features/*` referenced from source comments;
+      (c) move all, then add a stub `knowledge-base/knowledge/README.md` pointing at the private location.
 - [ ] Whichever is chosen, update `CLAUDE.md` and `README.md` so the public repo's own
       instructions do not point at files that are not there.
 - [ ] **`docs/` still describes a `website/` that left in Phase 4.** Found 2026-08-17 while
       sweeping for dangling references; left alone because `docs/` is being handled separately,
       but these are not archives — they are wrong right now:
-      - `docs/website.md` §"lives in the SRW repo under `website/`" (lines ~173-180) states the
+      - `knowledge-base/knowledge/website.md` §"lives in the SRW repo under `website/`" (lines ~173-180) states the
         source paths, the image `ghcr.io/knaeckebrothero/…`, the `build-website` CI job and the
         publish procedure. All four are false since 2026-08-15.
-      - `docs/drafts/sales_page_improvement_instructions.md` — a runnable instruction set aimed
+      - `knowledge-history/drafts/sales_page_improvement_instructions.md` — a runnable instruction set aimed
         at `website/index.html`, `website/test/*` and `docker/Dockerfile.website`. Handed to an
         agent today it fails on the first path.
-      - `docs/superpowers/specs/2026-08-13-waitlist-design.md` — a *pending* design whose page
+      - `knowledge-base/knowledge/superpowers/specs/2026-08-13-waitlist-design.md` — a *pending* design whose page
         edits, byte budget and `COPY`-line changes all target the other repo now.
       The dated plan/spec pair from 2026-06-18/19 is correct **as history** — leave those.
 

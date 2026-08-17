@@ -22,7 +22,7 @@ What each property buys, concretely:
   * **per-status dedup** — pending_review → completed via approve is a second,
     legitimate wake, and it must not be suppressed by the first.
 
-Design: docs/features/session_wake_on_job_completion.md.
+Design: knowledge-base/knowledge/features/session_wake_on_job_completion.md.
 """
 
 import asyncio

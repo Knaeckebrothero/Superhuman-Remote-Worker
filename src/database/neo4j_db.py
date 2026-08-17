@@ -7,7 +7,7 @@ Provides a generic Neo4j interface using the official driver with:
 - Proper transaction handling
 
 Connection details come from the datasource connector system
-(see docs/datasources.md). No env var fallbacks.
+(see knowledge-base/knowledge/datasources.md). No env var fallbacks.
 """
 
 import logging

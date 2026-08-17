@@ -1,6 +1,6 @@
 """Guard: the agent pre-auth key must be ephemeral, or agent nodes leak.
 
-See docs/superpowers/specs/2026-06-04-headscale-agent-ephemeral-keys-design.md.
+See knowledge-base/knowledge/superpowers/specs/2026-06-04-headscale-agent-ephemeral-keys-design.md.
 """
 
 import re

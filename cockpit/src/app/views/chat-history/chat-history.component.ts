@@ -851,7 +851,7 @@ export class ChatHistoryComponent {
   constructor() {
     // Drive the chat panel off the loaded job — the same signal the workbench
     // dashboard sets on selection (DataService.currentJobId). See
-    // docs/features/debug_audit_view_refactor.md (Phase 2c / P3).
+    // knowledge-base/knowledge/features/debug_audit_view_refactor.md (Phase 2c / P3).
     effect(() => {
       const jobId = this.data.currentJobId();
       untracked(() => this.chat.setJob(jobId));

@@ -414,7 +414,7 @@ export interface UploadStageView {
  * files would read "Uploading 0 of n…" for work that has not started and
  * never lies about being in flight. The honest line names what it is
  * actually blocked on — the head's first not-yet-`done` file — matching
- * `docs/features/session_attachment_send_flow.md`'s "Waiting for
+ * `knowledge-base/knowledge/features/session_attachment_send_flow.md`'s "Waiting for
  * Zeugniss.pdf…" example (the Signal #3720 case: a FIFO queue silently
  * swallowing a message typed behind a big upload). If the head has no files
  * of its own (a plain text send ahead of it), there is nothing honest to
@@ -715,7 +715,7 @@ export function shouldFoldToolRun(
  * Scroll-pin geometry. Extracted as pure functions because jsdom has no layout
  * engine — every geometry read there returns 0 — so the *decisions* are unit
  * tested here and the *wiring* is verified in a real browser. See
- * docs/issues/cockpit_session_scroll_pin_misses_late_height_changes.md
+ * knowledge-base/knowledge/issues/cockpit_session_scroll_pin_misses_late_height_changes.md
  * §"Verification plan".
  */
 
@@ -2370,7 +2370,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         ),
     );
 
-    // --- Live compaction progress (docs/features/context_summarization_rework.md S3)
+    // --- Live compaction progress (knowledge-base/knowledge/features/context_summarization_rework.md S3)
     /** 1s tick driving the elapsed timer; interval runs only mid-compaction. */
     private readonly compactionNow = signal(Date.now());
     private compactionTimer: ReturnType<typeof setInterval> | null = null;
@@ -2452,7 +2452,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      * header 500px. Keyed off `viewport.isMobile()` the actions simply ran past
      * the pane edge and were clipped by the split area — the buttons neither
      * moved nor shrank, they just stopped existing. See
-     * docs/done/canvas_settings_pane_clips_chat_header_actions.md.
+     * knowledge-history/done/canvas_settings_pane_clips_chat_header_actions.md.
      */
     readonly headerCompact = computed(
         () => this.viewport.isMobile() || this.headerActionsOverflow(),
@@ -2746,7 +2746,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // Full rationale, measurements and the rejected alternatives (scroll
         // anchoring, column-reverse, scroll-snap, CDK, afterRenderEffect, a
         // MutationObserver) live in
-        // docs/issues/cockpit_session_scroll_pin_misses_late_height_changes.md.
+        // knowledge-base/knowledge/issues/cockpit_session_scroll_pin_misses_late_height_changes.md.
         afterNextRender(() => {
             const container = this.messagesContainer.nativeElement;
             const inner = this.messagesInner().nativeElement;

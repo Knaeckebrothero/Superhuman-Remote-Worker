@@ -2083,7 +2083,7 @@ async def deny_sudo_request(
 
 
 # =============================================================================
-# Officers — the Legate's side (docs/features/officer_legate_channel.md)
+# Officers — the Legate's side (knowledge-base/knowledge/features/officer_legate_channel.md)
 # =============================================================================
 
 

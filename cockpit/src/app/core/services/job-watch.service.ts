@@ -25,7 +25,7 @@ import {isTerminalJobStatus} from '../util/job-status';
  * NATS→SSE bridge rather than a local broadcast, so it is not free either.
  * Polling is bounded by what is on screen and is the honest v1.
  *
- * Design: docs/features/unified_tool_cards.md (slice 4).
+ * Design: knowledge-base/knowledge/features/unified_tool_cards.md (slice 4).
  */
 
 /** Poll cadence for a non-terminal job. Slow on purpose — jobs run for minutes. */

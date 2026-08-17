@@ -7,9 +7,9 @@
 --                override) and jobs.expert_id (nullable, SET NULL on delete --
 --                history is safe because jobs.resolved_config is frozen). The
 --                jobs FK uses the two-phase NOT VALID -> VALIDATE pattern
---                (docs/db_migration.md) so squawk stays green; the column is
+--                (knowledge-base/knowledge/db_migration.md) so squawk stays green; the column is
 --                born all-NULL so VALIDATE is instant.
---                Design: docs/features/global_expert_management.md (Slice 1).
+--                Design: knowledge-base/knowledge/features/global_expert_management.md (Slice 1).
 -- depends-on:    0001_initial.sql
 -- expected:      < 1s on dev DB. New empty tables + one nullable FK column
 --                (metadata-only ADD COLUMN in PostgreSQL 11+, no table rewrite).
@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS project_experts (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_project_default_expert
     ON project_experts (project_id, default_for) WHERE default_for IS NOT NULL;
 
--- jobs.expert_id: two-phase FK (NOT VALID then VALIDATE) per docs/db_migration.md.
+-- jobs.expert_id: two-phase FK (NOT VALID then VALIDATE) per knowledge-base/knowledge/db_migration.md.
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS expert_id UUID;
 DO $$ BEGIN
     ALTER TABLE jobs ADD CONSTRAINT jobs_expert_id_fkey
@@ -67,6 +67,6 @@ ALTER TABLE jobs VALIDATE CONSTRAINT jobs_expert_id_fkey;
 COMMENT ON TABLE experts IS
     'DB-backed user/admin experts (overlay over bundled config/experts/). '
     'config = fragment vs the expert_type base; prompts = {persona, instructions}. '
-    'Design: docs/features/global_expert_management.md.';
+    'Design: knowledge-base/knowledge/features/global_expert_management.md.';
 
 COMMIT;

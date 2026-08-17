@@ -1157,7 +1157,7 @@ class TestContextWindowBaseResolution:
 class TestExtraBodyPassthrough:
     """Family `settings.extra_body` must survive matrix apply + config parse so
     the LLM factories can merge it into the request body. Guards the MiniMax
-    reasoning_split fix (docs/issues/minimax_m3_think_tag_reasoning_leak_post_gateway.md)."""
+    reasoning_split fix (knowledge-base/knowledge/issues/minimax_m3_think_tag_reasoning_leak_post_gateway.md)."""
 
     def test_minimax_families_declare_reasoning_split(self):
         for model in ("minimax-m2.7", "MiniMax-M3"):

@@ -6,7 +6,7 @@ This module provides a modern async PostgreSQL interface using asyncpg with:
 - Named query loading from SQL files
 - CRUD operations with proper async patterns
 
-Part of Phase 1 database refactoring - see docs/db_refactor.md
+Part of Phase 1 database refactoring - see knowledge-base/knowledge/db_refactor.md
 """
 
 import json
@@ -1260,7 +1260,7 @@ class PostgresDB:
         config writes, so message writes go straight here instead of through
         ``POST /api/agents/threads/{id}/messages`` (a pure pass-through). Two
         properties this direct path adds, both load-bearing for the resume fix in
-        docs/issues/persistent_session_midturn_message_loss.md:
+        knowledge-base/knowledge/issues/persistent_session_midturn_message_loss.md:
 
         - **Caller-supplied ``id`` + idempotent upsert.** The agent mints a stable
           id per message (``persistent_graph._ensure_msg_id`` /

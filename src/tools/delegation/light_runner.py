@@ -14,7 +14,7 @@ bound to the reader's worktree on the workspace pod; Phase 3 is the tool that
 calls this). The harness only drives the loop, so it is unit-testable with a
 fake LLM and fake tools — no SSH, no pods, no orchestrator.
 
-See docs/issues/delegation_light_mode_missing.md (Phase 1).
+See knowledge-base/knowledge/issues/delegation_light_mode_missing.md (Phase 1).
 """
 
 import asyncio

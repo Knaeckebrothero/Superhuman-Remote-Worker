@@ -1,4 +1,4 @@
-"""Officer slot roster tests — S5b of docs/features/centurion.md.
+"""Officer slot roster tests — S5b of knowledge-base/knowledge/features/centurion.md.
 
 Pure-module coverage for services/officer_slots.py: provision-time
 validation, funnel admission (flat cap vs roster, auto-select, stamping,

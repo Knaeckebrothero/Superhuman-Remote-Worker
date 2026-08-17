@@ -144,7 +144,7 @@ export interface ExpertDetail extends Expert {
  * `shell_tools`) the copier does not hold. Duplicate strips what's ungranted
  * rather than refusing the fork (refusing blocked "start from scholar" for
  * every default-grants user), and reports what it removed here so the
- * strip is never silent — see docs/done/global_expert_management.md decision 9.
+ * strip is never silent — see knowledge-history/done/global_expert_management.md decision 9.
  */
 export interface ExpertDuplicateResult extends ExpertDetail {
   /**
@@ -252,7 +252,7 @@ export interface SkillUpdateRequest {
  *
  * ``kubeconfig`` / ``ssh_key`` / ``generic_file`` are credential-file types whose
  * ``credentials.files[]`` payload is materialized as files on the agent's
- * filesystem at job start (see docs/features/credential_file_datasources.md).
+ * filesystem at job start (see knowledge-base/knowledge/features/credential_file_datasources.md).
  */
 export type DatasourceType =
   | 'generic'
@@ -269,7 +269,7 @@ export type DatasourceType =
   | 'generic_file';
 
 /**
- * Access tier for an ``email`` datasource (see docs/features/email_datasource.md).
+ * Access tier for an ``email`` datasource (see knowledge-base/knowledge/features/email_datasource.md).
  * ``draft`` is the default: the agent composes drafts, the human sends them.
  */
 export type EmailAccessTier = 'read' | 'read_write' | 'draft' | 'send';
@@ -1076,7 +1076,7 @@ export type ProjectLoopStatus =
  * A multi-job campaign a campaign-scheduled loop's checkpoint critic filed
  * via `loop_plan`. Lives in `project_loops.campaign` (JSONB); shape is what
  * `_advance_planner_campaign` writes (orchestrator/main.py).
- * See docs/features/loop_campaign_scheduling.md.
+ * See knowledge-base/knowledge/features/loop_campaign_scheduling.md.
  */
 export interface LoopCampaign {
   /** Deterministic: the plan-filing critic job's id. */
@@ -1119,7 +1119,7 @@ export interface LoopCampaignHistoryEntry {
  * A project self-improvement loop — the control row that runs jobs one at a
  * time, rotating role_sequence (e.g. scholar→critic→developer) until a
  * budget (max_iterations / run_until / consecutive-failure cap) stops it.
- * Mirrors the project_loops table. See docs/features/project_self_improvement_loop.md.
+ * Mirrors the project_loops table. See knowledge-base/knowledge/features/project_self_improvement_loop.md.
  */
 export interface ProjectLoop {
   id: string;
@@ -1193,7 +1193,7 @@ export interface ProjectLoopStartRequest {
 
 // =============================================================================
 // Project Backlog (loop ticket pool) —
-// docs/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md
+// knowledge-base/knowledge/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md
 // =============================================================================
 
 /**
@@ -1229,7 +1229,7 @@ export interface ProjectBacklog {
 }
 
 // =============================================================================
-// Officer post (docs/features/officer_post.md §8) — `project_officers` row +
+// Officer post (knowledge-base/knowledge/features/officer_post.md §8) — `project_officers` row +
 // runtime projection. GET /projects/{id}/officer ALWAYS returns the post,
 // vacant or commissioned; the card never infers existence from a 404.
 // =============================================================================
@@ -1926,7 +1926,7 @@ export interface JobCreateRequest {
 
 /**
  * Result of the Mode B export (`POST /api/jobs/{id}/export-to-shared-folder`).
- * See docs/done/job_cloud_export.md §3.2.
+ * See knowledge-history/done/job_cloud_export.md §3.2.
  */
 export interface JobCloudExportResult {
   job_id: string;
@@ -1950,7 +1950,7 @@ export interface JobCloudExportResult {
 
 /**
  * Mode A diff summary for a project-attached job in `pending_review`.
- * See docs/done/job_cloud_export.md §3.4–§3.5.
+ * See knowledge-history/done/job_cloud_export.md §3.4–§3.5.
  */
 export interface JobDiffFileEntry {
   path: string;
@@ -2027,7 +2027,7 @@ export type JobAcceptOutcome =
 // JobDiffReviewComponent, generalized to also drive against a persistent
 // thread's staged protected-cloud diff instead of a job's Gitea-baseline
 // diff. See .superpowers/sdd/task-8-brief.md / task-10-brief.md for the
-// endpoint contracts and docs/design/cloud_access_unification.md §5/§11.
+// endpoint contracts and knowledge-base/knowledge/design/cloud_access_unification.md §5/§11.
 
 /**
  * Staged protected-cloud diff summary for a thread (GET
@@ -2232,7 +2232,7 @@ export interface GrantListResponse {
   catalog: GrantCatalog;
 }
 
-// --- Contacts registry (docs/done/contacts_registry.md) ---
+// --- Contacts registry (knowledge-history/done/contacts_registry.md) ---
 export type ContactChannel = 'email' | 'whatsapp';
 export type ContactOptIn = 'pending' | 'opted_in' | 'opted_out';
 

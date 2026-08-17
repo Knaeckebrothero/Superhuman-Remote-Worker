@@ -14,7 +14,7 @@ running pod), so we fall back to the currently-attached thread on the live
 PersistentSession instance. Same JWT, same signature check — only the
 expected `tid` source differs.
 
-See docs/features/direct_session_websockets.md §Component details.
+See knowledge-base/knowledge/features/direct_session_websockets.md §Component details.
 """
 
 from __future__ import annotations

@@ -32,10 +32,10 @@ the Better Resavio loop producing curator archive passes). **Status:** RUN 2026-
 
 Unit coverage remains green; the slice-3 reindex live-verification findings from
 the same day (import heisenbug, pgvector codec, batch cap) are recorded in
-`docs/features/okf_knowledge_base.md` §11 PR3.1 — they came out of exercising
+`knowledge-base/knowledge/features/okf_knowledge_base.md` §11 PR3.1 — they came out of exercising
 this corpus at reindex scale, exactly what this runbook existed to provoke.
 
-**What it validates** (the 2026-07-05 batch, `docs/features/okf_knowledge_base.md`
+**What it validates** (the 2026-07-05 batch, `knowledge-base/knowledge/features/okf_knowledge_base.md`
 §11.1 addendum):
 
 1. `oversized-note` flags the legacy 131 KB curator dumps (WARNING > 15 KB body).
@@ -189,6 +189,6 @@ After ≥ 2 post-deploy curator passes on the loop:
 - [ ] Follow-ups filed for anything failed (esp. the possible dual-write gap on
       superseded-status frontmatter, §1+2).
 
-When all boxes tick, update `docs/features/okf_knowledge_base.md` §11.1 addendum
+When all boxes tick, update `knowledge-base/knowledge/features/okf_knowledge_base.md` §11.1 addendum
 with "straggler batch LIVE-VERIFIED <date>" and proceed to slice 3 (Postgres
 index + retrieval cutover) — which will re-run these rules at reindex scale.

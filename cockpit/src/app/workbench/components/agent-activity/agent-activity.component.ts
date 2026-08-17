@@ -13,7 +13,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
  * time (infinite scroll), and a step's heavy detail (tool arguments, error
  * traceback, in-state message count) is lazy-loaded only on expand. No eager
  * download, no IndexedDB, no slider — see
- * docs/features/debug_audit_view_refactor.md (Phase 2).
+ * knowledge-base/knowledge/features/debug_audit_view_refactor.md (Phase 2).
  */
 @Component({
   selector: 'app-agent-activity',

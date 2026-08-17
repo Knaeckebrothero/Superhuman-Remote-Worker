@@ -383,12 +383,15 @@ class TestCaptureEtagBaseline:
         be = NextcloudBackend(_nc_test_settings())
         fake = FakeNextcloud()
         fake.add_file("a.md", b"a")
-        fake.add_file("docs/b.md", b"b")
+        fake.add_file("knowledge-base/knowledge/b.md", b"b")
         _install_fake(be, fake)
 
         base = await be.capture_etag_baseline(_handle())
 
-        assert set(base) == {"a.md", "docs/b.md"}  # files only, no dirs
+        assert set(base) == {
+            "a.md",
+            "knowledge-base/knowledge/b.md",
+        }  # files only, no dirs
         assert all(v for v in base.values())  # etags populated
         # Exactly one PROPFIND — the infinity short-circuit, not a per-dir BFS.
         propfinds = [r for r in fake.requests if r.method == "PROPFIND"]
@@ -401,12 +404,15 @@ class TestCaptureEtagBaseline:
         fake = FakeNextcloud()
         fake.reject_infinity = True  # sabre with infinity disabled → 400
         fake.add_file("a.md", b"a")
-        fake.add_file("docs/b.md", b"b")
+        fake.add_file("knowledge-base/knowledge/b.md", b"b")
         _install_fake(be, fake)
 
         base = await be.capture_etag_baseline(_handle())
 
-        assert set(base) == {"a.md", "docs/b.md"}  # same result via BFS
+        assert set(base) == {
+            "a.md",
+            "knowledge-base/knowledge/b.md",
+        }  # same result via BFS
         methods = [r for r in fake.requests if r.method == "PROPFIND"]
         # One rejected infinity attempt + at least the root + docs Depth:1 walks.
         assert any(r.headers.get("Depth") == "infinity" for r in methods)
@@ -429,9 +435,11 @@ class TestGetBytes:
     async def test_returns_bytes(self):
         be = NextcloudBackend(_nc_test_settings())
         fake = FakeNextcloud()
-        fake.add_file("docs/readme.md", b"# hi\n")
+        fake.add_file("knowledge-base/knowledge/readme.md", b"# hi\n")
         _install_fake(be, fake)
-        blob = await be.get_project_folder_file_bytes(_handle(), path="docs/readme.md")
+        blob = await be.get_project_folder_file_bytes(
+            _handle(), path="knowledge-base/knowledge/readme.md"
+        )
         assert blob == b"# hi\n"
 
     @pytest.mark.asyncio

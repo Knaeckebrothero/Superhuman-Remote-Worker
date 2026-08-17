@@ -1,6 +1,6 @@
 """Journal-before-observe for the job_complete decision.
 
-Pins the durability chain of docs/issues/
+Pins the durability chain of knowledge-base/knowledge/issues/
 job_finalization_decisions_held_only_in_process_memory.md:
 
 1. the tool journals the decision through the orchestrator BEFORE it returns

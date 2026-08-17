@@ -1,6 +1,6 @@
 """Tests for OKF KB slice 3 PR1 — chunk-granular index store surface.
 
-Design: docs/features/okf_knowledge_base.md §5.1 / §11 slice-3 PR1.
+Design: knowledge-base/knowledge/features/okf_knowledge_base.md §5.1 / §11 slice-3 PR1.
 
 PR1 is the SCHEMA + STORE surface, inert: it adds the persistence primitives the
 git-tree reindexer (PR3) writes and the retrieval cutover (PR4) reads, but nothing

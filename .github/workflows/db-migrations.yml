@@ -20,7 +20,7 @@ name: db-migrations
 #   4. uniqueness  — refuse duplicate NNNN_ prefixes within each migrations
 #                    subdirectory
 #
-# Design rationale: see docs/db_migration.md §Testing & CI.
+# Design rationale: see knowledge-base/knowledge/db_migration.md §Testing & CI.
 
 on:
   push:
@@ -214,7 +214,7 @@ jobs:
     # differ from what's committed. Unlike `dry-run`, this does a REAL apply
     # (so the .notx.sql CONCURRENTLY files execute), covers ALL THREE families
     # including audit (net-new — no audit dry-run exists), and pins each
-    # family's prod major. See docs/features/database_roadmap.md Phase 2.
+    # family's prod major. See knowledge-base/knowledge/features/database_roadmap.md Phase 2.
     name: schema artifacts fresh
     runs-on: ubuntu-latest
     timeout-minutes: 10

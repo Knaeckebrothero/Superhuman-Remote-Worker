@@ -11,7 +11,7 @@ operative word — none of these failures raise, they just make the session answ
 a question it can no longer see, or make the transcript claim the user said
 something they did not.
 
-Design: docs/features/session_wake_on_job_completion.md.
+Design: knowledge-base/knowledge/features/session_wake_on_job_completion.md.
 """
 
 from __future__ import annotations

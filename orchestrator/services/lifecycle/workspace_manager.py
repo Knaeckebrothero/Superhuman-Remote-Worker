@@ -10,7 +10,7 @@ from the same S3 reference.
 
 Phase 2a scope: drift detection + snapshot/drain integration.
 Phase 2b adds crash recovery for ``Unknown`` / ``Failed`` workspace
-pods (the gap in ``docs/issues/stuck_thread_workspace_pods.md``).
+pods (the gap in ``knowledge-base/knowledge/issues/stuck_thread_workspace_pods.md``).
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ _LABEL_SELECTOR = "srw.io/component=agent-workspace"
 # "the lookup succeeded and found no row". The distinction matters: a missing
 # row means the job/thread was deleted and the pod is an orphan we may reap
 # (age-gated), while a failed lookup means we know nothing and must not act.
-# See docs/done/deleted_job_orphans_workspace_pod.md.
+# See knowledge-history/done/deleted_job_orphans_workspace_pod.md.
 _FETCH_FAILED = object()
 
 # 'reviewing' is the verification-enabled twin of 'pending_review'
@@ -57,7 +57,7 @@ _FETCH_FAILED = object()
 # whole review dies. The is_idle/is_reapable predicates below therefore gate on
 # ``has_live_shared_child`` (a non-terminal child bound to this same pod); the
 # status set stays optimistic and the guard handles the dependency precisely.
-# See docs/issues/reviewing_parent_pod_reaped_under_critic.md.
+# See knowledge-base/knowledge/issues/reviewing_parent_pod_reaped_under_critic.md.
 _IDLE_JOB_STATUSES = frozenset(
     {"paused", "pending_review", "reviewing", "waiting_for_reply"}
 )
@@ -77,7 +77,7 @@ _IDLE_THREAD_STATUSES = frozenset({"ended"})
 # user's working tree on an idle timeout — strictly worse than the emptyDir
 # behavior the PVC replaces. The volume-side predicate is
 # ``_is_volume_reclaimable``; keep the two apart.
-# See docs/features/workspace_pvc_backed_migration.md ("thread **deleted**, not
+# See knowledge-base/knowledge/features/workspace_pvc_backed_migration.md ("thread **deleted**, not
 # merely *ended*") and workspace_pvc_branch_a_implementation.md.
 _TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _TERMINAL_THREAD_STATUSES = frozenset({"ended"})
@@ -142,7 +142,7 @@ def paused_grace_seconds() -> float:
     A pause is frequently a human-wait (sudo/VM-upgrade approval: 24 h TTL;
     review pauses) — reaping on the very next tick destroys the workspace
     minutes into that window (see
-    docs/issues/vm_upgrade_pause_workspace_reaped_before_approval.md). Keep it
+    knowledge-base/knowledge/issues/vm_upgrade_pause_workspace_reaped_before_approval.md). Keep it
     warm for the grace so a fast decision resumes losslessly; a slow one pays
     a snapshot-restore. Defaults to the suspension sweep's
     ``WORKSPACE_IDLE_TIMEOUT`` (minutes, default 30) so the graceful
@@ -205,7 +205,7 @@ def infra_transient_retry_pending(metadata: dict[str, Any]) -> bool:
     so it stops matching here and the normal terminal reap collects it. That is
     why no attempt counter is needed in this predicate.
 
-    docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 1b)
+    knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 1b)
     """
     freeze = metadata.get("job_freeze")
     if not isinstance(freeze, dict):
@@ -487,12 +487,12 @@ class WorkspaceInstanceManager:
         pod-created-but-row-not-yet-persisted provisioning window, which is
         seconds long — the grace default is minutes. A pod whose row state is
         merely *unknown* (lookup failed) is never reapable.
-        See docs/done/deleted_job_orphans_workspace_pod.md.
+        See knowledge-history/done/deleted_job_orphans_workspace_pod.md.
 
         Guard: a workspace shared by a live child job (a critic SSHed into the
         parent's pod) is never reapable, regardless of the parent's own status —
         reaping would strand the child. See ``_live_shared_child_exists`` and
-        docs/issues/reviewing_parent_pod_reaped_under_critic.md.
+        knowledge-base/knowledge/issues/reviewing_parent_pod_reaped_under_critic.md.
         """
         if _is_stateless_thread_instance(inst):
             return False
@@ -549,7 +549,7 @@ class WorkspaceInstanceManager:
           'ended' reclaimed the volume, an ordinary coffee break would delete
           the user's working tree — worse than the emptyDir behavior PVCs
           replace. A session's volume is reclaimed only when the thread itself
-          is gone. See docs/features/workspace_pvc_backed_migration.md:186-191.
+          is gone. See knowledge-base/knowledge/features/workspace_pvc_backed_migration.md:186-191.
 
         ``bound_row_missing`` is the deletion signal for both kinds and the ONLY
         one for sessions: thread deletion is a hard ``DELETE FROM threads``
@@ -1108,7 +1108,7 @@ class WorkspaceInstanceManager:
         # ``workspace-data`` volume is the claim), so it stays 'deleted' and the
         # next attach recreates a pod that reattaches the live volume, while an
         # emptyDir session still hands off through S3.
-        # See docs/issues/vm_upgrade_pause_workspace_reaped_before_approval.md.
+        # See knowledge-base/knowledge/issues/vm_upgrade_pause_workspace_reaped_before_approval.md.
         if (
             not self._is_terminal(inst)
             and inst.metadata.get("volume_ephemeral", True)

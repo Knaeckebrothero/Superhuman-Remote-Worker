@@ -20,7 +20,7 @@ import {ViewModeService} from '../../core/services/view-mode.service';
  * `ViewModeService.effectiveMode`, which reports `'me'` for non-admins and
  * would make the banner misfire for them.
  *
- * Design: `docs/features/admin_view_as_user.md`.
+ * Design: `knowledge-base/knowledge/features/admin_view_as_user.md`.
  */
 @Component({
   selector: 'app-view-mode-banner',

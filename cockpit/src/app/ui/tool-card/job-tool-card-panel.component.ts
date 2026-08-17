@@ -36,7 +36,7 @@ import {
  *
  * This codebase has a documented rule against it. SSE replay once resurrected a
  * dead approve button and the click 409'd
- * (`docs/issues/session_silent_failure_audit.md`); the resulting rule, stated in
+ * (`knowledge-base/knowledge/issues/session_silent_failure_audit.md`); the resulting rule, stated in
  * `persistent-chat.service.ts`, is that such cards are **live-only** and the
  * durable transcript gets a text system message instead, "because the reason is
  * stale."
@@ -55,7 +55,7 @@ import {
  * - **The remaining race settles itself.** If the agent approves a job in the
  *   second before the user clicks, the post-action refresh corrects the card.
  *
- * Design: docs/features/unified_tool_cards.md (slice 4).
+ * Design: knowledge-base/knowledge/features/unified_tool_cards.md (slice 4).
  */
 @Component({
     selector: 'app-job-tool-card-panel',
@@ -291,7 +291,7 @@ export class JobToolCardPanelComponent {
      * Approve and Cancel are "ship it" and "kill it"; the common answer to a
      * job that stopped for review is neither, it is "close, but do X". Without
      * this the user has to leave the transcript for the Jobs page, which is the
-     * trip this card exists to remove (docs/features/unified_tool_cards.md).
+     * trip this card exists to remove (knowledge-base/knowledge/features/unified_tool_cards.md).
      *
      * The draft survives a failed send. `run()` reports the API's result rather
      * than swallowing it, so a resume rejected by the resume PEP (403 on a

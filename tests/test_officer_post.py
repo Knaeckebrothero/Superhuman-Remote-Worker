@@ -1,4 +1,4 @@
-"""The officer's durable post — O1/O2 of docs/features/officer_post.md.
+"""The officer's durable post — O1/O2 of knowledge-base/knowledge/features/officer_post.md.
 
 Covers the ``project_officers`` row helpers (get-or-create self-heal,
 registration claim + stale-link fold, config/state/incarnation writers), the

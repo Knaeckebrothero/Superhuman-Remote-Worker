@@ -211,7 +211,7 @@ class TestAssignLaneChoice:
     """Paused jobs only take /job/resume when a checkpoint proves they ran.
 
     A paused-but-never-started job routed down /job/resume starts brief-less
-    (docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+    (knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
     """
 
     @pytest.mark.asyncio

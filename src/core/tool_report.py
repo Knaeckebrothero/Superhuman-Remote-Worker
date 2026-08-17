@@ -5,7 +5,7 @@ regression survived eleven days and why ``GET .../tool-groups`` shipped as a
 *lean* orchestrator-side re-derivation covering 4 of 24 categories.
 
 This module is the shared vocabulary for the fix.  The governing decision (D6,
-``docs/issues/tool_configuration_defects_and_fix_roadmap.md``) is that **the
+``knowledge-base/knowledge/issues/tool_configuration_defects_and_fix_roadmap.md``) is that **the
 resolved answer comes from the agent, not from a re-implementation**: the agent
 binds the toolset, so the agent reports it and the API serves that.  Rebuilding
 the runtime-injection layer orchestrator-side would be a second implementation

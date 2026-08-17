@@ -1045,7 +1045,7 @@ class TestScholarOutputPointer:
         # step 3b) — the parent must keep waiting for the resumed scholar's
         # real outcome, not be unblocked as research-success. Live-caught on
         # k3d: a cooldown-paused scholar falsely flipped its parent
-        # waiting→created. docs/features/llm_outage_subjob_resilience.md
+        # waiting→created. knowledge-base/knowledge/features/llm_outage_subjob_resilience.md
         scholar = {
             "id": "sch-1",
             "parent_job_id": "par-1",
@@ -1122,7 +1122,7 @@ class TestDelegationUnblockDispatcherContract:
     ``update_job_status(status="paused")`` leaves the parent's delegation
     freeze set, and ``get_dispatchable_jobs`` requires ``freeze_data IS
     NULL`` — the re-queued parent would be dispatcher-invisible forever.
-    Regression for docs/issues/delegation_freeze_lifecycle_gaps.md (Gap 1).
+    Regression for knowledge-base/knowledge/issues/delegation_freeze_lifecycle_gaps.md (Gap 1).
     """
 
     def _fixtures(self):

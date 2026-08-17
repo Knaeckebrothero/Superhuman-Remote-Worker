@@ -423,7 +423,7 @@ class TestUpdateThreadConfig:
 
 class TestRecordVerificationRound:
     """record_verification_round: journal-before-observe durability for the
-    critic verdict tools (docs/superpowers/plans/2026-07-27-verification-fail-
+    critic verdict tools (knowledge-base/knowledge/superpowers/plans/2026-07-27-verification-fail-
     closed.md, Task 5). Unlike the rest of this client, failure must be LOUD —
     every downstream loss path treats a missing verdict as approval, so this
     method raises VerdictRecordingError instead of returning None/False."""

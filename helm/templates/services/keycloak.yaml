@@ -132,7 +132,7 @@ data:
         {
           "clientId": "cockpit-bff",
           "name": "SRW Cockpit BFF",
-          "description": "Confidential client for the orchestrator's cookie BFF (docs/features/auth_bff_and_api_tokens.md). Distinct from the cockpit SPA's public client — same realm + same user identity, different auth model.",
+          "description": "Confidential client for the orchestrator's cookie BFF (knowledge-base/knowledge/features/auth_bff_and_api_tokens.md). Distinct from the cockpit SPA's public client — same realm + same user identity, different auth model.",
           "enabled": true,
           "publicClient": false,
           "clientAuthenticatorType": "client-secret",
@@ -645,7 +645,7 @@ spec:
             # Legacy V1 token-exchange enabled so the ``requested_subject``
             # impersonation parameter works (RFC 8693 standard V2 mode
             # rejects it). Required by Phase 2.1 of
-            # docs/features/cloud_collaboration_model.md §9 so the agent
+            # knowledge-base/knowledge/features/cloud_collaboration_model.md §9 so the agent
             # can mint user-scoped WebDAV tokens for default-project
             # (user-home) mounts on OpenCloud Personal Spaces.
             # The feature is called ``token-exchange`` in Keycloak 26.2;
@@ -748,7 +748,7 @@ spec:
             # Cockpit BFF — flips the cockpit client from public-PKCE to
             # confidential when a value is present. Absence keeps the
             # client public (pre-BFF behavior). See
-            # docs/features/auth_bff_and_api_tokens.md.
+            # knowledge-base/knowledge/features/auth_bff_and_api_tokens.md.
             - name: KC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:

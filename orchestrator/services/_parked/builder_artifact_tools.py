@@ -1,10 +1,10 @@
 """Parked: instruction-builder artifact-tool schemas (Dynamic Canvas seed).
 
 Reference snapshot, NOT live code. The instruction builder was removed in the
-builder -> sessions consolidation (docs/features/builder_to_sessions_consolidation.md).
+builder -> sessions consolidation (knowledge-base/knowledge/features/builder_to_sessions_consolidation.md).
 These five LLM tool schemas -- the ones that let the builder author a job's
 ``instructions`` / ``config`` / ``description`` -- are preserved verbatim because
-the Dynamic Canvas (docs/features/dynamic_canvas.md) will reuse them for its
+the Dynamic Canvas (knowledge-base/knowledge/features/dynamic_canvas.md) will reuse them for its
 job/expert authoring operations.
 
 These tools were applied CLIENT-side: the orchestrator emitted each call as a

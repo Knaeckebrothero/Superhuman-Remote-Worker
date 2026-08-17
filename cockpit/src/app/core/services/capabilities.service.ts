@@ -12,7 +12,7 @@ export const PERMISSION_MODES = ['supervised', 'auto_accept', 'autonomous'];
  * The caller's resolved capability grants, fetched once and shared. Drives
  * permission-mode dropdown greying so a user is never offered a mode the
  * backend will deny at provisioning — the UX half of
- * docs/issues/session_permission_mode_grant_denied_ready_timeout.md.
+ * knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md.
  *
  * Fails open (grants ⇒ all modes) while loading, for admins, and on error:
  * Phase 1's provisioning pre-flight is the authoritative backstop, so this
@@ -61,7 +61,7 @@ export class CapabilitiesService {
    * the permission-mode helpers this FAILS CLOSED while loading and on fetch
    * error — the section stays hidden until a successful capabilities fetch
    * proves entitlement (the server gate is the real backstop either way).
-   * Spec: docs/features/public_datasources.md. */
+   * Spec: knowledge-base/knowledge/features/public_datasources.md. */
   readonly canPublishDatasources = computed(() => {
     if (this.loadFailed()) return false;
     const g = this.grants();
@@ -76,7 +76,7 @@ export class CapabilitiesService {
    * stays hidden until a successful fetch proves entitlement. Hiding is UX
    * only; the orchestrator refuses start/resume/convert/commission with 403
    * and the config PDP refuses `officer.enabled` regardless of what renders.
-   * Spec: docs/done/unattended_operations_grant.md. */
+   * Spec: knowledge-history/done/unattended_operations_grant.md. */
   readonly canRunUnattendedOperations = computed(() => {
     if (this.loadFailed()) return false;
     const g = this.grants();

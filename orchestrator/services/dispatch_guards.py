@@ -5,7 +5,7 @@ decision logic is unit-testable without standing up the whole dispatcher (which
 is otherwise untested). The dispatcher performs the DB I/O and passes the
 resolved values in.
 
-See docs/done/preemption_before_first_checkpoint_replays_job_opening.md.
+See knowledge-history/done/preemption_before_first_checkpoint_replays_job_opening.md.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def resume_lane_applies(job: dict[str, Any], *, has_checkpoint: bool) -> bool:
     presence is unknowable (sqlite backend) that probe fails open to True,
     preserving today's behavior — the agent-side brief hydration + tripwire
     cover that half. See
-    docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md.
+    knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md.
     """
     if str(job.get("status") or "") != "paused":
         return False
@@ -74,7 +74,7 @@ VM_PARK_HEADSCALE = "park_headscale"  # mesh VPN never recovered → fail + park
 # Observed cold import on the shared VM cluster: ~30 min — deliberately above
 # both VM_PROVISION_TIMEOUT_S (600) and the controller's VM_GOLDEN_POLL_TIMEOUT
 # (900), which is the misalignment that burned a loop iteration (see
-# docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md).
+# knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md).
 DEFAULT_GOLDEN_WAIT_TIMEOUT_S = 2700.0
 
 # Bounded patience for a Headscale outage. The controller refuses to build a

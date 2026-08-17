@@ -1,4 +1,4 @@
-"""Tests for the job log archive read path (docs/features/job_log_archive.md).
+"""Tests for the job log archive read path (knowledge-base/knowledge/features/job_log_archive.md).
 
 Covers the pure helpers behind GET /api/jobs/{id}/logs and
 GET /api/persistent/threads/{id}/logs:

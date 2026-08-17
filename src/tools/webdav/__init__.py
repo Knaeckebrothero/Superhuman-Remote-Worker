@@ -5,7 +5,7 @@ Provides WebDAV tools when a WebDAV datasource is attached to a job:
 - Download files to workspace
 - Get file metadata
 
-See docs/datasources.md for the datasource connector system.
+See knowledge-base/knowledge/datasources.md for the datasource connector system.
 """
 
 from typing import Any, Dict, List

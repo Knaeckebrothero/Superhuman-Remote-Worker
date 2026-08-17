@@ -84,7 +84,7 @@ helm:
       # Golden-image boot acceleration: import the VM base image ONCE into a
       # per-digest golden PVC, then clone per-VM rootdisks from it (CDI
       # host-assisted on local-path) instead of a ~10-min GHCR registry
-      # import per VM. See docs/features/vm_golden_image_boot_acceleration.md.
+      # import per VM. See knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md.
       goldenImage:
         enabled: true
       # Persistent rootdisks: create each VM's root disk as a STANDALONE
@@ -92,7 +92,7 @@ helm:
       # no ownerRef and survives VM deletion. A recreate reattaches it by name
       # — files intact, and the ~3m27s clone skipped entirely, which makes
       # crash recovery faster than a fresh start.
-      # See docs/features/vm_persistent_rootdisk.md.
+      # See knowledge-base/knowledge/features/vm_persistent_rootdisk.md.
       #
       # The orchestrator has its own copy of this flag
       # (deployment/values-experimental.yaml → VM_PERSISTENT_ROOTDISK) which
@@ -105,7 +105,7 @@ helm:
       # may omit. Fixed in daec8704, and the fixed manifest was validated
       # against the live webhook with `kubectl apply --dry-run=server` before
       # this re-enable. Live-gate log:
-      # docs/features/vm_workspace_persistence_reconciliation.md.)
+      # knowledge-base/knowledge/features/vm_workspace_persistence_reconciliation.md.)
       persistentRootdisk:
         enabled: true
 dependsOn: []

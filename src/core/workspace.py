@@ -15,7 +15,7 @@ Git versioning:
 Backend abstraction:
 - File I/O is delegated to a WorkspaceBackend implementation
 - RemoteBackend (SSH/SFTP) is the only production backend
-- See docs/features/vm_backend.md for the full design
+- See knowledge-base/knowledge/features/vm_backend.md for the full design
 """
 
 import logging
@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # blindly a few times: a permanent failure only costs a couple of cheap extra
 # attempts before the caller's F29 hard-fail. Removes the single-shot clone that
 # turned a rollout-window blip into a dead project job.
-# docs/done/coincident_infra_error_overrides_reported_job_outcome.md
+# knowledge-history/done/coincident_infra_error_overrides_reported_job_outcome.md
 _CLONE_ATTEMPTS = 3
 _CLONE_BACKOFF_SECONDS = (2.0, 5.0)  # waits before attempts 2 and 3
 
@@ -302,7 +302,7 @@ class WorkspaceManager:
 
         # Virtual directories: wrap the real backend so registered prefixes
         # (tools/, contacts/, instructions.md) are served from live state.
-        # See docs/features/virtual_directories.md.
+        # See knowledge-base/knowledge/features/virtual_directories.md.
         # Unconditional, and there is no opt-out. `backend is None` already
         # raised above and nothing reassigns `_virtual_overlay` afterwards
         # (`swap_backend` rebinds it in place), so every manager has an overlay
@@ -312,7 +312,7 @@ class WorkspaceManager:
         # "off" position materialized instructions.md / task_brief.md into the
         # workspace root, which on a subjob sharing its parent's workspace put
         # the critic's brief where the TARGET reads it — see
-        # docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md.
+        # knowledge-history/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md.
         # It guarded against an agent booting with no task; src/graph.py now
         # guarantees that directly by refusing to start when both briefs resolve
         # empty, which covers every cause rather than this one.
@@ -628,7 +628,7 @@ class WorkspaceManager:
 
         # Empty root: clone (bounded retry+backoff — a momentary reachability
         # blip during an image rollout must not hard-fail the job on the first
-        # miss; docs/done/coincident_infra_error_overrides_reported_job_outcome.md)
+        # miss; knowledge-history/done/coincident_infra_error_overrides_reported_job_outcome.md)
         if git_mgr is None:
             git_mgr = _clone_repo_with_retry(
                 repo_url, self._workspace_path, backend=self._backend
@@ -748,7 +748,7 @@ class WorkspaceManager:
         notes are read through the KB tools and written via the
         orchestrator's materialisation endpoint, so a checkout would be a
         stale second copy nobody reads;
-        docs/features/knowledge_base_repo_separation.md §3).
+        knowledge-base/knowledge/features/knowledge_base_repo_separation.md §3).
         """
         if not self.config.repositories:
             return

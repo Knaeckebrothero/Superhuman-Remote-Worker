@@ -1,7 +1,7 @@
 """Durable Canvas presentation: capture, offline serve, and generation re-pin.
 
 Acceptance criteria are numbered in
-``docs/features/canvas_durable_presentation.md`` §7; each test names the ones
+``knowledge-base/knowledge/features/canvas_durable_presentation.md`` §7; each test names the ones
 it covers. Object storage is stubbed — these never touch a live bucket.
 """
 

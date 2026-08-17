@@ -178,7 +178,7 @@ def test_experimental_overlay_enables_dev_viewer_without_production_claims() -> 
         "passwordKey": "CANVAS_VIEWER_POSTGRES_PASSWORD",
     }
     # The edge is the existing Cloudflare Tunnel connector (see
-    # docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md).
+    # knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md).
     assert viewer["networkPolicy"]["edgeNamespaceSelector"] == {
         "matchLabels": {"kubernetes.io/metadata.name": "cloudflare-tunnel"}
     }
@@ -294,7 +294,7 @@ def test_canvas_gateway_templates_default_dark_with_optional_ingress() -> None:
     }
     # The optional plug-and-play wildcard route is the only Ingress and is
     # double-gated: it renders nothing unless the viewer AND the ingress are
-    # both explicitly enabled (docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md).
+    # both explicitly enabled (knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md).
     assert all(
         "kind: Ingress" not in source
         for name, source in templates.items()

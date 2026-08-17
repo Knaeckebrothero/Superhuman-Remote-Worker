@@ -18,7 +18,7 @@ import { JobSummary } from '../models/audit.model';
  * Historically this also eagerly downloaded a job's entire audit/chat/graph
  * streams into IndexedDB and exposed a slider-windowed view — that bulk path
  * OOM'd the orchestrator on large jobs (see
- * docs/features/debug_audit_view_refactor.md). The streams now load lazily via
+ * knowledge-base/knowledge/features/debug_audit_view_refactor.md). The streams now load lazily via
  * their own paged services (AuditTraceService / ChatTraceService) and graph via
  * GraphService, all keyed off `currentJobId`. What remains here is the thin
  * selection state + the job-list auto-refresh that the panels react to.

@@ -6,7 +6,7 @@ current tool batch instead of paying another LLM iteration
 (persistent_graph.py, officer sleep check). The transport then consumes the
 request at park time and FILES the wake with the orchestrator as a durable
 ``timer`` outbox row — the timer is Postgres-owned, so a pod crash or node
-downtime never loses the schedule (docs/features/centurion.md §4, decision
+downtime never loses the schedule (knowledge-base/knowledge/features/centurion.md §4, decision
 2026-07-29). The tool itself is a pure flag-setter, mirroring the
 ``request_workspace_upgrade`` freeze-seam pattern in ``upgrade.py``.
 

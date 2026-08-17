@@ -1,6 +1,6 @@
 """MemoryManager — the single seam for all agent memory.
 
-Design: docs/features/agent_memory_overhaul.md §2.1. Both graphs hold
+Design: knowledge-base/knowledge/features/agent_memory_overhaul.md §2.1. Both graphs hold
 exactly one of these; neither touches RecallStore/KnowledgeStore directly
 (Phase-1 acceptance). The manager is a binder (P6): ``from_config``
 resolves named plugins from the registry and wires the pipeline — it
@@ -139,8 +139,8 @@ class MemoryManager:
         reranker) is required, so it raises ``MemoryPipelineError`` rather
         than silently serving legacy order behind the user's back ("configured
         ⇒ required" — the caller fails the turn loud). See
-        docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
-        and docs/issues/reranker_transient_fault_hard_fails_job.md.
+        knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
+        and knowledge-base/knowledge/issues/reranker_transient_fault_hard_fails_job.md.
         """
         watch = _StopWatch()
         stats = AssembleStats()
