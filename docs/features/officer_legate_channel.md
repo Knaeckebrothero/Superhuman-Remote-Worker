@@ -43,7 +43,10 @@ a router), `deliver_officer_note` in `services/session_wake.py`, the verbatim Le
 section in `services/sitrep.py`, `list_project_officer_posts` in `database/postgres.py`.
 Surface: three tools in `orchestrator/mcp/server.py` with their contracts in
 `capabilities.py`, schema revision **10 → 11**, client + formatters in
-`src/shared/orch_surface/`. **Live gate on dev is owed** — see [Acceptance](#acceptance).
+`src/shared/orch_surface/`. Adding a tool also moves three pins in
+`tests/test_mcp_capabilities.py` — the contract count (112 → 115), the revision, and
+`tool_count` in the build-info assertion; that is the gate doing its job, not noise.
+**Live gate on dev is owed** — see [Acceptance](#acceptance).
 
 ## 1. Why
 
@@ -96,6 +99,16 @@ renderer truncates a payload summary to 160 chars; routing a directive through i
 amputate it on the queued path. `_legate_lines` caps at 4000 chars only to stop a
 pathological paste from crowding out the briefing, and says so when it trims.
 
+**Both renderers carry the note, and a broken transport does not eat it.** The sitrep is
+not the only thing he might read: when its build fails, `_format_officer_wake` is the
+fallback, and it rendered non-timer rows as `<source>: <dedup_key>` — a directive would
+have arrived as a bare uuid. That renderer now prints the note verbatim too. Symmetrically,
+resolving or reaching the pod may raise rather than return False; the live attempt is
+wrapped so the note falls through to the durable row instead of 500-ing the caller. Both
+were found reviewing the diff after the fact, and both have tests
+(`test_the_fallback_renderer_still_carries_the_note_itself`,
+`test_a_live_attempt_that_raises_still_queues_the_note`).
+
 **Provenance is part of the message.** The endpoint stamps
 `[Legate note — <name> via MCP, <ts>]` ahead of the body. He treats a Legate directive as
 top authority, so a note composed by an assistant holding the Legate's credentials must
@@ -119,6 +132,11 @@ admission funnel's own terminal-status list.
 log so the answer shows what he has been doing rather than only how he is configured. A
 failed tail read costs the log section, not the whole answer.
 
+The rendered card carries what a Legate glance needs and no more: commission state, hold,
+kit with pool depth and its floor warning, next wake, pending events, page budget, spend
+against the daily token ceiling (the ceiling defers his wakes when hit, so the number
+belongs there), digest ring, and any open conference.
+
 `newest_first` on `get_persistent_thread_messages` switches the existing endpoint to its
 `before` cursor and drops the offset-paging footer, which would otherwise send a reader
 walking forward from turn one.
@@ -139,7 +157,8 @@ officer's own 28-tool surface.
 ## 5. Tests
 
 - `tests/test_officer_legate_note.py` — delivery for every officer state, hold-kind split,
-  non-coalescing keys, owner gate, vacant 409, message validation, provenance, routes wired.
+  non-coalescing keys, a raising live attempt still queuing, the fallback renderer carrying
+  the note, owner gate, vacant 409, message validation, provenance, routes wired.
 - `tests/test_officer_roster.py` — roster view logic, scoping, admin sentinel, and that the
   read never creates a post.
 - `tests/test_officer_roster_real_postgres.py` — the join against a real server: vacant post
