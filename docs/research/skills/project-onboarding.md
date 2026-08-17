@@ -29,7 +29,7 @@ to produce the evidence base for the `project-onboarding` skill.
   ties together: the project KB (`search_knowledge`/`kb_write`), `datasources.md`,
   the datasource inventory, and RecallStore memories.
 - **Roster:** Tier-2 opt-in (was `codebase-onboarding`),
-  [`../docs/features/default_skill_roster.md`](../docs/features/default_skill_roster.md).
+  [`../docs/features/default_skill_roster.md`](../../features/default_skill_roster.md).
 - **THE crux (foregrounded):** the transfer question. Onboarding is the roster's
   *best* generalization candidate — "orient before you act" predates software
   (consultants, analysts, new hires, archivists all do it), unlike debugging

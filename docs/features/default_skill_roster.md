@@ -21,13 +21,13 @@ tags:
 
 | Skill | Tier | Status | Scope / binding | Transfer verdict | Evidence base |
 |---|---|---|---|---|---|
-| `verify-before-done` | 1 | ✅ built 06-22; activation corrected 08-03 | **gated** before tactical `todo_complete` and strategic `job_complete`; read must be in the current phase and ≤20 LLM turns old | universal | `Verify Before Done Skill Research.md` (repo root) |
+| `verify-before-done` | 1 | ✅ built 06-22; activation corrected 08-03 | **gated** before tactical `todo_complete` and strategic `job_complete`; read must be in the current phase and ≤20 LLM turns old | universal | `docs/research/skills/verify-before-done.report.md` |
 | `todo-guide` (= planning-and-decomposition) | 1 | ✅ shipped earlier; optimized 06-24 (308→82-line body, +L3 `references/phase-patterns.md`) | **bound** `before_tool:next_phase_todos` (enforced gate) | universal | predates this initiative |
-| `brainstorming` | 1 | ✅ built 06-24 | **model-invoked** (unbound) | universal | `researches/brainstorming*.md` |
-| `systematic-debugging` | 1 | ✅ built 06-24 | **model-invoked**, code-scoped (description self-scopes) | **code-scoped — NOT universal** (RCA bridge fails its own evidence test; no non-code agent example) | `researches/systematic-debugging*.md` |
-| `code-review` | 2 | ✅ built 06-25 | **model-invoked**; home=`critic` (binding deferred) | **universal as a *frame*** (critique/peer-review/steelman); load-bearing verify steps stay code-shaped | `researches/code-review.report.md` |
-| `project-onboarding` (was `codebase-onboarding`) | 2 | ✅ built 06-25 | **model-invoked**, universal (all experts) | **universal as a *procedure*** (inventory→source-of-truth→structure/vocab→map: the named procedure in archival survey / *First 90 Days* / consulting / journalism / Klein) | `researches/project-onboarding.report.md` |
-| `test-driven-development` | 2 | ✅ built 06-25 | **model-invoked**, code-scoped (self-scopes); home=`developer` (binding deferred) | **universal only as a *principle*** (pre-registration); code-specific procedure; agent practice near-totally code | `researches/test-driven-development.report.md` |
+| `brainstorming` | 1 | ✅ built 06-24 | **model-invoked** (unbound) | universal | `docs/research/skills/brainstorming*.md` |
+| `systematic-debugging` | 1 | ✅ built 06-24 | **model-invoked**, code-scoped (description self-scopes) | **code-scoped — NOT universal** (RCA bridge fails its own evidence test; no non-code agent example) | `docs/research/skills/systematic-debugging*.md` |
+| `code-review` | 2 | ✅ built 06-25 | **model-invoked**; home=`critic` (binding deferred) | **universal as a *frame*** (critique/peer-review/steelman); load-bearing verify steps stay code-shaped | `docs/research/skills/code-review.report.md` |
+| `project-onboarding` (was `codebase-onboarding`) | 2 | ✅ built 06-25 | **model-invoked**, universal (all experts) | **universal as a *procedure*** (inventory→source-of-truth→structure/vocab→map: the named procedure in archival survey / *First 90 Days* / consulting / journalism / Klein) | `docs/research/skills/project-onboarding.report.md` |
+| `test-driven-development` | 2 | ✅ built 06-25 | **model-invoked**, code-scoped (self-scopes); home=`developer` (binding deferred) | **universal only as a *principle*** (pre-registration); code-specific procedure; agent practice near-totally code | `docs/research/skills/test-driven-development.report.md` |
 | `sub-agent-delegation` | 2 | ⏳ **NOT built — next/last Tier-2** | TBD | optimization-shaped (see below) | — |
 | `research-guide` | 3-ish | ✅ shipped earlier; activation corrected 08-03 | **bound** `phase_start:tactical` on scholar; injected once per concrete tactical phase | scholar research methodology | predates this initiative |
 
@@ -47,13 +47,13 @@ The honest move throughout: **build on the evidence-backed core, not the dogma**
 ### The build pipeline ("the machine")
 
 Each skill is built the same way (greenlit, repeatable):
-1. **Research prompt** — copy `researches/template.md` → `researches/<skill>.md`, swap the `SKILL UNDER RESEARCH` block, tailor objectives/guardrails, and **foreground the skill's specific cruxes** (always incl. the transfer question; add skill-specific ones e.g. TDD's active-ingredient + sibling boundaries).
+1. **Research prompt** — copy `docs/research/skills/template.md` → `docs/research/skills/<skill>.md`, swap the `SKILL UNDER RESEARCH` block, tailor objectives/guardrails, and **foreground the skill's specific cruxes** (always incl. the transfer question; add skill-specific ones e.g. TDD's active-ingredient + sibling boundaries).
 2. **Run research INLINE** via **3 scoped foreground `general-purpose` Agent passes** (split: vendor/agent practice · empirical canon · transfer + boundaries/honesty). *Why inline, not the `deep-research` Workflow: the background harness keeps getting orphaned by process restarts between turns — cross-session resume drops `args`. Inline passes finish within the turn.*
-3. **Synthesize** → `researches/<skill>.report.md` (A–K deliverable structure: exec synthesis / body procedure / scaffold / quality bar / anti-patterns / enforcement+scope / trigger-description / model-variance / examples / open questions / sources).
+3. **Synthesize** → `docs/research/skills/<skill>.report.md` (A–K deliverable structure: exec synthesis / body procedure / scaffold / quality bar / anti-patterns / enforcement+scope / trigger-description / model-variance / examples / open questions / sources).
 4. **Author** `config/skills/<skill>/SKILL.md` — house style: frontmatter (`name`, `description`, `display_name`, `icon`, `color`, `tags`) → framing paragraph → `## The <noun>` numbered steps → scaffold (table or fenced block) → `## Don't`. **Budgets:** `description` ≤1024 chars (it IS the trigger), body <500 lines / <5k tokens.
 5. **Test** — add a focused test to `tests/test_bundled_skills.py` (the generic `test_every_bundled_skill_parses_and_respects_limits` already covers format/limits for all; the focused test asserts on-topic content + that the description names its sibling-boundary skills).
 6. **Verify** — `pytest tests/test_bundled_skills.py tests/test_skill_bindings.py -q` + `ruff check`; budget check; **local k3d parse-in-pod** via `src.core.skill_format.parse_skill_md` (exactly what `_scan_skills` calls) — `kubectl --context=k3d-srw -n srw exec deploy/srw-orchestrator -c orchestrator -- python3 -c "..."`.
-7. **Document** — update this section + the table, the `researches/<skill>.md` status line, and memory `[[project-baseline-skill-roster-research]]`.
+7. **Document** — update this section + the table, the `docs/research/skills/<skill>.md` status line, and memory `[[project-baseline-skill-roster-research]]`.
 
 ### Mechanics & gotchas (so a future session doesn't re-learn them)
 

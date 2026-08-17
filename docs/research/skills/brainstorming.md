@@ -7,7 +7,7 @@ to produce the evidence base for the `brainstorming` skill.
   `verify-before-done`) — the cheap, model-invoked creative skill, and the one
   non-code member of the universal core. Run this prompt, save the report
   alongside, then author `config/skills/brainstorming/SKILL.md`.
-- **Roster:** Tier-1 universal core, [`../docs/features/default_skill_roster.md`](../docs/features/default_skill_roster.md).
+- **Roster:** Tier-1 universal core, [`../docs/features/default_skill_roster.md`](../../features/default_skill_roster.md).
 - **Likely enforcement:** model-invoked (the agent loads it when it hits an
   open-ended "which approach?" decision) — confirm via deliverable F.
 

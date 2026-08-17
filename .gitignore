@@ -171,6 +171,10 @@ docs/_build/
 .settings/
 *.sublime-workspace
 
+# Kate — local project file, kept on disk but untracked (2026-08-17)
+.kateproject
+.kateproject.d/
+
 # IntelliJ
 *.ipr
 *.iml

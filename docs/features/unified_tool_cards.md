@@ -269,11 +269,22 @@ sets `parent_job_id` when the *creator is itself a worker job*. The tree would
 render one level deep forever. Keep D for a future delegation/subjob view where
 the nesting is real.
 
-> **Mockups.** `Delegate-A-Compact-List-Rows.html` and
-> `Delegate-D-Hierarchical-Tree.html`, untracked in the repo root as of
-> 2026-07-26 (~2 MB each, self-contained bundles). They predate this doc and were
-> drawn for `delegate_work`, not `create_worker_job`. Move them somewhere tracked
-> if this slice proceeds, or this reference goes stale.
+> **Mockups — deleted 2026-08-17, and this note is what survives them.**
+> `Delegate-A-Compact-List-Rows.html` and `Delegate-D-Hierarchical-Tree.html` sat
+> untracked in the repo root (~2 MB each, self-contained bundles) from 2026-07-26.
+> This note used to warn "move them somewhere tracked if this slice proceeds, or
+> this reference goes stale" — instead they were swept in the pre-OSS root-directory
+> cleanup. Being untracked, they had no commits and are **not recoverable**; they
+> would have to be regenerated.
+>
+> Little is actually lost. They predated this doc and were drawn for `delegate_work`
+> rather than `create_worker_job`, and every decision they informed is written down
+> here rather than only visible in the render: Delegate-A's row vocabulary (§Running),
+> the two forced deviations from it (§below), and why Delegate-D's tree is wrong for
+> this card. The shipped component and its comments at
+> `cockpit/src/app/ui/tool-card/job-batch-card.component.ts` are now the reference.
+> Lesson worth keeping: an untracked file cited by a tracked doc is a dangling
+> reference that no tooling can see.
 
 ### Feasibility audit (2026-07-26)
 

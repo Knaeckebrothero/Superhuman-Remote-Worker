@@ -326,7 +326,8 @@ tools:
 ### External research reconciliation (2026-07-02)
 
 An external deep-research report on cross-model delegation-tool design
-(`Subagent Delegation Interface Design.md`) was run against our fleet (MiniMax
+(`docs/research/skills/subagent-delegation.report.md`, in the repo root until 2026-08-17) was
+run against our fleet (MiniMax
 M3, GLM-5.2, GPT-5.5, Opus, Gemini, Kimi, Qwen, DeepSeek). Adopted:
 
 - **Invocation pattern → iterative, not batch** (flips the earlier

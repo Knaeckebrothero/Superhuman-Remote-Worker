@@ -812,7 +812,7 @@ below in new order). Every bug worth fixing *before* the seam is fixed
 - [`../issues/memory_bugs.md`](../issues/memory_bugs.md) — B1–B11, bugs fixable
   independently of this redesign. B1, B2, B4 fixed (2026-06-10/11); the
   remainder are mapped to overhaul phases in its §Suggested order.
-- [`ai-memory-research/`](../../ai-memory-research) — five deep-research briefs + verified
+- [`docs/research/ai_memory/`](../research/ai_memory) — five deep-research briefs + verified
   reports under `results/`.
 
 ---
@@ -1456,11 +1456,11 @@ memory panel fed by `AssembleStats` provenance (optional stretch).
 
 - [`agent_memory_current_state.md`](agent_memory_current_state.md) — the audited baseline this doc designs against
 - [`../issues/memory_bugs.md`](../issues/memory_bugs.md) — independent bug track (B1–B11; B1/B2/B4 fixed)
-- [`ai-memory-research/results/01_frontier_labs_report.md`](../../ai-memory-research/results/01_frontier_labs_report.md) — bounded+on-demand norm; model- vs system-managed camps
-- [`ai-memory-research/results/02_academic_sota_report.md`](../../ai-memory-research/results/02_academic_sota_report.md) — consolidation efficacy refuted; Self-RAG backs gating
-- [`ai-memory-research/results/03_retrieval_report.md`](../../ai-memory-research/results/03_retrieval_report.md) — reranker #1 ROI; keep RRF/qwen3; gate by score
-- [`ai-memory-research/results/04_graphs_temporal_report.md`](../../ai-memory-research/results/04_graphs_temporal_report.md) — graph task-dependent; bi-temporal in pgvector columns
-- [`ai-memory-research/results/05_lifecycle_eval_report.md`](../../ai-memory-research/results/05_lifecycle_eval_report.md) — harness-first; boundary extraction; completeness>precision; conflict = #1 failure
+- [`docs/research/ai_memory/results/01_frontier_labs_report.md`](../research/ai_memory/results/01_frontier_labs_report.md) — bounded+on-demand norm; model- vs system-managed camps
+- [`docs/research/ai_memory/results/02_academic_sota_report.md`](../research/ai_memory/results/02_academic_sota_report.md) — consolidation efficacy refuted; Self-RAG backs gating
+- [`docs/research/ai_memory/results/03_retrieval_report.md`](../research/ai_memory/results/03_retrieval_report.md) — reranker #1 ROI; keep RRF/qwen3; gate by score
+- [`docs/research/ai_memory/results/04_graphs_temporal_report.md`](../research/ai_memory/results/04_graphs_temporal_report.md) — graph task-dependent; bi-temporal in pgvector columns
+- [`docs/research/ai_memory/results/05_lifecycle_eval_report.md`](../research/ai_memory/results/05_lifecycle_eval_report.md) — harness-first; boundary extraction; completeness>precision; conflict = #1 failure
 
 > v1 of this doc (2026-06-07, "eval-first" phase ordering) is superseded by this
 > restructure; its phase content survives above in new order. Its appendix of

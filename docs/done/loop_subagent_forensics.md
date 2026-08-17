@@ -191,7 +191,8 @@ the *specific numbers* as unconfirmed:
   decisions carry bad results"; parallelism for read/gather breadth only.
 
 Separately, the interface-design report the light-mode feature originally leaned on
-(`Subagent Delegation Interface Design.md`) contains **known-synthetic** specifics (DeepSeek "128
+(`docs/research/skills/subagent-delegation.report.md`, in the repo root until 2026-08-17) contains
+**known-synthetic** specifics (DeepSeek "128
 parallel calls," Kimi "300 subagents") — its directional advice is fine, its numbers are not.
 
 ---

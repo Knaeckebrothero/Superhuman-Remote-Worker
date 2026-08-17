@@ -1,5 +1,10 @@
 # **Verification Before Completion: Universal Skill Architecture and Evidence Base**
 
+> Evidence base for authoring `config/skills/verify-before-done/SKILL.md`. Prompt:
+> [`verify-before-done.md`](./verify-before-done.md). `[VERIFIED FACT]` = sourced;
+> `[RECOMMENDATION]` = synthesis. Filed here 2026-08-17 — it had sat in the repo
+> root since it was returned, the only report in this folder missing from its pair.
+
 ## **A. Executive Synthesis**
 
 The deployment of fully autonomous agents in unconstrained environments necessitates a fundamental paradigm shift in how task completion is evaluated. When autonomous systems run without human-in-the-loop oversight, the agent’s capacity to verify its own work becomes the single critical safety net preventing the propagation of silent failures, corrupted data, and expensive state rollbacks. An extensive analysis of the multi-agent systems literature reveals that the inability to properly verify outputs before signaling completion is not an edge case, but rather one of the most systemic vulnerabilities in modern agentic architectures.  

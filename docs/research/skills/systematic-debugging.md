@@ -9,7 +9,7 @@ to produce the evidence base for the `systematic-debugging` skill.
   settle whether `systematic-debugging` ships as a universal model-invoked skill
   or gets bound to the `developer` expert. Run it, save the report alongside,
   then author the skill (and decide its scope).
-- **Roster:** Tier-1 universal core, [`../docs/features/default_skill_roster.md`](../docs/features/default_skill_roster.md)
+- **Roster:** Tier-1 universal core, [`../docs/features/default_skill_roster.md`](../../features/default_skill_roster.md)
   (this is open decision #2 in that doc).
 - **Likely enforcement:** model-invoked (the agent loads it when it hits a
   failure / unexpected behaviour). **Scope:** TBD by the research.

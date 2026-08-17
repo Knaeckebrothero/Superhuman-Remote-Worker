@@ -18,7 +18,6 @@ ignorePaths:
   - "legacy/**"
   - "nats/**"
   - "README.md"
-  - "deploy.sh"
   - "fleet-gitrepo.yaml"
   - "**/*secret*"
   - "**/*secrets*"

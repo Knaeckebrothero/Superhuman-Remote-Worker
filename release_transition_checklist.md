@@ -6,8 +6,41 @@ splitting out the non-product pieces, and cleaning the history before the public
 **This file is transition scaffolding, not product documentation.** It gets deleted (or moved
 into `srw-cloud`) in Phase 6 before the announcement — see the last item.
 
-Status: drafted 2026-08-13. **Phase 4 executed 2026-08-15** (see below); everything else
-still pending.
+Drafted 2026-08-13. Current as of **2026-08-17**.
+
+| Phase | State |
+|---|---|
+| 0 — Rotate credentials | **not started.** Independent of everything else; nothing blocks it |
+| 1 — Transfer repo to org | not started. Blocks 2 |
+| 2 — Migrate GHCR packages | not started. Blocked by 1 |
+| 3 — Deploy config → HomeLab | not started, and **larger than drafted** — see below |
+| 4 — `srw-cloud` + sales page | **DONE 2026-08-15.** Live and verified. One item deferred into 5 |
+| 5 — Cleanup commits | **6 of 15 done 2026-08-17.** Root and gitignore are clean. Remaining: two dead directories to delete, the `helm/values.yaml` home-network defaults, a triage, and two decisions |
+| 6 — History rewrite | not started. Gated on everything above |
+| 7 — Pre-announce hardening | not started |
+| 8 — Announce | not started |
+
+**Done on 2026-08-17** (all uncommitted at time of writing, one working tree):
+
+- Swept the whole tree for anything else that should leave. Findings folded into the phases
+  below; the negative results are in *Audited and clean* near the end, so they are not re-audited.
+- Deleted `deployment/deploy.sh` and `design/asset-pack/` (28 files) — both dead or duplicate.
+- Cleared the root directory: 6.0 MB of Playwright dumps, a fake PDF, two bundled mockups and a
+  scratch script. Root is now five markdown files, all of which belong there.
+- Filed three root files that were **not** detritus into `researches/` and `docs/features/`,
+  with all six citations repointed.
+- `.kateproject` untracked and gitignored, kept on disk.
+- Resolved Phase 5's open directory triage: three of the five candidates were documents wearing
+  a root-folder costume and moved into `docs/` (`docs/research/skills/`,
+  `docs/research/ai_memory/`, `docs/design/cockpit/`); `eval/` and `bench/` stay because they are
+  code. **The repo root now holds 17 directories, down from 20.**
+
+**The one thing to read before scheduling anything: Phase 3 is bigger than it looks.** It was
+drafted as a file move. It is actually a re-plumbing of the dev deploy loop, because CI commits
+image tags back into the very paths being relocated.
+
+**Two decisions are still owed and block nothing else, so they can be made any time:** the `docs/`
+split (Phase 5) and whether `config/`'s prompt library publishes as-is (Phase 5).
 
 ---
 
@@ -120,8 +153,8 @@ move them. Once the repo lives in the org, CI's `GITHUB_TOKEN` is scoped to an o
 `403` pushing to packages in the personal namespace.
 
 - [ ] Republish images and charts under `ghcr.io/superhuman-remote-worker/*`.
-- [ ] Update every reference in one commit. ~20 distinct `ghcr.io/knaeckebrothero/*` paths,
-      concentrated in:
+- [ ] Update every reference in one commit. ~20 distinct `ghcr.io/knaeckebrothero/*` paths —
+      **70 occurrences across 32 files** (recount 2026-08-17, excluding `docs/`), concentrated in:
       - `helm/values.yaml` (8 refs) and `helm-vm-cluster/values.yaml` (3)
       - `docker-compose.yaml` (10)
       - `.github/workflows/develop.yml` (3)
@@ -133,6 +166,13 @@ move them. Once the repo lives in the org, CI's `GITHUB_TOKEN` is scoped to an o
       - tests asserting image refs: `test_vm_provisioner.py`, `test_vm_controller.py`,
         `test_persistent_provisioner.py`, `test_infrastructure_metering_vm_cluster_helm.py`,
         `test_vm_template_description_escaping.py`
+- [ ] **The Go module path is coupled to the repo name** — added 2026-08-17, missed in the
+      original draft. `vm/sudo-daemon/go.mod` declares
+      `module github.com/knaeckebrothero/superhuman-remote-worker/sudo-gated`, with three internal
+      imports resolving off it (`cmd/sudo-gated/main.go` ×2, `internal/gate/handler.go`). This is
+      Phase 1's rename, not Phase 2's registry move, and it breaks the build rather than a pull:
+      `go build` fails the moment the module path and the repo disagree. `go.mod` and all three
+      imports change together, in one commit.
 - [ ] Leave the old packages published (do not delete) until Fleet is confirmed on the new
       namespace — rollback path.
 - [ ] Check package visibility is public on the new namespace, or anonymous `helm pull` of the
@@ -148,15 +188,64 @@ stops reconciling. Do not combine this with the Phase 2 namespace flip.
 
 - [ ] Move `deployment/values-experimental.yaml` and `deployment/fleet.yaml` into `HomeLab`,
       next to the existing `deployments_managed/srw-sales-page/`.
+- [ ] **Move `deployment-vms/` (4 files) as well** — see below. Same domain, same move.
 - [ ] Confirm Fleet reconciles from the new location against the **old** chart namespace.
 - [ ] Only then flip the chart namespace on both sides simultaneously.
 - [ ] Keep in the public repo: `values-local.yaml.example`, `values-tilt.yaml`. These describe
       the product's dev loop, not an instance of it.
 - [ ] Consider `headscale-bootstrap.sh` for HomeLab too — it is instance infrastructure.
+- [x] `deployment/deploy.sh` — **deleted 2026-08-17**, not moved. It rewrote image tags in
+      `MANIFEST_DIR="$SCRIPT_DIR"`, i.e. the `deployment/legacy/` manifests that Phase 5 deletes;
+      it had no purpose once the chart took over. Its `ignorePaths` entry in `fleet.yaml` went
+      with it.
 
 Rationale for what leaves: `values-experimental.yaml` is not secrets (those are in Vault) but a
 map of the home network — LAN IPs such as `10.0.51.11`, MikroTik split-horizon DNS notes, Vault
 paths, and the `srw.works` / `superhuman-remote-worker.com` domain split.
+
+**`deployment-vms/` — added 2026-08-17, missed in the original draft.** Four files, and
+`srw-vm-controller/fleet.yaml` is the most instance-specific file left in the repo — more so than
+`values-experimental.yaml`, which is the one this phase was written around. It carries Vault
+paths (`homelab/agent-vms/headscale-api-key`, `homelab/superhuman-remote-worker/srw-secrets`),
+`headscale.h4ll.app`, the NATS hub at `10.0.51.14`, a `hostAliases` entry pinning
+`api.srw.works` to `10.0.51.11`, the SSH **public** key authorised into every agent VM
+(`srw-agent-vm-access`), Rancher cluster display-name selectors, and a closing comment that
+already points at its sibling `HomeLab/rancher_cluster/fleet-gitrepo-srw-vms.yaml`. It is also a
+Fleet bundle reconciled continuously by a cluster controller — the exact "different security and
+cadence domain" that justifies `HomeLab` existing at all.
+
+- `kubevirt/fleet.yaml` + `overcommit.yaml` — Rancher cluster selectors, KubeVirt node overcommit.
+- `cdi/install.sh` — generic upstream CDI installer, but it is cluster bootstrap; travels with them.
+- Sequencing note: this bundle pins `oci://ghcr.io/knaeckebrothero/charts/srw-dev-vm-cluster` at
+  its own version, **independent of** `deployment/fleet.yaml`'s `srw-dev` pin. Phase 2's namespace
+  flip has to move both.
+
+**This phase is not a file move — it is re-plumbing the dev deploy loop.** The single biggest
+thing the original draft missed. `develop.yml` ends with a deploy job that runs six `yq -i` steps
+stamping chart versions and per-component image tags into exactly the three paths this phase
+relocates — `deployment/fleet.yaml`, `deployment/values-experimental.yaml`,
+`deployment-vms/srw-vm-controller/fleet.yaml` — then does `git add deployment/fleet.yaml
+deployment/values-experimental.yaml deployment-vms/ && git commit && git push` as
+`github-actions[bot]`. Continuous deployment on dev *is* CI committing back into this repo.
+
+Move the files and that loop breaks silently: the `yq` steps keep succeeding against paths
+nothing reads, the git-diff gate sees no delta, and dev quietly stops picking up new images. So
+decide the mechanism before moving anything:
+
+- [ ] Pick one and note it here before executing:
+      (a) CI pushes to `HomeLab` — needs a Gitea credential as an Actions secret, since
+          `GITHUB_TOKEN` has no reach there. Straightforward, but it gives a **public** repo's CI
+          write access to the private GitOps repo, which is a real supply-chain surface once the
+          repo is public and anyone can open a PR against the workflow file;
+      (b) invert the direction — let Fleet resolve tags itself (image scan / digest tracking) so
+          nothing has to write a file at all. More work now, no cross-repo credential ever;
+      (c) keep a thin `deployment/` in the public repo purely as CI's write target, and have
+          HomeLab read from it. Cheapest, and concedes the point of the phase.
+- [ ] Whichever is chosen, the workflow path edits land in the **same commit** as the move.
+- [ ] Re-check `develop.yml`'s deploy-job guards afterwards. Today the trigger is `pull_request`
+      (**not** `pull_request_target`), so fork PRs get a read-only token and cannot reach the push
+      step. Any move to (a) must preserve that property — a cross-repo credential exposed to a
+      fork-PR-triggered job is the whole attack.
 
 ---
 
@@ -212,22 +301,90 @@ Until a fresh release is cut, the only chart a customer can install has no schem
 
 All ordinary, reviewable, revertible commits. The public repo's root directory is its front page.
 
-- [ ] **`.gitignore` `HomeLab/`.** It is a separate private repo checked out inside this working
-      tree and is currently untracked *but not ignored* — one `git add -A` publishes it. It is the
-      only such hazard; everything else untracked is already ignored.
+- [x] **`.gitignore` `HomeLab/` — done.** It is a separate private repo checked out inside this
+      working tree and was untracked *but not ignored*, so one `git add -A` would have published
+      it. `srw-cloud/` arrived later with the same problem and is ignored too (`.gitignore` 239,
+      242). Re-verified 2026-08-17: seven foreign repos/dirs now sit inside this tree
+      (`HomeLab`, `srw-cloud`, `knowledge-base`, `KurortEngine*`, `BetterResavio-KB`) and **all**
+      are ignored — `git status --porcelain` reports no untracked, unignored path anywhere.
 - [ ] Swap the `HomeLab` remote for a credential helper — its `origin` URL currently carries a
       Gitea token inline in plaintext (local config only, but the habit is what leaks).
-- [ ] Delete rather than move — dead instance config: `deployment/legacy/` (30 files),
-      `deprecated_deployment-local/` (14 files).
-- [ ] Delete root-level detritus: `cmdpalette.md`, `palette2.md`, `palette3.md`, `rubin_costs.pdf`,
-      `runreal.js`, `Subagent Delegation Interface Design.md`,
-      `Variant B - Token Box (standalone).html` (1.8 MB), `Verify Before Done Skill Research.md`,
-      `.kateproject`.
-- [ ] Triage, don't reflexively delete: `ai-memory-research/` (16), `bench/` (5), `design/` (32),
-      `eval/` (26), `researches/` (12). Several are genuine engineering assets — decide per
-      directory whether they ship, move to `srw-cloud`, or go.
-- [ ] Decide `Officers.md` — feature documentation, so either keep or fold into whatever survives
-      of the docs tree.
+- [ ] Delete rather than move — dead instance config: `deployment/legacy/` (**27** files),
+      `deprecated_deployment-local/` (**12** files). (Recounted 2026-08-17; the draft's 30/14 were
+      high.) These are the last two directories on the delete list.
+- [x] **Root-level detritus deleted 2026-08-17** — 6.0 MB. What each actually was, since the
+      original draft listed them by filename without checking:
+      - `cmdpalette.md`, `palette2.md`, `palette3.md` (37 KB) — Playwright **accessibility-tree
+        dumps** of a code-server/VS Code window (`[ref=e31]`, "Toggle Primary Side Bar (Ctrl+B)").
+        Raw tool output pasted to disk.
+      - `rubin_costs.pdf` — **not a PDF.** A Cloudflare "Just a moment…" bot-challenge page saved
+        with a `.pdf` extension: 0 PDF objects, 0 pages, a `cRay` token inside. A failed fetch of
+        `philarchive.org/archive/RUBTCO-14`, committed 2026-06-25 with the project-onboarding
+        research. Whatever it was gathered to cite never arrived.
+      - `runreal.js` — one-off Playwright benchmark against `http://127.0.0.1:8972/real-css.html`,
+        a file present nowhere in the repo.
+      - `Variant B - Token Box (standalone).html` (1.8 MB) — bundled UI mockup.
+      - `Delegate-A-Compact-List-Rows.html`, `Delegate-D-Hierarchical-Tree.html` (2.1 MB each) —
+        delegation-UI mockups, **untracked with 0 commits**, so they never entered history and
+        need nothing from Phase 6.
+- [x] `.kateproject` — **untracked 2026-08-17** (`git rm --cached`) and added to `.gitignore`,
+      rather than deleted. It is a working local editor file; it just should not be published.
+      Still needs the Phase 6 pass to leave history.
+- [x] **Correction to the original draft: two entries on that detritus list were not detritus.**
+      Both were substantive research reports, orphaned by location rather than obsolete. **Filed
+      2026-08-17 rather than deleted**, with all citations repointed:
+      - `Verify Before Done Skill Research.md` → `researches/verify-before-done.report.md`. Every
+        brief in `researches/` has an `X.md` + `X.report.md` pair, and `verify-before-done` was
+        the **only** one missing its report — because the report was in the repo root. It is also
+        the cited evidence base for a shipped skill. The folder now pairs up completely.
+      - `Subagent Delegation Interface Design.md` → `researches/subagent-delegation.report.md`.
+        No prompt file was ever filed for this one, so it is the folder's lone unpaired report;
+        its header now says so. Its header also carries forward the caveat already on record in
+        `docs/done/loop_subagent_forensics.md` — the report contains **known-synthetic** figures
+        (DeepSeek "128 parallel calls", Kimi "300 subagents"), so its direction is usable and its
+        numbers are not. The real decision record is the reconciliation section in
+        `docs/issues/delegation_light_mode_missing.md`.
+- [x] `Officers.md` → `docs/features/officers.md`, **done 2026-08-17.** Not root detritus either:
+      `docs/features/centurion.md` cites it in Sources as the consolidated officer notes. It was an
+      Obsidian note with frontmatter sitting outside the vault; it now rides along with whatever
+      `docs/` decision gets made below. Both citations in `centurion.md` repointed.
+- [x] **`design/asset-pack/` deleted 2026-08-17** (28 files, 228 KB). It was a second copy of the
+      PWA assets, self-described as "the originals" and requiring every icon regeneration to be
+      applied twice. Verified file-by-file before deleting: 24 of 27 byte-identical to
+      `cockpit/public/` or `cockpit/src/assets/`, and the three that differed were all the *stale*
+      side — `manifest.webmanifest` and `head-snippet.html` still carried the pre-Travertine
+      `#9c1f2e` brand red, and `microcopy.json` was fully superseded by the `pwa` namespace in
+      `cockpit/src/assets/i18n/`. `design/README.md` updated to point at the shipped locations and
+      to record why the mirror is not coming back.
+- [x] **Triage resolved 2026-08-17 — three of the five were documents, not product, and moved
+      into `docs/`.** The original framing ("ship, move to `srw-cloud`, or go") had a false
+      premise: that being cited somewhere was a reason to leave a folder at the repo root. It is
+      a reason to update the citation. The real test is product vs. working knowledge, and the
+      file types answer it — the three that moved contain **zero code** between them:
+      - `researches/` (14 `.md`) → **`docs/research/skills/`**. Skill-authoring evidence base.
+      - `ai-memory-research/` (11 `.md` + 5 `.json`) → **`docs/research/ai_memory/`**.
+      - `design/` (2 `.md` + 3 `.reference.*` files that nothing in the cockpit build imports) →
+        **`docs/design/cockpit/`**.
+
+      Two of these were merging into folders that **already existed** — `docs/research/` and
+      `docs/design/` — so the root copies were a navigational trap independent of this release.
+      All inbound citations rewritten across 8 files, plus the relative links inside the moved
+      trees (their depth changed by two levels); every link verified to resolve.
+
+      **Consequence, stated so it is not a surprise:** this research now inherits whatever the
+      `docs/` decision below turns out to be. If `docs/` goes private, so does it. That is the
+      intent — none of it is something a self-hoster needs — but it is now one decision instead
+      of four.
+- [ ] **`eval/` and `bench/` stay at the repo root — they are code, not documents.** `eval/` is a
+      Python package importing `src.services.memory`, `src.core.loader`, `src.database.postgres_db`
+      and `orchestrator.database.migrate` in 20+ places; it cannot leave `src/`'s side. `bench/`
+      has no product imports (it talks HTTP to `SRW_API_URL`) so it *could* live anywhere, but it
+      is a live instrument and there is no `tools/` folder worth creating for one thing. Decide
+      only whether they publish, not where they live.
+- [ ] **Pre-existing collision the `docs/` decision has to settle:** `docs/` holds **both**
+      `research/` (30 files, `stateless_agents/` + the two trees added above) and `researches/`
+      (15 PDFs). Same species, two names. Not created by this transition, but merging them is
+      cheapest while the tree is being reorganised anyway.
 - [ ] Sanity-check `.env.example` (47 KB) renders as a clean first-run experience. Only 1 line
       matched infra-shaped patterns, so it is in good shape.
 
@@ -244,6 +401,40 @@ tail: **676 tracked files outside `docs/` reference `docs/` paths**, 385 of them
       (c) move all, then add a stub `docs/README.md` pointing at the private location.
 - [ ] Whichever is chosen, update `CLAUDE.md` and `README.md` so the public repo's own
       instructions do not point at files that are not there.
+- [ ] **`docs/` still describes a `website/` that left in Phase 4.** Found 2026-08-17 while
+      sweeping for dangling references; left alone because `docs/` is being handled separately,
+      but these are not archives — they are wrong right now:
+      - `docs/website.md` §"lives in the SRW repo under `website/`" (lines ~173-180) states the
+        source paths, the image `ghcr.io/knaeckebrothero/…`, the `build-website` CI job and the
+        publish procedure. All four are false since 2026-08-15.
+      - `docs/drafts/sales_page_improvement_instructions.md` — a runnable instruction set aimed
+        at `website/index.html`, `website/test/*` and `docker/Dockerfile.website`. Handed to an
+        agent today it fails on the first path.
+      - `docs/superpowers/specs/2026-08-13-waitlist-design.md` — a *pending* design whose page
+        edits, byte budget and `COPY`-line changes all target the other repo now.
+      The dated plan/spec pair from 2026-06-18/19 is correct **as history** — leave those.
+
+**Fix in place — not a move.** `helm/values.yaml` ships the home network as the **default** for a
+chart strangers are meant to install: `10.0.50.0/24` and `10.0.51.0/24` as network-policy
+allow-CIDRs at three sites (lines ~467, ~1661, ~1672), and
+`kbGitAllowedHosts: "git.srw.works,srw-gitea:3000"` (~163). RFC1918, so not a leak — but it is
+the same home-network map this transition takes out of `values-experimental.yaml`, and it makes
+the default install wrong for everyone who is not us. Five lines.
+
+- [ ] Replace the CIDR defaults with empty/documented placeholders and move the real values into
+      `values-experimental.yaml`, where the rest of the instance config already lives.
+- [ ] Default `kbGitAllowedHosts` to empty. Note the existing behaviour first: empty currently
+      blocks in-cluster Gitea, which is a known dev-side trap — check that is still the semantics
+      before flipping it.
+
+**One strategic call, deliberately flagged rather than defaulted.** `config/` publishes **75
+experts, 64 prompts, 32 skills and 11 guardrails** verbatim. FSL stops someone shipping a
+competing product; it does not stop them lifting the prompt library into something that is not
+competing. That is plausibly the right trade — it is also the most copyable asset in the tree,
+and the only item in this checklist that ships by default without anyone having decided it.
+
+- [ ] Decide explicitly: publish `config/` as-is, or hold some subset back. Record the answer
+      here either way, so it reads as a choice rather than an oversight.
 
 ---
 
@@ -260,12 +451,47 @@ launch, and right now it contains a private key file, a credentials overlay, and
       descendant commit, so every SHA after the first touched commit changes. `docs/` is dense
       with commit references (`22b2511e`, `871bdf45`, `83da2983`, `7d72b964`, …) and so is the
       working memory index — all of them dangle afterward. The mirror keeps archaeology working.
-- [ ] Install `git-filter-repo` (not currently on this machine; neither is `gitleaks` or
-      `trufflehog`).
-- [ ] Single pass removing all dead paths at once:
-      `deployment/values-local.yaml`, `.local-ssh/`, `deployment/values-experimental.yaml`,
-      `deployment/fleet.yaml`, `deployment/legacy/`, `deprecated_deployment-local/`, the root
-      detritus, and whatever `docs/` decision was made in Phase 5.
+- [x] `git-filter-repo` is installed (`~/.local/bin/git-filter-repo`) — it was used for the
+      Phase 4 extraction. `gitleaks` and `trufflehog` are still **not** on this machine; Phase 7
+      wants `gitleaks`.
+- [ ] Single pass removing all dead paths at once. Enumerated 2026-08-17 — the draft said "the
+      root detritus", which is no longer specific enough to execute from:
+
+      *Credential-bearing (the original reason for this phase):*
+      `deployment/values-local.yaml`, `.local-ssh/`
+
+      *Instance config, moved to HomeLab in Phase 3:*
+      `deployment/values-experimental.yaml`, `deployment/fleet.yaml`, `deployment-vms/`,
+      and `headscale-bootstrap.sh` if Phase 3 takes it
+
+      *Deleted in Phase 5, still in history:*
+      `deployment/legacy/`, `deprecated_deployment-local/`, `deployment/deploy.sh`,
+      `design/asset-pack/`, `cmdpalette.md`, `palette2.md`, `palette3.md`, `rubin_costs.pdf`,
+      `runreal.js`, `Variant B - Token Box (standalone).html`, `.kateproject`
+
+      *Whatever `docs/` decision was made in Phase 5.*
+
+- [ ] **Decide separately whether `website/` leaves history.** Phase 4 moved it to `srw-cloud`
+      (with its 23 commits preserved there), so it is dead weight in this tree — but it is
+      marketing copy, not credentials, and removing it rewrites a large slice of history for
+      tidiness alone. Cheap to include in the pass that is happening anyway; not a reason to run
+      one. Same question for `docker/Dockerfile.website`.
+- [ ] **Do not bother with the two `Delegate-*.html` mockups** (2.1 MB each). They were untracked
+      with zero commits and were deleted from disk on 2026-08-17 — they were never in history and
+      nothing needs to remove them.
+
+**Scale check, measured 2026-08-17.** The history is 3,640 commits. 597 of them touch
+`deployment/fleet.yaml`, `values-experimental.yaml` or `deployment-vms/` — and **498 of those are
+CI's `deploy: update image tags to sha-…` commits**, i.e. the write-back loop described in Phase 3.
+Two consequences:
+
+- Removing those paths rewrites roughly a sixth of the history, and `filter-repo` prunes commits
+  that become empty, so those 498 deploy commits **disappear entirely**. That is a large, visible
+  change to what the log looks like at launch — mostly an improvement, but decide it deliberately
+  rather than discovering it after the force-push.
+- It is another argument for settling Phase 3's mechanism first. If the loop moves to HomeLab or
+  goes away, the noise stops accumulating; if it does not, this history grows by roughly one
+  deploy commit per push to `develop` forever.
 - [ ] Force-push all branches and tags.
 - [ ] Ask GitHub Support to garbage-collect unreachable objects. Without this, old commits stay
       reachable forever by direct SHA URL. With 0 forks this actually works cleanly.
@@ -301,6 +527,34 @@ next `values-local.yaml` will not be full of `dev_` placeholders.
 - [ ] Announcement copy says "source-available", never "open source".
 - [ ] The FSL Competing-Use terms and the two-year Apache-2.0 conversion are stated plainly —
       it is the strongest part of the story and gets misread if left implicit.
+
+---
+
+## Audited and clean — do not re-audit
+
+Swept 2026-08-17, hunting for anything else that should leave the repo before it goes public.
+Everything below was checked and found fine. Recorded so the next pass does not spend the effort
+again — and so a "that looks alarming" reaction has an answer.
+
+- **No SaaS code has leaked into the product tree.** No Stripe, Paddle, LemonSqueezy, checkout
+  session or subscription handling anywhere in `src/`, `orchestrator/`, `cockpit/src/`. The
+  metering and pricing machinery is the hook-point embryo already accounted for above. The
+  dependency-direction rule is holding on its own so far.
+- **`usage_rate_cards` is not commercially sensitive**, despite the name. Checked because "rate
+  card" reads like margins: it is AWS / Azure / STACKIT **public list prices** used to reprice
+  already-metered CPU and RAM for comparison, and migration `0082` says so in a table comment —
+  "planning estimates, never provider billing". No cost basis, no markup, no SRW pricing.
+- **CI is safe to publish.** Everything runs on `ubuntu-latest`, and `ci-policy.yml` exists
+  specifically to hard-gate any job routing to a self-hosted label — the homelab runners are
+  never reachable from a public PR. Trigger is `pull_request`, not `pull_request_target`.
+- **`docker/keycloak/realm-export.json` bakes in no secrets** — every client secret is a
+  `${ENV_VAR}` placeholder.
+- **`.env.example`** — 86 assignments, none matched an infra-shaped pattern. Confirms the
+  original draft's "1 line" note; it is in good shape.
+- **No pilot or customer names anywhere outside `docs/`.**
+- **Trademarks need no separate policy.** The FSL text already carries both a Patents and a
+  Trademarks clause, so the brand marks that necessarily ship inside `cockpit/` are covered by
+  the licence rather than by holding assets back.
 
 ---
 

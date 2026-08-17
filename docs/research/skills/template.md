@@ -6,7 +6,7 @@ writing its `SKILL.md`. Run it **one skill at a time** in a deep-research agent
 web access). The returned report is the evidence base for authoring the skill.
 
 These skills come from the recommended roster in
-[`../docs/features/default_skill_roster.md`](../docs/features/default_skill_roster.md)
+[`../docs/features/default_skill_roster.md`](../../features/default_skill_roster.md)
 (Tier-1 universal core first).
 
 ## How to use
