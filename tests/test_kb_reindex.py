@@ -19,7 +19,10 @@ from src.tools.knowledge.chunker import CHUNKER_VERSION, note_centroid
 from src.tools.knowledge.gardener import parse_note_md
 
 from orchestrator.services.kb_reindex import (
+    FIRST_SWEEP_DELAY_SECONDS,
+    SWEEP_TICK_SECONDS,
     KbRepoRef,
+    kb_reindex_sweeper_loop,
     kb_sweep_tick,
     knowledge_blob_map,
     note_fields,
@@ -56,7 +59,21 @@ def _make_deps(
 
     store = AsyncMock()
     store.get_watermark.return_value = watermark
-    store.get_indexed_blob_shas.return_value = indexed or {}
+    # One shared dict so clear_note_stamps below is observable by the later
+    # get_indexed_blob_shas call, the way the real table is.
+    indexed_map = dict(indexed or {})
+    store.get_indexed_blob_shas.return_value = indexed_map
+
+    async def _clear_note_stamps(_kb_id):
+        # Mirror the UPDATE: the stamp goes NULL, the *row* stays. Dropping the
+        # keys instead would quietly empty plan_reindex's delete set, so a test
+        # store that "cleared" harder than Postgres would hide a real bug.
+        stamped = [path for path, sha in indexed_map.items() if sha is not None]
+        for path in stamped:
+            indexed_map[path] = None
+        return len(stamped)
+
+    store.clear_note_stamps = AsyncMock(side_effect=_clear_note_stamps)
     store.adopt_legacy_row.return_value = None
     store.upsert_kb_note.return_value = uuid.uuid4()
     store.replace_note_chunks.return_value = 1
@@ -71,6 +88,21 @@ def _make_deps(
 
     svc.embed_batch = AsyncMock(side_effect=_batch)
     return gitea, store, svc
+
+
+def _watermark_commits(store):
+    """Every ``indexed_commit`` the run wrote, in order.
+
+    A rebuild writes the watermark twice: once up front to record the pipeline
+    version (``indexed_commit`` deliberately left where it was, which is what
+    makes an interrupted run resumable) and once at the end to advance it. So
+    "a failed run must not advance the index" is a claim about the as-of commit,
+    not about how many times the row was touched — assert on this rather than on
+    the call count, or the assertion silently starts checking the wrong thing.
+    """
+    return [
+        c.kwargs.get("indexed_commit") for c in store.upsert_watermark.await_args_list
+    ]
 
 
 # =============================================================================
@@ -1032,6 +1064,173 @@ class TestReindexKbIncremental:
         assert result["upserted"] == 1
 
 
+class TestRebuildIsResumable:
+    """A rebuild killed mid-run must not restart from note zero.
+
+    Indexing is an in-process task, so an orchestrator rollout kills it. The
+    fact that drove ``full`` (pipeline_version) used to be recorded on success
+    only, so the next run re-derived it and re-embedded everything the dead run
+    had finished — on dev a 2635-note vault went back to 0 on each of three
+    consecutive deploys and never converged.
+    """
+
+    def _tree(self):
+        return [
+            {"path": "knowledge/a.md", "type": "blob", "sha": "sa"},
+            {"path": "knowledge/b.md", "type": "blob", "sha": "sb"},
+        ]
+
+    def _contents(self):
+        return {
+            "knowledge/a.md": _note_md("a"),
+            "knowledge/b.md": _note_md("b"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_full_rebuild_clears_stamps_and_records_pipeline_up_front(self):
+        kb = uuid.uuid4()
+        wm = KbWatermark(kb_id=kb, indexed_commit="old", pipeline_version="stale:1")
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=self._tree(),
+            indexed={"knowledge/a.md": "sa", "knowledge/b.md": "sb"},
+            contents=self._contents(),
+        )
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["full"] is True
+        # Matching blob_shas notwithstanding, every note still re-embeds — the
+        # invalidation, not a forced work list, is what selects them.
+        assert result["upserted"] == 2
+        store.clear_note_stamps.assert_awaited_once_with(kb)
+        # The pipeline version is durable BEFORE the first embed, so a crash
+        # from here on resumes instead of re-deriving full=True.
+        early = store.upsert_watermark.await_args_list[0].kwargs
+        assert early["pipeline_version"].startswith("qwen3-embedding-8b")
+        assert early["status"] == "indexing"
+        assert early["indexed_commit"] == "old"  # not advanced yet
+
+    @pytest.mark.asyncio
+    async def test_interrupted_rebuild_resumes_and_skips_finished_notes(self):
+        """The whole point: run 2 embeds only what run 1 didn't finish."""
+        kb = uuid.uuid4()
+        wm = KbWatermark(kb_id=kb, indexed_commit=None, pipeline_version="stale:1")
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=self._tree(),
+            indexed={},
+            contents=self._contents(),
+        )
+        # Run 1 dies after 'a' is stamped and before 'b' is.
+        store.stamp_note_indexed.side_effect = [None, RuntimeError("pod terminated")]
+        first = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+        assert first["upserted"] == 1
+        assert first["errors"] == 1
+
+        # Run 2 sees the watermark run 1 wrote up front: same pipeline version,
+        # so no forced rebuild, and 'a' carries a matching stamp.
+        resumed_wm = KbWatermark(
+            kb_id=kb,
+            indexed_commit=None,
+            pipeline_version=store.upsert_watermark.await_args_list[0].kwargs[
+                "pipeline_version"
+            ],
+        )
+        gitea2, store2, svc2 = _make_deps(
+            head="headsha",
+            watermark=resumed_wm,
+            tree=self._tree(),
+            indexed={"knowledge/a.md": "sa"},
+            contents=self._contents(),
+        )
+
+        second = await reindex_kb(
+            gitea_client=gitea2,
+            store=store2,
+            embedding_service=svc2,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert second["full"] is False
+        assert second["upserted"] == 1  # 'b' only — 'a' was NOT re-embedded
+        store2.clear_note_stamps.assert_not_awaited()
+        embedded = [c.args[0] for c in svc2.embed_batch.await_args_list]
+        assert not any("# a" in "".join(texts) for texts in embedded)
+
+    @pytest.mark.asyncio
+    async def test_cleared_stamps_still_delete_removed_paths(self):
+        """Invalidation must not swallow the deletion set.
+
+        ``clear_note_stamps`` NULLs the stamp but keeps the row, so a path that
+        left the tree is still visible to ``plan_reindex``'s delete arm.
+        """
+        kb = uuid.uuid4()
+        wm = KbWatermark(kb_id=kb, indexed_commit="old", pipeline_version="stale:1")
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=[{"path": "knowledge/a.md", "type": "blob", "sha": "sa"}],
+            indexed={"knowledge/a.md": "sa", "knowledge/gone.md": "sg"},
+            contents={"knowledge/a.md": _note_md("a")},
+        )
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["deleted"] == 1
+        store.delete_kb_note.assert_awaited_once_with(kb, "knowledge/gone.md")
+
+    @pytest.mark.asyncio
+    async def test_failed_invalidation_falls_back_to_forced_full_pass(self):
+        """Resumability is an optimization; a correct work list is not.
+
+        If the stamps cannot be cleared, the run must still re-embed every note
+        rather than trusting a diff that would skip the stale-but-stamped ones.
+        """
+        kb = uuid.uuid4()
+        wm = KbWatermark(kb_id=kb, indexed_commit="old", pipeline_version="stale:1")
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=self._tree(),
+            indexed={"knowledge/a.md": "sa", "knowledge/b.md": "sb"},
+            contents=self._contents(),
+        )
+        store.clear_note_stamps.side_effect = RuntimeError("read-only transaction")
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["full"] is True
+        assert result["upserted"] == 2  # forced, despite matching blob_shas
+
+
 class TestReindexKbFailureHonesty:
     @pytest.mark.asyncio
     async def test_fetch_failure_counts_error_and_blocks_watermark(self):
@@ -1049,7 +1248,7 @@ class TestReindexKbFailureHonesty:
         )
         assert result["status"] == "partial"
         assert result["errors"] == 1
-        store.upsert_watermark.assert_not_awaited()
+        assert "headsha" not in _watermark_commits(store)
 
     @pytest.mark.asyncio
     async def test_unparseable_note_is_skipped_not_fatal(self):
@@ -1076,7 +1275,7 @@ class TestReindexKbFailureHonesty:
         assert result["status"] == "completed"
         assert result["skipped"] == 1
         assert result["upserted"] == 1
-        store.upsert_watermark.assert_awaited_once()
+        assert _watermark_commits(store)[-1] == "headsha"
 
     @pytest.mark.asyncio
     async def test_unparseable_changed_note_drops_stale_indexed_version(self):
@@ -1118,7 +1317,7 @@ class TestReindexKbFailureHonesty:
         assert result["status"] == "partial"
         assert result["errors"] == 1
         store.upsert_kb_note.assert_not_awaited()  # embed-first ordering
-        store.upsert_watermark.assert_not_awaited()
+        assert "headsha" not in _watermark_commits(store)
 
     @pytest.mark.asyncio
     async def test_chunk_write_failure_leaves_note_unstamped(self):
@@ -1144,7 +1343,7 @@ class TestReindexKbFailureHonesty:
         assert result["status"] == "partial"
         assert result["errors"] == 1
         store.stamp_note_indexed.assert_not_awaited()
-        store.upsert_watermark.assert_not_awaited()
+        assert "headsha" not in _watermark_commits(store)
 
     @pytest.mark.asyncio
     async def test_stamp_failure_counts_error_and_blocks_watermark(self):
@@ -1163,7 +1362,7 @@ class TestReindexKbFailureHonesty:
         )
         assert result["status"] == "partial"
         assert result["errors"] == 1
-        store.upsert_watermark.assert_not_awaited()
+        assert "headsha" not in _watermark_commits(store)
 
 
 # =============================================================================
@@ -2070,3 +2269,57 @@ class TestManualReindexProjectionSettlement:
 
         assert result == {"status": "partial", "errors": 1}
         db.mark_knowledge_projections_synced.assert_not_awaited()
+
+
+# =============================================================================
+# kb_reindex_sweeper_loop — the sweep is also the crash-recovery path
+# =============================================================================
+
+
+class TestSweeperFirstPassIsPrompt:
+    """Indexing is an in-process task, so a rollout kills it and this loop is
+    the only thing that brings it back. The loop used to wait a full tick before
+    its first pass, so a KB interrupted by a deploy stayed dead for 15 minutes.
+    """
+
+    def test_first_delay_is_much_shorter_than_the_steady_tick(self):
+        assert FIRST_SWEEP_DELAY_SECONDS < SWEEP_TICK_SECONDS
+        assert FIRST_SWEEP_DELAY_SECONDS <= 60
+
+    @pytest.mark.asyncio
+    async def test_first_sweep_waits_the_short_delay_then_the_full_tick(self):
+        waits: list[float] = []
+        shutdown = asyncio.Event()
+
+        async def fake_wait_for(_awaitable, timeout):
+            # Close the coroutine we're not awaiting so the loop doesn't warn.
+            _awaitable.close()
+            waits.append(timeout)
+            if len(waits) >= 3:
+                shutdown.set()
+                return True
+            raise asyncio.TimeoutError
+
+        sweeps = 0
+
+        async def fake_tick(**_kwargs):
+            nonlocal sweeps
+            sweeps += 1
+            return 0
+
+        with (
+            patch("orchestrator.services.kb_reindex.asyncio.wait_for", fake_wait_for),
+            patch("orchestrator.services.kb_reindex.kb_sweep_tick", fake_tick),
+        ):
+            await kb_reindex_sweeper_loop(
+                postgres_db=AsyncMock(),
+                store=AsyncMock(),
+                gitea_client=AsyncMock(),
+                shutdown_event=shutdown,
+                embedding_service_factory=AsyncMock(return_value=MagicMock()),
+            )
+
+        # The first pass comes quickly; every later one is on the coarse cadence.
+        assert waits[0] == FIRST_SWEEP_DELAY_SECONDS
+        assert waits[1:] == [SWEEP_TICK_SECONDS, SWEEP_TICK_SECONDS]
+        assert sweeps == 2

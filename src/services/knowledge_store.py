@@ -670,10 +670,20 @@ class KnowledgeStore:
     ) -> None:
         """Record (or advance) the as-of commit for a KB's index.
 
-        PR3 calls this once, at the END of a reindex — the watermark advances only
-        after every changed row is written, so an interrupted run leaves the old
-        commit and the next run re-diffs from there (per-row ``blob_sha`` skips the
+        The as-of commit advances only at the END of a reindex, after every
+        changed row is written, so an interrupted run leaves the old commit and
+        the next run re-diffs from there (per-row ``blob_sha`` skips the
         already-current rows).
+
+        A *rebuild* also calls this once up front, with ``indexed_commit`` left
+        at its previous value and ``status='indexing'``, purely to record the
+        ``pipeline_version`` it is rebuilding to. That write is what makes the
+        rebuild resumable: the version is the flag the next run reads to decide
+        whether to force a full pass, and recording it only on success meant an
+        interrupted rebuild always started over (see
+        :meth:`clear_note_stamps`). Because it never carries the new commit, the
+        "a failed run must not advance the index" invariant is unchanged — but
+        assert it on ``indexed_commit``, not on this method's call count.
 
         The ``::varchar`` casts on $4/$6 are load-bearing, not decoration. Both
         parameters feed ``VARCHAR(64)`` columns *and* appear inside
@@ -835,6 +845,39 @@ class KnowledgeStore:
             kb_id,
         )
         return {r["path"]: r["blob_sha"] for r in rows}
+
+    async def clear_note_stamps(self, kb_id: uuid.UUID) -> int:
+        """Drop every note's ``blob_sha`` stamp so a rebuild becomes resumable.
+
+        A full rebuild used to exist only as ``plan_reindex(full=True)`` — a
+        per-run instruction that had to survive to completion, because the fact
+        driving it (the watermark's ``pipeline_version``) is written on success
+        alone. Any interruption left that fact unrecorded, so the next run
+        re-derived ``full=True`` and re-embedded the notes the dead run had
+        already finished: a 2635-note vault restarted from note zero after every
+        orchestrator rollout.
+
+        Recording the invalidation on the rows instead makes it durable. An
+        unstamped note stays in every subsequent diff until it is individually
+        re-embedded and re-stamped, so a rebuild resumes exactly where it
+        stopped — the per-row self-heal :func:`plan_reindex` was built around.
+
+        Chunks are deliberately left in place: :meth:`replace_note_chunks` swaps
+        them one note at a time, so search keeps serving the previous index for
+        the duration of the rebuild rather than going dark. Returns the number
+        of stamps cleared.
+        """
+        rows = await self.db.fetch(
+            """
+            UPDATE knowledge_index
+               SET blob_sha = NULL
+             WHERE kb_id = $1
+               AND blob_sha IS NOT NULL
+            RETURNING id
+            """,
+            kb_id,
+        )
+        return len(rows)
 
     async def adopt_legacy_row(
         self,
