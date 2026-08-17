@@ -66,6 +66,9 @@ async def db(pg_dsn):
                 execution_lane text NOT NULL DEFAULT 'pinned',
                 context jsonb,
                 assigned_agent_id uuid,
+                -- The CAS fences on freeze_data too (a frozen job is not
+                -- dispatchable); see tests/test_job_claim.py.
+                freeze_data jsonb,
                 error_message text,
                 error_details jsonb,
                 lease_expires_at timestamptz,
