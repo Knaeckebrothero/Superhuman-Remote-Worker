@@ -1178,7 +1178,14 @@ class TestDualCallableEndpoints:
         assert kwargs["creation_order"] is None
         assert kwargs["worktree_path"] is None
         assert kwargs["delegation_context"] is None
-        assert kwargs["context"] == {"instructions": "keep me"}
+        assert kwargs["context"] == {
+            "instructions": "keep me",
+            # Server-stamped provenance, not caller-supplied: this body names
+            # a bundled expert (via the deprecated config_name alias), and an
+            # explicit selection is recorded in the same field the DB-expert
+            # path already writes. See tests/test_unified_expert_selection.py.
+            "expert_selection": {"source": "bundled", "expert": "critic"},
+        }
         assert kwargs["config_override"] == {"autonomy": "full"}
 
 

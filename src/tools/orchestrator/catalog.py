@@ -667,8 +667,15 @@ def create_catalog_tools(context: ToolContext) -> List[Any]:
                 shown = experts[:effective_limit]
                 if not shown:
                     return "No matching experts found."
+                # One line, once, rather than a selector per entry: the id
+                # printed below is the selector whichever store it came from,
+                # and a caller who does not know that lands on the deployment
+                # default forever (experts_one_catalogue_two_selection_paths).
                 lines = [
-                    f"Found {len(experts)} matching expert(s); showing {len(shown)}:\n"
+                    f"Found {len(experts)} matching expert(s); showing {len(shown)}:",
+                    'Hire one with create_job(expert="<id below>"); Source is '
+                    "where the definition lives, not a different way to select "
+                    "it.\n",
                 ]
                 for expert in shown:
                     lines.extend(_format_catalog_item(expert, kind="Expert"))

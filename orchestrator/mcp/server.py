@@ -22,6 +22,10 @@ from starlette.responses import JSONResponse
 
 # Shared-surface imports resolve identically in-repo (repo root on sys.path)
 # and in-image (/app/src/shared), so no fallback chain is needed for them.
+from src.shared.expert_reference import (
+    ExpertReferenceConflict,
+    resolve_expert_selection,
+)
 from src.shared.orch_surface import formatters as fmt
 from src.shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
 from src.shared.orch_surface.jobs import AUTH_CONTEXT_FAILURE_NOTICE, CallerCtx
@@ -209,7 +213,10 @@ def _format_action_error(action: str, target: str, error: Exception) -> str:
 # "11": officer_legate_channel — list_officers, get_project_officer,
 # send_officer_note (the Legate's side), plus newest_first on
 # get_persistent_thread_messages.
-MCP_TOOL_SCHEMA_REVISION = "11"
+# "12": one expert selector — create_job / create_project_job take `expert`
+# (a bundled expert id or a DB expert UUID, exactly as list_experts prints
+# it); config_name and expert_id stay as deprecated single-store aliases.
+MCP_TOOL_SCHEMA_REVISION = "12"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 
@@ -1324,6 +1331,7 @@ async def list_project_jobs(
 async def create_project_job(
     project_id: str,
     description: str,
+    expert: str | None = None,
     config_name: str = "worker_base",
     expert_id: str | None = None,
     instructions: str | None = None,
@@ -1343,8 +1351,13 @@ async def create_project_job(
     Args:
         project_id: Project UUID
         description: Task description
-        config_name: Base agent config (default: uses project default)
-        expert_id: Preferred database-backed expert UUID (optional)
+        expert: Which expert runs this job — the worker profile that decides
+            its tools, prompts and model. Takes either form the catalogue
+            prints: a bundled expert id ("developer") or a database expert
+            UUID. Use the `list_experts` tool to discover valid values and
+            `get_expert` to inspect one. Omit to accept the project's default.
+        config_name: DEPRECATED alias for `expert`, bundled experts only.
+        expert_id: DEPRECATED alias for `expert`, database experts only.
         instructions: Additional inline instructions (optional)
         kickoff_message: Opening task brief sent to the agent (optional)
         config_override: Per-job config overrides as JSON (optional). To set
@@ -1365,12 +1378,20 @@ async def create_project_job(
     Returns:
         Created job summary with ID
     """
+    # Same resolver the shared create_job descriptor and the REST funnel use;
+    # see src/shared/expert_reference.py.
+    try:
+        choice = resolve_expert_selection(
+            expert=expert, config_name=config_name, expert_id=expert_id
+        )
+    except ExpertReferenceConflict as conflict:
+        return f"Refusing to create job: {conflict}"
     client = _get_client()
     result = await client.create_project_job(
         project_id=project_id,
         description=description,
-        config_name=config_name,
-        expert_id=expert_id,
+        config_name=choice.config_name,
+        expert_id=choice.expert_id,
         instructions=instructions,
         kickoff_message=kickoff_message,
         config_override=config_override,
@@ -1379,7 +1400,7 @@ async def create_project_job(
         priority=priority,
         required_deliverables=required_deliverables,
     )
-    return fmt.format_created_job(result, config_name)
+    return fmt.format_created_job(result, choice.config_name, expert=choice.reference)
 
 
 # =============================================================================
