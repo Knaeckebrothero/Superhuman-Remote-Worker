@@ -42,6 +42,7 @@ blocking it should be taken before the next bench campaign.
 
 | doc | why |
 |---|---|
+| [experts_one_catalogue_two_selection_paths](experts_one_catalogue_two_selection_paths.md) | **Upstream of every officer-effectiveness issue.** One expert catalogue, two mutually-exclusive selection parameters (`config_name` slug vs `expert_id` UUID) and no documented mapping — so 10 of 12 experts, including every shell-capable one, are unreachable when choosing a worker. All 8 Better Resavio jobs ran `general-worker` with no shell. |
 | [message_route_delivery_failure_is_stamped_delivered](message_route_delivery_failure_is_stamped_delivered.md) | **Rescoped (OC-06 residue).** False stamp fixed; what remains is a persisted attempt count / last error for diagnosability. Needs a schema change. |
 | [officer_evidence_and_messages_leak_secret_shaped_content](officer_evidence_and_messages_leak_secret_shaped_content.md) | **Rescoped (OC-05 residue).** Sanitizer exists and covers evidence + routed messages; completion reports, SITREP excerpts and notification bodies are still unwired. |
 | [officer_internal_messages_consume_human_rate_limits](officer_internal_messages_consume_human_rate_limits.md) | Officer-only triage is counted against the user's human interruption quotas because limits run before routing. |
