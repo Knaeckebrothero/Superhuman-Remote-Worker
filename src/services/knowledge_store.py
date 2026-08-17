@@ -846,8 +846,14 @@ class KnowledgeStore:
         )
         return {r["path"]: r["blob_sha"] for r in rows}
 
-    async def clear_note_stamps(self, kb_id: uuid.UUID) -> int:
-        """Drop every note's ``blob_sha`` stamp so a rebuild becomes resumable.
+    async def clear_note_stamps(
+        self,
+        kb_id: uuid.UUID,
+        *,
+        embedding_version: Optional[str] = None,
+        batch_size: int = 200,
+    ) -> int:
+        """Drop note ``blob_sha`` stamps so a rebuild becomes resumable.
 
         A full rebuild used to exist only as ``plan_reindex(full=True)`` — a
         per-run instruction that had to survive to completion, because the fact
@@ -864,20 +870,52 @@ class KnowledgeStore:
 
         Chunks are deliberately left in place: :meth:`replace_note_chunks` swaps
         them one note at a time, so search keeps serving the previous index for
-        the duration of the rebuild rather than going dark. Returns the number
-        of stamps cleared.
+        the duration of the rebuild rather than going dark.
+
+        **Batched deliberately.** ``knowledge_index`` carries an HNSW index over
+        the note centroid plus two GIN indexes, so each row touched costs an
+        index insert on every one of them — measured at ~9ms/row on dev. As a
+        single statement over a large KB that runs past the pool's 60s
+        ``command_timeout``, and asyncpg cancels it with an *empty-message*
+        ``asyncio.TimeoutError`` (Postgres side: ``canceling statement due to
+        user request``). That is exactly how the first version of this shipped
+        and silently fell back in production, so keep the batching. Each batch
+        is its own statement, which also makes a half-finished invalidation
+        harmless — the next run simply continues it.
+
+        ``embedding_version`` narrows the sweep to rows stamped by a *different*
+        embedding version. That is the form to use when nothing is known to be
+        stale: it normally matches zero rows and costs one cheap statement,
+        while still catching a KB whose embedding model moved under it.
+
+        Returns the number of stamps cleared.
         """
-        rows = await self.db.fetch(
-            """
-            UPDATE knowledge_index
-               SET blob_sha = NULL
-             WHERE kb_id = $1
-               AND blob_sha IS NOT NULL
-            RETURNING id
-            """,
-            kb_id,
-        )
-        return len(rows)
+        total = 0
+        while True:
+            rows = await self.db.fetch(
+                """
+                UPDATE knowledge_index
+                   SET blob_sha = NULL
+                 WHERE id IN (
+                       SELECT id
+                         FROM knowledge_index
+                        WHERE kb_id = $1
+                          AND blob_sha IS NOT NULL
+                          AND ($2::text IS NULL
+                               OR embedding_version IS DISTINCT FROM $2::text)
+                        LIMIT $3
+                 )
+                RETURNING id
+                """,
+                kb_id,
+                embedding_version,
+                batch_size,
+            )
+            total += len(rows)
+            # A short batch means the predicate is exhausted — every row this
+            # statement touched no longer matches it.
+            if len(rows) < batch_size:
+                return total
 
     async def adopt_legacy_row(
         self,

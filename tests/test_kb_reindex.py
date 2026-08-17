@@ -64,11 +64,18 @@ def _make_deps(
     indexed_map = dict(indexed or {})
     store.get_indexed_blob_shas.return_value = indexed_map
 
-    async def _clear_note_stamps(_kb_id):
+    async def _clear_note_stamps(_kb_id, *, embedding_version=None, batch_size=200):
         # Mirror the UPDATE: the stamp goes NULL, the *row* stays. Dropping the
         # keys instead would quietly empty plan_reindex's delete set, so a test
         # store that "cleared" harder than Postgres would hide a real bug.
-        stamped = [path for path, sha in indexed_map.items() if sha is not None]
+        # embedding_version narrows it to rows from a *different* version; this
+        # fake store stamps everything with the current one, so a targeted call
+        # clears nothing — which is the production case worth modelling.
+        stamped = [
+            path
+            for path, sha in indexed_map.items()
+            if sha is not None and embedding_version is None
+        ]
         for path in stamped:
             indexed_map[path] = None
         return len(stamped)
@@ -1110,7 +1117,9 @@ class TestRebuildIsResumable:
         # Matching blob_shas notwithstanding, every note still re-embeds — the
         # invalidation, not a forced work list, is what selects them.
         assert result["upserted"] == 2
-        store.clear_note_stamps.assert_awaited_once_with(kb)
+        # embedding_version=None is the wholesale sweep: the pipeline really did
+        # change, so every stamped row is stale.
+        store.clear_note_stamps.assert_awaited_once_with(kb, embedding_version=None)
         # The pipeline version is durable BEFORE the first embed, so a crash
         # from here on resumes instead of re-deriving full=True.
         early = store.upsert_watermark.await_args_list[0].kwargs
@@ -1171,6 +1180,41 @@ class TestRebuildIsResumable:
         assert second["upserted"] == 1  # 'b' only — 'a' was NOT re-embedded
         store2.clear_note_stamps.assert_not_awaited()
         embedded = [c.args[0] for c in svc2.embed_batch.await_args_list]
+        assert not any("# a" in "".join(texts) for texts in embedded)
+
+    @pytest.mark.asyncio
+    async def test_never_completed_index_keeps_its_existing_stamps(self):
+        """The live dev case: a first index killed by a rollout.
+
+        ``pipeline_version`` is NULL only because no run ever *finished*, so the
+        notes already stamped are current. Wiping them would re-embed exactly
+        the work this change exists to keep — and on a 2635-note vault that
+        wipe is also what blew the 60s statement timeout.
+        """
+        kb = uuid.uuid4()
+        wm = KbWatermark(kb_id=kb, indexed_commit=None, pipeline_version=None)
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=self._tree(),
+            indexed={"knowledge/a.md": "sa"},  # 'a' finished before the kill
+            contents=self._contents(),
+        )
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        # Targeted sweep (rows from another embedding version), not wholesale.
+        kwargs = store.clear_note_stamps.await_args.kwargs
+        assert kwargs["embedding_version"] is not None
+        # ...so 'a' keeps its stamp and only 'b' is embedded.
+        assert result["upserted"] == 1
+        embedded = [c.args[0] for c in svc.embed_batch.await_args_list]
         assert not any("# a" in "".join(texts) for texts in embedded)
 
     @pytest.mark.asyncio
