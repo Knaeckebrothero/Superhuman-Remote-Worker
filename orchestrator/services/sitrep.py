@@ -192,7 +192,7 @@ async def build_wake_message(
             db, thread, thread_id, vector_db, project_id, now
         )
         lines += await _fleet_section(db)
-        lines += await _budget_section(usage_ledger, project_id, now)
+        lines += await _budget_section(thread, usage_ledger, project_id, now)
 
         lines.append(
             "Assess, act within your authority, then file a sleep. Use "
@@ -632,10 +632,30 @@ async def _fleet_section(db: Any) -> list[str]:
         return ["Fleet: (unavailable)"]
 
 
+def _budget_visible(thread: dict[str, Any]) -> bool:
+    """Ships OFF, flipped per century by the Legate.
+
+    A spend figure with no spend policy attached is an invitation to author
+    one. On 2026-08-16 this line read "$40" to an officer who had, one minute
+    earlier, been ordered to dispatch two specific jobs; he filed both as
+    ``blocked:budget-cap`` against a stop threshold nobody had set, and the
+    Legate had to countermand him to get the night's work started. Cost is the
+    project owner's lever, not the officer's — he sees it only when the owner
+    hands it to him.
+    """
+    officer_meta = _as_dict(
+        _as_dict(_as_dict(thread.get("metadata")).get("config_override")).get("officer")
+    )
+    return officer_meta.get("show_budget") in (True, "true", "True", 1)
+
+
 async def _budget_section(
-    usage_ledger: Any, project_id: Optional[str], now: datetime
+    thread: dict[str, Any],
+    usage_ledger: Any,
+    project_id: Optional[str],
+    now: datetime,
 ) -> list[str]:
-    if usage_ledger is None or not project_id:
+    if usage_ledger is None or not project_id or not _budget_visible(thread):
         return []
     try:
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
