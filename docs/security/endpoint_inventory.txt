@@ -337,6 +337,7 @@ POST   /api/projects/{project_id}/jobs                                          
 GET    /api/projects/{project_id}/knowledge                                             gated:require_project_member
 POST   /api/projects/{project_id}/knowledge/export                                      gated:require_project_member
 POST   /api/projects/{project_id}/knowledge/materialize                                 internal:require_internal
+POST   /api/projects/{project_id}/knowledge/materialize/{intent_id}/projection          internal:require_internal
 POST   /api/projects/{project_id}/knowledge/reindex                                     gated:require_project_member
 POST   /api/projects/{project_id}/knowledge/repository                                  gated:require_project_owner
 POST   /api/projects/{project_id}/knowledge/search                                      gated:require_project_member
