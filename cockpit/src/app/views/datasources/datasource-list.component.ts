@@ -64,7 +64,7 @@ type KeyValueRow = {key: string; value: string};
     AppMenuTriggerDirective,
   ],
   template: `
-    <div class="ds-container">
+    <div class="ds-container" [class.form-open]="showForm()">
       <!-- Header -->
       <div class="header-bar">
         <span class="title">{{ 'datasources.title' | transloco }}</span>
@@ -1287,46 +1287,46 @@ type KeyValueRow = {key: string; value: string};
                 </app-form-field>
               </div>
             }
+          </div>
 
-            <div class="form-row form-footer">
-              <div class="form-actions">
-                @if (formData.type !== 'generic' && formData.type !== 'repository' && !isCredentialFileType()) {
-                  <app-button
-                    variant="secondary"
-                    size="sm"
-                    [loading]="isTesting()"
-                    [disabled]="!canTestFromForm()"
-                    (clicked)="testFromForm()"
-                  >
-                    @if (isTesting()) {
-                      {{ 'datasources.form.testing' | transloco }}
-                    } @else {
-                      <app-icon size="sm">cable</app-icon> {{ 'datasources.form.test' | transloco }}
-                    }
-                  </app-button>
-                }
+          <div class="form-footer-bar">
+            <div class="form-actions">
+              @if (formData.type !== 'generic' && formData.type !== 'repository' && !isCredentialFileType()) {
                 <app-button
                   variant="secondary"
                   size="sm"
-                  [disabled]="isSaving()"
-                  (clicked)="closeForm()"
+                  [loading]="isTesting()"
+                  [disabled]="!canTestFromForm()"
+                  (clicked)="testFromForm()"
                 >
-                  {{ 'datasources.form.cancel' | transloco }}
-                </app-button>
-                <app-button
-                  variant="primary"
-                  size="sm"
-                  [loading]="isSaving()"
-                  [disabled]="!canSave()"
-                  (clicked)="saveForm()"
-                >
-                  @if (isSaving()) {
-                    {{ 'datasources.form.saving' | transloco }}
+                  @if (isTesting()) {
+                    {{ 'datasources.form.testing' | transloco }}
                   } @else {
-                    {{ (editingId() ? 'datasources.form.update' : 'datasources.form.create') | transloco }}
+                    <app-icon size="sm">cable</app-icon> {{ 'datasources.form.test' | transloco }}
                   }
                 </app-button>
-              </div>
+              }
+              <app-button
+                variant="secondary"
+                size="sm"
+                [disabled]="isSaving()"
+                (clicked)="closeForm()"
+              >
+                {{ 'datasources.form.cancel' | transloco }}
+              </app-button>
+              <app-button
+                variant="primary"
+                size="sm"
+                [loading]="isSaving()"
+                [disabled]="!canSave()"
+                (clicked)="saveForm()"
+              >
+                @if (isSaving()) {
+                  {{ 'datasources.form.saving' | transloco }}
+                } @else {
+                  {{ (editingId() ? 'datasources.form.update' : 'datasources.form.create') | transloco }}
+                }
+              </app-button>
             </div>
 
             @if (formTestResult()) {
@@ -1363,236 +1363,238 @@ type KeyValueRow = {key: string; value: string};
       <!-- Table -->
       @if (filteredDatasources().length > 0) {
         <div class="table-container">
-          <table class="ds-table">
-            <thead>
-              <tr>
-                <th>{{ 'datasources.table.colType' | transloco }}</th>
-                <th>{{ 'datasources.table.colName' | transloco }}</th>
-                <th class="col-url">{{ 'datasources.table.colUrl' | transloco }}</th>
-                <th class="col-scope">{{ 'datasources.table.colVisibility' | transloco }}</th>
-                @if (capabilities.datasourceScopeAutoAttachAvailable()) {
-                  <th class="col-availability">{{ 'datasources.table.colAvailability' | transloco }}</th>
-                }
-                <th>{{ 'datasources.table.colActions' | transloco }}</th>
-              </tr>
-            </thead>
-            <tbody>
-              @for (ds of filteredDatasources(); track ds.id) {
+          <div class="table-inner">
+            <table class="ds-table">
+              <thead>
                 <tr>
-                  <td>
-                    <app-badge [tone]="dsTypeTone(ds.type)" size="sm">
-                      <app-icon size="sm">{{ getTypeIcon(ds.type) }}</app-icon>
-                      {{ 'datasources.filter.' + ds.type | transloco }}
-                    </app-badge>
-                  </td>
-                  <td class="name-cell">
-                    <span class="ds-name">{{ ds.name }}</span>
-                    @if (ds.description) {
-                      <span class="ds-desc">{{ ds.description }}</span>
-                    }
-                    @if (ds.type === 'kb' && indexStatuses()[ds.id]; as indexStatus) {
-                      <div class="index-status-row">
-                        <app-badge [tone]="indexStatusTone(indexStatus.status)" size="xs">
-                          {{ indexStatusLabel(indexStatus) }}
+                  <th>{{ 'datasources.table.colType' | transloco }}</th>
+                  <th>{{ 'datasources.table.colName' | transloco }}</th>
+                  <th class="col-url">{{ 'datasources.table.colUrl' | transloco }}</th>
+                  <th class="col-scope">{{ 'datasources.table.colVisibility' | transloco }}</th>
+                  @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+                    <th class="col-availability">{{ 'datasources.table.colAvailability' | transloco }}</th>
+                  }
+                  <th>{{ 'datasources.table.colActions' | transloco }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (ds of filteredDatasources(); track ds.id) {
+                  <tr>
+                    <td>
+                      <app-badge [tone]="dsTypeTone(ds.type)" size="sm">
+                        <app-icon size="sm">{{ getTypeIcon(ds.type) }}</app-icon>
+                        {{ 'datasources.filter.' + ds.type | transloco }}
+                      </app-badge>
+                    </td>
+                    <td class="name-cell">
+                      <span class="ds-name">{{ ds.name }}</span>
+                      @if (ds.description) {
+                        <span class="ds-desc">{{ ds.description }}</span>
+                      }
+                      @if (ds.type === 'kb' && indexStatuses()[ds.id]; as indexStatus) {
+                        <div class="index-status-row">
+                          <app-badge [tone]="indexStatusTone(indexStatus.status)" size="xs">
+                            {{ indexStatusLabel(indexStatus) }}
+                          </app-badge>
+                          @if (indexStatus.status === 'indexing' && indexStatus.notes_total) {
+                            <span
+                              class="index-progress"
+                              [title]="
+                                'datasources.table.indexProgressTitle'
+                                  | transloco
+                                    : {
+                                        done: indexStatus.notes_done ?? 0,
+                                        total: indexStatus.notes_total
+                                      }
+                              "
+                            >
+                              <span class="index-progress-count">
+                                {{ indexStatus.notes_done ?? 0 }}/{{ indexStatus.notes_total }}
+                              </span>
+                              <span class="index-progress-track">
+                                <span
+                                  class="index-progress-fill"
+                                  [style.width.%]="indexProgressPercent(indexStatus)"
+                                ></span>
+                              </span>
+                            </span>
+                          }
+                          @if (indexStatus.last_success_at) {
+                            <span
+                              class="index-status-detail"
+                              [title]="indexStatus.last_success_at"
+                            >
+                              {{ 'datasources.table.lastSuccess' | transloco }}:
+                              {{ formatIndexDate(indexStatus.last_success_at) }}
+                            </span>
+                          }
+                          @if (indexStatus.last_error) {
+                            <span
+                              class="index-status-error"
+                              [title]="redactIndexError(indexStatus.last_error)"
+                            >
+                              {{ redactIndexError(indexStatus.last_error) }}
+                            </span>
+                          }
+                        </div>
+                      }
+                      @if (viewport.isMobile()) {
+                        <app-badge class="ds-scope-inline" [tone]="scopeTone(ds)" size="xs">
+                          {{ scopeLabelKey(ds) | transloco }}
                         </app-badge>
-                        @if (indexStatus.status === 'indexing' && indexStatus.notes_total) {
-                          <span
-                            class="index-progress"
-                            [title]="
-                              'datasources.table.indexProgressTitle'
-                                | transloco
-                                  : {
-                                      done: indexStatus.notes_done ?? 0,
-                                      total: indexStatus.notes_total
-                                    }
-                            "
-                          >
-                            <span class="index-progress-count">
-                              {{ indexStatus.notes_done ?? 0 }}/{{ indexStatus.notes_total }}
-                            </span>
-                            <span class="index-progress-track">
-                              <span
-                                class="index-progress-fill"
-                                [style.width.%]="indexProgressPercent(indexStatus)"
-                              ></span>
-                            </span>
-                          </span>
+                        @if (ds.is_global && ds.read_only === false) {
+                          <app-badge class="ds-scope-inline" tone="warning" size="xs">
+                            {{ 'datasources.table.badgeRw' | transloco }}
+                          </app-badge>
                         }
-                        @if (indexStatus.last_success_at) {
-                          <span
-                            class="index-status-detail"
-                            [title]="indexStatus.last_success_at"
-                          >
-                            {{ 'datasources.table.lastSuccess' | transloco }}:
-                            {{ formatIndexDate(indexStatus.last_success_at) }}
-                          </span>
+                        @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+                          <app-badge class="ds-scope-inline" [tone]="availabilityTone(ds)" size="xs">
+                            {{ availabilityLabel(ds) }}
+                          </app-badge>
+                          @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
+                            <app-badge class="ds-scope-inline" tone="accent" size="xs">
+                              {{ 'datasources.table.badgeAuto' | transloco }}
+                            </app-badge>
+                          }
                         }
-                        @if (indexStatus.last_error) {
-                          <span
-                            class="index-status-error"
-                            [title]="redactIndexError(indexStatus.last_error)"
-                          >
-                            {{ redactIndexError(indexStatus.last_error) }}
-                          </span>
-                        }
-                      </div>
-                    }
-                    @if (viewport.isMobile()) {
-                      <app-badge class="ds-scope-inline" [tone]="scopeTone(ds)" size="xs">
+                      }
+                    </td>
+                    <td class="url-cell mono col-url">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
+                    <td class="col-scope">
+                      <app-badge [tone]="scopeTone(ds)" size="xs">
                         {{ scopeLabelKey(ds) | transloco }}
                       </app-badge>
                       @if (ds.is_global && ds.read_only === false) {
-                        <app-badge class="ds-scope-inline" tone="warning" size="xs">
+                        <app-badge tone="warning" size="xs">
                           {{ 'datasources.table.badgeRw' | transloco }}
                         </app-badge>
                       }
-                      @if (capabilities.datasourceScopeAutoAttachAvailable()) {
-                        <app-badge class="ds-scope-inline" [tone]="availabilityTone(ds)" size="xs">
+                    </td>
+                    @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+                      <td class="col-availability">
+                        <app-badge [tone]="availabilityTone(ds)" size="xs">
                           {{ availabilityLabel(ds) }}
                         </app-badge>
                         @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
-                          <app-badge class="ds-scope-inline" tone="accent" size="xs">
+                          <app-badge tone="accent" size="xs">
                             {{ 'datasources.table.badgeAuto' | transloco }}
                           </app-badge>
                         }
+                      </td>
+                    }
+                    <td class="actions-cell">
+                      @if (canManage(ds) && viewport.isMobile()) {
+                        <!-- Mobile: collapse the row actions into a ⋯ overflow menu so the
+                             cell is just the kebab and the table fits without h-scroll
+                             (mirrors the Jobs list). -->
+                        <app-icon-button
+                          variant="ghost"
+                          size="sm"
+                          [ariaLabel]="'datasources.table.moreActions' | transloco"
+                          [loading]="testingIds().has(ds.id) || reindexingIds().has(ds.id)"
+                          [appMenuTrigger]="rowMenu"
+                          menuPlacement="bottom-end"
+                        >
+                          <app-icon size="sm">more_vert</app-icon>
+                        </app-icon-button>
+                        <app-menu #rowMenu>
+                          <app-menu-item (activated)="testDatasource(ds.id)">
+                            {{ 'datasources.table.testTooltip' | transloco }}
+                          </app-menu-item>
+                          @if (ds.type === 'kb') {
+                            <app-menu-item (activated)="reindexDatasource(ds)">
+                              {{ 'datasources.table.reindexTooltip' | transloco }}
+                            </app-menu-item>
+                          }
+                          @if (ds.type === 'kb') {
+                            <app-menu-item (activated)="reindexDatasource(ds, true)">
+                              {{ 'datasources.table.fullReindexTooltip' | transloco }}
+                            </app-menu-item>
+                          }
+                          <app-menu-item (activated)="openEditForm(ds)">
+                            {{ 'datasources.table.editTooltip' | transloco }}
+                          </app-menu-item>
+                          <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
+                            {{ 'datasources.table.deleteTooltip' | transloco }}
+                          </app-menu-item>
+                        </app-menu>
+                      } @else if (canManage(ds)) {
+                        <app-icon-button
+                          variant="ghost"
+                          size="sm"
+                          [ariaLabel]="'datasources.table.testTooltip' | transloco"
+                          [tooltip]="'datasources.table.testTooltip' | transloco"
+                          [loading]="testingIds().has(ds.id)"
+                          (clicked)="testDatasource(ds.id)"
+                        >
+                          <app-icon size="sm">cable</app-icon>
+                        </app-icon-button>
+                        @if (ds.type === 'kb') {
+                          <app-icon-button
+                            variant="ghost"
+                            size="sm"
+                            [ariaLabel]="'datasources.table.reindexTooltip' | transloco"
+                            [tooltip]="'datasources.table.reindexTooltip' | transloco"
+                            [loading]="reindexingIds().has(ds.id)"
+                            (clicked)="reindexDatasource(ds)"
+                          >
+                            <app-icon size="sm">sync</app-icon>
+                          </app-icon-button>
+                          <app-icon-button
+                            variant="ghost"
+                            size="sm"
+                            [ariaLabel]="'datasources.table.fullReindexTooltip' | transloco"
+                            [tooltip]="'datasources.table.fullReindexTooltip' | transloco"
+                            [disabled]="reindexingIds().has(ds.id)"
+                            (clicked)="reindexDatasource(ds, true)"
+                          >
+                            <app-icon size="sm">restart_alt</app-icon>
+                          </app-icon-button>
+                        }
+                        <app-icon-button
+                          variant="ghost"
+                          size="sm"
+                          [ariaLabel]="'datasources.table.editTooltip' | transloco"
+                          [tooltip]="'datasources.table.editTooltip' | transloco"
+                          (clicked)="openEditForm(ds)"
+                        >
+                          <app-icon size="sm">edit</app-icon>
+                        </app-icon-button>
+                        <app-icon-button
+                          variant="danger"
+                          size="sm"
+                          [ariaLabel]="'datasources.table.deleteTooltip' | transloco"
+                          [tooltip]="'datasources.table.deleteTooltip' | transloco"
+                          (clicked)="deleteDatasource(ds)"
+                        >
+                          <app-icon size="sm">delete</app-icon>
+                        </app-icon-button>
                       }
-                    }
-                  </td>
-                  <td class="url-cell mono col-url">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
-                  <td class="col-scope">
-                    <app-badge [tone]="scopeTone(ds)" size="xs">
-                      {{ scopeLabelKey(ds) | transloco }}
-                    </app-badge>
-                    @if (ds.is_global && ds.read_only === false) {
-                      <app-badge tone="warning" size="xs">
-                        {{ 'datasources.table.badgeRw' | transloco }}
-                      </app-badge>
-                    }
-                  </td>
-                  @if (capabilities.datasourceScopeAutoAttachAvailable()) {
-                    <td class="col-availability">
-                      <app-badge [tone]="availabilityTone(ds)" size="xs">
-                        {{ availabilityLabel(ds) }}
-                      </app-badge>
-                      @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
-                        <app-badge tone="accent" size="xs">
-                          {{ 'datasources.table.badgeAuto' | transloco }}
-                        </app-badge>
+
+                      @if (canManage(ds) && testResults()[ds.id]; as result) {
+                        <span
+                          class="inline-test"
+                          [class.test-ok]="result.status === 'ok'"
+                          [class.test-error]="result.status === 'error'"
+                          title="{{ result.message }}"
+                        >
+                          <app-icon size="sm">{{ result.status === 'ok' ? 'check_circle' : 'error' }}</app-icon>
+                        </span>
                       }
                     </td>
-                  }
-                  <td class="actions-cell">
-                    @if (canManage(ds) && viewport.isMobile()) {
-                      <!-- Mobile: collapse the row actions into a ⋯ overflow menu so the
-                           cell is just the kebab and the table fits without h-scroll
-                           (mirrors the Jobs list). -->
-                      <app-icon-button
-                        variant="ghost"
-                        size="sm"
-                        [ariaLabel]="'datasources.table.moreActions' | transloco"
-                        [loading]="testingIds().has(ds.id) || reindexingIds().has(ds.id)"
-                        [appMenuTrigger]="rowMenu"
-                        menuPlacement="bottom-end"
-                      >
-                        <app-icon size="sm">more_vert</app-icon>
-                      </app-icon-button>
-                      <app-menu #rowMenu>
-                        <app-menu-item (activated)="testDatasource(ds.id)">
-                          {{ 'datasources.table.testTooltip' | transloco }}
-                        </app-menu-item>
-                        @if (ds.type === 'kb') {
-                          <app-menu-item (activated)="reindexDatasource(ds)">
-                            {{ 'datasources.table.reindexTooltip' | transloco }}
-                          </app-menu-item>
-                        }
-                        @if (ds.type === 'kb') {
-                          <app-menu-item (activated)="reindexDatasource(ds, true)">
-                            {{ 'datasources.table.fullReindexTooltip' | transloco }}
-                          </app-menu-item>
-                        }
-                        <app-menu-item (activated)="openEditForm(ds)">
-                          {{ 'datasources.table.editTooltip' | transloco }}
-                        </app-menu-item>
-                        <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
-                          {{ 'datasources.table.deleteTooltip' | transloco }}
-                        </app-menu-item>
-                      </app-menu>
-                    } @else if (canManage(ds)) {
-                      <app-icon-button
-                        variant="ghost"
-                        size="sm"
-                        [ariaLabel]="'datasources.table.testTooltip' | transloco"
-                        [tooltip]="'datasources.table.testTooltip' | transloco"
-                        [loading]="testingIds().has(ds.id)"
-                        (clicked)="testDatasource(ds.id)"
-                      >
-                        <app-icon size="sm">cable</app-icon>
-                      </app-icon-button>
-                      @if (ds.type === 'kb') {
-                        <app-icon-button
-                          variant="ghost"
-                          size="sm"
-                          [ariaLabel]="'datasources.table.reindexTooltip' | transloco"
-                          [tooltip]="'datasources.table.reindexTooltip' | transloco"
-                          [loading]="reindexingIds().has(ds.id)"
-                          (clicked)="reindexDatasource(ds)"
-                        >
-                          <app-icon size="sm">sync</app-icon>
-                        </app-icon-button>
-                        <app-icon-button
-                          variant="ghost"
-                          size="sm"
-                          [ariaLabel]="'datasources.table.fullReindexTooltip' | transloco"
-                          [tooltip]="'datasources.table.fullReindexTooltip' | transloco"
-                          [disabled]="reindexingIds().has(ds.id)"
-                          (clicked)="reindexDatasource(ds, true)"
-                        >
-                          <app-icon size="sm">restart_alt</app-icon>
-                        </app-icon-button>
-                      }
-                      <app-icon-button
-                        variant="ghost"
-                        size="sm"
-                        [ariaLabel]="'datasources.table.editTooltip' | transloco"
-                        [tooltip]="'datasources.table.editTooltip' | transloco"
-                        (clicked)="openEditForm(ds)"
-                      >
-                        <app-icon size="sm">edit</app-icon>
-                      </app-icon-button>
-                      <app-icon-button
-                        variant="danger"
-                        size="sm"
-                        [ariaLabel]="'datasources.table.deleteTooltip' | transloco"
-                        [tooltip]="'datasources.table.deleteTooltip' | transloco"
-                        (clicked)="deleteDatasource(ds)"
-                      >
-                        <app-icon size="sm">delete</app-icon>
-                      </app-icon-button>
-                    }
-
-                    @if (canManage(ds) && testResults()[ds.id]; as result) {
-                      <span
-                        class="inline-test"
-                        [class.test-ok]="result.status === 'ok'"
-                        [class.test-error]="result.status === 'error'"
-                        title="{{ result.message }}"
-                      >
-                        <app-icon size="sm">{{ result.status === 'ok' ? 'check_circle' : 'error' }}</app-icon>
-                      </span>
-                    }
-                  </td>
-                </tr>
-              }
-            </tbody>
-          </table>
-        </div>
-        @if (capabilities.datasourceScopeAutoAttachAvailable() && catalogNextCursor()) {
-          <div class="load-more-row">
-            <app-button variant="secondary" size="sm" [loading]="isLoadingMore()" (clicked)="loadMoreCatalog()">
-              {{ 'datasources.catalog.loadMore' | transloco }}
-            </app-button>
+                  </tr>
+                }
+              </tbody>
+            </table>
+            @if (capabilities.datasourceScopeAutoAttachAvailable() && catalogNextCursor()) {
+              <div class="load-more-row">
+                <app-button variant="secondary" size="sm" [loading]="isLoadingMore()" (clicked)="loadMoreCatalog()">
+                  {{ 'datasources.catalog.loadMore' | transloco }}
+                </app-button>
+              </div>
+            }
           </div>
-        }
+        </div>
       }
     </div>
 
@@ -1725,6 +1727,7 @@ type KeyValueRow = {key: string; value: string};
         padding: 8px 12px;
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         background: var(--panel-header-bg);
+        flex-shrink: 0;
       }
 
       .catalog-project-filter {
@@ -1761,13 +1764,22 @@ type KeyValueRow = {key: string; value: string};
         color: var(--danger);
       }
 
-      /* Form Panel */
+      /* Form Panel
+         The panel is a self-contained scroll region rather than a flex-shrink:0
+         block: :host and .page-content both clip, so a form taller than the
+         viewport (OKF/repository types with the project picker expanded) used to
+         be unreachable — no scrollbar anywhere. flex:0 1 auto + min-height:0 lets
+         the panel take only the space left over and hand the overflow to
+         .form-body, keeping the title and the Test/Cancel/Create bar pinned. */
       .form-panel {
         margin: 8px 12px 0;
         border: 1px solid var(--border-color, var(--surface-1));
         border-radius: var(--radius-surface);
         background: rgba(0, 0, 0, 0.2);
-        flex-shrink: 0;
+        display: flex;
+        flex-direction: column;
+        flex: 0 1 auto;
+        min-height: 0;
       }
 
       .form-header {
@@ -1779,10 +1791,13 @@ type KeyValueRow = {key: string; value: string};
         font-weight: 600;
         font-size: 13px;
         color: var(--text-primary, var(--text-primary));
+        flex-shrink: 0;
       }
 
       .form-body {
         padding: 14px;
+        overflow-y: auto;
+        min-height: 0;
       }
 
       .form-row {
@@ -1805,10 +1820,17 @@ type KeyValueRow = {key: string; value: string};
         max-width: 160px;
       }
 
-      .form-footer {
-        align-items: center;
+      /* Pinned action bar — stays visible while .form-body scrolls. */
+      .form-footer-bar {
+        flex-shrink: 0;
+        padding: 10px 14px;
+        border-top: 1px solid var(--border-color, var(--surface-0));
+        border-radius: 0 0 var(--radius-surface) var(--radius-surface);
+        background: var(--panel-header-bg);
+      }
+
+      .form-footer-bar .form-actions {
         justify-content: flex-end;
-        margin-bottom: 0;
       }
 
       .hint-inline {
@@ -2181,17 +2203,27 @@ type KeyValueRow = {key: string; value: string};
         opacity: 0.7;
       }
 
-      /* Table */
+      /* Table
+         Padding lives on .table-inner, not here: .table-container is the flex
+         item that gets squeezed to nothing when an open form claims the column,
+         and padding on the item itself can't be squeezed — it would leave a 16px
+         strip of clipped table header pinned to the bottom edge. Inside the
+         scroll box it just gets clipped along with the rows. Same reason the
+         load-more row sits inside rather than beside it. */
       .table-container {
         flex: 1;
         overflow: auto;
+        min-height: 0;
+      }
+
+      .table-inner {
         padding: 8px;
       }
 
       .load-more-row {
         display: flex;
         justify-content: center;
-        padding: 0 12px 12px;
+        padding: 8px 12px 4px;
       }
 
       .ds-table {
@@ -2348,6 +2380,16 @@ type KeyValueRow = {key: string; value: string};
       @media (max-width: 768px) {
         .catalog-filter-bar {
           grid-template-columns: 1fr 1fr;
+        }
+
+        /* The browse controls cost ~215px of an 800px phone viewport (a 165px
+           3-row filter grid + the 32px chip strip), which came straight out of
+           the form's scroll window. They filter a list the open form has already
+           squeezed to nothing, so drop them while authoring and give the height
+           to the fields. Everything returns when the form closes. */
+        .form-open .catalog-filter-bar,
+        .form-open .filter-chips {
+          display: none;
         }
         /* Filter chips: scroll sideways instead of overflowing 599px and getting
            clipped by :host{overflow:hidden}. order:1 + flex-basis:100% drops the

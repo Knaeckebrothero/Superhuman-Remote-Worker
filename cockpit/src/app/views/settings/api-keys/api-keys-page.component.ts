@@ -235,7 +235,11 @@ const DEFAULT_SCOPES = ['jobs:read', 'chat:read'];
     </div>
   `,
   styles: [`
-    :host { display: block; height: 100%; }
+    /* overflow: auto matches the parent settings page. Without it the host is a
+       600px-tall flex item holding ~850px of content and the shell's
+       .content-area clips the rest: "Create token" and the whole "How to use"
+       section sat below the fold with no scrollbar anywhere on a short viewport. */
+    :host { display: block; height: 100%; overflow: auto; }
     .api-keys-page { padding: 24px; max-width: var(--content-max-width); margin: 0 auto; }
     .api-keys-container { display: flex; flex-direction: column; gap: 24px; }
     .page-header { display: flex; align-items: center; gap: 12px; }
