@@ -40,6 +40,9 @@ async def db(pg_dsn):
                 execution_lane text NOT NULL DEFAULT 'pinned',
                 assigned_agent_id uuid,
                 lease_expires_at timestamptz,
+                -- A frozen job is not dispatchable (idx_jobs_dispatchable's
+                -- partial predicate), so the CAS fences on it too.
+                freeze_data jsonb,
                 -- claim_job_for_agent() clears the previous run's failure
                 -- record on the CAS statement itself; see
                 -- tests/test_claim_clears_stale_failure.py
@@ -80,6 +83,24 @@ async def test_claim_rejects_non_dispatchable_status(db):
     # 'processing'/terminal jobs are not claimable even if assigned_agent_id is NULL.
     async with db.acquire() as conn:
         await conn.execute("UPDATE jobs SET status='completed', assigned_agent_id=NULL")
+    assert await db.claim_job_for_agent(JOB, AGENT_1) is False
+
+
+@pytest.mark.asyncio
+async def test_claim_rejects_a_frozen_job(db):
+    """A frozen job is not dispatchable, so the CAS must refuse it.
+
+    ``get_dispatchable_jobs`` rides ``idx_jobs_dispatchable``, whose partial
+    predicate carries ``freeze_data IS NULL``. Without the same guard on the
+    claim, a job frozen between listing and claiming (officer preflight, a
+    completion freeze) would still be handed to an agent.
+    """
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET freeze_data = $2::jsonb WHERE id = $1",
+            UUID(JOB),
+            '{"freeze_type": "officer_preflight"}',
+        )
     assert await db.claim_job_for_agent(JOB, AGENT_1) is False
 
 
