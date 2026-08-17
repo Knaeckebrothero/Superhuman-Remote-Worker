@@ -47,6 +47,10 @@ _MAX_NEW = 8
 _MAX_ACTIVE = 8
 _MAX_PENDING = 5
 _DESC_CHARS = 120
+# A Legate note is delivered whole (see _legate_lines); the cap only stops a
+# pathological paste from crowding out the rest of the briefing.
+_MAX_NOTE_CHARS = 4000
+LEGATE_SOURCE = "legate"
 
 # Statuses that count as "in flight" for the active-jobs detail and the
 # capacity line. 'paused' is shown in transitions but does not hold a slot.
@@ -170,7 +174,12 @@ async def build_wake_message(
         prev_watermark = _parse_iso(prev.get("watermark"))
 
         lines: list[str] = [_header(now, prev_watermark)]
-        lines += _reason_lines(rows)
+        notes, reasons = [], []
+        for row in rows:
+            is_note = str(row.get("source") or "") == LEGATE_SOURCE
+            (notes if is_note else reasons).append(row)
+        lines += _legate_lines(notes)
+        lines += _reason_lines(reasons)
 
         jobs_lines, fingerprints = await _jobs_section(
             db, audit_reader, project_id, prev_prints, prev_watermark, now
@@ -206,6 +215,34 @@ def _header(now: datetime, prev_watermark: Optional[datetime]) -> str:
     if prev_watermark is None:
         return f"[SITREP] {stamp} — first sitrep (no prior watermark)"
     return f"[SITREP] {stamp} — delta since {_ago(prev_watermark, now)}"
+
+
+def _legate_lines(rows: list[dict[str, Any]]) -> list[str]:
+    """Render Legate notes verbatim, at the top, before anything else.
+
+    Deliberately NOT routed through :func:`_reason_lines`: that renderer
+    truncates a payload summary to 160 chars, which would silently amputate a
+    directive delivered on the queued path. A note is the Legate speaking —
+    it arrives whole, and it arrives first.
+    """
+    if not rows:
+        return []
+    lines = [
+        f"Legate notes ({len(rows)}) — direct from your Legate; "
+        "they outrank your standing plan:"
+    ]
+    for index, row in enumerate(rows, start=1):
+        message = str(_as_dict(row.get("payload")).get("message") or "").strip()
+        if not message:
+            continue
+        if len(message) > _MAX_NOTE_CHARS:
+            message = (
+                message[:_MAX_NOTE_CHARS]
+                + f"\n[note truncated at {_MAX_NOTE_CHARS} chars]"
+            )
+        lines.append(f"[note {index}]")
+        lines.append(message)
+    return lines
 
 
 def _reason_lines(rows: list[dict[str, Any]]) -> list[str]:

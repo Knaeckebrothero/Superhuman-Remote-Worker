@@ -220,6 +220,12 @@ _READ_CAPABILITIES = (
     _read("list_sudo_requests", "GET /api/sudo/requests"),
     _read("list_message_threads", "GET /api/jobs/{job_id}/messages"),
     _read("get_message_thread", "GET /api/jobs/{job_id}/messages (client filter)"),
+    _read("list_officers", "GET /api/officers"),
+    _read(
+        "get_project_officer",
+        "GET /api/projects/{project_id}/officer + "
+        "/api/persistent/threads/{thread_id}/messages",
+    ),
     _read("list_persistent_threads", "GET /api/persistent/threads"),
     _read("get_persistent_thread", "GET /api/persistent/threads/{thread_id}"),
     _read(
@@ -458,6 +464,14 @@ _MUTATION_CAPABILITIES = (
             "commissioned officer session of the job's project; verified "
             "server-side against the durable post row"
         ),
+    ),
+    _mutation(
+        "send_officer_note",
+        "POST /api/projects/{project_id}/officer/note",
+        "delivers a Legate note to the project's officer, waking him or "
+        "queuing durably for his next wake",
+        authorization=_OWNER_AUTH,
+        open_world=True,
     ),
     _mutation(
         "create_persistent_thread",

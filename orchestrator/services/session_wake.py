@@ -59,6 +59,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from uuid import uuid4
 
 import httpx
 
@@ -790,6 +791,10 @@ OFFICER_DEBOUNCE_BY_SOURCE: dict[str, int] = {
     # worker is waiting on this wake — it may coalesce with already-claimed
     # events into one turn but must never wait for the routine timer.
     "worker_message": 0,
+    # A note is the Legate speaking. Two directives a minute apart are two
+    # directives; the claim query's unlisted-source default is 0 today, and
+    # this entry keeps the note out of a future default's reach.
+    "legate": 0,
     "job_transition": 300,
     "sudo_request": 300,
     "loop": 300,
@@ -1033,6 +1038,63 @@ async def notify_all_officers(
     return enqueued
 
 
+LEGATE_NOTE_SOURCE = "legate"
+LEGATE_NOTE_MAX_CHARS = 4000
+
+
+def _officer_hold(thread: dict[str, Any]) -> dict[str, Any]:
+    """Whatever hold is stamped on an officer thread ({} when he is free)."""
+    metadata = _as_dict(thread.get("metadata"))
+    officer = _as_dict(_as_dict(metadata.get("config_override")).get("officer"))
+    return _as_dict(officer.get("hold"))
+
+
+async def deliver_officer_note(db: Any, thread: dict[str, Any], text: str) -> str:
+    """Deliver one Legate note to an officer. Returns how it landed.
+
+    ``'live'`` — it reached the pod's input queue, which wakes him before his
+    timer (centurion.md §4). ``'queued'`` — no live loop took it, so it is a
+    durable ``legate`` outbox row the drain delivers at the next wake.
+    ``'held'`` — it is queued behind a hold and will not arrive until that
+    hold lifts.
+
+    Holds are not all alike, and the difference is visible in the row. A
+    CONFERENCE hold carries the conference ``thread_id``: the meeting is the
+    single writer (centurion.md §2), so the note is queued without a live
+    attempt and arrives with the brief wake. A MAINTENANCE hold carries no
+    ``thread_id`` — the Legate stood him down himself and the hold notice
+    promises "Legate messages still reach you", so the live path stays open
+    (the same rule ``_inject_officer_notice`` states).
+
+    The return value is the caller's honesty contract — a note reported as
+    delivered when it only reached a table is worse than an error. Each note
+    carries a fresh ``dedup_key`` so notes never coalesce with each other.
+    """
+    hold = _officer_hold(thread)
+    if not hold.get("thread_id"):
+        try:
+            agent = await _resolve_live_agent(db, thread)
+            if agent is not None and await _inject_live(agent, text):
+                return "live"
+        except Exception:
+            # Resolving or reaching the pod may fail; the durable row below is
+            # the whole point of having a second path.
+            logger.warning(
+                "legate note: live attempt failed for thread %s — queuing",
+                str(thread.get("id"))[:8],
+                exc_info=True,
+            )
+    project_id = thread.get("project_id")
+    await db.enqueue_session_wake_event(
+        str(thread["id"]),
+        source=LEGATE_NOTE_SOURCE,
+        dedup_key=uuid4().hex,
+        payload={"message": text},
+        project_id=str(project_id) if project_id else None,
+    )
+    return "held" if hold else "queued"
+
+
 def kick_event_drain(db: Any) -> None:
     """Fire-and-forget the officer event drain after an enqueue commits.
 
@@ -1068,6 +1130,11 @@ def _format_officer_wake(rows: list[dict[str, Any]]) -> str:
             desc = f"timer: slept ~{minutes} min"
             if reason:
                 desc += f" (reason: {_truncate(str(reason), 160)})"
+        elif source == LEGATE_NOTE_SOURCE:
+            # The Legate's own words, verbatim — this renderer runs when the
+            # sitrep build failed, and a truncated directive is a lost one.
+            note = str(payload.get("message") or "").strip()
+            desc = f"Legate note:\n{note[:LEGATE_NOTE_MAX_CHARS]}"
         else:
             detail = payload.get("summary") or payload.get("status") or ""
             desc = f"{source}: {row.get('dedup_key')}"

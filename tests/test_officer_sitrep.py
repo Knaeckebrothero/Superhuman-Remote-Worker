@@ -356,3 +356,58 @@ class TestDeliverOfficerConversion:
         }
         ok = await session_wake._deliver(db, row)
         assert ok is False  # released → retried, never dropped
+
+
+class TestLegateNotes:
+    """A directive is delivered whole or not at all (officer_legate_channel.md)."""
+
+    NOTE = (
+        "Stand down the theme work. Hotel Rheinland presents to their board on "
+        "Thursday and nothing we have is demonstrable: no deployed URL, no seed "
+        "data, no way for a non-developer to click through a booking. Reprioritise "
+        "the backlog around one clickable path and tell me what you cut."
+    )
+
+    def _legate_row(self, message=None, key="ab12cd34"):
+        return {
+            "id": 2,
+            "source": "legate",
+            "dedup_key": key,
+            "payload": {"message": message or self.NOTE},
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_queued_note_arrives_verbatim_and_leads_the_sitrep(self):
+        """The generic reason renderer truncates at 160 chars — a directive must not."""
+        text, _ = await sitrep.build_wake_message(
+            _fake_db(),
+            _officer_thread(),
+            [self._legate_row(), TIMER_ROW],
+            audit_reader=_audit(),
+            usage_ledger=None,
+        )
+        assert self.NOTE in text
+        assert text.index("Legate note") < text.index("Wake reasons")
+
+    @pytest.mark.asyncio
+    async def test_a_note_is_not_repeated_as_a_wake_reason(self):
+        text, _ = await sitrep.build_wake_message(
+            _fake_db(),
+            _officer_thread(),
+            [self._legate_row(key="deadbeef"), TIMER_ROW],
+            audit_reader=_audit(),
+            usage_ledger=None,
+        )
+        assert "deadbeef" not in text
+        assert "Wake reasons (1)" in text
+
+    @pytest.mark.asyncio
+    async def test_a_sitrep_without_notes_has_no_legate_section(self):
+        text, _ = await sitrep.build_wake_message(
+            _fake_db(),
+            _officer_thread(),
+            [TIMER_ROW],
+            audit_reader=_audit(),
+            usage_ledger=None,
+        )
+        assert "Legate note" not in text
