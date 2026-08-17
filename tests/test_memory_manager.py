@@ -788,7 +788,7 @@ class TestRerankerScorer:
         # A configured scorer (reranker) is REQUIRED: a runtime failure raises
         # MemoryPipelineError (fails the turn loud) rather than silently
         # degrading to legacy order. Regression for
-        # docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+        # knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
         from src.services.memory import MemoryPipelineError
         from src.services.memory.plugins.reranker import RerankerScorer
 
@@ -829,7 +829,7 @@ class TestRerankerScorer:
     def test_factory_defaults_to_embedding_transport(self, monkeypatch):
         # The reranker rides the EMBEDDING endpoint, never the auxiliary — even
         # when the aux has a perfectly good base_url. Regression guard for
-        # docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+        # knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
         from src.services.memory.plugins.reranker import _build_reranker
         from src.core.loader import RerankerConfig
 

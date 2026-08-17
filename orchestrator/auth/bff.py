@@ -4,7 +4,7 @@ Replaces the cockpit's in-memory Bearer-token model with server-side
 sessions keyed by an opaque HttpOnly cookie. The browser never sees the
 Keycloak access/refresh/id token.
 
-See docs/features/auth_bff_and_api_tokens.md.
+See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md.
 """
 
 from __future__ import annotations

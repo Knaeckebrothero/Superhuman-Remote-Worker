@@ -49,6 +49,8 @@ cockpit/dist/
 
 # Documentation (not needed in images)
 docs/
+knowledge-base/
+knowledge-history/
 project_documentation/
 *.md
 !config/**/*.md

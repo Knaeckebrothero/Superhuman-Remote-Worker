@@ -107,7 +107,7 @@ SEEDED_FROM_TAG = "helm:llm.seed"
 CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
 
 # ElevenLabs TTS provider, auto-wired from the deployment-wide ELEVENLABS_API_KEY
-# secret (see docs/features/tts_vendor_providers.md). Like the codex proxy, the
+# secret (see knowledge-base/knowledge/features/tts_vendor_providers.md). Like the codex proxy, the
 # key in the secret is all it takes — no manual Admin step.
 ELEVENLABS_ENDPOINT_LABEL = "ElevenLabs"
 ELEVENLABS_TTS_MODEL_ID = "eleven_multilingual_v2"
@@ -553,7 +553,7 @@ async def ensure_elevenlabs_tts_endpoint(db: PostgresDB) -> bool:
     is set — the read-aloud provider then appears in the picker with no manual
     Admin step, exactly like the codex proxy.
 
-    Design (docs/features/tts_vendor_providers.md): the env secret is the single
+    Design (knowledge-base/knowledge/features/tts_vendor_providers.md): the env secret is the single
     source of truth for the key. The endpoint row is stored **without** a key
     (``api_key=None``) purely to anchor the catalog model; the TTS adapter reads
     ``ELEVENLABS_API_KEY`` from the environment at synth time, so rotating the

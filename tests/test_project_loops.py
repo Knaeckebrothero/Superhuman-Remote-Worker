@@ -186,7 +186,7 @@ async def test_ownerless_loop_materializes_authoritative_empty_selection(
 class TestJobLoopId:
     """job_loop_id detects loop membership from context.loop_id — the guard the
     completion handler uses to exempt loop jobs from the Mode-A diff-review gate
-    (which would wedge an unattended loop). docs/features/loop_parallel_stages.md."""
+    (which would wedge an unattended loop). knowledge-base/knowledge/features/loop_parallel_stages.md."""
 
     def test_loop_job_returns_id(self) -> None:
         assert job_loop_id({"context": {"loop_id": "abc-123"}}) == "abc-123"
@@ -214,7 +214,7 @@ class TestJobLoopId:
 class TestFanOutMemoryAssembler:
     """Fan-out stage members disable the TTL-curation assembler so concurrent
     analysis roles don't race the shared project RecallStore's curation slot
-    (docs/features/loop_parallel_stages.md). The lever is the existing
+    (knowledge-base/knowledge/features/loop_parallel_stages.md). The lever is the existing
     ``auxiliary.tasks.assemble_memories.enabled`` gate — a scalar deep-merge,
     NOT a rewrite of ``memory.pipeline.writers``."""
 
@@ -265,7 +265,7 @@ class TestFanOutMemoryAssembler:
 
 
 class TestProductQaLoopWiring:
-    """Phase 0 wiring for the product-qa role (docs/features/loop_parallel_stages.md):
+    """Phase 0 wiring for the product-qa role (knowledge-base/knowledge/features/loop_parallel_stages.md):
     the loop must give it a QA-specific kickoff (not the generic default) and the
     Critic must be told to triage QA findings alongside Scholar proposals."""
 
@@ -326,7 +326,7 @@ class TestProductQaLoopWiring:
 
 
 class TestCategoryContractComposition:
-    """B5 of docs/features/officer_backlog_pools.md §7.
+    """B5 of knowledge-base/knowledge/features/officer_backlog_pools.md §7.
 
     The loop's kickoff now leads with the work-category contract and follows
     with the role's identity. This is the half of the pools feature that
@@ -415,7 +415,7 @@ class TestEvidenceIncentiveWording:
 
 class TestNormalizeStage:
     """The parallel-stage grammar: a role_sequence entry is a single role name
-    (one-job stage) or a list of role names (fan-out). docs/features/loop_parallel_stages.md."""
+    (one-job stage) or a list of role names (fan-out). knowledge-base/knowledge/features/loop_parallel_stages.md."""
 
     def test_single_role_string(self) -> None:
         assert normalize_stage("scholar") == ["scholar"]
@@ -530,7 +530,7 @@ class TestLoopCounterStamps:
 
 
 # =============================================================================
-# extract_cooldown_reset_at (docs/issues/loop_advances_into_active_model_cooldown.md)
+# extract_cooldown_reset_at (knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md)
 # =============================================================================
 
 
@@ -578,7 +578,7 @@ class TestExtractCooldownResetAt:
 
 
 # =============================================================================
-# Born-parked creation (docs/issues/loop_advances_into_active_model_cooldown.md)
+# Born-parked creation (knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md)
 # =============================================================================
 
 
@@ -701,7 +701,7 @@ class TestHistoryNamesTheDelivery:
 class TestNextStageIndex:
     """Rotation must not step past a turn that produced nothing.
 
-    docs/features/better_resavio_restart_status.md §6c. A turn in which every
+    knowledge-base/knowledge/features/better_resavio_restart_status.md §6c. A turn in which every
     member failed leaves the next role nothing new to work from. The canonical
     case is a failed critic: the developer runs anyway and builds on the
     previous iteration's verdict as though it were fresh, because the engine

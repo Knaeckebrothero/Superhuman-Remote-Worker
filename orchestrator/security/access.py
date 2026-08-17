@@ -16,10 +16,10 @@ loaded resource on success so callers don't refetch.
 
 Status code policy: 404 when the resource doesn't exist, 403 when it
 does but the caller lacks access. Same shape as H1-H5, decided in
-``docs/multi_tenancy.md`` open-question #1. Every 403 raised here is
+``knowledge-base/knowledge/multi_tenancy.md`` open-question #1. Every 403 raised here is
 additionally recorded as a security event (structured log line + a
 best-effort ``security_events`` row) via :func:`log_security_event` —
-see ``docs/features/security_event_log.md``.
+see ``knowledge-base/knowledge/features/security_event_log.md``.
 
 The H1-H5 hotfix helpers (``user_can_access_ide_entity``,
 ``require_project_owner``, ``require_sudo_request_authority``) moved
@@ -74,7 +74,7 @@ def _role_satisfies(actual: str | None, minimum: Role) -> bool:
 # signal. Each deny now emits a structured WARNING line (survives in pod
 # logs even if the DB is down) plus a best-effort row in the
 # ``security_events`` table (queryable forensics, pruned on retention).
-# Closes M1.B #4; design in docs/features/security_event_log.md.
+# Closes M1.B #4; design in knowledge-base/knowledge/features/security_event_log.md.
 
 
 def _request_meta(request: Any) -> tuple[str | None, str | None, str | None]:
@@ -217,7 +217,7 @@ async def _denied(
 #                       project. Personal resources (threads, builder
 #                       sessions) become inaccessible since they have no
 #                       project. See open-question #3 in
-#                       ``docs/multi_tenancy.md``.
+#                       ``knowledge-base/knowledge/multi_tenancy.md``.
 #
 # Cookie / OIDC / PAT auth paths leave ``scopes`` empty or carry non-legacy
 # entries; the guards below short-circuit to "no narrowing" for anything
@@ -806,7 +806,7 @@ def redact_datasource(ds: dict[str, Any]) -> dict[str, Any]:
     F3 policy: credentials never leave the orchestrator over REST. The
     agent reads them via internal dispatch; the cockpit's edit form is
     expected to use a "leave blank to keep existing" UX. See
-    ``docs/multi_tenancy.md`` open-question #2 (decided: strip always).
+    ``knowledge-base/knowledge/multi_tenancy.md`` open-question #2 (decided: strip always).
     """
     if not ds:
         return ds

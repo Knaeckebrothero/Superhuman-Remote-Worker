@@ -1,7 +1,7 @@
 {{- if .Values.agent.stateless.enabled }}
 # Stateless executor Deployment — the `agent-stateless` class.
-# (docs/features/stateless_agents.md §5.8 deployment shape, §5.6 threat model;
-# docs/research/stateless_agents/implementation_log.md M5.)
+# (knowledge-base/knowledge/features/stateless_agents.md §5.8 deployment shape, §5.6 threat model;
+# knowledge-base/knowledge/research/stateless_agents/implementation_log.md M5.)
 #
 # A static pool of generic agent processes that PULL work units from the
 # run_queue instead of being provisioned per job/session. Mirrors the

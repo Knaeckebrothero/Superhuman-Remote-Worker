@@ -9,7 +9,7 @@ import {JOB_TOOL, NOTIFY_USER_TOOL} from './tool-card.model';
  * further tool calls). A turn carries an ordered list of typed events
  * (thoughts, plain-text blocks, and tool calls) as the agent emits them.
  *
- * See `docs/features/session_turn_rendering.md` for the design rationale.
+ * See `knowledge-base/knowledge/features/session_turn_rendering.md` for the design rationale.
  * The model is intentionally flat-with-types rather than nested: thoughts
  * and tools have a 1:N (not 1:1) cardinality at the event level, and the
  * renderer is free to merge them visually without distorting the data.
@@ -100,7 +100,7 @@ export interface AssistantTurn {
     /** True for turns synthesised by the reducer to absorb streaming events
      * that arrived without a preceding `turn.started` (e.g. SSE replay
      * cursor past the start event after a mid-turn reconnect). See
-     * docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
+     * knowledge-base/knowledge/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md
      * §Approach 2. The turn gets promoted to the real id (or closed) when
      * `turn.completed` / `turn.interrupted` finally arrives. */
     recovered?: boolean;
@@ -275,7 +275,7 @@ export function trailingText(turn: AssistantTurn): string {
  * This is the "answer, then a closing tool pass" case. Its most common shape is
  * a citation pass — the model writes its reply with inline [N] markers, then
  * calls cite_web/cite_document to register each one (see
- * docs/features/session_turn_rendering.md) — but a trailing verification
+ * knowledge-base/knowledge/features/session_turn_rendering.md) — but a trailing verification
  * `run_command` or a final `save_file` produces the same shape, so this is
  * category-agnostic rather than citation-specific (history rows may not even
  * carry a stamped category). Without it, a collapsed turn ending on such a pass

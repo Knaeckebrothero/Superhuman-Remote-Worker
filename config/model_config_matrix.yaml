@@ -26,10 +26,10 @@
 # Summarization budgets are deliberately NOT derived here: they are computed
 # at call time from the AUXILIARY model's own window (src/core/summarizer.py).
 # Deriving them from the main model's window sent 951k-token payloads to a
-# 131k summarizer — docs/features/context_summarization_rework.md.
+# 131k summarizer — knowledge-base/knowledge/features/context_summarization_rework.md.
 
 default:
-  # Reasoning control per family (see docs/features/family_centered_reasoning.md).
+  # Reasoning control per family (see knowledge-base/knowledge/features/family_centered_reasoning.md).
   # method: effort_enum | binary_toggle | token_budget | always_on | none
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   prompts:
@@ -60,7 +60,7 @@ default:
     # Per-image token cost for the compaction trigger. `default` is the flat
     # biased-high fallback used for unknown families and unreadable image dims;
     # multimodal families below override with a dimension-aware mode. Verified
-    # formulas: docs/done/context_token_accounting.md §4 + appendix.
+    # formulas: knowledge-history/done/context_token_accounting.md §4 + appendix.
     image_tokens: { mode: flat, flat: 1600 }
 
 minimax:
@@ -91,7 +91,7 @@ minimax:
     # reasoning_split moves it to reasoning_content/reasoning_details — fields
     # the reasoning capture layer already parses. Harmless via OpenRouter
     # (normalizes either way). See
-    # docs/issues/minimax_m3_think_tag_reasoning_leak_post_gateway.md
+    # knowledge-base/knowledge/issues/minimax_m3_think_tag_reasoning_leak_post_gateway.md
     extra_body:
       reasoning_split: true
 
@@ -146,7 +146,7 @@ minimax-m3:
     # Same as the `minimax` family: without reasoning_split MiniMax's direct
     # API returns thinking as <think> tags inside `content` (leaky titles,
     # duplicated streaming text, stray double closer on tool-call turns).
-    # See docs/issues/minimax_m3_think_tag_reasoning_leak_post_gateway.md
+    # See knowledge-base/knowledge/issues/minimax_m3_think_tag_reasoning_leak_post_gateway.md
     extra_body:
       reasoning_split: true
 
@@ -467,7 +467,7 @@ gpt-oss:
 #    `instructions_gemma.md` teach the canonical format with concrete examples
 #    and a positive contrast ("braces, never parens"). The runtime-side
 #    no-tool-call streak detector in `src/graph.py` is the safety net.
-#    Precipitating incident: docs/issues/gemma_tool_call_parser_loop.md.
+#    Precipitating incident: knowledge-base/knowledge/issues/gemma_tool_call_parser_loop.md.
 #
 # 2. Repetition loops: the structured-output (memory/curation) variants add
 #    explicit anti-repetition guidance to mitigate vllm#40080 (xgrammar JSON

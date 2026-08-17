@@ -7,7 +7,7 @@ the loader recognizes it the whole namespace is re-buried as ``extra["extra"]``
 and every ``extra`` key silently disappears from the new config.
 
 That is not a hypothetical: it is the root cause of
-``docs/issues/live_config_update_buries_extra_and_empties_the_shell_group.md``,
+``knowledge-base/knowledge/issues/live_config_update_buries_extra_and_empties_the_shell_group.md``,
 where the loss of ``extra.shell.mode`` dropped the session to the stateless floor
 and the shell tool group bound only ``shell_read``.
 """

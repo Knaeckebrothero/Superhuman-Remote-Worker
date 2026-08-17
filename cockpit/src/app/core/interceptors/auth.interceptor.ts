@@ -46,7 +46,7 @@ export const authInterceptor: HttpInterceptorFn = (
     // (file uploads die with net::ERR_FAILED) and buys nothing since ngsw
     // never caches non-GET/HEAD anyway. It is ngsw's only real opt-out;
     // dataGroup config only controls caching, not handling. See
-    // docs/issues/cockpit_service_worker_breaks_file_uploads.md.
+    // knowledge-base/knowledge/issues/cockpit_service_worker_breaks_file_uploads.md.
     modified = modified.clone({
       headers: modified.headers.set('X-CSRF', '1').set('ngsw-bypass', '1'),
     });

@@ -439,7 +439,7 @@ class TestFinalizeJobHeadCommit:
     short-circuit (``orchestrator/main.py``) can never fire in production —
     the exact defect the amendment identified: unit tests for the decision
     function pass ``head_commit`` in explicitly and stay green while the
-    real wiring is dead. See docs/superpowers/specs/
+    real wiring is dead. See knowledge-base/knowledge/superpowers/specs/
     2026-07-27-verification-fail-closed-design.md.
     """
 

@@ -4,7 +4,7 @@ Write-through companion to KnowledgeGraphDB. Every kb_write/kb_update
 call writes to Neo4j (source of truth) first, then upserts into this
 search index. Never edited directly — rebuilt from Neo4j if needed.
 
-See docs/features/project_knowledge_base.md for full architecture.
+See knowledge-base/knowledge/features/project_knowledge_base.md for full architecture.
 
 Usage:
     ```python
@@ -57,7 +57,7 @@ NOTE_ID_MAX = 100
 
 
 # TTL (in loop cycles) by note_type for KB convergence — see
-# docs/features/kb_convergence_ttl_reverification.md. ``None`` = no TTL (durable
+# knowledge-base/knowledge/features/kb_convergence_ttl_reverification.md. ``None`` = no TTL (durable
 # facts never expire on a clock; they're only retired by an explicit newer note).
 # Moving-target governance notes get a short TTL and are re-verified by the
 # knowledge-assembler aux pass when the counter runs out. Unknown types default to
@@ -702,7 +702,7 @@ class KnowledgeStore:
         killed *every* watermark write — the reindex wrote all its rows and then
         died on this last statement, so ``indexed_commit`` never advanced and
         each run re-embedded the whole vault
-        (docs/done/kb_reindex_watermark_never_advances.md). Casting at every
+        (knowledge-history/done/kb_reindex_watermark_never_advances.md). Casting at every
         occurrence pins both parameters to the column type regardless of which
         use Postgres resolves first. ``::varchar`` (unqualified) rather than
         ``::varchar(64)`` deliberately: a cast to a length-qualified type
@@ -1555,7 +1555,7 @@ class KnowledgeStore:
 
         Deliberately NOT ``list_notes`` with a bigger limit. Two differences,
         both load-bearing for a maintenance surface
-        (docs/features/knowledge_base_repo_separation.md §5a):
+        (knowledge-base/knowledge/features/knowledge_base_repo_separation.md §5a):
 
         1. **No ``path IS NOT NULL`` gate.** The read path (``kb_read``/
            ``kb_list``) is files-canonical and hides pathless rows on purpose.
@@ -1617,7 +1617,7 @@ class KnowledgeStore:
 
     # =========================================================================
     # TTL lifecycle — KB convergence
-    # (docs/features/kb_convergence_ttl_reverification.md)
+    # (knowledge-base/knowledge/features/kb_convergence_ttl_reverification.md)
     # =========================================================================
 
     async def decrement_ttl(self, project_id: uuid.UUID) -> int:

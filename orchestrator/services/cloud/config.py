@@ -10,7 +10,7 @@ actually consumed by ``NextcloudBackend`` today — the other two exist so
 Phase 2 (OpenCloud adapter) and Phase 5 (MS365 adapter) can start from a
 populated settings class instead of re-inventing env-var plumbing.
 
-See §4.2 of ``docs/features/main_cloud_abstraction.md``.
+See §4.2 of ``knowledge-base/knowledge/features/main_cloud_abstraction.md``.
 """
 
 from __future__ import annotations
@@ -356,7 +356,7 @@ def missing_secret_envs(
     run "just works". This helper lets the admin endpoints **refuse to activate**
     (PUT) or **warn before probing** (test) a backend whose real secrets are not
     wired, instead of silently connecting with dev credentials and failing at
-    the first cloud call. See ``docs/issues/main_cloud.md`` Issue 5.
+    the first cloud call. See ``knowledge-base/knowledge/issues/main_cloud.md`` Issue 5.
 
     Returns one ``{"field", "env_var", "checked"}`` entry per missing secret; an
     empty list means every required secret resolves to a non-empty value.

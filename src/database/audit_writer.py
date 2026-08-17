@@ -13,7 +13,7 @@ that loop via ``run_coroutine_threadsafe(...).result(timeout=...)``.
 Blocking the caller for one INSERT round-trip keeps the same latency class as
 the fire-and-forget write it replaces, so no call site changes.
 
-Design: ``docs/features/postgres_audit_store_implementation.md`` §5. Counterpart
+Design: ``knowledge-base/knowledge/features/postgres_audit_store_implementation.md`` §5. Counterpart
 reader is ``orchestrator/database/audit_store.py`` (PR 3); the schema is
 ``migrations/audit/0001_initial.sql``.
 

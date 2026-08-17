@@ -379,7 +379,7 @@ EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
 -- Migration: Main cloud abstraction — pluggable backend per project
--- (see docs/features/main_cloud_abstraction.md §4.4 and §6 for the
+-- (see knowledge-base/knowledge/features/main_cloud_abstraction.md §4.4 and §6 for the
 -- non-destructive switching rule).
 DO $$ BEGIN
     ALTER TABLE projects ADD COLUMN main_cloud_backend TEXT;
@@ -892,7 +892,7 @@ ALTER TABLE thread_messages
 -- ============================================================================
 -- 3. DATASOURCES TABLE
 -- External database connections that agents can use during job execution.
--- See docs/datasources.md for the full connector system design.
+-- See knowledge-base/knowledge/datasources.md for the full connector system design.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS datasources (

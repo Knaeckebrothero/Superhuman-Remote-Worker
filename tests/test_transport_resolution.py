@@ -1,6 +1,6 @@
 """Transport-resolvability policy tests.
 
-Guards docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md:
+Guards knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md:
 a session/role that can never start must be caught before a pod spawns.
 """
 

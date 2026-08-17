@@ -5,7 +5,7 @@
 --                rollout; readers/writers in orchestrator are migrated to
 --                consume this table instead). Forms the foundation for
 --                Phase 1 of the cloud-mirror workspace model
---                (docs/features/cloud_collaboration_model.md §9).
+--                (knowledge-base/knowledge/features/cloud_collaboration_model.md §9).
 --
 --                Each row describes one mount: where in the agent's workspace
 --                the surface appears (target_path), what kind of surface it

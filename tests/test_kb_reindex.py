@@ -1,6 +1,6 @@
 """Tests for OKF KB slice 3 PR3 — tree-diff reindexer.
 
-Design: docs/features/okf_knowledge_base.md §5 / §5.1 / §11 slice-3 PR3.
+Design: knowledge-base/knowledge/features/okf_knowledge_base.md §5 / §5.1 / §11 slice-3 PR3.
 
 The reindexer is the composition PR: watermark → git tree diff → parse changed
 notes (gardener parse_note_md) → chunk+embed (PR2) → persist (PR1 store surface)
@@ -2202,7 +2202,7 @@ def _function_body(src: str, signature: str) -> str:
 
 
 class TestPostJobReindexTriggerResolvesItsOwnRepo:
-    """Guard for docs/features/knowledge_base_repo_separation.md §10a.
+    """Guard for knowledge-base/knowledge/features/knowledge_base_repo_separation.md §10a.
 
     ``_reindex_project_kb`` resolves the vault repo (knowledge-role first,
     jobs as fallback) **only when it is not handed a ``repo_name``**. The

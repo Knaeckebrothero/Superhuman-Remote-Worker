@@ -417,7 +417,7 @@ class TestGitToolsIntegration:
 
 # ---------------------------------------------------------------------------
 # Attached repository datasources (repos/<name>/) — see
-# docs/issues/cloned_repo_checkout_cannot_reach_non_default_refs.md
+# knowledge-base/knowledge/issues/cloned_repo_checkout_cannot_reach_non_default_refs.md
 # ---------------------------------------------------------------------------
 
 

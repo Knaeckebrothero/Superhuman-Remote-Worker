@@ -755,7 +755,7 @@ describe('PersistentChatService — connect()', () => {
   });
 
   it('rehydrates an unanswered gate as not-run, never as completed or denied', async () => {
-    // docs/done/supervised_parallel_gates_timeout_fabricates_denial.md — the
+    // knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md — the
     // backend settles an unanswered gate as 'expired' | 'interrupted' |
     // 'unavailable'. History used to paint everything but 'denied'/'expired'
     // as completed, so a reload claimed tools had run that never did.
@@ -804,7 +804,7 @@ describe('PersistentChatService — connect()', () => {
   });
 
   it('dedupes a replayed thinking frame against the rendered history bubble', async () => {
-    // docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+    // knowledge-base/knowledge/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
     // After a cold connect paints the completed turn, the SSE replay cursor
     // can re-emit the trailing reasoning frame (gemma journals it after the
     // token run). It must not spawn a second `recovered:` thought bubble.
@@ -1737,7 +1737,7 @@ describe('PersistentChatService — SSE event dispatch', () => {
     // A dropped live stream (or a reload) must not strand a gate that is
     // still waiting on the user — otherwise it can never be answered and
     // times out. See
-    // docs/done/supervised_parallel_gates_timeout_fabricates_denial.md.
+    // knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md.
     const { service, es } = await setup();
     fireSseMessage(
       es,
@@ -1917,7 +1917,7 @@ describe('PersistentChatService — SSE event dispatch', () => {
 
   it('clears cloudSyncDegraded when the agent recovers sync at a turn boundary', async () => {
     // The agent retries the coordinator build each turn after a degraded
-    // attach (docs/done/session_resume_cloud_sync_race_late_provision.md).
+    // attach (knowledge-history/done/session_resume_cloud_sync_race_late_provision.md).
     // Leaving the warning up after it succeeds would tell the user their
     // edits aren't being saved when they are.
     const { service, es } = await setup();
@@ -2016,7 +2016,7 @@ describe('PersistentChatService — SSE event dispatch', () => {
     // end. Mapping anything != approved to 'denied' told the user they
     // refused calls they never saw — the same fabricated-denial class the
     // backend fix removed. See
-    // docs/done/supervised_parallel_gates_timeout_fabricates_denial.md
+    // knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md
     const { service, es } = await setup();
     const dispatched: { decision?: string }[] = [];
     const origDispatch = (service as any).dispatch.bind(service);
@@ -6521,7 +6521,7 @@ describe('PersistentChatService — usage.updated telemetry', () => {
   // ── Thread isolation ───────────────────────────────────────────────────
   // The service is a root singleton, so `usage` outlives any one session.
   // Regression net for
-  // docs/done/session_usage_panel_leaks_previous_session_counters.md —
+  // knowledge-history/done/session_usage_panel_leaks_previous_session_counters.md —
   // a brand-new session rendered the previous one's 154.6k input at Turn 0.
 
   it('does not render a previous session’s counters after a thread switch', async () => {
@@ -7025,7 +7025,7 @@ describe('PersistentChatService — renameThread', () => {
 
 // ---------------------------------------------------------------------------
 // Phase 2 — send-liveness kickstart, wake recovery, _openSse single-flight
-// (docs/features/session_reliability_and_transport_simplification.md)
+// (knowledge-base/knowledge/features/session_reliability_and_transport_simplification.md)
 // ---------------------------------------------------------------------------
 
 describe('PersistentChatService — Phase 2: send-liveness kickstart', () => {
@@ -7399,7 +7399,7 @@ describe('PersistentChatService — Phase 4: delta coalescing', () => {
 describe('PersistentChatService — session wake on job completion', () => {
   // A worker job the session created reached a terminal state and the
   // orchestrator injected the notice via POST /api/input with role='event'
-  // (docs/features/session_wake_on_job_completion.md).
+  // (knowledge-base/knowledge/features/session_wake_on_job_completion.md).
   //
   // Both halves matter and fail differently:
   //   * the live frame — without it the user watches a turn start and stream
@@ -7515,7 +7515,7 @@ describe('PersistentChatService — awaiting-turn state (queued input visibility
   // outbox empty, no active turn — composer back to idle/mic while the agent
   // was still flushing the previous turn's cloud push. pendingTurnCount is
   // the client-side ledger that keeps the send visibly alive.
-  // docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+  // knowledge-base/knowledge/issues/session_turn_end_cloud_push_blocks_queued_input.md
   let originalEs: any;
   let originalWs: any;
 

@@ -188,7 +188,7 @@ async def test_poll_cancels_cleanly(tmp_path: Path):
 # ---------------------------------------------------------------------------
 # Virtual directories: cloud sync is not a tool-layer consumer and must never
 # see (or write back into) a virtual prefix.
-# docs/features/virtual_directories.md
+# knowledge-base/knowledge/features/virtual_directories.md
 # ---------------------------------------------------------------------------
 
 
@@ -259,7 +259,7 @@ async def test_pull_write_back_does_not_hit_the_virtual_prefix(tmp_path: Path):
 # Fresh-pod economics: recursive remote tree, dedup seeding, reconcile.
 # All dedup state is process memory, so a recycled agent pod used to
 # re-upload (and re-download) the whole mount.
-# docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+# knowledge-base/knowledge/issues/session_turn_end_cloud_push_blocks_queued_input.md
 # ---------------------------------------------------------------------------
 
 

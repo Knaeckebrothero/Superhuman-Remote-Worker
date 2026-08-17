@@ -16,14 +16,14 @@ llm:
   # Tier 1) is the ONE retry authority for the main LLM call. Provider-SDK retries
   # here would multiply with the graph loop and burn the Tier-2 outage budget
   # 2–10× too fast. See
-  # docs/features/llm_outage_pause_and_backoff_redispatch.md §Hard preconditions.
+  # knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md §Hard preconditions.
   max_retries: 0
   # NOTE: do NOT declare max_output_tokens here, even as null. It is matrix-driven
   # (per-family settings.max_output_tokens in config/model_config_matrix.yaml,
   # clamped to the context window by _resolve_max_output_tokens). A base
   # declaration enters explicit_llm_keys and SHADOWS the family value the same way
   # a base model_max_context_tokens would (see
-  # docs/features/reasoning_aware_max_output_tokens.md). A per-job/expert override
+  # knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md). A per-job/expert override
   # still wins — it re-enters explicit_llm_keys with a real value.
   # Model-specific inference params (temperature, top_p, top_k, multimodal,
   # parallel_tool_calls) and context limits are set via config/model_config_matrix.yaml
@@ -45,7 +45,7 @@ llm:
 workspace:
   structure:
     # No tools/ here: the whole prefix is a virtual directory served from the
-    # live tool registry (docs/features/virtual_directories.md). Listing it
+    # live tool registry (knowledge-base/knowledge/features/virtual_directories.md). Listing it
     # made initialize() create an empty real directory that nothing ever wrote
     # to — dead scaffolding the virtual-dirs live gate flagged.
     - archive/
@@ -134,7 +134,7 @@ tools:
   # Graph tools - Neo4j operations (src/tools/graph/)
   # NOTE: Graph tools are no longer listed in defaults. They are injected
   # automatically when a Neo4j datasource is attached to the job.
-  # See docs/datasources.md for the datasource connector system.
+  # See knowledge-base/knowledge/datasources.md for the datasource connector system.
   graph: []
   # SQL tools - PostgreSQL operations (src/tools/sql/)
   # Injected automatically via datasource system
@@ -217,7 +217,7 @@ instruction_files:
     max_read_age_turns: 20
   # Cite-as-you-write: bound to the citation tools (not a phase) so it also fires
   # in persistent sessions, which have no phase loop. enforce=true → the agent must
-  # read it before its first citation. See docs/done/citation_engine_integration.md Phase 4.
+  # read it before its first citation. See knowledge-history/done/citation_engine_integration.md Phase 4.
   - skill: cite-as-you-write
     trigger: before_tool:cite_web
     enforce: true
@@ -236,7 +236,7 @@ limits:
   # Tier-1 in-process LLM retries for a transient outage before the worker
   # freezes the job for pause+backoff re-dispatch (Tier 2). 5 → 1+2+4+8+16s
   # ≈ 31s of hot-context coverage for a short blip, avoiding a re-dispatch.
-  # See docs/features/llm_outage_pause_and_backoff_redispatch.md.
+  # See knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md.
   llm_inproc_retries: 5
   response_validation:
     enabled: true
@@ -309,7 +309,7 @@ phase_settings:
   # Raised 20 -> 30 for the fewer-larger-phases model: a single execution phase
   # now covers work that used to be split across several. Note the cost — todo
   # bodies are injected verbatim on EVERY turn (see the ~15k/turn floor in
-  # docs/issues/phase_model_overhead_amnesia_loop.md F3), so this cap is also a
+  # knowledge-base/knowledge/issues/phase_model_overhead_amnesia_loop.md F3), so this cap is also a
   # per-turn token budget. Prefer coarser todos over more of them.
   max_todos: 30
 
@@ -331,7 +331,7 @@ research:
     port: null
 
 # Memory Light (RecallStore) — hybrid search memory for cross-context recall
-# See docs/features/memory_light.md for architecture details.
+# See knowledge-base/knowledge/features/memory_light.md for architecture details.
 memory:
   enabled: true                    # Opt-in per config
   required: false                  # When true, a memory-dependent job pauses for bounded re-dispatch instead of running blind if memory/KB fail to init (self-improvement loop sets this)
@@ -346,7 +346,7 @@ memory:
   project_scoped: true             # When true, memories are shared across all jobs in the same project
   # NOTE: the observer runs on the auxiliary LLM (see `auxiliary:` below) and
   # the embedding model comes from the EMBEDDING_* env vars — neither is
-  # configurable here (dead keys removed, docs/issues/memory_bugs.md B9).
+  # configurable here (dead keys removed, knowledge-base/knowledge/issues/memory_bugs.md B9).
   # MemoryManager seam (memory overhaul Phase 1). manager.enabled is the
   # cutover flag: true routes memory through the manager + the pipeline
   # below; false keeps the legacy direct-store paths in the graph. The
@@ -371,7 +371,7 @@ memory:
       - compaction_memory            # Store compaction summaries
       - queued_memory                # Flush todo_complete-queued memories
   # Phase-3+4 production-candidate stack, flipped on for the dev rollout
-  # (GATE B — docs/features/agent_memory_overhaul.md). Harness-measured:
+  # (GATE B — knowledge-base/knowledge/features/agent_memory_overhaul.md). Harness-measured:
   # R@5 0.20->1.0 at ~111 tok/q (80x cheaper than the full dump) and
   # knowledge-update end-task 0/4->3/4 once stale facts are retired.
   # ROLLBACK: set scorers/policies back to [] and ingestion.enabled false —
@@ -385,7 +385,7 @@ memory:
     # Transient faults (timeout/connection drop/5xx) retry in-call, then
     # degrade THAT TURN to hybrid order instead of failing the job; structural
     # failures (4xx/shape) stay job-fatal ("configured => required").
-    # docs/issues/reranker_transient_fault_hard_fails_job.md
+    # knowledge-base/knowledge/issues/reranker_transient_fault_hard_fails_job.md
     retries: 2                       # extra attempts after the first
     retry_backoff: 1.0               # seconds before retry 1, doubling after
   gate:
@@ -406,7 +406,7 @@ memory:
 # Auxiliary LLM — unified support task system for background LLM tasks.
 # Handles memory extraction, knowledge curation, and other support tasks
 # using structured output. Two modes: chain (in→out) and agent (in→tools→out).
-# See docs/features/auxiliary.md for full design.
+# See knowledge-base/knowledge/features/auxiliary.md for full design.
 auxiliary:
   enabled: true
   model: RedHatAI/gemma-4-31B-it-FP8-Dynamic  # Free local model for all support tasks
@@ -422,7 +422,7 @@ auxiliary:
       enabled: true
     curate_knowledge:
       enabled: true
-      verdict: true          # OKF KB slice 2 PR2 — adjudicate each curator write (ADD/UPDATE/SUPERSEDE/DISCARD) against existing notes before it lands. Fires only where the curator runs (loops); cost-guarded to neighbours >= review_floor. See docs/features/okf_knowledge_base.md §11.1.
+      verdict: true          # OKF KB slice 2 PR2 — adjudicate each curator write (ADD/UPDATE/SUPERSEDE/DISCARD) against existing notes before it lands. Fires only where the curator runs (loops); cost-guarded to neighbours >= review_floor. See knowledge-base/knowledge/features/okf_knowledge_base.md §11.1.
     assemble_memories:
       enabled: true
     # Citation verification (citation engine Phase 2): cite_* returns 'pending'
@@ -433,7 +433,7 @@ auxiliary:
 
 # Verification — auto-spawn a critic job after job_complete to review deliverables.
 # The critic either approves the job or resumes it with feedback.
-# See docs/features/verification_phase.md for full design.
+# See knowledge-base/knowledge/features/verification_phase.md for full design.
 verification:
   enabled: false         # Experts opt in when an independent critic is required
   critic_config: critic  # Which expert config to use for the reviewer
@@ -443,7 +443,7 @@ verification:
 # Runs CurateKnowledgeTask in agent mode to extract knowledge notes
 # into the project knowledge base (Neo4j + pgvector).
 # Requires a project_id in job metadata and Neo4j connection.
-# See docs/features/project_knowledge_base.md for full design.
+# See knowledge-base/knowledge/features/project_knowledge_base.md for full design.
 curator:
   enabled: false         # Opt-in per config or per project
 
@@ -492,7 +492,7 @@ autonomy: review
 # Image quality — resolution tier of images the agent receives
 # economy | standard | high (default standard). Higher = more visual detail and
 # more image tokens; resolved to a per-model-family max edge at the image seam.
-# See docs/issues/session_turn_hard_fails_on_transient_llm_outage.md (Track 1).
+# See knowledge-base/knowledge/issues/session_turn_hard_fails_on_transient_llm_outage.md (Track 1).
 image_quality: standard
 
 # Communication — agent-initiated messaging to humans via email

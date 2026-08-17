@@ -19,7 +19,7 @@
 #
 # and the inner loop is wedged until someone clears it by hand. Restarting Tilt
 # does not help — the lock lives in the cluster, not the process. Diagnosed
-# 2026-07-29; see docs/features/tilt_inner_loop_dev.md "Risks and known
+# 2026-07-29; see knowledge-base/knowledge/features/tilt_inner_loop_dev.md "Risks and known
 # gotchas".
 #
 # The recovery is to drop the pending revision's secret. The previous revision

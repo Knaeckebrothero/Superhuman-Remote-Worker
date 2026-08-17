@@ -156,7 +156,7 @@ def test_write_file_not_blocked_when_overlay_manager_absent():
 
     assert "Cloud staging guard" not in result
     # Absolute, not the caller's relative string — see
-    # docs/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md
+    # knowledge-base/knowledge/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md
     assert result == "Written: /workspace/cloud/notes/todo.md (2 chars)"
     assert workspace.write_calls == [("cloud/notes/todo.md", "hi")]
 

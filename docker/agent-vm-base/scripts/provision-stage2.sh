@@ -104,7 +104,7 @@ MaxStartups 10:30:100
 # Above the OpenSSH default (10): the agent multiplexes parallel tool execs
 # plus persistent SFTP/shell channels over ONE transport; mirrors
 # docker/Dockerfile.workspace. See
-# docs/issues/maxsessions_parallel_tools_false_workspace_death.md
+# knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md
 MaxSessions 16
 SSHEOF
 
@@ -138,7 +138,7 @@ EOF
 #
 # The binary is installed in stage1. Here we place the loopback / auth-none
 # config and a DISABLED systemd unit. The management daemon runs
-# `systemctl start code-server` on IDE request (see docs/features/
+# `systemctl start code-server` on IDE request (see knowledge-base/knowledge/features/
 # vm_snapshots_and_ide.md, "Live-VM IDE Access via the Agent"); we deliberately
 # do NOT enable it, so it stays dormant during normal headless job runs.
 # -----------------------------------------------------------------------------
@@ -269,7 +269,7 @@ sudo -u agent-host git config --global core.pager cat
 # The agent drives this over SSH (src/tools/context.py) so Chrome's CDP stays on
 # the workspace loopback and never crosses the network. It is the agent's ONLY
 # browser path — the in-pod fallback was removed deliberately
-# (docs/issues/remove_local_browser_fallback.md) — so a workspace without
+# (knowledge-base/knowledge/issues/remove_local_browser_fallback.md) — so a workspace without
 # browser-exec cannot render at all. It fails opaquely, too: the tool returns
 # "browser-exec returned no output" and the agent concludes no renderer exists
 # anywhere, then remembers that conclusion.

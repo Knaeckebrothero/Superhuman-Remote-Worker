@@ -1,7 +1,7 @@
 """run_queue SQL contract — claim, lease, fence, completion (§5.1/§5.2).
 
 The work-queue + recorded-lease substrate of the stateless-agents design
-(docs/features/stateless_agents.md). Both the orchestrator (enqueue paths,
+(knowledge-base/knowledge/features/stateless_agents.md). Both the orchestrator (enqueue paths,
 reaper, read models) and the agent executor (claim, heartbeat, fence,
 complete, release) import THIS module, so the semantics live in exactly one
 place. Pure functions over an asyncpg connection or pool; SQL as module

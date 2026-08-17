@@ -5,8 +5,8 @@ resolver, the before_tool/phase-start consumers resolving via entry.path, the
 flag-independent serialize channel for bound skills, and the migration of the
 two bundled guides (research-guide, todo-guide).
 
-Design: docs/features/agent_skills.md (Slice 3).
-Plan:   docs/superpowers/plans/2026-06-19-skills-slice-3.md
+Design: knowledge-base/knowledge/features/agent_skills.md (Slice 3).
+Plan:   knowledge-base/knowledge/superpowers/plans/2026-06-19-skills-slice-3.md
 """
 
 import pytest

@@ -1644,7 +1644,7 @@ class TestExecuteTurnInterrupt:
 
 class TestExecuteTurnIncrementalPersistence:
     """persist_message must fire for each message the instant it's produced, so
-    a mid-turn crash keeps the tail (docs/issues/...midturn_message_loss.md)."""
+    a mid-turn crash keeps the tail (knowledge-base/knowledge/issues/...midturn_message_loss.md)."""
 
     def _sequenced_llm(self, responses):
         """LLM whose astream yields a different response on each call."""
@@ -3381,7 +3381,7 @@ class TestToolExecutionLoop:
         # (legacy bool False == PermissionOutcome.DECLINED) says "declined";
         # only a real user decision may claim the user refused — an
         # unanswered gate must not (see
-        # docs/done/supervised_parallel_gates_timeout_fabricates_denial.md).
+        # knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md).
         tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
         assert any("declined" in m.content.lower() for m in tool_msgs)
 
@@ -4156,7 +4156,7 @@ class TestHardInterruptHelpers:
 class TestExecuteTurnReasoning:
     """Reasoning frames carry the AI message id and are emitted exactly once.
 
-    docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+    knowledge-base/knowledge/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
     """
 
     @pytest.mark.asyncio

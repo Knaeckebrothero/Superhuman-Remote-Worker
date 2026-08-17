@@ -4,7 +4,7 @@ The officer decides WHAT gets worked; this decides only WHEN a ready ticket
 becomes a job. Every judgment call stays his: classification, arming a ticket,
 reviewing an outcome, re-arming it. The tick's whole job is to notice that a
 pool has a free slot and an authorized ticket, and to close that gap within a
-minute instead of whenever he next wakes (docs/features/officer_backlog_pools.md
+minute instead of whenever he next wakes (knowledge-base/knowledge/features/officer_backlog_pools.md
 §5).
 
 **Claims are one-shot.** A ticket is claimed the moment a job carries its id —

@@ -4,7 +4,7 @@ Covers ``services/thread_uploads.py`` across all four workspace tiers. The
 ``virtual`` tier is the interesting one: it has no workspace pod by design, so
 before this existed every attachment 409'd with a transient-sounding message
 that could never come true (see
-``docs/issues/session_uploads_never_implemented_for_lite_workspace_tiers.md``).
+``knowledge-base/knowledge/issues/session_uploads_never_implemented_for_lite_workspace_tiers.md``).
 
 The object-store path runs over ``InMemoryObjectStore`` — the same double the
 virtual backend's own contract tests use — so nothing here needs rclone or SSH.

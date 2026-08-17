@@ -1,5 +1,5 @@
 /**
- * Instant-landing draft sessions (docs/features/instant_landing_session.md):
+ * Instant-landing draft sessions (knowledge-base/knowledge/features/instant_landing_session.md):
  * `/` shows an open composer with no thread; the first send creates the
  * session with a reviewed body (title, default project, connector selection) and
  * the queued message rides the outbox into the new thread. The orchestrator

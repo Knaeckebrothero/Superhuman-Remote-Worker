@@ -410,7 +410,7 @@ export class ProjectListPageComponent implements OnInit {
   readonly formDescription = signal('');
   readonly formGoal = signal('');
 
-  /** External-KB opt-in (see docs/features/external_forge_knowledge_base.md).
+  /** External-KB opt-in (see knowledge-base/knowledge/features/external_forge_knowledge_base.md).
    *  Off ⇒ the create body carries no `external_kb` key at all and the backend
    *  provisions the internal forge repo exactly as before. */
   readonly useExternalKb = signal(false);

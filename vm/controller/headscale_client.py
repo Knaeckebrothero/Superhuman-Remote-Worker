@@ -8,7 +8,7 @@ Used by the VM controller to:
 Requires HEADSCALE_URL and HEADSCALE_API_KEY environment variables.
 When not configured, all methods return None/False (graceful degradation).
 
-See docs/features/headscale_mesh.md for the full design.
+See knowledge-base/knowledge/features/headscale_mesh.md for the full design.
 """
 
 import logging
@@ -62,7 +62,7 @@ class HeadscaleClient:
         Headscale is unreachable — see ``is_ready`` for a health signal. A
         transient outage must never permanently disable mesh networking:
         that is exactly the latch that made every VM boot keyless and
-        unreachable (docs/issues/
+        unreachable (knowledge-base/knowledge/issues/
         vm_controller_headscale_latch_kills_provisioning.md).
         """
         return self._configured

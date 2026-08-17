@@ -206,7 +206,7 @@ async def test_register_raises_on_409_for_thread_bound():
     DuplicateThreadBinding so the dedicated-mode lifespan can exit the pod
     cleanly — leaving the per-session Service endpoints instead of lingering as
     an orphan that black-holes connections. See
-    docs/done/persistent_thread_double_provisioning_race.md."""
+    knowledge-history/done/persistent_thread_double_provisioning_race.md."""
     from src.api.orchestrator_client import DuplicateThreadBinding
 
     client = OrchestratorClient(

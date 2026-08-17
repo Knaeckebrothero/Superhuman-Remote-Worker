@@ -8,7 +8,7 @@ advance the per-KB watermark — only at the end, and only on a clean run, so an
 interrupted or failed reindex self-heals on the next pass (§5: "git is the
 Merkle tree").
 
-Design: docs/features/okf_knowledge_base.md §5 / §5.1 / §11 slice-3 PR3.
+Design: knowledge-base/knowledge/features/okf_knowledge_base.md §5 / §5.1 / §11 slice-3 PR3.
 
 Dependencies are injected (gitea client, KnowledgeStore, EmbeddingService) so the
 flow is unit-testable and trigger sites (post-merge, job-start, leader-gated
@@ -1133,7 +1133,7 @@ async def _reindex_snapshot(
 async def resolve_kb_repo(postgres_db: Any, project_id: str) -> Optional[KbRepoRef]:
     """Resolve a project's KB vault location and secret-free auth handle.
 
-    Precedence (docs/features/knowledge_base_repo_separation.md §5):
+    Precedence (knowledge-base/knowledge/features/knowledge_base_repo_separation.md §5):
 
     1. the project's ``knowledge``-role repo, if it has one;
     2. otherwise its ``jobs`` repo — the vault's original home, and where

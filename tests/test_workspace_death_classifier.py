@@ -1,6 +1,6 @@
 """Unit tests for the workspace-death legibility classifier.
 
-Slice 1 of docs/features/workspace_resource_pressure_resilience.md — turn a
+Slice 1 of knowledge-base/knowledge/features/workspace_resource_pressure_resilience.md — turn a
 workspace pod's terminated-container facts into a legible cause + an
 is-resource-kill escalation signal, so an OOM stops masquerading as an SSH blip.
 """

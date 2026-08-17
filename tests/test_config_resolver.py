@@ -272,7 +272,7 @@ def test_request_override_context_window_drives_derived_limits():
     This is the mechanism the orchestrator's ``_seed_registry_model_overrides``
     relies on so an admin's Admin -> Models ``context_window`` survives the blob
     dispatch path. Regression guard for
-    ``docs/issues/per_model_context_window_override_shadowed_in_blob_dispatch.md``
+    ``knowledge-base/knowledge/issues/per_model_context_window_override_shadowed_in_blob_dispatch.md``
     (job 19707fa1: minimax-m3 baked 1000000/800000 despite a registry cap of
     262144). Matrix-independent: the override value itself drives the result.
     """

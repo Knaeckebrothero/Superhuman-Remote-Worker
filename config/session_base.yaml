@@ -14,7 +14,7 @@ display_name: Framework Session Base
 # Image quality — resolution tier of images the agent receives
 # economy | standard | high (default standard). Resolved to a per-model-family
 # max edge at the image seam; overridable per session via config_override.
-# See docs/issues/session_turn_hard_fails_on_transient_llm_outage.md (Track 1).
+# See knowledge-base/knowledge/issues/session_turn_hard_fails_on_transient_llm_outage.md (Track 1).
 image_quality: standard
 
 llm:
@@ -30,7 +30,7 @@ llm:
   # (per-family in config/model_config_matrix.yaml, clamped to the context window by
   # _resolve_max_output_tokens). A base declaration enters explicit_llm_keys and
   # SHADOWS the family value; per-job/expert overrides still win. See
-  # docs/features/reasoning_aware_max_output_tokens.md.
+  # knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md.
   # multimodal and parallel_tool_calls are set per model family
   # in config/model_config_matrix.yaml — do not set them here.
 
@@ -201,7 +201,7 @@ memory:
       - pre_compaction_extractor       # Chunked extraction of the evicted slice before compaction
       - teardown_extractor             # Final extraction on session end / idle archive
   # Phase-3+4 production-candidate stack, flipped on for the dev rollout
-  # (GATE B — docs/features/agent_memory_overhaul.md). Harness-measured:
+  # (GATE B — knowledge-base/knowledge/features/agent_memory_overhaul.md). Harness-measured:
   # R@5 0.20->1.0 at ~111 tok/q and knowledge-update end-task 0/4->3/4.
   # ROLLBACK: scorers/policies back to [] + ingestion.enabled false (the
   # legacy two-tier read + cosine-dedup write stay in place behind the flags).
@@ -253,7 +253,7 @@ auxiliary:
       enabled: true
     assemble_memories:
       # Worker-only: no persistent code path calls assemble_memories, so
-      # enabling it here is a no-op (docs/issues/memory_bugs.md B3). Whether
+      # enabling it here is a no-op (knowledge-base/knowledge/issues/memory_bugs.md B3). Whether
       # to wire or retire the assembler is a memory-overhaul decision.
       enabled: false
     # Citation verification (citation engine Phase 2): cite_* returns 'pending'

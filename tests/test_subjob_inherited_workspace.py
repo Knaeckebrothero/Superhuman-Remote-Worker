@@ -2,7 +2,7 @@
 
 Regression coverage for two coupled issues:
 
-* docs/issues/subjob_inherits_stale_workspace_container_snapshot.md — a
+* knowledge-base/knowledge/issues/subjob_inherits_stale_workspace_container_snapshot.md — a
   scholar/critic subjob copies the parent's ``workspace_container`` / ``vm``
   context by value at spawn time. When the scholar is spawned ~3s after its
   parent (before the parent pod is ready) that snapshot is frozen at
@@ -10,7 +10,7 @@ Regression coverage for two coupled issues:
   ``init_workspace``. ``_resolve_subjob_inherited_workspace`` re-reads the
   parent's LIVE context at dispatch and overlays it.
 
-* docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md —
+* knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md —
   when the parent has NO workspace at scholar-spawn (idle cluster), the scholar
   inherits nothing and self-provisions its OWN pod, writing its own
   ``workspace_container`` into context. The old resolver keyed the inherit path
@@ -120,7 +120,7 @@ class TestSelfProvisionedDiscrimination:
     workspace that will never exist.
 
     Regression for
-    docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
+    knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
     The old resolver keyed off presence of ``workspace_container`` / ``vm`` and
     so misclassified these as inheriting.
     """
@@ -227,7 +227,7 @@ class TestContainerInheritance:
         inherit window anchored on the outage's scheduled wake
         (context.llm_outage.next_retry_at) — keyed on created_at, a resume 3h
         after spawn would insta-fail on any transiently non-ready parent
-        workspace (docs/features/llm_outage_subjob_resilience.md #5)."""
+        workspace (knowledge-base/knowledge/features/llm_outage_subjob_resilience.md #5)."""
         patch_get_job(
             {
                 "status": "waiting",

@@ -19,7 +19,7 @@
   assertions can check the *actual bucket contents* after a bad upload, not
   just what was called.
 
-See docs/features/workspace_durability_tiering.md §C2/§C3.
+See knowledge-base/knowledge/features/workspace_durability_tiering.md §C2/§C3.
 """
 
 import hashlib

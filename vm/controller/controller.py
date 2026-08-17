@@ -19,8 +19,8 @@ controller generates short-lived auth keys via the Headscale API and injects
 them into cloud-init so VMs join the tailnet on boot. Agent pods run a
 Tailscale sidecar and route directly to VMs via 100.64.x.y addresses.
 
-See docs/features/headscale_mesh.md for the mesh VPN design.
-See docs/features/vm_backend.md (Phase 3) and docs/features/nats.md.
+See knowledge-base/knowledge/features/headscale_mesh.md for the mesh VPN design.
+See knowledge-base/knowledge/features/vm_backend.md (Phase 3) and knowledge-base/knowledge/features/nats.md.
 """
 
 import asyncio
@@ -93,7 +93,7 @@ VM_STORAGE_CLASS = os.environ.get("VM_STORAGE_CLASS", "local-path")
 VM_DISK_SIZE = os.environ.get("VM_DISK_SIZE", "20Gi")
 
 # Golden-image boot acceleration
-# (docs/features/vm_golden_image_boot_acceleration.md). When enabled, the base
+# (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md). When enabled, the base
 # image is imported ONCE into a standalone "golden" DataVolume/PVC per image
 # digest, and each VM's root disk is a CDI clone of it (host-assisted local copy
 # on local-path) instead of a per-VM registry import. Off by default →
@@ -114,7 +114,7 @@ VM_GOLDEN_GC_ENABLED = os.environ.get(
 VM_GOLDEN_KEEP = int(os.environ.get("VM_GOLDEN_KEEP", "3"))
 VM_GOLDEN_GC_MIN_AGE_MINUTES = int(os.environ.get("VM_GOLDEN_GC_MIN_AGE_MINUTES", "30"))
 
-# Persistent rootdisks (docs/features/vm_persistent_rootdisk.md). When enabled,
+# Persistent rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md). When enabled,
 # the VM's root disk is created as a STANDALONE DataVolume — same deterministic
 # name the template already renders — instead of via spec.dataVolumeTemplates.
 # Without an ownerRef it is not cascade-deleted with the VM, so a recreate
@@ -762,7 +762,7 @@ class VMController:
         # while stale handlers were still parked in the wait; when the golden
         # finally succeeded, the racers collided in 409 AlreadyExists and failed
         # two loop jobs. The orchestrator polls create until the golden is
-        # ready (see docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md).
+        # ready (see knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md).
         # Checked FIRST so a poll doesn't mint a fresh Headscale auth key every
         # ~30s for the whole import window.
         #
@@ -799,7 +799,7 @@ class VMController:
         # provisioning budget — 3 × 10 min — before the job fails. Defer the
         # create instead, mirroring waiting_golden: no VM is built, so the
         # dispatcher polls without consuming a provision attempt. See
-        # docs/issues/vm_controller_headscale_latch_kills_provisioning.md.
+        # knowledge-base/knowledge/issues/vm_controller_headscale_latch_kills_provisioning.md.
         tailscale_auth_key = ""
         if self.headscale.is_available:
             tailscale_auth_key = await self.headscale.create_auth_key(job_id) or ""
@@ -864,7 +864,7 @@ class VMController:
                     # live VM with this name IS this job's VM — a duplicate or
                     # racing create lost to one that already succeeded. Treat
                     # as idempotent success; propagating the 409 as a 'failed'
-                    # status parked two healthy loop jobs (see docs/issues/
+                    # status parked two healthy loop jobs (see knowledge-base/knowledge/issues/
                     # golden_image_cold_import_fails_inflight_vm_jobs.md §B).
                     log.info(
                         "VM %s already exists (job %s) — idempotent create",
@@ -1282,7 +1282,7 @@ class VMController:
 
     # =========================================================================
     # Golden-image cloning
-    # (docs/features/vm_golden_image_boot_acceleration.md)
+    # (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md)
     #
     # All K8s calls go through asyncio.to_thread — the kubernetes client is
     # synchronous and a blocking poll here would stall every other NATS/HTTP
@@ -1752,7 +1752,7 @@ class VMController:
         """Delete orphaned rootdisk DataVolumes — no VirtualMachine, older than
         VM_ROOTDISK_ORPHAN_HOURS.
 
-        Layer 3 of the rootdisk GC (docs/features/vm_persistent_rootdisk.md D4),
+        Layer 3 of the rootdisk GC (knowledge-base/knowledge/features/vm_persistent_rootdisk.md D4),
         and the only layer that can reach a disk whose entity row is gone from
         the orchestrator's DB entirely.
 

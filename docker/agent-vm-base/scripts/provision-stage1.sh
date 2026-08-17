@@ -179,7 +179,7 @@ rm /tmp/rclone.deb
 rclone version
 
 # fuse-overlayfs version gate — the overlay-over-rclone spike (see
-# docs/superpowers/plans/2026-07-09-protected-cloud-mode-phase0-spike.md)
+# knowledge-base/knowledge/superpowers/plans/2026-07-09-protected-cloud-mode-phase0-spike.md)
 # needs the big-dir/readdir fixes that landed in 1.13. Fail the build loudly
 # rather than silently shipping a too-old binary.
 #
@@ -309,7 +309,7 @@ sudo corepack enable
 # 8. code-server (Web IDE for live-VM IDE sessions)
 #     Pinned upstream .deb + SHA256 (same pattern as rclone in section 3b).
 #     Reached only through the agent's authenticated SSH direct-tcpip channel
-#     to guest loopback — see docs/features/vm_snapshots_and_ide.md
+#     to guest loopback — see knowledge-base/knowledge/features/vm_snapshots_and_ide.md
 #     "Live-VM IDE Access via the Agent" — so it binds 127.0.0.1 with auth
 #     disabled; that config + a (disabled) systemd unit land in stage2. The
 #     .deb bundles its own Node runtime and does NOT use the system Node.js

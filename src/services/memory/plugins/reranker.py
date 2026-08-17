@@ -9,7 +9,7 @@ credential plumbing. It deliberately does NOT ride the auxiliary model: the
 auxiliary is a freely-swapped chat model that may be OpenRouter-direct (no
 explicit ``base_url``) or a provider that serves no ``/rerank`` route —
 coupling to it crashed session startup and silently no-op'd reranking. See
-``docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md``.
+``knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md``.
 
 Motivated by the Phase-2 baseline finding: hybrid retrieval surfaces
 the evidence memory at ~rank 13 of ~122 injected items on the seam arm
@@ -26,7 +26,7 @@ Scope discipline:
 - At most ``memory.reranker.top_k`` candidates go to the endpoint; the
   remainder keeps its original (hybrid) order behind the reranked head.
 - Failure semantics split by cause (mirrors the main-LLM retry
-  classifier; docs/issues/reranker_transient_fault_hard_fails_job.md):
+  classifier; knowledge-base/knowledge/issues/reranker_transient_fault_hard_fails_job.md):
   *transient* transport faults — timeouts, connection errors/resets,
   5xx/429 — get a bounded in-call retry with backoff, and if they
   persist the scorer raises ``TransientScorerError`` so the manager can

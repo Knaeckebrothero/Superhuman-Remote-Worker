@@ -483,7 +483,7 @@ class TestProcessDatasourcesRepoGuard:
 
 class TestDeclaredReadOnlyIndexNote:
     """Public datasources declared read-only get an advisory index note
-    (docs/features/public_datasources.md — declarative, not enforced)."""
+    (knowledge-base/knowledge/features/public_datasources.md — declarative, not enforced)."""
 
     def test_declared_ro_repo_notes_in_index(self):
         ws = make_workspace_manager()

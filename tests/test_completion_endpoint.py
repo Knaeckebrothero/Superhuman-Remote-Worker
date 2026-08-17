@@ -548,7 +548,7 @@ class TestVerificationInstructionsDelivery:
     passed to ``create_job`` (which has no ``instructions`` parameter) — so
     every critic since the orchestrator migration ran on a generic
     description instead of the rendered brief. See
-    docs/superpowers/plans/2026-07-27-verification-fail-closed.md Task 7.
+    knowledge-base/knowledge/superpowers/plans/2026-07-27-verification-fail-closed.md Task 7.
     """
 
     def test_prior_findings_rendered_into_template(self):

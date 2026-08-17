@@ -230,7 +230,7 @@ def resolve_ssh_target(context: dict) -> Optional[tuple[str, int]]:
     headless Service from `7fb9e9e2`) is preferred over the ephemeral
     ``pod_ip``: a workspace pod that restarted keeps its Service name but not
     its IP, and dialing the stale IP was the residual "No route to host"
-    source in the sweeper (docs/done/
+    source in the sweeper (knowledge-history/done/
     ide_settings_sweeper_probes_stale_workspace_endpoints.md, residual
     hardening). ``pod_ip`` stays as the fallback for legacy context rows that
     predate the headless Service. Returns None when no reachable target
@@ -723,7 +723,7 @@ async def _ssh_tar_to_file(
     the snapshot_service transport, narrowed to one path. The remote command is
     wrapped in ``bash -c`` with a PIPESTATUS-discriminated verdict so a masked
     upstream ``tar`` failure can't hide behind ``zstd``'s own exit code (see
-    docs/features/workspace_durability_tiering.md §C1d). Returns False on error.
+    knowledge-base/knowledge/features/workspace_durability_tiering.md §C1d). Returns False on error.
     """
     from services import resolve_ssh_key_path
 

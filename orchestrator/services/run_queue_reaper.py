@@ -13,7 +13,7 @@ already committed receipt is authoritative and is terminalized without
 duplication. Post-steal is a
 sanctioned writer-exclusion context for ``append_system_frame``: the steal's
 ``lease_token`` bump already fenced the previous holder's persists, and the
-epoch bump retires its in-memory seq counter (docs/features/stateless_agents.md
+epoch bump retires its in-memory seq counter (knowledge-base/knowledge/features/stateless_agents.md
 §5.3.2, system-writer class).
 
 Leadership is a session-scoped advisory lock (``RUN_QUEUE_REAPER_ID``,

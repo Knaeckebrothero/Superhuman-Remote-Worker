@@ -9,7 +9,7 @@ e2e below has **not** been run. Design/impl recorded in the plan
 `~/.claude/plans/okay-then-let-s-do-golden-quail.md`; this doc is the operational
 evidence that remains. Record the image `sha-…` and results inline when run.
 
-Origin: the readiness-surfacing follow-up to `docs/features/okf_knowledge_base.md`
+Origin: the readiness-surfacing follow-up to `knowledge-base/knowledge/features/okf_knowledge_base.md`
 (§4 "tools show status during partial/indexing/failed" + §10). Before this work,
 KB indexing was fire-and-forget and near-invisible: agents got a bare "no matches"
 on a not-yet-indexed KB (indistinguishable from a genuine miss), the Cockpit badge
@@ -152,6 +152,6 @@ While the KB from §2 is still `pending`/`indexing`:
 - [ ] Follow-ups filed for anything failed.
 
 When all boxes tick, note "index-readiness surfacing LIVE-VERIFIED <date>" in
-`docs/done/okf_knowledge_base.md` (Status block). **If any box fails**, move
-`docs/done/okf_knowledge_base.md` back to `docs/features/` (reopen) and record the
+`knowledge-history/done/okf_knowledge_base.md` (Status block). **If any box fails**, move
+`knowledge-history/done/okf_knowledge_base.md` back to `knowledge-base/knowledge/features/` (reopen) and record the
 gap here.

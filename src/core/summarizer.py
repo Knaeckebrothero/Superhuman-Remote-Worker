@@ -1,6 +1,6 @@
 """Aux-budgeted rolling-fold summarization engine.
 
-Design: docs/features/context_summarization_rework.md (slices S1+S2).
+Design: knowledge-base/knowledge/features/context_summarization_rework.md (slices S1+S2).
 
 Replaces the recursive map-reduce path (``_recursive_summarize``) and the
 unstructured fallback that used to live in

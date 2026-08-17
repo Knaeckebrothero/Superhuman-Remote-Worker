@@ -43,7 +43,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       # App schema is built from the migration chain (orchestrator startup +
       # `python init.py`), not an initdb snapshot — the frozen schema.sql
-      # drifted from migrations. See docs/features/database_roadmap.md Phase 2b.
+      # drifted from migrations. See knowledge-base/knowledge/features/database_roadmap.md Phase 2b.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-srw}"]
       interval: 5s
@@ -77,7 +77,7 @@ services:
     volumes:
       - postgres_vector_data:/var/lib/postgresql/data
       # Vector schema is built from the migration chain, not an initdb snapshot.
-      # See docs/features/database_roadmap.md Phase 2b.
+      # See knowledge-base/knowledge/features/database_roadmap.md Phase 2b.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${VECTOR_POSTGRES_USER:-srw}"]
       interval: 5s

@@ -12,7 +12,7 @@ operation finishes. Nothing is cached across tool calls, so there is no
 keepalive/reconnect machinery and a dead mail host fails fast instead of
 wedging the tool node.
 
-Correctness rules enforced here (see docs/features/email_datasource.md,
+Correctness rules enforced here (see knowledge-base/knowledge/features/email_datasource.md,
 "IMAP correctness caveats"):
 
 - Read paths open folders with EXAMINE (``readonly=True``) and fetch with

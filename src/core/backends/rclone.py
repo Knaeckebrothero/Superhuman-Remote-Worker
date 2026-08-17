@@ -1,7 +1,7 @@
 """rclone-subprocess :class:`ObjectStore` — the production virtual-tier transport.
 
 Chosen for provider continuity with ``RcloneMountSpec``
-(``docs/features/no_workspace_agent_mode.md`` §5): the same ``{type, config}``
+(``knowledge-base/knowledge/features/no_workspace_agent_mode.md`` §5): the same ``{type, config}``
 remote descriptor that drives FUSE mounts on full workspaces describes the
 explicit-op remote here, so S3, WebDAV, Drive, etc. all work from one spec.
 

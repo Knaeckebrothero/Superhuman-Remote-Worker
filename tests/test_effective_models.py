@@ -3,7 +3,7 @@
 The pure helper mirrors the dispatch precedence + the agent's get_phase_config
 fallback so the create-form picker can show the model that will actually run when
 left untouched. See
-docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md (Layer 3).
+knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md (Layer 3).
 """
 
 from __future__ import annotations

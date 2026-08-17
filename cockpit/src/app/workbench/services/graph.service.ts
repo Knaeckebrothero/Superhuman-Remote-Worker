@@ -39,7 +39,7 @@ export class GraphService {
   constructor() {
     // Graph navigation is self-contained (its own currentIndex); it no longer
     // syncs to the removed global timeline slider. See
-    // docs/features/debug_audit_view_refactor.md (Phase 2c / P3).
+    // knowledge-base/knowledge/features/debug_audit_view_refactor.md (Phase 2c / P3).
   }
 
   // Computed values

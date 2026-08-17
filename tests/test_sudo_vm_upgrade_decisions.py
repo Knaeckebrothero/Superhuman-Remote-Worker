@@ -1,7 +1,7 @@
 """Tests for the vm_upgrade decision paths (reap-and-restore fix spec).
 
 Covers the orchestrator-side decision plumbing added by
-docs/issues/vm_upgrade_pause_workspace_reaped_before_approval.md:
+knowledge-base/knowledge/issues/vm_upgrade_pause_workspace_reaped_before_approval.md:
 
 - `_job_frozen_for_vm_upgrade` — freeze-shape predicate.
 - `_apply_vm_upgrade_decision` — the single driver behind ALL four decision

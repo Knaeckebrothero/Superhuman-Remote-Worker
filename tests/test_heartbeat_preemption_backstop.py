@@ -1,7 +1,7 @@
 """An agent must learn its job was terminated out from under it.
 
 Regression guard for Defect 3 of
-docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
+knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
 
 The heartbeat was one-directional: the agent asserted liveness and learned
 nothing back. Job c6dd288d was failed at ~09:27:46 and kept streaming until
@@ -14,7 +14,7 @@ the 13+ call sites that can write a terminal status without sending one.
 The deployed handler is dual_app, which for months read only
 ``intents.should_drain`` and ignored ``job_status`` — every out-of-band
 steer/pause/cancel left the incumbent pod running to natural END as an orphan
-(P0-D of docs/issues/officer_blind_reads_and_worker_bureaucracy.md). The
+(P0-D of knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md). The
 second half of this file guards the dual_app port. Note the response carries
 no job-id echo: the orchestrator derives ``job_status`` from the job id THIS
 pod sent in its heartbeat, so "denied status for some other job" is not a

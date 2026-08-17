@@ -15,7 +15,7 @@ import {authInterceptor} from './auth.interceptor';
  * which corrupts multipart bodies (file uploads fail with net::ERR_FAILED).
  * `ngsw-bypass` is ngsw's only real opt-out — dataGroup config only
  * controls caching, not handling. See
- * docs/issues/cockpit_service_worker_breaks_file_uploads.md.
+ * knowledge-base/knowledge/issues/cockpit_service_worker_breaks_file_uploads.md.
  *
  * Since Slice 2 the header is load-bearing for a SECOND, independent reason:
  * a service worker that answers with respondWith() destroys XHR upload
@@ -75,7 +75,7 @@ describe('authInterceptor', () => {
     // Two independent reasons, and only the first is recorded anywhere else:
     //   1. ngsw re-issues intercepted requests via scope.fetch(), which
     //      corrupts multipart bodies (the net::ERR_FAILED outage in
-    //      docs/done/cockpit_service_worker_breaks_file_uploads.md).
+    //      knowledge-history/done/cockpit_service_worker_breaks_file_uploads.md).
     //   2. A service worker that calls respondWith() destroys XHR upload
     //      progress outright: the browser reports progress on the request it
     //      actually sends, and the SW's re-issued fetch is not that request.

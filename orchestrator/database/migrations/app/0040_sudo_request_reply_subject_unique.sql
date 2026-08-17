@@ -2,7 +2,7 @@
 -- description:   Partial unique index on sudo_approval_requests.nats_reply_subject
 --                — the insert-as-claim dedup slot for fan-out NATS sudo requests
 --                (HA / M2 Layer 4,
---                docs/superpowers/specs/2026-06-28-orchestrator-m2-l4-nats-replica-safety-design.md).
+--                knowledge-base/knowledge/superpowers/specs/2026-06-28-orchestrator-m2-l4-nats-replica-safety-design.md).
 --
 --                NATS sudo requests fan out to BOTH orchestrator replicas (no
 --                queue group), so on_sudo_request runs twice -> two approval

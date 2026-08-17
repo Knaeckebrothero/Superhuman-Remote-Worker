@@ -105,7 +105,7 @@ describe('canComposeDuringSession', () => {
     });
 
     it('allows composing in the landing draft, before any thread exists', () => {
-        // Instant landing (docs/features/instant_landing_session.md): the
+        // Instant landing (knowledge-base/knowledge/features/instant_landing_session.md): the
         // first send creates the session; typing must be possible at t=0.
         expect(canComposeDuringSession(false, false, true)).toBe(true);
     });
@@ -649,7 +649,7 @@ describe('shouldFoldToolRun', () => {
  * targets, and that a height change re-pins. The component is never mounted in a
  * spec, and jsdom couldn't answer either question anyway. Those are browser
  * checks — see §"Verification plan" in
- * docs/issues/cockpit_session_scroll_pin_misses_late_height_changes.md.
+ * knowledge-base/knowledge/issues/cockpit_session_scroll_pin_misses_late_height_changes.md.
  */
 describe('isNearBottom', () => {
     // scrollHeight 1000, clientHeight 400 → bottom is scrollTop 600.

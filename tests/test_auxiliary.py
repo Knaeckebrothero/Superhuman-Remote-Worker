@@ -763,7 +763,7 @@ class TestOutputSchemas:
 
 # =============================================================================
 # Failed-aux archiving — surface silent aux failures
-# (docs/issues/surface_silent_aux_failures.md)
+# (knowledge-base/knowledge/issues/surface_silent_aux_failures.md)
 # =============================================================================
 
 

@@ -9,7 +9,7 @@ import {buildToolCardView} from './tool-descriptors';
  * {@link buildToolCardView}. All tool semantics live in the descriptor
  * registry — these only translate field names and map status.
  *
- * Design: `docs/features/unified_tool_cards.md`.
+ * Design: `knowledge-base/knowledge/features/unified_tool_cards.md`.
  */
 
 /** Live persistent-session statuses → unified card status. */

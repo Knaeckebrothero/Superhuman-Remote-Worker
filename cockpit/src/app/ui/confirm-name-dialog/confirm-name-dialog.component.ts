@@ -15,7 +15,7 @@ import {AppInputComponent} from '../input';
 /** Warning-confirm dialog with an optional type-the-name friction gate.
  *  requiredName == null → plain confirm; requiredName set → the confirm
  *  button enables only on an exact (case-sensitive) match. Built for the
- *  datasource publish flow (docs/features/public_datasources.md) but
+ *  datasource publish flow (knowledge-base/knowledge/features/public_datasources.md) but
  *  deliberately generic (reusable for e.g. delete confirmation later). */
 @Component({
   selector: 'app-confirm-name-dialog',

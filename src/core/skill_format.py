@@ -6,7 +6,7 @@ artifact — we store its bytes verbatim and only PARSE it to denormalize
 name/description onto the skills row. This module is pure (no DB, no FastAPI):
 parse, validate paths, and pack/unpack the native zip used for import/export.
 
-Design: docs/features/agent_skills.md (Slice 1).
+Design: knowledge-base/knowledge/features/agent_skills.md (Slice 1).
 """
 
 from __future__ import annotations

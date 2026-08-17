@@ -19,7 +19,7 @@ def _d(path):
 
 @pytest.mark.asyncio
 async def test_infinity_path_used_when_list_tree_succeeds():
-    tree = [_d("docs"), _f("docs/a.md", "e1"), _f("b.md", "e2")]
+    tree = [_d("docs"), _f("knowledge-base/knowledge/a.md", "e1"), _f("b.md", "e2")]
     calls = {"children": 0}
 
     async def list_tree():
@@ -32,7 +32,10 @@ async def test_infinity_path_used_when_list_tree_succeeds():
     out = await capture_etag_baseline(
         root_subpath="", list_children=list_children, list_tree=list_tree
     )
-    assert out == {"docs/a.md": "e1", "b.md": "e2"}  # files only, no dirs
+    assert out == {
+        "knowledge-base/knowledge/a.md": "e1",
+        "b.md": "e2",
+    }  # files only, no dirs
     assert calls["children"] == 0  # infinity short-circuits the BFS
 
 
@@ -43,7 +46,7 @@ async def test_falls_back_to_bfs_when_infinity_rejected():
 
     tree = {
         "": [_d("docs"), _f("top.md", "e0")],
-        "docs": [_d("docs/sub"), _f("docs/a.md", "e1")],
+        "docs": [_d("docs/sub"), _f("knowledge-base/knowledge/a.md", "e1")],
         "docs/sub": [_f("docs/sub/c.md", "e3")],
     }
 
@@ -53,7 +56,11 @@ async def test_falls_back_to_bfs_when_infinity_rejected():
     out = await capture_etag_baseline(
         root_subpath="", list_children=list_children, list_tree=list_tree
     )
-    assert out == {"top.md": "e0", "docs/a.md": "e1", "docs/sub/c.md": "e3"}
+    assert out == {
+        "top.md": "e0",
+        "knowledge-base/knowledge/a.md": "e1",
+        "docs/sub/c.md": "e3",
+    }
 
 
 @pytest.mark.asyncio

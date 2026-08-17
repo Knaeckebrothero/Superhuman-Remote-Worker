@@ -850,7 +850,7 @@ SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 # wire each instance to its own subdir.
 MIGRATIONS_APP_DIR = Path(__file__).parent / "migrations" / "app"
 
-# --- Job execution lease (docs/features/job_execution_lease.md) -------------
+# --- Job execution lease (knowledge-base/knowledge/features/job_execution_lease.md) -------------
 # Pickup lease: set atomically by claim_job_for_agent, covers the dispatch
 # POST + agent init + workspace connect. If the pod is dead or never accepts,
 # nothing renews and the job recovers by expiry — this is what makes the
@@ -934,7 +934,7 @@ PG_TYPE_MAP = {
 
 
 # =============================================================================
-# Contacts registry (docs/done/contacts_registry.md)
+# Contacts registry (knowledge-history/done/contacts_registry.md)
 # =============================================================================
 # House gotcha: asyncpg returns json_agg()/JSONB columns as strings, not
 # parsed Python objects — _contact_row() decodes them (mirrors
@@ -1704,7 +1704,7 @@ class PostgresDB:
                 creates a born-parked row the dispatcher cannot pick up)
             freeze_data: Optional freeze dict set atomically at creation — an
                 INSERT-time park has no window in which the dispatcher poll
-                could grab the row (docs/issues/loop_advances_into_active_model_cooldown.md)
+                could grab the row (knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md)
             created_by_thread_id: Session thread that created this job. Only the
                 creating *session* sets this — scholar/critic/delegation subjob
                 call sites pass parent_job_id alone and therefore correctly do
@@ -1712,7 +1712,7 @@ class PostgresDB:
                 job's business, not the session's).
             wake_on_complete: Whether this job's terminal state owes the creating
                 session a wake. Set server-side by the create endpoint, never by
-                the model — see docs/features/session_wake_on_job_completion.md.
+                the model — see knowledge-base/knowledge/features/session_wake_on_job_completion.md.
             datasource_ids: Complete materialized connector selection. Nonempty
                 sets are inserted into ``job_datasources`` in the same transaction
                 as the job; an empty set is authoritative after migration 0082.
@@ -2710,7 +2710,7 @@ class PostgresDB:
         ``get_dispatchable_jobs`` requires ``freeze_data IS NULL``
         (partial-index contract, 0046). A freeze surviving this transition
         parks the job paused-but-invisible forever
-        (docs/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
+        (knowledge-base/knowledge/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
         The freeze is stashed into ``context.last_freeze_data`` first, same
         shape as ``queue_job_for_resume``.
 
@@ -2882,7 +2882,7 @@ class PostgresDB:
         # gc_offline_agents' FK cascade, which rewrites it to exactly 24h after
         # the agent's last heartbeat and misdates the failure by a full day.
         # COALESCE keeps the FIRST failure time if a job is re-failed.
-        # docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 4)
+        # knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 4)
         if status == "failed":
             updates.append("failed_at = COALESCE(failed_at, CURRENT_TIMESTAMP)")
 
@@ -3199,7 +3199,7 @@ class PostgresDB:
         querying ``error_message``.
 
         Clears ``failed_at`` too: the job did not, in the end, fail.
-        docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 2)
+        knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 2)
         """
         try:
             uuid_val = UUID(job_id)
@@ -3249,7 +3249,7 @@ class PostgresDB:
         Lane-choice probe for the dispatcher: a paused job with no checkpoint
         never actually ran, so it must re-dispatch through the fresh
         ``/job/start`` lane instead of ``/job/resume``
-        (docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+        (knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
 
         Fails OPEN (True → resume lane, today's behavior): only a positive
         "no checkpoint" verdict may flip the lane. sqlite-backed deployments
@@ -3301,7 +3301,7 @@ class PostgresDB:
 
         so the one mechanism that reclaims space failed precisely when space was
         scarce. Correctness never depended on it being one statement.
-        docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 6).
+        knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 6).
 
         ``strict=True`` is reserved for permanent stateless job deletion. It
         raises on a real deletion failure and verifies that every surviving
@@ -4140,7 +4140,7 @@ class PostgresDB:
     ) -> bool:
         """Durably journal a job_complete decision on the job's own row.
 
-        Journal-before-observe (docs/issues/
+        Journal-before-observe (knowledge-base/knowledge/issues/
         job_finalization_decisions_held_only_in_process_memory.md): the agent's
         ``job_complete`` tool calls this THROUGH the orchestrator before it
         returns to the model, so the decision survives any restart. One atomic
@@ -4192,7 +4192,7 @@ class PostgresDB:
         the array when the key is absent; the ``COALESCE`` guards a NULL column.
         Appending an object to an array yields the object as one element.
         Validated on PG 15.17 (NULL column + missing key). See HF-3 in
-        docs/features/database_roadmap.md.
+        knowledge-base/knowledge/features/database_roadmap.md.
 
         Args:
             job_id: Job UUID as string
@@ -4257,7 +4257,7 @@ class PostgresDB:
         """Atomically append one guidance entry to ``context.pending_guidance``.
 
         The non-destructive steer lane (P1-A of
-        docs/issues/officer_blind_reads_and_worker_bureaucracy.md): urgent
+        knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md): urgent
         officer/operator messages land here instead of triggering a
         resume-with-feedback, ride the agent-heartbeat response into the
         worker's next LLM turn, and are moved to ``context.consumed_replies``
@@ -4522,7 +4522,7 @@ class PostgresDB:
 
         Single-statement ``jsonb_set(..., arr || $1)`` so two orchestrator
         replicas racing on the same target both land (same property as
-        ``append_queued_reply``; see HF-3 in docs/features/database_roadmap.md).
+        ``append_queued_reply``; see HF-3 in knowledge-base/knowledge/features/database_roadmap.md).
 
         Idempotent on ``critic_job_id``: a retried ``/complete`` for the same
         critic is a no-op, because a duplicate round would corrupt the round
@@ -4584,7 +4584,7 @@ class PostgresDB:
         /complete handlers — e.g. a duplicate/racing re-dispatch of the same
         paused job — can't both read the same value and stall the counter at 1.
         Returns the new count, or 0 if the job was not found / id was invalid.
-        See docs/done/embedding_key_missing_silently_disables_memory_and_kb.md.
+        See knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md.
         """
         try:
             uuid_val = UUID(job_id)
@@ -4615,7 +4615,7 @@ class PostgresDB:
         the counter. A fresh critic is spawned every round, so the per-critic
         count naturally resets each round. Returns the new count, or 0 if the
         job was not found / id was invalid.
-        docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
+        knowledge-history/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
         """
         try:
             uuid_val = UUID(job_id)
@@ -4659,7 +4659,7 @@ class PostgresDB:
 
         Returns ``{"attempt": int, "first_failed_at": str|None, "reset": bool}``;
         ``attempt=0`` on a missing/invalid job (caller treats as no-op).
-        See docs/features/llm_outage_pause_and_backoff_redispatch.md.
+        See knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md.
         """
         import json as json_module
 
@@ -4704,7 +4704,7 @@ class PostgresDB:
                 # us deliberately sleeping, not the job running fine. MUST mirror
                 # services.completion.evaluate_llm_outage exactly (the two are
                 # kept in lockstep). Missing next_retry_at → today's behavior.
-                # docs/features/llm_cooldown_pause_and_resume.md §Design decision
+                # knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md §Design decision
                 anchor_dt = last_dt
                 if next_retry_dt is not None and (
                     anchor_dt is None or next_retry_dt > anchor_dt
@@ -4737,7 +4737,7 @@ class PostgresDB:
                         else 1
                     )
 
-                # >>> TEMPORARY QUICKFIX — docs/done/codex_stream_disconnect_shape_nudge.md
+                # >>> TEMPORARY QUICKFIX — knowledge-history/done/codex_stream_disconnect_shape_nudge.md
                 # One request-shape nudge per streak. Logic lives in
                 # services.completion.llm_outage_nudge_state so it is unit-
                 # testable without a database (the latch it implements is what
@@ -7325,7 +7325,7 @@ class PostgresDB:
                       AND status = 'processing'
                       -- A stateless worker is not coupled to this
                       -- registered-agent row; run_queue owns its rescue
-                      -- (docs/features/stateless_agents.md §5.4.4).
+                      -- (knowledge-base/knowledge/features/stateless_agents.md §5.4.4).
                       AND jobs.execution_lane = 'pinned'
                       {completion_exclusion}
                       {control_guard}
@@ -7529,7 +7529,7 @@ class PostgresDB:
             if result != "UPDATE 1":
                 return None
 
-            # Job execution lease renewal (docs/features/job_execution_lease.md):
+            # Job execution lease renewal (knowledge-base/knowledge/features/job_execution_lease.md):
             # a heartbeat that carries a job renews that job's lease — liveness
             # by renewal, no dependency on agent-row reconciliation. The
             # assigned_agent_id guard fences an agent that lost the job (it
@@ -7837,7 +7837,7 @@ class PostgresDB:
     ) -> List[str]:
         """Pause processing jobs whose execution lease has expired.
 
-        The lease is the direct liveness signal (docs/features/
+        The lease is the direct liveness signal (knowledge-base/knowledge/features/
         job_execution_lease.md): ``claim_job_for_agent`` sets a pickup lease,
         the assigned agent's heartbeats renew it, and expiry — checked purely
         against the DATABASE clock — IS the definition of orphaned. Unlike
@@ -7889,7 +7889,7 @@ class PostgresDB:
     # ``cancel_stale_verification_subjobs`` below for the full rationale.
     #
     # 'waiting' was added to the top-level status filter (closes
-    # docs/issues/stale_critic_waiting_status_escapes_reaper.md): as of the
+    # knowledge-base/knowledge/issues/stale_critic_waiting_status_escapes_reaper.md): as of the
     # fail-closed verification design a critic is never parked in 'waiting'
     # between rounds any more — a fresh critic is spawned every round instead
     # (orchestrator/main.py's ``_trigger_verification_on_complete``) — so a
@@ -7899,7 +7899,7 @@ class PostgresDB:
     # 'paused' is deliberately KEPT — never remove it. Orphan recovery
     # legitimately re-dispatches critics through 'paused', "paused too long
     # ⇒ dead" was evaluated and rejected as a standalone deadness signal in a
-    # prior design (docs/features/llm_outage_subjob_resilience.md), and the
+    # prior design (knowledge-base/knowledge/features/llm_outage_subjob_resilience.md), and the
     # outage/cooldown exemption clause below only has any effect while
     # 'paused' rows still reach it — removing 'paused' from this filter would
     # silently disable that exemption rather than just "widen" the reap.
@@ -7998,9 +7998,9 @@ class PostgresDB:
         ``updated_at`` never refreshes — without the exemption the critic was
         cancelled mid-pause. An OVERDUE wake (paused long past next_retry_at =
         the outage sweeper broke) and the parent-terminal arm still reap.
-        docs/features/llm_outage_subjob_resilience.md (#7).
+        knowledge-base/knowledge/features/llm_outage_subjob_resilience.md (#7).
 
-        See docs/done/preemption_before_first_checkpoint_replays_job_opening.md
+        See knowledge-history/done/preemption_before_first_checkpoint_replays_job_opening.md
         and critic_failure_leaves_parent_job_stuck_reviewing.md.
 
         Args:
@@ -8431,9 +8431,9 @@ class PostgresDB:
         The CAS (``WHERE status='reviewing'``) makes it idempotent and safe
         against a concurrent sweeper / the verdict handler.
 
-        See docs/superpowers/specs/2026-07-05-reviewing-parent-unstick-watchdog-design.md,
+        See knowledge-base/knowledge/superpowers/specs/2026-07-05-reviewing-parent-unstick-watchdog-design.md,
         critic_failure_leaves_parent_job_stuck_reviewing.md (#4), and
-        docs/superpowers/sdd/2026-07-27-verification-fail-closed/task-10-brief.md.
+        knowledge-base/knowledge/superpowers/sdd/2026-07-27-verification-fail-closed/task-10-brief.md.
 
         Args:
             grace_minutes: minimum time a parent must have been in 'reviewing'.
@@ -8477,7 +8477,7 @@ class PostgresDB:
     # iterations over 105 minutes in the field case). Requires a live critic
     # (EXISTS mirrors the other arm's NOT EXISTS, keeping the two disjoint)
     # and a distinct message, per fix direction 2 of
-    # docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md.
+    # knowledge-history/done/rejected_verdict_livelocks_critic_and_wedges_parent.md.
     # No ledger check here: a recorded verdict flips the parent out of
     # 'reviewing' promptly, and any wedge that keeps it 'reviewing' for the
     # whole generous ceiling deserves escalation regardless.
@@ -8686,7 +8686,7 @@ class PostgresDB:
         Also clears the delegation ``freeze_data`` blob — ``get_dispatchable_jobs``
         requires ``freeze_data IS NULL`` (partial-index contract, 0046), so a
         kept freeze would hide the re-queued parent from the dispatcher forever
-        (docs/issues/delegation_freeze_lifecycle_gaps.md, Gap 1). Nothing reads
+        (knowledge-base/knowledge/issues/delegation_freeze_lifecycle_gaps.md, Gap 1). Nothing reads
         the blob back: children are re-derived from parent_job_id +
         creation_order, and the results ride ``context.delegation_results``.
         """
@@ -8715,7 +8715,7 @@ class PostgresDB:
     # A single-message-per-row transactional outbox on the jobs row itself:
     # same correctness as a dedicated outbox table, no new table, and durable
     # and inspectable in a way an in-memory claim is not. Design + rationale:
-    # docs/features/session_wake_on_job_completion.md.
+    # knowledge-base/knowledge/features/session_wake_on_job_completion.md.
     #
     # The claim exists because the send is NOT idempotent — the agent's
     # /api/input mints a fresh message id per call and unconditionally enqueues,
@@ -9255,7 +9255,7 @@ class PostgresDB:
     # --- Officer wake event outbox (centurion) -------------------------------
     #
     # General wake outbox for officer sessions: events + durable sleep timers
-    # (migration 0074, docs/features/centurion.md §4). Mirrors the jobs-row
+    # (migration 0074, knowledge-base/knowledge/features/centurion.md §4). Mirrors the jobs-row
     # outbox trio above (claim/finish/release with a visibility timeout) but
     # in a dedicated table, because officer wakes cover non-job events and
     # jobs the officer did not create. source='timer' rows carry fire_at and
@@ -13685,7 +13685,7 @@ class PostgresDB:
         parks where the job is NOT being sent back for more work (e.g. the
         missing-workspace requeue on manual assign) — there the journaled
         decision must survive the restart; losing it is the exact defect
-        docs/issues/job_finalization_decisions_held_only_in_process_memory.md
+        knowledge-base/knowledge/issues/job_finalization_decisions_held_only_in_process_memory.md
         describes.
 
         Clearing the freeze is the whole point. ``get_dispatchable_jobs``
@@ -13698,7 +13698,7 @@ class PostgresDB:
         (``claim_delegation_resume``, ``claim_llm_outage_redispatch``, the
         vm_upgrade approve/deny arms); the human-reply resume paths did not,
         which wedged every reply to a blocking agent message.
-        See docs/issues/blocking_message_reply_keeps_freeze_data.md.
+        See knowledge-base/knowledge/issues/blocking_message_reply_keeps_freeze_data.md.
 
         Returns True iff a row was updated.
         """
@@ -14090,8 +14090,8 @@ class PostgresDB:
         and a ``freeze_data.next_retry_at`` that has arrived. Oldest-due first so
         a backlog drains fairly. ``parent_job_id``/``creation_order`` ride along
         so the sweeper's ceiling-fail path can run the subjob unblock handlers
-        (docs/features/llm_outage_subjob_resilience.md). See
-        docs/features/llm_outage_pause_and_backoff_redispatch.md.
+        (knowledge-base/knowledge/features/llm_outage_subjob_resilience.md). See
+        knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md.
         """
         completion_exclusion = _completion_sweep_exclusion_clause(
             completion_commands_enabled
@@ -14132,7 +14132,7 @@ class PostgresDB:
         (``get_dispatchable_jobs`` requires ``freeze_data IS NULL``) and re-asserts
         ``assigned_agent_id=NULL``. ``context.llm_outage`` is untouched, so the
         attempt counter survives the resume. Returns True iff THIS call cleared it.
-        See docs/features/llm_outage_pause_and_backoff_redispatch.md.
+        See knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md.
         """
         try:
             uuid_val = UUID(job_id)
@@ -14179,7 +14179,7 @@ class PostgresDB:
         it exactly once (the project-loop safety net advances it). Records the
         reason + stamps ``completed_at``; leaves ``freeze_data`` for the audit
         trail (a ``failed`` job is never re-dispatched). Returns True iff THIS
-        call failed it. See docs/features/llm_outage_pause_and_backoff_redispatch.md.
+        call failed it. See knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md.
         """
         try:
             uuid_val = UUID(job_id)
@@ -14710,7 +14710,7 @@ class PostgresDB:
         hash of the thread_id (Postgres advisory locks take a bigint key).
         Used by ``POST /api/sessions/{thread_id}/prepare`` to serialize
         concurrent prepare calls — see
-        ``docs/issues/persistent_thread_double_provisioning_race.md``.
+        ``knowledge-base/knowledge/issues/persistent_thread_double_provisioning_race.md``.
         """
         h = hashlib.blake2b(thread_id.encode(), digest_size=8).digest()
         key = int.from_bytes(h, byteorder="big", signed=True)
@@ -14738,7 +14738,7 @@ class PostgresDB:
         ``thread_id`` is user-supplied path input on every thread route; a
         malformed id (e.g. an 8-char prefix) resolves to None — the caller's
         404 — instead of leaking an asyncpg DataError 500 out of the UUID
-        bind. docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+        bind. knowledge-base/knowledge/issues/session_turn_end_cloud_push_blocks_queued_input.md
         """
         try:
             UUID(str(thread_id))
@@ -16435,7 +16435,7 @@ class PostgresDB:
     # Canonical store for which cloud surfaces are attached to a thread.
     # Replaces the legacy ``threads.metadata.project_ids`` JSONB key as
     # source of truth for project attachment (Phase 1 of
-    # docs/features/cloud_collaboration_model.md). The runtime
+    # knowledge-base/knowledge/features/cloud_collaboration_model.md). The runtime
     # ``project_ids: list[str]`` contract for downstream consumers is
     # derived from these rows at payload-build time.
 
@@ -16799,8 +16799,8 @@ class PostgresDB:
         ``status`` is 'session' before ``thread_id`` is written is never reaped.
 
         Superseded by the orchestrator intent/observed split in
-        ``docs/features/unified_instance_lifecycle.md``; tracked in
-        ``docs/issues/lifecycle_session_agents_without_thread_never_drain.md``.
+        ``knowledge-base/knowledge/features/unified_instance_lifecycle.md``; tracked in
+        ``knowledge-base/knowledge/issues/lifecycle_session_agents_without_thread_never_drain.md``.
 
         Returns:
             List of ``{"id": <agent uuid str>, "hostname": <pod name>}`` for
@@ -19780,7 +19780,7 @@ class PostgresDB:
 
     # =========================================================================
     # AUTH TOKEN OPERATIONS  (consolidated mcp_tokens + PATs — see
-    # docs/features/auth_bff_and_api_tokens.md §3)
+    # knowledge-base/knowledge/features/auth_bff_and_api_tokens.md §3)
     #
     # Two kinds live in one table:
     #   - kind='mcp' — legacy Claude-Code/MCP tokens (srw_<32-byte>); scope
@@ -23916,7 +23916,7 @@ class PostgresDB:
         Thin wrapper over ``orchestrator.database.migrate.run_migrations`` —
         each ``PostgresDB`` instance binds to its migrations dir at
         construction time, so the call site doesn't pass the directory.
-        See ``docs/db_migration.md`` for the runner's design and contract.
+        See ``knowledge-base/knowledge/db_migration.md`` for the runner's design and contract.
 
         Returns:
             True if migrations were applied successfully.
@@ -24479,7 +24479,7 @@ class PostgresDB:
         return (count or 0) + 1
 
     # =========================================================================
-    # Contacts registry (docs/done/contacts_registry.md)
+    # Contacts registry (knowledge-history/done/contacts_registry.md)
     # =========================================================================
 
     async def list_contacts_for_user(
@@ -24772,7 +24772,7 @@ class PostgresDB:
     ) -> Optional[str]:
         """Resolve the project a job or thread belongs to, for agent-internal reads.
 
-        The internal contacts endpoint (docs/done/contacts_registry.md)
+        The internal contacts endpoint (knowledge-history/done/contacts_registry.md)
         never accepts a project_id from the agent — this is the server-side
         control point that derives it from the job/thread identity instead,
         the same trust posture as send_message recipient resolution. Callers
@@ -25231,7 +25231,7 @@ class PostgresDB:
         legacy-column fallback (new capability, deny-by-default) and the
         fail mode is CLOSED: publishing hands the publisher's credentials
         to every user's agents, so a grant-read failure must deny.
-        Spec: docs/features/public_datasources.md.
+        Spec: knowledge-base/knowledge/features/public_datasources.md.
         """
         if user.get("is_admin"):
             return True
@@ -25265,7 +25265,7 @@ class PostgresDB:
         Unlike its siblings this one passes the job's ``project_id`` through, so
         a project-scope grant resolves. Dropping it would silently reduce the
         key to a user-only capability and lose the axis the design chose grants
-        for. Spec: docs/features/merged_pr_completion_grant.md.
+        for. Spec: knowledge-base/knowledge/features/merged_pr_completion_grant.md.
         """
         if user.get("is_admin"):
             return True
@@ -25304,7 +25304,7 @@ class PostgresDB:
         spend. This is the loop half of the gate only; the officer half also
         rides the config PDP via `evaluate` on `officer.enabled`, which is what
         covers a hand-rolled thread create and stands a running officer down on
-        revocation. Spec: docs/done/unattended_operations_grant.md.
+        revocation. Spec: knowledge-history/done/unattended_operations_grant.md.
         """
         if user.get("is_admin"):
             return True
@@ -25334,7 +25334,7 @@ class PostgresDB:
         no legacy-column fallback (new capability, deny-by-default) and the
         fail mode is CLOSED — unattended send bypasses the human
         send-approval freeze, so a grant-read failure must deny.
-        Spec: docs/features/email_datasource.md.
+        Spec: knowledge-base/knowledge/features/email_datasource.md.
         """
         if user.get("is_admin"):
             return True
@@ -25494,7 +25494,7 @@ class PostgresDB:
 
     # =========================================================================
     # AUTOMATIONS (cron + event-trigger job templates; see
-    # docs/features/automations_v0.md and migration 0015_create_automations.sql)
+    # knowledge-base/knowledge/features/automations_v0.md and migration 0015_create_automations.sql)
     # =========================================================================
 
     async def create_automation(
@@ -25765,7 +25765,7 @@ class PostgresDB:
         injected into every spawned job's config_override (mirrors ``model``).
         ``scheduling`` / ``campaign_caps`` (0050) opt the loop into
         campaign-mode scheduling; both are start-time-only and validated by the
-        router (docs/features/loop_campaign_scheduling.md).
+        router (knowledge-base/knowledge/features/loop_campaign_scheduling.md).
         """
         roles = role_sequence or ["scholar", "critic", "developer"]
         async with self.acquire() as conn:
@@ -26467,7 +26467,7 @@ class PostgresDB:
     ) -> bool:
         """Restore a torn turn's in-flight membership (width 1 included).
 
-        The torn-advance recovery (docs/issues/loop_advance_nonatomic_wedges_loop.md):
+        The torn-advance recovery (knowledge-base/knowledge/issues/loop_advance_nonatomic_wedges_loop.md):
         an advance that spawned the next turn's jobs — or drained the barrier —
         but lost its write-back leaves the loop wedged with
         ``current_job_id IS NULL AND current_stage_jobs='[]'``. This re-points

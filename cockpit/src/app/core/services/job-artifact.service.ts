@@ -9,7 +9,7 @@ import {JobContextService} from './job-context.service';
  * This service used to double as the instruction builder's AI-sync target
  * (applyToolCall, the streaming lock, builder session/model tracking, workspace
  * proposals). That half was parked in `_parked/job-artifact.service.ts` when the
- * builder was removed — see docs/features/builder_to_sessions_consolidation.md.
+ * builder was removed — see knowledge-base/knowledge/features/builder_to_sessions_consolidation.md.
  * The dynamic canvas will revive it.
  */
 @Injectable({ providedIn: 'root' })

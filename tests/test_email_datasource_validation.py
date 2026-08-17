@@ -6,7 +6,7 @@ validation and dispatch-time config normalization — without importing
 ``src/core/datasource_setup.py``; a contract test here pins the shared
 tier→tool-name map both trust boundaries depend on.
 
-Spec: docs/features/email_datasource.md.
+Spec: knowledge-base/knowledge/features/email_datasource.md.
 """
 
 import pytest

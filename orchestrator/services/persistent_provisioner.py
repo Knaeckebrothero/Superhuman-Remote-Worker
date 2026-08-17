@@ -32,7 +32,7 @@ def _normalize_config_name(config_name: str) -> str:
     wrong slot — it has no on-disk ``<uuid>.yaml`` and ``--config <uuid>``
     crashes startup. Sessions apply the bound expert via ``config_override``,
     so fall back to the session base. See
-    docs/done/global_expert_management.md."""
+    knowledge-history/done/global_expert_management.md."""
     if not config_name:
         return canonical_config_name(config_name)
     try:

@@ -1,7 +1,7 @@
 """Shared run_queue substrate — work queue + recorded lease + fencing (S1).
 
 The single home of the claim/heartbeat/fence/complete semantics from
-docs/features/stateless_agents.md §5.1/§5.2, imported by BOTH the
+knowledge-base/knowledge/features/stateless_agents.md §5.1/§5.2, imported by BOTH the
 orchestrator (enqueue paths, reaper loop, read models) and the agent executor
 (claim, heartbeat, fence, complete, release) — the ``orch_surface``
 precedent. Schema: ``orchestrator/database/migrations/app/0115_run_queue.sql``.

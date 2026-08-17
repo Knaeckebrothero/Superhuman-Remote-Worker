@@ -3,7 +3,7 @@
 agent.vm.*.register fans out to both replicas (no queue group). The IDE-config
 seed task must be spawned on exactly one replica, when the leader promotes the
 VM to ready on the daemon's readiness evidence (there is no orchestrator-side
-SSH probe — the orchestrator has no tailnet route; see docs/issues/
+SSH probe — the orchestrator has no tailnet route; see knowledge-base/knowledge/issues/
 vm_ssh_readiness_probe_unroutable_from_orchestrator.md). Mock-only.
 
 Imports the FLATTENED is_leader (from services.leader_election) so the test

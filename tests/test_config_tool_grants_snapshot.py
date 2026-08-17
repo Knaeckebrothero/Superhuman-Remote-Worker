@@ -26,7 +26,7 @@ mentions (``persistent_session.py:1408-1557`` injects ``sleep`` /
 ``notify_user``, plus datasource categories and the ``task_*`` family) and
 *subtracts* via ``filter_tools_by_backend`` and the capability grants. Pinning
 that final set needs a live agent to report it and is Phase 1.1 of
-``docs/issues/tool_configuration_defects_and_fix_roadmap.md``.
+``knowledge-base/knowledge/issues/tool_configuration_defects_and_fix_roadmap.md``.
 
 No shipped config uses a ``*`` wildcard today, so this snapshot is currently
 independent of the registry's contents. ``expand_tool_wildcards`` is applied
@@ -140,7 +140,7 @@ def test_config_tool_grants_match_snapshot(config_name, snapshot):
         "If deliberate, regenerate with UPDATE_TOOL_GRANTS_SNAPSHOT=1 and let "
         "the fixture diff show the intent in review. If not, a config change "
         "has altered what this agent can do — see "
-        "docs/issues/tool_configuration_defects_and_fix_roadmap.md."
+        "knowledge-base/knowledge/issues/tool_configuration_defects_and_fix_roadmap.md."
     )
 
 

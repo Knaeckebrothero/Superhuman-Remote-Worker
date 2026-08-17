@@ -72,7 +72,7 @@ class MemoryUnavailableError(RuntimeError):
     lifespan handler exits the pod cleanly (status 0, no crash-loop) and the
     cockpit re-surfaces the reason via the orchestrator's create/prepare
     pre-flight. See
-    docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+    knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
     """
 
 
@@ -807,7 +807,7 @@ class PersistentSession:
         PVC-backed and orchestrator-restored, so on attach any existing
         content belongs to THIS thread and must be preserved — the thread's
         Gitea repo only ever holds the scaffold, so the wipe is unrecoverable
-        (docs/issues/session_workspace_wiped_by_agent_clone_on_attach.md).
+        (knowledge-base/knowledge/issues/session_workspace_wiped_by_agent_clone_on_attach.md).
 
         Mirrors ``src/agent.py``'s G2 reattach + resume-existing branches: a
         ``.git`` tree gets a git handle attached in place (no clone, no
@@ -2069,7 +2069,7 @@ class PersistentSession:
 
         # Officer (centurion) sessions get the sleep tool — their park verb —
         # and notify_user, their communication contract. Gated on config, not
-        # backend (docs/features/centurion.md §4/§6). Strict `is True` so
+        # backend (knowledge-base/knowledge/features/centurion.md §4/§6). Strict `is True` so
         # MagicMock configs in tests can't enable them.
         if getattr(getattr(self.config, "officer", None), "enabled", False) is True:
             for officer_tool in ("sleep", "notify_user"):
@@ -2088,7 +2088,7 @@ class PersistentSession:
         )
 
         # Background-officer capability ceiling
-        # (docs/features/officer_knowledge_plane.md §4, K3): a commissioned
+        # (knowledge-base/knowledge/features/officer_knowledge_plane.md §4, K3): a commissioned
         # background officer (officer.enabled is True — the runtime fact, not
         # agent_id) never sees object-plane tools, no matter what the config
         # override or the backend filter admitted. Applied LAST so the runtime
@@ -2124,7 +2124,7 @@ class PersistentSession:
         # tools — the intersection can empty a whole category with nothing in the
         # log. `tool_names` is already backend-filtered above, so a miss here is
         # a genuine anomaly rather than the capability gate doing its job.
-        # See docs/issues/live_config_update_buries_extra_and_empties_the_shell_group.md.
+        # See knowledge-base/knowledge/issues/live_config_update_buries_extra_and_empties_the_shell_group.md.
         unbound = [
             name
             for name in dict.fromkeys(tool_names)
@@ -2193,7 +2193,7 @@ class PersistentSession:
         # admits it only when both use_skill and set_canvas actually loaded.
         self._deploy_catalog_skill_files({"present-with-canvas"})
 
-        # Tool docs are virtual (docs/features/virtual_directories.md).
+        # Tool docs are virtual (knowledge-base/knowledge/features/virtual_directories.md).
         from ..core.virtual_dirs import ToolsProvider, sweep_legacy_tools_dir
 
         # Pre-override objects — see the CRITICAL note in the agent.py step:
@@ -2206,7 +2206,7 @@ class PersistentSession:
         if self.workspace_manager.virtual_overlay is not None:
             sweep_legacy_tools_dir(self.workspace_manager.virtual_overlay.inner)
 
-        # contacts/ is virtual and project-scoped (docs/done/contacts_registry.md).
+        # contacts/ is virtual and project-scoped (knowledge-history/done/contacts_registry.md).
         # Only registered when the session has a project — without one,
         # `contacts/` is never reserved and the path falls through to the real
         # filesystem. `os` is already imported at module level (line 14) — reuse
@@ -2564,7 +2564,7 @@ class PersistentSession:
         running loop's captured reference stays valid and the provider-usage
         anchor survives — a downswitch to a smaller-window model then compacts
         on the next turn instead of dead-ending in empty responses. See
-        docs/done/session_model_switch_stale_context_manager_empty_response.md.
+        knowledge-history/done/session_model_switch_stale_context_manager_empty_response.md.
         """
         if getattr(self, "context_manager", None) is None:
             return
@@ -2658,7 +2658,7 @@ class PersistentSession:
         transport won't resolve. "Configured ⇒ required": if the manager
         pipeline is on (or memory.required is set) the session must fail loud
         rather than run half-working. See
-        docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+        knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
         """
         if not vector_conn:
             return
@@ -2950,7 +2950,7 @@ class PersistentSession:
         # Swap on WorkspaceManager. swap_backend() rebinds the virtual overlay
         # onto the new backend and keeps the registered providers; assigning
         # `_backend` directly unwraps the overlay and 404s every virtual path
-        # (docs/features/virtual_directories.md).
+        # (knowledge-base/knowledge/features/virtual_directories.md).
         self.workspace_manager.swap_backend(new_backend)
 
         # Rebuild ShellManager with new backend

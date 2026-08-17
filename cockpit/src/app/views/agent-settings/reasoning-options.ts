@@ -3,7 +3,7 @@
  * per-model reasoning capability (config/model_config_matrix.yaml's `reasoning`
  * block, surfaced via /api/models → ModelService.reasoningByModel). This file
  * no longer hardcodes family/provider logic — the backend is the single source
- * of truth. See docs/features/family_centered_reasoning.md.
+ * of truth. See knowledge-base/knowledge/features/family_centered_reasoning.md.
  */
 import type {ReasoningCapability} from '../../core/services/model.service';
 

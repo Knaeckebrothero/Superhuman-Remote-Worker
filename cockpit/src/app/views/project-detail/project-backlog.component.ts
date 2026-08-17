@@ -41,7 +41,7 @@ export function groupByPriority(items: BacklogItem[]): BacklogGroup[] {
  * fictional "open backlog" the kickoff used to claim existed. Read-only view
  * for now: filing/closing tickets happens through the loop itself (kb_write /
  * the disposition close), not this panel. Mounted next to the Loop tab's live
- * panel — see docs/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md.
+ * panel — see knowledge-base/knowledge/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md.
  *
  * Priority is shown as a label only (high/normal/low); the server never sends
  * the storage rank, and nothing here gates or reorders on it — it only sorts

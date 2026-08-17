@@ -23,7 +23,7 @@ def test_vm_context_defaults_22():
     assert _resolve_ssh_port(ws_ctx={}, vm_ctx={}) == 22
 
 
-# Explicit-tier resolution (docs/issues/
+# Explicit-tier resolution (knowledge-base/knowledge/issues/
 # workspace_suspension_infers_tier_from_metadata_presence.md).
 #
 # The cases above all have an empty-or-pod-shaped ws_ctx, so presence happens to

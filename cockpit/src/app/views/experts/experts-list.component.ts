@@ -35,7 +35,7 @@ export function isBundled(e: Expert): boolean {
  * config needed that this user doesn't hold; the server strips them rather
  * than refusing the fork (2026-08-04 decision) and reports them here so the
  * strip is never silent — decision 9 in
- * docs/done/global_expert_management.md is explicit that a silent capability
+ * knowledge-history/done/global_expert_management.md is explicit that a silent capability
  * downgrade burns debugging time. Grant keys are passed through verbatim
  * (comma-joined, not humanized), because they're exactly what the Admin
  * UI's grants table shows (`admin-grants.component.ts` renders them raw in

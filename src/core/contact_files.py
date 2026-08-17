@@ -1,4 +1,4 @@
-"""Render project contacts as workspace files (docs/done/contacts_registry.md).
+"""Render project contacts as workspace files (knowledge-history/done/contacts_registry.md).
 
 DB is the source of truth; these files are a read-only projection written at
 job/session start (same lever as skills/). Frontmatter scalars are emitted via
@@ -6,7 +6,7 @@ json.dumps — JSON is valid YAML flow syntax, so this needs no yaml dependency
 (this module is imported by the orchestrator image; keep it stdlib-only).
 
 The boot-time caller was reverted in favour of a virtual-directory overlay
-(docs/features/virtual_directories.md). ``ContactsProvider`` now serves the same
+(knowledge-base/knowledge/features/virtual_directories.md). ``ContactsProvider`` now serves the same
 content live, and it calls ``contact_slug`` + ``render_contact_md`` directly —
 those two are the live renderers and are covered by the provider's tests.
 

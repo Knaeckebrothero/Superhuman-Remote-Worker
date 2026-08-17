@@ -1,6 +1,6 @@
 /**
  * Eager upload: the transfer starts when a file is ATTACHED, not when the
- * message is sent (docs/features/session_attachment_send_flow.md §5.4). Most
+ * message is sent (knowledge-base/knowledge/features/session_attachment_send_flow.md §5.4). Most
  * users attach first and type second, so by the time they hit Enter the bytes
  * are often already in the workspace and the send is instant.
  *
@@ -60,7 +60,7 @@ export const MAX_CONCURRENT_UPLOADS = 2;
  * Angular reports a user abort and a dead network identically as `status: 0`,
  * so a cancelled upload that surfaced through the normal error path would read
  * as *"Network error — check your connection"* — the misleading message from
- * the service-worker incident (docs/done/cockpit_service_worker_breaks_file_
+ * the service-worker incident (knowledge-history/done/cockpit_service_worker_breaks_file_
  * uploads.md). Intent is recorded in `cancelled` BEFORE the abort, and this
  * type is what any awaiting consumer sees instead of an HttpErrorResponse.
  */

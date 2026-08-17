@@ -107,7 +107,7 @@ def _stateless_worker_remote_authority(
 
 
 # >>> TEMPORARY QUICKFIX (2026-07-30) — delete with the upstream fix.
-# docs/done/codex_stream_disconnect_shape_nudge.md
+# knowledge-history/done/codex_stream_disconnect_shape_nudge.md
 # Injected as a user turn when the orchestrator has seen N byte-identical
 # upstream rejections of the SAME payload. Its only job is to make the next
 # request differ, so the wording is secondary to its existence — but it has
@@ -282,7 +282,7 @@ def ensure_job_branch(
     ``get_workspace_file``, and any later re-clone) still reads ``main`` and
     correctly reports the work missing.
 
-    See docs/done/resumed_job_inherits_subjob_git_branch.md — job
+    See knowledge-history/done/resumed_job_inherits_subjob_git_branch.md — job
     6df02f64, where a ``## Sources`` append was committed and pushed to
     ``subjob/50dee4ae/critic`` and was never visible on ``main``.
 
@@ -406,10 +406,10 @@ class UniversalAgent:
         # Agent-authored workspace files (path → content) that a pod re-provision
         # would drop (bound skills). Re-asserted on SSH reconnect via
         # RemoteBackend's on_reconnect hook. See
-        # docs/issues/reviewing_parent_pod_reaped_under_critic.md (Issue 4).
+        # knowledge-base/knowledge/issues/reviewing_parent_pod_reaped_under_critic.md (Issue 4).
         # instructions.md / task_brief.md used to be re-asserted here too, but
         # a virtual file cannot be lost, so re-assertion narrows to genuinely
-        # seeded real files (docs/features/virtual_directories.md).
+        # seeded real files (knowledge-base/knowledge/features/virtual_directories.md).
         self._agent_seed_files: Dict[str, str] = {}
         self._datasource_connections: Dict[str, Any] = {}
         self._datasource_clients: Dict[
@@ -552,7 +552,7 @@ class UniversalAgent:
             # Phase models resolve their OWN family params + window instead of
             # inheriting the base/primary slot (gemma by default). The shared
             # context budget is the min of the two phase windows (single shared
-            # history). See docs/done/context_budget_uses_base_model_not_phase_models.md.
+            # history). See knowledge-history/done/context_budget_uses_base_model_not_phase_models.md.
             # NOTE: this overwrites the matrix/DB-derived `limits` window leaves —
             # the phase-min is authoritative for a job whose inference models are
             # the phase models, so it supersedes any base-family admin override.
@@ -684,7 +684,7 @@ class UniversalAgent:
         # The summarizer's budgeting authority: the aux model's own window when
         # a dedicated model is configured, else the main working window (the
         # fallback summarizer IS the main/summarization LLM there). See
-        # docs/features/context_summarization_rework.md (S1).
+        # knowledge-base/knowledge/features/context_summarization_rework.md (S1).
         main_window = getattr(limits, "model_max_context_tokens", None)
         summarization_config = llm_config.get_phase_config("summarization")
         summarization_settings = resolve_model_settings(
@@ -842,7 +842,7 @@ class UniversalAgent:
 
         Falls back to environment variables for configuration.
         External datasources (Neo4j, MongoDB, etc.) are resolved per-job
-        via the datasource connector system — see docs/datasources.md.
+        via the datasource connector system — see knowledge-base/knowledge/datasources.md.
         """
         from src.utils.db_url import build_postgres_url
 
@@ -1042,7 +1042,7 @@ class UniversalAgent:
             # dropped EMBEDDING_API_KEY). Pause for bounded re-dispatch — the
             # orchestrator caps retries then fails — instead of silently running
             # with memory + KB disabled. See
-            # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md.
+            # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md.
             _has_kb_scope = bool(
                 getattr(getattr(self, "_tool_context", None), "knowledge_bindings", [])
             )
@@ -1336,7 +1336,7 @@ class UniversalAgent:
             # stages its clear + optional shape nudge so _arm_worker_batch can
             # commit clear + nudge + arm in ONE START update. Scoped to
             # auto-continue freeze types so human-review stops are untouched. See
-            # docs/issues/version_upgrade_drain_livelock.md.
+            # knowledge-base/knowledge/issues/version_upgrade_drain_livelock.md.
             if (
                 resume
                 and graph_input is None
@@ -1548,7 +1548,7 @@ class UniversalAgent:
                     )
                 return None
             # >>> TEMPORARY QUICKFIX — remove with the upstream fix.
-            # docs/done/codex_stream_disconnect_shape_nudge.md
+            # knowledge-history/done/codex_stream_disconnect_shape_nudge.md
             if pending_shape_nudge:
                 from langchain_core.messages import HumanMessage
 
@@ -2401,7 +2401,7 @@ class UniversalAgent:
             # stripping the `workspace_unavailable` type the orchestrator's
             # recovery arm routes on, so a dead-workspace job hard-fails (and
             # its VM is torn down) instead of pause → reprovision → resume.
-            # docs/issues/streaming_strips_workspace_unavailable_type.md
+            # knowledge-base/knowledge/issues/streaming_strips_workspace_unavailable_type.md
             from .core.workspace_backend import completion_error_payload
 
             job_id = self._current_job_id
@@ -3123,7 +3123,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # inject_blob_credentials). Fall back to the blob so embedding / vision /
         # whisper / tts / citation keys still reach os.environ — otherwise the
         # embedding-backed memory + KB silently fail for every blob-delivered job.
-        # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
+        # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md
         env_keys = (metadata.get("config_override") or {}).get("env_keys")
         if not env_keys:
             env_keys = ((metadata.get("resolved_config") or {}).get("agent") or {}).get(
@@ -3400,7 +3400,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # — no clone, no rm -rf — then resume on the intact files. Gated on
         # `resume`, so any content present belongs to THIS job's continuation
         # (PVCs are owner-keyed by UUID).
-        # See docs/features/workspace_pvc_branch_a_implementation.md (G2 / Phase 2).
+        # See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md (G2 / Phase 2).
         _reattached = False
         if (
             resume
@@ -3434,7 +3434,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             # keeps whatever branch its previous occupant (possibly a subjob)
             # left checked out.
             ensure_job_branch(self._workspace_manager.git_manager, metadata, job_id)
-            # instructions.md is virtual (docs/features/virtual_directories.md)
+            # instructions.md is virtual (knowledge-base/knowledge/features/virtual_directories.md)
             # and cannot go missing, so the old "rewrite if vanished" guard is
             # gone; the upload source (if any) was already resolved at the top
             # of this function, before this branch could return early.
@@ -3532,7 +3532,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 f"{'snapshot' if _seeded_from_snapshot else 'existing'}"
             )
             logger.info(f"Resuming job {job_id} with existing workspace")
-            # instructions.md is virtual (docs/features/virtual_directories.md)
+            # instructions.md is virtual (knowledge-base/knowledge/features/virtual_directories.md)
             # and cannot go missing; the upload source (if any) was already
             # resolved at the top of this function, before this branch could
             # return early.
@@ -3571,7 +3571,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             # Every resume source struck out: no reattached tree, no job-repo
             # clone (git_remote_url absent or clone failed), no snapshot.
             # Loudly distinguishable from a legitimate first dispatch —
-            # docs/issues/resume_fresh_workspace_no_clone_fallback.md.
+            # knowledge-base/knowledge/issues/resume_fresh_workspace_no_clone_fallback.md.
             logger.warning(
                 f"[{job_id}] workspace_init_path=blank — resume found no "
                 f"reattached tree, no clonable job repo, and no phase "
@@ -3583,7 +3583,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             self._workspace_manager.initialize()
 
         # instructions.md / task_brief.md are virtual
-        # (docs/features/virtual_directories.md): served live by providers
+        # (knowledge-base/knowledge/features/virtual_directories.md): served live by providers
         # registered in _deploy_instruction_files(), never written here.
         # Priority for instructions.md is inline > upload > template — inline
         # is read live from metadata at serve time, and the upload source (if
@@ -3888,7 +3888,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # Repository datasources clone onto the workspace backend — never
         # locally in the agent pod (the subprocess git-clone branch was
-        # removed; see docs/features/no_workspace_agent_mode.md §9.4).
+        # removed; see knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4).
         repo_datasources = [ds for ds in ds_configs if ds.get("type") == "repository"]
         kb_datasources = [ds for ds in ds_configs if ds.get("type") == "kb"]
         non_repo_datasources = [
@@ -4072,7 +4072,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Initialize RecallStore for Memory Light (if enabled). These flags let
         # the process_job guard fail-closed (pause for re-dispatch) when a
         # memory-required job loses its embedding-backed stores. See
-        # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md.
+        # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md.
         self._memory_degraded = False
         self._kb_degraded = False
         if self.config.memory.enabled:
@@ -4189,7 +4189,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
             self._tools = implemented_tools
 
-        # Tool docs are a virtual directory (docs/features/virtual_directories.md):
+        # Tool docs are a virtual directory (knowledge-base/knowledge/features/virtual_directories.md):
         # served from the live tool list, never written to the workspace.
         from .core.virtual_dirs import ToolsProvider, sweep_legacy_tools_dir
 
@@ -4207,7 +4207,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         if self._workspace_manager.virtual_overlay is not None:
             sweep_legacy_tools_dir(self._workspace_manager.virtual_overlay.inner)
 
-        # contacts/ is virtual and project-scoped (docs/done/contacts_registry.md).
+        # contacts/ is virtual and project-scoped (knowledge-history/done/contacts_registry.md).
         # Only registered when the job has a project — without one, `contacts/`
         # is never reserved and the path falls through to the real filesystem.
         # `os` is already imported at module level (line 17) — a local re-import
@@ -4309,7 +4309,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # Inject family-specific Examples blocks into tool descriptions before
         # binding. This is where the model first sees the tool catalog and
-        # decides on a wire format — see docs/design/guardrails_matrix.md.
+        # decides on a wire format — see knowledge-base/knowledge/design/guardrails_matrix.md.
         from src.services.guardrails import apply_guardrails_to_tools
 
         strategic_tools = apply_guardrails_to_tools(
@@ -4459,7 +4459,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         Sources: orchestrator internal ``/brief`` endpoint first, the agent's
         own DB handle second; both non-fatal. Never overwrites fields the
         dispatch already provided.
-        docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md
+        knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md
         """
         row = None
         if self._orchestrator_client:
@@ -4511,7 +4511,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         ``/job/resume`` lane — almost always a never-started job (that lane
         ships no brief fields). Fall toward fresh seeding: backfill the brief
         and commit the Phase-0 seed the fresh path would have committed.
-        docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md
+        knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md
         """
         logger.error(
             f"[{job_id}] resume=True but no checkpoint or snapshot was found "
@@ -4566,7 +4566,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         Deploys:
         - instructions.md / task_brief.md as virtual providers (served live,
-          never written — see docs/features/virtual_directories.md)
+          never written — see knowledge-base/knowledge/features/virtual_directories.md)
         - Additional instruction_files from config (literal files + bound skills)
         - In-scope skill directories (Slice 2)
         """
@@ -4577,7 +4577,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         )
 
         # instructions.md / task_brief.md are virtual
-        # (docs/features/virtual_directories.md): served from the job record or
+        # (knowledge-base/knowledge/features/virtual_directories.md): served from the job record or
         # the rendered template, never written to the workspace. This deletes
         # the exists()-probe precedence dance and the "rewrite if it vanished"
         # repair path — a virtual file cannot go missing.
@@ -4587,7 +4587,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Providers read self._job_metadata LIVE (not a bound alias): resume
         # hydration may replace or backfill it after these closures are
         # registered, and a stale alias would serve an empty brief forever
-        # (docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+        # (knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
         def _uploaded_instructions():
             # Priority inline > upload (the template is the caller's fallback).
             # Inline is read live so it survives the resume path; upload content
@@ -4630,14 +4630,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # these two into the workspace root is what dropped a critic's brief
         # into the root its TARGET reads from, on every subjob that inherits
         # its parent's workspace
-        # (docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md).
+        # (knowledge-history/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md).
         # The fallback existed to stop an agent booting with no task; graph.py
         # now refuses to start when both briefs resolve empty, which covers
         # every cause rather than the single one this branch handled.
 
         # todo_guide is now the bundled "todo-guide" skill, bound via instruction_files
         # (before_tool:next_phase_todos) and materialized in the loop below — no matrix
-        # special-case. See docs/features/agent_skills.md (Slice 3).
+        # special-case. See knowledge-base/knowledge/features/agent_skills.md (Slice 3).
 
         # Additional instruction files (config-driven)
         if self.config.instruction_files:

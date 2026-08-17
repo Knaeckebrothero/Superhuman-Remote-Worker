@@ -9,7 +9,7 @@ The fake DB here faithfully replicates the real
 ``||`` merge with ``jsonb_strip_nulls`` — because the store's correctness hinges
 on not clobbering sibling keys through that shallow merge.
 
-Also covers the honest-rc fix (§C1d, docs/features/workspace_durability_tiering.md)
+Also covers the honest-rc fix (§C1d, knowledge-base/knowledge/features/workspace_durability_tiering.md)
 for this module's OWN ``tar | zstd`` (capture, ``_ssh_tar_to_file``) and
 ``zstd -d | tar`` (extract, ``_ssh_untar_from_file``) SSH commands — the third
 masking site after C1b (``snapshot_service.py``) and C1c (``ssh_helpers.py``):

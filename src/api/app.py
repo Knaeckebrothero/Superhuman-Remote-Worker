@@ -97,7 +97,7 @@ def _on_heartbeat_response(response: dict) -> None:
     backstop for the 13+ call sites that can write a terminal status without
     sending one, and it costs no new call — the heartbeat already runs on the
     right cadence.
-    docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
+    knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
     """
     job_id = _current_job_id
     if not job_id or _stop_requested.is_set():
@@ -648,7 +648,7 @@ async def _process_orchestrator_job(
         # failed-only) and the dispatcher re-runs the finished job. The 30s
         # dispatcher cooldown means slot availability is not on the critical
         # path, so reporting first costs nothing.
-        # docs/research/stateless_agents/gate3_adversarial_review.md (B8).
+        # knowledge-base/knowledge/research/stateless_agents/gate3_adversarial_review.md (B8).
         _current_job_id = None
         if _orchestrator_client:
             try:

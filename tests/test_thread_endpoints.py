@@ -51,7 +51,7 @@ async def agent_create_thread(
     Includes the system-default chat/auxiliary/embedding pin injection
     that lands a config_override in thread metadata. Without this, the
     standalone agent boots against its YAML default and 401s on
-    api.openai.com (see docs/hardcoded_model_defaults.md).
+    api.openai.com (see knowledge-base/knowledge/hardcoded_model_defaults.md).
     """
     thread_id = await db.create_thread(
         user_id=None,
@@ -681,7 +681,7 @@ class TestAgentCreateThread:
         + auxiliary + embedding sections so the agent doesn't fall
         through to YAML defaults at attach. This is the fix for the
         "Untitled Session" + missing-memory + embedding-401 bug
-        documented in docs/hardcoded_model_defaults.md."""
+        documented in knowledge-base/knowledge/hardcoded_model_defaults.md."""
         db = _mock_db()
 
         async def _resolve(cap):

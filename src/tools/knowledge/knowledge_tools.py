@@ -9,7 +9,7 @@ Provides tools for interacting with native and datasource-backed OKF knowledge b
 These tools use the system Neo4j connection (not the external datasource
 connector). Connection comes from ToolContext.knowledge_graph.
 
-See docs/features/project_knowledge_base.md for full architecture.
+See knowledge-base/knowledge/features/project_knowledge_base.md for full architecture.
 """
 
 import asyncio
@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 # ten NOTE_TYPES for long enough that nobody noticed 'datasource' was missing.
 # A Literal puts the vocabulary in the args_schema, which is serialized on every
 # call anyway and cannot silently disagree with the enforcement in kb_write.
-# See docs/issues/agent_tool_fixed_vocabularies_invisible_to_model.md.
+# See knowledge-base/knowledge/issues/agent_tool_fixed_vocabularies_invisible_to_model.md.
 #
 # Spelled literally (not derived from the frozensets) so they stay valid static
 # annotations; tests/test_tool_vocabularies.py asserts they stay in sync.
@@ -796,7 +796,7 @@ def _resolve_note_scope(
 
 # =============================================================================
 # OKF markdown serialization (files-canonical KB)
-# See docs/features/okf_knowledge_base.md §7, §11.
+# See knowledge-base/knowledge/features/okf_knowledge_base.md §7, §11.
 # =============================================================================
 
 
@@ -827,7 +827,7 @@ def _yaml_quote(value: str) -> str:
 def _render_note_md(note: Dict[str, Any]) -> str:
     """Serialize a note dict to an OKF/markdown document (pure function).
 
-    OKF conventions (docs/features/okf_knowledge_base.md §7): ``type`` +
+    OKF conventions (knowledge-base/knowledge/features/okf_knowledge_base.md §7): ``type`` +
     ``description`` frontmatter, standard **markdown** links (never wikilinks)
     for the emergent graph, in-note ``author``/``job``/``branch`` provenance
     (squash-merge erases git authorship). Optional fields are omitted when
@@ -929,7 +929,7 @@ def _note_provenance(context: ToolContext) -> Dict[str, Optional[str]]:
 
 # =============================================================================
 # Server-side materialisation
-# (docs/features/knowledge_base_repo_separation.md §3, step 4)
+# (knowledge-base/knowledge/features/knowledge_base_repo_separation.md §3, step 4)
 #
 # A note used to be written twice: the row into ``knowledge_index``, and the
 # file into the agent's own workspace checkout (``_dual_write_note``). That
@@ -1207,7 +1207,7 @@ def _export_dir_error(path: str) -> Optional[str]:
 
 # =============================================================================
 # Gardener source of truth — the knowledge index, not the workspace
-# (docs/features/knowledge_base_repo_separation.md §5a)
+# (knowledge-base/knowledge/features/knowledge_base_repo_separation.md §5a)
 #
 # kb_lint/kb_index used to glob `knowledge/*.md` off the workspace. Once the
 # vault moves into its own server-side repo that glob does not fail, it returns

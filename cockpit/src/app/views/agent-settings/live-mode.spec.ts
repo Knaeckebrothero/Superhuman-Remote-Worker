@@ -11,7 +11,7 @@ import type {SessionToolGroupsResponse} from '../../core/services/api.service';
 
 /**
  * Live-mode behavior of the shared settings surface
- * (docs/done/2026-07-16-live-session-settings.md, Slice A).
+ * (knowledge-history/done/2026-07-16-live-session-settings.md, Slice A).
  *
  * The tool half of this changed shape: live mode used to render four
  * hand-picked closed groups and re-enable them by echoing a mirrored tool-name

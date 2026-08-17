@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Backfill source_embeddings for registered sources that missed auto-embed.
 
-The overflow defect (docs/issues/
+The overflow defect (knowledge-base/knowledge/issues/
 embedding_batch_overflow_skips_citation_source_embeddings.md) skipped the
 automatic embedding of ~1/3 of registered sources: whole-source chunk lists
 hit the TEI backend as one >64-input request, the 422 was swallowed, and the

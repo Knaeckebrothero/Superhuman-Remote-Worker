@@ -1,7 +1,7 @@
 """Pure capability-grants logic: catalog, resolution, PDP, and the adversarial
 matrix (User-Defined Experts, Slice 2). No DB/framework — hermetic.
 
-Spec: docs/done/global_expert_management.md (decisions 8, 9, 19, 21-23).
+Spec: knowledge-history/done/global_expert_management.md (decisions 8, 9, 19, 21-23).
 """
 
 import copy

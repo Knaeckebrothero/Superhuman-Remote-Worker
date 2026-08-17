@@ -1,5 +1,5 @@
 """Server-side knowledge-note materialisation (step 3 of §7,
-docs/features/knowledge_base_repo_separation.md).
+knowledge-base/knowledge/features/knowledge_base_repo_separation.md).
 
 ``materialize_knowledge_note`` replaces the agent's workspace write of
 ``knowledge/<slug>.md`` with a single Gitea commit into whichever repo

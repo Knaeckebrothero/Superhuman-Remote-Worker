@@ -288,7 +288,7 @@ class SnapshotService:
         ``SNAPSHOT_KEEP_GENERATIONS``). A bad or truncated capture is
         therefore never able to overwrite the last known-good canonical
         archive in place — see
-        docs/features/workspace_durability_tiering.md §C3.
+        knowledge-base/knowledge/features/workspace_durability_tiering.md §C3.
 
         Args:
             job_id: Job or thread UUID.
@@ -728,7 +728,7 @@ class SnapshotService:
         if not orchestrator_can_reach(ssh_host):
             # Tailnet target (VM workspace) — SSH from the orchestrator would
             # black-hole. Skip visibly instead of hanging on a doomed connect;
-            # snapshots are not supported on the VM backend (see docs/issues/
+            # snapshots are not supported on the VM backend (see knowledge-base/knowledge/issues/
             # vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
             logger.info(
                 "Skipping snapshot capture for %s %s (%s:%d): orchestrator "
@@ -798,7 +798,7 @@ class SnapshotService:
                 # artifact, never workspace data. Confirmed on the dev cluster:
                 # ``tar: /home/agent-host/lost+found: Cannot open: Permission
                 # denied`` was the sole cause of a real capture rc=2. See
-                # docs/features/workspace_durability_tiering.md §C1.
+                # knowledge-base/knowledge/features/workspace_durability_tiering.md §C1.
                 "--exclude=*/lost+found",
                 # Workspace content re-cloned/regenerated on restore
                 "--exclude=*/repos/*",

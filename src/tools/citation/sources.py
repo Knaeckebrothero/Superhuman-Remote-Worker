@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # tool is bound. The docstring does not reach the model; the args_schema does
 # (and is serialized on every call regardless). A vocabulary documented only in
 # prose is therefore invisible — see
-# docs/issues/agent_tool_fixed_vocabularies_invisible_to_model.md.
+# knowledge-base/knowledge/issues/agent_tool_fixed_vocabularies_invisible_to_model.md.
 #
 # Spelled literally rather than derived from the enums so these signatures stay
 # importable when the engine is absent (the @tool decorator evaluates

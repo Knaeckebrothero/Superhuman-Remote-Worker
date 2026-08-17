@@ -8,7 +8,7 @@
 #   1. **BuildKit cache mounts on every download step** for the same
 #      reason as Dockerfile.agent.dev — prod's `--no-cache-dir` and apt
 #      list deletion make layers non-deterministic and kill BuildKit's
-#      cache on warm rebuilds. See docs/features/tilt_inner_loop_dev.md
+#      cache on warm rebuilds. See knowledge-base/knowledge/features/tilt_inner_loop_dev.md
 #      for the full diagnosis.
 #   2. **watchfiles wrapper instead of plain `python run.py`** — Tilt's
 #      live_update sync drops new files into /app, and `watchfiles`

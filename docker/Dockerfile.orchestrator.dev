@@ -11,7 +11,7 @@
 #     overlaps with the prod image (you don't pay a separate cold build).
 #
 # Production parity is intentionally not preserved; this image is dev-only.
-# `docs/features/tilt_inner_loop_dev.md` has the design rationale.
+# `knowledge-base/knowledge/features/tilt_inner_loop_dev.md` has the design rationale.
 # =============================================================================
 
 FROM python:3.11-slim AS builder

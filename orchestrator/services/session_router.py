@@ -6,7 +6,7 @@ pod by its `srw.io/thread-id` label) and one Ingress (path-based,
 ``ownerReferences`` to the agent pod so K8s GC cleans them up if explicit
 teardown is skipped (orchestrator crash, etc.).
 
-See `docs/features/direct_session_websockets.md` §Component details.
+See `knowledge-base/knowledge/features/direct_session_websockets.md` §Component details.
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ class SessionRouterService:
         # selects on it) and flip srw/purpose to "session": a warm pool pod
         # is provisioned as purpose=job, and serving a session under a job
         # label breaks purpose-based selectors and dashboards
-        # (docs/issues/session_silent_failure_audit.md #16).
+        # (knowledge-base/knowledge/issues/session_silent_failure_audit.md #16).
         try:
             await self._call(
                 self._core_api.patch_namespaced_pod,

@@ -32,7 +32,7 @@ Non-load-bearing, like the rest of the audit/usage tier: when either pool is
 absent the pass no-ops and the serving methods transparently fall back to the
 raw ledger (or empty when that too is unavailable).
 
-Design: ``docs/features/database_roadmap.md`` Phase 6 (D-1).
+Design: ``knowledge-base/knowledge/features/database_roadmap.md`` Phase 6 (D-1).
 """
 
 from __future__ import annotations

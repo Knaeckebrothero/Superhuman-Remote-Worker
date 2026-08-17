@@ -1,7 +1,7 @@
 """Job completion tools must propagate WorkspaceUnavailableError, not stringify it.
 
 Regression guard for Defect 8 of
-docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
+knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
 
 Job c6dd288d called ``job_complete`` five times over 13 minutes against a VM
 that had already been deleted. Every call was recorded ``Tool [ok] … success:

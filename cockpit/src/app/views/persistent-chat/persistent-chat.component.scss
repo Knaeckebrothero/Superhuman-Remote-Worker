@@ -363,7 +363,7 @@
          Any of the three properties above collapses the automatic minimum to 0.
          The box then pins at the container height forever, the RO NEVER fires,
          and content silently clips with no error. See
-         docs/issues/cockpit_session_scroll_pin_misses_late_height_changes.md §8. */
+         knowledge-base/knowledge/issues/cockpit_session_scroll_pin_misses_late_height_changes.md §8. */
       .messages-inner {
         flex: 1;
         width: 100%;
@@ -2594,7 +2594,7 @@
 .tool-group-body { padding: v.$space-xs; }
 
 // --- Live context-compaction progress block ---------------------------------
-// (docs/features/context_summarization_rework.md S3 — mockup: header with
+// (knowledge-base/knowledge/features/context_summarization_rework.md S3 — mockup: header with
 // trigger + ctx %, segmented per-pass bar, pass detail line with in→out tokens)
 .compaction-progress {
   margin: v.$space-sm 0;

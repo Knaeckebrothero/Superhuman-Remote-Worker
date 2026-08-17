@@ -289,7 +289,7 @@ def is_late_completion_report(job: dict[str, Any], result: dict[str, Any]) -> bo
         after something failed it out-of-band — it stays ``failed`` forever, and
         ``determine_job_status``' carve-outs never run because they sit
         downstream of the gate (see
-        docs/done/coincident_infra_error_overrides_reported_job_outcome.md);
+        knowledge-history/done/coincident_infra_error_overrides_reported_job_outcome.md);
       * a recoverable ``workspace_unavailable`` report, whose recovery arm is
         47 lines further down and therefore unreachable.
 
@@ -306,7 +306,7 @@ def is_late_completion_report(job: dict[str, Any], result: dict[str, Any]) -> bo
         job that already ran — that is the hazard that made us reconstruct job
         c6dd288d by hand rather than resume it.
 
-    docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 2)
+    knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 2)
     """
     if job.get("status") != "failed":
         return False
@@ -331,7 +331,7 @@ def is_late_completion_report(job: dict[str, Any], result: dict[str, Any]) -> bo
 
 # Bounded re-dispatch cap for memory/KB-unavailable pauses. After this many
 # pause+retry cycles a memory-required job is failed instead of looping forever
-# (docs/done/embedding_key_missing_silently_disables_memory_and_kb.md).
+# (knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md).
 MEMORY_RETRY_CAP = 2
 
 
@@ -340,7 +340,7 @@ MEMORY_RETRY_CAP = 2
 # ancestor, but that is temporary — the subjob re-dispatches once the parent
 # resumes — so only the permanent terminals wedge a paused subjob forever. A
 # drain-frozen subjob under such a parent must resolve terminally, not pause.
-# docs/done/coincident_infra_error_overrides_reported_job_outcome.md
+# knowledge-history/done/coincident_infra_error_overrides_reported_job_outcome.md
 _PARENT_TERMINAL_BLOCKING: frozenset[str] = frozenset({"failed", "cancelled"})
 
 # Freeze types whose subjob short-circuit routes to the shared re-dispatch
@@ -351,7 +351,7 @@ _PARENT_TERMINAL_BLOCKING: frozenset[str] = frozenset({"failed", "cancelled"})
 # own row), so they apply per-subjob unchanged. All are guarded by
 # _PARENT_TERMINAL_BLOCKING first: a paused subjob under a permanently-dead
 # parent is a silent cascade-guard wedge.
-# docs/features/llm_outage_subjob_resilience.md. Membership is centralized in
+# knowledge-base/knowledge/features/llm_outage_subjob_resilience.md. Membership is centralized in
 # src.shared.job_freeze_types so independently deployed consumers cannot drift.
 
 # Substrings that mark an error as a workspace/VM *teardown* (connectivity) blip
@@ -360,7 +360,7 @@ _PARENT_TERMINAL_BLOCKING: frozenset[str] = frozenset({"failed", "cancelled"})
 # error must not override an outcome the agent already reported as complete.
 # Kept deliberately narrow (connectivity/teardown only) — widen on evidence, not
 # on suspicion (the "cleanup hiccup vs real failure" line, signed off 2026-07-12).
-# docs/done/coincident_infra_error_overrides_reported_job_outcome.md
+# knowledge-history/done/coincident_infra_error_overrides_reported_job_outcome.md
 _TEARDOWN_ERROR_PATTERNS: tuple[str, ...] = (
     "failed to connect to workspace",
     "workspace i/o timed out",
@@ -391,7 +391,7 @@ async def probe_workspace_ssh(host: str, port: int, timeout: float = 3.0) -> boo
     misclassified a live pod" (e.g. an sshd MaxSessions refusal) before doing
     anything destructive. Any failure — refused, unroutable, timeout — is
     False; a False probe degrades safely to the old delete-and-reprovision
-    path. docs/issues/maxsessions_parallel_tools_false_workspace_death.md
+    path. knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md
     """
     import asyncio
 
@@ -434,7 +434,7 @@ def should_persist_completion_freeze(result: dict[str, Any]) -> bool:
     ``get_dispatchable_jobs`` (partial-index contract, migration 0046).
     Deliberately narrow — an errored completion with a genuinely new freeze
     (e.g. an llm_outage backoff freeze) must keep persisting.
-    docs/issues/recovery_pause_repersists_stale_freeze_invisible_job.md
+    knowledge-base/knowledge/issues/recovery_pause_repersists_stale_freeze_invisible_job.md
     """
     error = result.get("error")
     return not (
@@ -467,8 +467,8 @@ async def handle_pod_workspace_recovery(
     A live pod is kept warm (its context stays ``ready`` so the re-dispatch
     adopts it); only a dead probe tears the pod down. The attempts counter
     increments either way so a pathological report-loop stays bounded.
-    See docs/features/workspace_pvc_branch_a_implementation.md (G1) and
-    docs/issues/maxsessions_parallel_tools_false_workspace_death.md (D).
+    See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md (G1) and
+    knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md (D).
     """
     container_ctx = _get_ctx(job)
 
@@ -763,7 +763,7 @@ async def handle_pod_workspace_recovery(
     # context.last_freeze_data: paused + freeze_data set is invisible to
     # get_dispatchable_jobs, so a freeze surviving this transition would park
     # the job forever
-    # (docs/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
+    # (knowledge-base/knowledge/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
     # Gate the dispatch on the processing→paused transition so a duplicate
     # completion can't double-dispatch.
     outcome: dict[str, Any] = {
@@ -880,7 +880,7 @@ async def write_job_change_record(
 
 # ---------------------------------------------------------------------------
 # Terminal-transition side effects (§6.6)
-# docs/features/workspace_and_change_records.md
+# knowledge-base/knowledge/features/workspace_and_change_records.md
 # ---------------------------------------------------------------------------
 
 # Delivery outcomes that mean a second terminal callback must not attempt the
@@ -931,7 +931,7 @@ def unmerged_pr_seal_status(
       unstick it. The cloud-diff downgrade excludes them for the same reason
       (``not _completion_loop_id``).
 
-    Spec: docs/features/merged_pr_completion_grant.md §5b.
+    Spec: knowledge-base/knowledge/features/merged_pr_completion_grant.md §5b.
     """
     if new_status != "completed" or reason is None:
         return new_status, None
@@ -1137,7 +1137,7 @@ def classify_workspace_death(
     eviction) means "retry bigger", not "re-dispatch into the same grave". We
     only assert a resource kill on positive evidence — a pod already gone before
     we could read it stays ``False`` (no evidence), so we never fabricate an OOM.
-    See docs/features/workspace_resource_pressure_resilience.md.
+    See knowledge-base/knowledge/features/workspace_resource_pressure_resilience.md.
     """
     if not termination:
         return (
@@ -1174,7 +1174,7 @@ def auto_continue_drain_update(
     """Progress-aware drain counter for auto-continue re-dispatches (backstop).
 
     Defense-in-depth for the version_upgrade drain livelock
-    (docs/issues/version_upgrade_drain_livelock.md). The agent-side resume-clear
+    (knowledge-base/knowledge/issues/version_upgrade_drain_livelock.md). The agent-side resume-clear
     (src/agent.py) guarantees a re-dispatched auto-continue job re-enters the
     graph and advances a phase each cycle, so a subsequent re-freeze carries a
     NEW ``phase_number``. If the freeze ``phase_number`` STOPS changing across
@@ -1206,7 +1206,7 @@ def auto_continue_drain_update(
 
 # ---------------------------------------------------------------------------
 # LLM-outage pause + backoff re-dispatch
-# (docs/features/llm_outage_pause_and_backoff_redispatch.md)
+# (knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md)
 #
 # A transient LLM outage exhausts the worker's Tier-1 in-process retries and
 # freezes the job (freeze_type=llm_unavailable). Rather than fail it, the
@@ -1227,7 +1227,7 @@ def _env_int(name: str, default: int) -> int:
 
 # 12h continuous-outage duration ceiling (primary; the Temporal
 # scheduleToCloseTimeout model). After this the job fails loudly. Doubles as the
-# cooldown pause-vs-fail-fast cutoff (docs/features/llm_cooldown_pause_and_resume.md):
+# cooldown pause-vs-fail-fast cutoff (knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md):
 # a quota cooldown whose provider-stated reset exceeds this fails fast instead of
 # pausing. Keep the 43_200 default in sync with src/graph.py's
 # _COOLDOWN_MAX_PAUSE_SECONDS (a different pod reads the same env var).
@@ -1259,7 +1259,7 @@ LLM_OUTAGE_JITTER = (os.getenv("LLM_OUTAGE_JITTER") or "full").strip().lower() o
 # Incident: 2026-07-29 job d251e513 burned 13 attempts on an identical
 # `503 auth_unavailable` that failed on attempt 1 of every single re-dispatch.
 LLM_OUTAGE_REPEAT_CEILING = _env_int("LLM_OUTAGE_REPEAT_CEILING", 4)
-# >>> TEMPORARY QUICKFIX (2026-07-30) — docs/done/codex_stream_disconnect_shape_nudge.md
+# >>> TEMPORARY QUICKFIX (2026-07-30) — knowledge-history/done/codex_stream_disconnect_shape_nudge.md
 # Spend one extra backoff cycle on a request-SHAPE change before the repeat
 # give-up fires. Exists only because OpenAI's `stream disconnected before
 # completion` (openai/codex#9995, still OPEN) is deterministic per payload: the
@@ -1300,7 +1300,7 @@ def llm_outage_fingerprint(fd: dict[str, Any]) -> str | None:
     pause whose normalized error text is IDENTICAL to the previous pause's is
     deterministic — retrying cannot fix the input (the 2026-07-11 `6a186c76`
     poisoned-tool-call incident burned 12 requests + would have burned the
-    whole give-up ceiling; see docs/features/outbound_message_hygiene.md).
+    whole give-up ceiling; see knowledge-base/knowledge/features/outbound_message_hygiene.md).
 
     Deliberately narrow: only request-shaped 4xx rejections qualify. A genuine
     endpoint outage (timeouts, connection errors, 5xx) repeats an identical
@@ -1316,7 +1316,7 @@ def llm_outage_fingerprint(fd: dict[str, Any]) -> str | None:
     out entirely: an identical edge page across pause cycles means the
     provider's gateway is still down, not that the request is deterministic,
     so the job must keep riding the outage ceilings like a 5xx outage. See
-    docs/issues/llm_infra_404_misclassified_permanent_kills_jobs.md.
+    knowledge-base/knowledge/issues/llm_infra_404_misclassified_permanent_kills_jobs.md.
     """
     if fd.get("deterministic_exempt"):
         return None
@@ -1376,7 +1376,7 @@ def llm_outage_nudge_state(
 ) -> tuple[bool, bool]:
     """One-shot arming for the request-shape nudge → ``(pending, attempted)``.
 
-    >>> TEMPORARY QUICKFIX — docs/done/codex_stream_disconnect_shape_nudge.md
+    >>> TEMPORARY QUICKFIX — knowledge-history/done/codex_stream_disconnect_shape_nudge.md
 
     Pure so it can be tested without a database;
     :meth:`PostgresDB.increment_job_llm_outage_attempt` is its only caller and
@@ -1432,7 +1432,7 @@ def evaluate_llm_outage(ctx: dict[str, Any], now: datetime) -> dict[str, Any]:
     # misread it as a productive gap, spuriously reset the ceiling, and let a
     # never-clearing cooldown park the loop forever. next_retry_at is absent on
     # legacy state → fall back to last_failed_at (byte-for-byte today's behavior).
-    # docs/features/llm_cooldown_pause_and_resume.md §Design decision
+    # knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md §Design decision
     anchor = last_failed_at
     if next_retry_at is not None and (anchor is None or next_retry_at > anchor):
         anchor = next_retry_at
@@ -1560,7 +1560,7 @@ def determine_job_status(
         # the error.) Return "no change" so the successful status stands.
         # ``curated`` (§6.4) is the same evidence as ``merged``: the job's
         # contribution is already on ``main``.
-        # docs/done/coincident_infra_error_overrides_reported_job_outcome.md
+        # knowledge-history/done/coincident_infra_error_overrides_reported_job_outcome.md
         if job.get("status") == "completed" or job.get("merge_status") in (
             "merged",
             "curated",
@@ -1584,15 +1584,15 @@ def determine_job_status(
         #      could never resume — fail on the error as before). A stale row
         #      freeze can't shield a crashed run (should_stop is False there →
         #      falls through to failed).
-        #      docs/done/version_upgrade_drain_masked_by_coincident_error.md
-        #      docs/features/llm_outage_subjob_resilience.md
+        #      knowledge-history/done/version_upgrade_drain_masked_by_coincident_error.md
+        #      knowledge-base/knowledge/features/llm_outage_subjob_resilience.md
         #  (2) a genuine completion whose only error is a post-completion
         #      workspace/VM *teardown* blip: the VM is reaped on completion and a
         #      trailing SSH/IO op then times out against the gone workspace. The
         #      deliverables already landed (merge/graft ran); the completion branch
         #      below resolves it exactly as it would with no error. A NON-teardown
         #      error (real mid-run crash) still fails, even on a completion report.
-        #      docs/done/coincident_infra_error_overrides_reported_job_outcome.md
+        #      knowledge-history/done/coincident_infra_error_overrides_reported_job_outcome.md
         redispatchable = should_stop and (
             (
                 job.get("parent_job_id") is None
@@ -1654,8 +1654,8 @@ def determine_job_status(
         # duration ceilings live on the subjob's own row
         # (context.memory_retry_count / context.llm_outage), so they apply
         # per-subjob unchanged.
-        # docs/done/coincident_infra_error_overrides_reported_job_outcome.md
-        # docs/features/llm_outage_subjob_resilience.md
+        # knowledge-history/done/coincident_infra_error_overrides_reported_job_outcome.md
+        # knowledge-base/knowledge/features/llm_outage_subjob_resilience.md
         if freeze_type in SUBJOB_REDISPATCH_FREEZE_TYPES:
             if parent_status in _PARENT_TERMINAL_BLOCKING:
                 return ("completed" if goal_achieved else "cancelled", None)
@@ -1676,7 +1676,7 @@ def determine_job_status(
     # without declaring completion maps to `completed` (weak, but honest in
     # its retro), never `pending_review`. Found live: a campaign member that
     # finished without freeze_data wedged the P1 smoke loop.
-    # docs/features/loop_campaign_scheduling.md.
+    # knowledge-base/knowledge/features/loop_campaign_scheduling.md.
     from services.project_loops import job_loop_id
 
     is_loop_job = bool(job_loop_id(job))
@@ -1740,7 +1740,7 @@ def determine_job_status(
         # backstop, fail loudly — a broken config must not park an overnight
         # loop iteration forever. The /complete handler owns the increment +
         # next_retry_at; here we only make the pause-vs-fail call.
-        # docs/features/llm_outage_pause_and_backoff_redispatch.md
+        # knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md
         ev = evaluate_llm_outage(_parse_context(job), datetime.now(timezone.utc))
         if ev["over_ceiling"]:
             summary = (
@@ -1767,7 +1767,7 @@ def determine_job_status(
         # identical to the PREVIOUS pause's is deterministic — a third, fourth,
         # ... cycle can only burn the give-up ceiling. Genuine outages never
         # enter here (llm_outage_fingerprint returns None for connection/5xx/
-        # rate errors). docs/features/outbound_message_hygiene.md (layer 3).
+        # rate errors). knowledge-base/knowledge/features/outbound_message_hygiene.md (layer 3).
         fp = llm_outage_fingerprint(fd)
         prior = _parse_context(job).get("llm_outage")
         prior = prior if isinstance(prior, dict) else {}
@@ -1797,7 +1797,7 @@ def determine_job_status(
             repeats = int(prior.get("repeats", 0) or 0) + 1
             if repeats >= LLM_OUTAGE_REPEAT_CEILING:
                 # >>> TEMPORARY QUICKFIX — remove when the upstream 408 is fixed.
-                # docs/done/codex_stream_disconnect_shape_nudge.md
+                # knowledge-history/done/codex_stream_disconnect_shape_nudge.md
                 # Spend ONE more cycle on a request-shape change before giving
                 # up. A byte-identical replay of a payload upstream has already
                 # rejected N times cannot succeed, but appending a short turn

@@ -302,7 +302,7 @@ def vm_persistent_rootdisk_enabled() -> bool:
     harmless: the controller keeps disks nobody asks it to keep, and the
     delete-status handler records what actually happened either way.
 
-    docs/features/vm_persistent_rootdisk.md
+    knowledge-base/knowledge/features/vm_persistent_rootdisk.md
     """
     return os.environ.get("VM_PERSISTENT_ROOTDISK", "false").strip().lower() in (
         "1",
@@ -1139,7 +1139,7 @@ class VMProvisioner:
                 # declines — notably for a VM workspace, whose only address is on
                 # the tailnet the orchestrator cannot reach. Ignoring the return
                 # made this log a capture that never happened, on every VM
-                # release. docs/issues/
+                # release. knowledge-base/knowledge/issues/
                 # vm_workspace_snapshot_unreachable_from_orchestrator.md
                 captured = await self._snapshot_service.capture_vm_snapshot(
                     job_id=job_id,

@@ -1,6 +1,6 @@
 """The loop's delivery guard: did this execution turn land anything?
 
-docs/features/better_resavio_restart_status.md §6a.
+knowledge-base/knowledge/features/better_resavio_restart_status.md §6a.
 
 The 2026-08-06 Better Resavio run finished 12 jobs with zero failures and
 delivered nothing, because delivery was measured on one path only. The

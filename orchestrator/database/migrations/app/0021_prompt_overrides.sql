@@ -10,7 +10,7 @@
 --                empty table is byte-identical to today. Overrides are read by
 --                the agent at job first-run and frozen into
 --                jobs.resolved_config, so reproducibility needs no versioning.
---                Design: docs/features/prompt_editing_page.md (v1).
+--                Design: knowledge-base/knowledge/features/prompt_editing_page.md (v1).
 --
 --                `kind` is the resolver subsection
 --                (MatrixResolver.MATRIX_SUBSECTION): 'prompts' or
@@ -61,7 +61,7 @@ COMMENT ON TABLE prompt_overrides IS
     'DB-backed overrides for bundled config/ prompts. One row overrides one '
     '(family, kind, name); NULL family = global. Resolved beneath the matrix '
     'resolver and frozen into jobs.resolved_config. Design: '
-    'docs/features/prompt_editing_page.md (v1).';
+    'knowledge-base/knowledge/features/prompt_editing_page.md (v1).';
 
 COMMENT ON COLUMN prompt_overrides.kind IS
     'Resolver subsection (MatrixResolver.MATRIX_SUBSECTION): prompts | instructions.';

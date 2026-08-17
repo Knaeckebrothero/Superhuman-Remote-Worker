@@ -6,7 +6,7 @@ Every VM test that renders a *fabricated* stand-in template has passed while the
 real chart was broken — that is how the description-escaping bug survived a
 passing "special characters" test (see
 ``tests/test_vm_template_description_escaping.py`` and
-``docs/issues/vm_reliability_assessment.md`` P2-12). So this module renders the
+``knowledge-base/knowledge/issues/vm_reliability_assessment.md`` P2-12). So this module renders the
 actual charts with ``helm template`` and asserts on the real output. A fixture
 that simplifies the artifact under test cannot catch structural defects in it.
 
@@ -451,7 +451,7 @@ def test_direct_mode_renderer_substitutes_every_placeholder() -> None:
     """Direct K8s mode renders the same template with its own replacements dict.
 
     It is the documented same-cluster path
-    (``docs/features/single_cluster_vm_deployment.md``), so its dict must cover
+    (``knowledge-base/knowledge/features/single_cluster_vm_deployment.md``), so its dict must cover
     the template too — a second renderer is only safe if it stays in parity.
     """
     emitted = placeholders(

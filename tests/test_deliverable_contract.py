@@ -1,6 +1,6 @@
 """P1-C deliverable contract — agent side.
 
-docs/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C, F13, F14.
+knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C, F13, F14.
 
 Covered here:
   - path normalization + workspace resolution tolerant of the ``repo/``

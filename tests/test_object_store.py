@@ -2,7 +2,7 @@
 
 The ObjectStore is the narrow flat key/value blob seam that
 VirtualWorkspaceBackend builds file operations on (see
-docs/features/no_workspace_agent_mode.md §5). These tests pin the seam's
+knowledge-base/knowledge/features/no_workspace_agent_mode.md §5). These tests pin the seam's
 contract: byte fidelity, missing-object signalling (FileNotFoundError vs
 None), prefix listing, and idempotent delete. The backend's own contract is
 exercised in test_virtual_workspace_backend.py over this same store.

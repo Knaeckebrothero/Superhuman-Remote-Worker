@@ -14,7 +14,7 @@
 # Idempotent: re-runs are safe. Use it to bring a stopped cluster back up
 # or after `k3d cluster delete`.
 #
-# Prereq: `tilt` binary on PATH. See docs/features/tilt_inner_loop_dev.md
+# Prereq: `tilt` binary on PATH. See knowledge-base/knowledge/features/tilt_inner_loop_dev.md
 # §Prerequisites for the install commands.
 # =============================================================================
 set -euo pipefail
@@ -35,7 +35,7 @@ die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- 0. Tilt-specific prereq -------------------------------------------------
 command -v tilt >/dev/null \
-  || die "tilt not on PATH — install per docs/features/tilt_inner_loop_dev.md"
+  || die "tilt not on PATH — install per knowledge-base/knowledge/features/tilt_inner_loop_dev.md"
 helm upgrade --help 2>/dev/null | grep -F -- '--take-ownership' >/dev/null \
   || die "helm lacks --take-ownership — install a current Helm 3 release before using Tilt Force Update"
 

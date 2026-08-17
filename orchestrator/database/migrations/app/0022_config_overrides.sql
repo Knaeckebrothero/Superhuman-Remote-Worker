@@ -44,6 +44,6 @@ COMMENT ON TABLE config_overrides IS
     'DB-backed overrides for the bundled config matrix (prompts, instructions, '
     'settings, guardrails). One row overrides one (family, kind, name); NULL '
     'family = global. File matrix is the immutable floor. Design: '
-    'docs/superpowers/specs/2026-05-31-config-matrix-db-overrides-design.md.';
+    'knowledge-base/knowledge/superpowers/specs/2026-05-31-config-matrix-db-overrides-design.md.';
 
 COMMIT;

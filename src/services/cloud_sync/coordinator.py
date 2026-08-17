@@ -1,7 +1,7 @@
 """Coordinator that drives several ``WorkspaceSyncBase`` instances together.
 
 Phase 1 of the cloud-mirror workspace model
-(``docs/features/cloud_collaboration_model.md`` §9) introduces multiple
+(``knowledge-base/knowledge/features/cloud_collaboration_model.md`` §9) introduces multiple
 cloud surfaces mounted into one agent workspace — typically the legacy
 session folder at the root *and* one project mount under ``projects/``.
 Each mount has its own ``WorkspaceSyncBase`` instance bound to its own

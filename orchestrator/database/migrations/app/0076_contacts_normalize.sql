@@ -1,6 +1,6 @@
 -- migration:     0076_contacts_normalize.sql
 -- description:   Cross-channel contacts registry, Phase 1 of
---                docs/features/contacts_registry.md. Creates the normalized
+--                knowledge-base/knowledge/features/contacts_registry.md. Creates the normalized
 --                contacts / contact_addresses / project_contacts tables and
 --                backfills them from external_contacts. The legacy table is
 --                deliberately left in place and untouched; a later migration

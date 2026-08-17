@@ -50,7 +50,7 @@ VALID_IMAGE_QUALITY_TIERS = {"economy", "standard", "high"}
 # MAIN model's window until 2026-06-12, which sent 951k-token payloads to a
 # 131k auxiliary summarizer. They are now computed at call time from the aux
 # model's own window — src/core/summarizer.py,
-# docs/features/context_summarization_rework.md.
+# knowledge-base/knowledge/features/context_summarization_rework.md.
 CONTEXT_THRESHOLD_FRACTION = 0.80
 # Pinned EQUAL to the threshold fraction on purpose (was 0.40 until 2026-08-11).
 # It floors the alternate message-count summarization trigger
@@ -590,7 +590,7 @@ def resolve_phase_model_budget(
     Worker jobs run a strategic and a tactical model over ONE shared message
     history, but historically derived both the global context budget AND the
     sampling params from the base ``llm.model`` slot (gemma by default) — see
-    docs/done/context_budget_uses_base_model_not_phase_models.md. This is the
+    knowledge-history/done/context_budget_uses_base_model_not_phase_models.md. This is the
     pure resolver that replaces that: each phase's params/window/multimodal come
     from its OWN family (never the base), and the shared budget is the ``min`` of
     the two phase windows (forced by the single shared history — the smaller
@@ -789,7 +789,7 @@ def _apply_settings_matrix(
         if key == "image_tokens":
             # Per-family image-token estimator config -> limits, not llm:
             # _parse_llm_config's closed constructor silently drops unknown
-            # keys. See docs/done/context_token_accounting.md S4.
+            # keys. See knowledge-history/done/context_token_accounting.md S4.
             data.setdefault("limits", {})["image_tokens"] = value
             mode = value.get("mode") if isinstance(value, dict) else value
             applied.append(f"limits.image_tokens(mode={mode})")
@@ -1263,7 +1263,7 @@ class InstructionFileEntry:
     Defines when and how a Layer-3 artifact is delivered to the agent. The
     artifact is either a literal instruction ``file`` (workspace-relative path)
     OR a bundled ``skill`` (resolved to ``skills/<skill>/SKILL.md``) — exactly
-    one. See docs/features/agent_skills.md (Slice 3).
+    one. See knowledge-base/knowledge/features/agent_skills.md (Slice 3).
 
     Attributes:
         trigger: Trigger condition string:
@@ -1601,11 +1601,11 @@ class ToolsConfig:
     # construction. Gated by the `catalog_authoring` capability grant
     # (deny-by-default), because these tools create and update rows a user's
     # other agents then run. Design:
-    # docs/features/agent_authored_catalog_entries.md
+    # knowledge-base/knowledge/features/agent_authored_catalog_entries.md
     catalog_authoring: List[str] = field(default_factory=list)
     # Loop campaign tools (loop_plan). Never listed in bundled configs — the
     # orchestrator injects `tools.loop` via config_override only for a planner
-    # loop's checkpoint critic (docs/features/loop_campaign_scheduling.md).
+    # loop's checkpoint critic (knowledge-base/knowledge/features/loop_campaign_scheduling.md).
     loop: List[str] = field(default_factory=list)
     # Registry categories that had no field until 2026-08-02, so a
     # `tools.product_help:` / `tools.session_task:` key parsed and did nothing.
@@ -1783,7 +1783,7 @@ class MemoryPipelineConfig:
     (src/services/memory/registry.py); an unknown name fails loudly at
     bind time. Empty lists bind a no-op manager. Defaults stay empty
     until the Phase-1 transplant registers the current-behaviour plugins
-    (docs/features/agent_memory_overhaul.md §5/§6).
+    (knowledge-base/knowledge/features/agent_memory_overhaul.md §5/§6).
     """
 
     retrievers: List[str] = field(default_factory=list)
@@ -1803,7 +1803,7 @@ class RerankerConfig:
     ``qwen3-reranker-8b`` ``/rerank`` route and ``qwen3-embedding-8b``), so
     production needs no extra credential plumbing. It does NOT ride the
     auxiliary model (that coupling crashed startup on OpenRouter auxiliaries;
-    see docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md).
+    see knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md).
     """
 
     model: str = "qwen3-reranker-8b"
@@ -1815,7 +1815,7 @@ class RerankerConfig:
     # attempts after the first, with exponential backoff from retry_backoff
     # seconds. Exhausting it degrades that one turn to hybrid order instead
     # of failing the job (structural 4xx/shape errors stay job-fatal). See
-    # docs/issues/reranker_transient_fault_hard_fails_job.md.
+    # knowledge-base/knowledge/issues/reranker_transient_fault_hard_fails_job.md.
     retries: int = 2
     retry_backoff: float = 1.0
     # Keep TTL-pinned items (the recency working set) ahead of the
@@ -1871,7 +1871,7 @@ class GateConfig:
 @dataclass
 class IngestionConfig:
     """memory.ingestion — write-path ingestion verdicts + bi-temporal supersede
-    (overhaul Phase 4, docs/features/agent_memory_overhaul.md §5).
+    (overhaul Phase 4, knowledge-base/knowledge/features/agent_memory_overhaul.md §5).
 
     When ``enabled``, ``RecallStore.store()`` replaces the lossy cosine-0.85
     dedup-merge with an aux-LLM adjudication: a new candidate is compared
@@ -1933,14 +1933,14 @@ class MemoryConfig:
 
     Controls the memory subsystem that stores and retrieves memories
     from PostgreSQL with hybrid search (dense vector + sparse keyword + recency).
-    See docs/features/memory_light.md for full architecture.
+    See knowledge-base/knowledge/features/memory_light.md for full architecture.
     """
 
     enabled: bool = False
     # When True, a job/session that needs memory but whose embedding-backed
     # stores fail to initialize must NOT run blind: the worker agent pauses for
     # bounded re-dispatch instead of silently degrading (see
-    # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md).
+    # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md).
     # Default False = degrade-loud (Layer 1 audit only).
     required: bool = False
     budget_tokens: int = 10000
@@ -1991,7 +1991,7 @@ class AuxiliaryConfig:
 
     Controls the AuxiliaryLLM class that handles background tasks like
     memory extraction and knowledge curation using structured output.
-    See docs/features/auxiliary.md for full design.
+    See knowledge-base/knowledge/features/auxiliary.md for full design.
     """
 
     enabled: bool = True
@@ -2001,7 +2001,7 @@ class AuxiliaryConfig:
     # Provider slug ("openrouter", "openai", "anthropic", ...). null = let
     # create_llm auto-detect (openrouter/ prefix) or fall back to openai. Must
     # be threaded through to create_llm or an OpenRouter aux misroutes to
-    # api.openai.com (docs/issues/openrouter_auxiliary_misrouted_to_openai.md).
+    # api.openai.com (knowledge-base/knowledge/issues/openrouter_auxiliary_misrouted_to_openai.md).
     provider: Optional[str] = None
     temperature: float = 0.0
     max_iterations: int = 15  # Cap for agent mode loops
@@ -2054,7 +2054,7 @@ class OfficerConfig:
     Sourced from the expert config, overridden per thread via
     threads.metadata.config_override.officer. The enabled flag MUST also be
     present in thread metadata for orchestrator-side SQL sweeps — expert YAML
-    alone is invisible to them (docs/features/centurion.md §4).
+    alone is invisible to them (knowledge-base/knowledge/features/centurion.md §4).
     """
 
     enabled: bool = False
@@ -2113,7 +2113,7 @@ class DelegationConfig:
 
     Controls whether agents can spawn child jobs via the delegate_work tool.
     Children branch off the parent workspace and work in parallel via git worktrees.
-    See docs/features/subagent_delegation.md.
+    See knowledge-base/knowledge/features/subagent_delegation.md.
 
     Depth is computed by counting delegation links (creation_order IS NOT NULL)
     in the ancestor chain.  Lifecycle links (scholar/critic with creation_order
@@ -2165,7 +2165,7 @@ class AgentConfig:
     autonomy: str = "partial"
     # Image-quality tier the agent receives (economy|standard|high). A
     # user/session knob (default standard) resolved to a per-family max edge at
-    # the image seam. See docs/issues/session_turn_hard_fails_on_transient_llm_outage.md.
+    # the image seam. See knowledge-base/knowledge/issues/session_turn_hard_fails_on_transient_llm_outage.md.
     image_quality: str = "standard"
 
     # Additional agent-specific config (preserved from JSON)
@@ -2946,7 +2946,7 @@ def load_agent_config_from_dict(
         # whole namespace is re-buried as ``extra["extra"]``, so
         # ``config.extra["shell"]`` — and every other extra key — vanishes from
         # the rebuilt config. That is the root cause of
-        # docs/issues/live_config_update_buries_extra_and_empties_the_shell_group.md;
+        # knowledge-base/knowledge/issues/live_config_update_buries_extra_and_empties_the_shell_group.md;
         # ``_deployment_dir`` is plumbing the caller passes as an argument.
         "extra",
         "_deployment_dir",
@@ -3073,7 +3073,7 @@ def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -
       or unsupported) — the factory handles toggles directly.
 
     Derived from the family's ``reasoning`` block in model_config_matrix.yaml
-    (single source of truth — see docs/features/family_centered_reasoning.md).
+    (single source of truth — see knowledge-base/knowledge/features/family_centered_reasoning.md).
     ``explicit_method`` still wins for callers that pin it.
 
     Args:
@@ -3112,7 +3112,7 @@ def _should_use_reasoning_summary(model: str) -> bool:
 
 # Reasoning levels assumed for the OpenAI wire when a family declares no usable
 # `options` list (conservative fallback; the matrix `reasoning.options` is the
-# source of truth — see docs/done/family_centered_reasoning.md).
+# source of truth — see knowledge-history/done/family_centered_reasoning.md).
 _OPENAI_REASONING_LEVELS = {"low", "medium", "high"}
 
 # Known effort levels, weakest → strongest. Clamping walks this ladder downward
@@ -3187,7 +3187,7 @@ def reasoning_capability(model: str) -> Dict[str, Any]:
     ``always_on`` (cannot disable), or ``none``.
 
     Deployment-overlay reasoning overrides are not applied yet (v1).
-    See docs/features/family_centered_reasoning.md.
+    See knowledge-base/knowledge/features/family_centered_reasoning.md.
     """
     base_path = get_project_root() / "config" / "model_config_matrix.yaml"
     matrix = _load_model_config_matrix_file(base_path)
@@ -3307,7 +3307,7 @@ def create_llm(
         # so a dropped provider silently misroutes its ``sk-or-v1`` key to
         # api.openai.com → 401. Honour the documented "auto-detect if None"
         # contract for the one prefix that needs it. See
-        # docs/issues/openrouter_auxiliary_misrouted_to_openai.md.
+        # knowledge-base/knowledge/issues/openrouter_auxiliary_misrouted_to_openai.md.
         provider = "openrouter"
     else:
         provider = "openai"
@@ -3328,7 +3328,7 @@ def create_llm(
         return _create_openai_llm(config, limits)
 
 
-# Output-token cap policy — see docs/features/reasoning_aware_max_output_tokens.md.
+# Output-token cap policy — see knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md.
 # The legacy hard 16384 starved reasoning models (their reasoning tokens are
 # billed as output and share this budget, so a hard turn truncates mid-thought
 # with finish_reason=length and no answer). The default is raised; safety now
@@ -3406,7 +3406,7 @@ def _resolve_timeout(
     so a large ``max_output_tokens`` turn has wall-clock room to finish while small
     turns keep the configured base. Static at construction — the LLM is built
     per-dispatch with the cap known, so no per-call plumbing is needed. See
-    docs/features/reasoning_aware_max_output_tokens.md §7.2.
+    knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md §7.2.
     """
     base = config.timeout
     if base is None:
@@ -3426,7 +3426,7 @@ def _is_output_truncated(finish_reason: Any) -> bool:
     provider spellings (``length`` / ``max_tokens`` / ``MAX_TOKENS``) and the
     ``"lengthlength"`` stream-merge doubling (§7.1). Both graphs share this so the
     detection stays consistent. See
-    docs/features/reasoning_aware_max_output_tokens.md §6.
+    knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md §6.
     """
     if not finish_reason:
         return False
@@ -3479,7 +3479,7 @@ def _create_openai_llm(
     # image (our flat image-token estimate assumes this), while Vertex crop-tiles
     # ~7x higher — so a Vertex endpoint makes the flat estimate UNDERCOUNT (the
     # unsafe direction). Surface the resolved endpoint so the assumption stays
-    # observable. See docs/features/multimodal_image_cost_optimization.md §5.
+    # observable. See knowledge-base/knowledge/features/multimodal_image_cost_optimization.md §5.
     if "gemini" in (config.model or "").lower():
         _gemini_ep = (base_url or "").lower()
         if "aiplatform" in _gemini_ep or "vertex" in _gemini_ep:
@@ -3526,7 +3526,7 @@ def _create_openai_llm(
     # (model_config_matrix.yaml): effort_enum→reasoning_effort, binary_toggle→
     # chat_template_kwargs (e.g. gemma's enable_thinking). Effort delivered by
     # system prompt (gpt-oss), token_budget, always_on and none inject nothing
-    # here. See docs/features/family_centered_reasoning.md.
+    # here. See knowledge-base/knowledge/features/family_centered_reasoning.md.
     reasoning_mode = "none"
     _rplan = resolve_reasoning_plan(config)
     if (
@@ -3591,7 +3591,7 @@ def _create_openai_llm(
     # Without it, OpenAI-compatible streaming (vLLM et al.) returns no token
     # usage at all — the persistent path streams every main call, so turn
     # metrics / usage.updated frames were empty
-    # (docs/features/context_summarization_rework.md S5; verified on k3d).
+    # (knowledge-base/knowledge/features/context_summarization_rework.md S5; verified on k3d).
     llm_kwargs["stream_usage"] = True
 
     # Pass KeyRing for automatic key rotation
@@ -3943,7 +3943,7 @@ def _create_openrouter_llm(
     # Without it, OpenAI-compatible streaming (vLLM et al.) returns no token
     # usage at all — the persistent path streams every main call, so turn
     # metrics / usage.updated frames were empty
-    # (docs/features/context_summarization_rework.md S5; verified on k3d).
+    # (knowledge-base/knowledge/features/context_summarization_rework.md S5; verified on k3d).
     llm_kwargs["stream_usage"] = True
 
     # Pass KeyRing for automatic key rotation
@@ -4247,7 +4247,7 @@ def scheduled_work_system_floor(
 
     Sessions that can create worker jobs are told, once, how to behave when one
     finishes — because the wake mechanism (see
-    docs/features/session_wake_on_job_completion.md) delivers a notice per job,
+    knowledge-base/knowledge/features/session_wake_on_job_completion.md) delivers a notice per job,
     and without a policy the natural failure mode is narrating all six
     completions of a fan-out, which turns the conversation into a job queue.
 

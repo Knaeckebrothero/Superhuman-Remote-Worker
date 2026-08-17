@@ -7,13 +7,13 @@ guard). ``write_loop_retro`` records the outcome as a standardized
 ``retros/NNN-<role>-<jobid8>.md`` on ``main``.
 
 ``merge_loop_job_contribution`` is the §6.4 dispatcher on top
-(docs/features/workspace_and_change_records.md): a job whose
+(knowledge-base/knowledge/features/workspace_and_change_records.md): a job whose
 ``required_deliverables`` name at least one FILE gets a curated merge —
 only the contracted files land on ``main`` (one commit), the audit PR is
 closed UNMERGED — while every other job takes the ``merge_loop_job_branch``
 path byte-identically.
 
-Design: docs/features/loop_repo_compounding_v2.md. Gitea is mocked
+Design: knowledge-base/knowledge/features/loop_repo_compounding_v2.md. Gitea is mocked
 (pattern: tests/test_job_provisioning.py).
 """
 
@@ -550,7 +550,7 @@ class TestWriteLoopRetro:
             merged_sha="deadbeef" * 5,
             merge_notes=[
                 "curated merge: 1/2 contracted deliverable(s) copied to main @ deadbeef",
-                "contracted deliverable NOT on the branch (not curated): docs/spec.md",
+                "contracted deliverable NOT on the branch (not curated): knowledge-base/knowledge/spec.md",
             ],
         )
 
@@ -559,7 +559,7 @@ class TestWriteLoopRetro:
         assert kwargs["delivery_status"] == "curated"
         assert kwargs["delivery_notes"] == [
             "curated merge: 1/2 contracted deliverable(s) copied to main @ deadbeef",
-            "contracted deliverable NOT on the branch (not curated): docs/spec.md",
+            "contracted deliverable NOT on the branch (not curated): knowledge-base/knowledge/spec.md",
         ]
         assert kwargs["completion_notes"] == "Shipped AC-11; tests green."
 
@@ -632,13 +632,18 @@ class TestMergeLoopJobContribution:
         g = _make_gitea(
             branch_files={
                 "repo/output/report.md": b"prefixed",
-                "docs/x.md": b"canonical wins",
-                "repo/docs/x.md": b"shadowed",
+                "knowledge-base/knowledge/x.md": b"canonical wins",
+                "repo/knowledge-base/knowledge/x.md": b"shadowed",
             },
         )
         job = _job(
             context=json.dumps(
-                {"required_deliverables": ["./repo/output/report.md", "docs/x.md"]}
+                {
+                    "required_deliverables": [
+                        "./repo/output/report.md",
+                        "knowledge-base/knowledge/x.md",
+                    ]
+                }
             )
         )
 
@@ -646,8 +651,11 @@ class TestMergeLoopJobContribution:
 
         assert status == "curated"
         files = {f["path"]: f for f in g.change_files.await_args.args[2]}
-        assert set(files) == {"repo/output/report.md", "docs/x.md"}
-        assert base64.b64decode(files["docs/x.md"]["content_b64"]) == b"canonical wins"
+        assert set(files) == {"repo/output/report.md", "knowledge-base/knowledge/x.md"}
+        assert (
+            base64.b64decode(files["knowledge-base/knowledge/x.md"]["content_b64"])
+            == b"canonical wins"
+        )
         assert any(
             "merged output/report.md (branch spelling: repo/output/report.md)" == n
             for n in notes
@@ -656,7 +664,7 @@ class TestMergeLoopJobContribution:
     @pytest.mark.asyncio
     async def test_partial_curation_lists_missing_paths(self) -> None:
         g = _make_gitea(branch_files={"output/report.md": b"# report"})
-        job = _contract_job("output/report.md", "docs/spec.md")
+        job = _contract_job("output/report.md", "knowledge-base/knowledge/spec.md")
 
         status, _, notes = await merge_loop_job_contribution(g, job, ctx=CTX)
 
@@ -668,7 +676,8 @@ class TestMergeLoopJobContribution:
         )
         assert any("curated merge: 1/2" in n for n in notes)
         assert any(
-            "contracted deliverable NOT on the branch (not curated): docs/spec.md" == n
+            "contracted deliverable NOT on the branch (not curated): knowledge-base/knowledge/spec.md"
+            == n
             for n in notes
         )
 
@@ -842,7 +851,7 @@ class TestMergeLoopJobContribution:
         """An empty curation would silently discard whatever work exists —
         the deliverable gate polices missing deliverables, not the merge."""
         g = _make_gitea(branch_files={"scratch.txt": b"only scratch"})
-        job = _contract_job("output/report.md", "docs/spec.md")
+        job = _contract_job("output/report.md", "knowledge-base/knowledge/spec.md")
 
         status, sha, notes = await merge_loop_job_contribution(g, job, ctx=CTX)
 

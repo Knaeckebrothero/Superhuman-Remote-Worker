@@ -8,7 +8,7 @@ Duck-typed proxy (not a ``WorkspaceBackend`` subclass), mirroring
 ``SubdirBackend``: anything not overridden passes through via ``__getattr__``.
 No isinstance checks target backend types in the codebase, so this is safe.
 
-See docs/features/virtual_directories.md.
+See knowledge-base/knowledge/features/virtual_directories.md.
 """
 
 import fnmatch

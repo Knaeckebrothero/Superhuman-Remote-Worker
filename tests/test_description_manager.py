@@ -3,7 +3,7 @@
 Tests docstring extraction, markdown generation, description overrides for
 deferred tools, and module-level convenience functions. Markdown rendered here
 is served live from tools/ as a virtual directory
-(docs/features/virtual_directories.md) rather than written to the workspace.
+(knowledge-base/knowledge/features/virtual_directories.md) rather than written to the workspace.
 """
 
 import pytest

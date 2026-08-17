@@ -6,8 +6,8 @@
 --                resources produce 1000 identical 403s and zero detection
 --                signal. This table is the durable sink for those denials
 --                (a structured log line fires alongside each insert).
---                Closes M1.B #4 in docs/multi_tenancy.md. See
---                docs/features/security_event_log.md.
+--                Closes M1.B #4 in knowledge-base/knowledge/multi_tenancy.md. See
+--                knowledge-base/knowledge/features/security_event_log.md.
 --
 --                Design notes:
 --                  - user_id has NO FK to users(id): rows must survive
@@ -16,7 +16,7 @@
 --                  - resource_id is TEXT, not UUID: ids arriving at the
 --                    gates include non-UUID slugs and paths.
 --                  - real_is_admin/view_as record the admin "view as user"
---                    shadow (docs/features/admin_view_as_user.md) so an
+--                    shadow (knowledge-base/knowledge/features/admin_view_as_user.md) so an
 --                    admin exercising the toggle is distinguishable from a
 --                    genuine cross-user attempt.
 --                  - No org_id: M2 multi-org is deferred; user_id suffices
@@ -55,7 +55,7 @@ COMMENT ON TABLE security_events IS
     'Denied-access audit log. One row per 403 raised by a security/access.py '
     'gate (plus _require_admin and IDE proxy denials). Written best-effort — '
     'a failed insert never blocks the 403. Pruned by the retention sweeper. '
-    'See docs/features/security_event_log.md.';
+    'See knowledge-base/knowledge/features/security_event_log.md.';
 COMMENT ON COLUMN security_events.event_type IS
     'access_denied (resource gates) | admin_denied (_require_admin). '
     'Open enum — future: login_failed, token_revoked, ...';

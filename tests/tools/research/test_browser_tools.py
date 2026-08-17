@@ -183,7 +183,7 @@ class TestNoLocalBrowserPath:
 
     The local browser_use fallback was removed — the workspace-side
     browser-exec daemon is the only browser (see
-    docs/issues/remove_local_browser_fallback.md). A reintroduced import
+    knowledge-base/knowledge/issues/remove_local_browser_fallback.md). A reintroduced import
     would put a JS-executing engine back inside the credential-holding
     agent pod.
     """

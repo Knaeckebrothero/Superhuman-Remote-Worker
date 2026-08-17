@@ -8,7 +8,7 @@ Provides MongoDB operations:
 - Document updates
 
 These tools are injected automatically when a MongoDB datasource is
-attached to a job. See docs/datasources.md.
+attached to a job. See knowledge-base/knowledge/datasources.md.
 """
 
 import json

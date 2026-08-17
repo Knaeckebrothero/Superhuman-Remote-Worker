@@ -70,7 +70,7 @@ function hintsToCapabilities(
  * windows), so a too-low window silently starves reasoning. Warn under ~16k output
  * — the cap that originally truncated minimax mid-reasoning. Returns the warning
  * string, or null when the window is healthy / unset.
- * See docs/features/reasoning_aware_max_output_tokens.md §5.4.
+ * See knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md §5.4.
  */
 export function reasoningStarveWarning(ctx: number | null): string | null {
   if (ctx == null || ctx <= 0) return null; // unset → family/default governs

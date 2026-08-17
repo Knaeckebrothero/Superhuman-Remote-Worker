@@ -345,7 +345,7 @@ async def test_restart_reconstructs_job_created_before_ledger_commit():
 async def test_concurrent_ticks_submit_once_across_replicas():
     """Two replicas' sweepers fired 2-5 ms apart and double-submitted the same
     (task, arm, replicate). The advisory claim makes the loser a no-op.
-    docs/issues/bench_sweeper_multi_replica_race.md
+    knowledge-base/knowledge/issues/bench_sweeper_multi_replica_race.md
     """
     store = FakeStore(_run(max_in_flight=2))
     first_submit = asyncio.Event()

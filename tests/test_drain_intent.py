@@ -3,7 +3,7 @@
 Covers:
   - persistent_app._handle_heartbeat_intents — drain → clean suspend when
     parked, defer while a turn is in flight, plain exit with no session
-    (docs/issues/session_agent_drift_drain_kills_idle_sessions.md option b)
+    (knowledge-base/knowledge/issues/session_agent_drift_drain_kills_idle_sessions.md option b)
   - dual_app._handle_heartbeat_intents — idle exit + busy flag
   - completion.determine_job_status — version_upgrade → paused
 """
@@ -697,7 +697,7 @@ class TestVersionUpgradeFreeze:
         # carve-out when the parent is live — the freeze branch owns the
         # decision (paused), matching top-level. Historically subjobs kept
         # failing on error; superseded by the subjob-redispatch routing.
-        # docs/features/llm_outage_subjob_resilience.md
+        # knowledge-base/knowledge/features/llm_outage_subjob_resilience.md
         from orchestrator.services.completion import determine_job_status
 
         job = {
@@ -733,7 +733,7 @@ class TestVersionUpgradeFreeze:
 class TestCoincidentInfraErrorOverride:
     """A coincident infra/teardown error must not override a reported outcome.
 
-    docs/done/coincident_infra_error_overrides_reported_job_outcome.md
+    knowledge-history/done/coincident_infra_error_overrides_reported_job_outcome.md
     Slice C (top-level completion masked by a post-completion teardown blip) and
     Slice B (drained subjob mis-routed to pending_review instead of re-dispatch).
     """
@@ -1007,7 +1007,7 @@ class TestCoincidentInfraErrorOverride:
 
 # =============================================================================
 # Auto-continue resume-clear — the version_upgrade drain livelock + its fix
-# (docs/issues/version_upgrade_drain_livelock.md)
+# (knowledge-base/knowledge/issues/version_upgrade_drain_livelock.md)
 #
 # Reproduces the LangGraph semantics at the heart of the bug: a graph that ends
 # with should_stop=True persists that in the checkpoint, and invoke(None) on the

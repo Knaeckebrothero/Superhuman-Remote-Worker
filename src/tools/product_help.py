@@ -4,7 +4,7 @@ Persistent sessions inject the current ``app-guide`` bundle into ToolContext
 after their final tools are known. This reader exposes only that trusted,
 digest-stamped payload and accepts logical topic IDs rather than file paths.
 
-Design: docs/features/app_guide_skill.md (M1).
+Design: knowledge-base/knowledge/features/app_guide_skill.md (M1).
 """
 
 from __future__ import annotations

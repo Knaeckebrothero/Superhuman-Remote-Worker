@@ -255,7 +255,7 @@ class TestProjectCreationProvisioning:
 
 
 # =============================================================================
-# External GitHub live vault — docs/features/external_forge_knowledge_base.md
+# External GitHub live vault — knowledge-base/knowledge/features/external_forge_knowledge_base.md
 # =============================================================================
 
 
@@ -407,7 +407,7 @@ class TestAttachExternalProjectKnowledgeRepo(TestProjectCreationProvisioning):
 
 # =============================================================================
 # Adopting an existing connector as the vault —
-# docs/features/external_forge_knowledge_base.md §4.4
+# knowledge-base/knowledge/features/external_forge_knowledge_base.md §4.4
 # =============================================================================
 
 

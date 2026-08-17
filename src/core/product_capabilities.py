@@ -10,8 +10,8 @@ later M2 server/tool slices.  Importing this module never reads guide files,
 queries a database, inspects environment flags, or infers runtime availability.
 
 Design:
-    docs/features/app_guide_skill.md
-    docs/superpowers/plans/2026-07-27-app-guide-m2.md
+    knowledge-base/knowledge/features/app_guide_skill.md
+    knowledge-base/knowledge/superpowers/plans/2026-07-27-app-guide-m2.md
 """
 
 from __future__ import annotations

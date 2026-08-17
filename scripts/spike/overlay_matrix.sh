@@ -2,7 +2,7 @@
 # scripts/spike/overlay_matrix.sh
 #
 # FUSE-on-FUSE feasibility matrix for protected cloud mode (Phase 0 spike,
-# docs/design/cloud_access_unification.md §6.1). Run INSIDE a workspace pod
+# knowledge-base/knowledge/design/cloud_access_unification.md §6.1). Run INSIDE a workspace pod
 # that already has a LIVE rclone cloud mount at $LOWER (the "raw" cloud view).
 #
 # Stacks fuse-overlayfs (writable scratch upper) over the rclone WebDAV lower

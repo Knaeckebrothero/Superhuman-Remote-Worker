@@ -1,7 +1,7 @@
 """Shared thread-event journal contract — epoch bumps and system frames.
 
 The (epoch, seq) allocation contract of ``thread_events`` / ``threads``
-(docs/features/stateless_agents.md §5.3.2) is maintained from more than one
+(knowledge-base/knowledge/features/stateless_agents.md §5.3.2) is maintained from more than one
 application: the agent's persistent runtime owns the streaming writer, while
 the orchestrator (rewind for detached threads today; the M4 reaper's
 ``turn.interrupted`` / ``turn.parked`` system frames next) must append frames
@@ -86,7 +86,7 @@ async def append_system_frame(
     increments locally); the UNIQUE (thread_id, epoch, seq) index makes that
     collision loud rather than silent, and generalizing this allocator to
     live epochs (e.g. outbox ``title.updated``) is deliberately out of scope
-    until S2 (docs/features/stateless_agents.md §5.3.2, system-writer class).
+    until S2 (knowledge-base/knowledge/features/stateless_agents.md §5.3.2, system-writer class).
     """
     row = await conn.fetchrow(
         _APPEND_SYSTEM_FRAME_SQL,
@@ -108,7 +108,7 @@ async def bump_epoch(conn: Any, *, thread_id: str) -> int:
     reaper/steal takeover (plus the attach-time resolver when it finds the
     previous session life terminal). Clean reattaches must NOT call this;
     they reuse the epoch so cached client cursors stay valid
-    (docs/features/stateless_agents.md §5.2/§5.3.2).
+    (knowledge-base/knowledge/features/stateless_agents.md §5.2/§5.3.2).
 
     Returns the new epoch. Raises ``LookupError`` when the thread row does
     not exist — callers wrap this in their own failure taxonomy.

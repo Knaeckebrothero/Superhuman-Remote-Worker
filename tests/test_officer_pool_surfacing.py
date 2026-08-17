@@ -1,4 +1,4 @@
-"""Pool surfacing — B4 of docs/features/officer_backlog_pools.md.
+"""Pool surfacing — B4 of knowledge-base/knowledge/features/officer_backlog_pools.md.
 
 B3 made the tick enforce policy; B4 makes the officer able to SEE it. That is
 not cosmetic. A policy enforced but invisible invites doctrine drift: he

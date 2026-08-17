@@ -3,7 +3,7 @@
 # =============================================================================
 # Tiltfile — inner-loop dev for the SRW stack on local k3d.
 #
-# Design doc: docs/features/tilt_inner_loop_dev.md
+# Design doc: knowledge-base/knowledge/features/tilt_inner_loop_dev.md
 #
 # Prerequisite: ./scripts/local-dev-tilt-up.sh has been run once. That script:
 #   - creates the k3d cluster `srw` with an embedded registry on localhost:5005
@@ -100,7 +100,8 @@ docker_build(
         # file change here would otherwise force a fall_back full rebuild.
         'cockpit/',
         'helm/',
-        'docs/',
+        'knowledge-base/',
+        'knowledge-history/',
         'deployment/',
         'scripts/',
         'docker/Dockerfile.cockpit*',
@@ -155,7 +156,8 @@ docker_build(
         'agent.py',
         'init.py',
         'helm/',
-        'docs/',
+        'knowledge-base/',
+        'knowledge-history/',
         'deployment/',
         'scripts/',
         'tests/',
@@ -250,7 +252,8 @@ docker_build(
         'config/',
         'cockpit/',
         'helm/',
-        'docs/',
+        'knowledge-base/',
+        'knowledge-history/',
         'deployment/',
         'scripts/',
         'tests/',
@@ -349,7 +352,7 @@ local(
 # someone clears the lock by hand — restarting Tilt does not help, because the
 # lock lives in the cluster. scripts/tilt-helm-apply.sh runs the identical helm
 # command with a preflight that clears a stale pending revision first. See
-# docs/features/tilt_inner_loop_dev.md "Risks and known gotchas".
+# knowledge-base/knowledge/features/tilt_inner_loop_dev.md "Risks and known gotchas".
 # -----------------------------------------------------------------------------
 # (image name, chart repository key, chart tag key)
 _srw_images = [
@@ -403,7 +406,7 @@ k8s_custom_deploy(
 # store unless `s3.endpoint` is set), and deployment/values-tilt.yaml keeps that
 # input blank rather than forcing the flag on — so local dev resolves the store
 # exactly the way a fresh `helm install` does. Canvas durability depends on this
-# being wired (docs/features/canvas_durable_presentation.md §11.1); if the
+# being wired (knowledge-base/knowledge/features/canvas_durable_presentation.md §11.1); if the
 # orchestrator logs "Snapshot service disabled" at startup, a stale
 # deployment/values-local.yaml is setting s3.endpoint.
 #

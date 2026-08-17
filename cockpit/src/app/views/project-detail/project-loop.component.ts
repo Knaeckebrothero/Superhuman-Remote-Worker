@@ -187,7 +187,7 @@ export function buildRoleSequence(
  * its ngOnInit/ngOnDestroy bound the polling lifecycle to tab visibility.
  *
  * Experimental power-user feature; copy is intentionally plain English.
- * Design: docs/features/project_self_improvement_loop.md.
+ * Design: knowledge-base/knowledge/features/project_self_improvement_loop.md.
  */
 @Component({
   selector: 'app-project-loop',

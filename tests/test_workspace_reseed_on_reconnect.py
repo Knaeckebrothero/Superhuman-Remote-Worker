@@ -1,7 +1,7 @@
 """Re-seed agent-authored files after a workspace pod is recreated under a
 live job.
 
-Root cause (docs/issues/reviewing_parent_pod_reaped_under_critic.md Issue 4,
+Root cause (knowledge-base/knowledge/issues/reviewing_parent_pod_reaped_under_critic.md Issue 4,
 memory srw_p4_unseeded_workspace_root): a sandbox pod is provisioned WITH its
 git clone (instructions.md, tools/), then the agent writes task_brief.md and
 bound skills on top via RemoteBackend. If the pod is torn down and

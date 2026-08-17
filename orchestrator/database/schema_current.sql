@@ -4400,7 +4400,7 @@ COMMENT ON COLUMN public.agents.pod_uid IS 'K8s-assigned metadata.uid of the age
 -- Name: COLUMN agents.aux_degraded; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.agents.aux_degraded IS 'Latest heartbeat-reported auxiliary-model health: TRUE while the agent''s auxiliary LLM (memory extraction/curation/assembly, session titles) is sustained-failing. Set from metrics.aux.degraded; detail in metadata.aux. See docs/issues/surface_silent_aux_failures.md (aux Phase 2).';
+COMMENT ON COLUMN public.agents.aux_degraded IS 'Latest heartbeat-reported auxiliary-model health: TRUE while the agent''s auxiliary LLM (memory extraction/curation/assembly, session titles) is sustained-failing. Set from metrics.aux.degraded; detail in metadata.aux. See knowledge-base/knowledge/issues/surface_silent_aux_failures.md (aux Phase 2).';
 
 
 --
@@ -4453,7 +4453,7 @@ CREATE TABLE public.auth_tokens (
 -- Name: TABLE auth_tokens; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.auth_tokens IS 'Bearer-auth tokens: kind=mcp (legacy Claude Code/CLI flow) and kind=api (PATs for n8n/automation). See docs/features/auth_bff_and_api_tokens.md §3.';
+COMMENT ON TABLE public.auth_tokens IS 'Bearer-auth tokens: kind=mcp (legacy Claude Code/CLI flow) and kind=api (PATs for n8n/automation). See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md §3.';
 
 
 --
@@ -4530,7 +4530,7 @@ CREATE TABLE public.automations (
 -- Name: TABLE automations; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.automations IS 'Job templates fired by the cron_dispatcher (trigger_type=cron) or event_dispatcher (trigger_type=event, v0.5+). One row = one rule of the form "when X happens, create job Y". Design: docs/features/automations_v0.md.';
+COMMENT ON TABLE public.automations IS 'Job templates fired by the cron_dispatcher (trigger_type=cron) or event_dispatcher (trigger_type=event, v0.5+). One row = one rule of the form "when X happens, create job Y". Design: knowledge-base/knowledge/features/automations_v0.md.';
 
 
 --
@@ -4551,7 +4551,7 @@ COMMENT ON COLUMN public.automations.catchup_window_seconds IS 'Grace window for
 -- Name: COLUMN automations.event_filter; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.automations.event_filter IS 'JSONB filter for v0.5 event triggers. Unused in v0 (NULL for all rows). Shape: {event_type, expert?, tags_any?, tags_all?, min_priority?, parent_automation_id?}. See docs/features/automations.md §Event Triggers.';
+COMMENT ON COLUMN public.automations.event_filter IS 'JSONB filter for v0.5 event triggers. Unused in v0 (NULL for all rows). Shape: {event_type, expert?, tags_any?, tags_all?, min_priority?, parent_automation_id?}. See knowledge-base/knowledge/features/automations.md §Event Triggers.';
 
 
 --
@@ -5199,7 +5199,7 @@ CREATE TABLE public.config_overrides (
 -- Name: TABLE config_overrides; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.config_overrides IS 'DB-backed overrides for the bundled config matrix (prompts, instructions, settings, guardrails). One row overrides one (family, kind, name); NULL family = global. File matrix is the immutable floor. Design: docs/superpowers/specs/2026-05-31-config-matrix-db-overrides-design.md.';
+COMMENT ON TABLE public.config_overrides IS 'DB-backed overrides for the bundled config matrix (prompts, instructions, settings, guardrails). One row overrides one (family, kind, name); NULL family = global. File matrix is the immutable floor. Design: knowledge-base/knowledge/superpowers/specs/2026-05-31-config-matrix-db-overrides-design.md.';
 
 
 --
@@ -5505,7 +5505,7 @@ CREATE TABLE public.experts (
 -- Name: TABLE experts; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.experts IS 'DB-backed user/admin experts (overlay over bundled config/experts/). config = fragment vs the expert_type base; prompts = {persona, instructions, strategic, tactical, summarization} (Part 2 — one family-agnostic version per segment; model adaptation stays in the systemprompt_<family> wrapper). Design: docs/features/global_expert_management.md.';
+COMMENT ON TABLE public.experts IS 'DB-backed user/admin experts (overlay over bundled config/experts/). config = fragment vs the expert_type base; prompts = {persona, instructions, strategic, tactical, summarization} (Part 2 — one family-agnostic version per segment; model adaptation stays in the systemprompt_<family> wrapper). Design: knowledge-base/knowledge/features/global_expert_management.md.';
 
 
 --
@@ -5995,7 +5995,7 @@ COMMENT ON COLUMN public.jobs.runner_kind IS 'Dispatch runner class. user = owne
 -- Name: COLUMN jobs.created_by_thread_id; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.jobs.created_by_thread_id IS 'Session thread that created this job (NULL for cockpit/automation/child jobs). Queryable backref powering the completion wake and the session''s own "my outstanding jobs" view. Design: docs/features/session_wake_on_job_completion.md.';
+COMMENT ON COLUMN public.jobs.created_by_thread_id IS 'Session thread that created this job (NULL for cockpit/automation/child jobs). Queryable backref powering the completion wake and the session''s own "my outstanding jobs" view. Design: knowledge-base/knowledge/features/session_wake_on_job_completion.md.';
 
 
 --
@@ -6016,14 +6016,14 @@ COMMENT ON COLUMN public.jobs.wake_notified_status IS 'Terminal status last deli
 -- Name: COLUMN jobs.failed_at; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.jobs.failed_at IS 'When the job entered ''failed'', set by update_job_status on the transition. Use this, NEVER updated_at, to date a failure: the update_jobs_updated_at trigger fires on FK cascades from gc_offline_agents, which rewrites updated_at to exactly 24h after the assigned agent''s last heartbeat. NULL on rows that failed before migration 0072 — the time is genuinely unknown, not zero. Design: docs/superpowers/specs/2026-07-28-transient-infra-failure-handling-design.md.';
+COMMENT ON COLUMN public.jobs.failed_at IS 'When the job entered ''failed'', set by update_job_status on the transition. Use this, NEVER updated_at, to date a failure: the update_jobs_updated_at trigger fires on FK cascades from gc_offline_agents, which rewrites updated_at to exactly 24h after the assigned agent''s last heartbeat. NULL on rows that failed before migration 0072 — the time is genuinely unknown, not zero. Design: knowledge-base/knowledge/superpowers/specs/2026-07-28-transient-infra-failure-handling-design.md.';
 
 
 --
 -- Name: COLUMN jobs.execution_lane; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.jobs.execution_lane IS 'Which execution plane owns this job: ''pinned'' (registered-agent dispatch and jobs-row lease recovery, the default) or ''stateless'' (worker_batch run_queue claim and reaper). App-validated by design; exactly one plane may dispatch or recover a job. See docs/features/stateless_agents.md §5.4.4.';
+COMMENT ON COLUMN public.jobs.execution_lane IS 'Which execution plane owns this job: ''pinned'' (registered-agent dispatch and jobs-row lease recovery, the default) or ''stateless'' (worker_batch run_queue claim and reaper). App-validated by design; exactly one plane may dispatch or recover a job. See knowledge-base/knowledge/features/stateless_agents.md §5.4.4.';
 
 
 --
@@ -6190,7 +6190,7 @@ CREATE TABLE public.magic_link_tokens (
 -- Name: TABLE magic_link_tokens; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.magic_link_tokens IS 'Opaque single-use tokens for email magic-links. Plaintext lives only in the email body; DB stores SHA-256 hashes. See docs/features/headless_persistent_sessions.md §4.';
+COMMENT ON TABLE public.magic_link_tokens IS 'Opaque single-use tokens for email magic-links. Plaintext lives only in the email body; DB stores SHA-256 hashes. See knowledge-base/knowledge/features/headless_persistent_sessions.md §4.';
 
 
 --
@@ -6507,7 +6507,7 @@ CREATE TABLE public.project_loops (
 -- Name: TABLE project_loops; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.project_loops IS 'Control row for the project self-improvement loop. One active row per project advances one job at a time via the _advance_project_loop completion hook, bounded by max_iterations / run_until / max_consecutive_failures. Design: docs/features/project_self_improvement_loop.md.';
+COMMENT ON TABLE public.project_loops IS 'Control row for the project self-improvement loop. One active row per project advances one job at a time via the _advance_project_loop completion hook, bounded by max_iterations / run_until / max_consecutive_failures. Design: knowledge-base/knowledge/features/project_self_improvement_loop.md.';
 
 
 --
@@ -6528,7 +6528,7 @@ COMMENT ON COLUMN public.project_loops.role_sequence IS 'Ordered JSONB array of 
 -- Name: COLUMN project_loops.current_job_id; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.project_loops.current_job_id IS 'Display-only mirror of the in-flight turn when its width is 1 (cockpit links, MCP formatters). NULL for fan-out turns and between turns. The engine''s advance/heal correctness keys on current_stage_jobs, never on this column. docs/features/loop_unified_engine.md.';
+COMMENT ON COLUMN public.project_loops.current_job_id IS 'Display-only mirror of the in-flight turn when its width is 1 (cockpit links, MCP formatters). NULL for fan-out turns and between turns. The engine''s advance/heal correctness keys on current_stage_jobs, never on this column. knowledge-base/knowledge/features/loop_unified_engine.md.';
 
 
 --
@@ -6549,14 +6549,14 @@ COMMENT ON COLUMN public.project_loops.workspace_backend IS 'Optional per-loop w
 -- Name: COLUMN project_loops.current_stage_jobs; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.project_loops.current_stage_jobs IS 'In-flight members of the loop''s current turn — the jobs the loop barriers on before rotating, width 1 included (the unified engine''s only advance path). Populated by the advance/start spawn; drained to [] by the atomic last-member barrier, which also nulls current_job_id so the torn-advance signature stays current_job_id IS NULL AND current_stage_jobs = ''[]''. docs/features/loop_unified_engine.md.';
+COMMENT ON COLUMN public.project_loops.current_stage_jobs IS 'In-flight members of the loop''s current turn — the jobs the loop barriers on before rotating, width 1 included (the unified engine''s only advance path). Populated by the advance/start spawn; drained to [] by the atomic last-member barrier, which also nulls current_job_id so the torn-advance signature stays current_job_id IS NULL AND current_stage_jobs = ''[]''. knowledge-base/knowledge/features/loop_unified_engine.md.';
 
 
 --
 -- Name: COLUMN project_loops.scheduling; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.project_loops.scheduling IS 'Scheduling mode: standard (the role_sequence stage list, one stage per turn — subsumes the old rotation mode and its fan-out stages) or campaign (a checkpoint Critic may expand the execution slot into a multi-stage campaign via a filed plan; formerly planner). Start-time-only. docs/features/loop_unified_engine.md.';
+COMMENT ON COLUMN public.project_loops.scheduling IS 'Scheduling mode: standard (the role_sequence stage list, one stage per turn — subsumes the old rotation mode and its fan-out stages) or campaign (a checkpoint Critic may expand the execution slot into a multi-stage campaign via a filed plan; formerly planner). Start-time-only. knowledge-base/knowledge/features/loop_unified_engine.md.';
 
 
 --
@@ -6707,7 +6707,7 @@ CREATE TABLE public.projects (
 -- Name: COLUMN projects.network_tier; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.projects.network_tier IS 'Workspace pod-network egress tier. Controls which CIDRs the project''s workspace pods can reach. The orchestrator emits this value as the srw.io/network-tier pod label; the matching helm NetworkPolicy (one per tier) enforces the allowlist. See docs/features/workspace_network_isolation.md §3.';
+COMMENT ON COLUMN public.projects.network_tier IS 'Workspace pod-network egress tier. Controls which CIDRs the project''s workspace pods can reach. The orchestrator emits this value as the srw.io/network-tier pod label; the matching helm NetworkPolicy (one per tier) enforces the allowlist. See knowledge-base/knowledge/features/workspace_network_isolation.md §3.';
 
 
 --
@@ -7232,7 +7232,7 @@ CREATE TABLE public.run_queue (
 -- Name: TABLE run_queue; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.run_queue IS 'Work queue + recorded lease for stateless execution (docs/features/stateless_agents.md §5.1/§5.2). One DURABLE row per unit (thread, job, or bg task): rows are never deleted while the unit lives, so lease_token stays monotonic — delete-and-reinsert would reset it and break fencing. State machine: queued -> leased -> {done | queued | parked}; states are app-validated by design (no CHECK), values: queued, leased, done, parked. All writes go through src/shared/run_queue/.';
+COMMENT ON TABLE public.run_queue IS 'Work queue + recorded lease for stateless execution (knowledge-base/knowledge/features/stateless_agents.md §5.1/§5.2). One DURABLE row per unit (thread, job, or bg task): rows are never deleted while the unit lives, so lease_token stays monotonic — delete-and-reinsert would reset it and break fencing. State machine: queued -> leased -> {done | queued | parked}; states are app-validated by design (no CHECK), values: queued, leased, done, parked. All writes go through src/shared/run_queue/.';
 
 
 --
@@ -7486,7 +7486,7 @@ CREATE TABLE public.security_events (
 -- Name: TABLE security_events; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.security_events IS 'Denied-access audit log. One row per 403 raised by a security/access.py gate (plus _require_admin and IDE proxy denials). Written best-effort — a failed insert never blocks the 403. Pruned by the retention sweeper. See docs/features/security_event_log.md.';
+COMMENT ON TABLE public.security_events IS 'Denied-access audit log. One row per 403 raised by a security/access.py gate (plus _require_admin and IDE proxy denials). Written best-effort — a failed insert never blocks the 403. Pruned by the retention sweeper. See knowledge-base/knowledge/features/security_event_log.md.';
 
 
 --
@@ -7535,7 +7535,7 @@ CREATE TABLE public.session_wake_events (
 -- Name: TABLE session_wake_events; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.session_wake_events IS 'Durable wake outbox for officer (centurion) sessions: events + sleep timers. See docs/features/centurion.md §4.';
+COMMENT ON TABLE public.session_wake_events IS 'Durable wake outbox for officer (centurion) sessions: events + sleep timers. See knowledge-base/knowledge/features/centurion.md §4.';
 
 
 --
@@ -7600,7 +7600,7 @@ CREATE TABLE public.skills (
 -- Name: TABLE skills; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.skills IS 'DB-backed user/admin Agent Skills (overlay over bundled config/skills/). name/description denormalized from the canonical SKILL.md in skill_files. Design: docs/features/agent_skills.md.';
+COMMENT ON TABLE public.skills IS 'DB-backed user/admin Agent Skills (overlay over bundled config/skills/). name/description denormalized from the canonical SKILL.md in skill_files. Design: knowledge-base/knowledge/features/agent_skills.md.';
 
 
 --
@@ -7651,7 +7651,7 @@ CREATE TABLE public.srw_sessions (
 -- Name: TABLE srw_sessions; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.srw_sessions IS 'BFF session rows. Cookie value = id (UUID). KC tokens held server-side and refreshed in place. See docs/features/auth_bff_and_api_tokens.md §1.2.';
+COMMENT ON TABLE public.srw_sessions IS 'BFF session rows. Cookie value = id (UUID). KC tokens held server-side and refreshed in place. See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md §1.2.';
 
 
 --
@@ -8208,7 +8208,7 @@ CREATE TABLE public.thread_events (
 -- Name: TABLE thread_events; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.thread_events IS 'Append-only wire-frame log for persistent-session SSE replay. See docs/features/headless_persistent_sessions.md.';
+COMMENT ON TABLE public.thread_events IS 'Append-only wire-frame log for persistent-session SSE replay. See knowledge-base/knowledge/features/headless_persistent_sessions.md.';
 
 
 --
@@ -8408,7 +8408,7 @@ COMMENT ON COLUMN public.thread_messages.seq IS 'Monotonic per-row insertion ord
 -- Name: COLUMN thread_messages.rewound_at; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.thread_messages.rewound_at IS 'Set when a session rewind supersedes this row (seq >= the rewind''s from_seq). Live conversation readers filter rewound_at IS NULL; the row itself is never deleted. See docs/features/session_rewind.md.';
+COMMENT ON COLUMN public.thread_messages.rewound_at IS 'Set when a session rewind supersedes this row (seq >= the rewind''s from_seq). Live conversation readers filter rewound_at IS NULL; the row itself is never deleted. See knowledge-base/knowledge/features/session_rewind.md.';
 
 
 --
@@ -8721,7 +8721,7 @@ CREATE TABLE public.threads (
 -- Name: COLUMN threads.events_epoch; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.threads.events_epoch IS 'Current event-log writer generation (client-visible). Bumped only deliberately: rewind, a reaper/steal takeover, or an attach that finds the previous session life terminal (terminal thread status, a terminal lifecycle frame in the epoch, or the epoch wholly beyond retention). Clean reattaches REUSE the epoch so cached client cursors stay valid; an older-epoch cursor triggers authoritative re-sync (gone_beyond_horizon). See docs/features/stateless_agents.md §5.3.2.';
+COMMENT ON COLUMN public.threads.events_epoch IS 'Current event-log writer generation (client-visible). Bumped only deliberately: rewind, a reaper/steal takeover, or an attach that finds the previous session life terminal (terminal thread status, a terminal lifecycle frame in the epoch, or the epoch wholly beyond retention). Clean reattaches REUSE the epoch so cached client cursors stay valid; an older-epoch cursor triggers authoritative re-sync (gone_beyond_horizon). See knowledge-base/knowledge/features/stateless_agents.md §5.3.2.';
 
 
 --
@@ -8742,14 +8742,14 @@ COMMENT ON COLUMN public.threads.extend_count IS 'Number of magic-link extend-wi
 -- Name: COLUMN threads.execution_lane; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.threads.execution_lane IS 'Which execution plane serves this thread: ''pinned'' (registered-agent pod, the default) or ''stateless'' (run_queue claim by any pod). App-validated by design — no CHECK. See docs/features/stateless_agents.md §5.4.4.';
+COMMENT ON COLUMN public.threads.execution_lane IS 'Which execution plane serves this thread: ''pinned'' (registered-agent pod, the default) or ''stateless'' (run_queue claim by any pod). App-validated by design — no CHECK. See knowledge-base/knowledge/features/stateless_agents.md §5.4.4.';
 
 
 --
 -- Name: COLUMN threads.events_seq_hwm; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.threads.events_seq_hwm IS 'Highest seq ever allocated in the CURRENT events_epoch. Survives retention pruning of the thread_events rows themselves; reset to 0 atomically on every epoch bump. Maintained by the agent journal writer''s fenced flush (GREATEST over the batch in the same statement) and pre-incremented by the system-frame allocator (src/shared/event_journal). Attach seeds its in-process counter from GREATEST(events_seq_hwm, MAX(seq) of the epoch). See docs/features/stateless_agents.md §5.3.2.';
+COMMENT ON COLUMN public.threads.events_seq_hwm IS 'Highest seq ever allocated in the CURRENT events_epoch. Survives retention pruning of the thread_events rows themselves; reset to 0 atomically on every epoch bump. Maintained by the agent journal writer''s fenced flush (GREATEST over the batch in the same statement) and pre-incremented by the system-frame allocator (src/shared/event_journal). Attach seeds its in-process counter from GREATEST(events_seq_hwm, MAX(seq) of the epoch). See knowledge-base/knowledge/features/stateless_agents.md §5.3.2.';
 
 
 --
@@ -9133,7 +9133,7 @@ CREATE TABLE public.users (
 -- Name: COLUMN users.is_approved; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.users.is_approved IS 'App-side admission flag. Checked per request by require_approved_user. Owned by the orchestrator, not the Keycloak realm role. See docs/features/app_side_admission.md.';
+COMMENT ON COLUMN public.users.is_approved IS 'App-side admission flag. Checked per request by require_approved_user. Owned by the orchestrator, not the Keycloak realm role. See knowledge-base/knowledge/features/app_side_admission.md.';
 
 
 --

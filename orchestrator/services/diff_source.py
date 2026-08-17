@@ -19,7 +19,7 @@ the live cloud backend (the same read path ``export_job_to_shared_folder``
 uses). See its class docstring for the mandatory tar/manifest content-binding
 check.
 
-See docs/done/job_cloud_export.md §5 and the Task 6 SDD brief
+See knowledge-history/done/job_cloud_export.md §5 and the Task 6 SDD brief
 (.superpowers/sdd/task-6-brief.md) for the shape contract — Tasks 7/8/10
 depend on these dataclasses staying exactly as defined.
 """

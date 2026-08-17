@@ -1,6 +1,6 @@
 """Merged-PR completion grant — the capability read.
 
-Spec: docs/features/merged_pr_completion_grant.md. Mirrors
+Spec: knowledge-base/knowledge/features/merged_pr_completion_grant.md. Mirrors
 tests/test_public_datasources.py, whose helper this one is modelled on.
 """
 

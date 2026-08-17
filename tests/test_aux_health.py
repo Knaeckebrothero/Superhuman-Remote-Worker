@@ -1,6 +1,6 @@
 """Tests for AuxHealth — observability for silent auxiliary-task failures.
 
-See docs/issues/surface_silent_aux_failures.md.
+See knowledge-base/knowledge/issues/surface_silent_aux_failures.md.
 """
 
 import logging

@@ -55,7 +55,7 @@ class TestHardOff:
     """ShellManager must refuse to construct without a shell-capable backend.
 
     The local libtmux execution path was removed (the sibling of the
-    local-browser fallback removal, docs/issues/remove_local_browser_fallback.md);
+    local-browser fallback removal, knowledge-base/knowledge/issues/remove_local_browser_fallback.md);
     a missing or shell-less backend must be a loud error, never a silent
     degradation to in-pod execution.
     """

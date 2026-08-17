@@ -490,7 +490,7 @@ async def build_session_state_snapshot(
         # Presence-authoritative, including an explicit null: a thread that has
         # never reported usage actively clears whatever the panel was showing,
         # which is the second, independent kill for the cross-session leak in
-        # docs/done/session_usage_panel_leaks_previous_session_counters.md.
+        # knowledge-history/done/session_usage_panel_leaks_previous_session_counters.md.
         "usage": _usage_snapshot(list(usage_rows)),
         "event_cursor": {
             "epoch": epoch,

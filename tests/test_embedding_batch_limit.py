@@ -1,6 +1,6 @@
 """Embedding batch overflow fix — the single batching seam.
 
-Pins docs/issues/embedding_batch_overflow_skips_citation_source_embeddings.md:
+Pins knowledge-base/knowledge/issues/embedding_batch_overflow_skips_citation_source_embeddings.md:
 ``EmbeddingService.embed_batch`` splits at the provider cap (default 64, the
 deployed TEI limit) with order preserved end to end, retries only transient
 classes, rejects non-finite vectors with a typed error, and the

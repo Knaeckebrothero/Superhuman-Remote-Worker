@@ -221,7 +221,7 @@ class MainCloudBackend(Protocol):
         list every descendant file and directory, sorted by ``path``.
 
         Used by the job cloud-export Mode A baseline-seed
-        (docs/done/job_cloud_export.md §3.1) to enumerate what to
+        (knowledge-history/done/job_cloud_export.md §3.1) to enumerate what to
         push into Gitea before the agent starts.
         """
         ...
@@ -326,7 +326,7 @@ class MainCloudBackend(Protocol):
         advisory; backends may pick a default if omitted.
 
         Used by the job cloud-export endpoint (Mode B in
-        docs/done/job_cloud_export.md) to copy a completed job's
+        knowledge-history/done/job_cloud_export.md) to copy a completed job's
         output files into a freshly-allocated shared folder.
         """
         ...

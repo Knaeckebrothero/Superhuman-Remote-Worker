@@ -36,7 +36,7 @@ if os.environ.get("LICENSE_TERMS_ACCEPTED", "").strip().lower() != "true":
 # Configure application-level logging (Uvicorn only configures its own loggers).
 # JSON when LOG_FORMAT=json (cluster), text otherwise (local/dev). When DEBUG,
 # only app namespaces get DEBUG; third-party stays at INFO (DEBUG_ALL=1 to
-# include it). See docs/features/centralized_logging.md.
+# include it). See knowledge-base/knowledge/features/centralized_logging.md.
 try:
     from logging_config import (  # noqa: E402
         CorrelationIdMiddleware,
@@ -1254,7 +1254,7 @@ async def _workspace_metering_attribution(
         return None
 
 
-# Session router singletons — see docs/features/direct_session_websockets.md
+# Session router singletons — see knowledge-base/knowledge/features/direct_session_websockets.md
 import json as _session_json  # noqa: E402
 
 _session_annotations_raw = os.environ.get("SESSION_INGRESS_ANNOTATIONS", "{}")
@@ -1359,7 +1359,7 @@ async def _graft_subjob_output(
     commit. Purely additive — never modifies/deletes parent content, so
     collisions and clobbering are impossible. Critic subjobs graft nothing
     (verdict is consumed from the DB).
-    See docs/superpowers/specs/2026-05-24-subjob-output-merge-model-design.md.
+    See knowledge-base/knowledge/superpowers/specs/2026-05-24-subjob-output-merge-model-design.md.
     """
     import base64
 
@@ -1637,7 +1637,7 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
         alternative: a bind-type bug in the graph-progress sweep silently
         disabled orphan-job recovery (and everything else after it) for ~36h
         because all steps shared one try block. See
-        docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
+        knowledge-history/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
         Returns None on failure — callers treat that as "no rows".
         """
         try:
@@ -1714,8 +1714,8 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
             # Scoped to thread_id + current_job_id both NULL (holds nothing
             # user-visible), so it never touches a thread-bound live session
             # (the 2026-06-10 incident). Proper fix = the intent/observed split
-            # in docs/features/unified_instance_lifecycle.md. Tracking:
-            # docs/issues/lifecycle_session_agents_without_thread_never_drain.md
+            # in knowledge-base/knowledge/features/unified_instance_lifecycle.md. Tracking:
+            # knowledge-base/knowledge/issues/lifecycle_session_agents_without_thread_never_drain.md
             orphaned_sessions = await _step(
                 "orphaned_session_reap",
                 postgres_db.reap_orphaned_session_agents(grace_minutes=5),
@@ -1801,7 +1801,7 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
             # purely by the DB clock — no agents-table join, no dependency on
             # step 1 having run. Primary recovery going forward; step 4 stays
             # as belt-and-suspenders during the soak
-            # (docs/features/job_execution_lease.md).
+            # (knowledge-base/knowledge/features/job_execution_lease.md).
             expired = await _step(
                 "lease_expiry_recovery",
                 postgres_db.recover_expired_lease_jobs(
@@ -2605,7 +2605,7 @@ def _is_protected_cloud_mode_enabled() -> bool:
     """Whether protected cloud mode (RO-reader provisioning + capture overlay)
     is enabled for this deployment. Dev-ON / prod-OFF via the helm
     ``agent.protectedCloudModeEnabled`` flag
-    (docs/design/cloud_access_unification.md §8 Phase 1)."""
+    (knowledge-base/knowledge/design/cloud_access_unification.md §8 Phase 1)."""
     return os.getenv("PROTECTED_CLOUD_MODE_ENABLED", "").lower().strip() in (
         "true",
         "1",
@@ -2726,7 +2726,7 @@ async def _acknowledged_grant_strip(
     ``resolve_config`` call with no strip at all, so an acknowledged
     ``catalog_authoring`` violation (say) still read "on" in the settings
     view after the delivered blob had already dropped it. See
-    docs/done/session_config_drift_resume.md §3.3.
+    knowledge-history/done/session_config_drift_resume.md §3.3.
     """
     ack_grant_keys = acknowledged_grant_keys(metadata)
     if not ack_grant_keys:
@@ -3345,7 +3345,7 @@ async def _session_grant_violations(thread: dict[str, Any]) -> list[str]:
     the workspace endpoint and exits "to be rebound" (a permanent grant denial is
     not recoverable by a rebind), leaving the cockpit to poll ``/connection``
     until its ~5m40s ready timeout.
-    See docs/issues/session_permission_mode_grant_denied_ready_timeout.md.
+    See knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md.
     """
     metadata = thread.get("metadata") or {}
     if isinstance(metadata, str):
@@ -3376,7 +3376,7 @@ async def _session_endpoint_violations(thread: dict[str, Any]) -> list[str]:
     with the real reason — instead of spawning a pod that crashes at agent
     startup (e.g. the memory reranker with no reachable endpoint), releasing the
     workspace, and hanging the cockpit on ``/connection`` until its ready
-    timeout. See docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+    timeout. See knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
     """
     metadata = thread.get("metadata") or {}
     if isinstance(metadata, str):
@@ -3510,7 +3510,7 @@ async def _seed_registry_model_overrides(
     (Admin -> Models) must land in ``llm.model_max_context_tokens`` *before*
     ``_apply_settings_matrix`` runs (``config_resolver.resolve_config``), or the
     family default wins and the cap is silently ignored. See
-    ``docs/issues/per_model_context_window_override_shadowed_in_blob_dispatch.md``.
+    ``knowledge-base/knowledge/issues/per_model_context_window_override_shadowed_in_blob_dispatch.md``.
 
     ``resolve_config`` is pure/synchronous (no DB), so the registry lookup
     happens here and rides the existing ``request_override`` layer: its llm keys
@@ -3740,7 +3740,7 @@ async def _inject_dispatch_credentials(
         # arrive via config_override.llm.{strategic,tactical} (the request
         # override), credentialed by the _inject_model_credentials calls earlier
         # in this function. See
-        # docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md (Layer 1).
+        # knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md (Layer 1).
 
         default_autonomy = user_settings.get("default_autonomy")
         if default_autonomy and "autonomy" not in config_override:
@@ -3802,7 +3802,7 @@ async def _inject_dispatch_credentials(
                 # was already set — _inject_env_key_credentials uses setdefault,
                 # so a pre-present MODEL must not suppress the _API_KEY (the bug
                 # that left jobs with MODEL+BASE_URL but no key:
-                # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md).
+                # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md).
                 await _inject_env_key_credentials(
                     env_keys=env_keys_block,
                     prefix="EMBEDDING",
@@ -3851,7 +3851,7 @@ async def _inject_dispatch_credentials(
     # preference (or no user at all) silently fell back to provider 'local' with
     # no key, disabling memory + KB with no signal. Inject the admin-curated
     # system embedding here so every job gets it the same way it gets its chat
-    # model. docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
+    # model. knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md
     _emb_env = config_override.setdefault("env_keys", {})
     if "EMBEDDING_API_KEY" not in _emb_env:
         _emb_model = _emb_env.get(
@@ -4133,7 +4133,7 @@ async def _build_job_start_request(
         # Backstop: never dispatch a workspace-backed job with no SSH remote.
         # A sandbox/vm backend without a `remote` block hard-fails the agent at
         # init_workspace (0 tokens, no log) — the failure mode from
-        # docs/issues/subjob_inherits_stale_workspace_container_snapshot.md. The
+        # knowledge-base/knowledge/issues/subjob_inherits_stale_workspace_container_snapshot.md. The
         # auto-assign dispatcher now resolves inherited workspaces up front, but
         # this guards every other dispatch path (manual assign, future callers):
         # fail fast with a diagnosable message instead of a cryptic agent crash.
@@ -4664,7 +4664,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         # The per-job Gitea remote. Without it the agent's pod-handoff clone
         # (resume onto a fresh workspace with no snapshot) can never fire and
         # the job silently restarts from a blank tree
-        # (docs/issues/resume_fresh_workspace_no_clone_fallback.md). VM
+        # (knowledge-base/knowledge/issues/resume_fresh_workspace_no_clone_fallback.md). VM
         # workspaces cannot resolve the cluster-internal Gitea host, so
         # mirror the fresh path's VM-scoped rewrite (F29).
         git_remote_url = job_context.get("git_remote_url")
@@ -4716,7 +4716,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 # zombie, or still finishing prior work) and rejected with 409.
                 # Demote it out of the ready pool so the next attempt doesn't
                 # re-pick the same agent. See
-                # docs/done/worker_pod_state_zombie_on_cancel.md.
+                # knowledge-history/done/worker_pod_state_zombie_on_cancel.md.
                 try:
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
@@ -5234,7 +5234,7 @@ async def _send_session_attach_locked(
     ``config_name`` is the thread's config — pool pods boot as workers
     (``worker_base``), so the agent must re-resolve the session base config
     from this name instead of its boot config
-    (docs/issues/session_config_name_plumbing.md, hole B).
+    (knowledge-base/knowledge/issues/session_config_name_plumbing.md, hole B).
 
     ``project_ids``/``datasources`` are accepted for caller compatibility but
     ignored: the assembly recomputes both from the thread's current state
@@ -5449,9 +5449,9 @@ def _is_lite_config_override(config_override: Any) -> bool:
 # Session workspace tiers selectable at create time (vm is upgrade-only) and
 # the platform default applied when neither the request nor the owner's saved
 # settings.persistent_agent.workspace_backend pick one. An S3 object store is
-# an assumed platform prerequisite (docs/done/s3_object_store_bundled_fallback.md),
+# an assumed platform prerequisite (knowledge-history/done/s3_object_store_bundled_fallback.md),
 # so the default is the instant lite tier — see
-# docs/features/instant_landing_session.md.
+# knowledge-base/knowledge/features/instant_landing_session.md.
 SESSION_WORKSPACE_BACKENDS = ("sandbox", "virtual", "none")
 SESSION_DEFAULT_WORKSPACE_BACKEND = "virtual"
 
@@ -5766,7 +5766,7 @@ def _object_store_startup_warning(
     default UX. Returns None only when BOTH seams have a durable store. Replaces
     the scattered, late per-feature failures (``LiteWorkspaceConfigError`` at
     dispatch, silent snapshot no-ops) with one signal at startup. See
-    docs/done/s3_object_store_bundled_fallback.md item 3.
+    knowledge-history/done/s3_object_store_bundled_fallback.md item 3.
     """
     env = os.environ if env is None else env
     s3_endpoint = (env.get("S3_ENDPOINT") or "").strip()
@@ -5798,7 +5798,7 @@ def _object_store_startup_warning(
         + "; ".join(bullets)
         + ". Fix: point at an external S3 (S3_ENDPOINT / VIRTUAL_WORKSPACE_S3_*) "
         "or enable the chart-bundled store (garage.enabled=true). "
-        "See docs/done/s3_object_store_bundled_fallback.md."
+        "See knowledge-history/done/s3_object_store_bundled_fallback.md."
     )
 
 
@@ -6161,7 +6161,7 @@ async def _fail_vm_parked_job(job_id: str, vm_error: str) -> None:
     scheduled to ever change its state — an invisible wedge that stalls any
     loop whose current_job never turns terminal. Failing the job makes the
     park visible (cockpit/API) and lets loop failure handling advance. See
-    docs/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md.
+    knowledge-base/knowledge/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md.
     """
     await postgres_db.update_job_status(
         job_id,
@@ -6435,7 +6435,7 @@ def _scholar_provision_parent_id(job: dict) -> str | None:
     ``_spawn_scholar_subjob``). It provisions the ONE pod ``workspace-<parentId>``
     under the parent's identity and rides it, rather than self-provisioning a
     throwaway pod (Phase 1,
-    docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md).
+    knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md).
     """
     ctx = job.get("context") or {}
     if isinstance(ctx, str):
@@ -6485,7 +6485,7 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
     parent is created — before the parent's pod is ready — so that snapshot
     carries ``status='created'`` with no SSH host and never self-updates,
     stranding the subjob at ``init_workspace`` with ``no workspace.remote``
-    (docs/issues/subjob_inherits_stale_workspace_container_snapshot.md).
+    (knowledge-base/knowledge/issues/subjob_inherits_stale_workspace_container_snapshot.md).
 
     We re-read the parent's current workspace here and overlay it onto the
     in-memory ``job['context']`` (never persisted — persisting would re-freeze a
@@ -6520,7 +6520,7 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
     # parent snapshot. Gating on key *presence* (as this once did) misread a
     # self-provisioned scholar as inheriting and waited the full budget on a
     # parent workspace that never exists, then failed. See
-    # docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
+    # knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
     if not ctx.get("inherits_parent_workspace"):
         return ("proceed", None)
 
@@ -6613,7 +6613,7 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
     # budget, and would insta-fail on any transiently non-ready parent
     # workspace at resume. Anchor = max(created_at, llm_outage.next_retry_at)
     # — the same next-wake philosophy as the outage reset window.
-    # docs/features/llm_outage_subjob_resilience.md (#5)
+    # knowledge-base/knowledge/features/llm_outage_subjob_resilience.md (#5)
     ref: datetime | None = None
     created_at = job.get("created_at")
     if isinstance(created_at, datetime):
@@ -6655,7 +6655,7 @@ async def _fail_subjob_and_unblock_parent(job: dict, message: str) -> None:
     which run inside ``complete_job``, a path a dispatch-time failure never
     reaches. Without this the parent strands in ``waiting`` forever (secondary
     bug in
-    docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md).
+    knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md).
     Mirror ``complete_job``'s terminal-subjob unblock here so any dispatch-path
     failure is self-healing, not just today's inherit-timeout.
     """
@@ -6702,7 +6702,7 @@ async def _provision_parent_workspace_for_scholar(job: dict, parent_id: str) -> 
     """Drive the PARENT's shared workspace container toward ready on a scholar's
     behalf, then promote the scholar to a normal inheriting subjob.
 
-    Phase 1 (docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md):
+    Phase 1 (knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md):
     a scholar spawned before its parent had any workspace provisions the parent's
     ONE shared pod (``workspace-<parentId>``, owner = parent) instead of a
     throwaway pod of its own, so the parent and later the critic ride the same
@@ -6881,7 +6881,7 @@ def _apply_sticky_sudo_denial(job: dict, config_override: dict | None) -> dict |
 # save-time (the 3 expert endpoints), job dispatch, job resume, and session
 # attach. Deny-by-default for security keys; existing approved users were
 # grandfathered by migration 0030 (shell_tools + delegation). See
-# docs/done/global_expert_management.md (decisions 8, 9, 19, 21-23).
+# knowledge-history/done/global_expert_management.md (decisions 8, 9, 19, 21-23).
 # =============================================================================
 
 
@@ -7074,7 +7074,7 @@ async def _strip_save_grants(
     config: dict[str, Any], *, user: dict[str, Any]
 ) -> tuple[dict[str, Any], list[str]]:
     """``duplicate_expert``'s save-time grants policy (2026-08-04 decision,
-    docs/superpowers/plans/2026-08-04-expert-write-gate-holes.md, task 3):
+    knowledge-base/knowledge/superpowers/plans/2026-08-04-expert-write-gate-holes.md, task 3):
     strip what the copier's grants forbid from the source config instead of
     refusing the fork outright, and report the grant keys that were dropped.
     ``_enforce_save_grants`` above is unchanged and still refuses for the
@@ -7220,7 +7220,7 @@ async def _enforce_session_create_grants(
     the owner's ceiling) is rejected synchronously at the API instead of being
     accepted and then failing later at provisioning with an opaque ready timeout.
     Admin owner bypasses (inside ``_enforce_dispatch_grants``).
-    See docs/issues/session_permission_mode_grant_denied_ready_timeout.md.
+    See knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md.
     """
     try:
         await _enforce_dispatch_grants(
@@ -7642,7 +7642,7 @@ async def _release_thread_resources(
 # same thread within a second (e.g. the disconnect watchdog and the agent's
 # own status→ended PUT); without this guard the loser found the workspace
 # already suspended, misread it as a failure, and deleted the agent pod a
-# second time (docs/issues/session_silent_failure_audit.md #13).
+# second time (knowledge-base/knowledge/issues/session_silent_failure_audit.md #13).
 _threads_suspending: set[str] = set()
 
 
@@ -7872,7 +7872,7 @@ async def _inject_env_key_credentials(
                 # cause) or is empty. Surface it loudly and do NOT emit a
                 # half-credential (base_url without api_key) that silently
                 # degrades the agent to a keyless 'local' provider — the failure
-                # mode in docs/done/embedding_key_missing_silently_disables_memory_and_kb.md.
+                # mode in knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md.
                 logger.error(
                     "Dispatch: %s endpoint %s resolved a base_url but no usable "
                     "api_key (decrypt failed or empty) — not injecting "
@@ -8251,7 +8251,7 @@ async def _try_dispatch_pending_jobs() -> None:
                 # copy its context by value at spawn time — stale when the parent
                 # pod wasn't ready yet. Re-resolve from the parent's live row so
                 # the subjob rides the parent pod instead of stranding at
-                # init_workspace with no SSH host. See docs/issues/
+                # init_workspace with no SSH host. See knowledge-base/knowledge/issues/
                 # subjob_inherits_stale_workspace_container_snapshot.md.
                 inherit_action, inherit_msg = await _resolve_subjob_inherited_workspace(
                     job
@@ -8337,7 +8337,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         # park holds. The job itself must go terminal too: leaving
                         # it 'created' with nothing scheduled to change its state
                         # is an invisible wedge (a loop's current_job never turns
-                        # terminal → the loop stalls forever). See docs/issues/
+                        # terminal → the loop stalls forever). See knowledge-base/knowledge/issues/
                         # vm_ssh_readiness_probe_unroutable_from_orchestrator.md.
                         park_error = (
                             f"provisioning exhausted after "
@@ -8443,7 +8443,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         # keeps the golden budget anchor + counters and does
                         # NOT consume a provision attempt — the attempt budget
                         # bounds VM boots, and no boot is happening. See
-                        # docs/done/
+                        # knowledge-history/done/
                         # golden_image_cold_import_fails_inflight_vm_jobs.md.
                         if not vm_ctx.get("golden_wait_started_at"):
                             await postgres_db.merge_vm_context(
@@ -9321,7 +9321,7 @@ class JobCreate(BaseModel):
         only by moving the nested .git aside and un-ignoring the paths by
         hand. Refusing at creation costs one 422 instead.
 
-        docs/issues/deliverable_gate_cannot_see_cloned_repo_deliverables.md
+        knowledge-base/knowledge/issues/deliverable_gate_cannot_see_cloned_repo_deliverables.md
         """
         if not value:
             return value
@@ -9598,7 +9598,7 @@ class McpTokenCreateInternal(BaseModel):
 # ----- API keys (Personal Access Tokens) -----
 # Distinct from `/api/settings/api-keys` (LLM provider keys). PATs are
 # Bearer-auth credentials for n8n / scripts hitting the orchestrator API
-# directly. See docs/features/auth_bff_and_api_tokens.md §3.
+# directly. See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md §3.
 
 VALID_PAT_SCOPES = {
     "jobs:read",
@@ -9890,7 +9890,7 @@ class UserSettingsUpdate(BaseModel):
     default_session_model: str | None = None
     # NOTE: per-phase model defaults (default_strategic_model /
     # default_tactical_model) were removed — see Layer 1 in
-    # docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+    # knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
     # Old clients PATCHing them are ignored (BaseModel drops unknown fields).
     default_embedding_model: str | None = None
     embedding_provider: str | None = None
@@ -10213,7 +10213,7 @@ async def lifespan(app: FastAPI):
     # it. ERROR + sys.exit(1) (not WARN + ignore) because the var being set
     # with no consumer is an active misconfiguration that won't self-heal —
     # the legacy code path silently fell through to api.openai.com with
-    # `not-needed` (the bug captured in docs/llm_routing_issues.md).
+    # `not-needed` (the bug captured in knowledge-base/knowledge/llm_routing_issues.md).
     if os.getenv("LLM_BASE_URL"):
         logger.error(
             "LLM_BASE_URL is set but no longer honoured. Self-hosted models "
@@ -10221,7 +10221,7 @@ async def lifespan(app: FastAPI):
             "+ Admin → Models (catalog row) or via "
             "helm.llm.seed.systemEndpoints[]. Unset LLM_BASE_URL and seed "
             "the endpoint in helm to migrate. See "
-            "docs/features/models_yaml_removal.md."
+            "knowledge-base/knowledge/features/models_yaml_removal.md."
         )
         sys.exit(1)
 
@@ -10273,7 +10273,7 @@ async def lifespan(app: FastAPI):
     # bound to its migrations directory at construction time; the runner
     # serializes via pg_advisory_xact_lock and refuses to proceed on
     # checksum drift or a dirty row from a prior failure (see
-    # docs/db_migration.md §Operational runbook for repair steps).
+    # knowledge-base/knowledge/db_migration.md §Operational runbook for repair steps).
     await postgres_db.apply_migrations()
     managed_defaults = await seed_managed_default_experts(
         postgres_db, _get_config_dir()
@@ -11083,7 +11083,7 @@ async def lifespan(app: FastAPI):
     # One loud, early signal when either object-store seam is unconfigured,
     # replacing the scattered late failures (virtual-session dispatch, snapshot
     # no-ops). Fail-closed (raise, crash-loop) when OBJECT_STORE_REQUIRED is
-    # set; warn-only otherwise. docs/done/s3_object_store_bundled_fallback.md.
+    # set; warn-only otherwise. knowledge-history/done/s3_object_store_bundled_fallback.md.
     _store_warning = _check_object_store_config()
     if _store_warning:
         logger.warning(_store_warning)
@@ -11358,7 +11358,7 @@ async def lifespan(app: FastAPI):
     # per-row claim. Under replicas:2 two unguarded copies would double-snapshot
     # to the same S3 key and race teardown against an in-flight snapshot. Gating
     # mirrors the lifecycle reconciler, which already owns the parallel idle
-    # workspace-teardown path. See docs/tests/orchestrator_ha_background_loop_sweep.md.
+    # workspace-teardown path. See knowledge-base/knowledge/tests/orchestrator_ha_background_loop_sweep.md.
     attention_sleep_task = asyncio.create_task(
         run_when_leader(attention_sleep_sweeper, _shutdown_event)
     )
@@ -11425,7 +11425,7 @@ async def lifespan(app: FastAPI):
     # Re-dispatch worker jobs paused for a transient LLM outage once their
     # backoff timer is due (fail-loud past the give-up ceiling). Leader-gated —
     # per-row CAS + run_when_leader keep N replicas from double-dispatching.
-    # docs/features/llm_outage_pause_and_backoff_redispatch.md
+    # knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md
     llm_outage_task = asyncio.create_task(
         run_when_leader(llm_outage_redispatch_sweeper, _shutdown_event)
     )
@@ -11466,7 +11466,7 @@ async def lifespan(app: FastAPI):
     )
     # Reap orphaned verification (critic) subjobs that would otherwise linger as
     # priority-10 dispatchable jobs and parasitically preempt real work. See
-    # docs/done/preemption_before_first_checkpoint_replays_job_opening.md.
+    # knowledge-history/done/preemption_before_first_checkpoint_replays_job_opening.md.
     stale_verification_sweeper_task = asyncio.create_task(
         stale_verification_sweeper_loop(
             postgres_db,
@@ -12662,7 +12662,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         # expert UUID and resolves to the (base config, DB overlay) pair this
         # funnel persists. The deprecated aliases go through the same helper,
         # so the "two experts in one call" refusal is stated once — see
-        # docs/issues/experts_one_catalogue_two_selection_paths.md.
+        # knowledge-base/knowledge/issues/experts_one_catalogue_two_selection_paths.md.
         try:
             expert_choice = resolve_expert_selection(
                 expert=job.expert,
@@ -13164,7 +13164,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         # fails SILENTLY — it forgets, then never learns the job finished, which
         # is indistinguishable from having no wake feature at all. A surplus
         # wake costs one cheap turn the agent can go straight back to sleep
-        # from. docs/features/session_wake_on_job_completion.md.
+        # from. knowledge-base/knowledge/features/session_wake_on_job_completion.md.
         creating_thread_id = (
             str(job.thread_id) if (job.thread_id and root_creation) else None
         )
@@ -13337,7 +13337,7 @@ async def delete_job(request: Request, job_id: str) -> dict[str, Any]:
         # provisioners resolve them through the job's context, and once the
         # row is gone the lifecycle reconciler refuses to reap the pod
         # (no-bound-row is treated as in-flight provisioning; see
-        # docs/done/deleted_job_orphans_workspace_pod.md).
+        # knowledge-history/done/deleted_job_orphans_workspace_pod.md).
         try:
             await _archive_and_cleanup_workspace(job_id)
         except Exception as e:
@@ -13351,7 +13351,7 @@ async def delete_job(request: Request, job_id: str) -> dict[str, Any]:
                 logger.warning(f"Snapshot cleanup failed for deleted job {job_id}: {e}")
 
         # Log-archive objects die with the job (retention:
-        # docs/features/job_log_archive.md). Re-fetch the row — keys may have
+        # knowledge-base/knowledge/features/job_log_archive.md). Re-fetch the row — keys may have
         # been stamped after this handler fetched it.
         if snapshot_service.is_available:
             try:
@@ -16866,7 +16866,7 @@ def _resume_reject_should_requeue(status_code: int) -> bool:
     cancel/pause, or an agent still finishing post-completion work) and refused
     the resume. Re-queuing lets a genuinely-ready agent pick the job up. Any
     other non-2xx is a real failure → 502. See
-    docs/done/worker_pod_state_zombie_on_cancel.md.
+    knowledge-history/done/worker_pod_state_zombie_on_cancel.md.
     """
     return status_code == 409
 
@@ -17320,7 +17320,7 @@ async def resume_job(
         # mounts, queued feedback/delegation results. The fast-path used to
         # hand-build a bare payload here, which killed jobs landing on fresh
         # (clean-env) agent pods.
-        # docs/issues/job_resume_direct_path_skips_credential_injection.md
+        # knowledge-base/knowledge/issues/job_resume_direct_path_skips_credential_injection.md
         if not await _resume_job_on_agent(job, agent):
             return await _queue_for_dispatch(
                 "Agent did not accept the direct resume; job queued for auto-dispatch"
@@ -17364,7 +17364,7 @@ async def _unmerged_pr_gate_reason(
     The principal is the calling user, or — on the internal/agent path, where
     ``require_internal_or_job_access`` yields ``None`` — the job's owner. An
     unresolvable principal holds no grant and therefore does not lift the
-    block. Spec: docs/features/merged_pr_completion_grant.md §5.
+    block. Spec: knowledge-base/knowledge/features/merged_pr_completion_grant.md §5.
     """
     from services.job_delivery import parse_job_pull_request, unmerged_pr_block_reason
 
@@ -18193,7 +18193,7 @@ async def _internal_resume_job(
     arrives here frozen — and ``get_dispatchable_jobs`` requires
     ``freeze_data IS NULL``, so keeping the blob parked the job as
     paused-but-invisible forever.
-    See docs/issues/blocking_message_reply_keeps_freeze_data.md.
+    See knowledge-base/knowledge/issues/blocking_message_reply_keeps_freeze_data.md.
     """
     updates: dict[str, Any] = {
         **dict(additional_context or {}),
@@ -18453,7 +18453,7 @@ async def _spawn_scholar_subjob(
     # (marker below) — never a throwaway pod of its own. The flag and the marker
     # are mutually exclusive: the flag routes into the inherit/wait path, the
     # marker into the provision-under-parent path. See
-    # docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
+    # knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
     if parent_ctx.get("vm"):
         scholar_context["vm"] = parent_ctx["vm"]
         scholar_context["inherits_parent_workspace"] = True
@@ -18641,7 +18641,7 @@ async def _handle_scholar_completion(
     # for the real outcome. Historically unreachable (subjobs only received
     # terminal statuses); live-caught on the k3d gate when a cooldown-paused
     # scholar falsely unblocked its parent as research-success.
-    # docs/features/llm_outage_subjob_resilience.md
+    # knowledge-base/knowledge/features/llm_outage_subjob_resilience.md
     if job_status not in ("completed", "failed", "cancelled", "pending_review"):
         logger.debug(
             f"Scholar {job_id} reported non-terminal status {job_status!r} — "
@@ -18851,7 +18851,7 @@ def _latest_delegation_outage_wake(children: list[dict]) -> "datetime | None":
     caller via the ``> freeze.timestamp`` comparison. Terminal children are
     included deliberately — extending on a finished child's recent wake errs
     in the safe (longer) direction and stays bounded by wake + timeout.
-    docs/features/llm_outage_subjob_resilience.md (#6)
+    knowledge-base/knowledge/features/llm_outage_subjob_resilience.md (#6)
     """
     from datetime import datetime, timezone
 
@@ -18931,7 +18931,7 @@ async def _check_delegation_timeouts() -> int:
                 continue
 
             # The naive timer expired — but outage-paused children suspend it
-            # (docs/features/llm_outage_subjob_resilience.md #6, LOCKED: rebase
+            # (knowledge-base/knowledge/features/llm_outage_subjob_resilience.md #6, LOCKED: rebase
             # semantics). Effective anchor = max(freeze.timestamp, latest child
             # llm_outage.next_retry_at): a child paused for a cooldown carries
             # a future wake (timer parked, up to the 12h pause budget); a child
@@ -19170,7 +19170,7 @@ async def _llm_outage_sweep_once() -> tuple[int, int]:
                 # parent would wait out its full timeout. Each handler no-ops
                 # for the wrong kind; critics need nothing (the unstick
                 # watchdog returns the reviewing parent to human review).
-                # docs/features/llm_outage_subjob_resilience.md (#4)
+                # knowledge-base/knowledge/features/llm_outage_subjob_resilience.md (#4)
                 if job.get("parent_job_id") is not None:
                     failed_job = {**job, "status": "failed"}
                     unblock_actions: list[str] = []
@@ -19209,7 +19209,7 @@ async def llm_outage_redispatch_sweeper(shutdown_event: asyncio.Event) -> None:
     Leader-gated (``run_when_leader``) + per-row CAS (``claim_llm_outage_redispatch``)
     so N replicas can't double-dispatch. The per-tick body is
     :func:`_llm_outage_sweep_once`.
-    docs/features/llm_outage_pause_and_backoff_redispatch.md
+    knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md
     """
     try:
         tick = float((os.getenv("LLM_OUTAGE_SWEEP_SECONDS") or "").strip() or 30)
@@ -19271,7 +19271,7 @@ async def infra_transient_redispatch_sweeper(shutdown_event: asyncio.Event) -> N
     Leader-gated (``run_when_leader``) + per-row CAS
     (``claim_backoff_redispatch``) so N replicas can't double-dispatch. Mirrors
     ``llm_outage_redispatch_sweeper``.
-    docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 1)
+    knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 1)
     """
     try:
         tick = float((os.getenv("INFRA_TRANSIENT_SWEEP_SECONDS") or "").strip() or 30)
@@ -19708,7 +19708,7 @@ async def _handle_critic_verdict_on_complete(
     TARGET job (``context.verification_rounds``, via ``_verification_rounds``
     + ``_resolve_critic_outcome``) — never by the critic's own freeze_data. A
     missing verdict is never read as approval; see
-    docs/superpowers/specs/2026-07-27-verification-fail-closed-design.md.
+    knowledge-base/knowledge/superpowers/specs/2026-07-27-verification-fail-closed-design.md.
     """
     if not _is_verification_critic(job):
         return  # scholar / delegation child / ordinary subjob — not a critic
@@ -20042,7 +20042,7 @@ async def _trigger_verification_on_complete(
     # delivered — an infrastructure fault reported as a work fault. That is not
     # hypothetical: on dev job 40efbb39 it cost a 105-minute critic livelock and
     # a verdict that misdiagnosed the failure entirely
-    # (docs/done/git_push_fails_silently_via_workspace_backend.md).
+    # (knowledge-history/done/git_push_fails_silently_via_workspace_backend.md).
     #
     # Checked BEFORE the gate on purpose. The gate compares `content_tree`,
     # which here describes a tree that was never pushed, so its no-progress
@@ -20878,7 +20878,7 @@ async def _spawn_loop_job(
     stamped into the job's context for the torn-advance heal (see
     ``create_loop_job``). ``disable_memory_assembler`` (set for fan-out stage
     members) turns off the TTL-curation assembler so concurrent members don't
-    race the shared project store. The real ticket pool (docs/superpowers/specs/
+    race the shared project store. The real ticket pool (knowledge-base/knowledge/superpowers/specs/
     2026-07-26-project-backlog-pipeline-design.md) is fetched here — the single
     funnel every loop spawn passes through — and handed to ``create_loop_job``
     pre-rendered. The recent structured job history is injected alongside it;
@@ -21005,7 +21005,7 @@ async def _spawn_loop_stage(
     (``base_total + width``) so members of a stage share it; ``seq_index`` and
     ``remaining`` are stamped for the heal. Raises if any job fails to create
     (the caller marks the loop failed — a half-spawned stage with no barrier
-    would wedge). docs/features/loop_parallel_stages.md.
+    would wedge). knowledge-base/knowledge/features/loop_parallel_stages.md.
 
     Every loop spawn funnels through here — the start endpoint's first stage,
     the rotation advance, and the campaign advance — which is why the
@@ -21072,7 +21072,7 @@ async def _notify_loop_event(
     Persists an outbound ``message_log`` row (the bell's backing store; the
     list view joins the job for description/config) and broadcasts the SSE
     event kind for connected clients. No email, no push — resolved Q3 of
-    docs/features/loop_campaign_scheduling.md. Best-effort on both channels:
+    knowledge-base/knowledge/features/loop_campaign_scheduling.md. Best-effort on both channels:
     a notification must never break an advance.
     """
     owner_id = loop.get("owner_id")
@@ -21234,7 +21234,7 @@ async def _writeback_loop_stage(
 
     ``campaign`` (campaign-mode loops) rides the SAME row update as the
     pointer, so the queue-cursor/status mutation and the stage pointer can
-    never tear apart from each other (docs/features/loop_campaign_scheduling.md).
+    never tear apart from each other (knowledge-base/knowledge/features/loop_campaign_scheduling.md).
     """
     ids = [str(j["id"]) for j in jobs]
     common = dict(
@@ -21275,7 +21275,7 @@ async def _record_loop_job_outcome(
     index refresh. Best effort — never raises. Returns
     ``(delivery_status, delivery_sha)``.
 
-    See docs/features/project_jobs_repo_retirement.md.
+    See knowledge-base/knowledge/features/project_jobs_repo_retirement.md.
     """
     from services.job_records import job_delivered_nothing, persisted_pull_request
     from services.project_loops import is_loop_execution_role, write_loop_retro
@@ -21301,7 +21301,7 @@ async def _record_loop_job_outcome(
     # delivered. Reads the orchestrator's own persisted record — never the
     # agent's prose — and a stale or malformed record fails loud rather than
     # silently reporting a delivery that may not exist.
-    # docs/features/better_resavio_restart_status.md §6a.
+    # knowledge-base/knowledge/features/better_resavio_restart_status.md §6a.
     completed_role = (ctx or {}).get("loop_role")
     if not failed and is_loop_execution_role(completed_role):
         pull_request = persisted_pull_request(job)
@@ -21511,7 +21511,7 @@ async def _advance_planner_campaign(
     spawn-time stamps, and plan application is guarded on
     ``campaign.plan_job_id`` (a healed re-run of the same critic job resumes
     at the persisted cursor instead of re-applying the plan).
-    docs/features/loop_campaign_scheduling.md (P0).
+    knowledge-base/knowledge/features/loop_campaign_scheduling.md (P0).
     """
     from services.project_loops import (
         LOOP_CAMPAIGN_HISTORY_LIMIT,
@@ -21844,7 +21844,7 @@ async def _rotate_loop_to_next_stage(
     On a spawn failure the loop is marked failed — a running loop with no
     in-flight job/stage would never advance.
 
-    Planner-scheduled loops (docs/features/loop_campaign_scheduling.md) get a
+    Planner-scheduled loops (knowledge-base/knowledge/features/loop_campaign_scheduling.md) get a
     campaign step first: a checkpoint critic's filed plan expands the execution
     slot into a stage queue, and a completed campaign member spawns its
     successor instead of rotating. When the campaign step falls through
@@ -21877,7 +21877,7 @@ async def _rotate_loop_to_next_stage(
     # handing the next role nothing to work from — the failed-critic case,
     # where the developer would otherwise build on a stale verdict the engine
     # cannot see. Bounded by the consecutive-failure stop evaluated above.
-    # docs/features/better_resavio_restart_status.md §6c.
+    # knowledge-base/knowledge/features/better_resavio_restart_status.md §6c.
     next_index, cycle_wrapped = next_stage_index(
         seq_index_completed=int(seq_index_completed),
         stage_count=len(roles),
@@ -21898,7 +21898,7 @@ async def _rotate_loop_to_next_stage(
             f"(attempt {consecutive + 1})"
         )
 
-    # KB convergence (docs/features/kb_convergence_ttl_reverification.md, F13): a
+    # KB convergence (knowledge-base/knowledge/features/kb_convergence_ttl_reverification.md, F13): a
     # full cycle completed when the rotation wraps back to the first stage. Tick
     # the per-note cycle TTL down once; notes that reach <= 0 become the stale
     # queue the next job's knowledge-assembler pass re-verifies. Mirrors
@@ -22718,7 +22718,7 @@ async def _advance_project_loop(
 
     Every turn is a barrier-tracked set of jobs in ``current_stage_jobs``
     (width 1 included) — the engine's ONLY advance path
-    (docs/features/loop_unified_engine.md). Membership is the idempotency
+    (knowledge-base/knowledge/features/loop_unified_engine.md). Membership is the idempotency
     guard: a stale or re-delivered completion hook for a job outside the
     current turn is a no-op, and the atomic barrier claim inside
     ``_advance_loop_member`` guarantees exactly one rotate per turn. Loop
@@ -22781,7 +22781,7 @@ async def _loop_cooldown_park_until(
     winner's reset rides the in-flight completion payload; siblings went
     terminal earlier, so their row (``error_details``, written atomically with
     ``status='failed'``) is the truth.
-    docs/issues/loop_advances_into_active_model_cooldown.md
+    knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md
     """
     from services.project_loops import (
         LOOP_COOLDOWN_PARK_CAP_SECONDS,
@@ -22834,7 +22834,7 @@ async def _advance_loop_member(
     critic and campaign members) only ever occupy width-1 turns by planner
     grammar, so the winner IS the campaign job whenever it matters; for a
     fan-out turn the campaign step falls through as a no-op.
-    docs/features/loop_unified_engine.md (Phase 1).
+    knowledge-base/knowledge/features/loop_unified_engine.md (Phase 1).
     """
     loop_id = str(loop["id"])
     stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
@@ -22944,7 +22944,7 @@ async def _advance_loop_member(
         return
 
     # Born-parked next spawn on a model-cooldown turn failure
-    # (docs/issues/loop_advances_into_active_model_cooldown.md, Option A).
+    # (knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md, Option A).
     # Strictly after the barrier claim (exactly-once per turn) and the stop
     # check (a stopping loop stops exactly as before — no park, no notify).
     park_until = await _loop_cooldown_park_until(
@@ -23098,7 +23098,7 @@ async def _trigger_curation_final_pass(
 
 class LoopPlanRequest(BaseModel):
     """Body for ``POST /api/jobs/{job_id}/loop-plan`` — a Critic-filed campaign
-    plan (docs/features/loop_campaign_scheduling.md). Validated structurally by
+    plan (knowledge-base/knowledge/features/loop_campaign_scheduling.md). Validated structurally by
     ``validate_loop_plan``; kept as a free dict here so the agent gets ONE
     consolidated, actionable error message from the domain validator instead of
     a pydantic field soup."""
@@ -24687,7 +24687,7 @@ async def _complete_job_legacy(
         # before its graph ran echoes the job's PREVIOUS freeze back at us,
         # and persisting that stale blob before the recovery arm's pause left
         # the job paused-but-invisible to the dispatcher
-        # (docs/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
+        # (knowledge-base/knowledge/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
         if result.get("freeze_data"):
             if should_persist_completion_freeze(result):
                 job["freeze_data"] = result["freeze_data"]
@@ -24752,7 +24752,7 @@ async def _complete_job_legacy(
         # 0. Workspace-unavailable recovery: the agent's remote workspace went
         #    unreachable mid-run. Recover by BACKEND TYPE — a pod-backed job must
         #    not be routed into the VM arm (that was the wedge in
-        #    docs/issues/loop_job_workspace_lost_wedged_in_recovery.md).
+        #    knowledge-base/knowledge/issues/loop_job_workspace_lost_wedged_in_recovery.md).
         error = result.get("error") or {}
 
         # 0a. Transient infrastructure failure (a backing service blipped, not a
@@ -24764,7 +24764,7 @@ async def _complete_job_legacy(
         #     On 2026-07-27 a dropped Postgres connection took this path's place
         #     as a terminal `job_error`, killing three multi-day jobs and
         #     destroying two workspaces.
-        #     docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md
+        #     knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md
         if isinstance(error, dict) and error.get("type") == "infra_transient":
             from services.completion import (
                 INFRA_TRANSIENT_MAX_ATTEMPTS,
@@ -24919,8 +24919,8 @@ async def _complete_job_legacy(
                 # workspace sshd before any delete (a live pod is kept warm),
                 # bounds attempts at the cap, and tears the last pod down on
                 # fail-loud so it cannot leak.
-                # See docs/features/workspace_pvc_branch_a_implementation.md (G1)
-                # and docs/issues/maxsessions_parallel_tools_false_workspace_death.md.
+                # See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md (G1)
+                # and knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md.
                 async def _delete_pod(jid: str) -> bool:
                     delete_kwargs: dict[str, Any] = {}
                     owner = WorkspaceOwner.job(jid)
@@ -25044,7 +25044,7 @@ async def _complete_job_legacy(
         # Any other handled completion proves the workspace connection works —
         # clear a lingering recovery strike so an old blip cannot make a later,
         # unrelated one exhaust the cap early.
-        # docs/issues/maxsessions_parallel_tools_false_workspace_death.md (D).
+        # knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md (D).
         if should_reset_recovery_counter(_get_container_context(job), error):
 
             async def _reset_recovery_strikes() -> dict[str, Any]:
@@ -25070,7 +25070,7 @@ async def _complete_job_legacy(
         # 1. Determine and set the new job status. For a subjob, pass the parent's
         # current status so a drain-frozen subjob resolves terminally instead of
         # pausing into a cascade-guard wedge under a permanently-failed parent.
-        # docs/done/coincident_infra_error_overrides_reported_job_outcome.md
+        # knowledge-history/done/coincident_infra_error_overrides_reported_job_outcome.md
         _parent_status = late_guard.get("entry_parent_status")
         if _effect_runner is None and job.get("parent_job_id"):
             _parent = await postgres_db.get_job(str(job["parent_job_id"]))
@@ -25115,7 +25115,7 @@ async def _complete_job_legacy(
         # is still 'processing', so it has to run before the generic status write
         # below. The loop-advance hook is correctly skipped because the job never
         # reaches a terminal status here.
-        # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
+        # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md
         if new_status == "paused":
             _mfd = result.get("freeze_data")
             if isinstance(_mfd, str):
@@ -25188,7 +25188,7 @@ async def _complete_job_legacy(
         # terminal FAIL (ceiling tripped): alert the operator (dead-letter +
         # alert, not silent give-up); the generic write below sets status=failed
         # and the loop-advance hook counts it once.
-        # docs/features/llm_outage_pause_and_backoff_redispatch.md
+        # knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md
         _lfd = result.get("freeze_data")
         if isinstance(_lfd, str):
             try:
@@ -25350,7 +25350,7 @@ async def _complete_job_legacy(
         # (bounded by the gate's cap; at the cap the seal falls through with
         # the report stamped in context.deliverable_gate). Gitea-down fails
         # open. Logic in services/deliverable_gate.py.
-        # docs/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C.
+        # knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C.
         from services.completion import apply_deliverable_gate
 
         async def _queue_deliverable_gate_resume(
@@ -25661,7 +25661,7 @@ async def _complete_job_legacy(
         # open. Routed to human review rather than refused, because refusing a
         # self-sealing job would strand it. Sibling of the mode A downgrade
         # above; both are deliberate exceptions to `full` autonomy being
-        # terminal (docs/issues/full_autonomy_is_not_actually_terminal.md).
+        # terminal (knowledge-base/knowledge/issues/full_autonomy_is_not_actually_terminal.md).
         if new_status == "completed":
             new_status, unmerged_pr_action = unmerged_pr_seal_status(
                 new_status,
@@ -25826,7 +25826,7 @@ async def _complete_job_legacy(
             # loop-advance heal path (which re-runs with result={}) can read
             # classification/reset_at back off the row. Rides the SAME UPDATE
             # as status='failed', so a sibling barrier winner never sees one
-            # without the other. docs/issues/loop_advances_into_active_model_cooldown.md
+            # without the other. knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md
             if new_status == "failed" and isinstance(result.get("error"), dict):
                 kwargs["error_details"] = result["error"]
 
@@ -25959,7 +25959,7 @@ async def _complete_job_legacy(
 
                 # Progress-aware drain backstop (defense-in-depth for the
                 # version_upgrade drain livelock,
-                # docs/issues/version_upgrade_drain_livelock.md). Detects a
+                # knowledge-base/knowledge/issues/version_upgrade_drain_livelock.md). Detects a
                 # re-dispatch loop that is NOT advancing (freeze phase_number
                 # stuck) and alerts, rather than letting it churn invisibly.
                 # Pure decision in services.completion; I/O stays here.
@@ -26490,7 +26490,7 @@ async def _complete_job_legacy(
         # Only a TERMINAL outcome advances the loop: a paused job (e.g. the
         # memory_unavailable bounded-retry) is re-dispatched as the SAME job, so
         # the loop must keep waiting on it rather than rotate to the next role.
-        # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
+        # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md
         if _effect_runner is None:
 
             async def _advance_completion_project_loop() -> dict[str, Any]:
@@ -26606,7 +26606,7 @@ async def _complete_job_legacy(
         # entry-time status would enqueue a wake for a transition that did not
         # occur. Anything genuinely terminal that this call misses is picked up
         # by the sweeper, which reads the row's real status.
-        # docs/features/session_wake_on_job_completion.md
+        # knowledge-base/knowledge/features/session_wake_on_job_completion.md
         if new_status:
 
             async def _enqueue_session_wake() -> dict[str, Any]:
@@ -26982,7 +26982,7 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
     # Live VM workspaces live on the Tailscale mesh; the orchestrator pod is
     # not a tailnet member, so proxying directly to pod_ip black-holes and the
     # request hangs into a Cloudflare 504. Until IDE traffic for mesh VMs is
-    # routed through the agent (docs/features/vm_snapshots_and_ide.md,
+    # routed through the agent (knowledge-base/knowledge/features/vm_snapshots_and_ide.md,
     # "Live-VM IDE Access via the Agent"), fail fast with a clear status.
     from services.ssh_helpers import orchestrator_can_reach
 
@@ -27744,7 +27744,7 @@ async def list_repo_tags(
 # with no job dimension — on k8s that PVC only ever holds uploads/), so
 # every read 404'd and any hit was a cross-job leak by construction. Job
 # files are served from Gitea via /api/jobs/{id}/repo/* above. See
-# docs/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P0-B.
+# knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P0-B.
 
 
 @app.get("/api/jobs/{job_id}/diff")
@@ -27760,7 +27760,7 @@ async def get_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     project job). Empty ``files`` list means no changes under
     ``projects/<slug>/`` — the agent didn't touch the mounted folder.
 
-    See docs/done/job_cloud_export.md §5.
+    See knowledge-history/done/job_cloud_export.md §5.
     """
     _, job = await require_job_access(request, postgres_db, job_id)
     if not job.get("cloud_diff_baseline_commit"):
@@ -27872,7 +27872,7 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     backend, then transitions ``diff_status='accepted'`` and
     ``status='completed'``.
 
-    See docs/done/job_cloud_export.md §3.5.
+    See knowledge-history/done/job_cloud_export.md §3.5.
     """
     _, job = await require_job_access(request, postgres_db, job_id)
     await _guard_completion_control(job_id, source="mode_a_accept")
@@ -28125,7 +28125,7 @@ async def reject_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     Gitea commits stay around as the audit trail of what the agent
     tried to do (cheap; see §3.6).
 
-    See docs/done/job_cloud_export.md §3.6.
+    See knowledge-history/done/job_cloud_export.md §3.6.
     """
     _, job = await require_job_access(request, postgres_db, job_id)
     await _guard_completion_control(job_id, source="mode_a_reject")
@@ -28328,7 +28328,7 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
     deliverable set changes can therefore leave files from the previous shape
     behind, since the collapsed prefix is recomputed per call.
 
-    See docs/done/job_cloud_export.md §3.2.
+    See knowledge-history/done/job_cloud_export.md §3.2.
     """
     user, job = await require_job_access(request, postgres_db, job_id)
 
@@ -28365,7 +28365,7 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
 
     # Fresh loose-job export folder — no project/thread row to pin to yet,
     # so resolve via the owner seam (returns the active backend today;
-    # per-org under multi-tenancy). Issue 16, docs/issues/main_cloud.md.
+    # per-org under multi-tenancy). Issue 16, knowledge-base/knowledge/issues/main_cloud.md.
     backend = main_cloud_router.for_owner(user)
     if not backend.is_initialized:
         raise HTTPException(status_code=503, detail="Cloud backend not available.")
@@ -28693,8 +28693,8 @@ async def get_archived_todos(
 # GET /api/jobs/{id}/audit?lean=true&offset=&limit= (per-step detail via
 # /audit/step/{id}), GET /api/jobs/{id}/chat?offset=&limit=, and
 # GET /api/graph/changes/{id} for the graph timeline. See
-# docs/features/debug_audit_view_refactor.md and
-# docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md.
+# knowledge-base/knowledge/features/debug_audit_view_refactor.md and
+# knowledge-base/knowledge/issues/audit_metadata_config_duplication_ooms_orchestrator.md.
 
 
 @app.get("/api/jobs/{job_id}/version")
@@ -28847,7 +28847,7 @@ def _build_datasources_payload(
         if ds_type == "email":
             # v1: one mailbox per job/session — the agent keys connections by
             # type, so a second email datasource would silently shadow the
-            # first (docs/features/email_datasource.md, open questions).
+            # first (knowledge-base/knowledge/features/email_datasource.md, open questions).
             if email_forwarded:
                 logger.warning(
                     "Skipping additional email datasource %r: only one email "
@@ -29080,7 +29080,7 @@ def _normalize_kb_config(
     an external connector to steer it out of the sweep — and, read the other
     way, cannot be stripped off a project's own KB by editing its root path
     (that would drop the vault straight back into the external sweep and
-    double-index it; docs/features/knowledge_base_repo_separation.md §6).
+    double-index it; knowledge-base/knowledge/features/knowledge_base_repo_separation.md §6).
     """
     from services.kb_datasources import NATIVE_PROJECT_CONFIG_KEY
 
@@ -29482,7 +29482,7 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
         await require_project_owner(request, postgres_db, project_id)
 
     # Publish gate — is_global hands the publisher's stored credentials to
-    # every user's agents (docs/features/public_datasources.md).
+    # every user's agents (knowledge-base/knowledge/features/public_datasources.md).
     if body.is_global and not await postgres_db.user_can_publish_datasource(user):
         raise HTTPException(
             status_code=403,
@@ -29493,7 +29493,7 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
         )
     # Mailboxes are never published — a public email datasource would hand the
     # owner's IMAP/SMTP credentials to every user's agents, so no capability
-    # can allow it (docs/features/email_datasource.md).
+    # can allow it (knowledge-base/knowledge/features/email_datasource.md).
     if body.type == "email" and body.is_global:
         raise HTTPException(
             status_code=400,
@@ -29631,7 +29631,7 @@ async def update_datasource(
             status_code=403,
             detail="MCP connectors are disabled on this deployment",
         )
-    # Publish gate (spec: docs/features/public_datasources.md). Only the
+    # Publish gate (spec: knowledge-base/knowledge/features/public_datasources.md). Only the
     # false→true transition needs the capability; unpublishing must always
     # work for creator/admin (a revoked grant must not trap a public row).
     if body.is_global is True and not existing_ds.get("is_global"):
@@ -29645,7 +29645,7 @@ async def update_datasource(
             )
     # Mailboxes are never published — a public email datasource would hand the
     # owner's IMAP/SMTP credentials to every user's agents, so no capability
-    # can allow it (docs/features/email_datasource.md).
+    # can allow it (knowledge-base/knowledge/features/email_datasource.md).
     if existing_ds.get("type") == "email" and body.is_global is True:
         raise HTTPException(
             status_code=400,
@@ -30779,7 +30779,7 @@ def _verification_rounds(job: dict[str, Any] | None) -> list[dict[str, Any]]:
     asyncpg returns JSONB as a string on the app pool (no codec registered), so
     the context must be coerced at every read. This is the single coercion
     point for the ledger — see
-    docs/issues/jsonb_isinstance_guard_without_parse_silent_dead_paths.md.
+    knowledge-base/knowledge/issues/jsonb_isinstance_guard_without_parse_silent_dead_paths.md.
     """
     if not job:
         return []
@@ -32799,7 +32799,7 @@ async def store_citation_snapshot(request: Request) -> dict[str, Any]:
 # resubmits forever (189 iterations / 105 min in the live incident) while its
 # parent sits wedged in 'reviewing'. A fresh critic is spawned every round, so
 # the per-critic count naturally resets each round.
-# docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
+# knowledge-history/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
 _MAX_VERDICT_REJECTIONS = 3
 
 
@@ -32858,7 +32858,7 @@ async def _record_verification_round_impl(
     if isinstance(critic_ctx, str):
         # asyncpg returns JSONB as a string on the app pool (no codec
         # registered); an isinstance-only check here would reject every real
-        # critic. See docs/issues/
+        # critic. See knowledge-base/knowledge/issues/
         # jsonb_isinstance_guard_without_parse_silent_dead_paths.md.
         try:
             critic_ctx = json.loads(critic_ctx)
@@ -33040,7 +33040,7 @@ async def _record_completion_decision_impl(
 ) -> dict[str, Any]:
     """Validate and durably journal one job_complete decision.
 
-    Journal-before-observe (docs/issues/
+    Journal-before-observe (knowledge-base/knowledge/issues/
     job_finalization_decisions_held_only_in_process_memory.md): the agent's
     ``job_complete`` tool must not return to the model until the decision is
     committed here. Idempotency key is ``(job_id, tool_call_id)`` — a replay
@@ -33809,7 +33809,7 @@ async def register_agent(
                     )
 
                 # Defense-in-depth against the double-provisioning race
-                # (docs/issues/persistent_thread_double_provisioning_race.md):
+                # (knowledge-base/knowledge/issues/persistent_thread_double_provisioning_race.md):
                 # refuse a different live owner before the hostname upsert can
                 # pause its jobs, change its binding, or delete it through an
                 # attempted loser rollback. A same-host restart targets that
@@ -34151,7 +34151,7 @@ async def _thread_project_ids(thread_id: str) -> list[str]:
     which is what actually filters; ``repo`` rows are the shape excluded here.
     (This line used to claim ``project_default`` was excluded too. It never
     was, and reading it that way sends you looking for a bug that isn't there
-    — see docs/issues/session_contacts_never_register_on_default_project.md.)
+    — see knowledge-base/knowledge/issues/session_contacts_never_register_on_default_project.md.)
 
     **Lazy backfill (transitional):** threads that predate the migration
     have ``metadata.project_ids`` set but no ``thread_mounts`` rows. Newer
@@ -34952,7 +34952,7 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
     }
 
 
-# Slice C (docs/design/cloud_access_unification.md §5): module-level registry
+# Slice C (knowledge-base/knowledge/design/cloud_access_unification.md §5): module-level registry
 # of in-flight turn-end staging tasks, keyed by thread_id. Same fire-and-
 # forget-task-GC hazard as ``_protected_engage_tasks`` above, plus de-dupe —
 # a slow stage from one turn must not be raced by a second ping landing
@@ -36951,7 +36951,7 @@ async def agent_update_thread_status(
                 # delete — preserve the workspace via S3 snapshot so /resume
                 # can restore it. The user-facing DELETE handler still uses
                 # _release_thread_resources for true destruction.
-                # See docs/issues/persistent_session_permission_check_race.md.
+                # See knowledge-base/knowledge/issues/persistent_session_permission_check_race.md.
                 asyncio.create_task(_suspend_thread_resources(thread_id))
                 # A conference ending by idle-archive concludes the meeting
                 # exactly like a deliberate end: release the officer's hold
@@ -37358,7 +37358,7 @@ async def _apply_thread_config_update(
     # escalation past the user's ceiling; the cockpit greys these out
     # client-side). Ownerless/standalone threads (user_id NULL) aren't
     # subject to a user's grants — skip. Admin owner bypasses.
-    # docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+    # knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md
     if thread_row and thread_row.get("user_id"):
         await _enforce_session_create_grants(
             grant_fragment,
@@ -37822,7 +37822,7 @@ async def get_job_brief(request: Request, job_id: str) -> dict[str, Any]:
     ``JobResumeRequest`` carries no description/deliverables/kickoff, so a
     resumed job would serve an empty brief for the rest of its life; the agent
     backfills from here on resume
-    (docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+    (knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
     """
     await require_internal(request)
     job = await postgres_db.get_job(job_id)
@@ -38014,7 +38014,7 @@ async def agent_heartbeat(
         # A push stop signal already exists and stays the fast path; this is the
         # BACKSTOP that catches the 13+ call sites which can write a terminal
         # status without sending one.
-        # docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
+        # knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
         job_status: str | None = None
         pending_guidance: list[dict[str, Any]] | None = None
         queued_replies: list[dict[str, Any]] | None = None
@@ -38174,7 +38174,7 @@ class ThreadCreateRequest(BaseModel):
     # Sessions run the persistent base config — every other session-config
     # fallback in this file already says "session_base". The old
     # "defaults" default silently put bare API threads on the WORKER yaml
-    # (docs/issues/session_config_name_plumbing.md, hole A).
+    # (knowledge-base/knowledge/issues/session_config_name_plumbing.md, hole A).
     config_name: str = Field("session_base", description="Agent config to use")
     project_id: str | None = Field(None, description="(Legacy) Single project to scope")
     project_ids: list[str] | None = Field(
@@ -38937,7 +38937,7 @@ async def create_thread(
         # letting the attach pre-flight fail it later (Phase 1). Validates the
         # user-chosen overrides (permission_mode, model, workspace.backend,
         # tools) against the owner's grants + the session's project scope; admins
-        # bypass. docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+        # bypass. knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md
         await _enforce_session_create_grants(
             effective_create_config,
             user_id=str(user["id"]),
@@ -39171,7 +39171,7 @@ async def create_thread(
             # bailing "no workspace provisioned". Then fire create_thread_vm
             # fire-and-forget (mirrors the container task) with the requested
             # sizing; the agent pod provisioned below SSHes into the VM once it
-            # reports ready. (docs/features/session_create_on_vm.md)
+            # reports ready. (knowledge-base/knowledge/features/session_create_on_vm.md)
             await postgres_db.merge_thread_vm_context(
                 thread_id, {"status": "provisioning"}
             )
@@ -39308,7 +39308,7 @@ async def create_thread(
             # Fresh session folder for a new thread — resolve via the owner
             # seam (active today). The thread row is stamped with this
             # backend's id below, so resume/delete later dispatch via
-            # for_thread. Issue 16, docs/issues/main_cloud.md.
+            # for_thread. Issue 16, knowledge-base/knowledge/issues/main_cloud.md.
             backend = main_cloud_router.for_owner(user)
             if not backend.is_initialized and backend.is_configured:
                 await backend.ensure_initialized()
@@ -39618,7 +39618,7 @@ def _build_agent_cloud_sync(
 ) -> Optional[dict[str, Any]]:
     """Build the ``cloud_sync`` payload the agent uses to push/pull workspace files.
 
-    Phase 1 of ``docs/features/cloud_collaboration_model.md`` §9 introduces the
+    Phase 1 of ``knowledge-base/knowledge/features/cloud_collaboration_model.md`` §9 introduces the
     multi-mount model. Payload shape is now ``version: 2``::
 
         {
@@ -39749,7 +39749,7 @@ async def _build_rclone_mount_from_row(
         target_path = f"/cloud/{workspace_name}"
         # vm tier = root → read-only by default (root + FUSE over the whole
         # Space is a real blast radius); see
-        # docs/issues/workspace_upgrade_drops_cloud_mount.md § Security.
+        # knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md § Security.
         access = "read_only" if runtime_is_vm else "read_write"
         spec = await backend.build_rclone_mount_spec(
             handle=handle,
@@ -40776,7 +40776,7 @@ async def update_thread_config(
 # Three endpoints share one gate (``_require_protected``) and one resolver
 # (``_thread_cloud_diff_source``) that builds a Task 7 ``UpperdirDiffSource``
 # from the thread's ``cloud_ro_mounts`` row + selected ``thread_mounts`` row.
-# See docs/design/cloud_access_unification.md §5/§11 and
+# See knowledge-base/knowledge/design/cloud_access_unification.md §5/§11 and
 # .superpowers/sdd/task-8-brief.md for the response-shape contract Cockpit
 # (Task 14) depends on.
 # =============================================================================
@@ -41725,7 +41725,7 @@ async def end_thread(
         force: Required to end a session whose agent is mid-turn. Without it
                a live turn returns 409 — a sessions-list cleanup sweep tore
                down an active session mid-turn, destroying its in-memory
-               input queue (docs/issues/session_silent_failure_audit.md #11).
+               input queue (knowledge-base/knowledge/issues/session_silent_failure_audit.md #11).
     """
     _user, thread = await require_thread_owner(request, postgres_db, thread_id)
     return await _end_thread_flow(thread_id, thread, permanent=permanent, force=force)
@@ -42020,7 +42020,7 @@ async def _end_thread_flow(
 # ``cloud_sync_degraded``, and ran with ``workspace_sync = None`` for the
 # session's WHOLE life (persistent_app.py has no rebuild path). Registering the
 # task lets the attach paths await it instead of racing it.
-# docs/done/session_resume_cloud_sync_race_late_provision.md
+# knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
 _late_cloud_setup_tasks: dict[str, "asyncio.Task[None]"] = {}
 
 # Ceiling on how long an attach waits for in-flight session-folder
@@ -42198,7 +42198,7 @@ async def resume_thread(
     Drifted config (deleted/revoked connectors or projects, withdrawn grants)
     is reported as 428 rather than silently denied; the caller re-POSTs with
     ``acknowledge`` naming the drift ids it accepts losing. See
-    docs/done/session_config_drift_resume.md.
+    knowledge-history/done/session_config_drift_resume.md.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     from src.shared.run_queue import LANE_PINNED, LANE_STATELESS
@@ -42486,11 +42486,11 @@ async def resume_thread(
             # of attach and never re-reads. Outside the advisory lock below:
             # this can take seconds and the fresh pod's /register needs that
             # same lock.
-            # docs/done/session_resume_cloud_sync_race_late_provision.md
+            # knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
             await _await_late_cloud_setup(tid)
 
             # Serialise concurrent provisioning attempts for the same
-            # thread (docs/issues/persistent_thread_double_provisioning_race.md).
+            # thread (knowledge-base/knowledge/issues/persistent_thread_double_provisioning_race.md).
             # A concurrent /prepare or /resume on the same thread blocks
             # here; the second arrival observes the binding written by
             # the first and exits. Lifecycle SSE events for the cockpit's
@@ -42657,7 +42657,7 @@ async def rewind_thread_detached(
 ) -> dict[str, Any]:
     """Rewind a DETACHED session's transcript (auth: owner only).
 
-    docs/features/session_rewind.md §Flow — detached. Conversation mode
+    knowledge-base/knowledge/features/session_rewind.md §Flow — detached. Conversation mode
     only: file restore needs the agent that holds the workspace, so live
     sessions rewind through the session WebSocket instead, and code modes
     here answer 400 ("resume first"). A bound agent means the in-memory
@@ -42880,7 +42880,7 @@ async def get_thread_messages_history(
 #
 # SSE replaces the WebSocket as the primary server→client path; the existing
 # /ws/persistent/{thread_id} stays as a fallback. Per
-# docs/features/headless_persistent_sessions.md.
+# knowledge-base/knowledge/features/headless_persistent_sessions.md.
 #
 # The per-turn input lock guards against duplicate POSTs from concurrent
 # cockpit tabs racing on the same turn. Single-instance orchestrator, so a
@@ -45999,7 +45999,7 @@ async def delete_thread_upload(
     the bytes have already landed. Without this, cancelling is a lie and
     attach → remove → re-attach cycles accumulate ``_1``/``_2`` copies in a
     directory the agent can list and read
-    (``docs/features/session_attachment_send_flow.md`` §9.1).
+    (``knowledge-base/knowledge/features/session_attachment_send_flow.md`` §9.1).
 
     ``path`` is relative to ``uploads/`` — i.e. the ``name`` field the upload
     response returned (``report.pdf``, or ``bundle/sub/a.txt`` for a
@@ -46455,7 +46455,7 @@ async def _read_archived_agent_log(meta: dict | str | None) -> str | None:
     """Stitch the archived agent-pod log(s) referenced by a job/thread row.
 
     ``log_archive_keys`` is stamped at pod deletion by the log archive
-    (docs/features/job_log_archive.md). Returns the concatenated text, or
+    (knowledge-base/knowledge/features/job_log_archive.md). Returns the concatenated text, or
     ``None`` when the row has no archive or the store is unavailable.
     """
     if isinstance(meta, str):
@@ -46500,7 +46500,7 @@ async def get_job_logs(
 
     Serves the live per-job file when it exists (compose/dev shared volume),
     else falls back to the S3 log archive written at agent-pod deletion
-    (docs/features/job_log_archive.md) — logs stay readable after the reap.
+    (knowledge-base/knowledge/features/job_log_archive.md) — logs stay readable after the reap.
 
     Args:
         job_id: Job UUID
@@ -46568,7 +46568,7 @@ async def get_thread_logs(
     """Read the archived agent-pod log for a session (auth: owner only).
 
     Post-mortem debugging for sessions whose agent pod is gone: serves the
-    S3 archive written at pod deletion (docs/features/job_log_archive.md).
+    S3 archive written at pod deletion (knowledge-base/knowledge/features/job_log_archive.md).
     404s until the pod has been deleted at least once — while it is alive,
     the log lives on the pod (``kubectl logs``).
     """
@@ -47026,7 +47026,7 @@ def _effective_models_from_layers(
     Returns ``{slot: {"model": str|None, "source": str}}`` for slots
     ``strategic`` / ``tactical`` / ``subagent`` / ``session``; ``source`` is one of ``expert`` /
     ``account_default`` / ``system_default``. See Layer 3 in
-    docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+    knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
     """
     llm = expert_llm or {}
 
@@ -47088,7 +47088,7 @@ async def _load_expert_detail(
     When ``user_id`` is provided, attaches ``effective_models`` (per-slot model +
     provenance) so the create-form picker can show what will actually run if left
     untouched — see Layer 3 in
-    docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+    knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
 
     ``include_account_defaults`` inserts the caller's account layer between the
     framework base and the expert fragment, exactly where ``resolve_config``
@@ -50729,7 +50729,7 @@ async def list_available_models(
     # Per-model reasoning capability (family-derived) so the Cockpit reasoning
     # control is driven by the catalog instead of hardcoded client logic. The
     # single source of truth is config/model_config_matrix.yaml's `reasoning`
-    # block per family. See docs/features/family_centered_reasoning.md.
+    # block per family. See knowledge-base/knowledge/features/family_centered_reasoning.md.
     from src.core.loader import reasoning_capability
 
     reasoning_by_model: dict[str, dict[str, Any]] = {}
@@ -52033,7 +52033,7 @@ async def admin_list_security_events(
     caller), ``event_type`` (``access_denied`` / ``admin_denied``),
     ``since`` (ISO 8601). Rows are pruned on retention
     (``SECURITY_EVENTS_RETENTION_DAYS``, default 90). Design:
-    docs/features/security_event_log.md.
+    knowledge-base/knowledge/features/security_event_log.md.
     """
     await _require_admin(request)
     since_dt: Optional[datetime] = None
@@ -52063,7 +52063,7 @@ async def admin_list_security_events(
 _project_heal_locks: dict[str, asyncio.Lock] = {}
 
 # Fire-and-forget repair tasks spawned off the project-GET read path (see
-# docs/issues/project_page_open_blocks_on_cloud_heal.md part 1). The task set
+# knowledge-base/knowledge/issues/project_page_open_blocks_on_cloud_heal.md part 1). The task set
 # holds strong references (bare create_task results are GC-able); the
 # last-fired map throttles per key so page views don't hammer Keycloak/the
 # cloud backend. Both are bounded by the number of live projects/users.
@@ -52138,7 +52138,7 @@ async def _ensure_project_cloud_resources(
       this is pure drift repair, which is why get_project runs it as a
       throttled background task rather than on the request path (it costs
       several external HTTP round-trips — see
-      docs/issues/project_page_open_blocks_on_cloud_heal.md).
+      knowledge-base/knowledge/issues/project_page_open_blocks_on_cloud_heal.md).
 
     Default projects skip both: they piggyback on the owner's personal home
     Space (already attached as a datasource by the user-creation flow), so a
@@ -52203,7 +52203,7 @@ async def _ensure_project_cloud_resources(
                     # double-expose the same files through the webdav_* tools.
                     # webdav_* tools are reserved for clouds that are NOT cloned
                     # (the personal home cloud + externally-attached WebDAV).
-                    # See docs/issues/main_cloud.md (Issue 1 / Issue 8).
+                    # See knowledge-base/knowledge/issues/main_cloud.md (Issue 1 / Issue 8).
                 except Exception as e:
                     logger.warning(
                         f"Failed to create cloud resources for project "
@@ -52546,7 +52546,7 @@ async def _adopt_kb_connector_as_vault(
     Copying it into a second row would leave two connectors on one repository:
     the copy indexed under the project id and the original still swept under
     its own UUID, so every note would answer a search twice — the one failure
-    in docs/features/knowledge_base_repo_separation.md that corrupts search
+    in knowledge-base/knowledge/features/knowledge_base_repo_separation.md that corrupts search
     rather than merely failing it.
 
     Scope narrows to the adopting project because the row stops being an
@@ -52848,7 +52848,7 @@ async def get_project(request: Request, project_id: str) -> dict[str, Any]:
 
     The warm path is pure Postgres — cloud/Keycloak reconciliation and
     identity resolution run as throttled background repairs, never on the
-    request (docs/issues/project_page_open_blocks_on_cloud_heal.md
+    request (knowledge-base/knowledge/issues/project_page_open_blocks_on_cloud_heal.md
     measured 2.3-5s per page open when they were inline).
     """
     _, project = await require_project_member(request, postgres_db, project_id)
@@ -52955,7 +52955,7 @@ async def update_project(
     # workspaces can reach at the pod-network layer (e.g. home-allowed
     # exposes the homelab LAN). Letting any project owner choose their own
     # tier defeats the operator-side control plane. See
-    # docs/features/workspace_network_isolation.md §3.
+    # knowledge-base/knowledge/features/workspace_network_isolation.md §3.
     if body.network_tier is not None:
         await _require_admin(request)
     success = await postgres_db.update_project(project_id, **kwargs)
@@ -54557,7 +54557,7 @@ async def materialize_knowledge_note(
     """Commit one rendered note to ``knowledge/<slug>.md`` in the project's KB
     repo. **Internal** (P4b) — requires ``X-Internal-Key``.
 
-    Step 3 of docs/features/knowledge_base_repo_separation.md: the agent used
+    Step 3 of knowledge-base/knowledge/features/knowledge_base_repo_separation.md: the agent used
     to write this file into its workspace checkout, which welded the vault to
     the jobs repo and skipped entirely wherever there was no git (persistent
     sessions, lite tiers, repo-less projects). The write is server-side now —

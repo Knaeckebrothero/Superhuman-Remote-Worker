@@ -6,7 +6,7 @@ branch (no URL/pool) so no live DB is required — the tests only have to prove
 the signatures accept offset/limit (and legacy page/pageSize) and the response
 echoes them back correctly. The chat case guards the migration that repointed
 the MCP `get_chat_bulk` tool off the removed `/chat/bulk` route onto the paged
-`/chat` endpoint (see docs/features/debug_audit_view_refactor.md).
+`/chat` endpoint (see knowledge-base/knowledge/features/debug_audit_view_refactor.md).
 """
 
 import pytest

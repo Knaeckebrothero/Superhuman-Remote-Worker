@@ -1,4 +1,4 @@
-"""Unified loop engine, Phase 1 (docs/features/loop_unified_engine.md).
+"""Unified loop engine, Phase 1 (knowledge-base/knowledge/features/loop_unified_engine.md).
 
 Every turn — width 1 included — is barrier-tracked in ``current_stage_jobs``:
 ``_writeback_loop_stage`` writes the membership plus the width-1 display
@@ -300,7 +300,7 @@ class TestResume:
 
 # =============================================================================
 # Born-parked spawn on model-cooldown turn failure
-# (docs/issues/loop_advances_into_active_model_cooldown.md)
+# (knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md)
 # =============================================================================
 
 
@@ -614,7 +614,7 @@ class TestSpawnRequiresUnattendedOperationsGrant:
     advance, the campaign advance — funnels through ``_spawn_loop_stage``,
     which is why the ``unattended_operations`` re-check lives there. Revoking
     the grant under a running loop must HALT it at the next advance, not let it
-    keep spending unattended. docs/done/unattended_operations_grant.md.
+    keep spending unattended. knowledge-history/done/unattended_operations_grant.md.
     """
 
     @staticmethod
@@ -705,7 +705,7 @@ class TestTurnOutcomeReachesRotation:
     ``completed_failed`` is the barrier winner's own status. On a fan-out
     turn that is whichever member happened to finish last, which says
     nothing about whether the turn produced anything. Rotation decisions
-    need the aggregate — docs/features/better_resavio_restart_status.md §6c.
+    need the aggregate — knowledge-base/knowledge/features/better_resavio_restart_status.md §6c.
     """
 
     @pytest.mark.asyncio

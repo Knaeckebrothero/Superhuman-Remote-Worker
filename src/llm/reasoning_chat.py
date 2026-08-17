@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # wants reasoning in true chronological order (before the answer) sets this
 # contextvar to a sync callback; the tap invokes it per delta as the bytes
 # arrive. Defaults to None ⇒ no live emission, identical to legacy behavior.
-# See docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+# See knowledge-base/knowledge/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
 _STREAM_REASONING_SINK: ContextVar[Optional[Callable[[str], None]]] = ContextVar(
     "stream_reasoning_sink", default=None
 )
@@ -75,7 +75,7 @@ def _dump_codex_raw_response(
 
     Diagnostic for the codex-proxy non-streaming failure mode where the
     proxy returns real LLM output but the agent ends up with an empty
-    AIMessage. See docs/issues/langchain_responses_api_streaming.md for
+    AIMessage. See knowledge-base/knowledge/issues/langchain_responses_api_streaming.md for
     background. Captures land in $CODEX_RAW_DUMP_DIR (default /tmp). All
     failures are silent — this must never break the live request path.
     """
@@ -133,7 +133,7 @@ def _overflow_response_413(
     supported". A synthetic 413 instead surfaces immediately as a typed,
     non-retried ``APIStatusError`` carrying the real message; callers detect
     it via ``code == "context_overflow"``.
-    See docs/issues/session_silent_failure_audit.md #3.
+    See knowledge-base/knowledge/issues/session_silent_failure_audit.md #3.
     """
     return httpx.Response(
         status_code=413,
@@ -845,7 +845,7 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
         # Diagnostic: dump raw /v1/responses payloads when DEBUG_CODEX_RAW_RESPONSE=1.
         # The codex proxy + openai SDK Pydantic deserialization path can produce
         # empty AIMessages from non-empty proxy responses (see
-        # docs/issues/langchain_responses_api_streaming.md "Non-streaming failure
+        # knowledge-base/knowledge/issues/langchain_responses_api_streaming.md "Non-streaming failure
         # mode"). This capture lets us inspect what the proxy is actually
         # returning vs. what langchain ends up with. Non-streaming only —
         # accessing response.content on a streamed response would raise.

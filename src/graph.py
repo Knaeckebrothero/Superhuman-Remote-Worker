@@ -308,7 +308,7 @@ def _handle_tool_errors_reraise_workspace(e: Exception) -> str:
     as handle_tool_errors=True did, so the model can fix its own mistakes.
     Annotating ``e: Exception`` makes ToolNode._infer_handled_types route ALL
     exceptions here (giving us the chance to re-raise ours).
-    See docs/issues/agent_fast_freeze_on_dead_workspace.md.
+    See knowledge-base/knowledge/issues/agent_fast_freeze_on_dead_workspace.md.
     """
     if isinstance(e, WorkspaceUnavailableError):
         raise e
@@ -318,7 +318,7 @@ def _handle_tool_errors_reraise_workspace(e: Exception) -> str:
 # C2 circuit breaker: after this many CONSECUTIVE execute-node invocations that
 # exhaust their inner LLM retries with no progress, stop instead of letting the
 # outer graph loop re-enter execute forever (the deferred "Fix 3" from
-# docs/done/agent_infinite_retry_on_permanent_llm_errors.md).
+# knowledge-history/done/agent_infinite_retry_on_permanent_llm_errors.md).
 _LLM_ERROR_STREAK_CAP = 5
 
 
@@ -624,7 +624,7 @@ def create_init_strategic_todos_node(
         # Refuse to start an agent that was never told its task.
         #
         # Both files are served by in-process virtual providers
-        # (docs/features/virtual_directories.md) and are never on disk, so
+        # (knowledge-base/knowledge/features/virtual_directories.md) and are never on disk, so
         # every way the overlay can fail — a provider raising, a missed
         # registration, a backend swap that loses the rebind — surfaces right
         # here as two empty reads. The composed HumanMessage below then
@@ -638,7 +638,7 @@ def create_init_strategic_todos_node(
         # materialized) by writing the two files to disk — which, on a subjob
         # sharing its parent's workspace, dropped the critic's brief into the
         # root the target reads from and convinced the target it was the
-        # reviewer (docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md).
+        # reviewer (knowledge-history/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md).
         # A lever whose "off" position reintroduces a high-severity defect is
         # not a rollback. Failing closed here covers every cause instead of one,
         # and cannot corrupt a shared workspace to do it.
@@ -648,7 +648,7 @@ def create_init_strategic_todos_node(
                 "Both task_brief.md and instructions.md resolved empty — the "
                 "virtual instruction providers did not serve content. Starting "
                 "anyway would run the job against an empty brief. See "
-                "docs/features/virtual_directories.md."
+                "knowledge-base/knowledge/features/virtual_directories.md."
             )
 
         # Load predefined strategic todos from config template
@@ -806,7 +806,7 @@ def create_execute_node(
     # signal). Catches malformed tool-call wire formats that the upstream
     # parser leaves as content text — the empty-response guard above misses
     # these because content is non-empty.
-    # See docs/issues/gemma_tool_call_parser_loop.md.
+    # See knowledge-base/knowledge/issues/gemma_tool_call_parser_loop.md.
     _no_tool_call_streak = [0]
     _no_tool_call_last_hash = [""]
 
@@ -906,7 +906,7 @@ def create_execute_node(
         # Memory extraction before compaction: if this call is about to trigger a
         # summary, snapshot the slice ensure_within_limits will evict and mine it
         # for durable memories BEFORE the lossy summary replaces it
-        # (docs/done/memory_extraction_before_compaction.md). Fire-and-forget
+        # (knowledge-history/done/memory_extraction_before_compaction.md). Fire-and-forget
         # over the snapshot so compaction latency is unchanged; the gate is
         # evaluated under the same lowered thresholds ensure_within_limits uses.
         if memory_service is not None and context_mgr.should_summarize(messages):
@@ -1588,7 +1588,7 @@ def create_execute_node(
                 # masked the undercount by resetting history every two phases;
                 # once that stops, the local count would sit below threshold
                 # while the real request ran far larger. See
-                # docs/issues/phase_model_overhead_amnesia_loop.md.
+                # knowledge-base/knowledge/issues/phase_model_overhead_amnesia_loop.md.
                 _record_usage = getattr(context_mgr, "record_provider_usage", None)
                 if _record_usage is not None:
                     _usage = getattr(response, "usage_metadata", None) or {}
@@ -1616,7 +1616,7 @@ def create_execute_node(
                 # Repair/scrub malformed tool-call arguments BEFORE anything
                 # else reads the response — an unparseable call otherwise
                 # reaches the checkpoint raw and poisons every subsequent
-                # request (docs/features/outbound_message_hygiene.md).
+                # request (knowledge-base/knowledge/features/outbound_message_hygiene.md).
                 response = repair_tool_call_arguments(response)
 
                 tool_calls_count = (
@@ -2505,7 +2505,7 @@ def create_execute_node(
                     # sqlite — fail fast with an actionable reason instead of
                     # looping (the gpt-5.3-codex-spark incident): re-run after the
                     # reset or pin a fallback model.
-                    # docs/features/llm_cooldown_pause_and_resume.md
+                    # knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md
                     reset_s, cd_model = _cooldown_detail(e)
                     when = (
                         f"~{reset_s / 3600:.1f}h" if reset_s else "an extended period"
@@ -2664,7 +2664,7 @@ def create_execute_node(
                 # the feature no-ops to today's fail-fast (the circuit breaker
                 # below). Only the retriable classes reach here — permanent /
                 # quota_exhausted / cooldown already returned above.
-                # docs/features/llm_outage_pause_and_backoff_redispatch.md
+                # knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md
                 if (
                     classification in ("transient", "rate_limit", "auth_unavailable")
                     and checkpointer_backend() == "postgres"
@@ -2981,7 +2981,7 @@ def create_archive_phase_node(
         is_strategic = state.get("is_strategic_phase", True)
         messages = state.get("messages", [])
 
-        # Exactly-once guard per phase INSTANCE (docs/issues/
+        # Exactly-once guard per phase INSTANCE (knowledge-base/knowledge/issues/
         # phase_boundary_tags_are_moved_then_rejected_by_remote.md, fix
         # direction 4): a rejected transition routes back to execute, and the
         # retried completion re-enters this node with the SAME phase number —
@@ -3222,7 +3222,7 @@ def create_archive_phase_node(
             # job 396a5d4c). Repeated irreversible query-agnostic compaction
             # grows end-task error super-linearly in the number of events
             # (arXiv 2607.08032); no major harness compacts on a structural
-            # boundary. See docs/issues/phase_model_overhead_amnesia_loop.md.
+            # boundary. See knowledge-base/knowledge/issues/phase_model_overhead_amnesia_loop.md.
             force_summarize = False
 
             compacted_messages = await context_mgr.ensure_within_limits(
@@ -3798,7 +3798,7 @@ def create_handle_transition_node(
             # boundary is clean and the resume continues from the checkpoint, so
             # a residual error must not ride out with the freeze and get the
             # orchestrator to fail (instead of pause) this re-dispatchable job.
-            # docs/done/version_upgrade_drain_masked_by_coincident_error.md
+            # knowledge-history/done/version_upgrade_drain_masked_by_coincident_error.md
             updates["error"] = None
             updates.update(_worker_batch_disarm_updates())
             logger.info(
@@ -4509,7 +4509,7 @@ def create_audited_tool_node(
     - Hard budget caps per phase
     - Tool-not-found enrichment with actionable guidance
 
-    See docs/features/stuck_agent_recovery.md for full design rationale.
+    See knowledge-base/knowledge/features/stuck_agent_recovery.md for full design rationale.
 
     Args:
         tools: List of tool objects
@@ -5469,7 +5469,7 @@ def build_phase_alternation_graph(
     # Extract RecallStore for memory injection and free sources
     recall_store = tool_context.recall_store if tool_context else None
 
-    # MemoryManager seam (memory overhaul Phase 1, docs/features/
+    # MemoryManager seam (memory overhaul Phase 1, knowledge-base/knowledge/features/
     # agent_memory_overhaul.md §5). Constructed only behind
     # memory.manager.enabled; while None, every legacy direct-store path
     # below runs unchanged (pinned by the equivalence suites). Named
@@ -5680,7 +5680,7 @@ def build_phase_alternation_graph(
     # Expose the memory seam on the compiled graph so the worker run loop can
     # drain in-flight capture_nowait tasks (the chunked pre_compaction
     # extraction) at job-end before the process moves on — OQ-C,
-    # docs/done/memory_extraction_before_compaction.md §8. The builder's
+    # knowledge-history/done/memory_extraction_before_compaction.md §8. The builder's
     # return type is pinned (deprecated wrapper + multiple callers), so the
     # manager rides on the graph object rather than the signature. None when the
     # manager cutover flag is off.

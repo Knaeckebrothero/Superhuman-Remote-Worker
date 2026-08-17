@@ -10,7 +10,7 @@ Tier→tool selection is NOT here: the tier-keyed ``EMAIL_TIER_TOOLS`` map and
 shared source of truth for both trust boundaries); this module imports them
 so validation and dispatch-config normalization cannot drift from selection.
 
-Spec: docs/features/email_datasource.md ("Trust and permission model").
+Spec: knowledge-base/knowledge/features/email_datasource.md ("Trust and permission model").
 """
 
 from __future__ import annotations

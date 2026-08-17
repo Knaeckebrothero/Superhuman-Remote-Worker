@@ -3,7 +3,7 @@
 Handles:
 1. Extracting docstrings from tool objects (no hardcoding)
 2. Rendering tool markdown (README index + per-tool docs), served live from
-   ``tools/`` as a virtual directory (docs/features/virtual_directories.md)
+   ``tools/`` as a virtual directory (knowledge-base/knowledge/features/virtual_directories.md)
 3. Applying runtime description overrides for deferred tools
 """
 

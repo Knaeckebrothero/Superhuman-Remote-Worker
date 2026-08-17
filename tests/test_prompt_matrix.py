@@ -623,7 +623,7 @@ class TestPromptMatrixResolverLoad:
 
 # =============================================================================
 # Location-primary resolution — regression cover for family-variant shadowing
-# (docs/issues/expert_prompts_shadowed_by_family_variants.md)
+# (knowledge-base/knowledge/issues/expert_prompts_shadowed_by_family_variants.md)
 # =============================================================================
 
 

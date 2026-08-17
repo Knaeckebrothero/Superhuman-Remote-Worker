@@ -3,8 +3,8 @@
 The instrument behind the guardrail-loosening loop: a fixed set of job
 templates with machine-checkable outcomes, a submitter that pins inputs and
 fires replicates against the dev cluster, and a reporter that computes the
-phase/ceremony metrics from `docs/issues/phase_model_overhead_amnesia_loop.md`
-§10. Protocol and rationale: `docs/features/worker_runtime_strategy.md` §9.
+phase/ceremony metrics from `knowledge-base/knowledge/issues/phase_model_overhead_amnesia_loop.md`
+§10. Protocol and rationale: `knowledge-base/knowledge/features/worker_runtime_strategy.md` §9.
 
 The core rules the tooling encodes:
 
@@ -97,14 +97,14 @@ absent from v1 — they change as the repo changes, which breaks pinning.
   frees its in-flight slot; the run does not block on it.
 - **Multi-replica orchestrators double-submit:** with 2 replicas the tick
   race fired 3×/30 pairs (twins 2–5 ms apart). Until the advisory-lock fix
-  lands (`docs/issues/bench_sweeper_multi_replica_race.md`), watch a running
+  lands (`knowledge-base/knowledge/issues/bench_sweeper_multi_replica_race.md`), watch a running
   run for duplicate (task, arm, replicate) pairs and cancel the younger twin
   (`PUT /api/jobs/{id}/cancel`).
 - **Reports heal retroactively:** the report endpoint recomputes from audit
   rows at read time, so a run that finished during an observability gap
   yields full metrics afterwards — nothing is lost by not watching.
 - **Mid-flight provider outages** classify as task failures, not infra
-  (`docs/issues/bench_infra_exclusion_misses_midflight_outages.md`) — scan
+  (`knowledge-base/knowledge/issues/bench_infra_exclusion_misses_midflight_outages.md`) — scan
   per-job request timelines for ≫retry-ceiling gaps before trusting a
   failed row.
 

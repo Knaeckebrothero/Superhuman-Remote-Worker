@@ -52,7 +52,7 @@ VISUAL_DOCUMENT_EXTENSIONS = {".pdf", ".pptx", ".docx"}
 
 # Archive extensions read_file lists entries for instead of attempting to
 # decode as text. Scoped to zip for now — the only format the session/worker
-# upload paths extract (docs/issues/session_uploads_never_extract_archives.md).
+# upload paths extract (knowledge-base/knowledge/issues/session_uploads_never_extract_archives.md).
 ARCHIVE_EXTENSIONS = {".zip"}
 
 # Bound the entry listing for a large archive — read_file's job is to tell
@@ -152,7 +152,7 @@ def _absolute(workspace: Any, path: str) -> str:
     real root. Falls back to the relative path if resolution fails: a
     diagnostic aid must never be the reason a write fails.
 
-    See docs/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md.
+    See knowledge-base/knowledge/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md.
     """
     try:
         return str(workspace.get_path(path))
@@ -925,7 +925,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             # Handle archives (zip): an entry listing beats a raw codec error
             # and lets the agent ask for a specific member instead of
             # searching the workspace for an "unzip" capability that isn't
-            # coming (docs/issues/session_uploads_never_extract_archives.md).
+            # coming (knowledge-base/knowledge/issues/session_uploads_never_extract_archives.md).
             if _is_archive_file(full_path):
                 # Check BEFORE describing the archive: a zip that the
                 # upload seam refused to extract (cap/traversal) still

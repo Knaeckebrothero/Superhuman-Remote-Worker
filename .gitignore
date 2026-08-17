@@ -239,4 +239,5 @@ BetterResavio-KB/
 HomeLab/
 # Knowledge vault, cloned in as a plain nested repo (not a submodule).
 knowledge-base/
+knowledge-history/
 srw-cloud/

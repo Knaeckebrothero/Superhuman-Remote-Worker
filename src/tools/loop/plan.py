@@ -6,7 +6,7 @@ time — schema, caps, budget reserve, disposition rules — so a malformed plan
 comes back as an actionable error message while the Critic can still fix it.
 The accepted plan is stored on the job and APPLIED when this job completes:
 the loop expands its execution slot into the plan's stage queue instead of
-rotating a single job. docs/features/loop_campaign_scheduling.md.
+rotating a single job. knowledge-base/knowledge/features/loop_campaign_scheduling.md.
 """
 
 import logging

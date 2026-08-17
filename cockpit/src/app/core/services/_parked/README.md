@@ -36,5 +36,5 @@ adapted and tested as new production code.
 
 See:
 
-- [`docs/features/builder_to_sessions_consolidation.md`](../../../../../docs/features/builder_to_sessions_consolidation.md) — why this was parked.
-- [`docs/features/dynamic_canvas.md`](../../../../../docs/features/dynamic_canvas.md) — where it goes next.
+- [`knowledge-base/knowledge/features/builder_to_sessions_consolidation.md`](../../../../../knowledge-base/knowledge/features/builder_to_sessions_consolidation.md) — why this was parked.
+- [`knowledge-base/knowledge/features/dynamic_canvas.md`](../../../../../knowledge-base/knowledge/features/dynamic_canvas.md) — where it goes next.

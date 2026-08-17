@@ -1,7 +1,7 @@
 """Object-store seam for the ``virtual`` workspace backend.
 
 ``VirtualWorkspaceBackend`` (the no-workspace ``virtual`` tier — see
-``docs/features/no_workspace_agent_mode.md`` §5) translates the
+``knowledge-base/knowledge/features/no_workspace_agent_mode.md`` §5) translates the
 ``WorkspaceBackend`` file contract into flat object-store key operations.
 This module defines that narrow seam so the backend's logic is
 transport-agnostic:

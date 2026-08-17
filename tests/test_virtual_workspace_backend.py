@@ -2,7 +2,7 @@
 
 VirtualWorkspaceBackend (the ``virtual`` no-workspace tier) implements the
 WorkspaceBackend file contract as explicit object-store ops under a key prefix
-(docs/features/no_workspace_agent_mode.md §5). These tests run the full
+(knowledge-base/knowledge/features/no_workspace_agent_mode.md §5). These tests run the full
 contract over InMemoryObjectStore — the same contract the filesystem test
 backend satisfies — plus the S3-isms the backend has to approximate
 (empty-dir markers, read-modify-write append, read size guard, bounded
@@ -74,7 +74,10 @@ class TestInitAndProperties:
 
 class TestPathResolution:
     def test_resolve_path_prepends_prefix(self, backend):
-        assert backend.resolve_path("docs/a.md") == PREFIX + "docs/a.md"
+        assert (
+            backend.resolve_path("knowledge-base/knowledge/a.md")
+            == PREFIX + "knowledge-base/knowledge/a.md"
+        )
 
     def test_resolve_root(self, backend):
         assert backend.resolve_path("") == PREFIX

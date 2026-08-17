@@ -21,7 +21,7 @@ timezone, which is then converted back to UTC for storage. "Every day
 at 09:00 Europe/Berlin" stays at 09:00 local across the spring-forward
 and fall-back transitions.
 
-Spec: docs/features/automations_v0.md §Cron Triggers.
+Spec: knowledge-base/knowledge/features/automations_v0.md §Cron Triggers.
 """
 
 from __future__ import annotations

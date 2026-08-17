@@ -807,7 +807,7 @@ class TestArchivePhaseNode:
         state from git, at a cost that grew every phase. Repeated irreversible
         query-agnostic compaction grows end-task error super-linearly in the
         number of events (arXiv 2607.08032), and no major harness compacts on a
-        structural boundary. See docs/issues/phase_model_overhead_amnesia_loop.md.
+        structural boundary. See knowledge-base/knowledge/issues/phase_model_overhead_amnesia_loop.md.
         """
         managers["todo"].add("Task 1")
         managers["todo"].complete("todo_1")
@@ -1095,7 +1095,7 @@ class TestInitStrategicTodosNode:
         """No brief and no instructions must abort the boot, not warn.
 
         Both files are served by in-process virtual providers
-        (docs/features/virtual_directories.md). If the overlay ever fails to
+        (knowledge-base/knowledge/features/virtual_directories.md). If the overlay ever fails to
         serve them — provider raises, registration missed, a backend swap loses
         the rebind — every read here returns empty and the composed first
         HumanMessage degrades to the boilerplate "You are starting in strategic

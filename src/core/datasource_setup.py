@@ -9,7 +9,7 @@ Repository datasources are cloned exclusively on the workspace via
 ``clone_repository_datasources()`` (GitManager + shell-capable backend).
 There is no agent-local clone path — the former subprocess ``git clone``
 branch wrote credentials and repos onto the agent pod and was removed
-(docs/features/no_workspace_agent_mode.md §9.4).
+(knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4).
 """
 
 import logging
@@ -47,7 +47,7 @@ def _ds_slug_hyphen(name: str) -> str:
 
 
 # Cumulative email access tiers (``config.access``): each tier includes every
-# tool of the tiers below it (docs/features/email_datasource.md). Order in
+# tool of the tiers below it (knowledge-base/knowledge/features/email_datasource.md). Order in
 # EMAIL_TIER_ORDER is the escalation order used for clamping/maxing.
 EMAIL_TIER_ORDER: Tuple[str, ...] = ("read", "read_write", "draft", "send")
 EMAIL_TIER_TOOLS: Dict[str, List[str]] = {
@@ -137,7 +137,7 @@ DATASOURCE_TOOL_MAP: Dict[str, Dict[str, Any]] = {
         ],
     },
     # Email is tier-keyed (config.access), not binary read/write — see
-    # EMAIL_TIER_TOOLS and docs/features/email_datasource.md.
+    # EMAIL_TIER_TOOLS and knowledge-base/knowledge/features/email_datasource.md.
     "email": {
         "category": "email",
         "tiers": EMAIL_TIER_TOOLS,
@@ -157,7 +157,7 @@ def email_effective_access(ds: Dict[str, Any]) -> str:
 
     Unknown values fail closed to ``read``. The clamp never empties
     credentials — email needs a live IMAP login at every tier
-    (docs/features/email_datasource.md, Touchpoints).
+    (knowledge-base/knowledge/features/email_datasource.md, Touchpoints).
     """
     if ds.get("project_read_only", False):
         return "read"
@@ -189,7 +189,7 @@ def datasource_tool_categories(
     History: read-write managed connectors (postgresql/neo4j/mongodb) used
     to map to ``[]`` — "CLI mode" — which was dead on remote workspace
     backends and left them with no access path at all
-    (docs/issues/datasource_cli_mode_dead_on_remote.md, fixed via
+    (knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md, fixed via
     direction 1: connection-backed write tools).
     """
     by_type: Dict[str, List[Dict[str, Any]]] = {}
@@ -230,7 +230,7 @@ def process_datasources(
     no connection) was a dead path on remote workspace backends: the env
     landed in the agent process while the shell runs on the workspace host,
     leaving read-write datasources with no access at all. See
-    docs/issues/datasource_cli_mode_dead_on_remote.md (fix direction 1);
+    knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md (fix direction 1);
     the inject_* helpers below are kept for a future real CLI-forwarding
     feature but are no longer called from here.
 
@@ -873,7 +873,7 @@ def clone_repository_datasources(
     There is deliberately NO agent-local fallback: without a shell-capable
     backend the datasources are skipped with an error. Repository
     datasources require a full workspace — lite tiers reject them at
-    dispatch (docs/features/no_workspace_agent_mode.md §4/§7).
+    dispatch (knowledge-base/knowledge/features/no_workspace_agent_mode.md §4/§7).
 
     Args:
         repo_datasources: Datasource config dicts of type "repository".
@@ -1104,7 +1104,7 @@ def clone_repository_datasources(
 def _declared_ro_note(ds: Dict[str, Any]) -> str:
     """Advisory suffix for publisher-declared read-only datasources.
 
-    Declarative only (docs/features/public_datasources.md): credentials are
+    Declarative only (knowledge-base/knowledge/features/public_datasources.md): credentials are
     the enforcement boundary; this just tells the agent the intent. Distinct
     from ``project_read_only`` (per-link connector mode), which switches the
     tool surface.
@@ -1315,4 +1315,4 @@ def inject_datasource_index(
 # lines for read-write connectors) was removed with the CLI-mode retirement —
 # it advertised commands that cannot work on remote workspace backends. A
 # future real CLI-forwarding feature reintroduces it properly
-# (docs/issues/datasource_cli_mode_dead_on_remote.md, direction 2).
+# (knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md, direction 2).

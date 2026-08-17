@@ -385,7 +385,7 @@ class TestExtractSnapshotScopedHome:
     silently never worked (confirmed on the dev cluster). Pods must extract
     home-only (``scoped_home=True`` -> ``EXTRACT_HOME_REMOTE_CMD``, matching the
     proven ``ide_session`` k8s-pod path); VMs (root, the snapshot IS the disk)
-    keep the full extract. See docs/features/workspace_durability_tiering.md §C1.
+    keep the full extract. See knowledge-base/knowledge/features/workspace_durability_tiering.md §C1.
     """
 
     @pytest.mark.asyncio
@@ -1117,7 +1117,7 @@ class TestHeartbeatActivityTracking:
 
 # =============================================================================
 # Test: thread tier is read explicitly, not inferred from metadata presence
-# docs/issues/workspace_suspension_infers_tier_from_metadata_presence.md
+# knowledge-base/knowledge/issues/workspace_suspension_infers_tier_from_metadata_presence.md
 # =============================================================================
 
 
@@ -1321,8 +1321,8 @@ class TestVmSuspendRidesThePersistentRootdisk:
     running. With a persistent rootdisk the snapshot stops being load-bearing —
     the disk itself carries the files across the teardown.
 
-    docs/features/vm_workspace_persistence_reconciliation.md,
-    docs/issues/vm_workspace_snapshot_unreachable_from_orchestrator.md.
+    knowledge-base/knowledge/features/vm_workspace_persistence_reconciliation.md,
+    knowledge-base/knowledge/issues/vm_workspace_snapshot_unreachable_from_orchestrator.md.
     """
 
     @pytest.mark.asyncio
@@ -2097,7 +2097,7 @@ class TestStrictTerminalSessionRestore:
 # =============================================================================
 # Test: reclaim-on-idle (Task 7) — opt-in, fail-safe PVC drop on session
 # suspend once the S3 snapshot is confirmed restorable.
-# docs/features/workspace_durability_tiering.md §D3
+# knowledge-base/knowledge/features/workspace_durability_tiering.md §D3
 # =============================================================================
 
 

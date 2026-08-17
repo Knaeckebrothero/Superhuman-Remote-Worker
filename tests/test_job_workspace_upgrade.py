@@ -1,6 +1,6 @@
 """Worker-job workspace tier upgrade — `virtual`/`none` → `sandbox` in process.
 
-Covers Phase 3 (W1 + W2) of docs/features/workspace_tier_upgrade.md:
+Covers Phase 3 (W1 + W2) of knowledge-base/knowledge/features/workspace_tier_upgrade.md:
 
   - POST /api/jobs/{id}/provision-workspace  (orchestrator, §4.3 W2)
   - GET  /api/jobs/{id}/workspace-status     (orchestrator, agent's poll source)

@@ -1,6 +1,6 @@
 """S2 — orchestrator-side dispatch/validation for the lite workspace tiers.
 
-Covers ``docs/features/no_workspace_agent_mode.md`` §4/§11 (orchestrator side):
+Covers ``knowledge-base/knowledge/features/no_workspace_agent_mode.md`` §4/§11 (orchestrator side):
 the pure config helpers the job-dispatch and session-attach seams share, the
 skip-provisioning decision, the repository-datasource rejection, and — the
 load-bearing one — that the §4 ``mounts`` payload the orchestrator emits is
@@ -321,7 +321,7 @@ class TestLiteSubjobGating:
 
 # ---------------------------------------------------------------------------
 # _object_store_startup_warning — one loud, early signal when the deployment
-# has NO object store at all (docs/done/s3_object_store_bundled_fallback.md
+# has NO object store at all (knowledge-history/done/s3_object_store_bundled_fallback.md
 # item 3). Reads the same env the features read; returns the message (or None)
 # so it is testable without a live lifespan.
 # ---------------------------------------------------------------------------
@@ -348,7 +348,7 @@ class TestObjectStoreStartupWarning:
         assert "LiteWorkspaceConfigError" in msg  # virtual bullet
         assert "snapshots" in msg.lower()  # snapshot bullet
         assert "garage.enabled=true" in msg
-        assert "docs/done/s3_object_store_bundled_fallback.md" in msg
+        assert "knowledge-history/done/s3_object_store_bundled_fallback.md" in msg
 
     def test_warns_about_virtual_when_only_snapshots_configured(self):
         # S3_ENDPOINT set (snapshots OK) but the virtual tier is unconfigured —

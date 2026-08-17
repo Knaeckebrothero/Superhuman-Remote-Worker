@@ -2,8 +2,8 @@
 
 Offline evaluation of the agent memory subsystem against
 **LongMemEval** (arXiv:2410.10813, ICLR 2025) — Phase 2 of
-[`docs/features/agent_memory_overhaul.md`](../../docs/features/agent_memory_overhaul.md).
-Research grounding: `docs/research/ai_memory/results/05_lifecycle_eval_report.md`.
+[`knowledge-base/knowledge/features/agent_memory_overhaul.md`](../../knowledge-base/knowledge/features/agent_memory_overhaul.md).
+Research grounding: `knowledge-base/knowledge/research/ai_memory/results/05_lifecycle_eval_report.md`.
 
 The harness drives the production seam directly — `MemoryManager.assemble()`
 and `capture()` from `src/services/memory/` — with the production loader,

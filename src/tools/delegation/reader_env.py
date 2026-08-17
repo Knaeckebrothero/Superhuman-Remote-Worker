@@ -16,7 +16,7 @@ Pod separation: worktree creation and git run on the workspace pod via the
 parent backend; blocking paramiko/git is offloaded with `run_in_executor`, and
 concurrent worktree creation is serialized behind a module lock (one repo lock).
 
-See docs/issues/delegation_light_mode_missing.md (Phase 2).
+See knowledge-base/knowledge/issues/delegation_light_mode_missing.md (Phase 2).
 """
 
 import asyncio

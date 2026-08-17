@@ -15,7 +15,7 @@ handle stamped on the thread, but ``main_cloud_share_handle`` stays NULL and the
 folder never appears in the owner's Files. The Cockpit's cloud button still
 resolves to ``{public_url}/apps/files/?dir=/<id8>`` — a path that exists only
 once the share has placed the folder in the owner's root — so the user lands on
-an empty view. See ``docs/issues/cloud_folder_invisible_until_owner_signs_into_cloud.md``.
+an empty view. See ``knowledge-base/knowledge/issues/cloud_folder_invisible_until_owner_signs_into_cloud.md``.
 
 The resume path (``needs_share_only``, ~``main.py:27180``) is the intended
 recovery and is correct, but it only fires when a thread is actually resumed.

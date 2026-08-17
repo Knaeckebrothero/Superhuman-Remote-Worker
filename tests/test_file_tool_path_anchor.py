@@ -6,7 +6,7 @@ resolves against the tab's cwd, so the same string denotes two different files.
 ``write_file`` used to return the caller's own string (``Written: output/x.md``),
 which told the model nothing about which file it got.
 
-See docs/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md
+See knowledge-base/knowledge/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md
 """
 
 from __future__ import annotations

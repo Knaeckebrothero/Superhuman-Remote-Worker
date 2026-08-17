@@ -35,7 +35,7 @@ async def provision_or_assign(
 
     Serialises concurrent provisioning attempts for the same thread via
     Postgres advisory lock
-    (docs/issues/persistent_thread_double_provisioning_race.md).
+    (knowledge-base/knowledge/issues/persistent_thread_double_provisioning_race.md).
     Idle-pool fast-path first; falls back to a dedicated pod on miss.
 
     Locking strategy: the advisory lock is held ONLY across the
@@ -71,7 +71,7 @@ async def provision_or_assign(
     # A VM-backed session pays a cold KubeVirt boot (minutes). Tag the lifecycle
     # events so the cockpit renders the "Booting VM (this can take a few minutes)"
     # copy, and size the readiness wait from the backend (VM budget vs the fast
-    # sandbox default) — see docs/features/session_create_on_vm.md.
+    # sandbox default) — see knowledge-base/knowledge/features/session_create_on_vm.md.
     _is_vm = _backend_from_override(co) == "vm"
     _vm_tag: dict[str, str] = {"backend": "vm"} if _is_vm else {}
 
@@ -137,7 +137,7 @@ async def provision_or_assign(
                 # at the workspace endpoint and exits, leaving the cockpit to poll
                 # /connection until its ~5m40s ready timeout. Fail fast with the
                 # real reason instead.
-                # docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+                # knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md
                 violations = await _session_grant_violations(cur)
                 if violations:
                     logger.warning(
@@ -158,7 +158,7 @@ async def provision_or_assign(
                 # model with no key) crashes the agent at startup, releases the
                 # workspace, and hangs the cockpit exactly like a grant denial.
                 # Fail fast with the real reason instead of spawning a doomed pod.
-                # docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
+                # knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
                 endpoint_violations = await _session_endpoint_violations(cur)
                 if endpoint_violations:
                     logger.warning(

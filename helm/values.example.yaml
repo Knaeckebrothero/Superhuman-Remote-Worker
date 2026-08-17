@@ -192,7 +192,7 @@ ingress:
 # (viewer.ingress, wildcard host + cert-manager DNS-01), a Cloudflare tunnel
 # entry pointing at the gateway Service, or an operator-owned edge. Ordinary
 # normalizing proxies are supported (see
-# docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). An enabled
+# knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). An enabled
 # production viewer must reference a separately provisioned, least-privilege
 # database credential Secret.
 canvas:
@@ -240,7 +240,7 @@ canvas:
 
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
-# (docs/features/direct_session_websockets.md)
+# (knowledge-base/knowledge/features/direct_session_websockets.md)
 #
 # Generate a strong key with:  openssl rand -hex 32
 # Then pass at install time so it never lives in the repo:

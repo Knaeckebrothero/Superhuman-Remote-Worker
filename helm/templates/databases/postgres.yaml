@@ -46,7 +46,7 @@ spec:
           # advisory lock — is detected in ~40s instead of the ~2h OS default,
           # bounding leader-election failover. (Server-side keepalives only
           # affect dead-connection detection; no risk to live sessions.)
-          # See docs/researches/orchestrator_leader_election.md.
+          # See knowledge-history/researches/orchestrator_leader_election.md.
           args:
             - "-c"
             - "tcp_keepalives_idle=10"

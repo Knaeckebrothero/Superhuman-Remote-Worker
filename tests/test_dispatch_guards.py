@@ -3,7 +3,7 @@
 Covers the pure predicate ``preemption_blocked_reason``. The dispatcher itself
 (``_try_dispatch_pending_jobs`` in orchestrator/main.py) is untested, so the
 decision logic is extracted here to be verified in isolation. See
-docs/done/preemption_before_first_checkpoint_replays_job_opening.md.
+knowledge-history/done/preemption_before_first_checkpoint_replays_job_opening.md.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ class TestResumeLaneApplies:
 
     A paused-but-never-started job dispatched as a resume reaches the agent
     brief-less (JobResumeRequest has no description/deliverables/kickoff) and
-    strands. See docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md.
+    strands. See knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md.
     """
 
     def test_paused_with_checkpoint_resumes(self):
@@ -150,7 +150,7 @@ class TestVmGoldenWaitDecision:
     DataVolume import (~30 min after an agent-vm-base bump — longer than
     timeout_s). Polling must not consume provision attempts, and recycling is
     meaningless (nothing exists to tear down). See
-    docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md.
+    knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md.
     """
 
     def _decide(
@@ -214,7 +214,7 @@ class TestVmHeadscaleWaitDecision:
     hand a tailnet pre-auth key to, because such a VM boots and heartbeats
     but is unreachable over SSH forever. Same shape as waiting_golden —
     polling must not consume provision attempts, and recycling is meaningless
-    (nothing exists to tear down). Regression for docs/issues/
+    (nothing exists to tear down). Regression for knowledge-base/knowledge/issues/
     vm_controller_headscale_latch_kills_provisioning.md.
     """
 

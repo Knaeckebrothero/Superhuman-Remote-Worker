@@ -1,4 +1,4 @@
-"""Officer knowledge plane — K1/K2/K3 of docs/features/officer_knowledge_plane.md.
+"""Officer knowledge plane — K1/K2/K3 of knowledge-base/knowledge/features/officer_knowledge_plane.md.
 
 Covers the three shipped slices:
 

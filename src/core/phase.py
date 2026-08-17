@@ -786,7 +786,7 @@ def _push_job_ending_state(
     success at confidence 1.0 while the pod was reclaimed with the only copy of
     the work. A parser regression made every push of a whole job fail exactly
     that way, 26 times, invisibly, for a day
-    (docs/done/git_push_fails_silently_via_workspace_backend.md).
+    (knowledge-history/done/git_push_fails_silently_via_workspace_backend.md).
 
     The push is deliberately NOT retried: ``push()`` already logs its own
     reason, and the pod is going away either way. The point is that the failure
@@ -977,7 +977,7 @@ def finalize_job(
         else:
             # Worker with NO recorded decision anywhere (cache, graph state,
             # resume hydration). Fabricating a placeholder report here is the
-            # exact defect of docs/issues/
+            # exact defect of knowledge-base/knowledge/issues/
             # job_finalization_decisions_held_only_in_process_memory.md —
             # fail loudly back to the model instead, which re-issues
             # job_complete (journaled + idempotent) and recovers.
@@ -1233,7 +1233,7 @@ def push_evidence_snapshot(
     local-only. Cancelling (or pausing/draining) a job mid-phase therefore
     destroyed everything since the last boundary push, and workspace reaping
     then erased it permanently (P1-D of
-    docs/issues/officer_blind_reads_and_worker_bureaucracy.md).
+    knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md).
 
     Unlike ``_complete_phase_with_git`` this is not a phase ritual: no tag,
     no archive — just stage-all + commit (skipped when the tree is clean) +

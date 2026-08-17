@@ -17,7 +17,7 @@ import {JobToolCardPanelComponent} from './job-tool-card-panel.component';
  * reproduce: which statuses offer the action, and that a *rejected* resume
  * keeps the user's typed draft. Everything else the card does was gated on dev.
  *
- * Design: docs/features/unified_tool_cards.md (slice 4).
+ * Design: knowledge-base/knowledge/features/unified_tool_cards.md (slice 4).
  */
 
 const JOB_ID = 'job-1234-5678';

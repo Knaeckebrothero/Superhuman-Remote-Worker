@@ -13,7 +13,7 @@ import {BadgeTone} from '../../ui/badge/badge.component';
  * to stop. Getting it wrong is not cosmetic: too narrow and a finished job is
  * polled forever, too broad and the card freezes mid-run.
  *
- * Design: docs/features/unified_tool_cards.md (slice 4).
+ * Design: knowledge-base/knowledge/features/unified_tool_cards.md (slice 4).
  */
 
 /**
@@ -22,7 +22,7 @@ import {BadgeTone} from '../../ui/badge/badge.component';
  * `pending_review` is deliberately NOT terminal: the job stopped, but an
  * approval flips it to `completed`, and that transition is exactly what a
  * watching card must catch. (The same asymmetry drives the wake feature's
- * per-status dedup key — see docs/features/session_wake_on_job_completion.md.)
+ * per-status dedup key — see knowledge-base/knowledge/features/session_wake_on_job_completion.md.)
  *
  * `paused` is also not terminal — the dispatcher re-picks a paused job.
  */

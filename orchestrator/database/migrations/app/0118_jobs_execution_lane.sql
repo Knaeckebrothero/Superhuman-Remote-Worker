@@ -1,6 +1,6 @@
 -- migration:     0118_jobs_execution_lane.sql
 -- description:   Stateless-agents S3 coexistence partition
---                (docs/features/stateless_agents.md §5.4.4): give jobs an
+--                (knowledge-base/knowledge/features/stateless_agents.md §5.4.4): give jobs an
 --                execution-plane class independent of runner_kind's grant
 --                semantics, so exactly one dispatch/recovery authority owns
 --                each job during the pinned/stateless soak.
@@ -27,6 +27,6 @@ COMMENT ON COLUMN jobs.execution_lane IS
     'dispatch and jobs-row lease recovery, the default) or ''stateless'' '
     '(worker_batch run_queue claim and reaper). App-validated by design; '
     'exactly one plane may dispatch or recover a job. See '
-    'docs/features/stateless_agents.md §5.4.4.';
+    'knowledge-base/knowledge/features/stateless_agents.md §5.4.4.';
 
 COMMIT;

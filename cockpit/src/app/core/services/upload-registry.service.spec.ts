@@ -1,6 +1,6 @@
 /**
  * Slice 3 — eager upload on attach
- * (docs/features/session_attachment_send_flow.md §5.4).
+ * (knowledge-base/knowledge/features/session_attachment_send_flow.md §5.4).
  *
  * The registry is the only thing that owns an upload started before the user
  * has committed to sending, so these tests pin the four properties that make

@@ -1,6 +1,6 @@
 """The /job/resume wire must deliver git_remote_url into process_job metadata.
 
-Agent-side half of docs/issues/resume_fresh_workspace_no_clone_fallback.md:
+Agent-side half of knowledge-base/knowledge/issues/resume_fresh_workspace_no_clone_fallback.md:
 the pod-handoff clone fallback in ``_setup_job_workspace`` keys on
 ``metadata["git_remote_url"]``, and ``JobResumeRequest`` historically had no
 such field — the orchestrator could not send it, so a resume onto a fresh

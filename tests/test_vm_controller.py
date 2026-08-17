@@ -817,7 +817,7 @@ class TestHandleCreate:
         Regression for the 2026-07-17/07-25 outage: a VM built without a
         tailnet pre-auth key boots and heartbeats but can never be reached
         over SSH, so it silently burned the whole 3 × 10 min provisioning
-        budget before failing the job. See docs/issues/
+        budget before failing the job. See knowledge-base/knowledge/issues/
         vm_controller_headscale_latch_kills_provisioning.md.
         """
         controller.headscale.create_auth_key = AsyncMock(return_value=None)
@@ -928,7 +928,7 @@ class TestHandleCreate:
         The VM name is agent-vm-<job_id>, so an existing live VM IS this
         job's VM (a duplicate/racing create lost to one that succeeded).
         Propagating the 409 as 'failed' parked two healthy loop jobs — see
-        docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md §B.
+        knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md §B.
         """
         conflict = _FakeApiException(status=409, body="already exists")
 
@@ -2021,7 +2021,7 @@ class TestModuleConstants:
 
 # =============================================================================
 # Tests: golden-image cloning
-# (docs/features/vm_golden_image_boot_acceleration.md)
+# (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md)
 # =============================================================================
 
 from vm.controller.controller import _golden_name  # noqa: E402
@@ -2144,7 +2144,7 @@ class TestGoldenStateNowait:
     Unlike _ensure_golden (kept for pre-warm), this must NEVER sleep waiting
     for CDI: a create handler blocked for a cold import (~30 min) outlives
     every orchestrator budget and races later creates into 409 collisions —
-    see docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md.
+    see knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md.
     """
 
     @staticmethod
@@ -2396,7 +2396,7 @@ class TestDoCreateGoldenIntegration:
 
 # =============================================================================
 # Tests: persistent rootdisk — Phase 0
-# (docs/features/vm_persistent_rootdisk.md D1 + D2's controller half)
+# (knowledge-base/knowledge/features/vm_persistent_rootdisk.md D1 + D2's controller half)
 # =============================================================================
 
 from vm.controller.controller import _rootdisk_name  # noqa: E402

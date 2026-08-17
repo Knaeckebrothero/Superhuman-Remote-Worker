@@ -1,4 +1,4 @@
-"""S8 — scheduling='officer' for project loops (docs/features/centurion.md §7).
+"""S8 — scheduling='officer' for project loops (knowledge-base/knowledge/features/centurion.md §7).
 
 Covers: migration 0075 CHECK shape; router vocabulary; the advance-path
 officer branch (clears pointers, wakes the officer, never rotates); the

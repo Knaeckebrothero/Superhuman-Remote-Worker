@@ -411,7 +411,7 @@ describe('turn-reducer — text/thinking deltas', () => {
 
     it('deltas without an active turn open a recovered placeholder turn (Approach 2)', () => {
         // Defense-in-depth from
-        // docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md:
+        // knowledge-base/knowledge/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md:
         // when streaming events arrive with activeAssistantTurnId === null
         // (e.g. SSE replay cursor is past turn.started after a mid-turn
         // reconnect), the reducer now synthesises a placeholder turn so the
@@ -460,7 +460,7 @@ describe('turn-reducer — text/thinking deltas', () => {
 });
 
 describe('turn-reducer — reasoning frame dedupe (message-id keyed)', () => {
-    // docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+    // knowledge-base/knowledge/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
     // For gemma-style models, the reasoning frame is journaled after the whole
     // token run; an SSE replay cursor landing in that gap re-emits just the
     // thinking frame after the turn closed, and ensurePlaceholderTurn would
@@ -814,7 +814,7 @@ describe('turn-reducer — permissions', () => {
     it('permission_decision (expired) marks the call unanswered, NOT denied', () => {
         // A gate that timed out or was swept at turn end is not a refusal.
         // Painting it "denied" is the fabricated-denial bug, in the UI:
-        // docs/done/supervised_parallel_gates_timeout_fabricates_denial.md
+        // knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md
         const state = play([
             {type: 'turn_started', turnId: 't1', startedAt: 1000},
             {

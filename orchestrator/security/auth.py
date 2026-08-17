@@ -2,7 +2,7 @@
 
 Four auth paths, tried in this order:
 1. ``srw_session`` cookie — cookie BFF; mid-stream access-token refresh is
-   transparent. See docs/features/auth_bff_and_api_tokens.md.
+   transparent. See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md.
 2. Bearer token (OIDC) — Keycloak access token. Transitional during the
    cockpit cutover; will remain for direct API consumers and for tests.
 3. X-MCP-Token — API tokens for Claude Code / CLI clients (unchanged).
@@ -34,7 +34,7 @@ SESSION_COOKIE = "srw_session"
 # regular user. The un-shadowed privilege flag is preserved on
 # ``real_is_admin`` so ``_require_admin`` (and the eventual
 # ``security.access.require_admin``) keep admin-only endpoints reachable.
-# Design: docs/features/admin_view_as_user.md.
+# Design: knowledge-base/knowledge/features/admin_view_as_user.md.
 VIEW_AS_HEADER = "X-Admin-View-As"
 
 
@@ -556,7 +556,7 @@ async def _ensure_cloud_user(
         from main import main_cloud_router  # noqa: PLC0415
 
         # Fresh per-owner provisioning — resolve via the owner seam, not
-        # ``.active`` directly (Issue 16, docs/issues/main_cloud.md).
+        # ``.active`` directly (Issue 16, knowledge-base/knowledge/issues/main_cloud.md).
         backend = main_cloud_router.for_owner({"keycloak_sub": sub, "email": email})
         if not backend.is_initialized:
             return
@@ -663,7 +663,7 @@ async def require_approved_user(request: Request, db) -> dict:
     so ``_require_admin`` keeps admin-only endpoints reachable while the
     shadow is on. The header is a no-op for non-admin callers — they get
     ``real_is_admin=False`` for parity. Design:
-    docs/features/admin_view_as_user.md.
+    knowledge-base/knowledge/features/admin_view_as_user.md.
     """
     user = await get_current_user(request, db)
     if not user.get("is_approved"):

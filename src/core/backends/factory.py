@@ -1,6 +1,6 @@
 """Factory for the lite (no-workspace-pod) backends, keyed on ``workspace.backend``.
 
-The two new tiers (``docs/features/no_workspace_agent_mode.md`` §4) are
+The two new tiers (``knowledge-base/knowledge/features/no_workspace_agent_mode.md`` §4) are
 selected by the existing ``workspace.backend`` config value, exactly like the
 legacy ``sandbox``/``vm`` aliases:
 
@@ -42,7 +42,7 @@ def is_vm_backend(backend: str) -> bool:
     Callers use this to keep container-provisioning paths off a VM-tier session:
     its workspace already exists as a VM, and provisioning a sandbox alongside it
     makes the session silently attach to the wrong tier
-    (docs/issues/session_vm_backend_never_attaches.md).
+    (knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md).
     """
     return backend in VM_BACKENDS
 

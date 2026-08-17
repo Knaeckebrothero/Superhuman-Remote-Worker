@@ -1,6 +1,6 @@
 """Unit tests for the RemoteBackend SSH session-channel semaphore.
 
-docs/issues/maxsessions_parallel_tools_false_workspace_death.md (slice A): a
+knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md (slice A): a
 wide parallel tool batch must never open more concurrent session channels than
 the workspace sshd allows (MaxSessions). The backend bounds short-lived exec
 channels with a semaphore (default 10, ``WORKSPACE_SSH_MAX_CONCURRENT_CHANNELS``

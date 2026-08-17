@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=../../schema.json
-# Centurion — the standing officer of a project (docs/features/centurion.md).
+# Centurion — the standing officer of a project (knowledge-base/knowledge/features/centurion.md).
 # An always-on session with no local workspace. His job surface is the
 # ratified supervision split (officer_supervision_surface.md §3): control +
 # observability + bounded evidence, never the job_workspace object plane; his

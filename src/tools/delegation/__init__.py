@@ -4,11 +4,11 @@ Two primitives:
 
 - `delegate_work` / `resume_delegation_child` — the heavyweight path: spawn 1-5
   child jobs as git worktree branches; the parent suspends (checkpoint + wake)
-  and resumes to review/merge results. See docs/features/subagent_delegation.md.
+  and resumes to review/merge results. See knowledge-base/knowledge/features/subagent_delegation.md.
 - `spawn_subagent` — the single agent-facing delegation primitive whose backend
   (`heavy` = child jobs, `light` = throwaway in-process readers) is selected by
   `delegation.mode`, not by the model. See
-  docs/issues/delegation_light_mode_missing.md.
+  knowledge-base/knowledge/issues/delegation_light_mode_missing.md.
 """
 
 from typing import Any, Dict, List

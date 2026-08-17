@@ -110,7 +110,7 @@ spec:
               existing repositories stay orphaned on disk.
 
               Either migrate the data:
-                docs/operations/gitea_sqlite_to_postgres.md
+                knowledge-base/knowledge/operations/gitea_sqlite_to_postgres.md
               or pin the old backend in your values overlay:
                 gitea:
                   database:

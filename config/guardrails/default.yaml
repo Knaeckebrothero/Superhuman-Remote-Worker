@@ -283,7 +283,7 @@ nudges:
   # NEVER enumerate the tool surface here ("Tools available: ..."). Models read
   # such lists as exhaustive and conclude their other bound tools are gone —
   # proven rewind-loop root cause (job 1cab4b88, 9 tactical phases burned;
-  # docs/issues/agent_phase_guardrails_burn_legitimate_work.md). Describe how
+  # knowledge-base/knowledge/issues/agent_phase_guardrails_burn_legitimate_work.md). Describe how
   # to advance the task list; the bound tool schema defines what exists.
   todo_list_footer: |-
     Mark each finished task by invoking the `todo_complete` tool with its todo id. This task list is a status reminder, not a tool list — it does not limit which tools you can call; every tool bound in this request stays available.

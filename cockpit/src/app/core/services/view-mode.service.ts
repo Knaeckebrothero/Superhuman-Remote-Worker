@@ -11,7 +11,7 @@ import {SettingsService} from './settings.service';
  * header (see `view-as.interceptor.ts`); the orchestrator's
  * `require_approved_user` flips `is_admin=False` on the resolved user
  * dict when the header is `user`, while preserving `real_is_admin` for
- * admin-only gates. Design: `docs/features/admin_view_as_user.md`.
+ * admin-only gates. Design: `knowledge-base/knowledge/features/admin_view_as_user.md`.
  *
  * **Hybrid persistence.** The choice is stored server-side as the
  * `admin_view_mode` user preference (the source of truth — it follows the

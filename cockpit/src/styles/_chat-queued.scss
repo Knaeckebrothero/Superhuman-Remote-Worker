@@ -3,7 +3,7 @@
 // Lives here rather than in persistent-chat.component.scss purely for the
 // anyComponentStyle budget: that component is a kitchen sink already sitting
 // ~0.5 kB under its cap, and the agreed rule is to keep new styling out of it
-// until it is split (docs/issues/persistent_chat_component_style_budget.md).
+// until it is split (knowledge-base/knowledge/issues/persistent_chat_component_style_budget.md).
 //
 // Scoped under the full `.message.message-user.queued.stalled` class chain, which
 // is deliberate and load-bearing, not redundancy. Two of these rules OVERRIDE
@@ -57,7 +57,7 @@
 
 /* Upload stage block inside a queued user bubble. Lives here, not in the
    component sheet, to keep new bytes out of that sheet's anyComponentStyle
-   budget (docs/issues/persistent_chat_component_style_budget.md).
+   budget (knowledge-base/knowledge/issues/persistent_chat_component_style_budget.md).
  *
  * NOTHING HERE MAY SET `display` ON `.upload-stage`. This selector is (0,5,0)
  * and outranks the component's own `.upload-stage[_ngcontent]` (0,2,0), so a

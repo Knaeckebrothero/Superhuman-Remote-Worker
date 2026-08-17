@@ -1,6 +1,6 @@
 # Coincident-infra-error / reported-outcome fix — test coverage map
 
-Companion to `docs/done/coincident_infra_error_overrides_reported_job_outcome.md`.
+Companion to `knowledge-history/done/coincident_infra_error_overrides_reported_job_outcome.md`.
 Records what is verified, by which mechanism, and — the point of this file —
 **what could not be covered yet**, why, and how to close each gap. Last updated
 2026-07-12 (after shipping Slices B/C + Phase 3 + Phase 5 Part 1 to `develop`:
@@ -66,7 +66,7 @@ and finishes (no re-freeze livelock).
 *mechanism* (dispatcher re-pick, freeze-shed, resume-clear, resolve-at-dispatch)
 is pre-existing code this change does not touch — it's covered by
 `tests/test_drain_intent.py::TestAutoContinueResumeClear` and
-`docs/issues/version_upgrade_drain_livelock.md`. Reproducing a live drain-mid-
+`knowledge-base/knowledge/issues/version_upgrade_drain_livelock.md`. Reproducing a live drain-mid-
 subjob is heavy and flaky for little marginal signal.
 
 **How to close.** On k3d: create a session/job that spawns a scholar research
@@ -95,13 +95,13 @@ loop after rollout" step.
 **Gap + why deferred.** Part 2 (sequence teardown so no workspace op is issued once
 the VM is scheduled for reaping) is **not built** — Slices B/C already make the
 trailing error *harmless*, so it's now cosmetic (log noise), and the exact
-trailing-op caller is unpinned. See `docs/done/coincident_infra_error_overrides_
+trailing-op caller is unpinned. See `knowledge-history/done/coincident_infra_error_overrides_
 reported_job_outcome.md` → "The infra layer §1".
 
 **How to close.** Pin the caller (orchestrator finalization diff/archive read, or a
 teardown handler), guard it against a reaped VM, then add a unit test that the
 finalization path short-circuits when `context.vm.status ∈ {deleting, deleted}`.
-Reconcile with `docs/issues/agent_fast_freeze_on_dead_workspace.md`.
+Reconcile with `knowledge-base/knowledge/issues/agent_fast_freeze_on_dead_workspace.md`.
 
 ### 2.4 Slice B — outage freezes (`memory/kb/llm_unavailable`) on subjobs
 

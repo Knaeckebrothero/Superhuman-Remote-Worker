@@ -1,6 +1,6 @@
 """P1-A non-destructive steer: the supervisor guidance lane.
 
-docs/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-A / §7 annex B.
+knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-A / §7 annex B.
 
 Before this change BOTH steering verbs were broken: an urgent steer was a
 hidden resume-with-feedback (force-compaction + silent todo wipe + false

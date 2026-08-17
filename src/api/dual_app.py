@@ -216,7 +216,7 @@ def _check_job_preempted(response: Dict[str, Any]) -> None:
     trip this: both completion paths null ``_current_job_id`` before
     ``report_completion``, so by the time its own report flips the row the
     current-job guard already blocks.
-    docs/issues/officer_blind_reads_and_worker_bureaucracy.md (P0-D)
+    knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md (P0-D)
     """
     job_id = _current_job_id
     if _pod_state != PodState.WORKING or not job_id or _stop_requested.is_set():
@@ -241,7 +241,7 @@ def _check_job_preempted(response: Dict[str, Any]) -> None:
 
 
 # Supervisor-guidance inbox (P1-A of
-# docs/issues/officer_blind_reads_and_worker_bureaucracy.md): the
+# knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md): the
 # non-destructive steer lane. The heartbeat response carries the job's
 # ``context.pending_guidance`` (entries ``{id, text, source, created_at}``);
 # the graph renders the inbox as a transient [SUPERVISOR GUIDANCE] block each
@@ -371,7 +371,7 @@ async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
     (defer while a turn is in flight, clean drain-suspend once parked) —
     a session never reaches a phase boundary, so before that branch the
     intent dead-lettered and stale adopted-session pods survived every
-    deploy (docs/issues/dual_app_persistent_app_redundancy.md).
+    deploy (knowledge-base/knowledge/issues/dual_app_persistent_app_redundancy.md).
     """
     global _drain_intent_received, _drain_intent_handled, _drain_deferred_logged
     _check_job_preempted(response)
@@ -580,7 +580,7 @@ def _final_idle_status() -> str:
     leaves a dispatchable-looking row for up to the 3-min offline threshold
     after the process is gone — the dispatcher claiming a job for that dead
     pod is Finding 5 of
-    docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
+    knowledge-history/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
     'draining' is agent-assertable (same vocabulary as the drain-intent
     path), excluded from get_available_agents, and the row falls to
     'offline' via the normal heartbeat timeout after the exit.
@@ -685,7 +685,7 @@ async def _push_evidence_snapshot(job_id: str, reason: str) -> None:
     phase-boundary push — per-todo commits are local-only, and workspace
     reaping then erases them permanently. The supervisor's kill switch must
     never destroy the evidence he kills for (P1-D of
-    docs/issues/officer_blind_reads_and_worker_bureaucracy.md).
+    knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md).
 
     Runs the sync git calls (possibly over SSH) in a thread with a hard
     timeout. A git failure must never block or fail the teardown itself.
@@ -718,7 +718,7 @@ async def _complete_stop(reset_source: str) -> None:
     that event, so it must be ``set()`` *after* the reset or the handler hangs
     to its 120s timeout. Without the reset, ``_pod_state`` stays ``WORKING``
     with no job — the zombie pattern (see
-    docs/done/worker_pod_state_zombie_on_cancel.md).
+    knowledge-history/done/worker_pod_state_zombie_on_cancel.md).
     """
     await _push_evidence_snapshot(_current_job_id or "unknown", _stop_reason or "stop")
     await _reset_to_idle(reset_source)
@@ -1393,7 +1393,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     datasources=request.get("datasources"),
                     # Thread's config beats this pod's boot config — dual
                     # pool pods boot as workers ('defaults'); see
-                    # docs/issues/session_config_name_plumbing.md (hole B).
+                    # knowledge-base/knowledge/issues/session_config_name_plumbing.md (hole B).
                     config_name=request.get("config_name"),
                 )
                 logger.info(f"Session setup complete for thread {thread_id}")
@@ -1509,7 +1509,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
     # interrupt,approve} to whichever agent is attached to the thread, which
     # in cluster usage is a dual-mode pod. Without these routes the agent
     # returns 404 and the cockpit's turn never lands. See task #136 /
-    # docs/issues/persistent_session_dual_mode_phase1_gap.md for the parallel
+    # knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md for the parallel
     # WS-handler gap this duplication caused.
 
     @app.post("/api/input", tags=["Session"])
@@ -1592,7 +1592,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         # Delegate to the shared module-level handler. Same implementation
         # the pure-persistent route uses — Phase-1 keystone, subscriber
         # model, Phase-5 status flips all included. See
-        # docs/issues/persistent_session_dual_mode_phase1_gap.md for why
+        # knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md for why
         # this delegation matters.
         await pa.handle_persistent_websocket(ws)
 

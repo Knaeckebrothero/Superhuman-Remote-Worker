@@ -7,7 +7,7 @@ Provides email tools when an ``email`` datasource is attached to a job:
 - Send mail via SMTP (send tier, gated)
 
 The connection wrapper lives in ``connection.EmailConnection``; see
-docs/features/email_datasource.md for the datasource design.
+knowledge-base/knowledge/features/email_datasource.md for the datasource design.
 """
 
 from typing import Any, Dict, List

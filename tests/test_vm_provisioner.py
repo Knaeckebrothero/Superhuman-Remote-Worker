@@ -965,7 +965,7 @@ class TestFreshProvisionReset:
 
 # =============================================================================
 # Test: golden-poll re-issue (fresh=False)
-# (docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md)
+# (knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md)
 # =============================================================================
 
 
@@ -2034,7 +2034,7 @@ class TestListVms:
 
 # =============================================================================
 # release_vm / release_thread_vm — snapshot outcome must be reported truthfully
-# docs/issues/vm_workspace_snapshot_unreachable_from_orchestrator.md
+# knowledge-base/knowledge/issues/vm_workspace_snapshot_unreachable_from_orchestrator.md
 # =============================================================================
 
 
@@ -2116,7 +2116,7 @@ class TestPurgeDiskIntent:
 
     Default True everywhere, so a call site that says nothing keeps today's
     semantics; False means "a recreate is coming, keep the rootdisk".
-    docs/features/vm_persistent_rootdisk.md D2.
+    knowledge-base/knowledge/features/vm_persistent_rootdisk.md D2.
     """
 
     @pytest.mark.asyncio

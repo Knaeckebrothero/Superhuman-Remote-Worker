@@ -214,7 +214,7 @@ aren't set), but the URL form is legacy and a footgun under `urlsplit`.
   is a native SRW subsystem on the vector pool, **not** a separate role or
   database (the former `srw_citations` / `citation_engine` DB was retired in
   the citation-engine native integration — see
-  `docs/done/citation_engine_integration.md`).
+  `knowledge-history/done/citation_engine_integration.md`).
 - `NEO4J_USERNAME`, `NEO4J_PASSWORD` — both live in Vault (mirroring
   the `POSTGRES_USER` / `VECTOR_POSTGRES_USER`
   pattern, so all DB credentials sit in one place). Community edition
@@ -244,7 +244,7 @@ plus `provisionRole=true` generates a dedicated Secret and runs the bounded
 role reconciler. That mode is rejected for a production viewer.
 The secret-safe production workflow, preflight, direct-Secret option, and
 rotation cautions are documented in
-`docs/operations/dynamic_canvas_gateway_database.md`.
+`knowledge-base/knowledge/operations/dynamic_canvas_gateway_database.md`.
 
 **OIDC / SSO** (when Keycloak or external IdP enabled):
 - `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` (internal Keycloak only)
@@ -386,7 +386,7 @@ envelope (UDP/41641 + DERP/443), not the in-VM traffic. Egress restriction
 on virt-launcher pods is meaningful for boot-time + tunnel handshake
 traffic and meaningless for everything inside the tunnel — Headscale ACLs
 are the right layer for tailnet-source filtering. See
-`docs/features/workspace_network_policy_unification.md` for details.
+`knowledge-base/knowledge/features/workspace_network_policy_unification.md` for details.
 
 ## Post-install verification
 

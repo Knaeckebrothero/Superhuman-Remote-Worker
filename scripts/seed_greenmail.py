@@ -4,7 +4,7 @@
 GreenMail's REST API cannot CREATE non-INBOX folders or APPEND a message into
 a chosen folder (it only ingests via SMTP, into INBOX), so seeding happens
 over plain IMAP with stdlib ``imaplib`` instead — see
-docs/features/email_datasource.md §Testing. The script:
+knowledge-base/knowledge/features/email_datasource.md §Testing. The script:
 
   1. logs in (GreenMail runs with ``-Dgreenmail.auth.disabled``, so any
      user/password pair works and the mailbox is created on first use),

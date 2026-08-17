@@ -7,7 +7,7 @@ the **write** path (idempotent, rate-snapshotting)
 and the raw aggregate **read** that ``/api/usage`` serves; the :class:`AuditStore`
 reader stays focused on the agent trace.
 
-Design: ``docs/features/observability_and_quotas.md`` ("The spine: one usage
+Design: ``knowledge-base/knowledge/features/observability_and_quotas.md`` ("The spine: one usage
 ledger" + "The rate table"). Two pieces:
 
 - :class:`UsageRates` — effective-dated $/unit resolver over the app-DB

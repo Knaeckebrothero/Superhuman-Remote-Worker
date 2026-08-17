@@ -1,6 +1,6 @@
 """Tests for OKF KB slice 3 PR2 — heading-aware chunker + embed pipeline.
 
-Design: docs/features/okf_knowledge_base.md §5.1 / §11 slice-3 PR2.
+Design: knowledge-base/knowledge/features/okf_knowledge_base.md §5.1 / §11 slice-3 PR2.
 
 PR2 is pure (no DB): a heading-aware structural chunker (~400-512-token target,
 sibling merge-up, 10-15% overlap only on forced mid-section splits), a breadcrumb

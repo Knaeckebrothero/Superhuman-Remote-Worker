@@ -43,7 +43,7 @@ def test_both_creation_tools_take_the_one_expert_selector():
     """`expert` accepts a bundled slug or a DB UUID on either tool, so a
     caller can pass any id `list_experts` printed without knowing which store
     it came from. The single-store aliases stay for existing callers.
-    See docs/issues/experts_one_catalogue_two_selection_paths.md."""
+    See knowledge-base/knowledge/issues/experts_one_catalogue_two_selection_paths.md."""
     signature = get_descriptor("create_job").public_signature.parameters
     assert {"expert", "config_name", "expert_id"} <= set(signature)
 

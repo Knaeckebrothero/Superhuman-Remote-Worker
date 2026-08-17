@@ -1,7 +1,7 @@
 """Tests for closed-vocabulary tool parameters.
 
 Regression cover for the bug in
-``docs/issues/agent_tool_fixed_vocabularies_invisible_to_model.md``: tool
+``knowledge-base/knowledge/issues/agent_tool_fixed_vocabularies_invisible_to_model.md``: tool
 parameters backed by a fixed set of values (Postgres enums, ``NOTE_TYPES``,
 ``_AUTONOMY_VALUES``) were typed as bare ``str`` and documented only in
 docstring prose. Every citation tool is registered ``defer_to_workspace=True``,

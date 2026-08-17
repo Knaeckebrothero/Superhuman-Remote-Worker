@@ -13,7 +13,7 @@ execute it. Its only options are to fire everything at once or to launch each
 stage when the previous one lands. **The wake is what makes the second possible;
 the conversation becomes the scheduler.**
 
-Design: docs/features/session_wake_on_job_completion.md.
+Design: knowledge-base/knowledge/features/session_wake_on_job_completion.md.
 
 Shape
 -----
@@ -771,7 +771,7 @@ async def session_wake_sweeper_loop(db: Any, shutdown_event: asyncio.Event) -> N
 # The jobs-row outbox above is keyed to jobs.created_by_thread_id and four
 # terminal statuses; officer sessions need wakes for non-job events and for
 # their own durable sleep timer, so those ride session_wake_events (migration
-# 0074, docs/features/centurion.md §4). Delivery reuses the exact same
+# 0074, knowledge-base/knowledge/features/centurion.md §4). Delivery reuses the exact same
 # primitives (_resolve_live_agent / _inject_live) and the same
 # claim-commit-send discipline. Rendering here is deliberately minimal — the
 # S3 sitrep service (orchestrator/services/sitrep.py) replaces

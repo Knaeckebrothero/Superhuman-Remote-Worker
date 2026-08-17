@@ -157,7 +157,7 @@ async def unmerged_pr_block_reason(
     by infrastructure it cannot fix, whereas every caller here either has a
     human present or is routing the job to one.
 
-    Spec: docs/features/merged_pr_completion_grant.md §4.
+    Spec: knowledge-base/knowledge/features/merged_pr_completion_grant.md §4.
     """
     pull_request = parse_job_pull_request(job.get("context"))
     if pull_request is None:

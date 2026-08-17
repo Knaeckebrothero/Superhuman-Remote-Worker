@@ -1,6 +1,6 @@
 """Deliverable-contract helpers (agent side).
 
-P1-C of docs/issues/officer_blind_reads_and_worker_bureaucracy.md: jobs may
+P1-C of knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md: jobs may
 carry ``context.required_deliverables`` — a list of workspace-relative paths
 (or ``kb:<slug>`` knowledge-note slugs) the seal is validated against. This
 module is the agent-side half of that contract:
@@ -99,7 +99,7 @@ def resolve_workspace_deliverable(
 
     Errors PROPAGATE rather than becoming "missing": reporting a broken
     probe as worker non-delivery is the F1 error-laundering anti-pattern
-    (docs/issues/officer_blind_reads_and_worker_bureaucracy.md), and a dead
+    (knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md), and a dead
     workspace (``WorkspaceUnavailableError``) is a lifecycle signal, not a
     bad deliverable (Defect 8). A probe error on ONE variant is tolerated
     when another variant answers ``True``.

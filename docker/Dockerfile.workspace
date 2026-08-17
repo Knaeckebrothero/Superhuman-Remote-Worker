@@ -19,7 +19,7 @@ ARG CODE_SERVER_VERSION=4.100.3
 ARG NODE_MAJOR=22
 # Pinned upstream rclone (Ubuntu's packaged 1.60.1-DEV predates the webdav
 # `infinitescale` vendor needed for OpenCloud mounts and lacks modern VFS
-# cache flags — see docs/features/rclone_cloud_mount.md §12). Keep version
+# cache flags — see knowledge-base/knowledge/features/rclone_cloud_mount.md §12). Keep version
 # and checksum in sync with docker/agent-vm-base/scripts/provision-stage1.sh.
 # SRW_ prefix is load-bearing: rclone parses RCLONE_* env vars as flags, so
 # an ARG named RCLONE_VERSION crashes `rclone version` inside the RUN.
@@ -155,7 +155,7 @@ RUN curl -fsSL "https://downloads.rclone.org/v${SRW_RCLONE_VERSION}/rclone-v${SR
     && rclone version
 
 # fuse-overlayfs version gate — the overlay-over-rclone spike (see
-# docs/superpowers/plans/2026-07-09-protected-cloud-mode-phase0-spike.md)
+# knowledge-base/knowledge/superpowers/plans/2026-07-09-protected-cloud-mode-phase0-spike.md)
 # needs the big-dir/readdir fixes that landed in 1.13. Fail the build loudly
 # rather than silently shipping a too-old binary.
 #
@@ -219,7 +219,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 # ---------------------------------------------------------------------------
 # 2c. browser-exec — workspace-side browser executor. The agent drives it over
 #     SSH (exec_command), so Chrome's CDP stays on the workspace loopback and
-#     never crosses the pod network. See docs/features/browser_workspace_executor.md
+#     never crosses the pod network. See knowledge-base/knowledge/features/browser_workspace_executor.md
 # ---------------------------------------------------------------------------
 COPY docker/browser-exec /usr/local/bin/browser-exec
 RUN chmod +x /usr/local/bin/browser-exec
@@ -230,7 +230,7 @@ RUN chmod +x /usr/local/bin/browser-exec
 #     two images are hand-maintained twins, and the VM shipped for ~5 weeks with
 #     a working Chromium that no agent could reach because browser-exec and
 #     browser-use were added here only, with nothing asserting the images agreed.
-#     See docs/issues/vm_workspace_missing_browser_exec.md. Installed permanently
+#     See knowledge-base/knowledge/issues/vm_workspace_missing_browser_exec.md. Installed permanently
 #     as well as run, so any live workspace can be interrogated in five seconds.
 # ---------------------------------------------------------------------------
 COPY docker/check-browser-stream.py /usr/local/bin/check-browser-stream
@@ -278,7 +278,7 @@ RUN mkdir -p /run/sshd \
 # Workspace container SSH config — optimized for RemoteBackend
 # Listener on 30022 (not 22): removes the egress/ingress port alias on
 # TCP/22 and is defense-in-depth against future NetworkPolicy drift.
-# See docs/features/workspace_network_isolation.md (PR 2).
+# See knowledge-base/knowledge/features/workspace_network_isolation.md (PR 2).
 Port 30022
 PermitRootLogin no
 PasswordAuthentication no
@@ -306,7 +306,7 @@ MaxStartups 10:30:100
 # batch at the default limit masqueraded as workspace death. The backend caps
 # concurrent execs at WORKSPACE_SSH_MAX_CONCURRENT_CHANNELS (10); 16 leaves
 # headroom for the long-lived channels.
-# docs/issues/maxsessions_parallel_tools_false_workspace_death.md
+# knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md
 MaxSessions 16
 SSHEOF
 

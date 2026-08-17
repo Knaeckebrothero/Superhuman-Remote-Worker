@@ -11,7 +11,7 @@ latest child ``context.llm_outage.next_retry_at``). A paused child's future
 wake parks the timer; a resumed child's recent wake grants a full window from
 resume (K8s suspend reset-on-resume semantics); an overdue/never-resuming
 child still terminates at wake + timeout. No extra writes, no dual-leader
-write races. docs/features/llm_outage_subjob_resilience.md (#6, LOCKED:
+write races. knowledge-base/knowledge/features/llm_outage_subjob_resilience.md (#6, LOCKED:
 rebase semantics).
 """
 

@@ -236,7 +236,7 @@ class TestGrantMapMatchesThePDP:
         "needs a grant".
 
         Filed in advance as
-        ``docs/issues/tool_configuration_deferred_findings.md`` §4.4, and adding
+        ``knowledge-base/knowledge/issues/tool_configuration_deferred_findings.md`` §4.4, and adding
         ``catalog_authoring`` walked straight into it — the map entry was missing
         and every test passed.
         """

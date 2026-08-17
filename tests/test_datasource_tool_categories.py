@@ -46,7 +46,7 @@ class TestDatasourceToolCategories:
         """RW postgresql/neo4j/mongodb → connection-backed write tools.
         Previously ``[]`` ("CLI mode"), which was dead on remote backends
         and left RW datasources with no access path at all
-        (docs/issues/datasource_cli_mode_dead_on_remote.md, direction 1)."""
+        (knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md, direction 1)."""
         for ds_type, category, write_tool in (
             ("postgresql", "sql", "sql_execute"),
             ("neo4j", "graph", "cypher_execute"),
@@ -371,7 +371,7 @@ class TestApplyDatasourceEnrichmentToResolved:
 class TestProcessDatasourcesConnectionRouting:
     """Read-write managed connectors get real connections now — the CLI-mode
     routing (env injection, no connection) is retired
-    (docs/issues/datasource_cli_mode_dead_on_remote.md, direction 1)."""
+    (knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md, direction 1)."""
 
     @pytest.fixture
     def spies(self, monkeypatch):

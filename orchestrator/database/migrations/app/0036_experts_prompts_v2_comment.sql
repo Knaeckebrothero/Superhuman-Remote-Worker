@@ -18,6 +18,6 @@ COMMENT ON TABLE experts IS
     'config = fragment vs the expert_type base; prompts = {persona, instructions, '
     'strategic, tactical, summarization} (Part 2 — one family-agnostic version per '
     'segment; model adaptation stays in the systemprompt_<family> wrapper). '
-    'Design: docs/features/global_expert_management.md.';
+    'Design: knowledge-base/knowledge/features/global_expert_management.md.';
 
 COMMIT;

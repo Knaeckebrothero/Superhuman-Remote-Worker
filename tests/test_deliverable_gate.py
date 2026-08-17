@@ -1,6 +1,6 @@
 """P1-C deliverable-contract gate at the seal (orchestrator side).
 
-docs/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C / §7 annex E.
+knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C / §7 annex E.
 
 Verifier #1 sealed "26/27 todos done" with 0/7 required deliverables and
 consumed a human-priced officer review cycle; F14's validator rejected a
@@ -295,7 +295,7 @@ class TestEvaluate:
         perfectly readable, it is just empty, which is why the four existing
         skip cases do not catch it.
 
-        docs/done/git_push_fails_silently_via_workspace_backend.md
+        knowledge-history/done/git_push_fails_silently_via_workspace_backend.md
         """
         job = make_job(
             manifest=["output/a.md"],
@@ -679,7 +679,7 @@ class TestCreatePlumbing:
 
 
 # =============================================================================
-# Cloned repository datasources (docs/issues/
+# Cloned repository datasources (knowledge-base/knowledge/issues/
 # deliverable_gate_cannot_see_cloned_repo_deliverables.md)
 # =============================================================================
 

@@ -1,6 +1,6 @@
 """Real-Postgres behavioral proof for the ledger-aware `unstick_reviewing_parents`.
 
-Task 10 (docs/superpowers/sdd/2026-07-27-verification-fail-closed/task-10-brief.md)
+Task 10 (knowledge-base/knowledge/superpowers/sdd/2026-07-27-verification-fail-closed/task-10-brief.md)
 replaces the watchdog's old "every critic child is failed/cancelled" gate —
 broken as of the fail-closed verification design, since every round (approved
 AND returned) now freezes its critic as an ordinary `completed` subjob
@@ -363,7 +363,7 @@ async def test_does_not_fire_before_grace_elapsed(db):
 @pytest.mark.asyncio
 async def test_fires_when_latest_critic_is_pending_review_unrecorded(db):
     """Bonus regression coverage for a related, separately-documented wedge
-    (docs/issues/critic_failure_leaves_parent_job_stuck_reviewing.md, "2026-
+    (knowledge-base/knowledge/issues/critic_failure_leaves_parent_job_stuck_reviewing.md, "2026-
     07-16 — new wedge variant"): a critic that freezes into `pending_review`
     (e.g. a non-outage subjob freeze) is ACTIONABLE, not live —
     `_CRITIC_ACTIONABLE_STATUSES` in orchestrator/main.py already treats it
@@ -630,7 +630,7 @@ async def test_cas_does_not_touch_non_reviewing_targets(db):
 # ---------------------------------------------------------------------------
 # Wall-clock arm (unstick_reviewing_parents_wallclock) — the LIVE-critic
 # backstop, fix direction 2 of
-# docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md.
+# knowledge-history/done/rejected_verdict_livelocks_critic_and_wedges_parent.md.
 # ---------------------------------------------------------------------------
 
 WALLCLOCK_MINUTES = 60

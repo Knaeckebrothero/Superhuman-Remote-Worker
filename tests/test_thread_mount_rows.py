@@ -1,6 +1,6 @@
 """Unit tests for the thread-mount-row builders in ``orchestrator/main.py``.
 
-Phase 2 of ``docs/features/cloud_collaboration_model.md`` §9 introduces the
+Phase 2 of ``knowledge-base/knowledge/features/cloud_collaboration_model.md`` §9 introduces the
 ``project_default`` row shape — default projects mount the owner's cloud
 home at the workspace root rather than under ``projects/<slug>/``. These
 tests cover the builder helpers (``_build_thread_mount_rows`` and
@@ -546,7 +546,7 @@ async def test_build_agent_cloud_mount_uses_supported_thread_mount(monkeypatch):
 async def test_build_agent_cloud_mount_vm_runtime_is_readonly_and_public(monkeypatch):
     """A cross-cluster VM runtime mounts read-only (root tier) and requests the
     public WebDAV URL — the internal service URL isn't reachable from the vm
-    cluster (docs/issues/workspace_upgrade_drops_cloud_mount.md)."""
+    cluster (knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md)."""
     from main import _build_agent_cloud_mount
     from services.cloud import RcloneMountSpec
 

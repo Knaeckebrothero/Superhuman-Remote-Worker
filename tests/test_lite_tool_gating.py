@@ -1,6 +1,6 @@
 """S3 — capability-gated tool binding for the lite workspace tiers.
 
-``docs/features/no_workspace_agent_mode.md`` §3.2/§7: tools that need a
+``knowledge-base/knowledge/features/no_workspace_agent_mode.md`` §3.2/§7: tools that need a
 workspace-backed execution environment (shell / browser / git) — and, for the
 ``none`` tier, file tools — are dropped by *backend capability*, not by hand-
 trimmed config tool lists. This is the enforcement that replaces the originally

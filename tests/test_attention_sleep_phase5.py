@@ -3,7 +3,7 @@ awaiting_user state transitions in the agent, magic-link wake on suspended
 thread, and the /magic/extend endpoint.
 
 Live DB round-trips (UPDATE → trigger → NOTIFY → wake) are covered by the
-smoke runbook at docs/tests/headless_sessions_smoke.md. Here we mock the
+smoke runbook at knowledge-base/knowledge/tests/headless_sessions_smoke.md. Here we mock the
 postgres pool and the workspace_suspension_service to exercise the
 contract surface of each new code path.
 """

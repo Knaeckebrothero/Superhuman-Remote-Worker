@@ -241,7 +241,7 @@ tools:
   # Database tool categories (src/tools/graph/, sql/, mongodb/)
   # These are injected/stripped automatically by the orchestrator based on
   # which datasources are attached to the job. Usually left empty in config.
-  # See docs/datasources.md for details.
+  # See knowledge-base/knowledge/datasources.md for details.
   graph: []      # Neo4j: execute_cypher_query, get_database_schema
   sql: []        # PostgreSQL: sql_query, sql_schema, sql_execute
   mongodb: []    # MongoDB: mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update
@@ -313,7 +313,7 @@ browser:
 ```
 
 The browser itself runs on the workspace (`browser-exec` daemon) — the agent
-pod never executes Chromium. See `docs/features/browser_workspace_executor.md`.
+pod never executes Chromium. See `knowledge-base/knowledge/features/browser_workspace_executor.md`.
 
 Proxy can also be set via environment variables: `RESEARCH_PROXY_TYPE`, `RESEARCH_PROXY_HOST`, `RESEARCH_PROXY_PORT`, `RESEARCH_PROXY_USER`, `RESEARCH_PROXY_PASS`.
 
@@ -324,7 +324,7 @@ connections:
   postgres: true
 ```
 
-External datasources (Neo4j, MongoDB, additional PostgreSQL) are managed through the datasource connector system. See `docs/datasources.md`.
+External datasources (Neo4j, MongoDB, additional PostgreSQL) are managed through the datasource connector system. See `knowledge-base/knowledge/datasources.md`.
 
 ### Multi-Stage Config Pipeline (Database Tools)
 
@@ -411,7 +411,7 @@ verification:
 
 ### Memory Light
 
-Opt-in recall system backed by PostgreSQL (pgvector hybrid search). Stores and retrieves insights across context compactions. See `docs/features/memory_light.md` for full design.
+Opt-in recall system backed by PostgreSQL (pgvector hybrid search). Stores and retrieves insights across context compactions. See `knowledge-base/knowledge/features/memory_light.md` for full design.
 
 ```yaml
 memory:

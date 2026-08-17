@@ -8,7 +8,7 @@ system prompt; this tool brings the body into context on demand. References
 run_command on a shell-capable tier. On a lite (virtual) tier use_skill notes
 that the scripts need a workspace upgrade first (Slice 4).
 
-Design: docs/features/agent_skills.md (Slice 2).
+Design: knowledge-base/knowledge/features/agent_skills.md (Slice 2).
 """
 
 import logging

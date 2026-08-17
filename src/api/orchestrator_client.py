@@ -39,7 +39,7 @@ class DuplicateThreadBinding(RuntimeError):
     than linger: it still carries the ``srw.io/thread-id`` label, so it stays in
     the per-session Service's endpoints (which sets ``publishNotReadyAddresses``)
     and black-holes ~half the cockpit's connection attempts until reaped. See
-    docs/done/persistent_thread_double_provisioning_race.md.
+    knowledge-history/done/persistent_thread_double_provisioning_race.md.
     """
 
 
@@ -50,7 +50,7 @@ class SessionGrantDenied(Exception):
     attach path must surface the real reason and stop, NOT misreport it as a
     transient 'workspace not provisioned' (the 5m40s ready-timeout bug). Not a
     RuntimeError so the pool-mode ``except RuntimeError`` attach handler doesn't
-    swallow it. See docs/issues/session_permission_mode_grant_denied_ready_timeout.md.
+    swallow it. See knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md.
     """
 
 
@@ -116,7 +116,7 @@ class CompletionDecisionError(Exception):
     """The job_complete decision could not be durably journaled.
 
     Sibling of ``VerdictRecordingError`` for the worker's own terminating
-    decision (journal-before-observe, docs/issues/
+    decision (journal-before-observe, knowledge-base/knowledge/issues/
     job_finalization_decisions_held_only_in_process_memory.md): a decision
     that is not persisted must never be reported to the model as accepted,
     because a restart would then convert "I decided" into "no decision was
@@ -946,7 +946,7 @@ class OrchestratorClient:
         ``JobResumeRequest`` carries no description/required_deliverables/
         kickoff_message, so a resumed agent backfills them from here before
         serving the virtual ``task_brief.md``
-        (docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+        (knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
 
         Returns:
             Dict {description, required_deliverables, kickoff_message}, or

@@ -1,5 +1,5 @@
 -- migration:     0063_loop_unified_engine_phase1.sql
--- description:   Loop unified engine, Phase 1 (docs/features/loop_unified_engine.md).
+-- description:   Loop unified engine, Phase 1 (knowledge-base/knowledge/features/loop_unified_engine.md).
 --                Renames the scheduling modes (rotation → standard,
 --                planner → campaign) and backfills current_stage_jobs for
 --                active loops' in-flight width-1 turns, so the generalized
@@ -47,7 +47,7 @@ COMMENT ON COLUMN project_loops.scheduling IS
     'turn — subsumes the old rotation mode and its fan-out stages) or '
     'campaign (a checkpoint Critic may expand the execution slot into a '
     'multi-stage campaign via a filed plan; formerly planner). '
-    'Start-time-only. docs/features/loop_unified_engine.md.';
+    'Start-time-only. knowledge-base/knowledge/features/loop_unified_engine.md.';
 
 COMMENT ON COLUMN project_loops.current_stage_jobs IS
     'In-flight members of the loop''s current turn — the jobs the loop '
@@ -55,10 +55,10 @@ COMMENT ON COLUMN project_loops.current_stage_jobs IS
     'only advance path). Populated by the advance/start spawn; drained to [] '
     'by the atomic last-member barrier, which also nulls current_job_id so '
     'the torn-advance signature stays current_job_id IS NULL AND '
-    'current_stage_jobs = ''[]''. docs/features/loop_unified_engine.md.';
+    'current_stage_jobs = ''[]''. knowledge-base/knowledge/features/loop_unified_engine.md.';
 
 COMMENT ON COLUMN project_loops.current_job_id IS
     'Display-only mirror of the in-flight turn when its width is 1 (cockpit '
     'links, MCP formatters). NULL for fan-out turns and between turns. The '
     'engine''s advance/heal correctness keys on current_stage_jobs, never '
-    'on this column. docs/features/loop_unified_engine.md.';
+    'on this column. knowledge-base/knowledge/features/loop_unified_engine.md.';

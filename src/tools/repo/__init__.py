@@ -1,7 +1,7 @@
 """Repository toolkit — operations on attached repository datasources.
 
 Distinct from the `git` toolkit, which is read-only and targets the internal
-workspace repo. See docs/features/self_development_workflow.md.
+workspace repo. See knowledge-base/knowledge/features/self_development_workflow.md.
 """
 
 from typing import Any, Dict, List

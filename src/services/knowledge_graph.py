@@ -4,7 +4,7 @@ Wraps Neo4jDB with knowledge-specific operations: create/read/update notes,
 manage relationships, graph traversal queries. This is the system-level
 Neo4j connection (not the external datasource connector).
 
-See docs/features/project_knowledge_base.md for full architecture.
+See knowledge-base/knowledge/features/project_knowledge_base.md for full architecture.
 
 Usage:
     ```python
@@ -55,14 +55,14 @@ NOTE_TYPES = frozenset(
         "state",
         "retrospective",
         "datasource",
-        # Backlog ticket types (docs/superpowers/specs/
+        # Backlog ticket types (knowledge-base/knowledge/superpowers/specs/
         # 2026-07-26-project-backlog-pipeline-design.md). These carry no TTL —
         # KB_TTL_BY_NOTE_TYPE's default of None already covers them, so a
         # backlog entry never expires on a clock.
         "feature",
         "issue",
         "idea",
-        # Officer types (docs/features/centurion.md §5, vector/0015). 'charter'
+        # Officer types (knowledge-base/knowledge/features/centurion.md §5, vector/0015). 'charter'
         # is the project's pinned commander's-intent note — one ACTIVE charter
         # per project, write-gated to sessions (Legate/officer hands; workers
         # are refused in kb_write). 'report' is a worker recon deliverable —
@@ -476,7 +476,7 @@ class KnowledgeGraphDB:
                 dispatch state, not just labels: a ``ready`` tag that can only
                 be added is a one-way door, and a ticket whose category
                 changes would otherwise match two pools at once
-                (docs/features/officer_backlog_pools.md §4). Detaching the
+                (knowledge-base/knowledge/features/officer_backlog_pools.md §4). Detaching the
                 ``:TAGGED`` edge leaves the ``:Tag`` node — it is shared across
                 the project's notes and may still have other holders.
 

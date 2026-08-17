@@ -7,7 +7,7 @@ carried two mutually-exclusive parameters for one concept and callers had to
 infer which store an entry came from by the shape of its id. This module is
 the single place that inference lives, shared by the agent/MCP job tool and by
 the REST funnel. See
-docs/issues/experts_one_catalogue_two_selection_paths.md.
+knowledge-base/knowledge/issues/experts_one_catalogue_two_selection_paths.md.
 
 Stdlib-only on purpose: ``src.shared.orch_surface`` may import nothing but the
 standard library, httpx and its own package (relatively), and this is one of

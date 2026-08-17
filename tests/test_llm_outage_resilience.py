@@ -1,7 +1,7 @@
 """Unit tests for LLM-outage pause + backoff re-dispatch.
 
 Covers the pure orchestrator-side logic added by
-docs/features/llm_outage_pause_and_backoff_redispatch.md:
+knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md:
 
 * evaluate_llm_outage — the auto-reset + give-up-ceiling decision
 * llm_outage_backoff_seconds — Full/Equal jitter bounds + Retry-After floor
@@ -116,7 +116,7 @@ class TestEvaluateLlmOutage:
         assert ev["attempt"] == 0
         assert ev["over_ceiling"] is False
 
-    # --- anchored reset (docs/features/llm_cooldown_pause_and_resume.md) --------
+    # --- anchored reset (knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md) --------
     # The reset must measure idle time from the END of any scheduled wait we
     # imposed (next_retry_at), not from last_failed_at — else a multi-hour
     # cooldown pause looks like "the job ran fine" and spuriously resets the
@@ -293,7 +293,7 @@ class TestDetermineJobStatusLlmUnavailable:
 
 # =============================================================================
 # Subjob outage routing — scholar/critic/delegate subjobs pause like top-level
-# (docs/features/llm_outage_subjob_resilience.md)
+# (knowledge-base/knowledge/features/llm_outage_subjob_resilience.md)
 # =============================================================================
 
 
@@ -373,7 +373,7 @@ class TestDetermineJobStatusSubjobOutage:
     def test_subjob_outage_with_coincident_error_still_pauses(self):
         # The redispatchable carve-out must admit a subjob outage freeze when
         # the parent is live — a teardown blip riding the freeze report must
-        # not hard-fail the pause (docs/features/llm_outage_subjob_resilience.md).
+        # not hard-fail the pause (knowledge-base/knowledge/features/llm_outage_subjob_resilience.md).
         result = {"should_stop": True, "error": {"message": "SSH teardown blip"}}
         status, err = determine_job_status(
             _subjob_llm_job({}), result, parent_status="waiting"
@@ -405,7 +405,7 @@ class TestDetermineJobStatusSubjobOutage:
 
 # =============================================================================
 # Determinism fingerprint — fail identical 4xx on the 2nd consecutive cycle
-# (docs/features/outbound_message_hygiene.md, layer 3)
+# (knowledge-base/knowledge/features/outbound_message_hygiene.md, layer 3)
 # =============================================================================
 
 MINIMAX_400 = (
@@ -700,7 +700,7 @@ class TestRepeatGiveUp:
 
 
 class TestShapeNudgeQuickfix:
-    """TEMPORARY — delete with docs/done/codex_stream_disconnect_shape_nudge.md.
+    """TEMPORARY — delete with knowledge-history/done/codex_stream_disconnect_shape_nudge.md.
 
     Upstream rejects a byte-identical payload deterministically, so the repeat
     give-up must spend exactly ONE more cycle on a shape change before it fires.
@@ -821,7 +821,7 @@ class TestBornParkedShape:
     """A born-parked loop member's context.llm_outage carries only
     {attempt: 0, next_retry_at} — evaluate_llm_outage must anchor the outage
     at the wake instant, not at creation
-    (docs/issues/loop_advances_into_active_model_cooldown.md)."""
+    (knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md)."""
 
     def test_born_parked_shape_survives_wake(self):
         ctx = {

@@ -1,6 +1,6 @@
 # Virtual Directories — test coverage map (what's covered vs what isn't)
 
-Companion to `docs/features/virtual_directories.md`. Records exactly what is
+Companion to `knowledge-base/knowledge/features/virtual_directories.md`. Records exactly what is
 verified, by which mechanism, and — the point of this file — **what could not be
 covered yet**, why, and how to close each gap.
 
@@ -42,7 +42,7 @@ manifest, red since a pre-branch commit).
 
 ### 1.2 Live gate — dev, 2026-08-01
 
-Recorded in full in `docs/features/virtual_directories.md` §Live gate. Verified
+Recorded in full in `knowledge-base/knowledge/features/virtual_directories.md` §Live gate. Verified
 on a real sandbox-tier worker job plus direct `kubectl exec` inspection of the
 workspace pod: virtual reads, listing merge, write rejection with the copy-out
 message, copy-out producing a real file, search merge, full-subtree ownership,
@@ -145,7 +145,7 @@ asserted what the first `HumanMessage` actually contained on a real run.
 **The switch is gone** (`a4929b17`). Its "off" position wrote `instructions.md`
 and `task_brief.md` into the workspace root, which on a workspace-inheriting
 subjob dropped the critic's brief where the *target* reads it — reopening
-`docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md` every
+`knowledge-history/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md` every
 time the lever was pulled. A rollback whose off position reintroduces a
 high-severity defect is not a rollback.
 
@@ -199,7 +199,7 @@ on `main`/prod** — `4f54f599` is develop-only and untagged.
 
 Full write-up, including the measured before/after table and the wider blast
 radius (the same empty `project_ids` also disabled the knowledge store and graph
-tier): `docs/issues/session_contacts_never_register_on_default_project.md`.
+tier): `knowledge-base/knowledge/issues/session_contacts_never_register_on_default_project.md`.
 
 The description below is kept as the original finding.
 

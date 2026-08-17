@@ -55,7 +55,7 @@ export function canvasToolCardContext(
  * {@link ToolCardView} (built by the descriptor registry from either the live
  * session stream or the workbench audit trail) with a fixed body order: raw tool
  * name → Parameters → Result → Details → Error. Owns its own `<details>`;
- * auto-opens on error/denied. Design: `docs/features/unified_tool_cards.md`.
+ * auto-opens on error/denied. Design: `knowledge-base/knowledge/features/unified_tool_cards.md`.
  */
 @Component({
     selector: 'app-tool-card',

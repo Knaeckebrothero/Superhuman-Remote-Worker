@@ -1,5 +1,5 @@
 -- migration:     0002_hybrid_search_halfvec_casts.sql
--- description:   B2 (docs/issues/memory_bugs.md): make dense retrieval
+-- description:   B2 (knowledge-base/knowledge/issues/memory_bugs.md): make dense retrieval
 --                HNSW-indexable. 0001's DO-block index attempts always
 --                failed silently — the vector type caps HNSW at 2000 dims
 --                and every embedding column is vector(4096); verified zero
@@ -32,7 +32,7 @@
 --                distance; not a hot path) and source_embeddings (0 rows on
 --                every cluster and no dense read path exists anywhere).
 --                ef_search tuning is deferred to overhaul Phase 3
---                (docs/features/agent_memory_overhaul.md).
+--                (knowledge-base/knowledge/features/agent_memory_overhaul.md).
 -- depends-on:    0001_initial.sql
 -- expected:      < 1s — five CREATE OR REPLACE FUNCTION, no data touched.
 --                Note the runner applies this transactional file before the

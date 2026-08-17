@@ -1264,7 +1264,7 @@ export class ApiService {
    * `uploads/` (`report.pdf`, `bundle/sub/a.txt`). Passing its `path` field
    * instead resolves to `uploads/uploads/…` server-side and 404s.
    *
-   * Exists so eager upload (docs/features/session_attachment_send_flow.md
+   * Exists so eager upload (knowledge-base/knowledge/features/session_attachment_send_flow.md
    * §5.4) can be cancelled honestly: removing an attachment chip can arrive
    * after the bytes have already landed, and without this the "cancel" would
    * be a lie that also litters a directory the agent can list.
@@ -2264,7 +2264,7 @@ export class ApiService {
   }
 
   // ===== Project self-improvement loop =====
-  // See docs/features/project_self_improvement_loop.md. The GET returns null on
+  // See knowledge-base/knowledge/features/project_self_improvement_loop.md. The GET returns null on
   // 404 (no active loop) — the caller treats null as "show the start form".
 
   getProjectLoop(projectId: string): Observable<ProjectLoop | null> {
@@ -2306,14 +2306,14 @@ export class ApiService {
       .pipe(catchError(() => of([])));
   }
 
-  /** The project's ticket pool (docs/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md). */
+  /** The project's ticket pool (knowledge-base/knowledge/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md). */
   getProjectBacklog(projectId: string): Observable<ProjectBacklog | null> {
     return this.http
       .get<ProjectBacklog>(`${this.baseUrl}/projects/${projectId}/backlog`)
       .pipe(catchError(() => of(null)));
   }
 
-  // ===== Officer post (docs/features/officer_post.md) =====
+  // ===== Officer post (knowledge-base/knowledge/features/officer_post.md) =====
   // The GET always returns the post — vacant or commissioned. The lifecycle
   // POSTs and the PATCH deliberately do NOT swallow errors: their FastAPI
   // `detail` strings (rival-commission 409s, hold fences, kit validation
@@ -2474,7 +2474,7 @@ export class ApiService {
    * that are completed AND have no project_id. Returns the folder's
    * browser/WebDAV URLs and the number of files copied.
    *
-   * See docs/done/job_cloud_export.md §3.2.
+   * See knowledge-history/done/job_cloud_export.md §3.2.
    */
   exportJobToSharedFolder(jobId: string): Observable<JobCloudExportResult | null> {
     return this.http

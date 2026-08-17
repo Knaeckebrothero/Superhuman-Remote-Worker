@@ -1,6 +1,6 @@
 # Squawk linter config for orchestrator/database/migrations/**.sql.
 # Wired into CI by .github/workflows/db-migrations.yml; design rationale
-# and the rule list this complements live in docs/db_migration.md
+# and the rule list this complements live in knowledge-base/knowledge/db_migration.md
 # §Testing & CI.
 
 # Match the orchestrator's deployed Postgres version. Squawk uses this to
@@ -39,7 +39,7 @@ excluded_rules = [
 #      without tripping the migration runner's checksum guard. The
 #      underlying advice (prefer IDENTITY over BIGSERIAL, NOT VALID on
 #      new CHECK constraints, CREATE INDEX CONCURRENTLY in .notx.sql) is
-#      documented in docs/db_migration.md and applies to all NEW migrations.
+#      documented in knowledge-base/knowledge/db_migration.md and applies to all NEW migrations.
 #      Files here shipped before squawk caught them; rewriting in place
 #      would re-execute against a DB that's already at the target state.
 #        - app/0004 / app/0006: BIGSERIAL primary keys (fixed forward by 0007).
@@ -52,7 +52,7 @@ excluded_rules = [
 #                brand-new empty tables (knowledge_chunks) — instant build, no
 #                meaningful lock; the two on knowledge_index are sub-second on a
 #                small table. The file is transactional-atomic by design
-#                (docs/features/okf_knowledge_base.md slice-3 PR1), so
+#                (knowledge-base/knowledge/features/okf_knowledge_base.md slice-3 PR1), so
 #                CONCURRENTLY — which cannot run in a transaction — can't live in
 #                it anyway, and it is already applied on develop; the runner's
 #                checksum guard forbids editing it in place.

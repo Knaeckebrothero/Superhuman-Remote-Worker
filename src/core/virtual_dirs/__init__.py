@@ -1,4 +1,4 @@
-"""Virtual directory providers. See docs/features/virtual_directories.md."""
+"""Virtual directory providers. See knowledge-base/knowledge/features/virtual_directories.md."""
 
 import logging
 from typing import Any, Callable, Optional

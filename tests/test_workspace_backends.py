@@ -180,7 +180,7 @@ def _wire_exec_channel(mock_ssh, channel):
 class TestExecDrainLoop:
     """_exec must drain the channel and bound every wait.
 
-    Regression tests for docs/issues/remote_backend_indefinite_wait_deadlock.md
+    Regression tests for knowledge-base/knowledge/issues/remote_backend_indefinite_wait_deadlock.md
     (job 2dbe6854: grep output 2,319,835 B > 2 MiB window wedged a job 8 h).
     """
 

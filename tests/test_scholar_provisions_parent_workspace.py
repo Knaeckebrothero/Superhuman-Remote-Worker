@@ -2,7 +2,7 @@
 workspace under the parent's identity, instead of self-provisioning a throwaway
 pod.
 
-Design: docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md
+Design: knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md
 (Phase 1 — one parent-owned workspace). On an idle cluster the parent holds no
 workspace when the scholar is dispatched. Rather than the scholar creating
 `workspace-<scholarId>` (a wasted second pod that the parent then can't inherit),

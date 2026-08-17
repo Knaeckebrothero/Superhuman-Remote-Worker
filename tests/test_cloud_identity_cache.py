@@ -1,6 +1,6 @@
 """Cached cloud-identity resolution + project-GET background repair.
 
-Covers the two halves of docs/issues/project_page_open_blocks_on_cloud_heal.md:
+Covers the two halves of knowledge-base/knowledge/issues/project_page_open_blocks_on_cloud_heal.md:
 
 * ``services.cloud.identity`` — cache-first semantics: positive resolutions
   persist (once per user per backend), negatives never do, the ``peek``

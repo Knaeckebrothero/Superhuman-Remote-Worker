@@ -3,7 +3,7 @@
 --                persistent sessions.
 --
 --                Phase 4 of headless persistent sessions
---                (docs/features/headless_persistent_sessions.md). When the
+--                (knowledge-base/knowledge/features/headless_persistent_sessions.md). When the
 --                agent's permission_check fires and no client is attached
 --                (or hasn't been for >30s), the permission-pending
 --                watcher emits an email with two magic-links: approve
@@ -72,7 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_mlt_approval
 COMMENT ON TABLE magic_link_tokens IS
     'Opaque single-use tokens for email magic-links. Plaintext lives only '
     'in the email body; DB stores SHA-256 hashes. See '
-    'docs/features/headless_persistent_sessions.md §4.';
+    'knowledge-base/knowledge/features/headless_persistent_sessions.md §4.';
 COMMENT ON COLUMN magic_link_tokens.token_hash IS
     'SHA-256 of the raw token bytes (hex-encoded).';
 COMMENT ON COLUMN magic_link_tokens.intended_decision IS

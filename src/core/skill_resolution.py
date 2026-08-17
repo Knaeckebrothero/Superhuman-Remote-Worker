@@ -5,8 +5,8 @@ mapping logic is small and unit-testable in isolation (mirrors
 ``expert_resolution.py``). No DB or framework imports live here; the disk reads
 are the explicit bundled system-skill floors used by persistent sessions.
 
-Design: docs/features/agent_skills.md (Slice 2).
-Managed product guide: docs/features/app_guide_skill.md (M1).
+Design: knowledge-base/knowledge/features/agent_skills.md (Slice 2).
+Managed product guide: knowledge-base/knowledge/features/app_guide_skill.md (M1).
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@
 --                Cockpit admin agents view renders a warning badge off this
 --                flag; the compact failure detail rides in agents.metadata.aux
 --                for the badge tooltip. Part of aux Phase 2
---                (docs/issues/surface_silent_aux_failures.md).
+--                (knowledge-base/knowledge/issues/surface_silent_aux_failures.md).
 -- depends-on:    0001_initial.sql
 -- expected:      < 1s on dev DB. ADD COLUMN with a constant default is a
 --                metadata-only change in PostgreSQL 11+ (no table rewrite).
@@ -24,6 +24,6 @@ COMMENT ON COLUMN agents.aux_degraded IS
     'Latest heartbeat-reported auxiliary-model health: TRUE while the agent''s '
     'auxiliary LLM (memory extraction/curation/assembly, session titles) is '
     'sustained-failing. Set from metrics.aux.degraded; detail in metadata.aux. '
-    'See docs/issues/surface_silent_aux_failures.md (aux Phase 2).';
+    'See knowledge-base/knowledge/issues/surface_silent_aux_failures.md (aux Phase 2).';
 
 COMMIT;

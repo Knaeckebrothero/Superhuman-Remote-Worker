@@ -5,7 +5,7 @@ covering: fingerprint-based loop warnings (soft, never blocking),
 progress tracking, category failure logging, stuck detection with
 reflection/freeze, hard caps, and tool-not-found enrichment.
 
-See docs/features/stuck_agent_recovery.md for the full design.
+See knowledge-base/knowledge/features/stuck_agent_recovery.md for the full design.
 """
 
 import asyncio

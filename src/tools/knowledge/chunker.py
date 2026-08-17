@@ -6,7 +6,7 @@ No DB: a heading-aware structural chunker, a breadcrumb embed-text builder, an
 (slice 3 PR1) consumes. The reindexer (PR3) parses a changed note with
 ``gardener.parse_note_md`` and feeds the body here.
 
-Design: docs/features/okf_knowledge_base.md §5.1.
+Design: knowledge-base/knowledge/features/okf_knowledge_base.md §5.1.
 
 Why structural, not semantic: heading-aware splitting benchmarks *better* than
 semantic chunking on this corpus, and OKF notes are already sectioned by the

@@ -4,7 +4,7 @@ Provides tools for reading and writing to the project knowledge base
 (Neo4j source of truth + pgvector search index). Write-through model:
 every write updates both stores atomically.
 
-See docs/features/project_knowledge_base.md for full architecture.
+See knowledge-base/knowledge/features/project_knowledge_base.md for full architecture.
 """
 
 from typing import Any, Dict, List

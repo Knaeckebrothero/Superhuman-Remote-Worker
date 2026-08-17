@@ -12,8 +12,8 @@ unresponsive and Tilt was not running.
 
 **Source documents:**
 
-- `docs/features/mcp_datasources.md`
-- `docs/superpowers/plans/2026-07-23-mcp-datasources.md`
+- `knowledge-base/knowledge/features/mcp_datasources.md`
+- `knowledge-base/knowledge/superpowers/plans/2026-07-23-mcp-datasources.md`
 
 This runbook is the authoritative list of MCP validation still requiring live
 or deployment evidence. Update it in place as checks are run. Do not put real
@@ -27,7 +27,7 @@ this document, screenshots, logs, or failure reports.
 ### P0 — v1 release gate
 
 Every P0 checkbox must pass before moving the MCP design and implementation
-plan to `docs/done/`. These checks cover the original Task 14 acceptance gate
+plan to `knowledge-history/done/`. These checks cover the original Task 14 acceptance gate
 plus credential redaction and process cleanup.
 
 ### P1 — required before broad stdio/dev rollout
@@ -546,9 +546,9 @@ appears in logs, API output, `datasources.md`, Cockpit, or audit records.
 - [ ] No credential/redaction failure remains open.
 - [ ] No stdio subprocess/cancel-scope leak remains open.
 - [ ] Task 14 in
-      `docs/superpowers/plans/2026-07-23-mcp-datasources.md` is checked.
-- [ ] The status block in `docs/features/mcp_datasources.md` records the live
+      `knowledge-base/knowledge/superpowers/plans/2026-07-23-mcp-datasources.md` is checked.
+- [ ] The status block in `knowledge-base/knowledge/features/mcp_datasources.md` records the live
       verification date and tested image revisions.
-- [ ] Both MCP documents are moved to `docs/done/`.
+- [ ] Both MCP documents are moved to `knowledge-history/done/`.
 - [ ] This runbook is updated to **LIVE-VERIFIED** with date, tester, revision,
       sanitized evidence, and follow-up issue links.

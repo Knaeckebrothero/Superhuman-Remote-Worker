@@ -1,4 +1,4 @@
-"""Backlog ticket plumbing — B2 of docs/features/officer_backlog_pools.md.
+"""Backlog ticket plumbing — B2 of knowledge-base/knowledge/features/officer_backlog_pools.md.
 
 B1 gave tags a meaning; B2 makes them writable, queryable, and — the part that
 matters — forgeable only by the officer. Three properties are load-bearing and

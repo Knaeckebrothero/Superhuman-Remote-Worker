@@ -1,7 +1,7 @@
 """A job paused for a transient-infra retry must keep its VM.
 
 Regression guard for Defect 1b of
-docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
+knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md.
 
 Pausing a job does NOT keep its workspace. Nothing in the completion path tore
 down job c6dd288d's VM — the REAPER did: ``failed`` is in

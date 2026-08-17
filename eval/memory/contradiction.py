@@ -17,7 +17,7 @@ unchanged) with one extra key per instance the runner ignores:
 Because the old/new values are KNOWN and chosen to be unambiguous
 substrings, scoring is exact — no judge LLM involved. Two layers, which
 decompose *where* a stale answer comes from (the Phase-4 acceptance
-metric of docs/features/agent_memory_overhaul.md):
+metric of knowledge-base/knowledge/features/agent_memory_overhaul.md):
 
 - **retrieval order** (always available, from ranked_sessions): was the
   update session injected at all / ranked above the original?

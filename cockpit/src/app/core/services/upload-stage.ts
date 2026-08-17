@@ -3,7 +3,7 @@
  *
  * Lives outside persistent-chat.service.ts so the send/upload logic that
  * matters most is testable without instantiating a 4300-line service.
- * See docs/features/session_attachment_send_flow.md §5.
+ * See knowledge-base/knowledge/features/session_attachment_send_flow.md §5.
  */
 import type {ChatAttachment} from './persistent-chat.service';
 

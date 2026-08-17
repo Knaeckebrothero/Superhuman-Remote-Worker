@@ -1,7 +1,7 @@
 """Loop toolkit — campaign-scheduling tools for project-loop jobs.
 
 Currently one tool: ``loop_plan``, the checkpoint Critic's campaign-filing
-verb (docs/features/loop_campaign_scheduling.md). The category is never listed
+verb (knowledge-base/knowledge/features/loop_campaign_scheduling.md). The category is never listed
 in any bundled expert config — the orchestrator injects it per-job via
 ``config_override.tools.loop`` only when spawning a planner loop's checkpoint
 critic, so campaign members (whatever their role) and rotation loops never

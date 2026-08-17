@@ -960,7 +960,7 @@ class ToolContext:
         The turn loop PEEKS this after the tool batch to end the turn instead
         of paying another LLM iteration; the transport CONSUMES it at park
         time to file the durable wake with the orchestrator
-        (docs/features/centurion.md §4).
+        (knowledge-base/knowledge/features/centurion.md §4).
         """
         self._officer_sleep_request = sleep_data
 
@@ -1379,7 +1379,7 @@ class ToolContext:
         historical unfenced behavior for pinned/custom backends. Returns the
         parsed JSON result, or an ``{"error": ...}`` dict on any failure.
 
-        See docs/features/browser_workspace_executor.md.
+        See knowledge-base/knowledge/features/browser_workspace_executor.md.
         """
         import asyncio
         import json as _json

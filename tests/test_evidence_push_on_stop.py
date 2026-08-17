@@ -1,7 +1,7 @@
 """Cancelling a job must not destroy the evidence it was killed over.
 
 Regression guard for P1-D of
-docs/issues/officer_blind_reads_and_worker_bureaucracy.md.
+knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md.
 
 Pushes to a job's Gitea branch happen at phase-0 seed, phase boundaries,
 freeze and finalize; per-todo completion commits are LOCAL-ONLY, and no push

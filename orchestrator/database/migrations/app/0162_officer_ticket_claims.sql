@@ -3,7 +3,7 @@
 --                claim outlives physical job deletion; only a newer trusted
 --                ready_at generation can be claimed again, and an extant or
 --                deleted non-terminal predecessor remains a blocker.
---                docs/issues/deleting_a_job_releases_its_backlog_ticket_claim.md
+--                knowledge-base/knowledge/issues/deleting_a_job_releases_its_backlog_ticket_claim.md
 -- depends-on:    0161_runtime_actor_credentials.sql
 -- expected:      seconds. One small table plus a fail-closed scan/backfill of
 --                all project-scoped jobs carrying ticket_note_id. History

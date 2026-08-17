@@ -19,7 +19,7 @@ turn's jobs, or drained the barrier, but lost its write-back leaves the loop
 wedged with BOTH pointer columns empty —
 ``current_job_id IS NULL AND current_stage_jobs='[]'`` — the single wedge
 signature, regardless of the turn's width
-(docs/issues/loop_advance_nonatomic_wedges_loop.md for the live incident).
+(knowledge-base/knowledge/issues/loop_advance_nonatomic_wedges_loop.md for the live incident).
 Crucially, that same state is also the *normal transient window of every
 healthy advance* — the barrier claim clears both columns seconds before the
 write-back restores them — so seeing it once is NOT evidence of a tear.
@@ -57,7 +57,7 @@ never fire.
 
 Mirrors ``cron_dispatcher_loop``'s structure (tick + shutdown-aware wait).
 
-Design: docs/features/project_self_improvement_loop.md (Phase 2).
+Design: knowledge-base/knowledge/features/project_self_improvement_loop.md (Phase 2).
 """
 
 from __future__ import annotations
@@ -437,7 +437,7 @@ async def _heal_wedged_loop(
 
     Guarded by the age gate + the DB-side heal guards so a live advance's
     transient window is never mistaken for a tear (the double-spawn
-    incident, docs/issues/loop_advance_nonatomic_wedges_loop.md).
+    incident, knowledge-base/knowledge/issues/loop_advance_nonatomic_wedges_loop.md).
     """
     loop_id = str(loop.get("id"))
     age = _wedge_age_seconds(loop)

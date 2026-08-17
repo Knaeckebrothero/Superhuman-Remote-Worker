@@ -592,7 +592,7 @@ def repair_tool_call_arguments(msg: BaseMessage, *, note: bool = True) -> BaseMe
     history tool calls on input and rejects its own prior output with a
     deterministic ``400 bad_request_error: invalid function arguments json
     string``, permanently poisoning the job/session
-    (docs/features/outbound_message_hygiene.md).
+    (knowledge-base/knowledge/features/outbound_message_hygiene.md).
 
     Repair-first: a call whose arguments ``_try_repair_json_object`` can fix
     is promoted into ``tool_calls`` (raw entry rewritten) so it executes
@@ -789,7 +789,7 @@ class ContextConfig:
     # they are computed at call time from the auxiliary model's own window
     # (src/core/summarizer.py) — deriving them from the MAIN model's window
     # sent 951k-token payloads to a 131k summarizer
-    # (docs/features/context_summarization_rework.md).
+    # (knowledge-base/knowledge/features/context_summarization_rework.md).
     model_max_context_tokens: int = 100_000
     # Per-family image-token estimator config (matrix settings.image_tokens via
     # LimitsConfig). None -> flat DEFAULT_IMAGE_TOKENS per image. S4.
@@ -857,7 +857,7 @@ def count_tokens_tiktoken(
             # split out image blocks and count them as flat image tokens
             # instead of tokenizing their base64 data URL as text (which
             # inflated session 5dbb5770 to ~9.2M phantom tokens). See
-            # src/core/image_tokens.py + docs/done/context_token_accounting.md.
+            # src/core/image_tokens.py + knowledge-history/done/context_token_accounting.md.
             text, image_blocks = split_text_and_image_blocks(msg.content)
             content_tokens = len(enc.encode(text, disallowed_special=()))
             image_tokens = sum(
@@ -1021,7 +1021,7 @@ class ContextManager:
         self._state = ContextManagementState()
         self._summarization_call_timeout = summarization_call_timeout
         # Optional async (event_name, params) callback for compaction
-        # progress (docs/features/context_summarization_rework.md). The
+        # progress (knowledge-base/knowledge/features/context_summarization_rework.md). The
         # transport decides rendering: persistent sessions broadcast SSE
         # frames, the worker graph logs. None = silent.
         self.progress_cb: Optional[Callable[[str, Dict[str, Any]], Any]] = None
@@ -1033,7 +1033,7 @@ class ContextManager:
         # transport reads it to record a message-granular `boundary_seq` on the
         # summary row so resume loads `summary + messages after the boundary`
         # instead of whole post-boundary turns. None when the last call did not
-        # actually compact. See docs/issues/persistent_session_midturn_message_loss.md.
+        # actually compact. See knowledge-base/knowledge/issues/persistent_session_midturn_message_loss.md.
         self._last_compaction_boundary_id: Optional[str] = None
         # Monotonic count of *successful* summarizations. Transports snapshot
         # it around a compaction call to know whether a summary was actually
@@ -1064,7 +1064,7 @@ class ContextManager:
         so a downswitch to a smaller-window model sees the real context size
         and compacts on the very next turn instead of resending an oversized
         history until the model returns empty responses. See
-        docs/done/session_model_switch_stale_context_manager_empty_response.md.
+        knowledge-history/done/session_model_switch_stale_context_manager_empty_response.md.
         """
         self.config = config
         image_config = getattr(config, "image_tokens", None)
@@ -1194,7 +1194,7 @@ class ContextManager:
         Tool results that carry evidence of side effects (file writes, edits)
         or failures (errors, exceptions, missing files) are preserved so the
         strategic phase audit protocol can cite verbatim tool output after
-        long tactical phases. See docs/features/phase_audit_protocol.md.
+        long tactical phases. See knowledge-base/knowledge/features/phase_audit_protocol.md.
 
         Args:
             msg: The ToolMessage to inspect
@@ -2251,7 +2251,7 @@ class ContextManager:
             ),
         )
 
-        # Stopgap (docs/issues/session_silent_failure_audit.md #4): when the
+        # Stopgap (knowledge-base/knowledge/issues/session_silent_failure_audit.md #4): when the
         # summarizer is fully unavailable, keep the original history rather
         # than compacting it away behind a placeholder. The turn may then
         # fail on context overflow — visibly — instead of the agent being

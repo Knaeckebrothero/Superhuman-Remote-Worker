@@ -1,6 +1,6 @@
 # Workspace Tier Upgrade — test coverage map (what's covered vs what isn't)
 
-Companion to `docs/features/workspace_tier_upgrade.md`. Records exactly what is
+Companion to `knowledge-base/knowledge/features/workspace_tier_upgrade.md`. Records exactly what is
 verified, by which mechanism, and — the point of this file — **what could not be
 covered yet**, why, and how to close each gap. Last updated 2026-06-20 (after the
 Phase 3 worker `virtual → sandbox` build + k3d end-to-end smoke).

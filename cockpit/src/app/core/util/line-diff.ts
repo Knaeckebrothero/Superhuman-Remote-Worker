@@ -1,6 +1,6 @@
 /**
  * Minimal line-level diff for rendering file-edit tool cards (#7 of
- * docs/features/persistent_chat_polish.md).
+ * knowledge-base/knowledge/features/persistent_chat_polish.md).
  *
  * `edit_file` replace calls carry both `old_string` and `new_string` in their
  * args, so we can show a real before/after diff with no backend round-trip.

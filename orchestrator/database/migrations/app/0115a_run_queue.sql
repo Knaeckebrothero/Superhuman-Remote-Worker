@@ -1,5 +1,5 @@
 -- migration:     0115_run_queue.sql
--- description:   Stateless-agents S1 substrate (docs/features/stateless_agents.md
+-- description:   Stateless-agents S1 substrate (knowledge-base/knowledge/features/stateless_agents.md
 --                §5.1/§5.2): the run_queue work/lease table with its claim,
 --                expiry and dedup indexes, plus threads.execution_lane — the
 --                per-thread lane partition flag ('pinned' | 'stateless').
@@ -39,7 +39,7 @@ CREATE TABLE run_queue (
 
 COMMENT ON TABLE run_queue IS
     'Work queue + recorded lease for stateless execution '
-    '(docs/features/stateless_agents.md §5.1/§5.2). One DURABLE row per unit '
+    '(knowledge-base/knowledge/features/stateless_agents.md §5.1/§5.2). One DURABLE row per unit '
     '(thread, job, or bg task): rows are never deleted while the unit lives, '
     'so lease_token stays monotonic — delete-and-reinsert would reset it and '
     'break fencing. State machine: queued -> leased -> {done | queued | '
@@ -137,6 +137,6 @@ COMMENT ON COLUMN threads.execution_lane IS
     'Which execution plane serves this thread: ''pinned'' (registered-agent '
     'pod, the default) or ''stateless'' (run_queue claim by any pod). '
     'App-validated by design — no CHECK. See '
-    'docs/features/stateless_agents.md §5.4.4.';
+    'knowledge-base/knowledge/features/stateless_agents.md §5.4.4.';
 
 COMMIT;

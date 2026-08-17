@@ -43,7 +43,7 @@
   // above, never a replacement for it. Assigning `background` here dropped the
   // surface and let whatever was behind bleed through at ~80%, which is how a
   // sticky danger toast ended up unreadable on top of an artifact.
-  // docs/done/session_resume_cloud_sync_race_late_provision.md
+  // knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
   &[data-tone='success'] {
     border-color: var(--success);
     background-image: linear-gradient(var(--success-tint), var(--success-tint));

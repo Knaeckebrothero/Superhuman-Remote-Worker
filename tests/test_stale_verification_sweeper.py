@@ -4,7 +4,7 @@ Covers the pure tick, the shutdown-aware loop, and the PostgresDB helper's
 wire-level contract (mocked connection — the SQL's runtime behavior is verified
 on the dev cluster, there is no test DB here, matching test_admin_providers_db.py
 and test_postgres_advisory_lock.py). See
-docs/done/preemption_before_first_checkpoint_replays_job_opening.md.
+knowledge-history/done/preemption_before_first_checkpoint_replays_job_opening.md.
 """
 
 from __future__ import annotations
@@ -278,7 +278,7 @@ def test_unstick_no_longer_requires_all_children_failed():
 
 class TestUnstickReviewingParentsWallclock:
     """The wall-clock arm — fix direction 2 of
-    docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md.
+    knowledge-history/done/rejected_verdict_livelocks_critic_and_wedges_parent.md.
     """
 
     @pytest.mark.asyncio
@@ -365,7 +365,7 @@ class TestUnstickReviewingParentsWallclock:
 
 def test_sweeper_reaps_waiting_critics_and_still_reaps_paused():
     """`waiting` critics are orphans of the retired inter-round parking
-    mechanism (docs/issues/stale_critic_waiting_status_escapes_reaper.md) and
+    mechanism (knowledge-base/knowledge/issues/stale_critic_waiting_status_escapes_reaper.md) and
     must now be reaped.
 
     Deviation from the task-10 brief's literal example test: the brief
@@ -376,7 +376,7 @@ def test_sweeper_reaps_waiting_critics_and_still_reaps_paused():
     same query, which tests specifically for ``j.status = 'paused'``. Orphan
     recovery legitimately re-dispatches critics through `paused`, and "paused
     too long ⇒ dead" was evaluated and rejected as a standalone signal in a
-    prior design (docs/features/llm_outage_subjob_resilience.md) — there is no
+    prior design (knowledge-base/knowledge/features/llm_outage_subjob_resilience.md) — there is no
     positive deadness signal for `paused` the way there now is for `waiting`
     (a status nothing legitimately parks in any more). So `paused` must
     survive in the predicate, and this test asserts presence, not absence.

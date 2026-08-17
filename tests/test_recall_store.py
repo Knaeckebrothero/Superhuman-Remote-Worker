@@ -906,7 +906,7 @@ class TestStats:
 
 
 # =============================================================================
-# Deadlock containment (docs/issues/project_scoped_memory_deadlocks_under_
+# Deadlock containment (knowledge-base/knowledge/issues/project_scoped_memory_deadlocks_under_
 # parallel_jobs.md) — deterministic id-ordered locking, bounded retry of the
 # access-stat write, containment, and MemoryHealth counters.
 # =============================================================================

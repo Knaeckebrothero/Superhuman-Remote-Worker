@@ -4,7 +4,7 @@
 --                MCP tokens (kind='mcp') and the new Personal Access Tokens
 --                for n8n / automation (kind='api').
 --
---                PR 3 of docs/features/auth_bff_and_api_tokens.md.
+--                PR 3 of knowledge-base/knowledge/features/auth_bff_and_api_tokens.md.
 --
 --                The dormant pre-Keycloak `auth_tokens` (verification +
 --                password_reset rows) is dropped first to free the name;
@@ -81,7 +81,7 @@ CREATE INDEX IF NOT EXISTS idx_auth_tokens_superseded_by
 
 COMMENT ON TABLE auth_tokens IS
     'Bearer-auth tokens: kind=mcp (legacy Claude Code/CLI flow) and '
-    'kind=api (PATs for n8n/automation). See docs/features/auth_bff_and_api_tokens.md §3.';
+    'kind=api (PATs for n8n/automation). See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md §3.';
 COMMENT ON COLUMN auth_tokens.kind IS
     'mcp=legacy MCP token (srw_<32-byte> prefix; scope column carries '
     'user/all/project:<uuid>). api=PAT (ak_<43-char> prefix; scopes column '

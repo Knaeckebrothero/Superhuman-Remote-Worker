@@ -2,7 +2,7 @@
 
 Covers the three leak sites where dual_app's stop paths used to strand
 ``_pod_state=WORKING`` with no job (see
-docs/done/worker_pod_state_zombie_on_cancel.md):
+knowledge-history/done/worker_pod_state_zombie_on_cancel.md):
 
   - ``_complete_stop()``            — the shared reset+signal helper (sites A/B)
   - ``_process_orchestrator_job()`` — cooperative stop mid-job (site A)
@@ -228,7 +228,7 @@ class TestCancelHardKillResets:
 
 class TestFinalIdleStatusOnExit:
     """Finding 5 of
-    docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md:
+    knowledge-history/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md:
     a one-shot worker's final heartbeat must not assert 'ready' — the process
     exits ~2s later, and a fresh-looking 'ready' row lets the dispatcher
     claim a job for the dead pod during the ~3-min offline window."""

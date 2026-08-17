@@ -2,7 +2,7 @@
 -- description:   Cookie BFF sessions + OAuth pre-auth state for the
 --                cockpit-side auth refactor.
 --
---                PR 1 of docs/features/auth_bff_and_api_tokens.md. The
+--                PR 1 of knowledge-base/knowledge/features/auth_bff_and_api_tokens.md. The
 --                orchestrator becomes a Backend-for-Frontend: it holds
 --                Keycloak access/refresh/id tokens server-side keyed by an
 --                opaque session UUID, and the browser only ever sees the
@@ -74,7 +74,7 @@ CREATE INDEX IF NOT EXISTS idx_srw_sessions_absolute_expires
 
 COMMENT ON TABLE srw_sessions IS
     'BFF session rows. Cookie value = id (UUID). KC tokens held server-side '
-    'and refreshed in place. See docs/features/auth_bff_and_api_tokens.md §1.2.';
+    'and refreshed in place. See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md §1.2.';
 COMMENT ON COLUMN srw_sessions.kc_sid IS
     'Keycloak session ID from id_token claim "sid". Used for back-channel logout.';
 COMMENT ON COLUMN srw_sessions.absolute_expires_at IS

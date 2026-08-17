@@ -1,6 +1,6 @@
 """Real-Postgres tests for ``KnowledgeStore.upsert_watermark`` parameter typing.
 
-Guards docs/done/kb_reindex_watermark_never_advances.md. ``upsert_watermark``
+Guards knowledge-history/done/kb_reindex_watermark_never_advances.md. ``upsert_watermark``
 bound ``$4`` (``indexed_commit``) both directly — deducing ``character
 varying`` from the column — and inside ``COALESCE($6, $4)``, whose two untyped
 arguments made Postgres resolve it to ``text``. One parameter cannot be both,

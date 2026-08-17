@@ -176,7 +176,7 @@ class TestRecordVerificationRound:
     @pytest.mark.asyncio
     async def test_rejections_below_cap_do_not_escalate(self, fake_db, monkeypatch):
         """Two invalid submissions: plain 409s, no escalation, empty ledger.
-        docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
+        knowledge-history/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
         """
         import orchestrator.main as main_module
 
@@ -600,7 +600,7 @@ class TestCriticMustBelongToTheTarget:
         """asyncpg returns JSONB as a string on the app pool (no codec
         registered), so an isinstance-only check would reject EVERY real
         critic — the failure mode documented in
-        docs/issues/jsonb_isinstance_guard_without_parse_silent_dead_paths.md.
+        knowledge-base/knowledge/issues/jsonb_isinstance_guard_without_parse_silent_dead_paths.md.
         """
         import json
 
@@ -1422,7 +1422,7 @@ class TestUndeliveredCompletionSkipsTheCritic:
     deliverable missing, and return the job for work that EXISTS but was never
     delivered. On dev job `40efbb39` that misdiagnosis cost a 105-minute
     livelock and a verdict describing an infrastructure fault as a work fault
-    (docs/done/git_push_fails_silently_via_workspace_backend.md).
+    (knowledge-history/done/git_push_fails_silently_via_workspace_backend.md).
 
     Escalating instead is both cheaper and more accurate, and routing it
     through ``_escalate_target`` puts the real reason in ``error_message``
@@ -2119,7 +2119,7 @@ class TestHandleCriticVerdictOnCompleteWiring:
         The test above stubs ``_internal_resume_job`` wholesale, so it alone
         cannot see a regression back to a hand-rolled UPDATE that forgets
         the clear. This pins the seam one level deeper.
-        See docs/done/critic_feedback_resume_parent_freeze_data_wedge.md
+        See knowledge-history/done/critic_feedback_resume_parent_freeze_data_wedge.md
         (write contract locked against real Postgres in
         tests/test_queue_job_for_resume.py).
         """

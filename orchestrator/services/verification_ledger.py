@@ -9,8 +9,8 @@ open unless a later round dispositioned it RESOLVED. DISPUTED records
 disagreement without closing, so a fresh critic cannot close a predecessor's
 finding by re-judging it.
 
-Design: docs/superpowers/specs/2026-07-27-verification-fail-closed-design.md
-Incident: docs/issues/verification_round_reset_spawns_blind_critic.md
+Design: knowledge-base/knowledge/superpowers/specs/2026-07-27-verification-fail-closed-design.md
+Incident: knowledge-base/knowledge/issues/verification_round_reset_spawns_blind_critic.md
 """
 
 from __future__ import annotations

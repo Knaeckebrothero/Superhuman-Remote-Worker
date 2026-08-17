@@ -1,4 +1,4 @@
-"""The officer's post — O3/O4 of docs/features/officer_post.md.
+"""The officer's post — O3/O4 of knowledge-base/knowledge/features/officer_post.md.
 
 Lifecycle endpoints (commission / decommission / hold / release), the PATCH
 editor with §7's validation matrix + effect labels, the row-only
@@ -685,7 +685,7 @@ class TestPatchEndpoint:
 
 class TestCommissionCapabilityGate:
     """Commissioning is gated on the `unattended_operations` capability grant
-    (docs/done/unattended_operations_grant.md). The config PDP refuses
+    (knowledge-history/done/unattended_operations_grant.md). The config PDP refuses
     `officer.enabled` downstream too, but only after the kit has been written —
     so the point of this gate is that it fires FIRST and touches nothing."""
 

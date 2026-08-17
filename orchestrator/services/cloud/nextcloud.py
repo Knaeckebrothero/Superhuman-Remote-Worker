@@ -194,7 +194,7 @@ class NextcloudBackend:
         # Cross-cluster VM runtimes can't reach the internal service URL; swap
         # to the public edge (no-op unless the URL is internal-prefixed). Mirror
         # of the OpenCloud path — see
-        # docs/issues/workspace_upgrade_drops_cloud_mount.md.
+        # knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md.
         if (
             prefer_public_url
             and webdav_url

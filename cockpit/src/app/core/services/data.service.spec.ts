@@ -10,7 +10,7 @@ import { IndexedDbService } from './indexed-db.service';
  * (AuditTraceService / ChatTraceService) and graph via GraphService, all driven
  * by `currentJobId`. Nothing is eagerly downloaded here anymore — that bulk path
  * OOM'd the orchestrator on large jobs. See
- * docs/features/debug_audit_view_refactor.md (Phase 2c / P3).
+ * knowledge-base/knowledge/features/debug_audit_view_refactor.md (Phase 2c / P3).
  */
 describe('DataService', () => {
   let service: DataService;

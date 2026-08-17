@@ -4,7 +4,7 @@ The orchestrator hard-fails (sys.exit(1)) when ``LLM_BASE_URL`` is set
 because the env-var-driven routing for self-hosted "Local" group models
 was removed; leaving it set with no consumer is exactly the "active
 misconfiguration that won't self-heal" path that produced the 401-against-
-api.openai.com bug captured in docs/llm_routing_issues.md.
+api.openai.com bug captured in knowledge-base/knowledge/llm_routing_issues.md.
 """
 
 from __future__ import annotations

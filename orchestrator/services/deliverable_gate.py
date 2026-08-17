@@ -1,6 +1,6 @@
 """Deterministic deliverable-contract gate at the seal (P1-C).
 
-docs/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C / §7 annex E.
+knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C / §7 annex E.
 
 Jobs may declare ``context.required_deliverables`` — workspace-relative paths
 (plus ``kb:<slug>`` knowledge-note slugs) that MUST exist before a completion
@@ -106,7 +106,7 @@ def is_cloned_repo_deliverable(path: Any) -> bool:
     because the platform refuses to version it. Treating it as missing is a
     false negative, and a costly one: it bounces a job that delivered, and
     teaches the agent that the way to pass is to defeat the .gitignore.
-    See docs/issues/deliverable_gate_cannot_see_cloned_repo_deliverables.md.
+    See knowledge-base/knowledge/issues/deliverable_gate_cannot_see_cloned_repo_deliverables.md.
     """
     if not isinstance(path, str) or path.startswith(KB_DELIVERABLE_PREFIX):
         return False
@@ -298,7 +298,7 @@ async def evaluate_deliverable_gate(
     # worker cannot fix"), and it is invisible to the others only because it is
     # the one infrastructure failure that looks like a CLEAN read — the tree is
     # readable, it is merely empty.
-    # docs/done/git_push_fails_silently_via_workspace_backend.md
+    # knowledge-history/done/git_push_fails_silently_via_workspace_backend.md
     freeze = _parse_freeze_data(job) or {}
     if isinstance(freeze, dict) and freeze.get("delivery_failed"):
         return {

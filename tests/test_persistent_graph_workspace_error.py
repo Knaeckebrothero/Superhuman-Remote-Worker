@@ -1,5 +1,5 @@
 """Chat turn loop must surface WorkspaceUnavailableError cleanly, not flatten it
-into a retryable ToolMessage. docs/issues/agent_fast_freeze_on_dead_workspace.md."""
+into a retryable ToolMessage. knowledge-base/knowledge/issues/agent_fast_freeze_on_dead_workspace.md."""
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock

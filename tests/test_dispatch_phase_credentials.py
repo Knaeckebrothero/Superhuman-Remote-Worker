@@ -7,7 +7,7 @@ phase blocks. The agent's LLM factory then fell back to the parent's
 `base_url` and returned `404 Model 'X' not found` in an infinite retry
 loop.
 
-See docs/issues/orchestrator_phase_override_credentials_not_injected.md
+See knowledge-base/knowledge/issues/orchestrator_phase_override_credentials_not_injected.md
 for the incident write-up.
 """
 
@@ -248,7 +248,7 @@ class TestPhaseOverrideCredentialInjection:
 # beats the top-level model in get_phase_config, so they silently shadowed an
 # explicit per-loop/per-job top-level model (a loop pinned to gpt-5.5 ran
 # entirely on gpt-5.3-codex-spark). Dispatch must no longer read them.
-# See docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md
+# See knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md
 # ---------------------------------------------------------------------------
 
 
@@ -677,7 +677,7 @@ class TestEndpointDirectRouting:
 # system-default fallback the chat model has (outside the user gate), stops a
 # pre-present EMBEDDING_MODEL from suppressing the key, and refuses to emit a
 # half-credential when the endpoint key can't decrypt.
-# See docs/done/embedding_key_missing_silently_disables_memory_and_kb.md
+# See knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md
 # ---------------------------------------------------------------------------
 
 EMB_ENDPOINT_ID = "33333333-3333-3333-3333-333333333333"

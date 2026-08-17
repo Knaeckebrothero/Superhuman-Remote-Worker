@@ -8,7 +8,7 @@ import {DiffLine} from '../util/line-diff';
  * presentational component (`<app-tool-card>`) renders identically. All
  * per-tool knowledge (title, icon, which arg is the "primary" parameter, how to
  * render the result) lives in the descriptor registry — see
- * `core/tools/tool-descriptors.ts`. Design: `docs/features/unified_tool_cards.md`.
+ * `core/tools/tool-descriptors.ts`. Design: `knowledge-base/knowledge/features/unified_tool_cards.md`.
  */
 
 export type ToolCardStatus = 'pending' | 'running' | 'ok' | 'error' | 'denied' | 'expired';

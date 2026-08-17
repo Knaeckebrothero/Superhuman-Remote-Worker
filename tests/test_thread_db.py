@@ -372,7 +372,7 @@ class TestGetThread:
         """The id is user-supplied path input on every thread route; an
         8-char prefix used to hit the uuid bind and 500. It must resolve to
         None (the caller's 404) without ever touching the pool.
-        docs/issues/session_turn_end_cloud_push_blocks_queued_input.md"""
+        knowledge-base/knowledge/issues/session_turn_end_cloud_push_blocks_queued_input.md"""
         conn = _mock_conn()
         conn.fetchrow = AsyncMock()
         db = _make_db_with_conn(conn)

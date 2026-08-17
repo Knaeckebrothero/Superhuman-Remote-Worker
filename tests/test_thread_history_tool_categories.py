@@ -6,7 +6,7 @@ the stamp the cockpit's folded-chip summary buckets every replayed call as
 "other", so the same turn reads "19x citations - 12x searches" while streaming
 and "38x steps" after a reload.
 
-See docs/features/session_turn_rendering.md "Phase 2 - the live edge".
+See knowledge-base/knowledge/features/session_turn_rendering.md "Phase 2 - the live edge".
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch

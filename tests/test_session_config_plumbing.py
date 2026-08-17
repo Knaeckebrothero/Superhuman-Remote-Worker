@@ -5,7 +5,7 @@ step 1 (2026-06-11):
 
 - Hole A: a bare ``POST /api/persistent/threads`` must land on the
   persistent base config, not the worker one
-  (docs/issues/session_config_name_plumbing.md).
+  (knowledge-base/knowledge/issues/session_config_name_plumbing.md).
 - Hole B: the idle-pool ``/session/attach`` path must carry the thread's
   config_name (orchestrator side) and resolve it as the session base
   (agent side) — otherwise pool-attached sessions bind the worker memory
@@ -190,7 +190,7 @@ class TestSessionWorkspaceBackendOverride:
         # vm is now selectable at creation (operator-gated + provisioned in
         # create_thread). Validation lets it through with its sizing sub-dict;
         # the permission/provisioner gate lives downstream, not here.
-        # docs/features/session_create_on_vm.md
+        # knowledge-base/knowledge/features/session_create_on_vm.md
         ws = orch_main._validated_session_workspace_override(
             {"workspace": {"backend": "vm", "vm": {"cpu_cores": 4, "memory": "8Gi"}}}
         )
@@ -228,7 +228,7 @@ class TestSessionWorkspaceBackendOverride:
 
 class TestSessionReadyTimeout:
     """VM-aware readiness budget for the session-start paths
-    (docs/features/session_create_on_vm.md)."""
+    (knowledge-base/knowledge/features/session_create_on_vm.md)."""
 
     def test_non_vm_uses_fast_default(self, monkeypatch):
         monkeypatch.delenv("WS_READY_TIMEOUT_S", raising=False)
@@ -283,7 +283,7 @@ class TestThreadWorkspaceBackend:
 
 
 class TestSessionWorkspaceBackendDefaultChain:
-    """Instant-landing defaults chain (docs/features/instant_landing_session.md):
+    """Instant-landing defaults chain (knowledge-base/knowledge/features/instant_landing_session.md):
     explicit request > owner's saved ``persistent_agent.workspace_backend`` >
     platform default (virtual). Sessions are never implicitly sandbox."""
 

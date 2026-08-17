@@ -9,7 +9,7 @@ Now the push is a background task. Ordering still matters: the next turn's
 start hook awaits it before its pull (strict push(N) → pull(N+1) per mount),
 and teardown awaits it before the final sync/aclose.
 
-docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+knowledge-base/knowledge/issues/session_turn_end_cloud_push_blocks_queued_input.md
 """
 
 import asyncio

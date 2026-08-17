@@ -28,10 +28,10 @@ model and several live fixtures were unavailable; its three complete
 with zero critical forbidden claims. Do not use those fallback results as a
 passing baseline or combine their cells with a later candidate.
 
-See the [verification record](../../docs/tests/app_guide_m2_verification.md),
+See the [verification record](../../knowledge-base/knowledge/tests/app_guide_m2_verification.md),
 the [sanitized first-run
-results](../../docs/tests/app_guide_m2_live_acceptance_results_2026-07-28.md),
-and the [re-run handoff](../../docs/tests/app_guide_m2_live_acceptance_handoff.md).
+results](../../knowledge-base/knowledge/tests/app_guide_m2_live_acceptance_results_2026-07-28.md),
+and the [re-run handoff](../../knowledge-base/knowledge/tests/app_guide_m2_live_acceptance_handoff.md).
 
 ## Validate the corpus
 

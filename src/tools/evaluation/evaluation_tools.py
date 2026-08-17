@@ -10,7 +10,7 @@ orchestrator (``OrchestratorClient.record_verification_round``, POST
 model, and the verdict it mirrors into module-level state is the
 server-COMPUTED verdict, never the model's assertion. A verdict that cannot
 be persisted is reported back to the model as an error, not as success — see
-docs/superpowers/plans/2026-07-27-verification-fail-closed.md.
+knowledge-base/knowledge/superpowers/plans/2026-07-27-verification-fail-closed.md.
 
 The module-level mirror below is consumed by finalize_job/handle_transition
 (src/core/phase.py) after the critic's graph ends; it is a cache of an

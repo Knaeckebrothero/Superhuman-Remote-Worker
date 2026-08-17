@@ -1,6 +1,6 @@
 """S3a — cross-backend workspace seeding + WorkspaceBackend.walk().
 
-``docs/features/workspace_tier_upgrade.md`` §4.2 S3a / §4.3 W1: when a lite
+``knowledge-base/knowledge/features/workspace_tier_upgrade.md`` §4.2 S3a / §4.3 W1: when a lite
 (``virtual``) session/job upgrades to a real ``sandbox``, the agent copies the
 object-store prefix down into the freshly provisioned backend via
 ``seed_workspace`` while both backends are live. This exercises:

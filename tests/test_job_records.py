@@ -1,5 +1,5 @@
 """Tests for the general per-job change record (§5/§6.5 of
-docs/features/workspace_and_change_records.md).
+knowledge-base/knowledge/features/workspace_and_change_records.md).
 
 ``services.job_records`` generalises the loop retro: every repo-backed job
 leaves exactly one record on the project repo's ``main`` on reaching a
@@ -632,7 +632,7 @@ PR_RECORD = {
 class TestPersistedPullRequestIsDelivery:
     """A pull request opened through ``repo_open_pr`` is verified delivery.
 
-    docs/features/better_resavio_restart_status.md §6a. A loop whose code
+    knowledge-base/knowledge/features/better_resavio_restart_status.md §6a. A loop whose code
     lives in a source repository reports ``delivery_status='no-changes'`` on
     every code turn *legitimately* — nothing goes to the project cloud
     folder. The delivered artefact is a pushed branch plus an open pull

@@ -5,7 +5,7 @@ The classifier half of `src/core/llm_retry.py` is pinned by
 This file covers the loop that was previously hand-rolled at four call sites
 with four different backoff schedules, and absent entirely at two more.
 
-docs/done/llm_retry_and_fallback_reimplemented_per_call_site.md
+knowledge-history/done/llm_retry_and_fallback_reimplemented_per_call_site.md
 """
 
 import asyncio

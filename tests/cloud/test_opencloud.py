@@ -544,7 +544,7 @@ class TestRcloneMountSpec:
     async def test_prefer_public_url_swaps_internal_to_public(self):
         # A cross-cluster VM mount must target the public edge; the internal
         # service URL isn't reachable from the vm cluster
-        # (docs/issues/workspace_upgrade_drops_cloud_mount.md). Same-cluster
+        # (knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md). Same-cluster
         # pods (default, prefer_public_url=False) keep the internal URL.
         settings = _settings().model_copy(
             update={

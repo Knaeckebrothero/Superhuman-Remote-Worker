@@ -1,5 +1,5 @@
 -- migration:     0008_kb_index_chunking.sql
--- description:   OKF files-canonical KB — slice 3 PR1 (docs/features/okf_knowledge_base.md
+-- description:   OKF files-canonical KB — slice 3 PR1 (knowledge-base/knowledge/features/okf_knowledge_base.md
 --                §5.1 / §11 slice-3 PR1). The SCHEMA half of the retrieval
 --                cutover, additive-only and inert: it adds the columns and tables
 --                the chunk-granular git-tree reindexer will WRITE, but nothing

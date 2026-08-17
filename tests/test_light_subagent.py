@@ -1,6 +1,6 @@
 """Unit tests for the light-subagent ReAct harness (Phase 1).
 
-Covers docs/issues/delegation_light_mode_missing.md Phase 1: run_light_subagent
+Covers knowledge-base/knowledge/issues/delegation_light_mode_missing.md Phase 1: run_light_subagent
 returns final text, executes tool calls, stops at each cap, uses a fresh message
 list, and handles the empty-tools path — all with a fake LLM + fake tools, no
 infra.
@@ -359,7 +359,7 @@ class TestReaderLLMRetry:
     Both readers of critic job 37c418d2 died on a single 408 stream-disconnect:
     the parent execute node's classify+retry never covered them, because a light
     reader is a graph-less in-process harness.
-    docs/done/llm_retry_and_fallback_reimplemented_per_call_site.md
+    knowledge-history/done/llm_retry_and_fallback_reimplemented_per_call_site.md
     """
 
     @pytest.mark.asyncio

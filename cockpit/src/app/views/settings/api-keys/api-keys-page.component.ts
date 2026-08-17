@@ -22,7 +22,7 @@ import {AppIconComponent} from '../../../ui/icon';
  * Personal Access Token (PAT) management.
  *
  * Distinct from the MCP token UI in `settings.component.ts`. PR 3 of
- * docs/features/auth_bff_and_api_tokens.md: PATs are for n8n /
+ * knowledge-base/knowledge/features/auth_bff_and_api_tokens.md: PATs are for n8n /
  * automation and use the `ak_` prefix; MCP tokens stay on `srw_` and
  * carry their own scope semantics. Both kinds back onto the same
  * `auth_tokens` table — see the design doc §3.6 for the consolidation

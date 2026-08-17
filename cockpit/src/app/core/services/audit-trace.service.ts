@@ -13,7 +13,7 @@ import { AuditEntry, AuditFilterCategory } from '../models/audit.model';
  * state / metadata) only when the row is expanded. Nothing is downloaded up
  * front and nothing is cached in IndexedDB.
  *
- * See docs/features/debug_audit_view_refactor.md (Phase 2).
+ * See knowledge-base/knowledge/features/debug_audit_view_refactor.md (Phase 2).
  */
 @Injectable({ providedIn: 'root' })
 export class AuditTraceService {

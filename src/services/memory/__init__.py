@@ -1,6 +1,6 @@
 """MemoryManager seam — single entry point for agent memory.
 
-Design: docs/features/agent_memory_overhaul.md. Phase-1 kernel: data
+Design: knowledge-base/knowledge/features/agent_memory_overhaul.md. Phase-1 kernel: data
 vocabulary (types), plugin protocols, registry, and the binder
 (MemoryManager.from_config). Current behaviour transplants into
 registered plugins in the follow-up slices; until the cutover flag

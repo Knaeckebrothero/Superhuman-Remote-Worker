@@ -1,6 +1,6 @@
 """Virtual workspace backend — explicit object-store file ops, no workspace pod.
 
-The ``virtual`` tier (``docs/features/no_workspace_agent_mode.md`` §5) gives a
+The ``virtual`` tier (``knowledge-base/knowledge/features/no_workspace_agent_mode.md`` §5) gives a
 lite agent real file tools without provisioning a workspace container/VM: file
 operations are explicit object-store ops against a per-job/per-thread key
 prefix, so files are durable in object storage and survive pod death. There is

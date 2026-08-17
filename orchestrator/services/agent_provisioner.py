@@ -62,7 +62,7 @@ def _normalize_config_name(config_name: str, purpose: str) -> str:
     bound expert is applied via the thread's ``config_override`` (sessions) or
     ``AGENT_EXPERT_ID`` (jobs), so a UUID in this slot is always wrong — boot
     the purpose's base config instead. See
-    docs/done/global_expert_management.md."""
+    knowledge-history/done/global_expert_management.md."""
     if not config_name:
         return config_name
     try:
@@ -476,7 +476,7 @@ class AgentProvisioner:
         if not self._k8s_available:
             return False
 
-        # Post-mortem log preservation (docs/features/job_log_archive.md):
+        # Post-mortem log preservation (knowledge-base/knowledge/features/job_log_archive.md):
         # archive the full pod log to S3 before the pod — and the log the
         # kubelet holds for it — disappears. This is the one choke point all
         # deletion paths share (reap, scale-down, session end, suspension,
@@ -1049,7 +1049,7 @@ class AgentProvisioner:
             # Capture agent stderr before delete so unexpected exits don't
             # vanish with the pod. Diagnostic for the
             # persistent_session_permission_check_race incident — see
-            # docs/issues/persistent_session_permission_check_race.md.
+            # knowledge-base/knowledge/issues/persistent_session_permission_check_race.md.
             await self._capture_agent_logs_before_reap(pod, category)
             if await self.delete_agent_pod(pod.metadata.name):
                 stats[category] += 1
@@ -1268,7 +1268,7 @@ class AgentProvisioner:
         active-vs-min count alone made the two loops fight — warm pool
         created one pod every cycle, scale-down deleted it the next
         (one pod/minute churn for hours on dev,
-        docs/issues/session_silent_failure_audit.md #12).
+        knowledge-base/knowledge/issues/session_silent_failure_audit.md #12).
 
         Returns:
             Number of pods terminated.
@@ -1477,7 +1477,7 @@ class AgentProvisioner:
         if thread_id:
             labels["srw/thread-id"] = thread_id[:12]
             # Full-value label consumed by the per-session Service selector
-            # built by the session router (docs/features/direct_session_websockets.md).
+            # built by the session router (knowledge-base/knowledge/features/direct_session_websockets.md).
             # The legacy `srw/thread-id` label above is kept for backwards-compat
             # with the lifecycle reconciler, which still selects on the truncated
             # form. K8s label values cap at 63 chars; a UUID fits.
@@ -1525,7 +1525,7 @@ class AgentProvisioner:
                     # agent reports this back at /api/agents/register so the
                     # session router can stamp ownerReferences on per-session
                     # Service/Ingress resources for K8s GC.
-                    # (docs/features/direct_session_websockets.md)
+                    # (knowledge-base/knowledge/features/direct_session_websockets.md)
                     {
                         "name": "POD_UID",
                         "valueFrom": {
