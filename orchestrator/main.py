@@ -187,6 +187,7 @@ from routers.contacts import router as contacts_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.project_loop_sweeper import project_loop_sweeper_loop  # noqa: E402
 from services.session_wake import (  # noqa: E402
+    deliver_officer_note as _deliver_officer_note,
     file_officer_timer,
     kick_drain as _kick_session_wake_drain,
     kick_event_drain as _kick_officer_event_drain,
@@ -35020,6 +35021,69 @@ async def _conclude_conference_if_any(thread: dict) -> None:
         logger.exception("conference end: brief wake failed (non-fatal)")
 
 
+def _roster_officer_view(row: dict[str, Any]) -> dict[str, Any]:
+    """One roster line from a ``project_officers`` join row."""
+    metadata = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    config_override = metadata.get("config_override") or {}
+    officer_cfg = config_override.get("officer") or {}
+    officer_state = metadata.get("officer_state") or {}
+    pages = officer_state.get("pages") or {}
+    today = datetime.now(timezone.utc).date().isoformat()
+    thread_id = row.get("thread_id")
+    thread_status = row.get("thread_status")
+    digest = officer_state.get("digest")
+    return {
+        "project_id": str(row.get("project_id")),
+        "project_name": row.get("project_name"),
+        "thread_id": str(thread_id) if thread_id else None,
+        "thread_status": thread_status,
+        "commissioned": bool(thread_id) and thread_status != "ended",
+        "held": officer_cfg.get("hold") or None,
+        "next_wake_at": _iso_or_none(row.get("next_wake_at")),
+        "pending_events": int(row.get("pending_events") or 0),
+        "in_flight_jobs": int(row.get("in_flight_jobs") or 0),
+        "pages_today": (
+            int(pages.get("count") or 0) if pages.get("date") == today else 0
+        ),
+        "digest_waiting": len(digest) if isinstance(digest, list) else 0,
+        "auto_pull": bool(officer_cfg.get("auto_pull")),
+        "model": (config_override.get("llm") or {}).get("model"),
+        "last_activity_at": _iso_or_none(row.get("last_agent_activity")),
+    }
+
+
+def _iso_or_none(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value) if value else None
+
+
+@app.get("/api/officers")
+async def list_officers(request: Request) -> dict[str, Any]:
+    """Every post the caller can see, vacant ones included — the roster.
+
+    Discovery for a Legate (or an assistant holding his credentials) who has
+    more projects than officers: one call answers which projects have an
+    officer, whether he is awake, held or vacant, and whether anything is
+    waiting on him. Per-slot kit utilization stays on the per-project card,
+    which computes it lineage-aware; this read stays cheap.
+    """
+    user = await require_approved_user(request, postgres_db)
+    visible = await user_visible_project_ids(user, postgres_db)
+    if visible != "all" and not visible:
+        return {"officers": [], "total": 0}
+    rows = await postgres_db.list_project_officer_posts(
+        None if visible == "all" else sorted(str(pid) for pid in visible)
+    )
+    officers = [_roster_officer_view(row) for row in rows]
+    return {"officers": officers, "total": len(officers)}
+
+
 @app.get("/api/projects/{project_id}/officer")
 async def get_project_officer_summary(
     request: Request, project_id: str
@@ -36162,6 +36226,95 @@ async def release_project_officer(request: Request, project_id: str) -> dict[str
         hold.get("kind") if isinstance(hold, dict) else "?",
     )
     return {"status": "released", "thread_id": officer_tid, "notified": notified}
+
+
+OFFICER_NOTE_MAX_CHARS = 8000
+
+
+class OfficerNoteRequest(BaseModel):
+    """Body for POST .../officer/note."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(..., description="What the Legate wants him to know or do")
+
+
+def _format_legate_note(user: dict[str, Any], message: str) -> str:
+    """Stamp a note with its author before it reaches the officer.
+
+    He treats a Legate directive as top authority, so who wrote it is part of
+    the message: a note composed by an assistant holding the Legate's
+    credentials must not read as words the Legate typed himself.
+    """
+    actor = str(user.get("display_name") or user.get("email") or "the Legate").strip()
+    channel = "via MCP" if str(user.get("auth_method") or "") == "mcp" else "via API"
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return f"[Legate note — {actor} {channel}, {stamp}]\n\n{message}"
+
+
+@app.post("/api/projects/{project_id}/officer/note")
+async def send_project_officer_note(
+    request: Request,
+    project_id: str,
+    body: OfficerNoteRequest,
+) -> dict[str, Any]:
+    """Send the project's officer a one-way note (officer_legate_channel.md).
+
+    Auth: project owner — a note carries command authority, the same bar as
+    hold/release. The reply, if he has one, arrives in his log or as a page;
+    this endpoint deliberately has no ask-and-wait leg.
+
+    The response states which of the three deliveries happened rather than a
+    bare 200: ``live`` reached his input queue, ``queued`` is a durable wake
+    row he reads at ``next_wake_at``, and ``held`` is queued behind a hold
+    that must lift first. A note reported as sent when it only reached a
+    table would be worse than an error.
+    """
+    user, _project = await require_project_owner(request, postgres_db, project_id)
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message must not be empty")
+    if len(message) > OFFICER_NOTE_MAX_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"message must be at most {OFFICER_NOTE_MAX_CHARS} characters "
+                f"(got {len(message)}) — put the long form in the knowledge "
+                "base and point him at it"
+            ),
+        )
+    officer = await postgres_db.get_officer_thread_for_project(project_id)
+    if not officer:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The post is vacant — commission an officer before sending him orders"
+            ),
+        )
+    officer_tid = str(officer["id"])
+    text = _format_legate_note(user, message)
+    delivered = await _deliver_officer_note(postgres_db, officer, text)
+    if delivered == "queued":
+        _kick_officer_event_drain(postgres_db)
+    next_wake_at = None
+    if delivered != "live":
+        timer = await postgres_db.get_pending_officer_timer(officer_tid)
+        next_wake_at = (timer or {}).get("fire_at")
+    hold = _thread_officer_meta(officer).get("hold") or None
+    logger.info(
+        "officer %s: legate note %s (project %s, %d chars)",
+        officer_tid[:8],
+        delivered,
+        project_id[:8],
+        len(message),
+    )
+    return {
+        "delivered": delivered,
+        "thread_id": officer_tid,
+        "project_id": project_id,
+        "next_wake_at": next_wake_at,
+        "held": hold,
+    }
 
 
 @app.patch("/api/projects/{project_id}/officer")

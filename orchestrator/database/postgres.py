@@ -9502,6 +9502,59 @@ class PostgresDB:
             )
         return [dict(row) for row in rows]
 
+    async def list_project_officer_posts(
+        self, project_ids: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """Every project's post at a glance — the Legate's roster.
+
+        Starts from ``project_officers`` so a VACANT post is still a row: the
+        answer to "does this project have an officer" is part of the roster,
+        not an absence the caller has to infer. ``project_ids=None`` means the
+        caller is an admin whose visibility set was not materialized.
+
+        Deliberately a plain read. The per-project card runs
+        ``get_or_create_project_officer``; fanning that across a user's
+        projects would commission posts as a side effect of looking.
+        """
+        from services.officer_admission import _TERMINAL_STATUSES_SQL
+
+        ids = [UUID(str(pid)) for pid in project_ids] if project_ids else None
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT po.project_id,
+                       p.name AS project_name,
+                       po.thread_id,
+                       t.status AS thread_status,
+                       t.metadata,
+                       (SELECT MIN(w.fire_at)
+                          FROM session_wake_events w
+                         WHERE w.thread_id = po.thread_id
+                           AND w.source = 'timer'
+                           AND w.state = 'pending') AS next_wake_at,
+                       (SELECT COUNT(*)
+                          FROM session_wake_events w
+                         WHERE w.thread_id = po.thread_id
+                           AND w.state = 'pending') AS pending_events,
+                       (SELECT COUNT(*)
+                          FROM jobs j
+                         WHERE j.project_id = po.project_id
+                           AND j.status NOT IN {_TERMINAL_STATUSES_SQL})
+                           AS in_flight_jobs,
+                       (SELECT MAX(m.created_at)
+                          FROM thread_messages m
+                         WHERE m.thread_id = po.thread_id
+                           AND m.role IN ('ai', 'tool')) AS last_agent_activity
+                  FROM project_officers po
+                  JOIN projects p ON p.id = po.project_id
+                  LEFT JOIN threads t ON t.id = po.thread_id
+                 WHERE ($1::uuid[] IS NULL OR po.project_id = ANY($1::uuid[]))
+                 ORDER BY p.name
+                """,
+                ids,
+            )
+        return [dict(row) for row in rows]
+
     async def get_pending_officer_timer(
         self, thread_id: str
     ) -> Optional[Dict[str, Any]]:

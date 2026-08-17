@@ -3001,12 +3001,16 @@ def format_created_thread(result: dict[str, Any], config_name: str, title: str) 
 
 
 def format_persistent_thread_messages(
-    data: dict[str, Any], full_content: bool = False
+    data: dict[str, Any], full_content: bool = False, tail: bool = False
 ) -> str:
     """Format persistent thread message history.
 
     Content is truncated to a 500-char preview per message by default; pass
     ``full_content=True`` to emit the complete body of each message.
+
+    ``tail=True`` labels the window as the END of the log and drops the
+    offset-paging footer: the reader already holds the newest messages, and
+    "use offset=N" would send them walking forward from the beginning.
     """
     thread_id = data.get("thread_id", "?")
     messages = data.get("messages", [])
@@ -3015,7 +3019,16 @@ def format_persistent_thread_messages(
     if not messages:
         return f"No messages found for thread {thread_id}."
 
-    lines = [f"Thread {thread_id} — showing {len(messages)} of {total} message(s):\n"]
+    if tail:
+        header = (
+            f"Thread {thread_id} — newest {len(messages)} of {total} message(s), "
+            "oldest first within this window:\n"
+        )
+    else:
+        header = (
+            f"Thread {thread_id} — showing {len(messages)} of {total} message(s):\n"
+        )
+    lines = [header]
     for m in messages:
         turn = m.get("turn_number", "?")
         role = m.get("role", "?")
@@ -3039,7 +3052,10 @@ def format_persistent_thread_messages(
         lines.append("")
 
     if len(messages) < total:
-        lines.append(f"... more messages available (use offset={len(messages)})")
+        if tail:
+            lines.append(f"... {total - len(messages)} earlier message(s) not shown.")
+        else:
+            lines.append(f"... more messages available (use offset={len(messages)})")
 
     return "\n".join(lines)
 
@@ -3072,3 +3088,188 @@ def format_thread_action_result(
         lines.append(f"{key}: {value}")
 
     return "\n".join(lines)
+
+
+# =============================================================================
+# Officer Formatters (the Legate's side — officer_legate_channel.md)
+# =============================================================================
+
+
+def _officer_held_label(held: Any) -> str | None:
+    """Render a hold as HELD — <kind>, or None when he is free."""
+    if not isinstance(held, dict) or not held:
+        return None
+    kind = held.get("kind") or ("conference" if held.get("thread_id") else "hold")
+    return f"HELD — {kind}"
+
+
+def format_officer_roster(data: dict[str, Any]) -> str:
+    """Every post the caller can see, one block each."""
+    officers = data.get("officers") or []
+    if not officers:
+        return (
+            "No officer posts on any project you can see. Commission one from "
+            "the project's Centurion tab in the cockpit."
+        )
+
+    lines = [f"Officers — {data.get('total', len(officers))} post(s):\n"]
+    for row in officers:
+        name = row.get("project_name") or "(unnamed project)"
+        held = _officer_held_label(row.get("held"))
+        if not row.get("commissioned"):
+            lines.append(f"  {name} [vacant] — {row.get('project_id')}")
+            lines.append("")
+            continue
+        state = held or "commissioned"
+        wake = row.get("next_wake_at")
+        headline = f"  {name} [{state}]"
+        if wake and not held:
+            headline += f" — next wake {wake}"
+        lines.append(headline)
+        lines.append(f"    Project {row.get('project_id')}")
+        detail = [
+            f"thread {_short_id(row.get('thread_id'))}",
+            str(row.get("model") or "model ?"),
+            "auto-pull on" if row.get("auto_pull") else "auto-pull off",
+        ]
+        lines.append(f"    {' | '.join(detail)}")
+        counts = [
+            f"{int(row.get('in_flight_jobs') or 0)} job(s) in flight",
+            f"{int(row.get('pending_events') or 0)} event(s) pending on him",
+            f"pages today {int(row.get('pages_today') or 0)}",
+            f"digest {int(row.get('digest_waiting') or 0)}",
+        ]
+        lines.append(f"    {' | '.join(counts)}")
+        if row.get("last_activity_at"):
+            lines.append(f"    Last acted {row['last_activity_at']}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def format_officer_post(
+    data: dict[str, Any],
+    project_name: str | None = None,
+    recent: dict[str, Any] | None = None,
+) -> str:
+    """One project's post in full, optionally with the tail of his log."""
+    officer = data.get("officer") or {}
+    label = project_name or data.get("project_id") or "project"
+    if not data.get("commissioned"):
+        lines = [f"Officer — {label}: the post is VACANT."]
+        while_vacant = data.get("while_vacant") or {}
+        if while_vacant.get("entries"):
+            lines.append(
+                f"  {len(while_vacant['entries'])} item(s) waiting in the "
+                "while-vacant ledger."
+            )
+        lines.append("  Commission one from the project's Centurion tab.")
+        return "\n".join(lines)
+
+    held = _officer_held_label(data.get("held") or officer.get("hold"))
+    lines = [
+        f"Officer — {label}",
+        f"Status: commissioned ({officer.get('status') or '?'})"
+        + (f" | {held}" if held else ""),
+        f"Thread: {officer.get('thread_id')}"
+        + (f" — {officer['title']}" if officer.get("title") else ""),
+    ]
+    brain = officer.get("model") or "?"
+    if officer.get("reasoning_level"):
+        brain += f" (reasoning {officer['reasoning_level']})"
+    lines.append(f"Brain: {brain}")
+    lines.append(
+        f"Next wake: {data.get('next_wake_at') or 'not scheduled'} | "
+        f"Pending events: {int(data.get('pending_events') or 0)}"
+    )
+    pages = data.get("pages_today") or {}
+    backlog = data.get("backlog") or {}
+    lines.append(
+        f"Pages today: {pages.get('used', 0)}/{pages.get('budget', '?')} | "
+        f"Backlog auto-pull: {'on' if backlog.get('auto_pull') else 'off'}"
+    )
+    spend = data.get("spend_today") or {}
+    if spend.get("tokens") is not None:
+        ceiling = spend.get("ceiling")
+        budget = f"{int(ceiling):,}" if ceiling else "no ceiling"
+        lines.append(f"Spend today: {int(spend['tokens']):,} / {budget} tokens")
+    if data.get("conference"):
+        lines.append(f"Conference open: {data['conference'].get('thread_id')}")
+
+    kit = data.get("kit") or {}
+    if kit:
+        lines.append("Kit:")
+        for slot, spec in kit.items():
+            entry = spec if isinstance(spec, dict) else {}
+            line = (
+                f"  - {slot}: {entry.get('in_flight', 0)}/{entry.get('count', '?')} "
+                "in flight"
+            )
+            if "ready_depth" in entry:
+                line += f" | ready {entry['ready_depth']}"
+                if entry.get("below_floor"):
+                    line += " — BELOW FLOOR"
+            lines.append(line)
+
+    digest = data.get("digest") or []
+    if digest:
+        lines.append(f"Digest ({len(digest)} waiting):")
+        for item in digest[-5:]:
+            subject = item.get("subject") or ""
+            message = (item.get("message") or "").replace("\n", " ")
+            stamp = item.get("at") or ""
+            lines.append(f"  - {stamp} {subject}: {message}"[:400])
+
+    if recent and recent.get("messages"):
+        lines.append("")
+        lines.append(_officer_recent_lines(recent))
+    return "\n".join(lines)
+
+
+def _officer_recent_lines(recent: dict[str, Any]) -> str:
+    """His last few turns: what woke him, what he did, how long he slept."""
+    lines = ["Recent log (oldest first):"]
+    for message in recent.get("messages") or []:
+        role = message.get("role")
+        stamp = str(message.get("created_at") or "")[:16]
+        content = (message.get("content") or "").strip()
+        if role == "event":
+            headline = content.split("\n", 1)[0]
+            lines.append(f"  {stamp} [wake] {headline[:160]}")
+        elif role == "ai":
+            calls = message.get("tool_calls")
+            names = (
+                [tc.get("name", "?") for tc in calls if isinstance(tc, dict)]
+                if isinstance(calls, list)
+                else []
+            )
+            if names:
+                lines.append(f"  {stamp} [acted] {', '.join(names)}")
+            elif content:
+                lines.append(f"  {stamp} [said] {content.splitlines()[0][:160]}")
+    return "\n".join(lines)
+
+
+def format_officer_note_result(data: dict[str, Any]) -> str:
+    """State how a note landed. 'Sent' is not an outcome here."""
+    delivered = data.get("delivered")
+    thread_id = data.get("thread_id")
+    if delivered == "live":
+        return (
+            f"Note delivered to his input queue (thread {_short_id(thread_id)}). "
+            "He reads it at his next turn — anything on the input queue wakes "
+            "him before his timer."
+        )
+    if delivered == "held":
+        held = _officer_held_label(data.get("held")) or "HELD"
+        blocker = held.replace("HELD — ", "")
+        return (
+            f"Note QUEUED behind a {blocker} hold (thread "
+            f"{_short_id(thread_id)}). He reads it when the hold lifts; "
+            "nothing else delivers it in the meantime."
+        )
+    wake = data.get("next_wake_at")
+    when = f" at {wake}" if wake else " at his next wake"
+    return (
+        f"Note queued durably (thread {_short_id(thread_id)}) — he was not "
+        f"live. He reads it{when}."
+    )

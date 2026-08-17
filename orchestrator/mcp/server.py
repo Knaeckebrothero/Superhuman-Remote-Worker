@@ -7,6 +7,7 @@ via the Model Context Protocol using FastMCP.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from datetime import datetime, timezone
 import functools
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
@@ -205,7 +206,10 @@ def _format_action_error(action: str, target: str, error: Exception) -> str:
 # caller-aware get_stuck_jobs threshold, liveness-backed progress output.
 # "10": officer_message_routing M3 — reply_to_job_message,
 # escalate_job_message, acknowledge_job_message (officer inbox actions).
-MCP_TOOL_SCHEMA_REVISION = "10"
+# "11": officer_legate_channel — list_officers, get_project_officer,
+# send_officer_note (the Legate's side), plus newest_first on
+# get_persistent_thread_messages.
+MCP_TOOL_SCHEMA_REVISION = "11"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 
@@ -2058,6 +2062,99 @@ async def deny_sudo_request(
 
 
 # =============================================================================
+# Officers — the Legate's side (docs/features/officer_legate_channel.md)
+# =============================================================================
+
+
+@mcp_tool
+async def list_officers() -> str:
+    """List every project officer (centurion) you can see, vacant posts included.
+
+    The roster answers "which of my projects has an officer, and is anything
+    waiting on him" in one call: commissioned / vacant / held, when he next
+    wakes, jobs in flight, events pending on him, pages he sent today.
+
+    Returns:
+        One block per post, or a note that no project you can see has one.
+    """
+    client = _get_client()
+    try:
+        data = await client.list_officers()
+    except Exception as e:
+        return _format_action_error("list_officers", "N/A", e)
+    return fmt.format_officer_roster(data)
+
+
+@mcp_tool
+async def get_project_officer(project_id: str, recent: int = 10) -> str:
+    """Get one project's officer: his post, his capacity, and his recent log.
+
+    Reads the post card (commission state, hold, kit utilization with pool
+    depth, next wake, page budget, digest ring, open conference) and, when the
+    post is filled, the tail of his session log — so you can see what he has
+    actually been doing, not only what he is configured to do.
+
+    Args:
+        project_id: Project UUID
+        recent: How many trailing log messages to include (0 disables)
+
+    Returns:
+        The post as a briefing, with a recent-log section when available.
+    """
+    client = _get_client()
+    try:
+        post = await client.get_project_officer(project_id)
+    except Exception as e:
+        return _format_action_error("get_project_officer", project_id, e)
+
+    thread_id = (post.get("officer") or {}).get("thread_id")
+    tail = None
+    footnote = None
+    if post.get("commissioned") and thread_id and recent > 0:
+        try:
+            tail = await client.get_persistent_thread_messages(
+                thread_id,
+                limit=max(2, min(int(recent), 100)),
+                before=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception as e:
+            # His post is the answer; the log is the bonus. Say which half is
+            # missing instead of failing the whole read.
+            footnote = f"(recent log unavailable: {type(e).__name__})"
+    rendered = fmt.format_officer_post(post, recent=tail)
+    return f"{rendered}\n{footnote}" if footnote else rendered
+
+
+@mcp_tool
+async def send_officer_note(project_id: str, message: str) -> str:
+    """Send the project's officer a one-way note from the Legate.
+
+    MUTATION: the note reaches a running agent. Use it to give direction,
+    answer something he paged about, or redirect his backlog — he treats a
+    Legate note as top authority. It is stamped with who sent it, so a note
+    you compose does not read as words the user typed.
+
+    There is no reply channel here: his answer shows up in his log, in his
+    digest, or as a page. The result states which delivery happened — reaching
+    his input queue, queuing durably for his next wake, or waiting behind a
+    hold — so never report a note as read until it actually is.
+
+    Args:
+        project_id: Project UUID whose officer should receive the note
+        message: The direction itself (max 8000 chars)
+
+    Returns:
+        How the note landed, including when he is expected to read it.
+    """
+    client = _get_client()
+    try:
+        result = await client.send_officer_note(project_id, message)
+    except Exception as e:
+        return _format_action_error("send_officer_note", project_id, e)
+    return fmt.format_officer_note_result(result)
+
+
+# =============================================================================
 # Persistent Session/Thread Management
 # =============================================================================
 
@@ -2225,6 +2322,7 @@ async def get_persistent_thread_messages(
     limit: int = 50,
     offset: int = 0,
     full_content: bool = False,
+    newest_first: bool = False,
 ) -> str:
     """Get message history for a persistent thread session.
 
@@ -2234,10 +2332,14 @@ async def get_persistent_thread_messages(
     Args:
         thread_id: Thread UUID to get messages for
         limit: Maximum messages to return (1-500, default 50)
-        offset: Pagination offset (default 0)
+        offset: Pagination offset (default 0), ignored when newest_first
         full_content: If True, emit each message's content in full instead of
             the default 500-char preview. Pair with a small ``limit`` — full
             bodies can be very large.
+        newest_first: Read the END of the log — the newest ``limit`` messages,
+            still printed oldest-first within that window. Use this on long
+            sessions (an officer runs hundreds of turns); paging ``offset``
+            from zero to reach the current state is the slow way there.
 
     Returns:
         Formatted message history
@@ -2248,10 +2350,19 @@ async def get_persistent_thread_messages(
         limit = 500
 
     client = _get_client()
-    data = await client.get_persistent_thread_messages(
-        thread_id, limit=limit, offset=offset
+    if newest_first:
+        data = await client.get_persistent_thread_messages(
+            thread_id,
+            limit=limit,
+            before=datetime.now(timezone.utc).isoformat(),
+        )
+    else:
+        data = await client.get_persistent_thread_messages(
+            thread_id, limit=limit, offset=offset
+        )
+    return fmt.format_persistent_thread_messages(
+        data, full_content=full_content, tail=newest_first
     )
-    return fmt.format_persistent_thread_messages(data, full_content=full_content)
 
 
 @mcp_tool

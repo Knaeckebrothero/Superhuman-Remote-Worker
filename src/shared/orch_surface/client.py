@@ -2956,6 +2956,36 @@ class AsyncCockpitClient:
         return resp.json()
 
     # =========================================================================
+    # Officers (the Legate's side — docs/features/officer_legate_channel.md)
+    # =========================================================================
+
+    async def list_officers(self) -> dict[str, Any]:
+        """Every post the caller can see, vacant ones included."""
+        resp = await self._client.get("/api/officers")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_project_officer(self, project_id: str) -> dict[str, Any]:
+        """One project's post: commission state, kit, wake, pages, digest."""
+        resp = await self._client.get(f"/api/projects/{project_id}/officer")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def send_officer_note(self, project_id: str, message: str) -> dict[str, Any]:
+        """Send the project's officer a one-way Legate note.
+
+        The response says how it landed (``live`` / ``queued`` / ``held``) —
+        callers must surface that rather than reporting a bare success.
+        """
+        resp = await self._mutation_request(
+            "POST",
+            f"/api/projects/{project_id}/officer/note",
+            json={"message": message},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # =========================================================================
     # Persistent Threads
     # =========================================================================
 
@@ -3086,15 +3116,27 @@ class AsyncCockpitClient:
         thread_id: str,
         limit: int = 200,
         offset: int = 0,
+        before: str | None = None,
     ) -> dict[str, Any]:
         """Get message history for a persistent thread.
+
+        ``before`` (ISO-8601) switches the endpoint to its backfill cursor —
+        the NEWEST ``limit`` messages at or before that instant. Reaching the
+        end of a long log by paging ``offset`` from zero is not a read
+        strategy; the two are mutually exclusive server-side, so a cursor read
+        sends no offset at all.
 
         Returns:
             Dict with ``messages``, ``total``, and ``thread_id``.
         """
+        params: dict[str, Any] = {"limit": limit}
+        if before:
+            params["before"] = before
+        else:
+            params["offset"] = offset
         resp = await self._client.get(
             f"/api/persistent/threads/{thread_id}/messages",
-            params={"limit": limit, "offset": offset},
+            params=params,
         )
         resp.raise_for_status()
         return resp.json()
