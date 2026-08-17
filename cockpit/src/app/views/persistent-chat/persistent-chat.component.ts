@@ -1945,7 +1945,7 @@ export function clearDraft(threadId: string | null): void {
       <div class="composer-wrap">
         <!-- Live token telemetry (usage.updated frames): latest context fill
              + cumulative output/reasoning for the running turn. -->
-        @if (chat.usage(); as u) {
+        @if (chat.currentUsage(); as u) {
           <div class="usage-panel" aria-hidden="true"
                [class.lvl-warn]="usageCtxLevel() === 'warn'"
                [class.lvl-danger]="usageCtxLevel() === 'danger'">
@@ -2402,7 +2402,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      *  of a window the agent never lets fill. Falls back to the model window if
      *  the agent hasn't reported the threshold yet (older backend). */
     readonly usageCtxPct = computed(() => {
-        const u = this.chat.usage();
+        const u = this.chat.currentUsage();
         if (!u || u.inputTokens == null) return null;
         const denom = u.compactionThresholdTokens || u.ctxLimitTokens;
         if (!denom) return null;
