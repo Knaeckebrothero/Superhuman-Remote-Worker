@@ -5,7 +5,7 @@ tags:
   - architecture
   - api
   - agents
-status: open
+status: fixed
 priority: P1
 created: 2026-08-17
 aliases:
@@ -20,7 +20,18 @@ related:
 
 # Experts are one catalogue and two selection paths
 
-**Status:** OPEN. Diagnosed 2026-08-17 against live dev (`sha-50af6e9`).
+**Status:** **FIXED on develop `916d54d4` (2026-08-17), not pushed, not deployed, and NOT
+live-verified.** Diagnosed 2026-08-17 against live dev (`sha-50af6e9`).
+
+One selector — `expert: str | None` — now spans the agent tool, both MCP tools and both REST
+endpoints, backed by a single resolver (`src/shared/expert_reference.py::resolve_expert_selection`).
+A bundled slug resolves to `(config_name=slug, expert_id=None)` and is its own base; a DB UUID
+resolves to `(worker_base, uuid)`. `config_name`/`expert_id` survive as aliases: a repeated
+reference is accepted, a contradicting one refused. An unknown `expert=` is now refused at
+creation naming `list_experts`, rather than failing at dispatch. 28 new tests.
+
+**Owed:** dispatch a real job with `expert="developer"` on dev and confirm the worker binds a
+shell. Everything below the fix line is local-test evidence only.
 
 An expert can be **discovered** uniformly and **inspected** uniformly, and then cannot be
 **selected** uniformly. Callers must know which of two mutually-exclusive parameters an expert
@@ -73,9 +84,14 @@ Four separate problems in that seam:
    (`:162` — "Base agent config (default: \"worker_base\")"). Compare the parameter
    immediately below it, which *does* point at its catalogue: "Use the `list_models` tool to
    discover available model IDs." Models are discoverable; worker profiles are not.
-4. **The refusal fires on the correct call.** Passing a bundled slug together with any DB
-   default is an error, so the safe-looking call is the one that specifies nothing — which
-   silently lands on the application default.
+4. **~~The refusal fires on the correct call.~~ — WRONG, corrected 2026-08-17.** An earlier
+   revision claimed that naming a bundled slug collided with the auto-injected application
+   default and tripped the refusal, making "specify nothing" the only safe call. It does not:
+   `should_resolve_default` (`orchestrator/main.py:12596-12602`, pre-change) was already gated
+   on `config_name == "worker_base"`, so an explicit slug suppressed the default and the
+   refusal could only fire if the caller *also* passed `expert_id`. The barrier was therefore
+   purely vocabulary and discoverability — the officer never avoided a collision, it simply
+   never knew the parameter existed. Verified by reading `916d54d4^`.
 
 ## Observed consequence
 
