@@ -84,6 +84,6 @@ These `*.reference.*` files are kept as historical mockup snapshots — what the
 
 ## Cross-references
 
-- Engineering docs (how to add/modify themes): [`cockpit/src/styles/README.md`](../../cockpit/src/styles/README.md)
+- Engineering docs (how to add/modify themes): [`cockpit/src/styles/README.md`](../../../../cockpit/src/styles/README.md)
 - Theme service (preference resolution + legacy migration): `cockpit/src/app/core/services/theme.service.ts`
 - Theme picker UI: `cockpit/src/app/ui/theme-toggle/theme-toggle.component.ts`

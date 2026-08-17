@@ -224,4 +224,9 @@ Admin access for emergency operations should require logging into the Rancher UI
 - `docs/deployment_checklist.md` — Original deployment vision
 - `docs/issues/local_e2e_testing.md` — Local testing gaps (workspace/VM provisioning)
 - `deployment-local/` — Single-cluster Kustomize overlay (prototype)
-- `deployment/deploy.sh` — Image tag update script for Fleet deployments
+
+`deployment/deploy.sh` used to be listed here as the image-tag update script. It was deleted on
+2026-08-17: it rewrote tags in the `deployment/legacy/` manifests, which the Helm chart replaced.
+Image tags are now stamped into `deployment/fleet.yaml`, `deployment/values-experimental.yaml` and
+`deployment-vms/srw-vm-controller/fleet.yaml` by the deploy job at the end of
+`.github/workflows/develop.yml`, which commits them back on each push to `develop`.

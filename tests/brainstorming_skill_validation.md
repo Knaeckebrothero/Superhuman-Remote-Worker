@@ -10,7 +10,7 @@ Does the `brainstorming` skill's diversity/quality benefit hold for **non-coding
 open-ended decisions — research framing, writing angles, analysis-method choice —
 or only for the narrow domains the literature actually measured?
 
-This is **open-question #1** from `researches/brainstorming.report.md`. The skill
+This is **open-question #1** from `docs/research/skills/brainstorming.report.md`. The skill
 ships as a **Tier-1 *universal* core** skill (`docs/features/default_skill_roster.md`),
 but that universality is currently a *reasoned design bet*: every strong empirical
 source (CreativeDC = intro-Python task generation; SCAMPER = engineering design;
@@ -18,7 +18,7 @@ the CHI'25 RCT = an alternate-uses creativity test) is narrow-domain. For
 research/writing/analysis the value is plausible-but-indirect, **not measured**.
 
 (Same flavour as the `systematic-debugging` transfer question — see
-`researches/systematic-debugging.md` objective 3. A shared eval harness could cover
+`docs/research/skills/systematic-debugging.md` objective 3. A shared eval harness could cover
 both.)
 
 ## Hypothesis
@@ -88,7 +88,7 @@ over pure LLM-rated diversity for the primary metric.
 ## Related
 
 - `config/skills/brainstorming/SKILL.md` — the skill under test.
-- `researches/brainstorming.report.md` — evidence base (open-question #1, findings 1/7).
+- `docs/research/skills/brainstorming.report.md` — evidence base (open-question #1, findings 1/7).
 - `docs/features/default_skill_roster.md` — the universal-core claim being tested.
-- `researches/systematic-debugging.md` — same transfer question; candidate shared harness.
+- `docs/research/skills/systematic-debugging.md` — same transfer question; candidate shared harness.
 - `eval/`, `tests/test_memory_eval_harness.py` — existing eval infra to model on.

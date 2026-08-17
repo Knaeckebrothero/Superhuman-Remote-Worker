@@ -1,5 +1,22 @@
 # **Architecting Cross-Model Subagent Delegation Interfaces**
 
+> External deep-research report on cross-model delegation-tool design, run against
+> our model fleet. **No prompt file was filed for this one**, so it breaks the
+> `X.md` + `X.report.md` pairing the rest of this folder follows. Moved here from
+> the repo root 2026-08-17.
+>
+> **Read with the caveat that is already on record: this report contains
+> known-synthetic specifics.** `docs/done/loop_subagent_forensics.md` §2 flags the
+> DeepSeek "128 parallel calls" and Kimi "300 subagents" figures as fabricated —
+> "its directional advice is fine, its numbers are not." Treat every concrete
+> number here as unsourced unless you can confirm it independently.
+>
+> What was actually adopted from it, and why, is recorded in
+> `docs/issues/delegation_light_mode_missing.md` §"External research
+> reconciliation (2026-07-02)" — most consequentially the flip from a batch
+> `tasks: list[...]` shape to iterative parallel invocation. That reconciliation,
+> not this report, is the decision record.
+
 The orchestration of multi-tier artificial intelligence agent systems increasingly relies on decoupled, model-agnostic architectures. Within these systems, a parent agent must seamlessly delegate well-scoped, ephemeral subtasks to disposable subagents. This "fire-and-collect" paradigm—where subagents execute bounded ReAct loops, utilize a subset of inherited tools, and return finalized text results without requiring human review or long-lived lifecycles—demands a highly robust interaction protocol. When the orchestration layer must operate across a heterogeneous fleet of frontier models, the interface design of the delegation tool becomes the single most critical point of failure or success.  
 The primary challenge lies in establishing a universal tool schema and invocation pattern exposed interchangeably to models with vastly different underlying architectures, parsing engines, and training distributions. The target fleet includes MiniMax M3, Zhipu GLM-5.2, OpenAI GPT-5.5, Anthropic Claude Opus, Google Gemini, Moonshot Kimi K2.5, Qwen, and DeepSeek. The delegation interface must reliably coerce accurate tool selection, precise argument formatting, and optimal parallel concurrency from all of these model families simultaneously. An interface optimized solely for OpenAI's function-calling implementation will inevitably degrade when exposed to the XML-translation layers of MiniMax or the strict role-alternation requirements of DeepSeek.  
 This report provides an exhaustive analysis of subagent delegation interfaces, synthesizing data from a comprehensive survey of production-grade agent harnesses. It delivers actionable, cross-model recommendations for invocation patterns, semantic tool naming, argument schema design, and behavioral steering mechanisms. The analysis culminates in a concrete, cross-model compatible tool definition designed to maximize resilience across the modern frontier model ecosystem.

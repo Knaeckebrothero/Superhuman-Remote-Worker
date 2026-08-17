@@ -4,11 +4,12 @@ The first instance of the [skill research template](./template.md). This is the
 exact prompt that was run to produce the evidence base for the `verify-before-done`
 skill.
 
-- **Status:** report returned → [`../Verify Before Done Skill Research.md`](../Verify%20Before%20Done%20Skill%20Research.md).
+- **Status:** report returned → [`verify-before-done.report.md`](./verify-before-done.report.md)
+  (filed here 2026-08-17; it had sat in the repo root since it was returned).
   Skill authored + shipped at `config/skills/verify-before-done/SKILL.md` (bound
   `phase:tactical` on the worker experts). Enforcement follow-ups (read-gate,
   trace-gate) are tracked under "Enforcement model & follow-ups" in
-  [`../docs/features/default_skill_roster.md`](../docs/features/default_skill_roster.md).
+  [`../docs/features/default_skill_roster.md`](../../features/default_skill_roster.md).
 - **Roster:** Tier-1 universal core, `docs/features/default_skill_roster.md`.
 
 ## The prompt

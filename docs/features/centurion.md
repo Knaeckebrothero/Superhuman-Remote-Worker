@@ -37,7 +37,7 @@ related:
 
 > Every project can have a **Centurion**: one persistent agent that never terminates. It holds a *responsibility* instead of a goal: it owns the project's backlog, schedules and supervises worker jobs, notices when things wedge, asks the user or makes recorded assumptions, and pages the user when it genuinely needs them. The user is the **Legate** — sets intent, makes the calls only a human can make. The centurion of the user's **default project** bears the title **Primus Pilus** — first among centurions; today a designation, later a command (§9).
 
-**Status:** Design v2 (research-hardened). Filed 2026-07-28 from the consolidated officer notes (`Officers.md`); hardened the same day by a five-agent research fan-out — three codebase planners/verifiers, two web researchers (prior art: Letta sleep-time agents, LangGraph ambient agents, Devin/Cursor/Factory, OpenClaw heartbeat, SRE/PagerDuty, Vending-Bench and governance-decay literature). No core decision was refuted; the research added a guardrail layer and corrected several mechanism-level assumptions. Interaction surface (the conference model, §2) settled 2026-07-29. Anchored build plan: [[centurion_implementation_notes]].
+**Status:** Design v2 (research-hardened). Filed 2026-07-28 from the consolidated officer notes (`docs/features/officers.md`, in the repo root until 2026-08-17); hardened the same day by a five-agent research fan-out — three codebase planners/verifiers, two web researchers (prior art: Letta sleep-time agents, LangGraph ambient agents, Devin/Cursor/Factory, OpenClaw heartbeat, SRE/PagerDuty, Vending-Bench and governance-decay literature). No core decision was refuted; the research added a guardrail layer and corrected several mechanism-level assumptions. Interaction surface (the conference model, §2) settled 2026-07-29. Anchored build plan: [[centurion_implementation_notes]].
 **Scope:** v1 = exactly one centurion on one project, full backlog + job-creation authority, sleep-loop architecture. The wider legion (Tesserarius/Optio as separate agents, centuries, model tiering) and the Primus Pilus command extension are explicitly parked — see [Deferred](#9-deferred--the-legion).
 
 **2026-08-14 operating-surface follow-on (proposed):** [[officer_knowledge_plane]] makes
@@ -401,7 +401,7 @@ Parked deliberately, revisited when scale demands (the notes' own staffing rule 
 
 ## Sources
 
-- `Officers.md` (repo root) — consolidated officer notes: concept, legion roles, staffing rules, model tiering, the four-officer-types principle.
+- `docs/features/officers.md` — consolidated officer notes: concept, legion roles, staffing rules, model tiering, the four-officer-types principle.
 - [[centurion_implementation_notes]] — the anchored build plan distilled from the code-planner research (S1–S8 steps, schema sketches, risks, blast radius).
 - `docs/features/agent_lifecycle.md` — persistent/worker two-mode architecture; delegation-tools decision.
 - `docs/features/headless_persistent_sessions.md` — shipped substrate: transport-independent loop, event log, DB permission gates, notification fan-out + magic links, attention sleep (officer exemptions per §4).

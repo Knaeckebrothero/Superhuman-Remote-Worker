@@ -16,7 +16,7 @@ to produce the evidence base for the `code-review` (giving) skill.
   the `critic` exists to review but had **no codified review methodology**.
 - **Scope:** GIVING a review (reviewing someone else's work). The mirror skill,
   **receiving-code-review**, is a separate Tier-3 entry — keep them distinct.
-- **Roster:** Tier-2 opt-in, [`../docs/features/default_skill_roster.md`](../docs/features/default_skill_roster.md)
+- **Roster:** Tier-2 opt-in, [`../docs/features/default_skill_roster.md`](../../features/default_skill_roster.md)
   (this is open decision #1 in that doc — TDD/code-review Tier-2-vs-3).
 - **Likely enforcement:** model-invoked (rides the catalog) **plus** a candidate
   `phase:tactical` binding on the `critic` expert (reviewing is its whole job).

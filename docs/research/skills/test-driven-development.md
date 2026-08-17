@@ -28,7 +28,7 @@ to produce the evidence base for the `test-driven-development` (TDD) skill.
   implementation, then minimal code to pass, then refactor — in tight, small
   increments. NOT end-of-task verification (that's `verify-before-done`), NOT
   diagnosing a failure (that's `systematic-debugging`).
-- **Roster:** Tier-2 opt-in, [`../docs/features/default_skill_roster.md`](../docs/features/default_skill_roster.md)
+- **Roster:** Tier-2 opt-in, [`../docs/features/default_skill_roster.md`](../../features/default_skill_roster.md)
   (this is open decision #1 — TDD/code-review Tier-2-vs-3; and TDD's roster home is
   the `developer` expert / dev bundle).
 - **THREE cruxes the research must settle:**
