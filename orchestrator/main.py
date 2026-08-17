@@ -54478,7 +54478,7 @@ async def _reindex_project_kb(
         )
         return {"status": "no-embedding-service"}
     store = KnowledgeStore(db=vector_db, embedding_service=svc)
-    return await reindex_kb(
+    result = await reindex_kb(
         gitea_client=repo_client,
         store=store,
         embedding_service=svc,
@@ -54487,6 +54487,16 @@ async def _reindex_project_kb(
         branch=branch or "main",
         force_full=force_full,
     )
+    if result.get("status") in {"completed", "up-to-date"}:
+        # A successful rebuild is also the recovery path for a canonical Git
+        # mutation whose direct projection failed.  The scheduled sweep
+        # already settles this ledger; manual/post-write reindex must expose
+        # the same truth rather than leaving an eligibility-blocking intent.
+        result = dict(result)
+        result[
+            "projection_intents_synced"
+        ] = await postgres_db.mark_knowledge_projections_synced(project_id)
+    return result
 
 
 @app.post("/api/projects/{project_id}/knowledge/reindex")
@@ -54679,22 +54689,80 @@ async def update_knowledge_note(
                 },
             )
 
+        required_metadata = []
+        if body.status:
+            required_metadata.append("canonical_status")
+        if body.add_tags or body.remove_tags:
+            required_metadata.extend(("canonical_tags", "canonical_ready_at"))
+        if materialization.get("canonical_metadata_complete") is not True or any(
+            field not in materialization for field in required_metadata
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "pending_sync",
+                    "reason": materialization.get("reason")
+                    or "canonical-metadata-unavailable",
+                    "retry_state": materialization.get("retry_state"),
+                    "intent_id": materialization.get("intent_id"),
+                },
+            )
+
         async with vector_db.acquire() as conn:
             updates = []
             params: list[Any] = [project_id, note_id]
             idx = 3
 
             if body.status:
+                canonical_status = materialization["canonical_status"]
+                if canonical_status is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "status": "pending_sync",
+                            "reason": "canonical-status-unavailable",
+                            "retry_state": materialization.get("retry_state"),
+                            "intent_id": materialization.get("intent_id"),
+                        },
+                    )
                 updates.append(f"status = ${idx}")
-                params.append(materialization.get("canonical_status") or body.status)
+                params.append(str(canonical_status))
                 idx += 1
 
             if body.add_tags or body.remove_tags:
+                canonical_tags = materialization["canonical_tags"]
+                if not isinstance(canonical_tags, list):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "status": "pending_sync",
+                            "reason": "canonical-tags-invalid",
+                            "retry_state": materialization.get("retry_state"),
+                            "intent_id": materialization.get("intent_id"),
+                        },
+                    )
+                raw_ready_at = materialization["canonical_ready_at"]
+                if isinstance(raw_ready_at, datetime):
+                    canonical_ready_at = raw_ready_at
+                elif raw_ready_at is None:
+                    canonical_ready_at = None
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "status": "pending_sync",
+                            "reason": "canonical-ready-at-invalid",
+                            "retry_state": materialization.get("retry_state"),
+                            "intent_id": materialization.get("intent_id"),
+                        },
+                    )
+                if canonical_ready_at is not None and canonical_ready_at.tzinfo is None:
+                    canonical_ready_at = canonical_ready_at.replace(tzinfo=timezone.utc)
                 updates.append(f"tags = ${idx}::text[]")
-                params.append(materialization.get("canonical_tags") or [])
+                params.append([str(tag) for tag in canonical_tags])
                 idx += 1
                 updates.append(f"ready_at = ${idx}::timestamptz")
-                params.append(materialization.get("canonical_ready_at"))
+                params.append(canonical_ready_at)
                 idx += 1
 
             updates.append("modified_at = NOW()")
@@ -54716,7 +54784,7 @@ async def update_knowledge_note(
             try:
                 update_kwargs: dict[str, Any] = {}
                 if body.status:
-                    update_kwargs["status"] = body.status
+                    update_kwargs["status"] = str(materialization["canonical_status"])
                 if body.add_tags:
                     update_kwargs["add_tags"] = body.add_tags
                 if body.remove_tags:

@@ -6,7 +6,7 @@ tags:
   - knowledge
   - data-integrity
   - git
-status: done-local-undeployed
+status: done-deployed-live-residue-open
 priority: P1
 created: 2026-08-15
 aliases:
@@ -20,7 +20,9 @@ related:
 
 # KB materialization failure can report a ticket as ready or closed
 
-**Status:** DONE LOCALLY 2026-08-17; UNDEPLOYED — truthful-write blocker/K4 closed.
+**Status:** DEPLOYED 2026-08-17; FAILURE-TRUTH BOUNDARY LIVE-PASSED. BP-13's recovery
+residue is repaired locally and awaits its bounded main-dev rerun; truthful-write
+blocker/K4 remains closed.
 
 ## Problem
 
@@ -109,9 +111,23 @@ latest per-note state including pending-sync, failed, and projection-only observ
 - Real PostgreSQL Officer/routing/pagination suite: **97 passed** in **232.40 s**.
 - Cockpit Officer component: **64 passed** in **730 ms**.
 
-The bounded integration exercises the production renderer, repository selection, tree
-probe, base64 commit payload, conflict retry, and convergence service with a deterministic
-forge transport. A real remote forge was not mutated: the repository has no hermetic
-in-process forge fixture and this checkpoint explicitly forbids shared-cluster mutation.
-That remains rollout observation, not a locally claimed live gate. `auto_pull` stayed
-false and unexposed.
+The bounded integration above was subsequently deployed and exercised against a real
+disposable main-dev Gitea vault. The failure half passed: a retryable forge/configuration
+outage returned 409 `pending_sync`, wrote no READY tag or `ready_at` to pgvector, and a
+broken reindex did not invent state. Retry committed the canonical file exactly once and
+two reindexes preserved one stable generation.
+
+The full gate nevertheless failed. The REST metadata route passed the canonical ISO
+timestamp string to asyncpg's `timestamptz` codec, returned 500 after the Git commit, and
+left projection state failed until reindex/settlement. Code audit also found that an
+`already-canonical` retry omits exact canonical metadata while the route defaults missing
+tags/readiness to `[]`/NULL. Those live/retry residues are tracked separately in
+[[knowledge_metadata_retry_commits_then_projection_fails]]. See
+[[officer_correctness_live_gate_2026-08-17]] for evidence and cleanup. `auto_pull`
+remained false fleet-wide.
+
+The local BP-13 follow-up now returns typed canonical metadata, rereads complete truth
+when another retry won, rejects incomplete snapshots, makes executor disposition consume
+the same status snapshot, and settles canonical intents after successful direct reindex.
+The direct and sweeper-won paths pass against the real migrated pgvector schema. This is
+not yet a live-pass claim; see [[knowledge_metadata_retry_commits_then_projection_fails]].

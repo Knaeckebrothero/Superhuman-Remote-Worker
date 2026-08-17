@@ -5,7 +5,7 @@ tags:
   - backlog
   - notifications
   - liveness
-status: done-local-undeployed
+status: done-deployed-live-gated
 priority: P1
 created: 2026-08-15
 aliases:
@@ -18,7 +18,8 @@ related:
 
 # A failed backlog-floor wake consumes the six-hour debounce
 
-**Status:** DONE LOCALLY 2026-08-17; UNDEPLOYED. Audit finding **BP-10**.
+**Status:** SHIPPED AND DEPLOYED; MAIN-DEV LIVE GATE PASSED 2026-08-17. Audit
+finding **BP-10**.
 
 ## Problem
 
@@ -85,6 +86,11 @@ durably queued, delivered, and failed outcomes.
 - Real PostgreSQL Officer/routing/pagination suite: **97 passed** in **232.40 s**.
 - Cockpit Officer component: **64 passed** in **730 ms**.
 
-This closure is local and undeployed. No shared queue, notification channel, cluster, or
-Officer was mutated; no delivery/live gate is claimed. `auto_pull` remained false and
-unexposed.
+The local checkpoint above was subsequently deployed. The bounded main-dev gate in
+[[officer_correctness_live_gate_2026-08-17]] injected a fault after the outbox insert and
+proved rollback left `last_attempted_at` but no event, `last_queued_at`, or consumed policy
+debounce. Retry queued successfully; two concurrent floor attempts produced one durable
+event and one `policy_debounce`; exact delivery settlement updated the episode; and a
+queue/decommission race left no pending/sending event, active episode, or linked post.
+Only the disposable synthetic Officer was in scope, all state was removed, and
+`auto_pull` remained false fleet-wide.
