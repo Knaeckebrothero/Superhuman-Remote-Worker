@@ -303,6 +303,54 @@ class TestGetIndexedBlobShas:
 
 
 # =============================================================================
+# clear_note_stamps — batched invalidation for a resumable rebuild
+# =============================================================================
+
+
+class TestClearNoteStamps:
+    """Batching is the whole point, not an implementation detail.
+
+    ``knowledge_index`` carries an HNSW index plus two GIN indexes, so this
+    UPDATE costs ~9ms/row. Shipped as one statement it ran past the pool's 60s
+    ``command_timeout`` on a large KB and asyncpg cancelled it — with an
+    empty-message ``asyncio.TimeoutError``, so the caller's fallback logged
+    nothing useful and the rebuild silently stayed non-resumable.
+    """
+
+    @pytest.mark.asyncio
+    async def test_keeps_paging_until_a_short_batch(self):
+        store, mock_db, _ = _make_store()
+        kb = uuid.uuid4()
+        mock_db.fetch.side_effect = [
+            [{"id": uuid.uuid4()} for _ in range(200)],
+            [{"id": uuid.uuid4()} for _ in range(200)],
+            [{"id": uuid.uuid4()} for _ in range(37)],
+        ]
+
+        assert await store.clear_note_stamps(kb, batch_size=200) == 437
+        assert mock_db.fetch.await_count == 3
+        query, *params = mock_db.fetch.call_args[0]
+        assert "LIMIT $3" in query
+        assert params == [kb, None, 200]
+
+    @pytest.mark.asyncio
+    async def test_single_short_batch_is_one_statement(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [{"id": uuid.uuid4()}]
+        assert await store.clear_note_stamps(uuid.uuid4(), batch_size=200) == 1
+        assert mock_db.fetch.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_embedding_version_narrows_to_other_versions(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        assert await store.clear_note_stamps(uuid.uuid4(), embedding_version="v2") == 0
+        query, *params = mock_db.fetch.call_args[0]
+        assert "embedding_version IS DISTINCT FROM" in query
+        assert params[1] == "v2"
+
+
+# =============================================================================
 # KnowledgeChunk dataclass
 # =============================================================================
 

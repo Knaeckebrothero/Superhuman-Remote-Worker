@@ -774,8 +774,23 @@ async def _reindex_kb_unlocked(
     # which makes every subsequent run resume where this one stops.
     plan_full = full
     if full:
+        # Only a *changed* pipeline leaves stale rows behind. A KB that merely
+        # never finished has pipeline_version NULL, and its stamped notes are
+        # perfectly current — clearing those would throw away precisely the work
+        # this whole change exists to preserve, and on a large vault it is also
+        # the expensive case. So invalidate wholesale only for a real version
+        # change or an operator rebuild; otherwise sweep just the rows whose
+        # embedding version moved, which is normally none of them.
+        stale_pipeline = force_full or bool(
+            wm is not None
+            and wm.pipeline_version
+            and wm.pipeline_version != current_version
+        )
         try:
-            cleared = await store.clear_note_stamps(kb_id)
+            cleared = await store.clear_note_stamps(
+                kb_id,
+                embedding_version=None if stale_pipeline else embedding_stamp,
+            )
             await store.upsert_watermark(
                 kb_id=kb_id,
                 repo_name=source_label[:255],
@@ -790,8 +805,11 @@ async def _reindex_kb_unlocked(
             # Resumability is an optimization; correctness is not. If either
             # write fails, fall back to the old per-run semantics rather than
             # entering the loop with a work list that skips unstamped notes.
+            # %r, not %s: the first production failure here was an asyncpg
+            # command timeout, whose str() is empty — the log read "skipped ()"
+            # and named nothing at all.
             logger.warning(
-                "kb_reindex[%s]: rebuild invalidation skipped (%s) — "
+                "kb_reindex[%s]: rebuild invalidation skipped (%r) — "
                 "falling back to a non-resumable full pass",
                 kb_id,
                 exc,
@@ -799,8 +817,10 @@ async def _reindex_kb_unlocked(
         else:
             plan_full = False
             logger.info(
-                "kb_reindex[%s]: full rebuild — cleared %d note stamp(s)",
+                "kb_reindex[%s]: resumable rebuild (stale_pipeline=%s) — "
+                "cleared %d note stamp(s)",
                 kb_id,
+                stale_pipeline,
                 cleared,
             )
 
