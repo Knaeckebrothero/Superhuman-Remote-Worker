@@ -2,7 +2,7 @@
 
 No workspace, no DB: these functions operate on already-read note text so they
 are fully unit-testable and reusable against any OKF/markdown vault (the
-project KB, a `repository` datasource, this repo's own `docs/`). The thin
+project KB, a `repository` datasource, this repo's own design vault). The thin
 `kb_lint` / `kb_index` tools in ``knowledge_tools.py`` read files via the
 workspace backend and delegate here.
 

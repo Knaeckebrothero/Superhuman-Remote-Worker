@@ -64,10 +64,11 @@ Two rules that matter when adding notes:
   anywhere in the live vault collide, and one of them is then silently never indexed. If a
   name must repeat (a `README.md`, say), give the note an explicit `id:` in its frontmatter
   — that overrides the stem.
-- **A few files deliberately stay in `docs/` here.** `docs/generated/` is machine-written,
-  and `docs/security/endpoint_inventory.txt` + `docs/ci_self_hosted_runners.md` are policy
-  manifests that CI validates against the code — CI cannot read the private vault, so they
-  must live beside the code.
+- **`policy/` holds the two manifests CI validates against the code**
+  (`policy/endpoint_inventory.txt`, `policy/ci_self_hosted_runners.md`). CI cannot read the
+  private vault, so these live beside the code. The generated job-tool catalogue is written
+  by `scripts/generate-job-surface.py` straight into the vault
+  (`knowledge-base/knowledge/generated/`), so running it needs the vault cloned.
 - **The design trail from before 2026-08-17 is in this repository's git history**, under
   the old `docs/` path. `git log -- docs/…` and `git show <sha>:docs/…` work; the folder
   was removed going forward.

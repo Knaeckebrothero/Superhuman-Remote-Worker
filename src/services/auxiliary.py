@@ -573,7 +573,7 @@ class GenerateTitleTask(AuxTask):
     guard against the model answering the sample instead of naming it. Fed the
     after-turn sample (user message + assistant reply), so there is a completed
     exchange to summarise rather than a lone, bait-y opening prompt — the input
-    shape that produced deflection "titles". See docs/issues title-gen bug.
+    shape that produced deflection "titles". See vault issues/ title-gen bug.
     """
 
     def __init__(self, sample_text: str):

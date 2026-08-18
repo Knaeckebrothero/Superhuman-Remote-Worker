@@ -5271,7 +5271,7 @@ def create_audited_tool_node(
                 tool_context.export_instruction_read_receipts()
             )
 
-        # Finalization-decision mirror (journal-before-observe step 3, docs/
+        # Finalization-decision mirror (journal-before-observe step 3, vault
         # issues/job_finalization_decisions_held_only_in_process_memory.md):
         # the module dicts are populated only AFTER the orchestrator durably
         # committed the decision, so mirroring them into checkpointed state

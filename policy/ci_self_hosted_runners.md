@@ -158,7 +158,7 @@ ruff check scripts/ tests/
 `ci-policy.yml` is the hard gate and should be a **required status check** on
 both `develop` and `main`. It has no `paths:` filter on purpose — GitHub treats a
 required check that did not run as failed, see the "status-check footgun" section
-of `docs/branch_protection_setup.md`.
+of `knowledge-base/knowledge/branch_protection_setup.md`.
 
 ### Prove the guard fails
 

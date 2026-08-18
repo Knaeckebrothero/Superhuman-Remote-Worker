@@ -1287,7 +1287,7 @@ class TestKbLint:
 
     def test_respects_path_arg(self):
         # The one thing the index cannot answer: an arbitrary markdown vault
-        # in the workspace (docs/, a repository datasource checkout).
+        # in the workspace (a design vault, a repository datasource checkout).
         ctx = _make_context()
         ctx.has_workspace.return_value = True
         ws, _ = _fake_kb_workspace(

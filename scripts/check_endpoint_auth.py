@@ -14,7 +14,7 @@ Classifications:
                      line immediately above the decorator
   unscoped         — no gate found; would fail the C2 snapshot test
 
-The CI snapshot lives at docs/security/endpoint_inventory.txt; a mismatch
+The CI snapshot lives at policy/endpoint_inventory.txt; a mismatch
 fails the regression test and forces a manual review of any new endpoint.
 
 Two route sources are walked:
@@ -39,7 +39,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ORCHESTRATOR = REPO_ROOT / "orchestrator"
 MAIN_PY = ORCHESTRATOR / "main.py"
-MANIFEST = REPO_ROOT / "docs" / "security" / "endpoint_inventory.txt"
+MANIFEST = REPO_ROOT / "policy" / "endpoint_inventory.txt"
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 
@@ -417,7 +417,7 @@ def main() -> int:
     parser.add_argument(
         "--write",
         action="store_true",
-        help="Write the manifest to docs/security/endpoint_inventory.txt",
+        help="Write the manifest to policy/endpoint_inventory.txt",
     )
     parser.add_argument(
         "--check",

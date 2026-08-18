@@ -68,7 +68,7 @@ class TestCiRunnerPolicy:
         its push. check() covers this too, but calling it out separately means a
         vanished contract reads as its own failure rather than one line in a list.
         """
-        doc = REPO_ROOT / "docs" / "ci_self_hosted_runners.md"
+        doc = REPO_ROOT / "policy" / "ci_self_hosted_runners.md"
         assert doc.is_file(), f"{doc} is missing — the runner contract is undocumented"
         text = doc.read_text(encoding="utf-8")
         missing = [n for n in checker.RUNNER_CONTRACT if n not in text]

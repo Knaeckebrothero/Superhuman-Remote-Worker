@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
 from src.shared.orch_surface.jobs import JOB_DESCRIPTORS  # noqa: E402
 
 TS_PATH = ROOT / "cockpit/src/app/core/tools/job-surface.generated.ts"
-CATALOGUE_PATH = ROOT / "docs/generated/job_tool_catalogue.md"
+CATALOGUE_PATH = ROOT / "knowledge-base/knowledge/generated/job_tool_catalogue.md"
 
 GROUP_PRESENTATION = {
     "job_control": {
@@ -119,8 +119,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # The catalogue lives in the private design vault, which is a separate
+    # nested clone. Guard before mkdir: without this, a vault-less machine
+    # would fabricate a bare knowledge-base/ tree that belongs to no repo and
+    # silently write the catalogue into a gitignored void.
+    vault = ROOT / "knowledge-base"
     stale: list[Path] = []
     for path, expected in _artifacts().items():
+        if path.is_relative_to(vault) and not (vault / ".git").exists():
+            raise SystemExit(
+                f"{path.relative_to(ROOT)} lives in the design vault, but "
+                "knowledge-base/ is not cloned here. Clone it first — see "
+                "AGENTS.md, 'Design vault'."
+            )
         current = path.read_text(encoding="utf-8") if path.is_file() else None
         if current == expected:
             continue
