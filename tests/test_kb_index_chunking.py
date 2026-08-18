@@ -698,6 +698,106 @@ class TestUpsertKbNoteRetrievalMessagesCoalesceSentinel:
 
 
 # =============================================================================
+# upsert_kb_note job_id / phase sentinels (Slice A task 6 fix round): the same
+# COALESCE contract as priority/ready_at/retrieval_messages above. Both columns
+# were written unconditionally, so the sweep -- which knows no job and no phase
+# -- NULLed them on its next pass over any note. job_id backs a shipped filter
+# (list_notes' `job_id = $n` clause, behind kb_list(job_id=...)), so a NULL
+# there is the difference between "which notes did job X write?" answering and
+# answering nothing.
+# =============================================================================
+
+
+class TestUpsertKbNoteProvenanceCoalesceSentinel:
+    @pytest.mark.asyncio
+    async def test_job_id_coalesces_against_the_existing_row_on_conflict(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="learning",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            job_id=None,
+        )
+        query, *params = mock_db.fetchval.call_args[0]
+        assert "job_id = COALESCE($16, knowledge_index.job_id)" in query
+        # Pin the ordinal, not just the identifier: $16 is mid-statement, so a
+        # renumbering slip would bind job_id into invalidated_at or phase and
+        # a presence-only assertion would stay green.
+        assert params[15] is None
+
+    @pytest.mark.asyncio
+    async def test_phase_coalesces_against_the_existing_row_on_conflict(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="learning",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            phase=None,
+        )
+        query, *params = mock_db.fetchval.call_args[0]
+        assert "phase = COALESCE($17, knowledge_index.phase)" in query
+        assert params[16] is None
+
+    @pytest.mark.asyncio
+    async def test_explicit_provenance_still_wins(self):
+        """Regression guard: the sentinel must not swallow a real value."""
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        writing_job = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="learning",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            job_id=writing_job,
+            phase=3,
+        )
+        _query, *params = mock_db.fetchval.call_args[0]
+        assert params[15] == writing_job
+        assert params[16] == 3
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_row_binds_them_raw(self):
+        # The INSERT half must stay raw: a new row has no prior value to
+        # preserve, and `knowledge_index.job_id` is not even addressable in a
+        # VALUES list. This pins the asymmetry so a later "tidy-up" cannot
+        # make both halves match and break the statement.
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="learning",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+        )
+        query = mock_db.fetchval.call_args[0][0]
+        insert_half, _conflict_half = query.split("ON CONFLICT", 1)
+        assert "$16, $17," in insert_half
+        assert "COALESCE($16" not in insert_half
+        assert "COALESCE($17" not in insert_half
+
+
+# =============================================================================
 # replace_note_chunks — atomic delete + insert of a note's chunks
 # =============================================================================
 

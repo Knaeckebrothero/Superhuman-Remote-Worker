@@ -518,6 +518,7 @@ async def _index_note_inline(
     content: str,
     intent_id: Optional[str],
     retrieval_messages: Optional[list[str]] = None,
+    job_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Index a just-committed note so it is searchable when the write returns.
 
@@ -533,6 +534,12 @@ async def _index_note_inline(
     ``None`` leaves whatever is already stored alone (see that function and
     ``KnowledgeStore.upsert_kb_note``).
 
+    ``job_id`` arrives as the request's string and becomes
+    ``knowledge_index.job_id`` (a UUID column), so it is parsed here, at the
+    boundary where strings stop. An unparseable one costs the note its
+    provenance, not its index: the commit has already happened and a note
+    nobody can find is far worse than one whose author is unknown.
+
     Never raises. Every failure degrades to "committed but not yet indexed",
     which is exactly the state the sweep already knows how to heal.
     """
@@ -541,6 +548,18 @@ async def _index_note_inline(
         kb_id = uuid.UUID(str(project_id))
     except (TypeError, ValueError):
         return {"indexed": False, "index_reason": "index-error"}
+
+    writing_job: Optional[uuid.UUID] = None
+    if job_id:
+        try:
+            writing_job = uuid.UUID(str(job_id))
+        except (TypeError, ValueError):
+            logger.warning(
+                "kb-materialize: %s has an unparseable job_id %r — indexing "
+                "without provenance",
+                path,
+                job_id,
+            )
 
     blob_sha = _git_blob_sha(str(content).encode("utf-8"))
     try:
@@ -567,6 +586,7 @@ async def _index_note_inline(
                 embedding_stamp=embedding_stamp,
                 max_chunks=_INLINE_MAX_CHUNKS,
                 retrieval_messages=retrieval_messages,
+                job_id=writing_job,
             )
     except Exception as e:  # noqa: BLE001 — non-fatal by contract
         logger.error(
@@ -695,7 +715,8 @@ async def materialize_knowledge_note(
     later) instead of failing the write.
 
     ``retrieval_messages`` forwards to the inline index call (``None`` leaves
-    any already-stored value alone) — see :func:`_index_note_inline`.
+    any already-stored value alone) — see :func:`_index_note_inline`. So does
+    ``job_id``, which names the commit *and* stamps the row's provenance.
     """
     result = await _materialize_note_canonical(
         postgres_db=postgres_db,
@@ -717,6 +738,7 @@ async def materialize_knowledge_note(
         slug=slug,
         content=str(content or ""),
         retrieval_messages=retrieval_messages,
+        job_id=job_id,
         intent_id=result.get("intent_id"),
     )
     return {**result, **index_state}

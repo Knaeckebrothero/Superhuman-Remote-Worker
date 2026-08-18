@@ -1082,6 +1082,22 @@ class KnowledgeStore:
         (Slice A) survives the very next sweep instead of being wiped back
         to empty.
 
+        ``job_id`` and ``phase`` take the same sentinel, for the sharpest
+        version of the reason yet: the note file cannot carry either (OKF
+        frontmatter has no job or phase field), so the *sweep* — which
+        re-indexes notes it did not write — has no opinion and passed None,
+        while this statement wrote both unconditionally. Every note therefore
+        lost its provenance on the first sweep after it was written. That
+        matters because ``job_id`` backs a shipped filter:
+        :meth:`list_notes` builds a real ``job_id = $n`` WHERE clause behind
+        ``kb_list(job_id=...)``, so a NULLed column is the difference between
+        "which notes did job X write?" answering and answering nothing.
+        ``None`` now means "leave the stored value alone"; only the inline
+        materialize call, which knows the writing job, has a value to set.
+        ``phase`` gets the sentinel too even though nothing supplies one yet —
+        it costs one line and it is what stops the next writer's value from
+        being swept away the same way.
+
         ``remaining_cycles`` is seeded on INSERT only. After Slice A the
         file-canonical path is the only writer for a new note, so if it did
         not seed the TTL, convergence re-verification would never see the
@@ -1139,8 +1155,10 @@ class KnowledgeStore:
                 status = $7, confidence = $8, tags = $9, keywords = $10,
                 retrieval_messages = COALESCE($11::text[], knowledge_index.retrieval_messages),
                 blob_sha = $12, embedding_version = $13,
-                superseded_by = $14, invalidated_at = $15, job_id = $16,
-                phase = $17, content_hash = $18, modified_at = $20, indexed_at = NOW(),
+                superseded_by = $14, invalidated_at = $15,
+                job_id = COALESCE($16, knowledge_index.job_id),
+                phase = COALESCE($17, knowledge_index.phase),
+                content_hash = $18, modified_at = $20, indexed_at = NOW(),
                 search_doc = EXCLUDED.search_doc,
                 priority = COALESCE($21, knowledge_index.priority),
                 ready_at = COALESCE($22, knowledge_index.ready_at)

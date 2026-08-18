@@ -552,6 +552,43 @@ class TestIndexSingleNote:
         )
         assert store.upsert_kb_note.await_args.kwargs["retrieval_messages"] is None
 
+    def test_forwards_the_writing_job_to_the_row(self):
+        # knowledge_index.job_id is the provenance behind kb_list(job_id=...).
+        # The note file cannot carry it -- OKF frontmatter has no job field --
+        # so the inline caller's argument is its only route onto the row.
+        store = _index_store()
+        writing_job = uuid.uuid4()
+        asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=uuid.uuid4(),
+                path="knowledge/n.md",
+                text=_note_md("n"),
+                blob_sha="sha",
+                embedding_stamp=EMBEDDING_VERSION,
+                job_id=writing_job,
+            )
+        )
+        assert store.upsert_kb_note.await_args.kwargs["job_id"] == writing_job
+
+    def test_an_omitted_job_id_leaves_the_row_alone(self):
+        # The sweep's every call: it re-indexes notes it did not write and has
+        # no job to name, so it must not overwrite the writer's provenance.
+        store = _index_store()
+        asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=uuid.uuid4(),
+                path="knowledge/n.md",
+                text=_note_md("n"),
+                blob_sha="sha",
+                embedding_stamp=EMBEDDING_VERSION,
+            )
+        )
+        assert store.upsert_kb_note.await_args.kwargs["job_id"] is None
+
 
 # =============================================================================
 # note_fields — created (frontmatter) -> created_at (project-backlog-pipeline
