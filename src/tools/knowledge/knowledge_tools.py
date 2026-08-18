@@ -1102,6 +1102,20 @@ def _canonical_materialization_error(slug: str, result: Dict[str, Any]) -> str:
     )
 
 
+def _index_state_suffix(result: Dict[str, Any]) -> str:
+    """How the tool reports whether the note is searchable yet.
+
+    The orchestrator indexes inline with the commit, but defers a note that is
+    too large or arrives while a rebuild holds the KB lock. Saying "created"
+    without saying which happened is how the old docstring came to promise
+    immediate searchability it could not deliver.
+    """
+    if result.get("indexed"):
+        return "[canonical=canonical, indexed=yes]"
+    reason = result.get("index_reason") or "pending"
+    return f"[canonical=canonical, indexed=deferred:{reason}]"
+
+
 def _canonical_ready_at(note: Dict[str, Any]) -> Optional[datetime]:
     """Parse the READY timestamp just committed to the canonical note."""
     value = note.get("ready_at")
@@ -1894,8 +1908,13 @@ def create_kb_tools(
         Write-through: creates the note in Neo4j (source of truth), upserts into
         the pgvector search index, AND materializes the note as an OKF markdown
         file at ``knowledge/<slug>.md`` in the project's knowledge repository —
-        committed server-side, so it needs neither a workspace nor git. The note
-        is immediately available for search and graph queries.
+        committed server-side, so it needs neither a workspace nor git.
+
+        The note is committed to the knowledge repository and, in the normal
+        case, indexed before this call returns — so kb_search and kb_read find
+        it immediately. A large note, or one written while the knowledge base
+        is rebuilding, reports ``indexed=deferred:<reason>`` and becomes
+        searchable on the next sweep.
 
         Args:
             title: Note title (generates the slug ID, e.g. "chose-jwt-over-oauth")
@@ -2050,7 +2069,6 @@ def create_kb_tools(
             else:
                 slug = candidate_slug
 
-            now = datetime.now(timezone.utc)
             rank = PRIORITY_RANKS[priority]
             new_note = {
                 "id": slug,
@@ -2070,37 +2088,6 @@ def create_kb_tools(
             materialization = _materialize_note(context, slug, new_note)
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(slug, materialization)
-
-            try:
-                _run_async(
-                    ks.upsert_note(
-                        note_id=slug,
-                        project_id=uuid.UUID(project_id),
-                        title=title,
-                        note_type=type,
-                        content=content,
-                        tags=tags,
-                        keywords=keywords,
-                        confidence=confidence,
-                        job_id=uuid.UUID(context.job_id) if context.job_id else None,
-                        phase=context.config.get("current_phase"),
-                        retrieval_messages=retrieval_messages,
-                        created_at=now,
-                        modified_at=now,
-                        priority=rank,
-                        ready=_new_tags.ready,
-                        ready_at=_canonical_ready_at(new_note),
-                    )
-                )
-            except Exception as exc:
-                _report_projection(
-                    project_id, materialization, synced=False, error=str(exc)
-                )
-                logger.error("knowledge search projection failed for %s: %s", slug, exc)
-                return (
-                    f"Error: '{slug}' is canonical but its searchable projection "
-                    "is pending sync; retry/reindex before treating it as Created."
-                )
 
             graph_error: Optional[Exception] = None
             if kg is not None:
@@ -2126,12 +2113,6 @@ def create_kb_tools(
                         slug,
                         exc,
                     )
-            if not _report_projection(project_id, materialization, synced=True):
-                return (
-                    f"Error: '{slug}' is canonical and searchable, but durable "
-                    "projection state remains pending; retry before treating it "
-                    "as Created."
-                )
             if graph_error is not None:
                 return (
                     f"Error: '{slug}' is canonical and searchable, but its optional "
@@ -2168,7 +2149,7 @@ def create_kb_tools(
                     return (
                         f"Created knowledge note: **{slug}** (type={type}) — "
                         f"superseded {', '.join(retired)}{_tag_notice} "
-                        "[canonical=canonical, projection=synced]"
+                        f"{_index_state_suffix(materialization)}"
                     )
 
             link_info = ""
@@ -2177,7 +2158,7 @@ def create_kb_tools(
 
             return (
                 f"Created knowledge note: **{slug}** (type={type}{link_info})"
-                f"{_tag_notice} [canonical=canonical, projection=synced]"
+                f"{_tag_notice} {_index_state_suffix(materialization)}"
             )
 
         except ValueError as e:

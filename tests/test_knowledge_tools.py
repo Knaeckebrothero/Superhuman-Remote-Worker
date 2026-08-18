@@ -339,22 +339,13 @@ class TestKbWrite:
         assert "my-note" in result
         assert "learning" in result
 
-    def test_pgvector_failure_reports_pending_projection(self):
-        tools, ctx = _make_tools()
-        ctx.knowledge_graph.create_note.return_value = "slug"
-        ctx.knowledge_store.upsert_note = AsyncMock(side_effect=Exception("db error"))
-
-        # _run_async uses asyncio.run since no loop; mock it
-        with patch("asyncio.run", side_effect=Exception("db error")):
-            result = _invoke(
-                _get_tool(tools, "kb_write"),
-                {
-                    "title": "T",
-                    "type": "decision",
-                    "content": "x",
-                },
-            )
-        assert "pending sync" in result
+    # The "canonical but its searchable projection is pending sync" path is
+    # gone with the agent-side row write (Slice A): kb_write no longer touches
+    # pgvector, so there is no second write left to fail on its own. Its two
+    # successors are in TestKbWriteMaterialization (the canonical write itself
+    # failing, which still fails the tool closed) and in
+    # TestKbWriteDoesNotWriteTheRow (a committed-but-not-yet-indexed note,
+    # which is reported rather than hidden).
 
     def test_returns_error_on_value_error(self):
         """A ValueError out of the graph layer surfaces as an error string.
@@ -1850,6 +1841,81 @@ class TestKbWriteMaterialization:
         assert 'description: "A crisp summary."' in calls[0]["content"]
 
 
+# =============================================================================
+# Slice A: the orchestrator owns the knowledge_index row
+# =============================================================================
+
+
+@pytest.fixture
+def ks():
+    """The context's knowledge store, as a mock these tests can interrogate."""
+    store = AsyncMock()
+    store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+    return store
+
+
+@pytest.fixture
+def materializer():
+    """Patch the canonical write seam — committed AND indexed by default.
+
+    ``_materialize_note`` is the whole server-side round trip now: the
+    orchestrator commits the note and indexes it inline before answering, so
+    its result dict is where ``indexed`` / ``index_reason`` come from.
+    """
+    with patch(
+        "src.tools.knowledge.knowledge_tools._materialize_note",
+        return_value={
+            "status": "committed",
+            "canonical_state": "canonical",
+            "indexed": True,
+            "index_reason": None,
+        },
+    ) as materialize:
+        yield materialize
+
+
+@pytest.fixture
+def kb_tools(ks, materializer):
+    """kb tools by name, each callable with the tool's keyword arguments."""
+    ctx = _make_context()
+    ctx.knowledge_store = ks
+    ctx.knowledge_graph.read_note.return_value = None  # no slug collision
+    tools, _ = _make_tools(ctx)
+    return {tool.name: (lambda _tool=tool, **kw: _invoke(_tool, kw)) for tool in tools}
+
+
+class TestKbWriteDoesNotWriteTheRow:
+    """After Slice A the orchestrator owns row, chunks and links. A second
+    agent-side write would clobber the centroid the inline index just wrote
+    and pay for an embedding nobody reads."""
+
+    def test_kb_write_never_calls_upsert_note(self, kb_tools, ks):
+        result = kb_tools["kb_write"](
+            type="learning", title="A finding", content="the body"
+        )
+        assert result.startswith("Created knowledge note:")
+        ks.upsert_note.assert_not_called()
+
+    def test_success_reports_the_note_is_searchable(self, kb_tools):
+        result = kb_tools["kb_write"](
+            type="learning", title="A finding", content="the body"
+        )
+        assert "indexed=yes" in result
+
+    def test_a_deferred_index_is_reported_not_hidden(self, kb_tools, materializer):
+        materializer.return_value = {
+            "status": "committed",
+            "canonical_state": "canonical",
+            "indexed": False,
+            "index_reason": "reindex-running",
+        }
+        result = kb_tools["kb_write"](
+            type="learning", title="A finding", content="the body"
+        )
+        assert result.startswith("Created knowledge note:")
+        assert "indexed=deferred:reindex-running" in result
+
+
 class TestKbUpdateMaterialization:
     """kb_update re-materializes the note server-side, on both update paths."""
 
@@ -2433,21 +2499,24 @@ def _existing_note(note_id="n1", content="old body", **over):
 
 
 class TestKbWriteWithoutNeo4j:
-    """kg-less kb_write (PR4c-3 write half): the pgvector store is the write
-    target and the OKF file is the canonical export; Neo4j is never touched."""
+    """kg-less kb_write (PR4c-3 write half): the canonical OKF file is the
+    write target and the orchestrator projects it into pgvector; Neo4j is
+    never touched. Since Slice A the agent makes exactly one write, so
+    ``_capture_materialize`` sees every note the tool writes — and every note
+    it refuses to."""
 
-    def test_no_kg_upserts_via_store(self):
+    def test_no_kg_writes_the_note_through_the_canonical_seam(self):
         ctx = _make_context_no_kg()
         ctx.knowledge_store.get_note_by_slug.return_value = None  # no collision
         tools, _ = _make_tools(ctx)
-        result = _invoke(
-            _get_tool(tools, "kb_write"),
-            {"title": "New Title", "type": "decision", "content": "body"},
-        )
-        assert ctx.knowledge_store.upsert_note.called
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["note_id"] == "new-title"
-        assert kwargs["content"] == "body"
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "New Title", "type": "decision", "content": "body"},
+            )
+        assert [c["slug"] for c in calls] == ["new-title"]
+        assert "body" in calls[0]["content"]
         assert "new-title" in result
 
     def test_no_kg_never_calls_neo4j(self):
@@ -2467,12 +2536,14 @@ class TestKbWriteWithoutNeo4j:
             note_id="new-title", content="identical"
         )
         tools, _ = _make_tools(ctx)
-        result = _invoke(
-            _get_tool(tools, "kb_write"),
-            {"title": "New Title", "type": "decision", "content": "identical"},
-        )
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "New Title", "type": "decision", "content": "identical"},
+            )
         assert "identical content" in result
-        assert not ctx.knowledge_store.upsert_note.called
+        assert calls == []
 
     def test_no_kg_collision_appends_content_hash(self):
         import hashlib
@@ -2483,13 +2554,14 @@ class TestKbWriteWithoutNeo4j:
             note_id="new-title", content="other body"
         )
         tools, _ = _make_tools(ctx)
-        _invoke(
-            _get_tool(tools, "kb_write"),
-            {"title": "New Title", "type": "decision", "content": "fresh body"},
-        )
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "New Title", "type": "decision", "content": "fresh body"},
+            )
         digest = hashlib.sha256(b"fresh body").hexdigest()[:6]
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["note_id"] == f"new-title-{digest}"
+        assert [c["slug"] for c in calls] == [f"new-title-{digest}"]
 
     def test_no_kg_invalid_type_errors(self):
         # Parity with kg.create_note: an invalid note_type is a clean up-front
@@ -2500,48 +2572,52 @@ class TestKbWriteWithoutNeo4j:
         ctx = _make_context_no_kg()
         ctx.knowledge_store.get_note_by_slug.return_value = None
         tools, _ = _make_tools(ctx)
-        with pytest.raises(ValidationError):
-            _invoke(
-                _get_tool(tools, "kb_write"),
-                {"title": "New Title", "type": "bogus", "content": "body"},
-            )
-        assert not ctx.knowledge_store.upsert_note.called
+        patcher, calls = _capture_materialize()
+        with patcher:
+            with pytest.raises(ValidationError):
+                _invoke(
+                    _get_tool(tools, "kb_write"),
+                    {"title": "New Title", "type": "bogus", "content": "body"},
+                )
+            assert calls == []
 
-        # ...and the body still refuses it for callers that skip the schema.
-        result = _invoke_unvalidated(
-            _get_tool(tools, "kb_write"),
-            title="New Title",
-            type="bogus",
-            content="body",
-        )
-        assert "Error" in result
-        assert not ctx.knowledge_store.upsert_note.called
+            # ...and the body still refuses it for callers that skip the schema.
+            result = _invoke_unvalidated(
+                _get_tool(tools, "kb_write"),
+                title="New Title",
+                type="bogus",
+                content="body",
+            )
+            assert "Error" in result
+            assert calls == []
 
     def test_no_kg_invalid_confidence_errors(self):
         ctx = _make_context_no_kg()
         ctx.knowledge_store.get_note_by_slug.return_value = None
         tools, _ = _make_tools(ctx)
-        with pytest.raises(ValidationError):
-            _invoke(
-                _get_tool(tools, "kb_write"),
-                {
-                    "title": "New Title",
-                    "type": "decision",
-                    "content": "body",
-                    "confidence": "bogus",
-                },
-            )
-        assert not ctx.knowledge_store.upsert_note.called
+        patcher, calls = _capture_materialize()
+        with patcher:
+            with pytest.raises(ValidationError):
+                _invoke(
+                    _get_tool(tools, "kb_write"),
+                    {
+                        "title": "New Title",
+                        "type": "decision",
+                        "content": "body",
+                        "confidence": "bogus",
+                    },
+                )
+            assert calls == []
 
-        result = _invoke_unvalidated(
-            _get_tool(tools, "kb_write"),
-            title="New Title",
-            type="decision",
-            content="body",
-            confidence="bogus",
-        )
-        assert "Error" in result
-        assert not ctx.knowledge_store.upsert_note.called
+            result = _invoke_unvalidated(
+                _get_tool(tools, "kb_write"),
+                title="New Title",
+                type="decision",
+                content="body",
+                confidence="bogus",
+            )
+            assert "Error" in result
+            assert calls == []
 
     def test_no_kg_materializes_the_okf_note(self):
         ws, writes = _capture_workspace()
@@ -2563,12 +2639,13 @@ class TestKbWriteWithoutNeo4j:
         ctx = _make_context_no_kg()
         ctx.knowledge_store.get_note_by_slug.return_value = None
         tools, _ = _make_tools(ctx)
-        _invoke(
-            _get_tool(tools, "kb_write"),
-            {"title": "!!!", "type": "learning", "content": "body"},
-        )
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["note_id"].startswith("note-")
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "!!!", "type": "learning", "content": "body"},
+            )
+        assert calls[0]["slug"].startswith("note-")
 
 
 class TestKbUpdateWithoutNeo4j:

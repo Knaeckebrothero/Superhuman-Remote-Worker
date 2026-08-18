@@ -279,17 +279,21 @@ class TestOfficerOnlyTags:
 
     def test_worker_may_still_classify(self):
         # Classification is triage help; authorization is not. A worker filing a
-        # well-tagged ticket is exactly what the backlog wants.
+        # well-tagged ticket is exactly what the backlog wants. kb_write's only
+        # write is the canonical note now, so that is where the tags must land.
         ctx = _worker_context()
-        _tool(ctx, "kb_write").invoke(
-            {
-                "title": "Add dark mode",
-                "type": "feature",
-                "content": "x",
-                "tags": ["category:executor", "expert:designer"],
-            }
-        )
-        assert _upsert_kwargs(ctx)["tags"] == ["category:executor", "expert:designer"]
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _tool(ctx, "kb_write").invoke(
+                {
+                    "title": "Add dark mode",
+                    "type": "feature",
+                    "content": "x",
+                    "tags": ["category:executor", "expert:designer"],
+                }
+            )
+        assert len(calls) == 1
+        assert 'tags: ["category:executor", "expert:designer"]' in calls[0]["content"]
 
     def test_worker_cannot_grant_itself_parallelism(self):
         ctx = _worker_context()

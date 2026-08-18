@@ -157,6 +157,7 @@ def _authorize_from_test_actor(ctx, project_id, action):
 
 @pytest.fixture(autouse=True)
 def _runtime_actor_pep():
+    """Stub the PEP and the server-side commit; yields the commit mock."""
     with (
         patch(
             "src.tools.knowledge.knowledge_tools._request_runtime_actor_authorization",
@@ -169,10 +170,23 @@ def _runtime_actor_pep():
                 "canonical_state": "canonical",
                 "projection_state": "pending",
                 "retry_state": "none",
+                "indexed": True,
+                "index_reason": None,
             },
-        ),
+        ) as vault_commit,
     ):
-        yield
+        yield vault_commit
+
+
+@pytest.fixture
+def canonical_write(_runtime_actor_pep):
+    """The single server-side write kb_write makes, as an assertable mock.
+
+    kb_write no longer writes the ``knowledge_index`` row itself (Slice A —
+    the orchestrator owns it), so ``upsert_note`` is no longer evidence that
+    a note was written, or refused. This is.
+    """
+    return _runtime_actor_pep
 
 
 def _tool(ctx, name):
@@ -188,38 +202,40 @@ def _tool(ctx, name):
 
 
 class TestCharterWriteAuthority:
-    def test_worker_cannot_create_charter(self):
+    def test_worker_cannot_create_charter(self, canonical_write):
         ctx = _worker_context()
         result = _tool(ctx, "kb_write").func(
             title="Charter", type="charter", content="orders"
         )
         assert "Authorization denied" in result
         assert "No changes were made" in result
-        ctx.knowledge_store.upsert_note.assert_not_called()
+        canonical_write.assert_not_called()
 
-    def test_worker_can_file_reports(self):
+    def test_worker_can_file_reports(self, canonical_write):
         ctx = _worker_context()
         ctx.knowledge_store.get_note_by_slug.return_value = None
-        ctx.knowledge_store.upsert_note.return_value = uuid.uuid4()
         result = _tool(ctx, "kb_write").func(
             title="Recon findings", type="report", content="findings"
         )
         assert "Error" not in result
-        ctx.knowledge_store.upsert_note.assert_called_once()
-        assert ctx.knowledge_store.upsert_note.call_args.kwargs["note_type"] == "report"
+        canonical_write.assert_called_once()
+        # _post_vault_file(project_id, slug, content, job_id) — the note type
+        # is frontmatter in the committed markdown, not a column the agent sets.
+        _, slug, content, _ = canonical_write.call_args.args
+        assert slug == "recon-findings"
+        assert "type: report" in content
 
-    def test_session_creates_charter_when_none_exists(self):
+    def test_session_creates_charter_when_none_exists(self, canonical_write):
         ctx = _session_context()
         ctx.knowledge_store.get_charter_note.return_value = None
         ctx.knowledge_store.get_note_by_slug.return_value = None
-        ctx.knowledge_store.upsert_note.return_value = uuid.uuid4()
         result = _tool(ctx, "kb_write").func(
             title="Century charter", type="charter", content="orders"
         )
         assert "Error" not in result
-        ctx.knowledge_store.upsert_note.assert_called_once()
+        canonical_write.assert_called_once()
 
-    def test_second_active_charter_refused(self):
+    def test_second_active_charter_refused(self, canonical_write):
         ctx = _session_context()
         ctx.knowledge_store.get_charter_note.return_value = {
             "id": "century-charter",
@@ -231,9 +247,9 @@ class TestCharterWriteAuthority:
         )
         assert "already has an active charter" in result
         assert "century-charter" in result
-        ctx.knowledge_store.upsert_note.assert_not_called()
+        canonical_write.assert_not_called()
 
-    def test_charter_lookup_failure_refuses_write(self):
+    def test_charter_lookup_failure_refuses_write(self, canonical_write):
         # Fail-closed: if we cannot verify uniqueness we do not write.
         ctx = _session_context()
         ctx.knowledge_store.get_charter_note.side_effect = RuntimeError("db down")
@@ -241,7 +257,7 @@ class TestCharterWriteAuthority:
             title="Charter", type="charter", content="orders"
         )
         assert "could not verify" in result
-        ctx.knowledge_store.upsert_note.assert_not_called()
+        canonical_write.assert_not_called()
 
     def test_worker_cannot_update_charter_kgless(self):
         ctx = _worker_context()
@@ -333,7 +349,9 @@ class TestCharterWriteAuthority:
             ("conference", "admin", True),
         ],
     )
-    def test_charter_human_role_matrix(self, caller_kind, project_role, allowed):
+    def test_charter_human_role_matrix(
+        self, caller_kind, project_role, allowed, canonical_write
+    ):
         ctx = _session_context(
             thread_id=None if caller_kind == "worker" else "thread-1",
             caller_kind=caller_kind,
@@ -341,14 +359,13 @@ class TestCharterWriteAuthority:
         )
         ctx.knowledge_store.get_charter_note.return_value = None
         ctx.knowledge_store.get_note_by_slug.return_value = None
-        ctx.knowledge_store.upsert_note.return_value = uuid.uuid4()
         result = _tool(ctx, "kb_write").func(
             title="Century charter", type="charter", content="orders"
         )
         if allowed:
-            ctx.knowledge_store.upsert_note.assert_called_once()
+            canonical_write.assert_called_once()
         else:
-            ctx.knowledge_store.upsert_note.assert_not_called()
+            canonical_write.assert_not_called()
             assert "No changes were made" in result
 
     def test_denied_charter_update_has_zero_side_effects(self):
@@ -380,27 +397,41 @@ class TestCharterWriteAuthority:
 
 
 class TestSoleStoreWriteHonesty:
-    def test_pgvector_failure_fails_tool_on_lite_session(self):
+    """A session with no Neo4j and no git has exactly one place its notes can
+    land, so a write that did not land must not be reported as one. Since
+    Slice A that place is the canonical commit (the orchestrator writes the
+    searchable row from it), and this is the failure the tool must not hide.
+    """
+
+    def test_canonical_failure_fails_tool_on_lite_session(self, canonical_write):
         ctx = _session_context()  # kg None + has_git False = sole store
         ctx.knowledge_store.get_note_by_slug.return_value = None
-        ctx.knowledge_store.upsert_note.side_effect = RuntimeError("pool gone")
+        canonical_write.return_value = {
+            "status": "failed",
+            "reason": "commit-refused",
+            "retry_state": "pending",
+        }
         result = _tool(ctx, "kb_write").func(
             title="State note", type="state", content="the century stands"
         )
-        assert "canonical" in result
-        assert "projection is pending sync" in result
+        assert result.startswith("Error: canonical knowledge write")
+        assert "commit-refused" in result
 
-    def test_pgvector_failure_fails_closed_even_with_git(self):
+    def test_canonical_failure_fails_closed_even_with_git(self, canonical_write):
         ctx = _session_context()
         ctx.has_git = MagicMock(return_value=True)
         # Dual-write path needs a workspace write to succeed.
         ctx.workspace_manager.write_file = MagicMock()
         ctx.knowledge_store.get_note_by_slug.return_value = None
-        ctx.knowledge_store.upsert_note.side_effect = RuntimeError("pool gone")
+        canonical_write.return_value = {
+            "status": "failed",
+            "reason": "commit-refused",
+            "retry_state": "pending",
+        }
         result = _tool(ctx, "kb_write").func(
             title="State note", type="state", content="the century stands"
         )
-        assert "projection is pending sync" in result
+        assert result.startswith("Error: canonical knowledge write")
 
 
 # =============================================================================

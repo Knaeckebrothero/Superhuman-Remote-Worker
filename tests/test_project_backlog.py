@@ -169,50 +169,59 @@ class TestKbToolPrioritySchema:
 
 
 class TestKbWritePriorityPersistence:
-    """Proves priority reaches the actual persistence call (ks.upsert_note)
-    as the correct rank integer — a schema assertion alone doesn't show this
+    """Proves priority reaches the persisted note, not just the tool schema
     (task-3 test-quality bar: "a signature/schema assertion alone does not
-    prove the value reaches storage")."""
+    prove the value reaches storage").
 
-    def test_high_priority_arrives_as_rank_zero(self):
+    Since Slice A the agent makes exactly one write — the canonical OKF note —
+    and the orchestrator projects ``knowledge_index`` from it. The rank still
+    runs through ``PRIORITY_RANKS`` into ``new_note["priority"]``; what changed
+    is that the only place it is observable is the frontmatter word
+    ``_render_note_md`` maps it back to.
+    """
+
+    def test_high_priority_reaches_the_note(self):
         ctx = _kb_context()
         ctx.knowledge_store.get_note_by_slug = AsyncMock(return_value=None)
         tools = _make_tools(ctx)
-        tools["kb_write"].invoke(
-            {
-                "title": "Add dark mode",
-                "type": "feature",
-                "content": "body",
-                "priority": "high",
-            }
-        )
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["priority"] == 0
+        patcher, rendered = _capture_materialize()
+        with patcher:
+            tools["kb_write"].invoke(
+                {
+                    "title": "Add dark mode",
+                    "type": "feature",
+                    "content": "body",
+                    "priority": "high",
+                }
+            )
+        assert "priority: high" in rendered["add-dark-mode"]
 
-    def test_low_priority_arrives_as_rank_two(self):
+    def test_low_priority_reaches_the_note(self):
         ctx = _kb_context()
         ctx.knowledge_store.get_note_by_slug = AsyncMock(return_value=None)
         tools = _make_tools(ctx)
-        tools["kb_write"].invoke(
-            {
-                "title": "Someday idea",
-                "type": "idea",
-                "content": "body",
-                "priority": "low",
-            }
-        )
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["priority"] == 2
+        patcher, rendered = _capture_materialize()
+        with patcher:
+            tools["kb_write"].invoke(
+                {
+                    "title": "Someday idea",
+                    "type": "idea",
+                    "content": "body",
+                    "priority": "low",
+                }
+            )
+        assert "priority: low" in rendered["someday-idea"]
 
-    def test_omitted_priority_defaults_to_rank_one(self):
+    def test_omitted_priority_defaults_to_normal(self):
         ctx = _kb_context()
         ctx.knowledge_store.get_note_by_slug = AsyncMock(return_value=None)
         tools = _make_tools(ctx)
-        tools["kb_write"].invoke(
-            {"title": "Some issue", "type": "issue", "content": "body"}
-        )
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["priority"] == 1
+        patcher, rendered = _capture_materialize()
+        with patcher:
+            tools["kb_write"].invoke(
+                {"title": "Some issue", "type": "issue", "content": "body"}
+            )
+        assert "priority: normal" in rendered["some-issue"]
 
 
 class TestKbWritePriorityNonTicketUnaffected:
