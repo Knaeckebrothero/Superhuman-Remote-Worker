@@ -1097,3 +1097,154 @@ class TestKnowledgeMutationEndpoint:
         assert exc.value.status_code == 409
         assert exc.value.detail["reason"] == "canonical-ready-at-invalid"
         conn.fetchval.assert_not_awaited()
+
+
+# Inline indexing (Slice A) — the endpoint indexes the note it just committed,
+# so kb_search/kb_read find it when the write returns instead of after the
+# next 900s sweep.
+
+import asyncio  # noqa: E402
+from contextlib import asynccontextmanager  # noqa: E402
+
+from orchestrator.services.kb_reindex import NoteIndexOutcome  # noqa: E402
+
+
+def _indexing_store(*, lock_claimed: bool = True) -> MagicMock:
+    """A store whose only job is to lend (or refuse) the per-KB reindex lock."""
+    store = MagicMock()
+
+    @asynccontextmanager
+    async def _lock(_kb_id):
+        yield lock_claimed
+
+    store.try_reindex_lock = _lock
+    return store
+
+
+class TestInlineIndexOnMaterialize:
+    def test_a_committed_note_is_indexed_before_the_call_returns(self):
+        db = _ledger_db()
+        gitea = _make_gitea(change_results=[True])
+        indexed = {}
+
+        async def _fake_index(**kwargs):
+            indexed.update(kwargs)
+            return NoteIndexOutcome(status="indexed", note_id=SLUG, chunks=1)
+
+        with (
+            _patch_resolve(_ref()),
+            patch("services.kb_materialize.index_single_note", _fake_index),
+        ):
+            result = asyncio.run(
+                materialize_knowledge_note(
+                    postgres_db=db,
+                    gitea_client=gitea,
+                    project_id=PROJECT,
+                    slug=SLUG,
+                    content=BODY,
+                    store=_indexing_store(),
+                    embedding_service=AsyncMock(),
+                )
+            )
+
+        assert result["status"] == "committed"
+        assert result["indexed"] is True
+        assert result["index_reason"] is None
+        assert indexed["path"] == PATH
+        assert indexed["kb_id"] == uuid.UUID(PROJECT)
+        assert indexed["blob_sha"] == _blob_sha(BODY)
+        assert indexed["max_chunks"] is not None
+        db.finish_knowledge_projection.assert_awaited_once()
+
+    def test_without_a_store_the_note_commits_and_defers(self):
+        gitea = _make_gitea(change_results=[True])
+        with _patch_resolve(_ref()):
+            result = asyncio.run(
+                materialize_knowledge_note(
+                    postgres_db=_ledger_db(),
+                    gitea_client=gitea,
+                    project_id=PROJECT,
+                    slug=SLUG,
+                    content=BODY,
+                )
+            )
+        assert result["status"] == "committed"
+        assert result["indexed"] is False
+        assert result["index_reason"] == "no-indexer"
+
+    def test_a_held_reindex_lock_defers_instead_of_blocking(self):
+        gitea = _make_gitea(change_results=[True])
+        with (
+            _patch_resolve(_ref()),
+            patch(
+                "services.kb_materialize.index_single_note",
+                AsyncMock(
+                    side_effect=AssertionError("must not index under a held lock")
+                ),
+            ),
+        ):
+            result = asyncio.run(
+                materialize_knowledge_note(
+                    postgres_db=_ledger_db(),
+                    gitea_client=gitea,
+                    project_id=PROJECT,
+                    slug=SLUG,
+                    content=BODY,
+                    store=_indexing_store(lock_claimed=False),
+                    embedding_service=AsyncMock(),
+                )
+            )
+        assert result["status"] == "committed"
+        assert result["indexed"] is False
+        assert result["index_reason"] == "reindex-running"
+
+    def test_an_index_failure_leaves_the_note_canonical_and_deferred(self):
+        db = _ledger_db()
+        gitea = _make_gitea(change_results=[True])
+        with (
+            _patch_resolve(_ref()),
+            patch(
+                "services.kb_materialize.index_single_note",
+                AsyncMock(side_effect=RuntimeError("embedding backend down")),
+            ),
+        ):
+            result = asyncio.run(
+                materialize_knowledge_note(
+                    postgres_db=db,
+                    gitea_client=gitea,
+                    project_id=PROJECT,
+                    slug=SLUG,
+                    content=BODY,
+                    store=_indexing_store(),
+                    embedding_service=AsyncMock(),
+                )
+            )
+        assert result["status"] == "committed"
+        assert result["canonical_state"] == "canonical"
+        assert result["indexed"] is False
+        assert result["index_reason"] == "index-error"
+        db.finish_knowledge_projection.assert_not_awaited()
+
+    def test_a_failed_commit_is_never_indexed(self):
+        gitea = _make_gitea(change_results=[False, False])
+        with (
+            _patch_resolve(_ref()),
+            patch(
+                "services.kb_materialize.index_single_note",
+                AsyncMock(side_effect=AssertionError("must not index a failed commit")),
+            ),
+        ):
+            result = asyncio.run(
+                materialize_knowledge_note(
+                    postgres_db=_ledger_db(),
+                    gitea_client=gitea,
+                    project_id=PROJECT,
+                    slug=SLUG,
+                    content=BODY,
+                    store=_indexing_store(),
+                    embedding_service=AsyncMock(),
+                )
+            )
+        assert result["status"] == "failed"
+        assert result["indexed"] is False
+        assert result["index_reason"] == "not-canonical"

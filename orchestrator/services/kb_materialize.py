@@ -28,7 +28,9 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
@@ -40,7 +42,12 @@ from src.tools.knowledge.gardener import parse_note_md
 # The vault prefix and the repo resolution are both owned by the reindexer:
 # the writer and the sweep MUST agree on repo and path or they silently
 # diverge (that is the shape of kb_reindex_watermark_never_advances).
-from services.kb_reindex import KNOWLEDGE_PREFIX, resolve_kb_repo
+from services.kb_reindex import (
+    KNOWLEDGE_PREFIX,
+    index_single_note,
+    resolve_kb_repo,
+)
+from src.tools.knowledge.chunker import embedding_version_for_service
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +68,12 @@ _RESERVED_SLUGS = frozenset({"index", "log"})
 _STATUS_COMMITTED = "committed"
 _STATUS_SKIPPED = "skipped"
 _STATUS_FAILED = "failed"
+
+# Chunks a note may have and still be indexed inside the write request. Over
+# it the note commits and the sweep indexes it: a 127 KB curator dump chunks
+# into ~95, and the embedding backend caps a batch at 64 inputs, so inlining
+# one would put several round-trips in the caller's request.
+_INLINE_MAX_CHUNKS = int(os.getenv("KB_INLINE_INDEX_MAX_CHUNKS", "8"))
 
 
 def note_repo_path(slug: str) -> str:
@@ -480,7 +493,98 @@ async def _attempt_content_intent(
     )
 
 
-async def materialize_knowledge_note(
+def _is_canonical(result: dict[str, Any]) -> bool:
+    """Whether the bytes are proven to be on the canonical branch."""
+    if result.get("canonical_state") == "canonical":
+        return True
+    return result.get("status") == _STATUS_COMMITTED or (
+        result.get("status") == _STATUS_SKIPPED
+        and result.get("reason") in {"unchanged", "already-canonical"}
+    )
+
+
+async def _index_note_inline(
+    *,
+    postgres_db: Any,
+    store: Any,
+    embedding_service: Any,
+    project_id: str,
+    slug: str,
+    content: str,
+    intent_id: Optional[str],
+) -> dict[str, Any]:
+    """Index a just-committed note so it is searchable when the write returns.
+
+    Slice A. Without this the row is pathless and chunkless until the next
+    sweep, which is post-job or up to 900s away — so an agent could not read
+    back the note it had just written.
+
+    Deliberately narrow: one note, no deletes, no reconcile, and never a
+    watermark write. The blob SHA stamped here is the one we just committed,
+    so the next sweep's tree diff skips this note instead of re-embedding it.
+
+    Never raises. Every failure degrades to "committed but not yet indexed",
+    which is exactly the state the sweep already knows how to heal.
+    """
+    path = note_repo_path(slug)
+    try:
+        kb_id = uuid.UUID(str(project_id))
+    except (TypeError, ValueError):
+        return {"indexed": False, "index_reason": "index-error"}
+
+    blob_sha = _git_blob_sha(str(content).encode("utf-8"))
+    try:
+        embedding_stamp = embedding_version_for_service(embedding_service)
+        # Non-blocking: if the sweep owns this KB we defer rather than hold a
+        # request open behind a full-vault rebuild. The sweep will index the
+        # note in the pass that is already running.
+        async with store.try_reindex_lock(kb_id) as claimed:
+            if not claimed:
+                return {"indexed": False, "index_reason": "reindex-running"}
+            outcome = await index_single_note(
+                store=store,
+                embedding_service=embedding_service,
+                kb_id=kb_id,
+                path=path,
+                text=content,
+                blob_sha=blob_sha,
+                embedding_stamp=embedding_stamp,
+                max_chunks=_INLINE_MAX_CHUNKS,
+            )
+    except Exception as e:  # noqa: BLE001 — non-fatal by contract
+        logger.error(
+            "kb-materialize: inline index of %s failed: %r — committed but not "
+            "searchable until the next sweep",
+            path,
+            e,
+            exc_info=True,
+        )
+        return {"indexed": False, "index_reason": "index-error"}
+
+    if outcome.status != "indexed":
+        logger.warning(
+            "kb-materialize: %s committed but not indexed inline (%s, %d chunks)",
+            path,
+            outcome.status,
+            outcome.chunks,
+        )
+        return {"indexed": False, "index_reason": outcome.status}
+
+    if intent_id:
+        try:
+            await postgres_db.finish_knowledge_projection(
+                intent_id, project_id=str(project_id), synced=True, error=None
+            )
+        except Exception as e:  # noqa: BLE001 — canonical truth already persisted
+            logger.warning(
+                "kb-materialize: projection ledger close failed for intent %s: %r",
+                intent_id,
+                e,
+            )
+    return {"indexed": True, "index_reason": None}
+
+
+async def _materialize_note_canonical(
     *,
     postgres_db: Any,
     gitea_client: Any,
@@ -547,6 +651,53 @@ async def materialize_knowledge_note(
         content=content_text,
         job_id=job_id,
     )
+
+
+async def materialize_knowledge_note(
+    *,
+    postgres_db: Any,
+    gitea_client: Any,
+    project_id: str,
+    slug: str,
+    content: str,
+    job_id: Optional[str] = None,
+    store: Any = None,
+    embedding_service: Any = None,
+) -> dict[str, Any]:
+    """Commit one note and, when an indexer is supplied, index it inline.
+
+    Two legs, in this order and no other: the commit is the write, the index
+    is derived from it. A note is never indexed unless the bytes are proven
+    canonical, so the searchable projection can never claim something git does
+    not have.
+
+    ``store``/``embedding_service`` are optional so the service stays testable
+    without a vector DB, and so a deployment with no resolvable embedding
+    service degrades to the pre-Slice-A behaviour (commit now, sweep indexes
+    later) instead of failing the write.
+    """
+    result = await _materialize_note_canonical(
+        postgres_db=postgres_db,
+        gitea_client=gitea_client,
+        project_id=project_id,
+        slug=slug,
+        content=content,
+        job_id=job_id,
+    )
+    if not _is_canonical(result):
+        return {**result, "indexed": False, "index_reason": "not-canonical"}
+    if store is None or embedding_service is None:
+        return {**result, "indexed": False, "index_reason": "no-indexer"}
+    index_state = await _index_note_inline(
+        postgres_db=postgres_db,
+        store=store,
+        embedding_service=embedding_service,
+        project_id=project_id,
+        slug=slug,
+        content=str(content or ""),
+        intent_id=result.get("intent_id"),
+    )
+    return {**result, **index_state}
 
 
 def metadata_mutation_content(
