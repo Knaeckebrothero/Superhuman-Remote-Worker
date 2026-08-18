@@ -34,6 +34,7 @@ from src.services.forge import parse_owner_repo
 from src.shared.backlog_tags import normalize_tags
 
 from src.tools.knowledge.chunker import (
+    chunk_note,
     embed_note_chunks,
     embedding_version_for_service,
     note_centroid,
@@ -371,9 +372,12 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
 class NoteIndexOutcome:
     """What one note's index attempt did.
 
-    ``status`` is ``indexed`` (chunks + links durable, note stamped) or
+    ``status`` is ``indexed`` (chunks + links durable, note stamped),
     ``malformed`` (unparseable frontmatter — lint's problem, not the
-    indexer's; the caller removes any prior indexed version of the path).
+    indexer's; the caller removes any prior indexed version of the path), or
+    ``oversized`` (over an inline caller's ``max_chunks``; ``chunks`` carries
+    the planned count and the store was never touched — the sweep indexes it
+    instead).
     """
 
     status: str
@@ -407,6 +411,7 @@ async def index_single_note(
     blob_sha: str,
     embedding_stamp: str,
     movable_paths: Optional[List[str]] = None,
+    max_chunks: Optional[int] = None,
 ) -> NoteIndexOutcome:
     """Index ONE note into the disposable chunk index.
 
@@ -424,6 +429,11 @@ async def index_single_note(
     Never advances the watermark, never deletes, never reconciles: those are
     whole-sweep concerns and an inline caller has no business with them.
 
+    ``max_chunks`` caps how much work an *inline* caller will do in a request:
+    over it, the note returns ``oversized`` and the sweep indexes it instead.
+    The sweep itself passes ``None`` — it has all the time it needs, and a
+    note no one indexes is worse than a slow one.
+
     Raises ``NoteIndexError`` for a genuine failure; returns a ``malformed``
     outcome for unparseable frontmatter, which is not an error here.
     """
@@ -436,6 +446,17 @@ async def index_single_note(
     note_id = fields["note_id"]
 
     try:
+        if max_chunks is not None:
+            # Count before embedding, so an oversized note costs one cheap
+            # structural pass and no embedding round-trip. Under the cap the
+            # chunker runs twice; that is regex + token counting on a small
+            # note, which is far cheaper than the API call it protects.
+            planned = chunk_note(body)
+            if len(planned) > max_chunks:
+                return NoteIndexOutcome(
+                    status="oversized", note_id=note_id, chunks=len(planned)
+                )
+
         # Embed BEFORE writing: a failed embed leaves the stale blob_sha in
         # place, so the next run retries this note.
         chunk_rows, _ = await embed_note_chunks(
