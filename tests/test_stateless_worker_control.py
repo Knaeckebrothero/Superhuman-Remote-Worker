@@ -1194,6 +1194,7 @@ async def test_flag_on_cancel_returns_exact_409_for_active_control_claim(
         "context": {
             "_completion_control_claim": {
                 "version": 1,
+                "source": "public_pause",
                 "expires_epoch": 4_102_444_800,
             }
         },
@@ -1216,7 +1217,9 @@ async def test_flag_on_cancel_returns_exact_409_for_active_control_claim(
         await main.cancel_job(MagicMock(), JOB_ID)
 
     assert exc.value.status_code == 409
-    assert exc.value.detail == "job control is in progress"
+    assert exc.value.detail.startswith("job control is in progress")
+    assert "source=public_pause" in exc.value.detail
+    assert "expires_at=2100-01-01T00:00:00Z" in exc.value.detail
     cleanup.assert_not_awaited()
     if lane == "pinned":
         pinned_cancel.assert_awaited_once_with(
