@@ -8,7 +8,7 @@
 --                (brand-new objects, no contention).
 -- transactional: yes
 --
--- Design: knowledge-base/knowledge/features/postgres_audit_store_implementation.md §3 (copied
+-- Design: docs/features/postgres_audit_store_implementation.md §3 (copied
 -- verbatim; live-validated on PostgreSQL 15.18). Runtime partition maintenance
 -- (creation beyond this bootstrap, parent ANALYZE; retention deferred in the
 -- lean-cut PR 1) lives in orchestrator/services/audit_partitions.py.
@@ -22,7 +22,7 @@
 -- Requires a server built --with-lz4 (true for official/PGDG images); the
 -- SET COMPRESSION statements below fail loudly otherwise.
 --
--- Design: knowledge-base/knowledge/features/postgres_audit_store.md. Three invariants enforced
+-- Design: docs/features/postgres_audit_store.md. Three invariants enforced
 -- here and in review:
 --   1. agent_audit is APPEND-ONLY. The Mongo two-phase insert+update becomes
 --      two INSERTs (event_phase 'pre' then 'post', correlated by pre_id).

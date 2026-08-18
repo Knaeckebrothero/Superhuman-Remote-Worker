@@ -6,7 +6,7 @@
 --                (decision 23). Grandfathers existing approved users for the base-shipped
 --                always-on capabilities (shell, delegation) so deny-by-default is a no-op
 --                on upgrade (decision 19). 0029 was claimed by add_mistral_provider.
---                Design: knowledge-base/knowledge/features/global_expert_management.md (Slice 2).
+--                Design: docs/features/global_expert_management.md (Slice 2).
 -- depends-on:    0001_initial.sql
 -- expected:      < 1s. Two empty tables + INSERT..SELECT backfills over (small) users.
 -- locks:         AccessExclusiveLock on the new tables only.

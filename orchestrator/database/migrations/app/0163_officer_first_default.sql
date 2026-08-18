@@ -3,7 +3,7 @@
 --                officer_first: new posts get it from the column DEFAULT,
 --                existing posts still sitting on user_direct are moved onto it.
 --                Resolves the "Commissioning default" open question in
---                knowledge-base/knowledge/features/officer_message_routing.md.
+--                docs/features/officer_message_routing.md.
 -- depends-on:    0162_officer_ticket_claims.sql
 -- expected:      < 1s. Metadata-only SET DEFAULT plus a full UPDATE of
 --                project_officers (one row per project; dev: hundreds).

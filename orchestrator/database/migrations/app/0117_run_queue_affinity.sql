@@ -1,6 +1,6 @@
 -- migration:     0117_run_queue_affinity.sql
 -- description:   Warm-pod affinity for the stateless lane
---                (knowledge-base/knowledge/features/stateless_agents.md §5.3.4): remember which pod
+--                (docs/features/stateless_agents.md §5.3.4): remember which pod
 --                last held each unit's lease, so the general claim can give
 --                that pod a short head start on its own thread instead of
 --                racing every idle pod. A cold winner pays a full re-attach

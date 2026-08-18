@@ -11,7 +11,7 @@
 --                The `ready` TAG alone cannot express that: it has no time, so
 --                the tick could not tell "authorized, never dispatched" from
 --                "dispatched, awaiting review".
---                knowledge-base/knowledge/features/officer_backlog_pools.md §5.3 (B2).
+--                docs/features/officer_backlog_pools.md §5.3 (B2).
 -- depends-on:    0013_kb_backlog_ticket_types.sql
 -- expected:      < 1s; ALTER TABLE ... ADD COLUMN with a NULL default takes no
 --                table rewrite on PG11+.

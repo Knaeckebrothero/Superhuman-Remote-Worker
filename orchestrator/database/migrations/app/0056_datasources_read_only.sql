@@ -3,7 +3,7 @@
 --                sources. NULL = not applicable (private/job-scoped rows).
 --                Publishing defaults it to TRUE; type='kb' is always TRUE.
 --                Declarative only — credentials remain the enforcement
---                boundary (knowledge-base/knowledge/features/public_datasources.md).
+--                boundary (docs/features/public_datasources.md).
 -- depends-on:    0055_datasource_config.sql
 -- expected:      < 1s; brief table lock for ADD COLUMN (nullable, no default
 --                value rewrite).

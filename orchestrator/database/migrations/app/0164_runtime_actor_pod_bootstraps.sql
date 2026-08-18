@@ -2,7 +2,7 @@
 -- description:   Allow a thread-less, pod-scoped runtime actor bootstrap so a
 --                warm pool agent can prove pod possession for a session that
 --                did not exist when the pod was provisioned.
---                knowledge-base/knowledge/issues/pool_attach_has_no_runtime_actor_identity.md
+--                docs/issues/pool_attach_has_no_runtime_actor_identity.md
 -- depends-on:    0161_runtime_actor_credentials.sql
 -- expected:      milliseconds. One DROP NOT NULL on a small, short-TTL table.
 -- locks:         ACCESS EXCLUSIVE on runtime_actor_bootstraps for the catalog

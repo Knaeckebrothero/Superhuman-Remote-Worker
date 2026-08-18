@@ -3,7 +3,7 @@
 --                CIDRs a workspace pod can reach at the pod-network layer
 --                (per-project egress policy via the workspace NetworkPolicy
 --                per-tier templating in helm). See
---                knowledge-base/knowledge/features/workspace_network_isolation.md §3.
+--                docs/features/workspace_network_isolation.md §3.
 --
 --                Tiers shipped in PR 3:
 --                  - 'internet-only' (default): public internet only;
@@ -62,6 +62,6 @@ COMMENT ON COLUMN projects.network_tier IS
     'workspace pods can reach. The orchestrator emits this value as the '
     'srw.io/network-tier pod label; the matching helm NetworkPolicy '
     '(one per tier) enforces the allowlist. See '
-    'knowledge-base/knowledge/features/workspace_network_isolation.md §3.';
+    'docs/features/workspace_network_isolation.md §3.';
 
 COMMIT;

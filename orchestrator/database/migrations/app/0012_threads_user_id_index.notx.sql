@@ -4,7 +4,7 @@
 --                growing table.
 --
 --                Background: F1 of the multi-tenancy work (see
---                knowledge-base/knowledge/multi_tenancy.md) centralises visibility queries in
+--                docs/multi_tenancy.md) centralises visibility queries in
 --                orchestrator/security/access.py. The threads table is the
 --                main per-user resource and ships without an index on
 --                user_id — list_threads and SSE filter currently rely on

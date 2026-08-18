@@ -6,7 +6,7 @@
 --                the OpenAI Responses API / Anthropic; the live gpt-5.5 path is
 --                Chat Completions where normalized replay suffices). Supersedes
 --                the lossy `thinking` column (kept for legacy reads). See
---                knowledge-base/knowledge/features/persistent_session_source_of_truth.md (D2, Q3).
+--                docs/features/persistent_session_source_of_truth.md (D2, Q3).
 --
 --                All columns nullable -> metadata-only, no row rewrite, no
 --                backfill (dev-cutover; old rows return NULL and degrade

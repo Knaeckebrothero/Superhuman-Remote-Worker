@@ -3,7 +3,7 @@
 --                datasource selection for a job (mirrors project_datasources
 --                and the thread metadata.datasource_ids list). Part of the
 --                explicit-only datasource attachment rollout
---                (knowledge-base/knowledge/features/multi_datasource_support.md): resolution now
+--                (docs/features/multi_datasource_support.md): resolution now
 --                returns only the datasources explicitly selected for a job
 --                instead of force-attaching every unlinked "global" datasource.
 --

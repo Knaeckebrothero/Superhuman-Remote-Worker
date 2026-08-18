@@ -3,11 +3,11 @@
 --                thread UUID (36 chars), not just the 6-hex email-threading
 --                key both columns were sized for.
 --
---                Officer pages (knowledge-base/knowledge/features/centurion.md §6) have no job
+--                Officer pages (docs/features/centurion.md §6) have no job
 --                behind them: the session thread is the addressable thing,
 --                and the only working reply channel is the session log at
 --                /sessions/{thread_id} (F4 addendum in
---                knowledge-base/knowledge/issues/officer_conference_live_fire_findings.md).
+--                docs/issues/officer_conference_live_fire_findings.md).
 --                _dispatch_officer_page now persists an outbound message_log
 --                row — the notification bell's backing store — with
 --                job_id NULL (the jobs FK forbids anything else) and

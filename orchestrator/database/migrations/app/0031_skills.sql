@@ -7,7 +7,7 @@
 --                for the catalog/menu. No project junction and no jobs.skill_id yet
 --                (project skills come from the Gitea repo; expert<->skill bindings
 --                are a later slice). Deleting a row cascades its files away.
---                Design: knowledge-base/knowledge/features/agent_skills.md (Slice 1).
+--                Design: docs/features/agent_skills.md (Slice 1).
 -- depends-on:    0001_initial.sql
 -- expected:      < 1s on dev DB. Two new empty tables, no table rewrite.
 -- locks:         AccessExclusiveLock on the two new tables only.
@@ -46,6 +46,6 @@ CREATE TABLE IF NOT EXISTS skill_files (
 COMMENT ON TABLE skills IS
     'DB-backed user/admin Agent Skills (overlay over bundled config/skills/). '
     'name/description denormalized from the canonical SKILL.md in skill_files. '
-    'Design: knowledge-base/knowledge/features/agent_skills.md.';
+    'Design: docs/features/agent_skills.md.';
 
 COMMIT;

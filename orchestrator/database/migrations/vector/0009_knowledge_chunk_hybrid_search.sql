@@ -1,5 +1,5 @@
 -- migration:     0009_knowledge_chunk_hybrid_search.sql
--- description:   OKF files-canonical KB — slice 3 PR4 (knowledge-base/knowledge/features/okf_knowledge_base.md
+-- description:   OKF files-canonical KB — slice 3 PR4 (docs/features/okf_knowledge_base.md
 --                §5.1 / §11 slice-3 PR4). The RETRIEVAL half of the cutover: the
 --                function `search_knowledge`/`kb_search` will call once PR4 flips
 --                the store method over. 0008 laid down `knowledge_chunks` (the

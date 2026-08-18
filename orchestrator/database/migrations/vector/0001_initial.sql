@@ -2,7 +2,7 @@
 -- description:   Initial vector-DB snapshot at migration-runner cutover.
 -- depends-on:    (none — first migration)
 -- expected:      Fast on empty DB; pre-marked applied on existing environments
---                (see knowledge-base/knowledge/db_migration.md §Operational runbook).
+--                (see docs/db_migration.md §Operational runbook).
 -- locks:         Brief AccessExclusiveLock per CREATE TABLE / CREATE INDEX.
 -- transactional: yes
 --
@@ -162,7 +162,7 @@ CREATE INDEX IF NOT EXISTS idx_tags_job ON source_tags(job_id);
 -- mechanism. That table is owned by orchestrator.database.migrate now —
 -- under a different shape (filename, checksum, ...) — and is created by
 -- the runner itself. Removed here to avoid colliding with the runner's
--- table on existing DBs; see knowledge-base/knowledge/db_migration.md.)
+-- table on existing DBs; see docs/db_migration.md.)
 
 -- Source embeddings
 CREATE TABLE IF NOT EXISTS source_embeddings (
@@ -189,7 +189,7 @@ END $$;
 -- ============================================================================
 -- 2. MEMORIES TABLE (Memory Light — RecallStore)
 -- Agent memory storage with hybrid search (dense vector + sparse keyword + recency).
--- See knowledge-base/knowledge/features/memory_light.md for full architecture.
+-- See docs/features/memory_light.md for full architecture.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS memories (
@@ -476,7 +476,7 @@ $$;
 -- 3. KNOWLEDGE INDEX (Project Knowledge Base — Search Index)
 -- Derived search index for project knowledge notes stored in Neo4j.
 -- Updated via write-through on every kb_write/kb_update.
--- See knowledge-base/knowledge/features/project_knowledge_base.md for full architecture.
+-- See docs/features/project_knowledge_base.md for full architecture.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS knowledge_index (

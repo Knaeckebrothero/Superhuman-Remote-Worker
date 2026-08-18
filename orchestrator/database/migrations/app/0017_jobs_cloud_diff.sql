@@ -1,6 +1,6 @@
 -- migration:     0017_jobs_cloud_diff.sql
 -- description:   Add four columns to the jobs table to support the two modes
---                of the job cloud workflow (knowledge-base/knowledge/features/job_cloud_export.md):
+--                of the job cloud workflow (docs/features/job_cloud_export.md):
 --
 --                Mode A (project-attached, primary): the orchestrator clones
 --                the project folder into the agent workspace at job-start,

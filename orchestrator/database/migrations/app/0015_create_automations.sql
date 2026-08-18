@@ -1,7 +1,7 @@
 -- migration:     0015_create_automations.sql
 -- description:   Create the automations table, the storage layer for
 --                schedule-based and event-based job triggers per
---                knowledge-base/knowledge/features/automations_v0.md.
+--                docs/features/automations_v0.md.
 --
 --                v0 only exercises the cron subset (trigger_type='cron');
 --                the table accepts both trigger types from day one so
@@ -150,7 +150,7 @@ COMMENT ON TABLE automations IS
     'Job templates fired by the cron_dispatcher (trigger_type=cron) or '
     'event_dispatcher (trigger_type=event, v0.5+). One row = one rule of '
     'the form "when X happens, create job Y". Design: '
-    'knowledge-base/knowledge/features/automations_v0.md.';
+    'docs/features/automations_v0.md.';
 
 COMMENT ON COLUMN automations.timezone IS
     'IANA timezone name (e.g. ''Europe/Berlin''), not a UTC offset. '
@@ -181,6 +181,6 @@ COMMENT ON COLUMN automations.max_fires_per_day IS
 COMMENT ON COLUMN automations.event_filter IS
     'JSONB filter for v0.5 event triggers. Unused in v0 (NULL for all rows). '
     'Shape: {event_type, expert?, tags_any?, tags_all?, min_priority?, '
-    'parent_automation_id?}. See knowledge-base/knowledge/features/automations.md §Event Triggers.';
+    'parent_automation_id?}. See docs/features/automations.md §Event Triggers.';
 
 COMMIT;

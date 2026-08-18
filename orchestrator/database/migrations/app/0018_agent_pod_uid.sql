@@ -1,6 +1,6 @@
 -- migration:     0018_agent_pod_uid.sql
 -- description:   Add pod_uid column to agents table. Used by the session
---                router (knowledge-base/knowledge/features/direct_session_websockets.md) to set
+--                router (docs/features/direct_session_websockets.md) to set
 --                K8s ownerReferences on per-session Service and Ingress
 --                resources, so K8s GC cleans them up when the pod is deleted.
 --

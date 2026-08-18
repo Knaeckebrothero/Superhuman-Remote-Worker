@@ -2,7 +2,7 @@
 -- description:   Thread-scoped tool permission requests + LISTEN/NOTIFY trigger.
 --
 --                Phase 3 of headless persistent sessions
---                (knowledge-base/knowledge/features/headless_persistent_sessions.md). Before
+--                (docs/features/headless_persistent_sessions.md). Before
 --                this migration, an agent waiting for tool-call approval
 --                blocked on an in-memory `asyncio.Queue` populated by the
 --                WebSocket handler. When the WS closed mid-prompt the

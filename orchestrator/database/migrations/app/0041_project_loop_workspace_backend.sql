@@ -7,7 +7,7 @@
 --                (root + sudo) instead of the default sandbox container.
 --                NULL = unchanged behaviour (each job defaults to sandbox).
 --                See orchestrator/services/project_loops.py (create_loop_job)
---                and knowledge-base/knowledge/features/project_self_improvement_loop.md.
+--                and docs/features/project_self_improvement_loop.md.
 -- depends-on:    0040_sudo_request_reply_subject_unique.sql
 -- expected:      < 100ms. One nullable column on a tiny table (no default, no
 --                rewrite) + a CHECK validated against an all-NULL column.

@@ -2,7 +2,7 @@
 -- description:   Make the six hybrid-search functions actually USE the halfvec
 --                HNSW indexes that 0002-0005 built. Fixes the unfinished half of
 --                memory_bugs.md B2 — see
---                knowledge-base/knowledge/issues/hnsw_indexes_never_used_inside_hybrid_search_functions.md
+--                docs/issues/hnsw_indexes_never_used_inside_hybrid_search_functions.md
 --
 --                THE DEFECT. B2 created the indexes and re-created these functions
 --                with matching subvector/halfvec casts, then recorded a

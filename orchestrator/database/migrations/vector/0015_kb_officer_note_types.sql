@@ -9,7 +9,7 @@
 --                (kb_write), NOT by a partial unique index: the reindexer
 --                upserts rows from human-editable files, and a constraint
 --                violation there would wedge a whole reindex run over one
---                duplicate file. See knowledge-base/knowledge/features/centurion.md §5.
+--                duplicate file. See docs/features/centurion.md §5.
 -- depends-on:    0014_kb_backlog_index.notx.sql
 -- transactional: YES.
 

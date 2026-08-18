@@ -2,7 +2,7 @@
 -- description:   Append-only event log for persistent-session subscribers.
 --
 --                Phase 2 of headless persistent sessions
---                (knowledge-base/knowledge/features/headless_persistent_sessions.md). The
+--                (docs/features/headless_persistent_sessions.md). The
 --                agent's persistent loop writes every frame the cockpit
 --                would have seen — streaming tokens, tool events, turn
 --                lifecycle, status — to this table. Reconnecting clients
@@ -66,7 +66,7 @@ CREATE INDEX IF NOT EXISTS idx_thread_events_thread_created
 
 COMMENT ON TABLE thread_events IS
     'Append-only wire-frame log for persistent-session SSE replay. '
-    'See knowledge-base/knowledge/features/headless_persistent_sessions.md.';
+    'See docs/features/headless_persistent_sessions.md.';
 COMMENT ON COLUMN thread_events.epoch IS
     'Bumped on agent pod restart with cold checkpoint. Client cursors '
     'whose epoch != current force a full re-sync (GONE_BEYOND_HORIZON).';
