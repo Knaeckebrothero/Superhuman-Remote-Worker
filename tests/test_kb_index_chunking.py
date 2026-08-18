@@ -540,6 +540,152 @@ class TestUpsertKbNote:
 
 
 # =============================================================================
+# upsert_kb_note seeds the convergence TTL (Slice A task 5): after Slice A
+# the file-canonical write is the only writer for a new note, so it must seed
+# remaining_cycles the same way upsert_note (the agent-write path) already
+# does -- and must never reset it on a later reindex.
+# =============================================================================
+
+
+class TestUpsertKbNoteSeedsTtl:
+    """A file-canonical write must seed the convergence TTL, because after
+    Slice A nothing else does — and must never reset it on a later reindex."""
+
+    @pytest.mark.asyncio
+    async def test_seeds_the_note_types_ttl_on_insert(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="ttl-seed",
+            path="knowledge/ttl-seed.md",
+            title="TTL seed",
+            note_type="state",  # KB_TTL_BY_NOTE_TYPE['state'] == 2
+            content="body",
+            blob_sha=None,
+            embedding_version=None,
+        )
+        query, *params = mock_db.fetchval.call_args[0]
+        assert "remaining_cycles" in query
+        assert 2 in params
+
+    @pytest.mark.asyncio
+    async def test_a_durable_note_type_stays_null(self):
+        # KB_TTL_DEFAULT is None: 'decision' notes never count down. Coercing
+        # that to a number would put durable knowledge on a countdown.
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="durable",
+            path="knowledge/durable.md",
+            title="Durable",
+            note_type="decision",
+            content="body",
+            blob_sha=None,
+            embedding_version=None,
+        )
+        _query, *params = mock_db.fetchval.call_args[0]
+        assert 2 not in params
+        assert 3 not in params
+
+    @pytest.mark.asyncio
+    async def test_on_conflict_never_touches_remaining_cycles(self):
+        # The mechanism that preserves a decremented TTL across reindexes: the
+        # column is seeded on INSERT and absent from DO UPDATE. If it appeared
+        # there, every sweep would re-arm every note's countdown.
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="ttl-keep",
+            path="knowledge/ttl-keep.md",
+            title="TTL keep",
+            note_type="state",
+            content="body",
+            blob_sha=None,
+            embedding_version=None,
+        )
+        query, *_params = mock_db.fetchval.call_args[0]
+        _insert_half, conflict_half = query.split("DO UPDATE", 1)
+        assert "remaining_cycles" not in conflict_half
+
+
+# =============================================================================
+# upsert_kb_note retrieval_messages sentinel (Slice A task 5): None must mean
+# "leave the stored value alone", the same COALESCE contract
+# TestUpsertKbNotePriorityCoalesceSentinel (test_knowledge_store.py) pins for
+# priority/ready_at. OKF frontmatter carries no retrieval_messages field, so a
+# reindex has no opinion of its own -- without this, a value set through the
+# inline materialize call would be wiped back to empty by the very next sweep.
+# =============================================================================
+
+
+class TestUpsertKbNoteRetrievalMessagesCoalesceSentinel:
+    @pytest.mark.asyncio
+    async def test_coalesces_none_against_existing_row_on_conflict(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="learning",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            retrieval_messages=None,
+        )
+        query, *params = mock_db.fetchval.call_args[0]
+        assert (
+            "retrieval_messages = COALESCE($11::text[], "
+            "knowledge_index.retrieval_messages)" in query
+        )
+        # This layer must never turn None into [] itself -- that decision
+        # belongs entirely to the SQL COALESCE against the live row.
+        assert params[10] is None
+
+    @pytest.mark.asyncio
+    async def test_coalesces_none_to_empty_array_for_a_fresh_row(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="learning",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            retrieval_messages=None,
+        )
+        query = mock_db.fetchval.call_args[0][0]
+        assert "COALESCE($11::text[], '{}'::text[])" in query
+
+    @pytest.mark.asyncio
+    async def test_explicit_retrieval_messages_still_win(self):
+        """Regression guard: the sentinel must not interfere with a real,
+        caller-supplied value."""
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="learning",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            retrieval_messages=["what auth approach?"],
+        )
+        _query, *params = mock_db.fetchval.call_args[0]
+        assert params[10] == ["what auth approach?"]
+
+
+# =============================================================================
 # replace_note_chunks — atomic delete + insert of a note's chunks
 # =============================================================================
 

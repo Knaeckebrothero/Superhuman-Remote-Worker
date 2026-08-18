@@ -520,6 +520,38 @@ class TestIndexSingleNote:
         assert outcome.status == "indexed"
         assert outcome.chunks > 2
 
+    def test_forwards_retrieval_messages_to_the_row(self):
+        store = _index_store()
+        asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=uuid.uuid4(),
+                path="knowledge/n.md",
+                text=_note_md("n"),
+                blob_sha="sha",
+                embedding_stamp=EMBEDDING_VERSION,
+                retrieval_messages=["when does the sweep run?"],
+            )
+        )
+        kwargs = store.upsert_kb_note.await_args.kwargs
+        assert kwargs["retrieval_messages"] == ["when does the sweep run?"]
+
+    def test_omitted_retrieval_messages_leave_the_row_alone(self):
+        store = _index_store()
+        asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=uuid.uuid4(),
+                path="knowledge/n.md",
+                text=_note_md("n"),
+                blob_sha="sha",
+                embedding_stamp=EMBEDDING_VERSION,
+            )
+        )
+        assert store.upsert_kb_note.await_args.kwargs["retrieval_messages"] is None
+
 
 # =============================================================================
 # note_fields — created (frontmatter) -> created_at (project-backlog-pipeline

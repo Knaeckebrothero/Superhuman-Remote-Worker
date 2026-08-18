@@ -412,6 +412,7 @@ async def index_single_note(
     embedding_stamp: str,
     movable_paths: Optional[List[str]] = None,
     max_chunks: Optional[int] = None,
+    retrieval_messages: Optional[List[str]] = None,
 ) -> NoteIndexOutcome:
     """Index ONE note into the disposable chunk index.
 
@@ -433,6 +434,11 @@ async def index_single_note(
     over it, the note returns ``oversized`` and the sweep indexes it instead.
     The sweep itself passes ``None`` — it has all the time it needs, and a
     note no one indexes is worse than a slow one.
+
+    ``retrieval_messages`` forwards straight to :meth:`KnowledgeStore.upsert_kb_note`.
+    ``None`` (the sweep's every call, since OKF frontmatter carries no such
+    field) means "leave the stored value alone" — only an inline materialize
+    call that was actually given messages has an opinion to write.
 
     Raises ``NoteIndexError`` for a genuine failure; returns a ``malformed``
     outcome for unparseable frontmatter, which is not an error here.
@@ -488,6 +494,7 @@ async def index_single_note(
             confidence=fields["confidence"],
             tags=fields["tags"],
             keywords=fields["keywords"],
+            retrieval_messages=retrieval_messages,
             superseded_by=fields["superseded_by"],
             priority=fields["priority"],
             created_at=fields["created_at"],

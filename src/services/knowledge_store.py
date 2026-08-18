@@ -1073,9 +1073,29 @@ class KnowledgeStore:
         Stamping ``now()`` here instead would re-arm every ready ticket in
         the vault on the next reindex and re-dispatch work already done.
 
+        ``retrieval_messages`` takes the same sentinel too, for a third
+        reason again: OKF frontmatter has no ``retrieval_messages:`` field
+        (:func:`_render_note_md` never emits one), so a reindex has no
+        opinion of its own. ``None`` means "leave the stored value alone" —
+        the counterpart to :meth:`upsert_note`'s own agent-write path, and
+        the only way a value set through the inline materialize call
+        (Slice A) survives the very next sweep instead of being wiped back
+        to empty.
+
+        ``remaining_cycles`` is seeded on INSERT only. After Slice A the
+        file-canonical path is the only writer for a new note, so if it did
+        not seed the TTL, convergence re-verification would never see the
+        note. It is deliberately absent from the ON CONFLICT branch: a
+        reindex is a replay, not a new authorization, and re-seeding would
+        reset every note's TTL on every sweep.
+
         Returns the row id (for the chunk FK).
         """
         content_hash = self._content_hash(content)
+        # Initial TTL (loop cycles) by note_type — set only on INSERT, the same
+        # rule (and the same helper) as upsert_note. After Slice A this is the
+        # only writer for a new note, so without it convergence never sees one.
+        ttl_value = self._ttl_for_note_type(note_type)
         # priority ($21) is referenced twice below with two different
         # COALESCE fallbacks, mirroring upsert_note's INSERT branch (see the
         # comment there): the VALUES list needs a concrete NOT-NULL value for
@@ -1085,6 +1105,17 @@ class KnowledgeStore:
         # $21 parameter, not EXCLUDED.priority: EXCLUDED.priority is already
         # the VALUES-list's coalesced-to-1 result and can never itself be
         # NULL, so using it here would silently reintroduce the clobber.
+        #
+        # retrieval_messages ($11) gets the identical treatment for the same
+        # reason, against the column's own empty-array default rather than a
+        # literal 1. The explicit ``::text[]`` casts are load-bearing: both
+        # sides of a bare ``COALESCE($11, '{}')`` are otherwise untyped, and
+        # Postgres's fallback type for an all-unknown COALESCE is scalar
+        # ``text``, not ``text[]`` — verified against a live Postgres, not
+        # just this mock-based suite (which cannot catch a mistake here).
+        #
+        # remaining_cycles ($23) is new (task 5) and does NOT follow this
+        # pattern — it has no ON CONFLICT branch at all (see the docstring).
         return await self.db.fetchval(
             """
             INSERT INTO knowledge_index
@@ -1093,19 +1124,20 @@ class KnowledgeStore:
                  status, confidence, tags, keywords, retrieval_messages,
                  blob_sha, embedding_version, superseded_by, invalidated_at,
                  job_id, phase, content_hash, created_at, modified_at, indexed_at,
-                 priority, ready_at)
+                 priority, ready_at, remaining_cycles)
             VALUES
                 ($1, $1, $2, $3, $4, $5, $6,
                  to_tsvector('english', $6),
-                 $7, $8, $9, $10, $11,
+                 $7, $8, $9, $10, COALESCE($11::text[], '{}'::text[]),
                  $12, $13, $14, $15,
                  $16, $17, $18, $19, $20, NOW(),
-                 COALESCE($21, 1), $22)
+                 COALESCE($21, 1), $22, $23)
             ON CONFLICT (kb_id, path) WHERE kb_id IS NOT NULL AND path IS NOT NULL
             DO UPDATE SET
                 note_id = $2, title = $4, note_type = $5, content = $6,
                 status = $7, confidence = $8, tags = $9, keywords = $10,
-                retrieval_messages = $11, blob_sha = $12, embedding_version = $13,
+                retrieval_messages = COALESCE($11::text[], knowledge_index.retrieval_messages),
+                blob_sha = $12, embedding_version = $13,
                 superseded_by = $14, invalidated_at = $15, job_id = $16,
                 phase = $17, content_hash = $18, modified_at = $20, indexed_at = NOW(),
                 search_doc = EXCLUDED.search_doc,
@@ -1123,7 +1155,7 @@ class KnowledgeStore:
             confidence,
             tags or [],
             keywords or [],
-            retrieval_messages or [],
+            retrieval_messages,
             blob_sha,
             embedding_version,
             superseded_by,
@@ -1135,6 +1167,7 @@ class KnowledgeStore:
             modified_at,
             priority,
             ready_at,
+            ttl_value,
         )
 
     async def stamp_note_indexed(
