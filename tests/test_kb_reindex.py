@@ -463,6 +463,63 @@ class TestIndexSingleNote:
             "knowledge/old.md"
         ]
 
+    def test_over_the_chunk_cap_defers_without_embedding(self):
+        store = _index_store()
+        embedder = _embedder()
+        # Six ~600-token sections chunk to six chunks, over a cap of 2.
+        body = "\n\n".join(f"## Section {i}\n\n" + ("word " * 600) for i in range(6))
+        outcome = asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=embedder,
+                kb_id=uuid.uuid4(),
+                path="knowledge/dump.md",
+                text=f"---\nid: dump\ntype: learning\n---\n# Dump\n\n{body}\n",
+                blob_sha="sha",
+                embedding_stamp=EMBEDDING_VERSION,
+                max_chunks=2,
+            )
+        )
+        assert outcome.status == "oversized"
+        assert outcome.note_id == "dump"
+        assert outcome.chunks > 2
+        embedder.embed_batch.assert_not_awaited()
+        store.upsert_kb_note.assert_not_awaited()
+
+    def test_under_the_cap_indexes_normally(self):
+        store = _index_store()
+        outcome = asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=uuid.uuid4(),
+                path="knowledge/small.md",
+                text=_note_md("small"),
+                blob_sha="sha",
+                embedding_stamp=EMBEDDING_VERSION,
+                max_chunks=8,
+            )
+        )
+        assert outcome.status == "indexed"
+        store.stamp_note_indexed.assert_awaited_once()
+
+    def test_no_cap_indexes_a_large_note(self):
+        store = _index_store()
+        body = "\n\n".join(f"## Section {i}\n\n" + ("word " * 600) for i in range(6))
+        outcome = asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=uuid.uuid4(),
+                path="knowledge/dump.md",
+                text=f"---\nid: dump\ntype: learning\n---\n# Dump\n\n{body}\n",
+                blob_sha="sha",
+                embedding_stamp=EMBEDDING_VERSION,
+            )
+        )
+        assert outcome.status == "indexed"
+        assert outcome.chunks > 2
+
 
 # =============================================================================
 # note_fields — created (frontmatter) -> created_at (project-backlog-pipeline
