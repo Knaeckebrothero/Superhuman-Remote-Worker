@@ -120,18 +120,23 @@ def main() -> None:
     args = parser.parse_args()
 
     # The catalogue lives in the private design vault, which is a separate
-    # nested clone. Guard before mkdir: without this, a vault-less machine
-    # would fabricate a bare knowledge-base/ tree that belongs to no repo and
-    # silently write the catalogue into a gitignored void.
+    # nested clone. Skip it — do not fail — when the vault is absent: CI and
+    # any vault-less checkout can neither read the file to check it nor write
+    # it without mkdir(parents=True) fabricating a bare knowledge-base/ tree
+    # that belongs to no repo, dropping the catalogue into a gitignored void.
+    # The public artifacts are still generated and checked.
     vault = ROOT / "knowledge-base"
+    vault_cloned = (vault / ".git").exists()
     stale: list[Path] = []
     for path, expected in _artifacts().items():
-        if path.is_relative_to(vault) and not (vault / ".git").exists():
-            raise SystemExit(
-                f"{path.relative_to(ROOT)} lives in the design vault, but "
-                "knowledge-base/ is not cloned here. Clone it first — see "
-                "AGENTS.md, 'Design vault'."
+        if path.is_relative_to(vault) and not vault_cloned:
+            print(
+                f"skipping {path.relative_to(ROOT)}: it lives in the design "
+                "vault and knowledge-base/ is not cloned here — see AGENTS.md, "
+                "'Design vault'.",
+                file=sys.stderr,
             )
+            continue
         current = path.read_text(encoding="utf-8") if path.is_file() else None
         if current == expected:
             continue
