@@ -54800,15 +54800,37 @@ async def materialize_knowledge_note(
     one note, one commit, into whichever repo ``resolve_kb_repo`` picks.
 
     Always answers 200 with the service's ``{status, reason, repo, branch,
-    path, operation}``; the failure vocabulary lives in the body, not the HTTP
-    code, because the caller is required to log-and-continue exactly as the
-    old non-fatal file write did. ``status`` is ``committed`` / ``skipped``
-    (``no-repo``, ``unchanged``) / ``failed``.
+    path, operation, indexed, index_reason}``; the failure vocabulary lives in
+    the body, not the HTTP code. ``indexed`` reports whether the note is
+    searchable already — ``false`` with an ``index_reason`` means the commit
+    landed and the sweep will finish the job.
     """
     await require_internal(request)
     from services.kb_materialize import (
         materialize_knowledge_note as _materialize_note,
     )
+
+    # Slice A: hand the materialiser an indexer so the note is searchable when
+    # this call returns. Both legs are optional by design — a deployment with
+    # no resolvable embedding service commits the note and lets the sweep
+    # index it, which is exactly the pre-Slice-A behaviour.
+    store = None
+    svc = None
+    try:
+        svc = await _build_kb_embedding_service()
+        if svc is not None:
+            from src.services.knowledge_store import KnowledgeStore
+
+            store = KnowledgeStore(db=vector_db, embedding_service=svc)
+    except Exception:
+        logger.warning(
+            "kb-materialize: no inline indexer for project %s — the note will "
+            "commit and be indexed by the next sweep",
+            project_id,
+            exc_info=True,
+        )
+        store = None
+        svc = None
 
     return await _materialize_note(
         postgres_db=postgres_db,
@@ -54817,6 +54839,8 @@ async def materialize_knowledge_note(
         slug=body.slug,
         content=body.content,
         job_id=body.job_id,
+        store=store,
+        embedding_service=svc,
     )
 
 

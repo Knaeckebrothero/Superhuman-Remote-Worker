@@ -1146,3 +1146,113 @@ class TestDeleteKnowledgeNote:
         with pytest.raises(HTTPException) as exc_info:
             await delete_knowledge_note("proj-1", "n1", conn)
         assert exc_info.value.status_code == 500
+
+
+class TestMaterializeEndpointIndexesInline:
+    """The endpoint must hand the materialiser an indexer, or nothing is
+    searchable until the next sweep — the whole point of Slice A."""
+
+    @pytest.mark.asyncio
+    async def test_endpoint_passes_a_store_and_embedding_service(self):
+        import orchestrator.main as main
+
+        captured = {}
+
+        async def _fake_materialize(**kwargs):
+            captured.update(kwargs)
+            return {"status": "committed", "indexed": True, "index_reason": None}
+
+        svc = MagicMock()
+        with (
+            patch.object(
+                main, "_build_kb_embedding_service", AsyncMock(return_value=svc)
+            ),
+            patch(
+                "services.kb_materialize.materialize_knowledge_note", _fake_materialize
+            ),
+            patch.object(main, "require_internal", AsyncMock(return_value=None)),
+        ):
+            result = await main.materialize_knowledge_note(
+                request=MagicMock(),
+                project_id="1a387b4d-0000-0000-0000-000000000000",
+                body=main.KnowledgeMaterializeRequest(
+                    slug="a-note", content="---\nid: a-note\n---\n# A\n"
+                ),
+            )
+
+        assert result["indexed"] is True
+        assert captured["store"] is not None
+        assert captured["embedding_service"] is svc
+
+    @pytest.mark.asyncio
+    async def test_no_embedding_service_still_commits(self):
+        import orchestrator.main as main
+
+        captured = {}
+
+        async def _fake_materialize(**kwargs):
+            captured.update(kwargs)
+            return {
+                "status": "committed",
+                "indexed": False,
+                "index_reason": "no-indexer",
+            }
+
+        with (
+            patch.object(
+                main, "_build_kb_embedding_service", AsyncMock(return_value=None)
+            ),
+            patch(
+                "services.kb_materialize.materialize_knowledge_note", _fake_materialize
+            ),
+            patch.object(main, "require_internal", AsyncMock(return_value=None)),
+        ):
+            result = await main.materialize_knowledge_note(
+                request=MagicMock(),
+                project_id="1a387b4d-0000-0000-0000-000000000000",
+                body=main.KnowledgeMaterializeRequest(
+                    slug="a-note", content="---\nid: a-note\n---\n# A\n"
+                ),
+            )
+
+        assert result["status"] == "committed"
+        assert captured["store"] is None
+        assert captured["embedding_service"] is None
+
+    @pytest.mark.asyncio
+    async def test_embedding_service_resolution_error_still_commits(self):
+        """A misconfigured embedding backend must degrade, not 500 the write."""
+        import orchestrator.main as main
+
+        captured = {}
+
+        async def _fake_materialize(**kwargs):
+            captured.update(kwargs)
+            return {
+                "status": "committed",
+                "indexed": False,
+                "index_reason": "no-indexer",
+            }
+
+        with (
+            patch.object(
+                main,
+                "_build_kb_embedding_service",
+                AsyncMock(side_effect=RuntimeError("catalog unavailable")),
+            ),
+            patch(
+                "services.kb_materialize.materialize_knowledge_note", _fake_materialize
+            ),
+            patch.object(main, "require_internal", AsyncMock(return_value=None)),
+        ):
+            result = await main.materialize_knowledge_note(
+                request=MagicMock(),
+                project_id="1a387b4d-0000-0000-0000-000000000000",
+                body=main.KnowledgeMaterializeRequest(
+                    slug="a-note", content="---\nid: a-note\n---\n# A\n"
+                ),
+            )
+
+        assert result["status"] == "committed"
+        assert captured["store"] is None
+        assert captured["embedding_service"] is None
