@@ -68,9 +68,9 @@ Two rules that matter when adding notes:
   and `docs/security/endpoint_inventory.txt` + `docs/ci_self_hosted_runners.md` are policy
   manifests that CI validates against the code — CI cannot read the private vault, so they
   must live beside the code.
-- **Everything before 2026-08-17 is in this repository's git history**, under the old
-  `docs/` path. `git log -- docs/…` and `git show <sha>:docs/…` still work; the folder was
-  removed going forward, not rewritten out of the past.
+- **The design trail from before 2026-08-17 is in this repository's git history**, under
+  the old `docs/` path. `git log -- docs/…` and `git show <sha>:docs/…` work; the folder
+  was removed going forward.
 
 ## Working Agreements
 
