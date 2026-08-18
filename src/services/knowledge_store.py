@@ -49,6 +49,13 @@ from src.shared.backlog_tags import strip_machine_tags
 logger = logging.getLogger(__name__)
 
 
+# Every stored note identifier is VARCHAR(100): knowledge_index.note_id and
+# .superseded_by, knowledge_links.source_id and .target_id. Ingest clamps ids to
+# this bound (kb_reindex._NOTE_ID_MAX), so anything longer could never resolve to
+# a note and must not be handed to Postgres unclamped.
+NOTE_ID_MAX = 100
+
+
 # TTL (in loop cycles) by note_type for KB convergence — see
 # docs/features/kb_convergence_ttl_reverification.md. ``None`` = no TTL (durable
 # facts never expire on a clock; they're only retired by an explicit newer note).
@@ -1296,9 +1303,26 @@ class KnowledgeStore:
             "DELETE FROM knowledge_links WHERE source_note_row = $1",
             source_note_row,
         )
+        source_id = str(source_id)[:NOTE_ID_MAX]
         seen: set = set()
         written = 0
         for target in targets:
+            # Clamp BEFORE the dedupe so two targets differing only past the
+            # bound collapse into the single edge they would both resolve to.
+            #
+            # Unclamped, a long `[[wikilink]]` raised "value too long for type
+            # character varying(100)" here. Because links are written *before*
+            # stamp_note_indexed, that left the note unstamped, so every
+            # subsequent sweep retried it and failed identically — 17 notes in
+            # the Better Resavio archive looped this way indefinitely, holding
+            # the whole KB at `partial` while the other 2618 were fine.
+            #
+            # Truncating costs no reachability: get_related_notes resolves
+            # target_id against knowledge_index.note_id, which ingest already
+            # clamps to the same bound, so an over-long target could never have
+            # matched a note. It gains some — a target written out in full now
+            # matches the note whose id was clamped on the way in.
+            target = str(target)[:NOTE_ID_MAX]
             if target in seen:
                 continue
             seen.add(target)
