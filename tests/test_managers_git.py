@@ -157,6 +157,32 @@ class TestPushSkipLogging:
         )
 
 
+class TestRevParse:
+    """rev_parse resolves refs so repo_push can verify what actually moved."""
+
+    def test_resolves_head_to_a_full_sha(self, initialized_git):
+        sha = initialized_git.rev_parse("HEAD")
+        assert sha is not None
+        assert len(sha) == 40
+
+    def test_unknown_ref_returns_none(self, initialized_git):
+        assert initialized_git.rev_parse("origin/definitely-missing") is None
+
+    def test_inactive_repo_returns_none(self, git_manager):
+        assert git_manager.rev_parse("HEAD") is None
+
+    def test_push_moves_the_remote_tracking_ref(self, initialized_git, bare_remote):
+        """A successful push updates origin/<branch>, which is how repo_push
+        tells a real update from git's exit-0 'Everything up-to-date'."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        branch = initialized_git.current_branch()
+        assert initialized_git.rev_parse(f"origin/{branch}") is None
+        assert initialized_git.push() is True
+        assert initialized_git.rev_parse(f"origin/{branch}") == (
+            initialized_git.rev_parse("HEAD")
+        )
+
+
 class TestGitManagerInit:
     """Tests for GitManager initialization."""
 

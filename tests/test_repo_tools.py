@@ -15,6 +15,7 @@ def make_context(read_only=False, forge="github"):
     git_mgr.push.return_value = True
     git_mgr.pull.return_value = True
     git_mgr.current_branch.return_value = "job/abc12345"
+    git_mgr.rev_parse.return_value = None
     ws.source_repos = {"widget": git_mgr}
     ws.source_repo_meta = {
         "widget": {
@@ -53,6 +54,101 @@ async def test_repo_push_pushes_current_branch():
     await tool.ainvoke({"repo": "widget"})
 
     git_mgr.push.assert_called_once()
+
+
+def track_remote_refs(git_mgr, refs):
+    """Back rev_parse with ``refs`` and make push move origin/<branch>,
+    mirroring how a real push updates the local remote-tracking ref."""
+    git_mgr.rev_parse.side_effect = refs.get
+
+    def fake_push(branch=None):
+        refs[f"origin/{branch}"] = refs[branch]
+        return True
+
+    git_mgr.push.side_effect = fake_push
+
+
+@pytest.mark.asyncio
+async def test_repo_push_reports_noop_when_remote_is_already_up_to_date():
+    """git exits 0 for 'Everything up-to-date'; the tool must not call
+    that 'Pushed' — three confident no-op pushes hid a lost deliverable."""
+    context, git_mgr = make_context()
+    sha = "a" * 40
+    git_mgr.rev_parse.side_effect = {
+        "job/abc12345": sha,
+        "origin/job/abc12345": sha,
+    }.get
+    tool = get_tool(create_repo_tools(context), "repo_push")
+
+    out = await tool.ainvoke({"repo": "widget"})
+
+    assert "NO-OP" in out
+    assert sha[:12] in out
+    assert "different branch" in out
+    assert "Pushed" not in out
+
+
+@pytest.mark.asyncio
+async def test_repo_push_reports_old_and_new_sha_when_the_ref_advances():
+    context, git_mgr = make_context()
+    refs = {"job/abc12345": "b" * 40, "origin/job/abc12345": "a" * 40}
+    track_remote_refs(git_mgr, refs)
+    tool = get_tool(create_repo_tools(context), "repo_push")
+
+    out = await tool.ainvoke({"repo": "widget"})
+
+    assert f"{'a' * 12} -> {'b' * 12}" in out
+    assert "NO-OP" not in out
+
+
+@pytest.mark.asyncio
+async def test_repo_push_reports_new_branch_when_remote_ref_did_not_exist():
+    context, git_mgr = make_context()
+    refs = {"job/abc12345": "b" * 40}
+    track_remote_refs(git_mgr, refs)
+    tool = get_tool(create_repo_tools(context), "repo_push")
+
+    out = await tool.ainvoke({"repo": "widget"})
+
+    assert f"(new branch) -> {'b' * 12}" in out
+    assert "NO-OP" not in out
+
+
+@pytest.mark.asyncio
+async def test_repo_push_refspec_target_keeps_the_simple_message():
+    """A raw refspec is a deliberate escape hatch; origin/<target> cannot
+    resolve, so the tool skips verification instead of breaking the push."""
+    context, git_mgr = make_context()
+    tool = get_tool(create_repo_tools(context), "repo_push")
+
+    out = await tool.ainvoke(
+        {"repo": "widget", "branch": "+refs/heads/main:refs/heads/feature/x"}
+    )
+
+    git_mgr.rev_parse.assert_not_called()
+    assert out == "Pushed +refs/heads/main:refs/heads/feature/x to widget's remote."
+
+
+@pytest.mark.asyncio
+async def test_repo_push_unresolvable_target_keeps_the_simple_message():
+    context, git_mgr = make_context()
+    git_mgr.rev_parse.return_value = None
+    tool = get_tool(create_repo_tools(context), "repo_push")
+
+    out = await tool.ainvoke({"repo": "widget"})
+
+    assert out == "Pushed job/abc12345 to widget's remote."
+
+
+@pytest.mark.asyncio
+async def test_repo_commit_names_the_branch_it_committed_on():
+    """A commit that silently lands on main must be visible in the reply."""
+    context, git_mgr = make_context()
+    tool = get_tool(create_repo_tools(context), "repo_commit")
+
+    out = await tool.ainvoke({"repo": "widget", "message": "fix: thing"})
+
+    assert "on branch 'job/abc12345'" in out
 
 
 @pytest.mark.asyncio
@@ -231,6 +327,7 @@ def make_context_without_metadata():
     git_mgr.push.return_value = True
     git_mgr.pull.return_value = True
     git_mgr.current_branch.return_value = "job/abc12345"
+    git_mgr.rev_parse.return_value = None
     ws.source_repos = {"widget": git_mgr}
     ws.source_repo_meta = {}
     return ToolContext(workspace_manager=ws), git_mgr

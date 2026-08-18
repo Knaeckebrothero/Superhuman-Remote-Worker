@@ -114,7 +114,9 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
         # manufacture an empty commit and report success, contradicting the
         # "nothing to commit" answer below.
         if git_mgr.commit(message, allow_empty=False):
-            return f"Committed in {repo}: {message}"
+            return (
+                f"Committed on branch '{git_mgr.current_branch()}' in {repo}: {message}"
+            )
         return (
             f"Nothing to commit in {repo} (or the commit failed). Inspect the "
             f"clone with the shell: `git -C repos/{repo} status`."
@@ -136,8 +138,23 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
         if refusal:
             return refusal
         target = branch or git_mgr.current_branch()
+        # A ':' or leading '+' makes target a raw refspec pass-through;
+        # "origin/<target>" would not resolve, so skip outcome verification.
+        plain = bool(target) and ":" not in target and not target.startswith("+")
+        local_sha = git_mgr.rev_parse(target) if plain else None
+        before = git_mgr.rev_parse(f"origin/{target}") if local_sha else None
         if git_mgr.push(branch=target):
-            return f"Pushed {target} to {repo}'s remote."
+            after = git_mgr.rev_parse(f"origin/{target}") if local_sha else None
+            if after is None:
+                return f"Pushed {target} to {repo}'s remote."
+            if after == before:
+                return (
+                    f"Push of '{target}' was a NO-OP: remote already at "
+                    f"{before[:12]}; nothing was transferred. Your commits "
+                    "may be on a different branch — check git_log."
+                )
+            old = before[:12] if before else "(new branch)"
+            return f"Pushed '{target}' to {repo}'s remote: {old} -> {after[:12]}."
         return (
             f"Push of {target} to {repo} failed. If the remote rejected it, the "
             "branch is probably protected — push a job branch instead."

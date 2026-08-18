@@ -1133,6 +1133,21 @@ class GitManager:
         except Exception:
             return None
 
+    def rev_parse(self, ref: str) -> str | None:
+        """Resolve a ref (e.g. "HEAD", "origin/main") to a commit SHA.
+
+        Returns:
+            Full commit SHA, or None if the ref does not resolve.
+        """
+        if not self.is_active:
+            return None
+
+        try:
+            result = self._run_git(["rev-parse", ref])
+            return result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            return None
+
     # Paths that are not part of what a round PRODUCED. Each changes on every
     # round regardless of the agent's output, so counting them makes the
     # content hash differ between two byte-identical rounds — reintroducing
