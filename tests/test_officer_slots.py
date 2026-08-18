@@ -26,6 +26,12 @@ ROSTER_META = {
 
 
 class TestValidateSlotsSpec:
+    @pytest.mark.parametrize("count", [0, 20])
+    def test_accepts_inclusive_slot_count_bounds(self, count):
+        assert validate_slots_spec({"line": {"count": count}}) == {
+            "line": {"count": count}
+        }
+
     def test_valid_spec_normalizes(self):
         cleaned = validate_slots_spec(
             {

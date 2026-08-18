@@ -3183,6 +3183,224 @@
     "deliveryFailed": "Zustellung fehlgeschlagen; Wiederholungsstatus beibehalten",
     "notQueued": "nicht eingereiht"
   },
+  "officerCard": {
+    "title": "Centurio",
+    "intro": "Ein ständiger Offizier für dieses Projekt: Er führt den Auftrag, überwacht Jobs und Flotte, entsendet Arbeiter aus seiner Ausrüstung und meldet sich nur, wenn du wirklich gebraucht wirst. In einer Konferenz sprichst du mit ihm; sein Hintergrundprotokoll ist das Sitzungsprotokoll. Der Posten überdauert ihn — Ausrüstung, Budgets und Gedächtnis bleiben zwischen Inkarnationen erhalten.",
+    "readOnly": "Du kannst diesen Offiziersposten ansehen, aber nur ein Projekteigentümer oder Systemadministrator darf ihn verwalten.",
+    "a11y": {
+      "loading": "Offiziersposten wird geladen",
+      "region": "Offiziersposten",
+      "brainModel": "Offiziersmodell",
+      "reasoning": "Denkaufwand des Offiziers",
+      "actionsPerWake": "Maximale Aktionen pro Weckruf",
+      "slotName": "Name von Platz {{index}}",
+      "slotCount": "Anzahl von Platz {{index}}",
+      "slotModel": "Modell von Platz {{index}}",
+      "slotWorkspace": "Arbeitsbereich von Platz {{index}}",
+      "slotPool": "Pool von Platz {{index}}",
+      "removeSlot": "Platz {{name}} entfernen",
+      "maxWorkers": "Maximale Arbeiterzahl",
+      "tokenCeiling": "Tägliche Token-Obergrenze",
+      "pagesPerDay": "Maximale Meldungen pro Tag",
+      "sleepMin": "Minimale Schlafdauer in Minuten",
+      "sleepMax": "Maximale Schlafdauer in Minuten",
+      "holdNote": "Notiz zur Aussetzung des Offiziers",
+      "routingPolicy": "Weiterleitung von Arbeiterfragen"
+    },
+    "actions": {
+      "addSlot": "Platz hinzufügen",
+      "cancel": "Abbrechen",
+      "commission": "Centurio einsetzen",
+      "conference": "Konferenz",
+      "confirmDecommission": "Abberufung bestätigen",
+      "confirmHold": "Aussetzung bestätigen",
+      "decommission": "Abberufen",
+      "decommissionKeepRunning": "Abberufen — Jobs weiterlaufen lassen",
+      "hold": "Aussetzen",
+      "keepOfficer": "Im Amt lassen",
+      "openLog": "Protokoll öffnen",
+      "rejoinConference": "Konferenz wieder betreten",
+      "release": "Freigeben",
+      "save": "Änderungen speichern"
+    },
+    "backlog": {
+      "autoPull": "Auto-Pull",
+      "on": "an — bereite Tickets werden freien Pool-Plätzen zugeteilt",
+      "off": "aus — Pools bleiben untätig, bis er manuell entsendet",
+      "stalled": "Festgefahren",
+      "stalledDetail": "{{count}} beanspruchte(s) Ticket(s) ohne Fortschritt — sie werden nie automatisch freigegeben; Job fortsetzen oder abbrechen, dann Ticket schließen oder erneut bereitstellen."
+    },
+    "brain": {
+      "actionsHint": "Harte Obergrenze für Werkzeugaufrufe pro Weckruf.",
+      "actionsLabel": "Aktionen pro Weckruf",
+      "modelHint": "Das Modell, auf dem sein Urteil beruht — wähle ein starkes; seine Weckrufe sind günstig, aber seine Entscheidungen lenken alles. Leer verwendet deinen Sitzungsstandard.",
+      "modelLabel": "Eigenes Modell des Offiziers",
+      "reasoningHint": "Aufwand pro Weckruf. Wird auf die Modellfähigkeiten begrenzt.",
+      "reasoningLabel": "Denkaufwand"
+    },
+    "budgets": {
+      "pages": "Meldungen pro Tag",
+      "pagesHint": "Wie oft er dich benachrichtigen darf (Standard 3).",
+      "tokenCeiling": "Tägliche Token-Obergrenze",
+      "tokenCeilingHint": "Für sein gesamtes Kommando. Leer bedeutet ohne Obergrenze."
+    },
+    "category": {
+      "none": "Kein Pool — der Offizier entsendet manuell",
+      "researcher": "Recherche — Ergebnis ist eine Antwort",
+      "tester": "Test — Ergebnis sind Issue-Tickets",
+      "executor": "Ausführung — Ergebnis sind ausgelieferte Dateien"
+    },
+    "decommission": {
+      "hint": "Ausrüstung, Budgets, Digest und SITREP-Fingerabdrücke bleiben am Posten; eine erneute Einsetzung stellt sie mit einer Kontinuitätsnotiz wieder her.",
+      "inFlightWarning": "Er hat {{count}} laufende(n) Job(s). Die Abberufung lässt sie weiterlaufen — ihre Abschlüsse landen im Posten-Ledger für seinen Nachfolger."
+    },
+    "defaults": {
+      "default": "Standard",
+      "project": "Projekt",
+      "session": "Sitzungsstandard",
+      "unlimited": "unbegrenzt",
+      "worker": "Arbeiterstandard"
+    },
+    "digest": {"title": "Digest — was er für dich vorgemerkt hat"},
+    "errors": {
+      "commission": "Einsetzung fehlgeschlagen",
+      "conference": "Konferenz konnte nicht geöffnet werden",
+      "decommission": "Abberufung fehlgeschlagen",
+      "hold": "Aussetzung fehlgeschlagen",
+      "policy": "Weiterleitung der Arbeiterfragen konnte nicht geändert werden",
+      "release": "Freigabe fehlgeschlagen",
+      "update": "Aktualisierung fehlgeschlagen",
+      "withDetail": "{{fallback}}: {{detail}}"
+    },
+    "hold": {
+      "noteHint": "Wird auf dem Abzeichen gezeigt — warum er zurücktritt. Anweisungen des Legaten erreichen ihn weiterhin.",
+      "noteLabel": "Notiz zur Aussetzung",
+      "placeholder": "Wartung"
+    },
+    "holdKind": {"maintenance": "Wartung", "conference": "Konferenz"},
+    "immediacy": {
+      "nextDelivery": "gilt ab der nächsten Zustellung",
+      "nextDispatch": "gilt ab der nächsten Entsendung",
+      "nextRespawn": "gilt nach dem nächsten Neustart",
+      "nextSleep": "gilt ab der nächsten Schlafmeldung"
+    },
+    "kit": {
+      "breakerOpen": "SCHUTZSCHALTER OFFEN",
+      "ready": "bereit {{count}}",
+      "readyBelowFloor": "bereit {{count}} — UNTER MINDESTBESTAND"
+    },
+    "machineState": {
+      "not-attempted": "nicht versucht",
+      "in-progress": "in Arbeit",
+      "retryable-failed": "wiederholbarer Fehler",
+      "permanent-failed": "dauerhafter Fehler",
+      "activated": "aktiviert",
+      "pending-sync": "Abgleich ausstehend",
+      "canonical": "kanonisch",
+      "failed": "fehlgeschlagen",
+      "superseded": "ersetzt",
+      "pending": "ausstehend",
+      "synced": "synchronisiert",
+      "projection-only": "nur Projektion",
+      "retryable": "wiederholbar",
+      "queued": "eingereiht",
+      "delivered": "zugestellt",
+      "unknown": "unbekannt"
+    },
+    "messages": {
+      "commissioned": "Eingesetzt.",
+      "commissionedWithBrief": "Eingesetzt — sein erster Weckruf enthält die Kontinuitätsnotiz. Öffne das Protokoll, um die Übernahme zu verfolgen.",
+      "decommissioned": "Posten abberufen — Ausrüstung, Budgets und Fingerabdrücke bleiben für den Nachfolger erhalten.",
+      "held": "Ausgesetzt — Entsendungen pausieren und der Wächter tritt zurück; deine Anweisungen erreichen ihn weiterhin.",
+      "released": "Freigegeben — wartende Ereignisse werden innerhalb eines Takts verarbeitet.",
+      "updated": "Posten aktualisiert — die Kapazitätszeile des nächsten SITREP zeigt den neuen Stand."
+    },
+    "policy": {
+      "title": "Arbeiterfragen",
+      "label": "Wenn ein Arbeiter eine Frage stellt",
+      "userDirect": "Direkt an mich",
+      "officerAndUser": "Offizier und ich",
+      "officerFirst": "Zuerst der Offizier",
+      "officerFirstRecommended": "Zuerst der Offizier (empfohlen)",
+      "hint": "Zuerst der Offizier fällt auf dich zurück, wenn er nicht verfügbar ist, und eskaliert nach {{minutes}} Min. ohne Antwort an dich.",
+      "hintVacant": "Zuerst der Offizier fällt auf dich zurück, wenn er nicht verfügbar ist, und eskaliert nach {{minutes}} Min. ohne Antwort an dich. Bei vakantem Posten gehen Fragen immer direkt an dich.",
+      "value": {
+        "user_direct": "Direkt an mich",
+        "officer_and_user": "Offizier und ich",
+        "officer_first": "Zuerst der Offizier"
+      }
+    },
+    "reasoning": {
+      "defaultHigh": "Standard (hoch)",
+      "low": "niedrig",
+      "medium": "mittel",
+      "high": "hoch",
+      "xhigh": "sehr hoch",
+      "max": "maximal"
+    },
+    "roster": {
+      "count": "Anzahl",
+      "countHint": "Null sperrt neue Aufnahmen, ohne laufende Arbeit abzubrechen; zulässig sind 0 bis 20.",
+      "drainHint": "{{inFlight}} laufend — wird auf {{count}} abgebaut",
+      "hint": "Ordne einen Platz einem Pool zu, damit der Offizier ihn automatisch mit bereiten Tickets dieser Art füllt; ohne Pool entsendet er die Kapazität manuell.",
+      "maxWorkers": "Max. Arbeiter",
+      "maxWorkersHint": "Flache Parallelitätsgrenze. Ohne Ausrüstung ist sie die einzige Schranke (Standard 3).",
+      "model": "Modell",
+      "pool": "Pool",
+      "slot": "Platz",
+      "slotPlaceholder": "Linie",
+      "workspace": "Arbeitsbereich"
+    },
+    "sections": {"brain": "Sein Modell", "budgets": "Budgets", "kit": "Ausrüstung", "sleep": "Schlaf"},
+    "sleep": {
+      "hint": "Er meldet seine Schlafzeit zwischen Weckrufen selbst; der Server begrenzt sie auf diese Werte.",
+      "min": "Min. (Minuten)",
+      "max": "Max. (Minuten)"
+    },
+    "status": {
+      "active": "aktiv",
+      "suspended": "ausgesetzt",
+      "ended": "beendet",
+      "created": "erstellt",
+      "processing": "in Bearbeitung",
+      "waiting_for_reply": "wartet auf Antwort",
+      "paused": "pausiert",
+      "pending_review": "Prüfung ausstehend",
+      "completed": "abgeschlossen",
+      "failed": "fehlgeschlagen",
+      "cancelled": "abgebrochen",
+      "held": "ausgesetzt",
+      "heldKind": "ausgesetzt — {{kind}}",
+      "unknown": "unbekannt"
+    },
+    "summary": {
+      "ceilingReached": "— Obergrenze erreicht; schläft bis zum Zurücksetzen",
+      "model": "Sein Modell",
+      "nextWake": "Nächster Weckruf",
+      "pagesToday": "Meldungen heute",
+      "queuedEvents": "Wartende Ereignisse",
+      "spendToday": "Verbrauch heute",
+      "tokens": "Token"
+    },
+    "vacant": {
+      "dropped": "… {{count}} ältere Einträge verworfen",
+      "flatCapHint": "Keine Plätze bedeutet eine flache Grenze von 3 parallelen Arbeitern. Der Offizier läuft kopflos; sein erster Weckruf enthält die Kontinuitätsnotiz und gegebenenfalls das Ledger der vakanten Zeit.",
+      "hint": "Der Posten ist vakant — kein Centurio hält diese Centurie. Ein Projekteigentümer oder Systemadministrator kann Ausrüstung zuweisen und ihn einsetzen.",
+      "ledgerTitle": "Während der Posten vakant war",
+      "pastIncarnations": "Frühere Inkarnationen"
+    },
+    "validation": {
+      "blankSlot": "Jede Zeile der Aufstellung benötigt einen Platznamen.",
+      "duplicateSlot": "Der Platzname '{{name}}' kommt mehrfach vor. Benenne den doppelten Eintrag um oder entferne ihn."
+    },
+    "wake": {
+      "dueNow": "jetzt fällig",
+      "eventDriven": "nicht geplant (ereignisgesteuert)",
+      "inMinutes": "in {{count}} Min.",
+      "overdueMinutes": "seit {{count}} Min. überfällig"
+    },
+    "workspace": {"sandbox": "Sandbox", "virtual": "virtuell", "none": "keiner", "vmRoot": "VM (Root)"}
+  },
   "pwa": {
     "splash": "Legion wird formiert…",
     "install": {

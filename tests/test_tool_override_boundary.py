@@ -740,6 +740,32 @@ def _persisted_thread_override(conn) -> dict:
 
 class TestSessionCreateBoundary:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", ["editor", "viewer"])
+    async def test_officer_conference_requires_current_management_authority(
+        self, session_create_env, monkeypatch, role
+    ):
+        main, db, _, _ = session_create_env
+        db.get_user_role_in_project = AsyncMock(return_value=role)
+        find_open = AsyncMock(return_value=None)
+        monkeypatch.setattr(main, "_find_open_conference_thread", find_open)
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="Officer conference",
+                    project_id=SESSION_THREAD_ID,
+                    project_ids=[SESSION_THREAD_ID],
+                    config_override={"officer": {"conference": True}},
+                ),
+                MagicMock(),
+            )
+
+        assert exc.value.status_code == 403
+        assert "Project owner" in exc.value.detail
+        db.create_thread.assert_not_awaited()
+        find_open.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_enabled_pool_auto_admits_sandbox_without_dedicated_agent(
         self, session_create_env, monkeypatch
     ):

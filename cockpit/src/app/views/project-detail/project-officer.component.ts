@@ -1,21 +1,13 @@
-import {
-  Component,
-  OnDestroy,
-  OnInit,
-  computed,
-  inject,
-  input,
-  signal,
-} from '@angular/core';
-import {DatePipe, DecimalPipe} from '@angular/common';
-import {HttpClient} from '@angular/common/http';
-import {Router, RouterLink} from '@angular/router';
-import {firstValueFrom} from 'rxjs';
-import {TranslocoPipe} from '@jsverse/transloco';
+import { Component, OnDestroy, OnInit, computed, inject, input, signal } from '@angular/core';
+import { DatePipe, DecimalPipe } from '@angular/common';
+import { HttpClient } from '@angular/common/http';
+import { Router, RouterLink } from '@angular/router';
+import { firstValueFrom } from 'rxjs';
+import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 
-import {environment} from '../../core/environment';
-import {ApiService} from '../../core/services/api.service';
-import {ModelService} from '../../core/services/model.service';
+import { environment } from '../../core/environment';
+import { ApiService } from '../../core/services/api.service';
+import { ModelService } from '../../core/services/model.service';
 import type {
   OfficerBrainSpec,
   OfficerDecommissionResult,
@@ -27,11 +19,11 @@ import type {
   OfficerVacantLedger,
   WorkerMessagesPolicy,
 } from '../../core/models/api.model';
-import {AppButtonComponent} from '../../ui/button';
-import {AppInputComponent} from '../../ui/input';
-import {AppSelectComponent} from '../../ui/select';
-import {AppFormFieldComponent} from '../../ui/form-field';
-import {AppSpinnerComponent} from '../../ui/spinner';
+import { AppButtonComponent } from '../../ui/button';
+import { AppInputComponent } from '../../ui/input';
+import { AppSelectComponent } from '../../ui/select';
+import { AppFormFieldComponent } from '../../ui/form-field';
+import { AppSpinnerComponent } from '../../ui/spinner';
 
 /** Editable roster row in the kit editor. */
 export interface SlotDraft {
@@ -41,6 +33,8 @@ export interface SlotDraft {
   backend: string;
   /** '' = not a pool (officer-directed only); otherwise a work category. */
   category: string;
+  /** Preserved from the durable roster; BP-01 owns any future editor control. */
+  spendCeilingDaily?: number | null;
 }
 
 /**
@@ -49,11 +43,13 @@ export interface SlotDraft {
  * own copy at provision time, so a drift here costs a 400, never a bad kit.
  */
 export const WORK_CATEGORY_OPTIONS = [
-  {value: '', label: 'No pool — officer dispatches by hand'},
-  {value: 'researcher', label: 'Researcher — deliverable is an answer'},
-  {value: 'tester', label: 'Tester — deliverable is issue tickets'},
-  {value: 'executor', label: 'Executor — deliverable is shipped files'},
+  { value: '', labelKey: 'officerCard.category.none' },
+  { value: 'researcher', labelKey: 'officerCard.category.researcher' },
+  { value: 'tester', labelKey: 'officerCard.category.tester' },
+  { value: 'executor', labelKey: 'officerCard.category.executor' },
 ] as const;
+
+export type OfficerTranslate = (key: string, params?: Record<string, unknown>) => string;
 
 /** The whole kit editor as plain strings ('' = unset / server default). */
 export interface OfficerEditorDraft {
@@ -80,6 +76,7 @@ export const STARTER_SLOT_DRAFT: SlotDraft = {
   // No category by default: a starter kit must not silently arm auto-pull on
   // a century whose officer has never triaged a backlog.
   category: '',
+  spendCeilingDaily: null,
 };
 
 /** Vacant / commissioned / held — held is commissioned-and-standing-down. */
@@ -93,9 +90,16 @@ export function postStateOf(post: OfficerPost | null): OfficerPostState {
  * the old hardcoded "held — conference in progress", which was wrong for
  * maintenance holds. The note renders separately.
  */
-export function holdBadgeLabel(held: OfficerHold | null | undefined): string {
+export function holdBadgeLabel(
+  held: OfficerHold | null | undefined,
+  translate: OfficerTranslate,
+): string {
   const kind = held?.kind?.trim();
-  return kind ? `held — ${kind}` : 'held';
+  if (!kind) return translate('officerCard.status.held');
+  const knownKind = ['maintenance', 'conference'].includes(kind)
+    ? translate(`officerCard.holdKind.${kind}`)
+    : kind;
+  return translate('officerCard.status.heldKind', { kind: knownKind });
 }
 
 /** Editor fields grouped by when a live edit actually lands (§7's table). */
@@ -109,19 +113,19 @@ export type OfficerEditField =
   | 'brain';
 
 /** Per-field honesty: what the §7 table promises, verbatim in the UI. */
-export function immediacyLabel(field: OfficerEditField): string {
+export function immediacyLabel(field: OfficerEditField, translate: OfficerTranslate): string {
   switch (field) {
     case 'slots':
     case 'max_concurrent_workers':
-      return 'applies at next dispatch';
+      return translate('officerCard.immediacy.nextDispatch');
     case 'daily_token_ceiling':
     case 'max_pages_per_day':
-      return 'applies at next delivery';
+      return translate('officerCard.immediacy.nextDelivery');
     case 'sleep':
-      return 'applies at next sleep filing';
+      return translate('officerCard.immediacy.nextSleep');
     case 'max_actions_per_wake':
     case 'brain':
-      return 'applies on next respawn';
+      return translate('officerCard.immediacy.nextRespawn');
   }
 }
 
@@ -132,9 +136,10 @@ export function immediacyLabel(field: OfficerEditField): string {
 export function drainHint(
   inFlight: number | null | undefined,
   newCount: number,
+  translate: OfficerTranslate,
 ): string | null {
   if (!inFlight || newCount >= inFlight) return null;
-  return `${inFlight} in flight — drains to ${newCount}`;
+  return translate('officerCard.roster.drainHint', { inFlight, count: newCount });
 }
 
 /**
@@ -152,9 +157,10 @@ export function drainHint(
  */
 export function kitChips(
   kit: Record<string, OfficerKitSlot> | null | undefined,
-  breakers: Record<string, {until?: string}> | null | undefined = null,
+  translate: OfficerTranslate,
+  breakers: Record<string, { until?: string }> | null | undefined = null,
   now: Date = new Date(),
-): {name: string; label: string; alert: boolean}[] {
+): { name: string; label: string; alert: boolean }[] {
   if (!kit) return [];
   return Object.entries(kit).map(([name, s]) => {
     const alloc = s.in_flight != null ? `${s.in_flight}/${s.count}` : `×${s.count}`;
@@ -163,20 +169,25 @@ export function kitChips(
     if (s.model) parts.push(s.model);
     if (s.backend) parts.push(s.backend);
     if (s.ready_depth != null) {
-      parts.push(`ready ${s.ready_depth}${s.below_floor ? ' — BELOW FLOOR' : ''}`);
+      parts.push(
+        translate(s.below_floor ? 'officerCard.kit.readyBelowFloor' : 'officerCard.kit.ready', {
+          count: s.ready_depth,
+        }),
+      );
     }
     const until = breakers?.[name]?.until;
     const broken = !!until && new Date(until).getTime() > now.getTime();
-    if (broken) parts.push('BREAKER OPEN');
-    return {name, label: parts.join(' · '), alert: broken || !!s.below_floor};
+    if (broken) parts.push(translate('officerCard.kit.breakerOpen'));
+    return { name, label: parts.join(' · '), alert: broken || !!s.below_floor };
   });
 }
 
 /**
  * Seed the editor from the post. A never-kitted VACANT post gets the starter
- * draft (§11 Q2: keep it); a commissioned officer without slots is genuinely
- * flat-cap — no starter is invented for him. Vacant posts expose only `kit`
- * in the O1–O4 contract, so the non-kit fields seed to '' until commissioned.
+ * draft (§11 Q2: keep it); an established post without slots is genuinely
+ * flat-cap — no starter is invented for a commissioned officer or a vacant
+ * post with prior incarnations. Vacant posts expose only `kit` in the O1–O4
+ * contract, so the non-kit fields seed to '' until commissioned.
  */
 export function draftFromPost(post: OfficerPost | null): OfficerEditorDraft {
   const kit = post?.kit ?? null;
@@ -187,13 +198,11 @@ export function draftFromPost(post: OfficerPost | null): OfficerEditorDraft {
         model: s.model ?? '',
         backend: s.backend ?? '',
         category: s.category ?? '',
+        spendCeilingDaily: s.spend_ceiling_daily ?? null,
       }))
     : [];
-  const slots = kitRows.length
-    ? kitRows
-    : post?.commissioned
-      ? []
-      : [{...STARTER_SLOT_DRAFT}];
+  const establishedPost = post?.commissioned === true || (post?.incarnations?.length ?? 0) > 0;
+  const slots = kitRows.length ? kitRows : establishedPost ? [] : [{ ...STARTER_SLOT_DRAFT }];
   const o = post?.officer ?? null;
   const num = (v: number | null | undefined): string => (v == null ? '' : String(v));
   return {
@@ -214,9 +223,10 @@ export function buildSlotsSpec(rows: SlotDraft[]): Record<string, OfficerSlotSpe
   const spec: Record<string, OfficerSlotSpec> = {};
   for (const row of rows) {
     const name = row.name.trim().toLowerCase();
-    if (!name) continue;
+    if (!name) throw new Error('blank_slot_name');
+    if (Object.hasOwn(spec, name)) throw new Error('duplicate_slot_name');
     const entry: OfficerSlotSpec = {
-      count: Math.max(1, Math.floor(row.count)),
+      count: Math.min(20, Math.max(0, Math.floor(row.count))),
     };
     if (row.model.trim()) entry.model = row.model.trim();
     if (row.backend.trim()) entry.backend = row.backend.trim();
@@ -225,20 +235,37 @@ export function buildSlotsSpec(rows: SlotDraft[]): Record<string, OfficerSlotSpe
     // "not a pool" rather than throwing mid-save.
     const category = (row.category ?? '').trim();
     if (category) entry.category = category.toLowerCase();
+    if (row.spendCeilingDaily != null) {
+      entry.spend_ceiling_daily = row.spendCeilingDaily;
+    }
     spec[name] = entry;
   }
   return Object.keys(spec).length ? spec : null;
 }
 
+export function rosterValidationIssue(
+  rows: SlotDraft[],
+): { key: string; params?: Record<string, unknown> } | null {
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const name = row.name.trim().toLowerCase();
+    if (!name) return { key: 'officerCard.validation.blankSlot' };
+    if (seen.has(name)) {
+      return { key: 'officerCard.validation.duplicateSlot', params: { name } };
+    }
+    seen.add(name);
+  }
+  return null;
+}
+
 /**
  * Full request body from the editor — the commission body, and the base both
- * sides of the PATCH diff are computed from. Blank fields are omitted, not
- * nulled: commission must not clear row state the editor never saw.
+ * sides of the PATCH diff are computed from. The roster is always explicit
+ * because the editor sees the whole map (`null` means flat-cap); other blank
+ * fields are omitted so commission cannot clear row state the editor never saw.
  */
 export function buildOfficerConfig(draft: OfficerEditorDraft): OfficerPostPatch {
-  const body: OfficerPostPatch = {};
-  const slots = buildSlotsSpec(draft.slots);
-  if (slots) body.slots = slots;
+  const body: OfficerPostPatch = { slots: buildSlotsSpec(draft.slots) };
   const brain: OfficerBrainSpec = {};
   if (draft.brainModel.trim()) brain.model = draft.brainModel.trim();
   if (draft.reasoning) brain.reasoning_level = draft.reasoning;
@@ -304,41 +331,46 @@ export function buildOfficerPatch(
  */
 export function vacantLedgerOf(
   post: OfficerPost | null,
-): {entries: NonNullable<OfficerVacantLedger['entries']>; dropped: number} | null {
+): { entries: NonNullable<OfficerVacantLedger['entries']>; dropped: number } | null {
   const raw = post?.while_vacant as
-    | OfficerVacantLedger
-    | OfficerVacantLedger['entries']
-    | null
-    | undefined;
+    OfficerVacantLedger | OfficerVacantLedger['entries'] | null | undefined;
   if (!raw) return null;
   const entries = Array.isArray(raw) ? raw : (raw.entries ?? []);
   const dropped = Array.isArray(raw) ? 0 : (raw.dropped ?? 0);
   if (!entries.length && !dropped) return null;
-  return {entries, dropped};
+  return { entries, dropped };
 }
 
 /** Build the officer conference's trusted thread-create request. */
 export function buildConferenceThreadCreateBody(
   projectId: string,
   projectName: string,
+  conferenceLabel: string,
 ): Record<string, unknown> {
   return {
-    title: `Conference — ${projectName || 'project'}`,
+    title: `${conferenceLabel} — ${projectName}`,
     config_name: 'centurion',
     project_ids: [projectId],
     use_datasource_defaults: true,
-    config_override: {officer: {conference: true}},
+    config_override: { officer: { conference: true } },
   };
 }
 
 /** "in 42 min" / "overdue 3 min" — the next-wake label. */
-export function nextWakeLabel(fireAt: string | null | undefined): string {
-  if (!fireAt) return 'not scheduled (event-driven)';
+export function nextWakeLabel(
+  fireAt: string | null | undefined,
+  translate: OfficerTranslate,
+): string {
+  if (!fireAt) return translate('officerCard.wake.eventDriven');
   const delta = (new Date(fireAt).getTime() - Date.now()) / 60000;
   if (Number.isNaN(delta)) return String(fireAt);
-  if (delta >= 1) return `in ${Math.round(delta)} min`;
-  if (delta > -2) return 'due now';
-  return `overdue ${Math.round(-delta)} min`;
+  if (delta >= 1) {
+    return translate('officerCard.wake.inMinutes', { count: Math.round(delta) });
+  }
+  if (delta > -2) return translate('officerCard.wake.dueNow');
+  return translate('officerCard.wake.overdueMinutes', {
+    count: Math.round(-delta),
+  });
 }
 
 /**
@@ -371,127 +403,143 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
   template: `
     <div class="officer-tab">
       <div class="officer-intro">
-        <h3>Centurion</h3>
-        <p>
-          A standing officer for this project: he holds the charge, watches
-          jobs and fleet, dispatches workers from his kit, and pages you only
-          when something genuinely needs you. You talk to him in a conference;
-          his background log is the session transcript. The post outlives him
-          — kit, budgets, and memory stay with it between incarnations.
-        </p>
+        <h3>{{ 'officerCard.title' | transloco }}</h3>
+        <p>{{ 'officerCard.intro' | transloco }}</p>
       </div>
 
       @if (loading()) {
-        <div class="officer-loading"><app-spinner size="md" tone="accent" /></div>
+        <div
+          class="officer-loading"
+          role="status"
+          [attr.aria-label]="'officerCard.a11y.loading' | transloco"
+        >
+          <app-spinner size="md" tone="accent" />
+        </div>
       } @else {
-        <div class="officer-card" data-testid="officer-card" [attr.data-state]="postState()">
+        <div
+          class="officer-card"
+          data-testid="officer-card"
+          role="region"
+          [attr.aria-label]="'officerCard.a11y.region' | transloco"
+          [attr.data-state]="postState()"
+        >
           @if (postState() === 'vacant') {
-            <p class="officer-hint">
-              The post is vacant — no centurion holds this century. Assign the
-              kit and commission him: he chooses which troops to send; you
-              decide what they are made of.
-            </p>
+            <p class="officer-hint">{{ 'officerCard.vacant.hint' | transloco }}</p>
 
             @if (vacantLedger(); as ledger) {
               <div class="officer-ledger" data-testid="officer-vacant-ledger">
-                <div class="officer-section-title">While the post was vacant</div>
+                <div class="officer-section-title">
+                  {{ 'officerCard.vacant.ledgerTitle' | transloco }}
+                </div>
                 @for (e of ledger.entries; track $index) {
                   <div class="officer-ledger-item">
-                    @if (e.at) { <span class="dim">{{ e.at | date: 'short' }}</span> }
+                    @if (e.at) {
+                      <span class="dim">{{ e.at | date: 'short' }}</span>
+                    }
                     <span>{{ e.title || e.job_id }}</span>
-                    @if (e.status) { <span class="officer-ledger-status">{{ e.status }}</span> }
+                    @if (e.status) {
+                      <span class="officer-ledger-status">{{ statusLabel(e.status) }}</span>
+                    }
                   </div>
                 }
                 @if (ledger.dropped) {
-                  <div class="dim">… {{ ledger.dropped }} older entr{{ ledger.dropped === 1 ? 'y' : 'ies' }} dropped</div>
+                  <div class="dim">
+                    {{ 'officerCard.vacant.dropped' | transloco: { count: ledger.dropped } }}
+                  </div>
                 }
               </div>
             }
           } @else {
             @if (post()?.officer; as o) {
               <div class="officer-status-row">
-                <span class="officer-badge" [attr.data-status]="o.status">{{ o.status }}</span>
+                <span class="officer-badge" [attr.data-status]="o.status">{{
+                  statusLabel(o.status)
+                }}</span>
                 @if (post()?.held; as h) {
                   <span class="officer-hold" data-testid="officer-hold">{{ holdLabel() }}</span>
                   @if (h.note) {
-                    <span class="officer-hold-note" data-testid="officer-hold-note">{{ h.note }}</span>
+                    <span class="officer-hold-note" data-testid="officer-hold-note">{{
+                      h.note
+                    }}</span>
                   }
                 }
-                <span class="officer-title">{{ o.title || 'Centurion' }}</span>
+                <span class="officer-title">{{
+                  o.title || ('officerCard.title' | transloco)
+                }}</span>
               </div>
 
               <div class="officer-meta">
                 <div>
-                  <span class="k">Next wake</span>
+                  <span class="k">{{ 'officerCard.summary.nextWake' | transloco }}</span>
                   <span class="v" data-testid="next-wake">{{ wakeLabel() }}</span>
                 </div>
                 <div>
-                  <span class="k">Queued events</span>
+                  <span class="k">{{ 'officerCard.summary.queuedEvents' | transloco }}</span>
                   <span class="v">{{ o.pending_events ?? 0 }}</span>
                 </div>
                 <div>
-                  <span class="k">Pages today</span>
-                  <span class="v">{{ o.pages_today?.used ?? 0 }}/{{ o.pages_today?.budget ?? 3 }}</span>
+                  <span class="k">{{ 'officerCard.summary.pagesToday' | transloco }}</span>
+                  <span class="v"
+                    >{{ o.pages_today?.used ?? 0 }}/{{ o.pages_today?.budget ?? 3 }}</span
+                  >
                 </div>
                 @if (post()?.spend_today; as spend) {
                   <div>
-                    <span class="k">Spend today</span>
+                    <span class="k">{{ 'officerCard.summary.spendToday' | transloco }}</span>
                     <span class="v" data-testid="officer-spend">
-                      {{ (spend.tokens ?? 0) | number }}
+                      {{ spend.tokens ?? 0 | number }}
                       @if (spendCeiling() != null) {
                         / {{ spendCeiling() | number }}
                       }
-                      tokens
+                      {{ 'officerCard.summary.tokens' | transloco }}
                       @if (o.token_ceiling?.deferred_today) {
-                        <span class="officer-warn">— ceiling reached; sleeping until reset</span>
+                        <span class="officer-warn">{{
+                          'officerCard.summary.ceilingReached' | transloco
+                        }}</span>
                       }
                     </span>
                   </div>
                 }
                 <div>
-                  <span class="k">His model</span>
+                  <span class="k">{{ 'officerCard.summary.model' | transloco }}</span>
                   <span class="v" data-testid="officer-model">
-                    {{ o.model || 'session default' }}
-                    @if (o.reasoning_level) { · {{ o.reasoning_level }} }
+                    {{ o.model || ('officerCard.defaults.session' | transloco) }}
+                    @if (o.reasoning_level) {
+                      · {{ o.reasoning_level }}
+                    }
                   </span>
                 </div>
               </div>
 
               @if (kitRows().length) {
                 <div class="officer-slots" data-testid="officer-slots">
-                  <span class="k">Kit</span>
+                  <span class="k">{{ 'officerCard.sections.kit' | transloco }}</span>
                   @for (s of kitRows(); track s.name) {
-                    <span
-                      class="officer-slot-chip"
-                      [class.officer-slot-chip-alert]="s.alert"
-                      >{{ s.label }}</span
-                    >
+                    <span class="officer-slot-chip" [class.officer-slot-chip-alert]="s.alert">{{
+                      s.label
+                    }}</span>
                   }
                 </div>
               }
 
               @if (backlogState(); as bl) {
                 <div class="officer-slots" data-testid="officer-backlog">
-                  <span class="k">Auto-pull</span>
+                  <span class="k">{{ 'officerCard.backlog.autoPull' | transloco }}</span>
                   <span class="v">
                     @if (bl.auto_pull) {
-                      on — ready tickets are dispatched into free pool slots
+                      {{ 'officerCard.backlog.on' | transloco }}
                     } @else {
-                      <span class="officer-warn"
-                        >off — pools stay idle until he dispatches by hand</span
-                      >
+                      <span class="officer-warn">{{ 'officerCard.backlog.off' | transloco }}</span>
                     }
                   </span>
                 </div>
                 @if (staleClaims().length) {
                   <div class="officer-slots" data-testid="officer-stale-claims">
-                    <span class="k">Stalled</span>
-                    <span class="v officer-warn">
-                      {{ staleClaims().length }} claimed
-                      {{ staleClaims().length === 1 ? 'ticket' : 'tickets' }} not
-                      moving — these are never released automatically; resume or
-                      cancel the job, then close or re-ready the ticket.
-                    </span>
+                    <span class="k">{{ 'officerCard.backlog.stalled' | transloco }}</span>
+                    <span class="v officer-warn">{{
+                      'officerCard.backlog.stalledDetail'
+                        | transloco: { count: staleClaims().length }
+                    }}</span>
                   </div>
                 }
               }
@@ -499,7 +547,10 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
                 <div class="officer-slots" data-testid="officer-provisioning-state">
                   <span class="k">{{ 'officerCorrectness.provisioningLabel' | transloco }}</span>
                   <span class="v officer-warn">
-                    {{ 'officerCorrectness.provisioningProblem' | transloco: {count: provisioningProblems().length} }}
+                    {{
+                      'officerCorrectness.provisioningProblem'
+                        | transloco: { count: provisioningProblems().length }
+                    }}
                     · {{ provisioningStateSummary() }}
                   </span>
                 </div>
@@ -508,7 +559,10 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
                 <div class="officer-slots" data-testid="officer-knowledge-sync">
                   <span class="k">{{ 'officerCorrectness.knowledgeLabel' | transloco }}</span>
                   <span class="v officer-warn">
-                    {{ 'officerCorrectness.knowledgeProblem' | transloco: {count: knowledgeProblems().length} }}
+                    {{
+                      'officerCorrectness.knowledgeProblem'
+                        | transloco: { count: knowledgeProblems().length }
+                    }}
                     · {{ knowledgeStateSummary() }}
                   </span>
                 </div>
@@ -523,10 +577,17 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
                     } @else if (wake.last_queued_at) {
                       {{ 'officerCorrectness.durablyQueued' | transloco }}
                       @if (wake.failure_class) {
-                        · <span class="officer-warn">{{ 'officerCorrectness.deliveryFailed' | transloco }} · {{ wake.failure_class }}</span>
+                        ·
+                        <span class="officer-warn"
+                          >{{ 'officerCorrectness.deliveryFailed' | transloco }} ·
+                          {{ wake.failure_class }}</span
+                        >
                       }
                     } @else {
-                      <span class="officer-warn">{{ 'officerCorrectness.notQueued' | transloco }} · {{ wake.failure_class || wake.state }}</span>
+                      <span class="officer-warn"
+                        >{{ 'officerCorrectness.notQueued' | transloco }} ·
+                        {{ wake.failure_class || stateLabel(wake.state) }}</span
+                      >
                     }
                   </span>
                 </div>
@@ -534,276 +595,378 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
             }
           }
 
-          <!-- THE EDITOR — the same editor in every state (§8) -->
-          <div class="officer-editor" data-testid="officer-editor">
-            <div class="officer-editor-head">
-              <span class="officer-section-title">His brain</span>
-              @if (showImmediacy()) {
-                <span class="officer-immediacy" data-testid="immediacy-brain">{{ immediacy('brain') }}</span>
-              }
-            </div>
-            <div class="officer-slot-row">
-              <app-form-field
-                label="Officer's own model"
-                hint="The brain his judgment runs on — pick a strong one; his wakes are cheap but his decisions steer everything. Blank = your session default."
-              >
-                <app-select [value]="fBrainModel()" (changed)="fBrainModel.set($event ?? '')">
-                  <option value="">session default</option>
-                  @for (m of modelOptions(); track m) {
-                    <option [value]="m">{{ m }}</option>
-                  }
-                </app-select>
-              </app-form-field>
-              <app-form-field
-                label="Reasoning"
-                hint="Effort per wake. Clamped to what the model supports."
-              >
-                <app-select [value]="fReasoning()" (changed)="fReasoning.set($event ?? '')">
-                  <option value="">default (high)</option>
-                  <option value="low">low</option>
-                  <option value="medium">medium</option>
-                  <option value="high">high</option>
-                  <option value="xhigh">xhigh</option>
-                  <option value="max">max</option>
-                </app-select>
-              </app-form-field>
-              <app-form-field label="Actions per wake" hint="Hard cap on tool calls each wake.">
-                <app-input
-                  type="number"
-                  [value]="fMaxActions()"
-                  (changed)="fMaxActions.set($event)"
-                  placeholder="default"
-                />
-              </app-form-field>
-            </div>
-
-            <div class="officer-editor-head">
-              <span class="officer-section-title">Kit</span>
-              @if (showImmediacy()) {
-                <span class="officer-immediacy" data-testid="immediacy-slots">{{ immediacy('slots') }}</span>
-              }
-            </div>
-            <p class="officer-hint dim">
-              Give a slot a <strong>pool</strong> and the officer fills it
-              automatically from ready tickets of that kind; leave it unset for
-              capacity he dispatches by hand.
-            </p>
-            @for (row of slotDrafts(); track $index; let i = $index) {
+          <!-- Management and operational visibility are separate authorities. -->
+          @if (canManage()) {
+            <div class="officer-editor" data-testid="officer-editor">
+              <div class="officer-editor-head">
+                <span class="officer-section-title">{{
+                  'officerCard.sections.brain' | transloco
+                }}</span>
+                @if (showImmediacy()) {
+                  <span class="officer-immediacy" data-testid="immediacy-brain">{{
+                    immediacy('brain')
+                  }}</span>
+                }
+              </div>
               <div class="officer-slot-row">
-                <app-form-field label="Slot">
-                  <app-input
-                    [value]="row.name"
-                    (changed)="patchSlot(i, {name: $event})"
-                    placeholder="line"
-                  />
-                </app-form-field>
-                <app-form-field label="Count">
-                  <app-input
-                    type="number"
-                    [value]="'' + row.count"
-                    (changed)="patchSlot(i, {count: toCount($event)})"
-                  />
-                </app-form-field>
-                <app-form-field label="Model">
-                  <app-select [value]="row.model" (changed)="patchSlot(i, {model: $event ?? ''})">
-                    <option value="">worker default</option>
+                <app-form-field
+                  [label]="'officerCard.brain.modelLabel' | transloco"
+                  [hint]="'officerCard.brain.modelHint' | transloco"
+                >
+                  <app-select
+                    [ariaLabel]="'officerCard.a11y.brainModel' | transloco"
+                    [value]="fBrainModel()"
+                    (changed)="fBrainModel.set($event ?? '')"
+                  >
+                    <option value="">{{ 'officerCard.defaults.session' | transloco }}</option>
                     @for (m of modelOptions(); track m) {
                       <option [value]="m">{{ m }}</option>
                     }
                   </app-select>
                 </app-form-field>
-                <app-form-field label="Workspace">
-                  <app-select [value]="row.backend" (changed)="patchSlot(i, {backend: $event ?? ''})">
-                    <option value="">default</option>
-                    <option value="sandbox">sandbox</option>
-                    <option value="virtual">virtual</option>
-                    <option value="none">none</option>
-                    <option value="vm">VM (root)</option>
-                  </app-select>
-                </app-form-field>
-                <app-form-field label="Pool">
+                <app-form-field
+                  [label]="'officerCard.brain.reasoningLabel' | transloco"
+                  [hint]="'officerCard.brain.reasoningHint' | transloco"
+                >
                   <app-select
-                    [value]="row.category"
-                    (changed)="patchSlot(i, {category: $event ?? ''})"
+                    [ariaLabel]="'officerCard.a11y.reasoning' | transloco"
+                    [value]="fReasoning()"
+                    (changed)="fReasoning.set($event ?? '')"
                   >
-                    @for (c of categoryOptions; track c.value) {
-                      <option [value]="c.value">{{ c.label }}</option>
-                    }
+                    <option value="">{{ 'officerCard.reasoning.defaultHigh' | transloco }}</option>
+                    <option value="low">{{ 'officerCard.reasoning.low' | transloco }}</option>
+                    <option value="medium">{{ 'officerCard.reasoning.medium' | transloco }}</option>
+                    <option value="high">{{ 'officerCard.reasoning.high' | transloco }}</option>
+                    <option value="xhigh">{{ 'officerCard.reasoning.xhigh' | transloco }}</option>
+                    <option value="max">{{ 'officerCard.reasoning.max' | transloco }}</option>
                   </app-select>
                 </app-form-field>
-                <app-button variant="secondary" size="sm" (clicked)="removeSlot(i)">✕</app-button>
+                <app-form-field
+                  [label]="'officerCard.brain.actionsLabel' | transloco"
+                  [hint]="'officerCard.brain.actionsHint' | transloco"
+                >
+                  <app-input
+                    type="number"
+                    [ariaLabel]="'officerCard.a11y.actionsPerWake' | transloco"
+                    [value]="fMaxActions()"
+                    (changed)="fMaxActions.set($event)"
+                    [placeholder]="'officerCard.defaults.default' | transloco"
+                  />
+                </app-form-field>
               </div>
-              @if (drainHints()[i]; as hint) {
-                <div class="officer-drain" data-testid="drain-hint">{{ hint }}</div>
-              }
-            }
-            <div class="officer-slot-row">
-              <app-form-field
-                label="Max workers"
-                hint="Flat concurrency cap. Without a kit it is the only gate (default 3)."
-              >
-                <app-input
-                  type="number"
-                  [value]="fMaxWorkers()"
-                  (changed)="fMaxWorkers.set($event)"
-                  placeholder="3"
-                />
-              </app-form-field>
-              <app-button variant="secondary" size="sm" [disabled]="busy()" (clicked)="addSlot()">
-                Add slot
-              </app-button>
-            </div>
 
-            <div class="officer-editor-head">
-              <span class="officer-section-title">Budgets</span>
-              @if (showImmediacy()) {
-                <span class="officer-immediacy" data-testid="immediacy-budgets">{{ immediacy('daily_token_ceiling') }}</span>
+              <div class="officer-editor-head">
+                <span class="officer-section-title">{{
+                  'officerCard.sections.kit' | transloco
+                }}</span>
+                @if (showImmediacy()) {
+                  <span class="officer-immediacy" data-testid="immediacy-slots">{{
+                    immediacy('slots')
+                  }}</span>
+                }
+              </div>
+              <p class="officer-hint dim">{{ 'officerCard.roster.hint' | transloco }}</p>
+              @if (rosterError(); as error) {
+                <div class="officer-validation" role="alert" data-testid="officer-roster-error">
+                  {{ error }}
+                </div>
               }
-            </div>
-            <div class="officer-slot-row">
-              <app-form-field
-                label="Daily token ceiling"
-                hint="Across his whole command. Blank = no ceiling."
-              >
-                <app-input
-                  type="number"
-                  [value]="fTokenCeiling()"
-                  (changed)="fTokenCeiling.set($event)"
-                  placeholder="unlimited"
-                />
-              </app-form-field>
-              <app-form-field label="Pages per day" hint="How often he may page you (default 3).">
-                <app-input
-                  type="number"
-                  [value]="fMaxPages()"
-                  (changed)="fMaxPages.set($event)"
-                  placeholder="3"
-                />
-              </app-form-field>
-            </div>
+              @for (row of slotDrafts(); track $index; let i = $index) {
+                <div class="officer-slot-row">
+                  <app-form-field [label]="'officerCard.roster.slot' | transloco">
+                    <app-input
+                      [ariaLabel]="'officerCard.a11y.slotName' | transloco: { index: i + 1 }"
+                      [value]="row.name"
+                      (changed)="patchSlot(i, { name: $event })"
+                      [placeholder]="'officerCard.roster.slotPlaceholder' | transloco"
+                    />
+                  </app-form-field>
+                  <app-form-field
+                    [label]="'officerCard.roster.count' | transloco"
+                    [hint]="'officerCard.roster.countHint' | transloco"
+                  >
+                    <app-input
+                      type="number"
+                      [ariaLabel]="'officerCard.a11y.slotCount' | transloco: { index: i + 1 }"
+                      [value]="'' + row.count"
+                      (changed)="patchSlot(i, { count: toCount($event) })"
+                    />
+                  </app-form-field>
+                  <app-form-field [label]="'officerCard.roster.model' | transloco">
+                    <app-select
+                      [ariaLabel]="'officerCard.a11y.slotModel' | transloco: { index: i + 1 }"
+                      [value]="row.model"
+                      (changed)="patchSlot(i, { model: $event ?? '' })"
+                    >
+                      <option value="">{{ 'officerCard.defaults.worker' | transloco }}</option>
+                      @for (m of modelOptions(); track m) {
+                        <option [value]="m">{{ m }}</option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  <app-form-field [label]="'officerCard.roster.workspace' | transloco">
+                    <app-select
+                      [ariaLabel]="'officerCard.a11y.slotWorkspace' | transloco: { index: i + 1 }"
+                      [value]="row.backend"
+                      (changed)="patchSlot(i, { backend: $event ?? '' })"
+                    >
+                      <option value="">{{ 'officerCard.defaults.default' | transloco }}</option>
+                      <option value="sandbox">
+                        {{ 'officerCard.workspace.sandbox' | transloco }}
+                      </option>
+                      <option value="virtual">
+                        {{ 'officerCard.workspace.virtual' | transloco }}
+                      </option>
+                      <option value="none">{{ 'officerCard.workspace.none' | transloco }}</option>
+                      <option value="vm">{{ 'officerCard.workspace.vmRoot' | transloco }}</option>
+                    </app-select>
+                  </app-form-field>
+                  <app-form-field [label]="'officerCard.roster.pool' | transloco">
+                    <app-select
+                      [ariaLabel]="'officerCard.a11y.slotPool' | transloco: { index: i + 1 }"
+                      [value]="row.category"
+                      (changed)="patchSlot(i, { category: $event ?? '' })"
+                    >
+                      @for (c of categoryOptions; track c.value) {
+                        <option [value]="c.value">{{ c.labelKey | transloco }}</option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  <app-button
+                    variant="secondary"
+                    size="sm"
+                    [ariaLabel]="
+                      'officerCard.a11y.removeSlot' | transloco: { name: row.name || i + 1 }
+                    "
+                    (clicked)="removeSlot(i)"
+                    >✕</app-button
+                  >
+                </div>
+                @if (drainHints()[i]; as hint) {
+                  <div class="officer-drain" data-testid="drain-hint">{{ hint }}</div>
+                }
+              }
+              <div class="officer-slot-row">
+                <app-form-field
+                  [label]="'officerCard.roster.maxWorkers' | transloco"
+                  [hint]="'officerCard.roster.maxWorkersHint' | transloco"
+                >
+                  <app-input
+                    type="number"
+                    [ariaLabel]="'officerCard.a11y.maxWorkers' | transloco"
+                    [value]="fMaxWorkers()"
+                    (changed)="fMaxWorkers.set($event)"
+                    placeholder="3"
+                  />
+                </app-form-field>
+                <app-button
+                  variant="secondary"
+                  size="sm"
+                  [disabled]="busy() || slotDrafts().length >= 8"
+                  (clicked)="addSlot()"
+                >
+                  {{ 'officerCard.actions.addSlot' | transloco }}
+                </app-button>
+              </div>
 
-            <div class="officer-editor-head">
-              <span class="officer-section-title">Sleep</span>
-              @if (showImmediacy()) {
-                <span class="officer-immediacy" data-testid="immediacy-sleep">{{ immediacy('sleep') }}</span>
-              }
+              <div class="officer-editor-head">
+                <span class="officer-section-title">{{
+                  'officerCard.sections.budgets' | transloco
+                }}</span>
+                @if (showImmediacy()) {
+                  <span class="officer-immediacy" data-testid="immediacy-budgets">{{
+                    immediacy('daily_token_ceiling')
+                  }}</span>
+                }
+              </div>
+              <div class="officer-slot-row">
+                <app-form-field
+                  [label]="'officerCard.budgets.tokenCeiling' | transloco"
+                  [hint]="'officerCard.budgets.tokenCeilingHint' | transloco"
+                >
+                  <app-input
+                    type="number"
+                    [ariaLabel]="'officerCard.a11y.tokenCeiling' | transloco"
+                    [value]="fTokenCeiling()"
+                    (changed)="fTokenCeiling.set($event)"
+                    [placeholder]="'officerCard.defaults.unlimited' | transloco"
+                  />
+                </app-form-field>
+                <app-form-field
+                  [label]="'officerCard.budgets.pages' | transloco"
+                  [hint]="'officerCard.budgets.pagesHint' | transloco"
+                >
+                  <app-input
+                    type="number"
+                    [ariaLabel]="'officerCard.a11y.pagesPerDay' | transloco"
+                    [value]="fMaxPages()"
+                    (changed)="fMaxPages.set($event)"
+                    placeholder="3"
+                  />
+                </app-form-field>
+              </div>
+
+              <div class="officer-editor-head">
+                <span class="officer-section-title">{{
+                  'officerCard.sections.sleep' | transloco
+                }}</span>
+                @if (showImmediacy()) {
+                  <span class="officer-immediacy" data-testid="immediacy-sleep">{{
+                    immediacy('sleep')
+                  }}</span>
+                }
+              </div>
+              <div class="officer-slot-row">
+                <app-form-field
+                  [label]="'officerCard.sleep.min' | transloco"
+                  [hint]="'officerCard.sleep.hint' | transloco"
+                >
+                  <app-input
+                    type="number"
+                    [ariaLabel]="'officerCard.a11y.sleepMin' | transloco"
+                    [value]="fSleepMin()"
+                    (changed)="fSleepMin.set($event)"
+                    placeholder="5"
+                  />
+                </app-form-field>
+                <app-form-field [label]="'officerCard.sleep.max' | transloco">
+                  <app-input
+                    type="number"
+                    [ariaLabel]="'officerCard.a11y.sleepMax' | transloco"
+                    [value]="fSleepMax()"
+                    (changed)="fSleepMax.set($event)"
+                    placeholder="60"
+                  />
+                </app-form-field>
+              </div>
             </div>
-            <div class="officer-slot-row">
-              <app-form-field
-                label="Min (minutes)"
-                hint="He files his own sleep between wakes; the server clamps to these bounds."
-              >
-                <app-input
-                  type="number"
-                  [value]="fSleepMin()"
-                  (changed)="fSleepMin.set($event)"
-                  placeholder="5"
-                />
-              </app-form-field>
-              <app-form-field label="Max (minutes)">
-                <app-input
-                  type="number"
-                  [value]="fSleepMax()"
-                  (changed)="fSleepMax.set($event)"
-                  placeholder="60"
-                />
-              </app-form-field>
-            </div>
-          </div>
+          } @else {
+            <p class="officer-hint officer-read-only" data-testid="officer-read-only">
+              {{ 'officerCard.readOnly' | transloco }}
+            </p>
+          }
 
           @if (postState() === 'vacant') {
-            <div class="officer-actions">
-              <app-button
-                variant="primary"
-                size="sm"
-                [disabled]="busy()"
-                (clicked)="commission()"
-                data-testid="officer-commission"
-              >
-                Commission centurion
-              </app-button>
-            </div>
-            <p class="officer-hint dim">
-              No slots = a flat cap of 3 concurrent workers. The officer runs
-              headless; his first wake carries the continuity brief — and the
-              while-vacant ledger, if jobs finished without him.
-            </p>
+            @if (canManage()) {
+              <div class="officer-actions">
+                <app-button
+                  variant="primary"
+                  size="sm"
+                  [disabled]="busy()"
+                  (clicked)="commission()"
+                  data-testid="officer-commission"
+                >
+                  {{ 'officerCard.actions.commission' | transloco }}
+                </app-button>
+              </div>
+              <p class="officer-hint dim">
+                {{ 'officerCard.vacant.flatCapHint' | transloco }}
+              </p>
+            }
           } @else {
             <div class="officer-actions">
-              <app-button
-                variant="primary"
-                size="sm"
-                [disabled]="busy() || !dirty()"
-                (clicked)="saveEdits()"
-                data-testid="officer-save"
-              >
-                Save changes
-              </app-button>
-              <app-button variant="secondary" size="sm" (clicked)="openLog()">Open log</app-button>
-              <app-button variant="secondary" size="sm" [disabled]="busy()" (clicked)="openConference()">
-                {{ post()?.officer?.conference ? 'Rejoin conference' : 'Conference' }}
-              </app-button>
-              @if (postState() === 'held') {
+              @if (canManage()) {
+                <app-button
+                  variant="primary"
+                  size="sm"
+                  [disabled]="busy() || !dirty()"
+                  (clicked)="saveEdits()"
+                  data-testid="officer-save"
+                >
+                  {{ 'officerCard.actions.save' | transloco }}
+                </app-button>
+              }
+              <app-button variant="secondary" size="sm" (clicked)="openLog()">{{
+                'officerCard.actions.openLog' | transloco
+              }}</app-button>
+              @if (canManage()) {
                 <app-button
                   variant="secondary"
                   size="sm"
                   [disabled]="busy()"
-                  (clicked)="release()"
-                  data-testid="officer-release"
+                  (clicked)="openConference()"
                 >
-                  Release
+                  {{
+                    conference()
+                      ? ('officerCard.actions.rejoinConference' | transloco)
+                      : ('officerCard.actions.conference' | transloco)
+                  }}
                 </app-button>
-              } @else if (!holdArmed()) {
-                <app-button variant="secondary" size="sm" [disabled]="busy()" (clicked)="holdArmed.set(true)">
-                  Hold
-                </app-button>
-              }
-              @if (!decommissionArmed()) {
-                <app-button
-                  variant="danger"
-                  size="sm"
-                  [disabled]="busy()"
-                  (clicked)="decommissionArmed.set(true)"
-                >
-                  Decommission
-                </app-button>
+                @if (postState() === 'held') {
+                  <app-button
+                    variant="secondary"
+                    size="sm"
+                    [disabled]="busy()"
+                    (clicked)="release()"
+                    data-testid="officer-release"
+                  >
+                    {{ 'officerCard.actions.release' | transloco }}
+                  </app-button>
+                } @else if (!holdArmed()) {
+                  <app-button
+                    variant="secondary"
+                    size="sm"
+                    [disabled]="busy()"
+                    (clicked)="holdArmed.set(true)"
+                  >
+                    {{ 'officerCard.actions.hold' | transloco }}
+                  </app-button>
+                }
+                @if (!decommissionArmed()) {
+                  <app-button
+                    variant="danger"
+                    size="sm"
+                    [disabled]="busy()"
+                    (clicked)="decommissionArmed.set(true)"
+                  >
+                    {{ 'officerCard.actions.decommission' | transloco }}
+                  </app-button>
+                }
               }
             </div>
 
-            @if (holdArmed()) {
+            @if (canManage() && holdArmed()) {
               <div class="officer-confirm" data-testid="officer-hold-confirm">
                 <app-form-field
-                  label="Hold note"
-                  hint="Shown on the badge — why he is standing down. Legate input still reaches him while held."
+                  [label]="'officerCard.hold.noteLabel' | transloco"
+                  [hint]="'officerCard.hold.noteHint' | transloco"
                 >
                   <app-input
+                    [ariaLabel]="'officerCard.a11y.holdNote' | transloco"
                     [value]="holdNote()"
                     (changed)="holdNote.set($event)"
-                    placeholder="maintenance"
+                    [placeholder]="'officerCard.hold.placeholder' | transloco"
                   />
                 </app-form-field>
                 <div class="officer-actions">
                   <app-button variant="primary" size="sm" [disabled]="busy()" (clicked)="hold()">
-                    Confirm hold
+                    {{ 'officerCard.actions.confirmHold' | transloco }}
                   </app-button>
-                  <app-button variant="secondary" size="sm" (clicked)="holdArmed.set(false)">Cancel</app-button>
+                  <app-button variant="secondary" size="sm" (clicked)="holdArmed.set(false)">{{
+                    'officerCard.actions.cancel' | transloco
+                  }}</app-button>
                 </div>
               </div>
             }
 
-            @if (decommissionArmed()) {
+            @if (canManage() && decommissionArmed()) {
               <div class="officer-confirm" data-testid="officer-decommission-confirm">
                 @if (decommissionWarning(); as warn) {
                   <p class="officer-hint" data-testid="officer-decommission-warning">
-                    He has {{ warn.in_flight_jobs?.length ?? 0 }} job(s) in flight.
-                    Decommissioning leaves them running — their completions land on
-                    the post's ledger for his successor.
+                    {{
+                      'officerCard.decommission.inFlightWarning'
+                        | transloco: { count: warn.in_flight_jobs?.length ?? 0 }
+                    }}
                   </p>
                   @for (j of warn.in_flight_jobs ?? []; track j.job_id) {
                     <div class="officer-ledger-item">
                       <span>{{ j.title || shortId(j.job_id) }}</span>
-                      @if (j.slot) { <span class="officer-slot-chip">{{ j.slot }}</span> }
-                      @if (j.status) { <span class="dim">{{ j.status }}</span> }
+                      @if (j.slot) {
+                        <span class="officer-slot-chip">{{ j.slot }}</span>
+                      }
+                      @if (j.status) {
+                        <span class="dim">{{ statusLabel(j.status) }}</span>
+                      }
                     </div>
                   }
                   <div class="officer-actions">
@@ -814,14 +977,15 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
                       (clicked)="decommission(true)"
                       data-testid="officer-decommission-force"
                     >
-                      Decommission — leave them running
+                      {{ 'officerCard.actions.decommissionKeepRunning' | transloco }}
                     </app-button>
-                    <app-button variant="secondary" size="sm" (clicked)="cancelDecommission()">Keep him</app-button>
+                    <app-button variant="secondary" size="sm" (clicked)="cancelDecommission()">{{
+                      'officerCard.actions.keepOfficer' | transloco
+                    }}</app-button>
                   </div>
                 } @else {
                   <p class="officer-hint">
-                    His kit, budgets, digest, and sitrep fingerprints stay on the
-                    post; recommissioning restores them with a continuity brief.
+                    {{ 'officerCard.decommission.hint' | transloco }}
                   </p>
                   <div class="officer-actions">
                     <app-button
@@ -831,9 +995,11 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
                       (clicked)="decommission(false)"
                       data-testid="officer-decommission"
                     >
-                      Confirm decommission
+                      {{ 'officerCard.actions.confirmDecommission' | transloco }}
                     </app-button>
-                    <app-button variant="secondary" size="sm" (clicked)="cancelDecommission()">Keep him</app-button>
+                    <app-button variant="secondary" size="sm" (clicked)="cancelDecommission()">{{
+                      'officerCard.actions.keepOfficer' | transloco
+                    }}</app-button>
                   </div>
                 }
               </div>
@@ -843,20 +1009,39 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
           <!-- Worker questions — the row-only routing policy; exists in every state -->
           <div class="officer-policy" data-testid="officer-policy">
             <div class="officer-editor-head">
-              <span class="officer-section-title">Worker questions</span>
+              <span class="officer-section-title">{{
+                'officerCard.policy.title' | transloco
+              }}</span>
             </div>
-            <app-form-field label="When a worker asks a question" [hint]="policyHint()">
-              <app-select [value]="policyValue()" (changed)="setPolicy($event)">
-                <option value="user_direct">Direct to me</option>
-                <option value="officer_and_user">Officer and me</option>
-                <option value="officer_first">{{ officerFirstLabel() }}</option>
-              </app-select>
-            </app-form-field>
+            @if (canManage()) {
+              <app-form-field
+                [label]="'officerCard.policy.label' | transloco"
+                [hint]="policyHint()"
+              >
+                <app-select
+                  [ariaLabel]="'officerCard.a11y.routingPolicy' | transloco"
+                  [value]="policyValue()"
+                  (changed)="setPolicy($event)"
+                >
+                  <option value="user_direct">
+                    {{ 'officerCard.policy.userDirect' | transloco }}
+                  </option>
+                  <option value="officer_and_user">
+                    {{ 'officerCard.policy.officerAndUser' | transloco }}
+                  </option>
+                  <option value="officer_first">{{ officerFirstLabel() }}</option>
+                </app-select>
+              </app-form-field>
+            } @else {
+              <span class="v" data-testid="officer-policy-read-only">{{ policyLabel() }}</span>
+            }
           </div>
 
           @if (postState() === 'vacant' && incarnations().length) {
             <div class="officer-incarnations" data-testid="officer-incarnations">
-              <div class="officer-section-title">Past incarnations</div>
+              <div class="officer-section-title">
+                {{ 'officerCard.vacant.pastIncarnations' | transloco }}
+              </div>
               @for (inc of incarnations(); track inc.thread_id) {
                 <div class="officer-ledger-item">
                   <a class="officer-incarnation-link" [routerLink]="['/sessions', inc.thread_id]">
@@ -866,7 +1051,9 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
                     {{ inc.commissioned_at | date: 'mediumDate' }} →
                     {{ inc.decommissioned_at | date: 'mediumDate' }}
                   </span>
-                  @if (inc.reason) { <span>{{ inc.reason }}</span> }
+                  @if (inc.reason) {
+                    <span>{{ inc.reason }}</span>
+                  }
                 </div>
               }
             </div>
@@ -874,7 +1061,7 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
 
           @if (postState() !== 'vacant' && digest().length) {
             <div class="officer-digest" data-testid="officer-digest">
-              <div class="officer-digest-title">Digest — what he queued for you</div>
+              <div class="officer-digest-title">{{ 'officerCard.digest.title' | transloco }}</div>
               @for (d of digest(); track $index) {
                 <div class="officer-digest-item">
                   <span class="dim">{{ d.at | date: 'short' }}</span>
@@ -888,16 +1075,34 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
       }
 
       @if (message()) {
-        <div class="officer-message" data-testid="officer-message">{{ message() }}</div>
+        <div class="officer-message" role="status" aria-live="polite" data-testid="officer-message">
+          {{ message() }}
+        </div>
       }
     </div>
   `,
   styles: [
     `
-      .officer-tab { display: flex; flex-direction: column; gap: 16px; }
-      .officer-intro h3 { margin: 0 0 6px; font-size: 15px; }
-      .officer-intro p { margin: 0; color: var(--text-secondary); font-size: 13px; max-width: 70ch; }
-      .officer-loading { display: flex; justify-content: center; padding: 32px; }
+      .officer-tab {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      .officer-intro h3 {
+        margin: 0 0 6px;
+        font-size: 15px;
+      }
+      .officer-intro p {
+        margin: 0;
+        color: var(--text-secondary);
+        font-size: 13px;
+        max-width: 70ch;
+      }
+      .officer-loading {
+        display: flex;
+        justify-content: center;
+        padding: 32px;
+      }
       .officer-card {
         border: 1px solid var(--border-color);
         border-radius: 10px;
@@ -907,7 +1112,12 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
         gap: 12px;
         background: var(--bg-secondary);
       }
-      .officer-status-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .officer-status-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
       .officer-badge {
         font-size: 11px;
         text-transform: uppercase;
@@ -917,16 +1127,53 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
         background: var(--bg-tertiary);
         color: var(--text-secondary);
       }
-      .officer-badge[data-status='active'] { background: color-mix(in srgb, var(--success, #22c55e) 18%, transparent); color: var(--success, #22c55e); }
-      .officer-badge[data-status='suspended'] { background: color-mix(in srgb, var(--warning, #eab308) 18%, transparent); color: var(--warning, #eab308); }
-      .officer-hold { font-size: 12px; color: var(--warning, #eab308); }
-      .officer-hold-note { font-size: 12px; color: var(--text-secondary); font-style: italic; }
-      .officer-title { font-weight: 600; font-size: 13px; }
-      .officer-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px 16px; }
-      .officer-meta .k, .officer-slots .k { display: block; font-size: 11px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.4px; }
-      .officer-meta .v { font-size: 13px; }
-      .officer-warn { color: var(--warning, #eab308); font-size: 12px; }
-      .officer-slots { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .officer-badge[data-status='active'] {
+        background: color-mix(in srgb, var(--success, #22c55e) 18%, transparent);
+        color: var(--success, #22c55e);
+      }
+      .officer-badge[data-status='suspended'] {
+        background: color-mix(in srgb, var(--warning, #eab308) 18%, transparent);
+        color: var(--warning, #eab308);
+      }
+      .officer-hold {
+        font-size: 12px;
+        color: var(--warning, #eab308);
+      }
+      .officer-hold-note {
+        font-size: 12px;
+        color: var(--text-secondary);
+        font-style: italic;
+      }
+      .officer-title {
+        font-weight: 600;
+        font-size: 13px;
+      }
+      .officer-meta {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 8px 16px;
+      }
+      .officer-meta .k,
+      .officer-slots .k {
+        display: block;
+        font-size: 11px;
+        color: var(--text-tertiary);
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+      }
+      .officer-meta .v {
+        font-size: 13px;
+      }
+      .officer-warn {
+        color: var(--warning, #eab308);
+        font-size: 12px;
+      }
+      .officer-slots {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
       .officer-slot-chip {
         font-size: 12px;
         padding: 2px 10px;
@@ -941,9 +1188,23 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
         border-color: var(--color-warning, #b45309);
         color: var(--color-warning, #b45309);
       }
-      .officer-editor { display: flex; flex-direction: column; gap: 10px; }
-      .officer-editor-head { display: flex; align-items: baseline; gap: 10px; margin-top: 4px; }
-      .officer-section-title { font-size: 12px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.4px; }
+      .officer-editor {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .officer-editor-head {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        margin-top: 4px;
+      }
+      .officer-section-title {
+        font-size: 12px;
+        color: var(--text-tertiary);
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+      }
       .officer-immediacy {
         font-size: 11px;
         color: var(--text-tertiary);
@@ -952,8 +1213,24 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
         border-radius: 999px;
         border: 1px dashed var(--border-color);
       }
-      .officer-drain { font-size: 12px; color: var(--warning, #eab308); padding-left: 2px; }
-      .officer-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .officer-drain {
+        font-size: 12px;
+        color: var(--warning, #eab308);
+        padding-left: 2px;
+      }
+      .officer-validation {
+        font-size: 12px;
+        color: var(--danger, #ef4444);
+      }
+      .officer-read-only {
+        border-left: 3px solid var(--border-color);
+        padding-left: 10px;
+      }
+      .officer-actions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
       .officer-confirm {
         border: 1px solid var(--border-color);
         border-radius: 8px;
@@ -963,19 +1240,71 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
         gap: 8px;
         background: var(--bg-tertiary);
       }
-      .officer-policy { display: flex; flex-direction: column; gap: 6px; }
-      .officer-ledger, .officer-incarnations { display: flex; flex-direction: column; gap: 6px; }
-      .officer-ledger-item { display: flex; gap: 8px; font-size: 13px; flex-wrap: wrap; align-items: baseline; }
-      .officer-ledger-status { font-size: 12px; color: var(--text-secondary); }
-      .officer-incarnation-link { font-family: var(--font-mono, monospace); font-size: 12px; }
-      .officer-digest { display: flex; flex-direction: column; gap: 6px; }
-      .officer-digest-title { font-size: 12px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.4px; }
-      .officer-digest-item { display: flex; gap: 8px; font-size: 13px; flex-wrap: wrap; }
-      .officer-slot-row { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; }
-      .officer-hint { margin: 0; font-size: 13px; color: var(--text-secondary); }
-      .officer-hint.dim { color: var(--text-tertiary); font-size: 12px; }
-      .officer-message { font-size: 13px; color: var(--text-secondary); }
-      .dim { color: var(--text-tertiary); }
+      .officer-policy {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .officer-ledger,
+      .officer-incarnations {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .officer-ledger-item {
+        display: flex;
+        gap: 8px;
+        font-size: 13px;
+        flex-wrap: wrap;
+        align-items: baseline;
+      }
+      .officer-ledger-status {
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+      .officer-incarnation-link {
+        font-family: var(--font-mono, monospace);
+        font-size: 12px;
+      }
+      .officer-digest {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .officer-digest-title {
+        font-size: 12px;
+        color: var(--text-tertiary);
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+      }
+      .officer-digest-item {
+        display: flex;
+        gap: 8px;
+        font-size: 13px;
+        flex-wrap: wrap;
+      }
+      .officer-slot-row {
+        display: flex;
+        gap: 8px;
+        align-items: end;
+        flex-wrap: wrap;
+      }
+      .officer-hint {
+        margin: 0;
+        font-size: 13px;
+        color: var(--text-secondary);
+      }
+      .officer-hint.dim {
+        color: var(--text-tertiary);
+        font-size: 12px;
+      }
+      .officer-message {
+        font-size: 13px;
+        color: var(--text-secondary);
+      }
+      .dim {
+        color: var(--text-tertiary);
+      }
     `,
   ],
 })
@@ -987,6 +1316,16 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   private readonly api = inject(ApiService);
   private readonly router = inject(Router);
   private readonly modelService = inject(ModelService);
+  private readonly transloco = inject(TranslocoService);
+
+  readonly language = signal(this.transloco.getActiveLang());
+  private readonly languageSubscription = this.transloco.langChanges$.subscribe((lang) =>
+    this.language.set(lang),
+  );
+  private readonly tr: OfficerTranslate = (key, params) => {
+    this.language();
+    return String(this.transloco.translate(key, params));
+  };
 
   readonly post = signal<OfficerPost | null>(null);
   readonly loading = signal(true);
@@ -1000,7 +1339,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   // The kit editor — one set of drafts, every state. Seeded from the post on
   // state transitions only (editorSeedKey), so the 15s poll never clobbers
   // in-progress edits.
-  readonly slotDrafts = signal<SlotDraft[]>([{...STARTER_SLOT_DRAFT}]);
+  readonly slotDrafts = signal<SlotDraft[]>([{ ...STARTER_SLOT_DRAFT }]);
   readonly categoryOptions = WORK_CATEGORY_OPTIONS;
   // The officer's OWN brain (distinct from the slot models, which are what
   // his workers run on — the classic mistake is arming the troops and leaving
@@ -1018,22 +1357,22 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   private pollHandle: ReturnType<typeof setInterval> | null = null;
 
   /** §7's per-field honesty, exposed to the template. */
-  readonly immediacy = immediacyLabel;
+  readonly immediacy = (field: OfficerEditField): string => immediacyLabel(field, this.tr);
 
-  readonly modelOptions = computed(() =>
-    this.modelService.models().flatMap((g) => g.models),
-  );
+  readonly modelOptions = computed(() => this.modelService.models().flatMap((g) => g.models));
   readonly postState = computed<OfficerPostState>(() => postStateOf(this.post()));
+  readonly canManage = computed(() => this.post()?.can_manage === true);
   readonly showImmediacy = computed(() => this.postState() !== 'vacant');
-  readonly holdLabel = computed(() => holdBadgeLabel(this.post()?.held));
+  readonly holdLabel = computed(() => holdBadgeLabel(this.post()?.held, this.tr));
   readonly wakeLabel = computed(() =>
-    nextWakeLabel(this.post()?.officer?.next_wake_at ?? null),
+    nextWakeLabel(this.post()?.officer?.next_wake_at ?? null, this.tr),
   );
-  readonly digest = computed(() =>
-    [...(this.post()?.officer?.digest ?? [])].reverse(),
-  );
+  readonly digest = computed(() => [...(this.post()?.officer?.digest ?? [])].reverse());
   readonly kitRows = computed(() =>
-    kitChips(this.post()?.kit, this.post()?.backlog?.breakers),
+    kitChips(this.post()?.kit, this.tr, this.post()?.backlog?.breakers, new Date()),
+  );
+  readonly conference = computed(
+    () => this.post()?.conference ?? this.post()?.officer?.conference ?? null,
   );
   /** Pool policy the officer is operating under, or null when he has no pools. */
   readonly backlogState = computed(() => {
@@ -1048,8 +1387,8 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   readonly provisioningStateSummary = computed(() =>
     [
       ...new Set(
-        this.provisioningProblems().map(
-          (row) => row.context?.provisioning_preflight?.state ?? 'unknown',
+        this.provisioningProblems().map((row) =>
+          this.stateLabel(row.context?.provisioning_preflight?.state ?? 'unknown'),
         ),
       ),
     ].join(', '),
@@ -1063,24 +1402,23 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     [
       ...new Set(
         this.knowledgeProblems().map(
-          (row) => `${row.canonical_state}/${row.projection_state}`,
+          (row) =>
+            `${this.stateLabel(row.canonical_state)}/${this.stateLabel(row.projection_state)}`,
         ),
       ),
     ].join(', '),
   );
-  readonly latestFloorWake = computed(
-    () => this.post()?.backlog?.floor_wakes?.[0] ?? null,
-  );
+  readonly latestFloorWake = computed(() => this.post()?.backlog?.floor_wakes?.[0] ?? null);
   readonly spendCeiling = computed(
-    () =>
-      this.post()?.spend_today?.ceiling ??
-      this.post()?.officer?.token_ceiling?.daily ??
-      null,
+    () => this.post()?.spend_today?.ceiling ?? this.post()?.officer?.token_ceiling?.daily ?? null,
   );
-  readonly incarnations = computed(() =>
-    [...(this.post()?.incarnations ?? [])].reverse(),
-  );
+  readonly incarnations = computed(() => [...(this.post()?.incarnations ?? [])].reverse());
   readonly vacantLedger = computed(() => vacantLedgerOf(this.post()));
+  readonly rosterIssue = computed(() => rosterValidationIssue(this.slotDrafts()));
+  readonly rosterError = computed(() => {
+    const issue = this.rosterIssue();
+    return issue ? this.tr(issue.key, issue.params) : null;
+  });
 
   private readonly currentDraft = computed<OfficerEditorDraft>(() => ({
     slots: this.slotDrafts(),
@@ -1095,7 +1433,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   }));
   /** What Save would send — diffed against the post's last known state. */
   readonly pendingPatch = computed(() =>
-    buildOfficerPatch(draftFromPost(this.post()), this.currentDraft()),
+    this.rosterIssue() ? {} : buildOfficerPatch(draftFromPost(this.post()), this.currentDraft()),
   );
   readonly dirty = computed(() => Object.keys(this.pendingPatch()).length > 0);
   /** Per-draft-row drain hint when shrinking a slot below its in-flight count. */
@@ -1105,7 +1443,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     return this.slotDrafts().map((row) => {
       if (vacant || !kit) return null;
       const live = kit[row.name.trim().toLowerCase()];
-      return drainHint(live?.in_flight, Math.max(1, Math.floor(row.count)));
+      return drainHint(live?.in_flight, Math.min(20, Math.max(0, Math.floor(row.count))), this.tr);
     });
   });
 
@@ -1113,16 +1451,19 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     () => this.post()?.communication_policy?.worker_messages ?? 'user_direct',
   );
   readonly officerFirstLabel = computed(() =>
-    this.postState() === 'vacant' ? 'Officer first' : 'Officer first (recommended)',
+    this.tr(
+      this.postState() === 'vacant'
+        ? 'officerCard.policy.officerFirst'
+        : 'officerCard.policy.officerFirstRecommended',
+    ),
   );
+  readonly policyLabel = computed(() => this.tr(`officerCard.policy.value.${this.policyValue()}`));
   readonly policyHint = computed(() => {
     const mins = this.post()?.communication_policy?.officer_response_minutes ?? 15;
-    const base =
-      `Officer first falls back to you if the officer is unavailable, ` +
-      `and escalates to you if he stays silent past ${mins} min.`;
-    return this.postState() === 'vacant'
-      ? `${base} While the post is vacant, questions come direct to you regardless.`
-      : base;
+    return this.tr(
+      this.postState() === 'vacant' ? 'officerCard.policy.hintVacant' : 'officerCard.policy.hint',
+      { minutes: mins },
+    );
   });
 
   ngOnInit(): void {
@@ -1134,6 +1475,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     if (this.pollHandle) clearInterval(this.pollHandle);
+    this.languageSubscription.unsubscribe();
   }
 
   refresh(silent = false): void {
@@ -1152,6 +1494,8 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
    */
   private applyPost(p: OfficerPost | null): void {
     if (p) {
+      const authorityChanged = this.post() !== null && this.post()?.can_manage !== p.can_manage;
+      if (authorityChanged) this.editorSeedKey = null;
       this.post.set(p);
       const key = p.commissioned ? `c:${p.officer?.thread_id ?? ''}` : 'vacant';
       if (this.editorSeedKey !== key) {
@@ -1178,27 +1522,78 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   }
 
   patchSlot(index: number, patch: Partial<SlotDraft>): void {
-    this.slotDrafts.update((rows) =>
-      rows.map((r, i) => (i === index ? {...r, ...patch} : r)),
-    );
+    if (!this.canManage()) return;
+    this.slotDrafts.update((rows) => rows.map((r, i) => (i === index ? { ...r, ...patch } : r)));
   }
 
   toCount(value: string | null | undefined): number {
     const n = parseInt(value ?? '1', 10);
-    return Number.isNaN(n) ? 1 : Math.max(1, n);
+    return Number.isNaN(n) ? 1 : Math.min(20, Math.max(0, n));
   }
 
   addSlot(): void {
+    if (!this.canManage() || this.slotDrafts().length >= 8) return;
     this.slotDrafts.update((rows) => [
       ...rows,
       // Uncategorized: a new row is plain capacity until someone chooses a
       // pool for it, so adding a slot can never arm auto-pull by accident.
-      {name: '', count: 1, model: '', backend: '', category: ''},
+      {
+        name: '',
+        count: 1,
+        model: '',
+        backend: '',
+        category: '',
+        spendCeilingDaily: null,
+      },
     ]);
   }
 
   removeSlot(index: number): void {
+    if (!this.canManage()) return;
     this.slotDrafts.update((rows) => rows.filter((_, i) => i !== index));
+  }
+
+  statusLabel(status: string | null | undefined): string {
+    if (!status) return this.tr('officerCard.status.unknown');
+    const known = new Set([
+      'active',
+      'suspended',
+      'ended',
+      'created',
+      'processing',
+      'waiting_for_reply',
+      'paused',
+      'pending_review',
+      'completed',
+      'failed',
+      'cancelled',
+    ]);
+    return known.has(status) ? this.tr(`officerCard.status.${status}`) : status;
+  }
+
+  stateLabel(state: string | null | undefined): string {
+    if (!state) return this.tr('officerCard.status.unknown');
+    const normalized = state.replaceAll('_', '-');
+    const known = new Set([
+      'not-attempted',
+      'in-progress',
+      'retryable-failed',
+      'permanent-failed',
+      'activated',
+      'pending-sync',
+      'canonical',
+      'failed',
+      'superseded',
+      'pending',
+      'synced',
+      'projection-only',
+      'retryable',
+      'queued',
+      'delivered',
+      'permanent-failed',
+      'unknown',
+    ]);
+    return known.has(normalized) ? this.tr(`officerCard.machineState.${normalized}`) : state;
   }
 
   shortId(id: string): string {
@@ -1208,7 +1603,12 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   /** Raise an officer onto the post with the editor's config (§5). */
   async commission(): Promise<void> {
     const pid = this.projectId();
-    if (!pid || this.busy()) return;
+    if (!pid || !this.canManage() || this.busy()) return;
+    const rosterError = this.rosterError();
+    if (rosterError) {
+      this.message.set(rosterError);
+      return;
+    }
     this.busy.set(true);
     this.message.set('');
     try {
@@ -1217,13 +1617,13 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
       );
       this.message.set(
         resp?.thread_id
-          ? 'Commissioned — his first wake carries the continuity brief. Open log to watch him take the post.'
-          : 'Commissioned.',
+          ? this.tr('officerCard.messages.commissionedWithBrief')
+          : this.tr('officerCard.messages.commissioned'),
       );
       this.editorSeedKey = null;
       this.refresh(true);
     } catch (err) {
-      this.message.set(this.errText(err, 'Commission failed'));
+      this.message.set(this.errText(err, 'officerCard.errors.commission'));
     } finally {
       this.busy.set(false);
     }
@@ -1233,18 +1633,22 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   async saveEdits(): Promise<void> {
     const pid = this.projectId();
     const patch = this.pendingPatch();
-    if (!pid || this.busy() || !Object.keys(patch).length) return;
+    if (!pid || !this.canManage() || this.busy()) return;
+    const rosterError = this.rosterError();
+    if (rosterError) {
+      this.message.set(rosterError);
+      return;
+    }
+    if (!Object.keys(patch).length) return;
     this.busy.set(true);
     this.message.set('');
     try {
       await firstValueFrom(this.api.updateOfficerPost(pid, patch));
-      this.message.set(
-        "Post updated — the next sitrep's capacity line carries the truth.",
-      );
+      this.message.set(this.tr('officerCard.messages.updated'));
       this.editorSeedKey = null;
       this.refresh(true);
     } catch (err) {
-      this.message.set(this.errText(err, 'Update failed'));
+      this.message.set(this.errText(err, 'officerCard.errors.update'));
     } finally {
       this.busy.set(false);
     }
@@ -1257,33 +1661,29 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
    */
   async decommission(force: boolean): Promise<void> {
     const pid = this.projectId();
-    if (!pid || this.busy()) return;
+    if (!pid || !this.canManage() || this.busy()) return;
     this.busy.set(true);
     this.message.set('');
     try {
       const resp = await firstValueFrom(this.api.decommissionOfficer(pid, force));
-      if (
-        !force &&
-        ((resp?.in_flight_jobs?.length ?? 0) > 0 || resp?.warning)
-      ) {
+      if (!force && ((resp?.in_flight_jobs?.length ?? 0) > 0 || resp?.warning)) {
         this.decommissionWarning.set(resp);
         return;
       }
       this.decommissionArmed.set(false);
       this.decommissionWarning.set(null);
-      this.message.set(
-        'Post decommissioned — kit, budgets, and fingerprints stay on the post for his successor.',
-      );
+      this.message.set(this.tr('officerCard.messages.decommissioned'));
       this.editorSeedKey = null;
       this.refresh(true);
     } catch (err) {
-      this.message.set(this.errText(err, 'Decommission failed'));
+      this.message.set(this.errText(err, 'officerCard.errors.decommission'));
     } finally {
       this.busy.set(false);
     }
   }
 
   cancelDecommission(): void {
+    if (!this.canManage()) return;
     this.decommissionArmed.set(false);
     this.decommissionWarning.set(null);
   }
@@ -1291,19 +1691,17 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   /** Maintenance hold — commissioned, standing down; never self-healed away. */
   async hold(): Promise<void> {
     const pid = this.projectId();
-    if (!pid || this.busy()) return;
+    if (!pid || !this.canManage() || this.busy()) return;
     this.busy.set(true);
     this.message.set('');
     try {
       await firstValueFrom(this.api.holdOfficer(pid, this.holdNote()));
       this.holdArmed.set(false);
       this.holdNote.set('');
-      this.message.set(
-        'Held — dispatches pause and the watchdog stands down; your input still reaches him.',
-      );
+      this.message.set(this.tr('officerCard.messages.held'));
       this.refresh(true);
     } catch (err) {
-      this.message.set(this.errText(err, 'Hold failed'));
+      this.message.set(this.errText(err, 'officerCard.errors.hold'));
     } finally {
       this.busy.set(false);
     }
@@ -1311,15 +1709,15 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
 
   async release(): Promise<void> {
     const pid = this.projectId();
-    if (!pid || this.busy()) return;
+    if (!pid || !this.canManage() || this.busy()) return;
     this.busy.set(true);
     this.message.set('');
     try {
       await firstValueFrom(this.api.releaseOfficer(pid));
-      this.message.set('Released — queued events drain within a tick.');
+      this.message.set(this.tr('officerCard.messages.released'));
       this.refresh(true);
     } catch (err) {
-      this.message.set(this.errText(err, 'Release failed'));
+      this.message.set(this.errText(err, 'officerCard.errors.release'));
     } finally {
       this.busy.set(false);
     }
@@ -1332,7 +1730,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   async setPolicy(value: string | null): Promise<void> {
     const pid = this.projectId();
     const v = value as WorkerMessagesPolicy | null;
-    if (!pid || !v || v === this.policyValue() || this.busy()) return;
+    if (!pid || !this.canManage() || !v || v === this.policyValue() || this.busy()) return;
     const prev = this.post();
     this.post.update((p) =>
       p
@@ -1348,15 +1746,13 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     try {
       await firstValueFrom(
         this.api.updateOfficerPost(pid, {
-          communication_policy: {worker_messages: v},
+          communication_policy: { worker_messages: v },
         }),
       );
       this.refresh(true);
     } catch (err) {
       this.post.set(prev);
-      this.message.set(
-        this.errText(err, 'Could not change worker-question routing'),
-      );
+      this.message.set(this.errText(err, 'officerCard.errors.policy'));
     }
   }
 
@@ -1367,8 +1763,8 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
 
   async openConference(): Promise<void> {
     const pid = this.projectId();
-    if (!pid || this.busy()) return;
-    const existing = this.post()?.officer?.conference;
+    if (!pid || !this.canManage() || this.busy()) return;
+    const existing = this.conference();
     if (existing) {
       await this.router.navigate(['/sessions', existing.thread_id]);
       return;
@@ -1377,22 +1773,29 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     this.message.set('');
     try {
       const resp = await firstValueFrom(
-        this.http.post<{thread_id: string}>(
+        this.http.post<{ thread_id: string }>(
           `${environment.apiUrl}/persistent/threads`,
-          buildConferenceThreadCreateBody(pid, this.projectName()),
+          buildConferenceThreadCreateBody(
+            pid,
+            this.projectName() || this.tr('officerCard.defaults.project'),
+            this.tr('officerCard.actions.conference'),
+          ),
         ),
       );
       await this.router.navigate(['/sessions', resp.thread_id]);
     } catch (err) {
       // conference_open 409 → someone beat us; refresh finds it.
-      this.message.set(this.errText(err, 'Could not open the conference'));
+      this.message.set(this.errText(err, 'officerCard.errors.conference'));
       this.busy.set(false);
       this.refresh(true);
     }
   }
 
-  private errText(err: unknown, fallback: string): string {
-    const detail = (err as {error?: {detail?: unknown}})?.error?.detail;
-    return typeof detail === 'string' && detail ? detail : fallback;
+  private errText(err: unknown, fallbackKey: string): string {
+    const detail = (err as { error?: { detail?: unknown } })?.error?.detail;
+    const fallback = this.tr(fallbackKey);
+    return typeof detail === 'string' && detail
+      ? this.tr('officerCard.errors.withDetail', { fallback, detail })
+      : fallback;
   }
 }
