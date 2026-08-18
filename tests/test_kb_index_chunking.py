@@ -799,9 +799,11 @@ class TestUpsertKbNoteProvenanceCoalesceSentinel:
 
     @pytest.mark.asyncio
     async def test_modified_at_coalesces_against_the_existing_row_on_conflict(self):
-        # modified_at orders the search function's recency arm
-        # (ORDER BY modified_at DESC NULLS LAST). A file with no `modified:`
-        # line carries no opinion, so a replay must not blank the stored one.
+        # modified_at orders the search function's recency arm — a bare
+        # ORDER BY ki.modified_at DESC, with no NULLS LAST. A file with no
+        # `modified:` line carries no opinion, so a replay must not blank the
+        # stored one; Postgres sorts NULLs FIRST under DESC, so blanking it
+        # would hoist the row to the top of that arm rather than bury it.
         store, mock_db, _ = _make_store()
         mock_db.fetchval.return_value = uuid.uuid4()
         await store.upsert_kb_note(

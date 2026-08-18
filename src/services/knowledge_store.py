@@ -1099,9 +1099,12 @@ class KnowledgeStore:
         being swept away the same way.
 
         ``modified_at`` takes the sentinel too. It orders the search
-        function's recency arm (``ORDER BY modified_at DESC NULLS LAST``), and
-        a file with no ``modified:`` line has no opinion about it — so a
-        replay must leave the stored value alone rather than blank it.
+        function's recency arm — a bare ``ORDER BY ki.modified_at DESC``
+        (vector_schema_current.sql), with no ``NULLS LAST`` — and a file with
+        no ``modified:`` line has no opinion about it, so a replay must leave
+        the stored value alone rather than blank it. Blanking is worse than
+        it sounds: Postgres sorts NULLs FIRST under ``DESC``, so a NULLed row
+        does not drop to the bottom of that arm, it jumps to the top of it.
         ``created_at`` needs no sentinel for the opposite reason: it is
         absent from this branch entirely, which is what stops a second write
         from moving a note's creation time.

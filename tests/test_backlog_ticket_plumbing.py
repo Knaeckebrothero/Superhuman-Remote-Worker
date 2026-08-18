@@ -516,7 +516,18 @@ class TestReadyAuthorization:
         # the ticket parked exactly as it was.
         assert _ready_outcome(canonical_writes) is True
 
-    def test_withdrawing_clears_readiness(self, canonical_writes):
+    def test_withdrawing_drops_the_ready_at_line_from_the_file(self, canonical_writes):
+        # What this proves is the FILE: the written note comes back with no
+        # `ready_at:` line and the `ready` tag gone. It does NOT prove the row
+        # is cleared, and the row deliberately is not: absence is the "leave
+        # the stored value alone" sentinel (upsert_kb_note COALESCEs
+        # `ready_at`), and OKF has no tombstone that could say "withdrawn"
+        # instead of "no opinion". So the column keeps the stale stamp.
+        #
+        # That is safe because the dispatch pool filters on the `ready` TAG
+        # (`tags @> ARRAY['ready']`, project_backlog.py) and only reads
+        # ready_at afterwards to date the authorization. A stamp with no tag
+        # can never enter the pool, so it is inert, not a live authorization.
         ctx = _session_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["ready", "category:executor"]
@@ -525,6 +536,8 @@ class TestReadyAuthorization:
             {"note": "feature-dark-mode", "remove_tags": ["ready"]}
         )
         assert _ready_outcome(canonical_writes) is False
+        # The tag is the half that actually gates dispatch, so assert it.
+        assert "ready" not in _canonical_fields(canonical_writes)["tags"]
         assert "withdrawn" in result
 
     def test_a_content_edit_on_a_ready_ticket_says_nothing_about_readiness(

@@ -224,6 +224,12 @@ class TestCharterWriteAuthority:
         _, slug, content, _ = canonical_write.call_args.args
         assert slug == "recon-findings"
         assert "type: report" in content
+        # The seam every other index-reporting test patches out. The stub here
+        # is at `_post_vault_file` — the HTTP boundary — so the REAL
+        # `_materialize_note` runs, and this proves the endpoint's `indexed`
+        # field survives that passthrough into the string the model reads.
+        # Patch `_materialize_note` instead and the whole hop goes untested.
+        assert "indexed=yes" in result
 
     def test_session_creates_charter_when_none_exists(self, canonical_write):
         ctx = _session_context()
