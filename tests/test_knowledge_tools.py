@@ -444,25 +444,15 @@ class TestKbUpdate:
         # bare "+2 tag(s)" no longer describes what the note now carries.
         assert "tags → [a, b]" in result
 
-    def test_pgvector_writethrough_failure_nonfatal(self):
-        tools, ctx = _make_tools()
-        ctx.knowledge_graph.update_note.return_value = True
-        # The authorization boundary pre-reads the durable note type before
-        # mutation; this test targets the later projection read failure.
-        ctx.knowledge_graph.read_note.side_effect = [
-            {"type": "learning", "tags": []},
-            Exception("read failed"),
-        ]
-
-        result = _invoke(
-            _get_tool(tools, "kb_update"),
-            {
-                "note": "n1",
-                "append": "extra",
-            },
-        )
-        assert "Updated" in result
-        assert "content appended" in result
+    # `test_pgvector_writethrough_failure_nonfatal` lived here. It drove a
+    # second `kg.read_note` into raising so kb_update's own pgvector
+    # write-through would fail, and asserted the update still reported
+    # "Updated". Slice A deleted that write — the orchestrator indexes the
+    # commit — so the failure mode has no trigger left. The surviving cases
+    # are TestKbUpdateMaterialization::test_materialization_failure_fails_closed
+    # (the canonical write itself not completing, which is now fatal) and
+    # TestKbUpdateDoesNotWriteTheRow (an index that defers, reported not
+    # hidden).
 
     def test_error_on_value_error(self):
         """A ValueError out of the graph layer surfaces as an error string.
@@ -2032,6 +2022,348 @@ class TestKbWriteDoesNotWriteTheRow:
         assert "indexed=deferred:reindex-running" in result
 
 
+_PRIOR_CREATED = "2026-01-02T03:04:05+00:00"
+
+
+def _graph_existing(**over):
+    """A ``kg.read_note``-shaped note that already exists in the KB."""
+    base = {
+        "id": "an-existing-note",
+        "title": "T",
+        "type": "decision",
+        "content": "old body",
+        "status": "active",
+        "tags": [],
+        "keywords": [],
+        "created": _PRIOR_CREATED,
+        "modified": _PRIOR_CREATED,
+        "retrieval_messages": ["why did we pick JWT?"],
+        "relationships": [],
+    }
+    base.update(over)
+    return base
+
+
+@pytest.fixture
+def kb_update_tools(ks, materializer):
+    """kb tools over a graph-backed KB that already holds ``an-existing-note``."""
+    ctx = _make_context()
+    ctx.knowledge_store = ks
+    ctx.knowledge_graph.read_note.return_value = _graph_existing()
+    ctx.knowledge_graph.update_note.return_value = True
+    tools, _ = _make_tools(ctx)
+    return {tool.name: (lambda _tool=tool, **kw: _invoke(_tool, kw)) for tool in tools}
+
+
+@pytest.fixture
+def kb_update_tools_kgless(ks, materializer):
+    """The same, on the store-only tier (``_update_existing_kgless``)."""
+    ctx = _make_context()
+    ctx.knowledge_graph = None
+    ctx.knowledge_store = ks
+    ks.get_note_by_slug = AsyncMock(
+        return_value=_existing_note(
+            note_id="an-existing-note", created=_PRIOR_CREATED, modified=_PRIOR_CREATED
+        )
+    )
+    tools, _ = _make_tools(ctx)
+    return {tool.name: (lambda _tool=tool, **kw: _invoke(_tool, kw)) for tool in tools}
+
+
+class TestKbUpdateDoesNotWriteTheRow:
+    """Slice A leaves exactly one writer of ``knowledge_index``: the
+    materialisation endpoint. kb_update's own ``upsert_note`` would clobber
+    the chunks/links/stamp the inline index just wrote, and would report a
+    projection state the orchestrator — not the agent — now owns."""
+
+    def test_kb_update_never_calls_upsert_note(self, kb_update_tools, ks):
+        result = kb_update_tools["kb_update"](
+            note="an-existing-note", append="more text"
+        )
+        assert result.startswith("Updated **")
+        ks.upsert_note.assert_not_called()
+
+    def test_kgless_kb_update_never_calls_upsert_note(self, kb_update_tools_kgless, ks):
+        result = kb_update_tools_kgless["kb_update"](
+            note="an-existing-note", append="more text"
+        )
+        assert result.startswith("Updated **")
+        ks.upsert_note.assert_not_called()
+
+    def test_kb_update_reports_index_state(self, kb_update_tools):
+        result = kb_update_tools["kb_update"](
+            note="an-existing-note", append="more text"
+        )
+        assert "indexed=yes" in result
+        assert "projection=synced" not in result
+
+    def test_kgless_kb_update_reports_index_state(self, kb_update_tools_kgless):
+        result = kb_update_tools_kgless["kb_update"](
+            note="an-existing-note", append="more text"
+        )
+        assert "indexed=yes" in result
+        assert "projection=synced" not in result
+
+    def test_a_deferred_index_is_reported_not_hidden(
+        self, kb_update_tools, materializer
+    ):
+        materializer.return_value = {
+            "status": "committed",
+            "canonical_state": "canonical",
+            "indexed": False,
+            "index_reason": "oversized",
+        }
+        result = kb_update_tools["kb_update"](
+            note="an-existing-note", append="more text"
+        )
+        assert result.startswith("Updated **")
+        assert "indexed=deferred:oversized" in result
+
+    def test_kgless_deferred_index_is_reported_not_hidden(
+        self, kb_update_tools_kgless, materializer
+    ):
+        materializer.return_value = {
+            "status": "committed",
+            "canonical_state": "canonical",
+            "indexed": False,
+            "index_reason": "reindex-running",
+        }
+        result = kb_update_tools_kgless["kb_update"](
+            note="an-existing-note", append="more text"
+        )
+        assert result.startswith("Updated **")
+        assert "indexed=deferred:reindex-running" in result
+
+
+class TestKbUpdateForwardsRetrievalMessages:
+    """The markdown has nowhere to put retrieval messages, so they ride the
+    POST. kb_update rewrites the whole note; the row write that used to carry
+    them is gone, so without forwarding them here the endpoint sees nothing.
+
+    Asserted at the ``_post_vault_file`` seam — the actual request body —
+    rather than at ``_materialize_note``'s arguments."""
+
+    def _update(self, existing):
+        ctx = _make_git_context()
+        ctx.knowledge_graph.read_note.return_value = existing
+        ctx.knowledge_graph.update_note.return_value = True
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "more text"},
+            )
+        return calls
+
+    def test_the_existing_notes_messages_reach_the_endpoint(self):
+        calls = self._update(_graph_existing())
+        assert calls[0]["retrieval_messages"] == ["why did we pick JWT?"]
+
+    def test_a_note_without_messages_forwards_the_leave_alone_sentinel(self):
+        # None, not [] — the endpoint reads None as "leave the stored value
+        # alone", so an ordinary edit must not blank an earlier write's
+        # messages. `existing.get(...) or []` would have done exactly that.
+        calls = self._update(_graph_existing(retrieval_messages=None))
+        assert calls[0]["retrieval_messages"] is None
+
+    def test_storeonly_path_forwards_the_leave_alone_sentinel(self):
+        # get_note_by_slug does not read the column, so this tier has no
+        # messages of its own to forward. None is what preserves them.
+        ctx = _make_gitless_context()
+        ctx.knowledge_graph = None
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            return_value=_existing_note(note_id="an-existing-note")
+        )
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "x"},
+            )
+        assert calls[0]["retrieval_messages"] is None
+
+
+class TestKbUpdateKeepsTheNotesTimestamps:
+    """Every kb_update rewrites the whole file. ``created:`` is the only
+    carrier of a note's birth date — ``created_at`` is absent from
+    ``upsert_kb_note``'s ON CONFLICT list, so a row that ever lands NULL can
+    never be repaired — and stripping the line here would take it off before
+    any sweep read it."""
+
+    def _graph_ctx(self, **over):
+        ctx = _make_git_context()
+        ctx.knowledge_graph.read_note.return_value = _graph_existing(**over)
+        ctx.knowledge_graph.update_note.return_value = True
+        return ctx
+
+    def test_graph_path_carries_created_and_stamps_modified(self):
+        ctx = self._graph_ctx()
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "more"},
+            )
+        content = calls[0]["content"]
+        assert f"created: {_PRIOR_CREATED}" in content
+        assert "\nmodified: " in content
+        assert f"modified: {_PRIOR_CREATED}" not in content
+
+    def test_storeonly_path_carries_created_and_stamps_modified(self):
+        ctx = _make_gitless_context()
+        ctx.knowledge_graph = None
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            return_value=_existing_note(
+                note_id="an-existing-note",
+                created=_PRIOR_CREATED,
+                modified=_PRIOR_CREATED,
+            )
+        )
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "more"},
+            )
+        content = calls[0]["content"]
+        assert f"created: {_PRIOR_CREATED}" in content
+        assert "\nmodified: " in content
+        assert f"modified: {_PRIOR_CREATED}" not in content
+
+    def test_a_datetime_created_is_serialized_not_repr_dumped(self):
+        # get_note_by_slug hands back the tz-aware datetime straight off the
+        # row, and Neo4j hands back its own DateTime — both must land as a
+        # timestamp the reindexer's YAML parse can read.
+        from datetime import datetime as _dt, timezone as _tz
+
+        ctx = self._graph_ctx(created=_dt(2025, 12, 31, 9, 0, tzinfo=_tz.utc))
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "more"},
+            )
+        assert "created: 2025-12-31T09:00:00+00:00" in calls[0]["content"]
+
+    def test_a_non_stdlib_timestamp_is_serialized_through_isoformat(self):
+        # `neo4j.time.DateTime` is NOT a `datetime` subclass, so an
+        # `isinstance` check would str() it. It does have `.isoformat()`, and
+        # this stands in for it — the graph path is the one that reads it.
+        class _GraphDateTime:
+            def isoformat(self):
+                return "2025-06-01T12:00:00.123456789+00:00"
+
+            def __str__(self):  # what a naive implementation would emit
+                return "<GraphDateTime object>"
+
+        ctx = self._graph_ctx(created=_GraphDateTime())
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "more"},
+            )
+        assert "created: 2025-06-01T12:00:00.123456789+00:00" in calls[0]["content"]
+        assert "GraphDateTime object" not in calls[0]["content"]
+
+        # ...and the reindexer resolves it (YAML truncates to microseconds).
+        from orchestrator.services.kb_reindex import note_fields, parse_note_md
+
+        fm, body = parse_note_md(calls[0]["content"])
+        created_at = note_fields("knowledge/n.md", fm, body)["created_at"]
+        assert created_at is not None
+        assert created_at.isoformat() == "2025-06-01T12:00:00.123456+00:00"
+
+    def test_a_note_with_no_creation_time_gains_no_created_line(self):
+        ctx = self._graph_ctx(created=None)
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "more"},
+            )
+        assert "\ncreated:" not in calls[0]["content"]
+        assert "\nmodified: " in calls[0]["content"]
+
+    def test_the_timestamps_survive_the_reindexers_parse(self):
+        # The whole point: the row is rebuilt from these bytes. A format the
+        # reindexer cannot read indexes fine and silently stores NULL.
+        from orchestrator.services.kb_reindex import note_fields, parse_note_md
+
+        ctx = self._graph_ctx()
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "more"},
+            )
+        fm, body = parse_note_md(calls[0]["content"])
+        fields = note_fields("knowledge/an-existing-note.md", fm, body)
+        assert fields["created_at"] is not None
+        assert fields["created_at"].isoformat() == _PRIOR_CREATED
+        assert fields["modified_at"] is not None
+        assert fields["modified_at"] > fields["created_at"]
+
+
+class TestKbUpdateErrorPathsDoNotOverclaim:
+    """The optional-graph-projection failure used to open "'<slug>' is
+    canonical and searchable". With an index that can defer, that is a claim
+    the tool cannot make — it has to report the state the endpoint returned."""
+
+    def _graph_failure(self, materialization):
+        ctx = _make_context()
+        ctx.knowledge_graph.read_note.return_value = _graph_existing()
+        ctx.knowledge_graph.update_note.side_effect = RuntimeError("neo4j down")
+        tools, _ = _make_tools(ctx)
+        with patch(
+            "src.tools.knowledge.knowledge_tools._materialize_note",
+            return_value=materialization,
+        ):
+            return _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "x"},
+            )
+
+    def test_graph_failure_reports_the_real_index_state(self):
+        result = self._graph_failure(
+            {
+                "status": "committed",
+                "canonical_state": "canonical",
+                "indexed": False,
+                "index_reason": "index-error",
+            }
+        )
+        assert result.startswith("Error:")
+        assert "graph projection failed" in result
+        assert "searchable" not in result
+        assert "indexed=deferred:index-error" in result
+
+    def test_an_indexed_note_still_says_so_on_an_error_path(self):
+        # The negative control for the reword: dropping the claim without
+        # reporting the state would pass the test above and fail this one.
+        result = self._graph_failure(
+            {
+                "status": "committed",
+                "canonical_state": "canonical",
+                "indexed": True,
+                "index_reason": None,
+            }
+        )
+        assert result.startswith("Error:")
+        assert "searchable" not in result
+        assert "indexed=yes" in result
+
+
 class TestKbUpdateMaterialization:
     """kb_update re-materializes the note server-side, on both update paths."""
 
@@ -2857,85 +3189,84 @@ class TestKbWriteWithoutNeo4j:
         assert calls[0]["slug"].startswith("note-")
 
 
+def _canonical_note_fields(calls):
+    """The last note written, parsed back by the reindexer's own mapper.
+
+    kb_update's only write is the canonical file now (Slice A — the
+    materialisation endpoint owns the row it indexes from that commit), so
+    the file is where a mutation has to be observed. Round-tripping it
+    through the code that actually turns those bytes into the row is a
+    stronger check than the ``upsert_note`` kwargs this replaced.
+    """
+    from orchestrator.services.kb_reindex import note_fields, parse_note_md
+
+    entry = calls[-1]
+    fm, body = parse_note_md(entry["content"])
+    return note_fields(f"knowledge/{entry['slug']}.md", fm, body)
+
+
 class TestKbUpdateWithoutNeo4j:
     """kg-less _update_existing (via kb_update): read the current row from the
-    store, apply the mutation in Python, write back to store + OKF file."""
+    store, apply the mutation in Python, write it back as the canonical OKF
+    file — which the orchestrator commits and indexes."""
+
+    def _update(self, existing, args):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = existing
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(_get_tool(tools, "kb_update"), {"note": "n1", **args})
+        return result, calls
 
     def test_no_kg_replaces_content(self):
-        ctx = _make_context_no_kg()
-        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
-            content="old body"
+        result, calls = self._update(
+            _existing_note(content="old body"), {"content": "new body"}
         )
-        tools, _ = _make_tools(ctx)
-        result = _invoke(
-            _get_tool(tools, "kb_update"), {"note": "n1", "content": "new body"}
-        )
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["content"] == "new body"
+        assert "new body" in calls[0]["content"]
+        assert "old body" not in calls[0]["content"]
         assert "content replaced" in result
 
     def test_no_kg_not_found(self):
-        ctx = _make_context_no_kg()
-        ctx.knowledge_store.get_note_by_slug.return_value = None
-        tools, _ = _make_tools(ctx)
-        result = _invoke(
-            _get_tool(tools, "kb_update"), {"note": "nope", "content": "x"}
-        )
+        result, calls = self._update(None, {"content": "x"})
         assert "not found" in result
-        assert not ctx.knowledge_store.upsert_note.called
+        assert calls == []
 
     def test_no_kg_appends_content(self):
-        ctx = _make_context_no_kg()
-        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
-            content="old body"
-        )
-        tools, _ = _make_tools(ctx)
-        _invoke(_get_tool(tools, "kb_update"), {"note": "n1", "append": "more"})
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert "old body" in kwargs["content"]
-        assert "more" in kwargs["content"]
+        _, calls = self._update(_existing_note(content="old body"), {"append": "more"})
+        assert "old body" in calls[0]["content"]
+        assert "more" in calls[0]["content"]
 
     def test_no_kg_changes_status(self):
-        ctx = _make_context_no_kg()
-        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note()
-        tools, _ = _make_tools(ctx)
-        result = _invoke(
-            _get_tool(tools, "kb_update"), {"note": "n1", "status": "superseded"}
-        )
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["status"] == "superseded"
+        result, calls = self._update(_existing_note(), {"status": "superseded"})
+        assert _canonical_note_fields(calls)["status"] == "superseded"
         assert "status → superseded" in result
 
     def test_no_kg_invalid_status_errors(self):
         ctx = _make_context_no_kg()
         ctx.knowledge_store.get_note_by_slug.return_value = _existing_note()
         tools, _ = _make_tools(ctx)
-        with pytest.raises(ValidationError):
-            _invoke(_get_tool(tools, "kb_update"), {"note": "n1", "status": "bogus"})
-        assert not ctx.knowledge_store.upsert_note.called
+        patcher, calls = _capture_materialize()
+        with patcher:
+            with pytest.raises(ValidationError):
+                _invoke(
+                    _get_tool(tools, "kb_update"), {"note": "n1", "status": "bogus"}
+                )
+            assert calls == []
 
-        result = _invoke_unvalidated(
-            _get_tool(tools, "kb_update"), note="n1", status="bogus"
-        )
-        assert "Error" in result
-        assert not ctx.knowledge_store.upsert_note.called
+            # ...and the body still refuses it for callers that skip the schema.
+            result = _invoke_unvalidated(
+                _get_tool(tools, "kb_update"), note="n1", status="bogus"
+            )
+            assert "Error" in result
+            assert calls == []
 
     def test_no_kg_merges_tags_lowercased(self):
-        ctx = _make_context_no_kg()
-        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
-            tags=["security"]
+        _, calls = self._update(
+            _existing_note(tags=["security"]), {"add_tags": ["Auth"]}
         )
-        tools, _ = _make_tools(ctx)
-        _invoke(_get_tool(tools, "kb_update"), {"note": "n1", "add_tags": ["Auth"]})
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["tags"] == ["security", "auth"]
+        assert _canonical_note_fields(calls)["tags"] == ["security", "auth"]
 
     def test_no_kg_preserves_type_from_existing(self):
-        ctx = _make_context_no_kg()
-        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
-            type="retrospective"
-        )
-        tools, _ = _make_tools(ctx)
-        _invoke(_get_tool(tools, "kb_update"), {"note": "n1", "content": "x"})
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["note_type"] == "retrospective"
+        _, calls = self._update(_existing_note(type="retrospective"), {"content": "x"})
+        assert _canonical_note_fields(calls)["note_type"] == "retrospective"
