@@ -965,6 +965,7 @@ def _post_vault_file(
     slug: str,
     content: str,
     job_id: Optional[str],
+    retrieval_messages: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """POST one rendered note to the orchestrator's materialisation endpoint.
 
@@ -976,6 +977,13 @@ def _post_vault_file(
     The endpoint answers HTTP 200 for every KB-level outcome on purpose (its
     failure vocabulary lives in the body), so a non-200 here is a transport or
     auth problem, not a refused note.
+
+    ``retrieval_messages`` is the one note field the markdown cannot carry —
+    OKF frontmatter has no such key, so the POST body is its only route to
+    ``knowledge_index``. The key is omitted entirely unless there is something
+    to send, because the endpoint reads a missing/None value as "leave the
+    stored value alone" (``KnowledgeStore.upsert_kb_note``'s COALESCE
+    sentinel). Sending ``[]`` would instead blank an earlier write's messages.
     """
     base_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085").rstrip("/")
     url = f"{base_url}/api/projects/{project_id}/knowledge/materialize"
@@ -987,6 +995,8 @@ def _post_vault_file(
     payload: Dict[str, Any] = {"slug": slug, "content": content}
     if job_id:
         payload["job_id"] = str(job_id)
+    if retrieval_messages:
+        payload["retrieval_messages"] = list(retrieval_messages)
 
     try:
         with httpx.Client(
@@ -1009,22 +1019,30 @@ def _post_vault_file(
 
 
 def _materialize_note(
-    context: ToolContext, slug: str, note: Dict[str, Any]
+    context: ToolContext,
+    slug: str,
+    note: Dict[str, Any],
+    retrieval_messages: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Commit a note as ``knowledge/<slug>.md`` in the project's KB repo.
 
     Renders ``note`` with the same serializer the file has always used, stamps
     in-note provenance (author/job/branch — squash-merge erases git
     authorship), and hands the markdown to the orchestrator, which owns the
-    commit. No workspace and no git are required, and none is touched.
+    commit *and* the searchable row it indexes from that commit. No workspace
+    and no git are required, and none is touched.
 
     The endpoint never raises for expected repository failures, but callers
     must fail closed unless the returned state proves the canonical write.
-    Retry intent is persisted before the remote mutation, and the pgvector
-    projection is written only after canonical success.
+    Retry intent is persisted before the remote mutation.
+
+    ``retrieval_messages`` rides along out of band because the markdown has
+    nowhere to put it; ``None`` (the default, and what every caller with no
+    opinion passes) means "leave whatever is stored alone".
 
     Returns the endpoint's status dict, for callers that want to report the
-    outcome. ``status`` is ``committed`` / ``skipped`` / ``failed``.
+    outcome. ``status`` is ``committed`` / ``skipped`` / ``failed``, and
+    ``indexed`` / ``index_reason`` say whether it is searchable yet.
     """
     project_id = _get_project_id(context)
     if not project_id:
@@ -1057,7 +1075,9 @@ def _materialize_note(
         )
         return {"status": "failed", "reason": "render-error"}
 
-    result = _post_vault_file(project_id, slug, content, job_id)
+    result = _post_vault_file(
+        project_id, slug, content, job_id, retrieval_messages=retrieval_messages
+    )
 
     if str(result.get("status")) == "failed":
         logger.error(
@@ -2085,7 +2105,9 @@ def create_kb_tools(
             if type in _TICKET_TYPES:
                 new_note["priority"] = rank
             _apply_ready_frontmatter(new_note, _new_tags.ready)
-            materialization = _materialize_note(context, slug, new_note)
+            materialization = _materialize_note(
+                context, slug, new_note, retrieval_messages
+            )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(slug, materialization)
 
@@ -2115,9 +2137,9 @@ def create_kb_tools(
                     )
             if graph_error is not None:
                 return (
-                    f"Error: '{slug}' is canonical and searchable, but its optional "
-                    f"graph projection failed ({graph_error}); the mutation was not "
-                    "reported as Created."
+                    f"Error: '{slug}' is canonical, but its optional graph "
+                    f"projection failed ({graph_error}); the mutation was not "
+                    f"reported as Created. {_index_state_suffix(materialization)}"
                 )
 
             # Verdict SUPERSEDE: retire the stale note(s) the candidate replaces,
@@ -2140,10 +2162,11 @@ def create_kb_tools(
                         logger.warning(f"supersede retire failed for {t.note_id}: {e}")
                         retire_failures.append(f"{t.note_id}: {e}")
                 if retire_failures:
+                    failures = "; ".join(retire_failures)
                     return (
-                        f"Error: '{slug}' is canonical and searchable, but its "
-                        "SUPERSEDE disposition did not converge: "
-                        + "; ".join(retire_failures)
+                        f"Error: '{slug}' is canonical, but its SUPERSEDE "
+                        f"disposition did not converge: {failures} "
+                        f"{_index_state_suffix(materialization)}"
                     )
                 if retired:
                     return (

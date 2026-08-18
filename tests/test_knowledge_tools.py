@@ -109,20 +109,22 @@ def _capture_materialize(result=None):
     """Patch the server-side materialisation seam and record what it was sent.
 
     Returns ``(patcher, calls)``; use ``with patcher:`` around the invocation.
-    ``calls`` collects one ``{project_id, slug, content, job_id}`` dict per
-    POST, which is the whole payload the orchestrator endpoint receives.
-    Patching here rather than at ``httpx`` keeps every tool test off the
-    network while still asserting the exact request.
+    ``calls`` collects one ``{project_id, slug, content, job_id,
+    retrieval_messages}`` dict per POST, which is the whole payload the
+    orchestrator endpoint receives. Patching here rather than at ``httpx``
+    keeps every tool test off the network while still asserting the exact
+    request.
     """
     calls: list = []
 
-    def _fake(project_id, slug, content, job_id):
+    def _fake(project_id, slug, content, job_id, retrieval_messages=None):
         calls.append(
             {
                 "project_id": project_id,
                 "slug": slug,
                 "content": content,
                 "job_id": job_id,
+                "retrieval_messages": retrieval_messages,
             }
         )
         return dict(result or {"status": "committed", "path": f"knowledge/{slug}.md"})
@@ -1687,6 +1689,31 @@ class TestPostVaultFile:
             _post_vault_file("proj-1", "n1", "x", None)
         assert "job_id" not in client.post.call_args.kwargs["json"]
 
+    def test_sends_retrieval_messages_when_the_caller_has_some(self):
+        # OKF frontmatter carries no retrieval field, so the POST body is the
+        # only way a caller's synthetic queries can reach knowledge_index.
+        patcher, ctor, client = _fake_http(body={"status": "committed"})
+        with patcher, patch.dict(os.environ, {}, clear=False):
+            _post_vault_file(
+                "proj-1", "n1", "x", None, ["when does the sweep run?", "why defer?"]
+            )
+        payload = client.post.call_args.kwargs["json"]
+        assert payload["retrieval_messages"] == [
+            "when does the sweep run?",
+            "why defer?",
+        ]
+
+    @pytest.mark.parametrize("messages", [None, []])
+    def test_omits_retrieval_messages_entirely_when_there_are_none(self, messages):
+        # Absent must stay absent, not arrive as []. The endpoint reads a
+        # missing key as "leave whatever is stored alone" (upsert_kb_note's
+        # COALESCE sentinel); sending [] would blank a note's messages on
+        # every ordinary rewrite.
+        patcher, ctor, client = _fake_http(body={"status": "committed"})
+        with patcher, patch.dict(os.environ, {}, clear=False):
+            _post_vault_file("proj-1", "n1", "x", None, messages)
+        assert "retrieval_messages" not in client.post.call_args.kwargs["json"]
+
     def test_transport_failure_returns_failed_instead_of_raising(self):
         import httpx as _httpx
 
@@ -1839,6 +1866,46 @@ class TestKbWriteMaterialization:
                 },
             )
         assert 'description: "A crisp summary."' in calls[0]["content"]
+
+    def test_forwards_retrieval_messages_to_the_endpoint(self):
+        # The last thing kb_write's deleted row write still owned. OKF
+        # frontmatter has no retrieval field, so if the tool does not hand
+        # these to the endpoint they reach nothing that a reader queries.
+        ctx = _make_git_context()
+        ctx.knowledge_graph.create_note.return_value = "n1"
+        tools, _ = _make_tools(ctx)
+
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {
+                    "title": "T",
+                    "type": "decision",
+                    "content": "x",
+                    "retrieval_messages": ["why JWT?", "which auth did we pick?"],
+                },
+            )
+        assert calls[0]["retrieval_messages"] == [
+            "why JWT?",
+            "which auth did we pick?",
+        ]
+
+    def test_a_note_without_retrieval_messages_forwards_none(self):
+        # None, not [] — the endpoint reads None as "leave the stored value
+        # alone", so an ordinary rewrite must not blank an earlier note's
+        # messages.
+        ctx = _make_git_context()
+        ctx.knowledge_graph.create_note.return_value = "n1"
+        tools, _ = _make_tools(ctx)
+
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "T", "type": "decision", "content": "x"},
+            )
+        assert calls[0]["retrieval_messages"] is None
 
 
 # =============================================================================
@@ -2173,6 +2240,99 @@ class TestKbWriteVerdictGate:
         )
         assert "Created" in result
         kg.create_note.assert_called_once()
+
+
+class TestKbWriteErrorPathsDoNotOverclaim:
+    """An error return may not assert searchability the index state denies.
+
+    Both of these used to open with "'<slug>' is canonical and searchable" —
+    the same promise the docstring made before Slice A, made in the same
+    place and wrong for the same reason: whether the note is searchable is
+    the orchestrator's answer to give, and it is sometimes "not yet".
+    """
+
+    def test_graph_failure_reports_the_real_index_state(self):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.read_note.return_value = None
+        ctx.knowledge_graph.create_note.side_effect = RuntimeError("neo4j down")
+        with patch(
+            "src.tools.knowledge.knowledge_tools._materialize_note",
+            return_value={
+                "status": "committed",
+                "canonical_state": "canonical",
+                "indexed": False,
+                "index_reason": "oversized",
+            },
+        ):
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "T", "type": "decision", "content": "x"},
+            )
+        assert result.startswith("Error:")
+        assert "optional graph projection failed" in result
+        assert "searchable" not in result
+        assert "indexed=deferred:oversized" in result
+
+    def test_supersede_failure_reports_the_real_index_state(self):
+        kg = MagicMock()
+        kg.create_note.return_value = "new-slug"
+        kg.update_note.side_effect = RuntimeError("retire failed")
+        kg.read_note.return_value = {
+            "type": "decision",
+            "title": "Old",
+            "content": "old",
+            "status": "active",
+        }
+        ks = _GateStore(neighbours=[_kb_neighbour("stale-note", "different old text")])
+        tools, _ = _gated_tools(
+            kg,
+            ks,
+            KnowledgeVerdict(action="SUPERSEDE", target_indices=[1], reason="replaced"),
+        )
+        with patch(
+            "src.tools.knowledge.knowledge_tools._materialize_note",
+            return_value={
+                "status": "committed",
+                "canonical_state": "canonical",
+                "indexed": False,
+                "index_reason": "reindex-running",
+            },
+        ):
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "New Note", "type": "decision", "content": "fresh content"},
+            )
+        assert result.startswith("Error:")
+        assert "SUPERSEDE disposition did not converge" in result
+        # Only kb_write's own clause is in scope: the retire failures quoted
+        # after the colon are kb_update's message, and kb_update still writes
+        # its own row, so "canonical and searchable" is true there until the
+        # task that deletes that write changes it too.
+        own_clause, _, quoted_failures = result.partition("did not converge:")
+        assert "searchable" not in own_clause
+        assert quoted_failures  # the failures really were quoted, not empty
+        assert "indexed=deferred:reindex-running" in result
+
+    def test_an_indexed_note_still_says_so_on_an_error_path(self):
+        # The reword must not flip the other way: when the orchestrator did
+        # index the note, an unrelated failure should still say so.
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.read_note.return_value = None
+        ctx.knowledge_graph.create_note.side_effect = RuntimeError("neo4j down")
+        with patch(
+            "src.tools.knowledge.knowledge_tools._materialize_note",
+            return_value={
+                "status": "committed",
+                "canonical_state": "canonical",
+                "indexed": True,
+                "index_reason": None,
+            },
+        ):
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "T", "type": "decision", "content": "x"},
+            )
+        assert "indexed=yes" in result
 
 
 class TestKbWriteSlugDedup:
