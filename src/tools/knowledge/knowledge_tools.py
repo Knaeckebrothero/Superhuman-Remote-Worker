@@ -2090,6 +2090,14 @@ def create_kb_tools(
                 slug = candidate_slug
 
             rank = PRIORITY_RANKS[priority]
+            # Both timestamps go in the FILE, not down a side channel. The
+            # column has no DEFAULT and `note_fields` sources created_at only
+            # from this frontmatter line, so a note that omits it stores NULL
+            # forever — which sorts every agent-filed ticket to the bottom of
+            # its backlog band (project_backlog.py's `created_at ASC NULLS
+            # LAST`) and ranks it last on the search recency arm. One stamp
+            # for both: a note is not modified after the write that created it.
+            stamped_at = datetime.now(timezone.utc).isoformat()
             new_note = {
                 "id": slug,
                 "type": type,
@@ -2100,6 +2108,8 @@ def create_kb_tools(
                 "keywords": keywords,
                 "confidence": confidence,
                 "status": "active",
+                "created": stamped_at,
+                "modified": stamped_at,
                 "relationships": links or [],
             }
             if type in _TICKET_TYPES:

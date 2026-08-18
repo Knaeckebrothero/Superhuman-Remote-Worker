@@ -589,6 +589,47 @@ class TestIndexSingleNote:
         )
         assert store.upsert_kb_note.await_args.kwargs["job_id"] is None
 
+    def test_forwards_both_timestamps_from_the_file(self):
+        # created_at was already forwarded; modified_at was not passed at all,
+        # so the recency arm saw NULL for every note the file path indexed.
+        store = _index_store()
+        asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=uuid.uuid4(),
+                path="knowledge/n.md",
+                text=(
+                    "---\nid: n\ntype: learning\n"
+                    "created: 2026-01-15T10:30:00+00:00\n"
+                    "modified: 2026-02-20T09:00:00+00:00\n"
+                    "---\n# N\n\nthe body\n"
+                ),
+                blob_sha="sha",
+                embedding_stamp=EMBEDDING_VERSION,
+            )
+        )
+        kwargs = store.upsert_kb_note.await_args.kwargs
+        assert kwargs["created_at"].isoformat() == "2026-01-15T10:30:00+00:00"
+        assert kwargs["modified_at"].isoformat() == "2026-02-20T09:00:00+00:00"
+
+    def test_a_file_with_no_timestamps_forwards_none(self):
+        store = _index_store()
+        asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=uuid.uuid4(),
+                path="knowledge/n.md",
+                text=_note_md("n"),
+                blob_sha="sha",
+                embedding_stamp=EMBEDDING_VERSION,
+            )
+        )
+        kwargs = store.upsert_kb_note.await_args.kwargs
+        assert kwargs["created_at"] is None
+        assert kwargs["modified_at"] is None
+
 
 # =============================================================================
 # note_fields — created (frontmatter) -> created_at (project-backlog-pipeline
@@ -634,6 +675,27 @@ class TestNoteFieldsCreatedAt:
         fm = {"id": "n", "type": "feature", "created": "not-a-date-at-all"}
         f = note_fields("knowledge/n.md", fm, "b")
         assert f["created_at"] is None
+
+    def test_frontmatter_modified_maps_to_modified_at(self):
+        """`modified_at` is the ordering key of the search function's recency
+        arm (`ORDER BY modified_at DESC NULLS LAST`), which feeds the RRF
+        score. A NULL there does not fail anything — it just quietly ranks
+        every agent-written note last on that arm."""
+        from datetime import datetime, timezone
+
+        fm, body = parse_note_md(
+            "---\nid: feature-x\ntype: feature\n"
+            "modified: 2026-01-15T10:30:00+00:00\n---\n# T\nbody\n"
+        )
+        f = note_fields("knowledge/feature-x.md", fm, body)
+        assert f["modified_at"] == datetime(2026, 1, 15, 10, 30, tzinfo=timezone.utc)
+
+    def test_absent_modified_maps_to_none(self):
+        # Same sentinel as created/priority/ready_at: a file with no opinion
+        # must not fabricate a timestamp.
+        fm = {"id": "n", "type": "feature"}
+        f = note_fields("knowledge/n.md", fm, "b")
+        assert f["modified_at"] is None
 
 
 # =============================================================================

@@ -1907,6 +1907,55 @@ class TestKbWriteMaterialization:
             )
         assert calls[0]["retrieval_messages"] is None
 
+    def test_stamps_created_and_modified_into_the_note(self):
+        # knowledge_index.created_at has no column DEFAULT, and the only
+        # ingest path that can set it is a frontmatter `created:` line. Before
+        # Slice A the deleted row write supplied it; the file must now carry
+        # it, or every agent-written note stores NULL forever.
+        ctx = _make_git_context()
+        ctx.knowledge_graph.create_note.return_value = "n1"
+        tools, _ = _make_tools(ctx)
+
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "T", "type": "decision", "content": "x"},
+            )
+        content = calls[0]["content"]
+        assert "\ncreated: " in content
+        assert "\nmodified: " in content
+
+    def test_the_stamped_timestamps_survive_the_reindexers_parse(self):
+        # The round trip that matters, both halves with real code: kb_write
+        # renders the note, and the reindexer's own parser reads it back. A
+        # format mismatch here is silent -- the note indexes fine and simply
+        # stores NULL -- so assert on the parsed values, not on the text.
+        # `note_fields` is imported by path rather than at module scope: this
+        # is the one agent-side test that reaches across the seam, and the
+        # repo has been bitten by loading orchestrator modules under two names.
+        from orchestrator.services.kb_reindex import note_fields
+
+        from src.tools.knowledge.gardener import parse_note_md
+
+        ctx = _make_git_context()
+        ctx.knowledge_graph.create_note.return_value = "n1"
+        tools, _ = _make_tools(ctx)
+
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "Round Trip", "type": "decision", "content": "x"},
+            )
+        fm, body = parse_note_md(calls[0]["content"])
+        fields = note_fields("knowledge/round-trip.md", fm, body)
+        assert fields["created_at"] is not None
+        assert fields["modified_at"] is not None
+        # Both stamps come from the one timestamp the write already computes.
+        assert fields["created_at"] == fields["modified_at"]
+        assert fields["created_at"].tzinfo is not None
+
 
 # =============================================================================
 # Slice A: the orchestrator owns the knowledge_index row

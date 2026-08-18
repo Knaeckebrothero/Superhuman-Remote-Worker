@@ -19,6 +19,7 @@ Covers:
 import logging
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -795,6 +796,47 @@ class TestUpsertKbNoteProvenanceCoalesceSentinel:
         assert "$16, $17," in insert_half
         assert "COALESCE($16" not in insert_half
         assert "COALESCE($17" not in insert_half
+
+    @pytest.mark.asyncio
+    async def test_modified_at_coalesces_against_the_existing_row_on_conflict(self):
+        # modified_at orders the search function's recency arm
+        # (ORDER BY modified_at DESC NULLS LAST). A file with no `modified:`
+        # line carries no opinion, so a replay must not blank the stored one.
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="learning",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            modified_at=None,
+        )
+        query, *params = mock_db.fetchval.call_args[0]
+        assert "modified_at = COALESCE($20, knowledge_index.modified_at)" in query
+        assert params[19] is None
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_modified_at_still_wins(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        stamp = datetime(2026, 2, 20, 9, 0, tzinfo=timezone.utc)
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="learning",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            modified_at=stamp,
+        )
+        _query, *params = mock_db.fetchval.call_args[0]
+        assert params[19] == stamp
 
 
 # =============================================================================
