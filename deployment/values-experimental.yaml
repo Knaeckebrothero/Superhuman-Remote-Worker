@@ -63,36 +63,36 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-301892f
+    tag: sha-e415ff0
   agent:
-    tag: sha-231c645
+    tag: sha-cee8f27
   cockpit:
-    tag: sha-231c645
+    tag: sha-cee8f27
   mcp:
-    tag: sha-231c645
-    digest: sha256:30674f9db1cb9d5df70198bcfd65fee20e1882d45b16646e0bf63bc6adb7882a
+    tag: sha-cee8f27
+    digest: sha256:592a0dcc66905851ad03663ec2accf4009fd4c37528f4fd7717276995ebb11d7
   workspace:
-    tag: sha-231c645
+    tag: sha-cee8f27
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-301892f333d8c913a27283e6d349b3ba74625e1c"
+  releaseVersion: "0.0.0-dev.sha-e415ff0e6a1f9d1d33eb615d64ccf1fb247fde86"
   components:
     orchestrator:
-      sourceRevision: 301892f333d8c913a27283e6d349b3ba74625e1c
-      releaseVersion: "0.0.0-dev.sha-301892f333d8c913a27283e6d349b3ba74625e1c"
+      sourceRevision: e415ff0e6a1f9d1d33eb615d64ccf1fb247fde86
+      releaseVersion: "0.0.0-dev.sha-e415ff0e6a1f9d1d33eb615d64ccf1fb247fde86"
     agent:
-      sourceRevision: 231c64596025ab8680fe73f80e8c8ca997d932d7
-      releaseVersion: "0.0.0-dev.sha-231c64596025ab8680fe73f80e8c8ca997d932d7"
+      sourceRevision: cee8f275e9cbb1c7a4d084ee2adc5b54d6919dcb
+      releaseVersion: "0.0.0-dev.sha-cee8f275e9cbb1c7a4d084ee2adc5b54d6919dcb"
     cockpit:
-      sourceRevision: 231c64596025ab8680fe73f80e8c8ca997d932d7
-      releaseVersion: "0.0.0-dev.sha-231c64596025ab8680fe73f80e8c8ca997d932d7"
+      sourceRevision: cee8f275e9cbb1c7a4d084ee2adc5b54d6919dcb
+      releaseVersion: "0.0.0-dev.sha-cee8f275e9cbb1c7a4d084ee2adc5b54d6919dcb"
     mcp:
-      sourceRevision: 231c64596025ab8680fe73f80e8c8ca997d932d7
-      releaseVersion: "0.0.0-dev.sha-231c64596025ab8680fe73f80e8c8ca997d932d7"
+      sourceRevision: cee8f275e9cbb1c7a4d084ee2adc5b54d6919dcb
+      releaseVersion: "0.0.0-dev.sha-cee8f275e9cbb1c7a4d084ee2adc5b54d6919dcb"
     workspace:
-      sourceRevision: 231c64596025ab8680fe73f80e8c8ca997d932d7
-      releaseVersion: "0.0.0-dev.sha-231c64596025ab8680fe73f80e8c8ca997d932d7"
+      sourceRevision: cee8f275e9cbb1c7a4d084ee2adc5b54d6919dcb
+      releaseVersion: "0.0.0-dev.sha-cee8f275e9cbb1c7a4d084ee2adc5b54d6919dcb"
 # Production-like Fleet deployments must resolve MCP by immutable digest.
 mcp:
   requireImageDigest: true
