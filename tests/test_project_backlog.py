@@ -290,9 +290,10 @@ class TestKbUpdatePriorityPreservation:
             return_value=_existing_ticket(priority=0)
         )
         tools = _make_tools(ctx)
-        result = tools["kb_update"].invoke({"note": "n1", "status": "resolved"})
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["priority"] == 0
+        patcher, rendered = _capture_materialize()
+        with patcher:
+            result = tools["kb_update"].invoke({"note": "n1", "status": "resolved"})
+        assert "priority: high" in rendered["n1"]
         # The status change itself still goes through — this isn't a no-op.
         assert "status → resolved" in result
 
@@ -302,9 +303,10 @@ class TestKbUpdatePriorityPreservation:
             return_value=_existing_ticket(priority=0)
         )
         tools = _make_tools(ctx)
-        tools["kb_update"].invoke({"note": "n1", "priority": "low"})
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["priority"] == 2
+        patcher, rendered = _capture_materialize()
+        with patcher:
+            tools["kb_update"].invoke({"note": "n1", "priority": "low"})
+        assert "priority: low" in rendered["n1"]
 
 
 class TestKbUpdatePriorityPreservationWithNeo4j:
@@ -328,9 +330,10 @@ class TestKbUpdatePriorityPreservationWithNeo4j:
             return_value={"priority": 0}  # pgvector's last-known value: high
         )
         tools = _make_tools(ctx)
-        tools["kb_update"].invoke({"note": "add-dark-mode", "status": "resolved"})
-        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
-        assert kwargs["priority"] == 0
+        patcher, rendered = _capture_materialize()
+        with patcher:
+            tools["kb_update"].invoke({"note": "add-dark-mode", "status": "resolved"})
+        assert "priority: high" in rendered["add-dark-mode"]
 
     def test_lookback_failure_rejects_before_canonical_mutation(self):
         """Fix round 1, Finding 1 repro: kg-enabled, get_note_by_slug raises,
@@ -365,7 +368,6 @@ class TestKbUpdatePriorityPreservationWithNeo4j:
         assert result.startswith("Error: could not read")
         assert rendered == {}
         ctx.knowledge_graph.update_note.assert_not_called()
-        ctx.knowledge_store.upsert_note.assert_not_awaited()
 
     def test_lookback_failure_is_returned_not_swallowed(self):
         ctx = _kb_context_with_kg()

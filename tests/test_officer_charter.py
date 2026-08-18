@@ -259,7 +259,7 @@ class TestCharterWriteAuthority:
         assert "could not verify" in result
         canonical_write.assert_not_called()
 
-    def test_worker_cannot_update_charter_kgless(self):
+    def test_worker_cannot_update_charter_kgless(self, canonical_write):
         ctx = _worker_context()
         ctx.knowledge_store.get_note_by_slug.return_value = {
             "id": "century-charter",
@@ -273,9 +273,9 @@ class TestCharterWriteAuthority:
         )
         assert "Authorization denied" in result
         assert "No changes were made" in result
-        ctx.knowledge_store.upsert_note.assert_not_called()
+        canonical_write.assert_not_called()
 
-    def test_session_can_update_charter_kgless(self):
+    def test_session_can_update_charter_kgless(self, canonical_write):
         ctx = _session_context()
         ctx.knowledge_store.get_note_by_slug.return_value = {
             "id": "century-charter",
@@ -286,12 +286,11 @@ class TestCharterWriteAuthority:
             "keywords": [],
             "priority": 1,
         }
-        ctx.knowledge_store.upsert_note.return_value = uuid.uuid4()
         result = _tool(ctx, "kb_update").func(
             note="century-charter", content="posture: demo Friday"
         )
         assert "cannot be written" not in result
-        ctx.knowledge_store.upsert_note.assert_called_once()
+        canonical_write.assert_called_once()
 
     def test_worker_cannot_update_charter_graph_path(self):
         ctx = _worker_context()
@@ -318,7 +317,7 @@ class TestCharterWriteAuthority:
         assert "No changes were made" in result
         ctx.knowledge_graph.update_note.assert_not_called()
 
-    def test_worker_updates_ordinary_notes_freely(self):
+    def test_worker_updates_ordinary_notes_freely(self, canonical_write):
         ctx = _worker_context()
         ctx.knowledge_store.get_note_by_slug.return_value = {
             "id": "some-learning",
@@ -329,10 +328,9 @@ class TestCharterWriteAuthority:
             "keywords": [],
             "priority": 1,
         }
-        ctx.knowledge_store.upsert_note.return_value = uuid.uuid4()
         result = _tool(ctx, "kb_update").func(note="some-learning", content="new")
         assert "cannot be written" not in result
-        ctx.knowledge_store.upsert_note.assert_called_once()
+        canonical_write.assert_called_once()
 
     @pytest.mark.parametrize(
         ("caller_kind", "project_role", "allowed"),
@@ -387,7 +385,6 @@ class TestCharterWriteAuthority:
             )
         assert "No changes were made" in result
         ctx.knowledge_graph.update_note.assert_not_called()
-        ctx.knowledge_store.upsert_note.assert_not_called()
         canonical_write.assert_not_called()
 
 

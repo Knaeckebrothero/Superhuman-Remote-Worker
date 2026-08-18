@@ -112,8 +112,18 @@ def _tool(ctx, name):
     raise KeyError(name)
 
 
+_PRIOR_READY_AT = "2026-08-15T09:00:00+00:00"
+
+
 def _ticket(tags, note_id="feature-dark-mode", content="body"):
-    """A ``get_note_by_slug``-shaped backlog ticket."""
+    """A ``get_note_by_slug``-shaped backlog ticket.
+
+    A ticket the store says is ``ready`` necessarily carries the stamp that
+    armed it. Modelling that is what makes "this write said nothing about
+    readiness" distinguishable from "this write withdrew it" in the file —
+    the two render identically for a ticket that was never armed.
+    """
+    tags = list(tags)
     return {
         "id": note_id,
         "title": "Dark mode",
@@ -121,33 +131,48 @@ def _ticket(tags, note_id="feature-dark-mode", content="body"):
         "status": "active",
         "content": content,
         "confidence": None,
-        "tags": list(tags),
+        "tags": tags,
         "keywords": [],
         "job_id": None,
         "phase": None,
         "priority": 1,
-        "ready_at": None,
+        "ready_at": _PRIOR_READY_AT if "ready" in tags else None,
     }
 
 
 @pytest.fixture(autouse=True)
-def _no_materialization_http():
+def canonical_writes():
+    """Every note handed to the canonical write, in order.
+
+    Keeps the module off the network, and doubles as the observation point:
+    since Slice A the OKF file is kb_write/kb_update's *only* write — the
+    materialisation endpoint owns the ``knowledge_index`` row it indexes from
+    that commit — so ``upsert_note`` is never called and asserting on it
+    would assert nothing.
+    """
+    calls: list = []
+
+    def _record(project_id, slug, content, job_id=None, **kw):
+        calls.append({"slug": slug, "content": content})
+        return {
+            "status": "committed",
+            "canonical_state": "canonical",
+            "projection_state": "pending",
+            "retry_state": "none",
+            "indexed": True,
+        }
+
     with (
         patch(
             "src.tools.knowledge.knowledge_tools._post_vault_file",
-            return_value={
-                "status": "committed",
-                "canonical_state": "canonical",
-                "projection_state": "pending",
-                "retry_state": "none",
-            },
+            side_effect=_record,
         ),
         patch(
             "src.tools.knowledge.knowledge_tools._request_runtime_actor_authorization",
             side_effect=_authorize_from_test_actor,
         ),
     ):
-        yield
+        yield calls
 
 
 def _capture_materialize():
@@ -171,8 +196,40 @@ def _capture_materialize():
     )
 
 
-def _upsert_kwargs(ctx):
-    return ctx.knowledge_store.upsert_note.call_args.kwargs
+def _canonical_fields(calls):
+    """The last note written, parsed back by the reindexer's own mapper.
+
+    Strictly stronger than the ``upsert_note`` kwargs this used to read: these
+    are the exact bytes the orchestrator commits, run through the code that
+    turns them into the row a pool query reads.
+    """
+    from orchestrator.services.kb_reindex import note_fields, parse_note_md
+
+    entry = calls[-1]
+    fm, body = parse_note_md(entry["content"])
+    return note_fields(f"knowledge/{entry['slug']}.md", fm, body)
+
+
+def _ready_outcome(calls):
+    """What the written file says happened to the dispatch authorization.
+
+    ``ready`` was a tri-state *argument* of the row write Slice A deleted.
+    The file — which is what a vault rebuild reads, and now the only carrier —
+    says the same three things: a **fresh** ``ready_at:`` means this write
+    armed the ticket, **no line** means it withdrew the authorization, and
+    the **prior stamp verbatim** means it said nothing about readiness.
+
+    Assumes the note started from ``_ticket``'s fixed ``_PRIOR_READY_AT``.
+    A ticket that was never armed cannot distinguish "said nothing" from
+    "withdrew" — both render no line — which is a true property of the
+    canonical artefact, not a gap in this helper.
+    """
+    ready_at = _canonical_fields(calls)["ready_at"]
+    if ready_at is None:
+        return False
+    if ready_at.isoformat() == _PRIOR_READY_AT:
+        return None
+    return True
 
 
 # =============================================================================
@@ -181,7 +238,7 @@ def _upsert_kwargs(ctx):
 
 
 class TestTagMutation:
-    def test_remove_tags_retracts_a_tag(self):
+    def test_remove_tags_retracts_a_tag(self, canonical_writes):
         ctx = _session_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["ready", "category:researcher"]
@@ -189,9 +246,9 @@ class TestTagMutation:
         _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "remove_tags": ["ready"]}
         )
-        assert _upsert_kwargs(ctx)["tags"] == ["category:researcher"]
+        assert _canonical_fields(canonical_writes)["tags"] == ["category:researcher"]
 
-    def test_set_tags_replaces_the_whole_list(self):
+    def test_set_tags_replaces_the_whole_list(self, canonical_writes):
         ctx = _session_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["ready", "category:researcher", "spike"]
@@ -202,9 +259,12 @@ class TestTagMutation:
                 "set_tags": ["category:executor", "expert:designer"],
             }
         )
-        assert _upsert_kwargs(ctx)["tags"] == ["category:executor", "expert:designer"]
+        assert _canonical_fields(canonical_writes)["tags"] == [
+            "category:executor",
+            "expert:designer",
+        ]
 
-    def test_swapping_a_category_in_one_call_leaves_exactly_one(self):
+    def test_swapping_a_category_in_one_call_leaves_exactly_one(self, canonical_writes):
         # The reason removal had to exist: a ticket matching two pools gets
         # pulled by whichever ticks first.
         ctx = _session_context()
@@ -218,10 +278,10 @@ class TestTagMutation:
                 "add_tags": ["category:executor"],
             }
         )
-        tags = _upsert_kwargs(ctx)["tags"]
+        tags = _canonical_fields(canonical_writes)["tags"]
         assert [t for t in tags if t.startswith("category:")] == ["category:executor"]
 
-    def test_add_and_remove_of_the_same_tag_resolves_to_present(self):
+    def test_add_and_remove_of_the_same_tag_resolves_to_present(self, canonical_writes):
         # Removal runs first so an overlapping pair cannot cancel the addition.
         ctx = _session_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(["spike"])
@@ -232,9 +292,9 @@ class TestTagMutation:
                 "add_tags": ["spike"],
             }
         )
-        assert _upsert_kwargs(ctx)["tags"] == ["spike"]
+        assert _canonical_fields(canonical_writes)["tags"] == ["spike"]
 
-    def test_set_tags_refuses_to_be_combined_with_add_or_remove(self):
+    def test_set_tags_refuses_to_be_combined_with_add_or_remove(self, canonical_writes):
         ctx = _session_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket([])
         result = _tool(ctx, "kb_update").invoke(
@@ -245,15 +305,18 @@ class TestTagMutation:
             }
         )
         assert "Error" in result
-        ctx.knowledge_store.upsert_note.assert_not_called()
+        assert canonical_writes == []
 
-    def test_tags_are_lowercased_at_the_write_path(self):
+    def test_tags_are_lowercased_at_the_write_path(self, canonical_writes):
         ctx = _session_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket([])
         _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "add_tags": ["Category:Executor", "Spike"]}
         )
-        assert _upsert_kwargs(ctx)["tags"] == ["category:executor", "spike"]
+        assert _canonical_fields(canonical_writes)["tags"] == [
+            "category:executor",
+            "spike",
+        ]
 
 
 # =============================================================================
@@ -262,7 +325,7 @@ class TestTagMutation:
 
 
 class TestOfficerOnlyTags:
-    def test_worker_cannot_arm_a_ticket_it_filed(self):
+    def test_worker_cannot_arm_a_ticket_it_filed(self, canonical_writes):
         ctx = _worker_context()
         result = _tool(ctx, "kb_write").invoke(
             {
@@ -272,7 +335,7 @@ class TestOfficerOnlyTags:
                 "tags": ["ready", "category:executor"],
             }
         )
-        ctx.knowledge_store.upsert_note.assert_not_called()
+        assert canonical_writes == []
         assert "Authorization denied" in result
         assert "No changes were made" in result
         assert "actor=worker" in result
@@ -295,7 +358,7 @@ class TestOfficerOnlyTags:
         assert len(calls) == 1
         assert 'tags: ["category:executor", "expert:designer"]' in calls[0]["content"]
 
-    def test_worker_cannot_grant_itself_parallelism(self):
+    def test_worker_cannot_grant_itself_parallelism(self, canonical_writes):
         ctx = _worker_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["category:executor"]
@@ -303,10 +366,10 @@ class TestOfficerOnlyTags:
         result = _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "add_tags": ["parallel-safe"]}
         )
-        ctx.knowledge_store.upsert_note.assert_not_called()
+        assert canonical_writes == []
         assert "No changes were made" in result
 
-    def test_worker_cannot_un_arm_a_queued_ticket(self):
+    def test_worker_cannot_un_arm_a_queued_ticket(self, canonical_writes):
         # Stripping the INPUT is not enough on its own: set_tags is absolute, so
         # a worker could drop `ready` simply by rewriting the list without it.
         ctx = _worker_context()
@@ -316,10 +379,12 @@ class TestOfficerOnlyTags:
         result = _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "set_tags": ["category:researcher"]}
         )
-        ctx.knowledge_store.upsert_note.assert_not_called()
+        assert canonical_writes == []
         assert "No changes were made" in result
 
-    def test_worker_remove_tags_cannot_reach_the_officer_namespace(self):
+    def test_worker_remove_tags_cannot_reach_the_officer_namespace(
+        self, canonical_writes
+    ):
         ctx = _worker_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["ready", "category:executor"]
@@ -327,10 +392,10 @@ class TestOfficerOnlyTags:
         result = _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "remove_tags": ["ready", "category:executor"]}
         )
-        ctx.knowledge_store.upsert_note.assert_not_called()
+        assert canonical_writes == []
         assert "No changes were made" in result
 
-    def test_officer_may_do_all_of_it(self):
+    def test_officer_may_do_all_of_it(self, canonical_writes):
         ctx = _officer_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["category:executor"]
@@ -338,9 +403,9 @@ class TestOfficerOnlyTags:
         _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "add_tags": ["ready", "parallel-safe"]}
         )
-        kwargs = _upsert_kwargs(ctx)
-        assert "ready" in kwargs["tags"] and "parallel-safe" in kwargs["tags"]
-        assert kwargs["ready"] is True
+        tags = _canonical_fields(canonical_writes)["tags"]
+        assert "ready" in tags and "parallel-safe" in tags
+        assert _ready_outcome(canonical_writes) is True
 
     @pytest.mark.parametrize(
         ("caller_kind", "project_role", "allowed"),
@@ -363,7 +428,10 @@ class TestOfficerOnlyTags:
             (["category:executor"], {"add_tags": ["ready"]}, True),
             (["ready", "category:executor"], {"remove_tags": ["ready"]}, False),
             (["ready", "category:executor"], {"add_tags": ["ready"]}, True),
-            (["category:executor"], {"add_tags": ["parallel-safe"]}, None),
+            # Starts armed so "said nothing about readiness" is observable in
+            # the file at all: for a never-armed ticket, saying nothing and
+            # withdrawing both render no `ready_at:` line.
+            (["ready", "category:executor"], {"add_tags": ["parallel-safe"]}, None),
         ],
         ids=["ready", "remove-ready", "re-ready", "parallel-safe"],
     )
@@ -375,6 +443,7 @@ class TestOfficerOnlyTags:
         initial_tags,
         mutation,
         expected_ready,
+        canonical_writes,
     ):
         ctx = _session_context(
             thread_id=None if caller_kind == "worker" else "thread-1",
@@ -386,9 +455,9 @@ class TestOfficerOnlyTags:
             {"note": "feature-dark-mode", **mutation}
         )
         if allowed:
-            assert _upsert_kwargs(ctx)["ready"] is expected_ready
+            assert _ready_outcome(canonical_writes) is expected_ready
         else:
-            ctx.knowledge_store.upsert_note.assert_not_called()
+            assert canonical_writes == []
             assert "No changes were made" in result
 
     def test_denied_machine_tag_write_has_zero_projection_or_file_side_effects(self):
@@ -412,7 +481,6 @@ class TestOfficerOnlyTags:
         assert "No changes were made" in result
         assert existing == before  # tags + ready_at remain byte-for-byte intent
         ctx.knowledge_graph.update_note.assert_not_called()
-        ctx.knowledge_store.upsert_note.assert_not_called()
         canonical_write.assert_not_called()
 
 
@@ -422,7 +490,7 @@ class TestOfficerOnlyTags:
 
 
 class TestReadyAuthorization:
-    def test_arming_stamps_readiness(self):
+    def test_arming_stamps_readiness(self, canonical_writes):
         ctx = _session_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["category:executor"]
@@ -430,10 +498,10 @@ class TestReadyAuthorization:
         result = _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "add_tags": ["ready"]}
         )
-        assert _upsert_kwargs(ctx)["ready"] is True
+        assert _ready_outcome(canonical_writes) is True
         assert "READY for dispatch" in result
 
-    def test_re_arming_an_already_ready_ticket_still_stamps(self):
+    def test_re_arming_an_already_ready_ticket_still_stamps(self, canonical_writes):
         # This IS the re-ready action after the officer reviews an outcome: the
         # tag list does not change, only the timestamp, and if that were treated
         # as a no-op the ticket would stay parked forever.
@@ -444,9 +512,11 @@ class TestReadyAuthorization:
         _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "add_tags": ["ready"]}
         )
-        assert _upsert_kwargs(ctx)["ready"] is True
+        # The stamp has to *move*: carrying the old one forward would leave
+        # the ticket parked exactly as it was.
+        assert _ready_outcome(canonical_writes) is True
 
-    def test_withdrawing_clears_readiness(self):
+    def test_withdrawing_clears_readiness(self, canonical_writes):
         ctx = _session_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["ready", "category:executor"]
@@ -454,10 +524,12 @@ class TestReadyAuthorization:
         result = _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "remove_tags": ["ready"]}
         )
-        assert _upsert_kwargs(ctx)["ready"] is False
+        assert _ready_outcome(canonical_writes) is False
         assert "withdrawn" in result
 
-    def test_a_content_edit_on_a_ready_ticket_says_nothing_about_readiness(self):
+    def test_a_content_edit_on_a_ready_ticket_says_nothing_about_readiness(
+        self, canonical_writes
+    ):
         # The dangerous case. The tag list still carries `ready`, but this write
         # did not assert it — bumping ready_at here would re-arm a ticket the
         # tick already claimed and put a second job on the same work.
@@ -468,11 +540,10 @@ class TestReadyAuthorization:
         _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "content": "a better description"}
         )
-        kwargs = _upsert_kwargs(ctx)
-        assert "ready" in kwargs["tags"]
-        assert kwargs["ready"] is None
+        assert "ready" in _canonical_fields(canonical_writes)["tags"]
+        assert _ready_outcome(canonical_writes) is None
 
-    def test_a_priority_change_says_nothing_about_readiness(self):
+    def test_a_priority_change_says_nothing_about_readiness(self, canonical_writes):
         ctx = _session_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["ready", "category:executor"]
@@ -480,9 +551,11 @@ class TestReadyAuthorization:
         _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "priority": "high"}
         )
-        assert _upsert_kwargs(ctx)["ready"] is None
+        assert _ready_outcome(canonical_writes) is None
 
-    def test_set_tags_is_absolute_and_therefore_does_assert_readiness(self):
+    def test_set_tags_is_absolute_and_therefore_does_assert_readiness(
+        self, canonical_writes
+    ):
         ctx = _session_context()
         ctx.knowledge_store.get_note_by_slug.return_value = _ticket(
             ["ready", "category:executor"]
@@ -490,7 +563,7 @@ class TestReadyAuthorization:
         _tool(ctx, "kb_update").invoke(
             {"note": "feature-dark-mode", "set_tags": ["category:executor"]}
         )
-        assert _upsert_kwargs(ctx)["ready"] is False
+        assert _ready_outcome(canonical_writes) is False
 
 
 # =============================================================================

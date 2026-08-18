@@ -429,6 +429,41 @@ def _apply_ready_frontmatter(
         )
 
 
+def _carry_timestamps(note: Dict[str, Any], existing: Dict[str, Any]) -> None:
+    """Keep the note's birth date and stamp this write's time, in the file.
+
+    ``kb_write`` puts ``created:``/``modified:`` into the frontmatter because
+    the row is rebuilt from the file, and ``created_at`` is deliberately
+    absent from ``upsert_kb_note``'s ``ON CONFLICT DO UPDATE`` list — a row
+    that ever lands NULL there can never be repaired by a later sweep, and
+    sorts every agent-filed ticket to the bottom of its backlog band forever
+    (project_backlog.py's ``created_at ASC NULLS LAST``). Every ``kb_update``
+    rewrites the whole file from scratch, so without this the first update
+    strips both lines back off — potentially before any sweep has read them,
+    since an inline index is allowed to defer.
+
+    ``created`` is carried from the existing note verbatim, never
+    regenerated: an edit is not a birth. It is serialised via ``isoformat()``
+    when the source gives one (a tz-aware ``datetime`` off the pgvector row,
+    a ``neo4j.time.DateTime`` off the graph), so the emitted scalar is
+    something ``note_fields``' YAML parse resolves back to a timestamp
+    instead of a repr. A note with no known creation time gains no line —
+    absent stays absent, which is what ``upsert_kb_note`` COALESCEs against.
+
+    ``modified`` is always stamped. kb_update is a mutation tool and its
+    caller asserted a change, so the cost — the materialisation endpoint's
+    blob-SHA ``skipped/unchanged`` short-circuit can no longer fire for an
+    update, and a semantically-null update commits — is accepted rather than
+    diffing before/after inside a fail-closed write path.
+    """
+    created = existing.get("created")
+    if created:
+        note["created"] = (
+            created.isoformat() if hasattr(created, "isoformat") else str(created)
+        )
+    note["modified"] = datetime.now(timezone.utc).isoformat()
+
+
 def _describe_update(
     *,
     content: Optional[str],
@@ -1136,56 +1171,14 @@ def _index_state_suffix(result: Dict[str, Any]) -> str:
     return f"[canonical=canonical, indexed=deferred:{reason}]"
 
 
-def _canonical_ready_at(note: Dict[str, Any]) -> Optional[datetime]:
-    """Parse the READY timestamp just committed to the canonical note."""
-    value = note.get("ready_at")
-    if isinstance(value, datetime):
-        return value
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def _report_projection(
-    project_id: str,
-    materialization: Dict[str, Any],
-    *,
-    synced: bool,
-    error: Optional[str] = None,
-) -> bool:
-    """Record projection truth for a durable canonical mutation."""
-    intent_id = materialization.get("intent_id")
-    if not intent_id:
-        return True
-    base_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085").rstrip("/")
-    headers: Dict[str, str] = {}
-    internal_key = os.getenv("MCP_INTERNAL_KEY", "")
-    if internal_key:
-        headers["X-Internal-Key"] = internal_key
-    try:
-        with httpx.Client(
-            timeout=_MATERIALIZE_TIMEOUT_SECONDS, headers=headers
-        ) as client:
-            response = client.post(
-                f"{base_url}/api/projects/{project_id}/knowledge/materialize/"
-                f"{intent_id}/projection",
-                json={"synced": synced, "error": error},
-            )
-        if response.status_code != 200:
-            raise RuntimeError(f"http-{response.status_code}")
-        return True
-    except Exception as exc:  # noqa: BLE001 - canonical truth already persisted
-        logger.error(
-            "%s projection outcome for intent %s could not be recorded: %r",
-            _MATERIALIZE_LOG,
-            intent_id,
-            exc,
-            exc_info=True,
-        )
-        return False
+# ``_report_projection`` used to POST the agent's own projection outcome back
+# to the intent ledger. Slice A deleted both writes it reported on, and the
+# materialisation endpoint now closes the ledger itself the moment it indexes
+# the commit (kb_materialize.py `finish_knowledge_projection`), so there is
+# nothing left for the agent to report. ``_canonical_ready_at`` went with it:
+# its only consumers were the two deleted `upsert_note(ready_at=...)`
+# arguments — the READY authorization now travels solely as the file's
+# `ready_at:` frontmatter line (`_apply_ready_frontmatter`).
 
 
 # The OKF vault root — the same prefix the reindexer scans and the
@@ -1545,7 +1538,7 @@ def create_kb_tools(
         set_tags: Optional[List[str]] = None,
     ) -> str:
         """Neo4j-less update: read the row from the store, apply the mutation in
-        Python (the graph does this in Cypher), write back to store + OKF file.
+        Python (the graph does this in Cypher), write the OKF file back.
 
         Same return contract and status/confidence validation as the Neo4j path.
         ``add_links`` round-trip as generic body links via the reindexer — the
@@ -1615,12 +1608,10 @@ def create_kb_tools(
             )
             merged_tags = tag_change.tags
 
-            _jid = existing.get("job_id")
-            job_id_arg = uuid.UUID(_jid) if isinstance(_jid, str) else _jid
-
-            # OKF file is canonical — materialise it first (mirrors kb_write
-            # ordering), so the edit survives even if the disposable pgvector
-            # write fails.
+            # The OKF file is the only write: the materialisation endpoint
+            # commits it and owns the searchable row it indexes from that
+            # commit (Slice A). Everything the row needs has to be in these
+            # bytes, or in the POST that carries them.
             updated_note = {
                 "id": note,
                 "type": new_type,
@@ -1636,44 +1627,18 @@ def create_kb_tools(
             if new_type in _TICKET_TYPES:
                 updated_note["priority"] = new_priority
             _apply_ready_frontmatter(updated_note, tag_change.ready, existing)
-            materialization = _materialize_note(context, note, updated_note)
+            _carry_timestamps(updated_note, existing)
+            materialization = _materialize_note(
+                context,
+                note,
+                updated_note,
+                # None means "leave the stored value alone". get_note_by_slug
+                # does not read the column, so this tier never has messages of
+                # its own to forward — and must not send [] instead.
+                existing.get("retrieval_messages"),
+            )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(note, materialization)
-            try:
-                _run_async(
-                    ks.upsert_note(
-                        note_id=note,
-                        project_id=uuid.UUID(project_id),
-                        title=new_title,
-                        note_type=new_type,
-                        content=new_content,
-                        status=new_status,
-                        confidence=new_confidence,
-                        tags=merged_tags,
-                        keywords=existing.get("keywords", []),
-                        job_id=job_id_arg,
-                        phase=existing.get("phase"),
-                        modified_at=datetime.now(timezone.utc),
-                        priority=new_priority,
-                        ready=tag_change.ready,
-                        ready_at=_canonical_ready_at(updated_note),
-                    )
-                )
-            except Exception as e:
-                _report_projection(
-                    project_id, materialization, synced=False, error=str(e)
-                )
-                logger.error("knowledge projection failed for %s: %s", note, e)
-                return (
-                    f"Error: '{note}' is canonical but its searchable projection "
-                    "is pending sync; retry/reindex before treating it as Updated."
-                )
-            if not _report_projection(project_id, materialization, synced=True):
-                return (
-                    f"Error: '{note}' is canonical and searchable, but durable "
-                    "projection state remains pending; retry before treating it "
-                    "as Updated."
-                )
 
             changes = _describe_update(
                 content=content,
@@ -1686,7 +1651,7 @@ def create_kb_tools(
             return (
                 f"Updated **{note}**: {', '.join(changes)}"
                 f"{_dropped_tag_notice(tag_change.dropped)}"
-                " [canonical=canonical, projection=synced]"
+                f" {_index_state_suffix(materialization)}"
             )
         except Exception as e:
             logger.error(f"kb_update failed: {e}")
@@ -1704,7 +1669,12 @@ def create_kb_tools(
         remove_tags: Optional[List[str]] = None,
         set_tags: Optional[List[str]] = None,
     ) -> str:
-        """Update canonical git first, then its graph/search projections."""
+        """Update canonical git first, then the optional Neo4j projection.
+
+        The searchable row is not written here: the materialisation endpoint
+        indexes it from the commit this makes (Slice A). Neo4j is the only
+        projection left for the tool to drive, and it degrades best-effort.
+        """
         if kg is None:
             return _update_existing_kgless(
                 note,
@@ -1812,41 +1782,18 @@ def create_kb_tools(
             if new_type in _TICKET_TYPES:
                 desired["priority"] = new_priority
             _apply_ready_frontmatter(desired, tag_change.ready, prior_row)
-            materialization = _materialize_note(context, note, desired)
+            _carry_timestamps(desired, existing)
+            materialization = _materialize_note(
+                context,
+                note,
+                desired,
+                # Carried across the rewrite: the markdown has nowhere to put
+                # them, and None (never []) is the "leave the stored value
+                # alone" sentinel the endpoint COALESCEs against.
+                existing.get("retrieval_messages"),
+            )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(note, materialization)
-
-            _jid = existing.get("job_id")
-            try:
-                _run_async(
-                    ks.upsert_note(
-                        note_id=note,
-                        project_id=uuid.UUID(project_id),
-                        title=desired["title"],
-                        note_type=new_type,
-                        content=new_content,
-                        status=new_status,
-                        confidence=new_confidence,
-                        tags=tag_change.tags,
-                        keywords=desired["keywords"],
-                        job_id=uuid.UUID(_jid) if isinstance(_jid, str) else _jid,
-                        phase=existing.get("phase"),
-                        retrieval_messages=existing.get("retrieval_messages") or [],
-                        modified_at=datetime.now(timezone.utc),
-                        priority=new_priority,
-                        ready=tag_change.ready,
-                        ready_at=_canonical_ready_at(desired),
-                    )
-                )
-            except Exception as exc:
-                _report_projection(
-                    project_id, materialization, synced=False, error=str(exc)
-                )
-                logger.error("knowledge search projection failed for %s: %s", note, exc)
-                return (
-                    f"Error: '{note}' is canonical but its searchable projection "
-                    "is pending sync; retry/reindex before treating it as Updated."
-                )
 
             # Neo4j is an optional derived graph, not the dispatch/search
             # projection repaired by the canonical Git reindexer. Preserve its
@@ -1878,17 +1825,11 @@ def create_kb_tools(
                     note,
                     exc,
                 )
-            if not _report_projection(project_id, materialization, synced=True):
-                return (
-                    f"Error: '{note}' is canonical and searchable, but durable "
-                    "projection state remains pending; retry before treating it "
-                    "as Updated."
-                )
             if graph_error is not None:
                 return (
-                    f"Error: '{note}' is canonical and searchable, but its optional "
-                    f"graph projection failed ({graph_error}); the mutation was not "
-                    "reported as Updated."
+                    f"Error: '{note}' is canonical, but its optional graph "
+                    f"projection failed ({graph_error}); the mutation was not "
+                    f"reported as Updated. {_index_state_suffix(materialization)}"
                 )
 
             changes = _describe_update(
@@ -1903,7 +1844,7 @@ def create_kb_tools(
             return (
                 f"Updated **{note}**: {', '.join(changes)}"
                 f"{_dropped_tag_notice(tag_change.dropped)}"
-                " [canonical=canonical, projection=synced]"
+                f" {_index_state_suffix(materialization)}"
             )
 
         except Exception as e:
@@ -2215,7 +2156,16 @@ def create_kb_tools(
     ) -> str:
         """Update an existing knowledge note.
 
-        Write-through: updates both Neo4j and pgvector search index.
+        Write-through: rewrites the note's OKF markdown file at
+        ``knowledge/<slug>.md`` in the project's knowledge repository —
+        committed server-side, so it needs neither a workspace nor git — and
+        updates Neo4j where a graph is configured.
+
+        The rewrite is committed and, in the normal case, re-indexed before
+        this call returns — so kb_search and kb_read see the edit
+        immediately. A large note, or one updated while the knowledge base is
+        rebuilding, reports ``indexed=deferred:<reason>`` and picks the edit
+        up on the next sweep.
 
         Args:
             note: Note slug ID (e.g. "chose-jwt-over-oauth")
