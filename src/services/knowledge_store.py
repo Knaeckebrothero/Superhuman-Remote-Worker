@@ -1098,6 +1098,14 @@ class KnowledgeStore:
         it costs one line and it is what stops the next writer's value from
         being swept away the same way.
 
+        ``modified_at`` takes the sentinel too. It orders the search
+        function's recency arm (``ORDER BY modified_at DESC NULLS LAST``), and
+        a file with no ``modified:`` line has no opinion about it — so a
+        replay must leave the stored value alone rather than blank it.
+        ``created_at`` needs no sentinel for the opposite reason: it is
+        absent from this branch entirely, which is what stops a second write
+        from moving a note's creation time.
+
         ``remaining_cycles`` is seeded on INSERT only. After Slice A the
         file-canonical path is the only writer for a new note, so if it did
         not seed the TTL, convergence re-verification would never see the
@@ -1158,7 +1166,9 @@ class KnowledgeStore:
                 superseded_by = $14, invalidated_at = $15,
                 job_id = COALESCE($16, knowledge_index.job_id),
                 phase = COALESCE($17, knowledge_index.phase),
-                content_hash = $18, modified_at = $20, indexed_at = NOW(),
+                content_hash = $18,
+                modified_at = COALESCE($20, knowledge_index.modified_at),
+                indexed_at = NOW(),
                 search_doc = EXCLUDED.search_doc,
                 priority = COALESCE($21, knowledge_index.priority),
                 ready_at = COALESCE($22, knowledge_index.ready_at)

@@ -297,7 +297,15 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
     the reindexer INSERTs new rows with no ``created_at`` otherwise — the
     cockpit's backlog panel is read-only, so a hand-authored file is the only
     way a user files a ticket, and without this it always sorts as if newest
-    (NULL), regardless of the ticket's real age.
+    (NULL), regardless of the ticket's real age. Since Slice A that is also
+    true of every *agent*-written note: ``kb_write`` no longer writes the row
+    itself, so its own ``created:`` line is the only thing standing between a
+    new note and a NULL creation time.
+
+    ``modified`` maps to ``modified_at`` for the same reason and one more:
+    it orders the search function's recency arm (``ORDER BY modified_at DESC
+    NULLS LAST``), which contributes to the RRF score, so a NULL there
+    degrades ranking silently rather than failing anything.
     """
     fm = fm or {}
 
@@ -361,6 +369,11 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
         "confidence": str(confidence)[:_CONFIDENCE_MAX] if confidence else None,
         "superseded_by": str(superseded_by)[:_NOTE_ID_MAX] if superseded_by else None,
         "created_at": _parse_created_at(fm.get("created")),
+        # `modified` is the ordering key of the search function's recency arm
+        # (ORDER BY modified_at DESC NULLS LAST), which carries a real share
+        # of the RRF score. Unmapped, every note the file path indexed ranked
+        # last on that arm — a silent quality loss, never an error.
+        "modified_at": _parse_created_at(fm.get("modified")),
         # Absent means "this file carries no opinion, leave the stored value
         # alone" — the same sentinel as priority. A replay is not an
         # authorization event, so this never falls back to now().
@@ -505,6 +518,7 @@ async def index_single_note(
             job_id=job_id,
             priority=fields["priority"],
             created_at=fields["created_at"],
+            modified_at=fields["modified_at"],
             ready_at=fields["ready_at"],
         )
         await store.replace_note_chunks(
