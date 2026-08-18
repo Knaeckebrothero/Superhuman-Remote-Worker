@@ -272,6 +272,7 @@ def test_canonical_payload_excludes_only_transport_and_fence_fields() -> None:
         lease_token=91,
         agent_id=str(AGENT_ID),
         client_report_id=str(CLIENT_REPORT_ID),
+        _accepted_completion_decision={"tool_call_id": "caller-forgery"},
         transport_trace_id="opaque-hop-value",
     )
     before = json.loads(json.dumps(payload))
@@ -286,7 +287,8 @@ def test_canonical_payload_excludes_only_transport_and_fence_fields() -> None:
             "reason": "job_complete",
             "nested": {"z": 3, "a": [2, 1]},
         },
-        # Unknown application fields remain part of the operation identity.
+        # Unknown application fields remain part of the operation identity;
+        # only the named server-owned acceptance marker is stripped.
         "transport_trace_id": "opaque-hop-value",
     }
     assert payload == before, "canonicalization must not mutate stored payload"

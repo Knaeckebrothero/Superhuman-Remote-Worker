@@ -23,7 +23,17 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Any, List, Dict, Tuple, Mapping
+from typing import (
+    Optional,
+    Any,
+    List,
+    Dict,
+    Tuple,
+    Mapping,
+    Awaitable,
+    Callable,
+    Sequence,
+)
 from uuid import UUID, uuid4
 
 try:
@@ -92,6 +102,34 @@ _SERVER_OWNED_OFFICER_CONTEXT_KEYS = frozenset(
         "officer_incarnation",
     }
 )
+
+_LEASE_RECOVERY_CONTEXT_KEY = "_lease_recovery"
+LEASE_RECOVERY_UNCHANGED_LIMIT = 3
+LEASE_RECOVERY_AUDIT_TIMEOUT_SECONDS = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseRecoveryCircuitTrip:
+    """One job durably parked by the unchanged-recovery containment."""
+
+    job_id: str
+    project_id: str | None
+    unchanged_recoveries: int
+    officer_destination: str
+    officer_thread_id: str | None
+    notification_queued: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseRecoveryBatch:
+    """Structured lease sweep result: only recovered ids may be dispatched."""
+
+    recovered_job_ids: tuple[str, ...] = ()
+    circuit_trips: tuple[LeaseRecoveryCircuitTrip, ...] = ()
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.recovered_job_ids or self.circuit_trips)
 
 
 def _completion_sweep_exclusion_clause(
@@ -205,6 +243,29 @@ def _strict_json_object(value: Any, *, label: str) -> dict[str, Any]:
         if isinstance(parsed, dict):
             return dict(parsed)
     raise RuntimeError(f"{label} is malformed")
+
+
+def _json_object_or_empty(value: Any) -> dict[str, Any]:
+    """Tolerant JSONB object decode for recovery/diagnostic read paths."""
+
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+    return {}
+
+
+def _nonnegative_int(value: Any) -> int:
+    """Best-effort integer for server-owned recovery diagnostics."""
+
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _canonical_uuid_text(value: Any, *, label: str) -> str:
@@ -1773,6 +1834,10 @@ class PostgresDB:
         # connector fails the whole data contract instead of becoming a
         # silently reduced selection. Always stamp new jobs, including [].
         context = dict(context or {})
+        # Recovery containment is derived only from DB/audit authority. A
+        # caller-provided job context may never seed/reset its counter or
+        # forge a circuit-trip diagnostic.
+        context.pop(_LEASE_RECOVERY_CONTEXT_KEY, None)
         if authoritative_officer_admission:
             if conn is None:
                 raise ValueError(
@@ -2615,6 +2680,69 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def route_pinned_agent_release_to_lease_recovery(
+        self,
+        job_id: str,
+        *,
+        completion_commands_enabled: bool = False,
+        expected_agent_id: str | None = None,
+    ) -> bool:
+        """Expire one leased pinned handoff without bypassing recovery accounting.
+
+        A graceful agent shutdown is cooperative, but it is still an
+        infrastructure-driven redispatch source. It may make its current lease
+        immediately due; only :meth:`recover_expired_lease_jobs` may perform
+        the authoritative processing -> paused transition and advance the
+        unchanged-recovery circuit. NULL-lease compatibility rows continue to
+        use :meth:`pause_job`.
+        """
+        try:
+            job_uuid = UUID(job_id)
+            agent_uuid = UUID(expected_agent_id) if expected_agent_id else None
+        except ValueError:
+            return False
+        if completion_commands_enabled and agent_uuid is None:
+            return False
+
+        agent_guard = " AND assigned_agent_id=$2::uuid" if agent_uuid else ""
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('context')})"
+            if completion_commands_enabled
+            else ""
+        )
+        query = f"""
+            UPDATE jobs
+               SET lease_expires_at = LEAST(
+                       lease_expires_at,
+                       clock_timestamp() - interval '1 microsecond'
+                   )
+             WHERE id=$1::uuid
+               AND status='processing'
+               AND execution_lane='pinned'
+               AND lease_expires_at IS NOT NULL
+               {agent_guard}
+               {control_guard}
+            RETURNING id
+            """
+        args = (job_uuid, *([agent_uuid] if agent_uuid else []))
+        async with self.acquire() as conn:
+            if completion_commands_enabled:
+                async with conn.transaction():
+                    await conn.fetchval(
+                        "SELECT id FROM jobs WHERE id=$1::uuid FOR UPDATE", job_uuid
+                    )
+                    blocked = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM "
+                        "job_completion_sweep_exclusions WHERE job_id=$1::uuid)",
+                        job_uuid,
+                    )
+                    if blocked:
+                        return False
+                    row = await conn.fetchrow(query, *args)
+            else:
+                row = await conn.fetchrow(query, *args)
+        return row is not None
+
     async def pause_stateless_job(
         self,
         job_id: str,
@@ -2796,6 +2924,7 @@ class PostgresDB:
         completion_command_id: str | None = None,
         completion_finalizing_by: str | None = None,
         completion_control_claim_id: str | None = None,
+        consume_completion_decision_tool_call_id: str | None = None,
     ) -> bool:
         """Update job status fields.
 
@@ -2824,6 +2953,11 @@ class PostgresDB:
             completion_control_claim_id: Exact live delivery-control marker to
                 require and remove in this same disposition UPDATE. This is
                 valid only with the matching durable completion command term.
+            consume_completion_decision_tool_call_id: Remove the durable
+                ``context.completion_decision`` in this same UPDATE only when
+                its tool-call identity exactly matches the decision captured
+                by ``completion_command_id`` at admission. A later decision is
+                never consumed by an older command.
 
         Returns:
             True if updated, False if not found
@@ -2839,6 +2973,7 @@ class PostgresDB:
         param_count = 0
         stash_freeze_param: int | None = None
         workspace_context_param: int | None = None
+        consume_decision_param: int | None = None
 
         if status is not None:
             param_count += 1
@@ -2876,6 +3011,19 @@ class PostgresDB:
             param_count += 1
             workspace_context_param = param_count
             values.append(json.dumps(workspace_context_updates))
+
+        if consume_completion_decision_tool_call_id is not None:
+            if completion_command_id is None or completion_finalizing_by is None:
+                raise ValueError(
+                    "completion decision consumption requires a paired "
+                    "completion command term"
+                )
+            decision_id = str(consume_completion_decision_tool_call_id).strip()
+            if not decision_id:
+                raise ValueError("completion decision tool_call_id must be non-empty")
+            param_count += 1
+            consume_decision_param = param_count
+            values.append(decision_id)
 
         # Stamp the failure time on the transition INTO 'failed'. updated_at
         # cannot serve this: the update_jobs_updated_at trigger also fires on
@@ -2915,6 +3063,16 @@ class PostgresDB:
                 "'{workspace_container}', "
                 f"COALESCE(({context_base})->'workspace_container', '{{}}'::jsonb) "
                 f"|| ${workspace_context_param}::jsonb, true)"
+            )
+
+        if consume_decision_param is not None:
+            context_base = context_expression or "COALESCE(context, '{}'::jsonb)"
+            context_expression = (
+                "CASE WHEN "
+                f"({context_base}) #>> '{{completion_decision,tool_call_id}}' "
+                f"= ${consume_decision_param}::text "
+                f"THEN ({context_base}) - 'completion_decision' "
+                f"ELSE ({context_base}) END"
             )
 
         if completion_control_claim_id is not None:
@@ -7327,6 +7485,11 @@ class PostgresDB:
                       -- registered-agent row; run_queue owns its rescue
                       -- (knowledge-base/knowledge/features/stateless_agents.md §5.4.4).
                       AND jobs.execution_lane = 'pinned'
+                      -- A non-NULL execution lease has one automatic
+                      -- infrastructure-loss authority: expiry recovery. A
+                      -- same-host replacement must not bypass its durable
+                      -- unchanged-recovery accounting.
+                      AND lease_expires_at IS NULL
                       {completion_exclusion}
                       {control_guard}
                     """,
@@ -7739,6 +7902,10 @@ class PostgresDB:
                   -- the sole rescue authority for stateless worker jobs.
                   -- Whitelist pinned so unknown future lanes fail closed.
                   AND jobs.execution_lane = 'pinned'
+                  -- Leased rows belong exclusively to
+                  -- recover_expired_lease_jobs. This predicate is the
+                  -- authority partition; detector ordering is not relied on.
+                  AND lease_expires_at IS NULL
                   AND (
                       assigned_agent_id IS NULL
                       OR assigned_agent_id IN (
@@ -7833,9 +8000,17 @@ class PostgresDB:
         return count
 
     async def recover_expired_lease_jobs(
-        self, *, completion_commands_enabled: bool = False
-    ) -> List[str]:
-        """Pause processing jobs whose execution lease has expired.
+        self,
+        *,
+        completion_commands_enabled: bool = False,
+        audit_fingerprint_provider: (
+            Callable[[Sequence[str]], Awaitable[Mapping[str, int]]] | None
+        ) = None,
+        audit_fingerprint_timeout_seconds: float = (
+            LEASE_RECOVERY_AUDIT_TIMEOUT_SECONDS
+        ),
+    ) -> LeaseRecoveryBatch:
+        """Recover expired pinned leases, parking the third unchanged cycle.
 
         The lease is the direct liveness signal (knowledge-base/knowledge/features/
         job_execution_lease.md): ``claim_job_for_agent`` sets a pickup lease,
@@ -7843,16 +8018,26 @@ class PostgresDB:
         against the DATABASE clock — IS the definition of orphaned. Unlike
         :meth:`recover_orphaned_jobs` this needs no join to ``agents``, no
         offline-marking to have run first, and no sweep ordering; it is the
-        primary recovery path, with the agents-table sweep kept as
-        belt-and-suspenders during the soak (see the feature doc's rollout).
+        sole automatic infrastructure-loss recovery path for leased pinned
+        rows. The agents-table sweep is constrained to legacy NULL-lease rows
+        in its own predicate, so call order and concurrent replicas cannot
+        bypass durable recovery accounting.
 
         ``lease_expires_at IS NOT NULL`` keeps pre-lease rows (claimed before
         the deploy, never backfilled) with the legacy sweep instead of
         recovering them instantly.
 
-        Returns:
-            The recovered job ids (callers log each — an expired lease is an
-            incident signal, not routine noise).
+        ``context._lease_recovery`` is server-owned. Its fingerprint excludes
+        assignment, agent/pod identity, heartbeats, lease timestamps and the
+        jobs-row ``updated_at`` trigger. It includes the audit-store pre-row
+        count plus durable completion-command/decision state, so only real
+        execution or completion movement resets the unchanged sequence.
+
+        Recovery and the circuit trip serialize under the established
+        post -> current Officer thread -> jobs -> wake order. The third
+        unchanged recovery parks with a non-auto-redispatch freeze and writes
+        the owning project's durable Officer outbox row (or the post's
+        while-vacant ledger) in the same transaction.
         """
         completion_exclusion = _completion_sweep_exclusion_clause(
             completion_commands_enabled
@@ -7863,13 +8048,10 @@ class PostgresDB:
             else ""
         )
         async with self.acquire() as conn:
-            rows = await conn.fetch(
+            candidates = await conn.fetch(
                 f"""
-                UPDATE jobs
-                   SET status = 'paused',
-                       assigned_agent_id = NULL,
-                       lease_expires_at = NULL,
-                       updated_at = CURRENT_TIMESTAMP
+                SELECT jobs.id, jobs.project_id
+                  FROM jobs
                  WHERE status = 'processing'
                    -- Stateless jobs are recovered only by run_queue's
                    -- lease-token reaper (§5.4.4), never this jobs-row lease.
@@ -7878,10 +8060,368 @@ class PostgresDB:
                    AND lease_expires_at < NOW()
                    {completion_exclusion}
                    {control_guard}
-                RETURNING id
+                 ORDER BY lease_expires_at, jobs.id
                 """
             )
-        return [str(row["id"]) for row in rows]
+        if not candidates:
+            return LeaseRecoveryBatch()
+
+        candidate_ids = [str(row["id"]) for row in candidates]
+        audit_counts: Mapping[str, int] | None = None
+        if audit_fingerprint_provider is not None:
+            try:
+                if audit_fingerprint_timeout_seconds <= 0:
+                    raise ValueError(
+                        "audit_fingerprint_timeout_seconds must be positive"
+                    )
+                audit_counts = await asyncio.wait_for(
+                    audit_fingerprint_provider(candidate_ids),
+                    timeout=float(audit_fingerprint_timeout_seconds),
+                )
+            except TimeoutError:
+                # Pool acquisition is outside AuditStore's command timeout.
+                # Bound the whole optional call so it cannot stall the primary
+                # stale-job detector. The prior component is retained below.
+                logger.warning(
+                    "Lease recovery audit fingerprint read timed out after %.3fs; "
+                    "retaining the last known audit component",
+                    audit_fingerprint_timeout_seconds,
+                )
+            except Exception:
+                # Audit storage is optional. Preserve the last known audit
+                # component below rather than converting an outage into fake
+                # movement that postpones containment forever.
+                logger.exception(
+                    "Lease recovery audit fingerprint read failed; retaining "
+                    "the last known audit component"
+                )
+
+        recovered: list[str] = []
+        trips: list[LeaseRecoveryCircuitTrip] = []
+        for candidate in candidates:
+            job_uuid = UUID(str(candidate["id"]))
+            candidate_project = candidate["project_id"]
+            project_uuid = (
+                UUID(str(candidate_project)) if candidate_project is not None else None
+            )
+            post = None
+            officer_thread = None
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    # Lock the durable post and its exact current thread before
+                    # the jobs row. Hold/decommission therefore serialize with
+                    # the outbox insert and route already-durable intent using
+                    # their established lifecycle policy.
+                    if project_uuid is not None:
+                        try:
+                            await conn.execute(
+                                "INSERT INTO project_officers (project_id) "
+                                "VALUES ($1) ON CONFLICT (project_id) DO NOTHING",
+                                project_uuid,
+                            )
+                        except asyncpg.ForeignKeyViolationError:
+                            project_uuid = None
+                        if project_uuid is not None:
+                            post = await conn.fetchrow(
+                                "SELECT thread_id, state FROM project_officers "
+                                "WHERE project_id=$1 FOR UPDATE",
+                                project_uuid,
+                            )
+                            if post is not None and post["thread_id"] is not None:
+                                officer_thread = await conn.fetchrow(
+                                    "SELECT id, project_id, status, metadata "
+                                    "FROM threads WHERE id=$1 FOR UPDATE",
+                                    post["thread_id"],
+                                )
+
+                    job = await conn.fetchrow(
+                        """
+                        SELECT id, status::text AS status, execution_lane,
+                               assigned_agent_id, lease_expires_at, project_id,
+                               context, completion_seq_hwm,
+                               clock_timestamp() AS db_now
+                        FROM jobs
+                        WHERE id=$1::uuid
+                        FOR UPDATE
+                        """,
+                        job_uuid,
+                    )
+                    if (
+                        job is None
+                        or str(job["status"]) != "processing"
+                        or str(job["execution_lane"]) != "pinned"
+                        or job["lease_expires_at"] is None
+                        or job["lease_expires_at"] >= job["db_now"]
+                        or job["project_id"] != project_uuid
+                    ):
+                        continue
+
+                    latest = await conn.fetchrow(
+                        """
+                        SELECT report_seq, state, error_code, finalized_at,
+                               outcome->>'new_status' AS new_status
+                        FROM job_completion_commands
+                        WHERE job_id=$1::uuid
+                        ORDER BY report_seq DESC
+                        LIMIT 1
+                        """,
+                        job_uuid,
+                    )
+                    context = _json_object_or_empty(job["context"])
+                    prior_recovery = context.get(_LEASE_RECOVERY_CONTEXT_KEY)
+                    if not isinstance(prior_recovery, Mapping):
+                        prior_recovery = {}
+                    prior_fingerprint = prior_recovery.get("fingerprint")
+                    if not isinstance(prior_fingerprint, Mapping):
+                        prior_fingerprint = {}
+                    prior_audit = prior_fingerprint.get("audit")
+                    prior_audit = (
+                        dict(prior_audit) if isinstance(prior_audit, Mapping) else {}
+                    )
+                    if audit_counts is not None:
+                        audit_marker: dict[str, Any] = {
+                            "available": True,
+                            "pre_row_count": _nonnegative_int(
+                                audit_counts.get(str(job_uuid), 0)
+                            ),
+                        }
+                    else:
+                        audit_marker = (
+                            dict(prior_audit) if prior_audit else {"available": False}
+                        )
+                    decision = context.get("completion_decision")
+                    decision = decision if isinstance(decision, Mapping) else {}
+                    completion_marker = {
+                        "completion_seq_hwm": int(job["completion_seq_hwm"] or 0),
+                        "decision_tool_call_id": decision.get("tool_call_id"),
+                        "decision_recorded_at": decision.get("recorded_at"),
+                        "latest_report_seq": (
+                            int(latest["report_seq"]) if latest is not None else None
+                        ),
+                        "latest_state": (
+                            str(latest["state"]) if latest is not None else None
+                        ),
+                        "latest_error_code": (
+                            latest["error_code"] if latest is not None else None
+                        ),
+                        "latest_new_status": (
+                            latest["new_status"] if latest is not None else None
+                        ),
+                        "latest_finalized_at": (
+                            latest["finalized_at"].isoformat()
+                            if latest is not None
+                            and isinstance(latest["finalized_at"], datetime)
+                            else None
+                        ),
+                    }
+                    fingerprint = {
+                        "audit": audit_marker,
+                        "completion": completion_marker,
+                    }
+                    # Availability itself is not audit movement. When the
+                    # first strict read after an outage establishes a count,
+                    # retain the unchanged sequence and store that baseline;
+                    # only a later count delta is proof of progress.
+                    prior_completion = prior_fingerprint.get("completion")
+                    completion_unchanged = (
+                        isinstance(prior_completion, Mapping)
+                        and dict(prior_completion) == completion_marker
+                    )
+                    audit_moved = (
+                        prior_audit.get("available") is True
+                        and audit_marker.get("available") is True
+                        and _nonnegative_int(prior_audit.get("pre_row_count"))
+                        != _nonnegative_int(audit_marker.get("pre_row_count"))
+                    )
+                    unchanged = bool(prior_fingerprint) and (
+                        completion_unchanged and not audit_moved
+                    )
+                    prior_count = _nonnegative_int(
+                        prior_recovery.get("unchanged_recoveries")
+                    )
+                    recovery_count = prior_count + 1 if unchanged else 1
+                    tripped = recovery_count >= LEASE_RECOVERY_UNCHANGED_LIMIT
+                    db_now = job["db_now"]
+                    prior_generation = prior_recovery.get("generation")
+                    recovery_generation = (
+                        str(prior_generation)
+                        if unchanged and prior_generation
+                        else str(uuid4())
+                    )
+                    fragment: dict[str, Any] = {
+                        "version": 1,
+                        "generation": recovery_generation,
+                        "state": "tripped" if tripped else "recovering",
+                        "unchanged_recoveries": recovery_count,
+                        "fingerprint": fingerprint,
+                        "last_recovered_at": db_now.isoformat(),
+                        "last_recovered_agent_id": (
+                            str(job["assigned_agent_id"])
+                            if job["assigned_agent_id"] is not None
+                            else None
+                        ),
+                        "first_unchanged_recovery_at": (
+                            prior_recovery.get("first_unchanged_recovery_at")
+                            if unchanged
+                            and prior_recovery.get("first_unchanged_recovery_at")
+                            else db_now.isoformat()
+                        ),
+                    }
+                    if tripped:
+                        fragment["tripped_at"] = db_now.isoformat()
+
+                    freeze = {
+                        "freeze_type": "redispatch_livelock",
+                        "reason": (
+                            "Execution lease expired three times without "
+                            "authoritative audit/completion movement"
+                        ),
+                        "automatic_redispatch": False,
+                        "unchanged_recoveries": recovery_count,
+                        "fingerprint": fingerprint,
+                        "timestamp": db_now.isoformat(),
+                    }
+                    updated = await conn.fetchrow(
+                        f"""
+                        UPDATE jobs
+                           SET status='paused', assigned_agent_id=NULL,
+                               lease_expires_at=NULL,
+                               context=jsonb_set(
+                                   COALESCE(context, '{{}}'::jsonb),
+                                   '{{{_LEASE_RECOVERY_CONTEXT_KEY}}}',
+                                   COALESCE(
+                                       context->'{_LEASE_RECOVERY_CONTEXT_KEY}',
+                                       '{{}}'::jsonb
+                                   ) || $2::jsonb,
+                                   true
+                               ),
+                               freeze_data=CASE WHEN $3::boolean
+                                   THEN $4::jsonb ELSE freeze_data END,
+                               error_message=CASE WHEN $3::boolean
+                                   THEN 'redispatch_livelock: three unchanged lease recoveries'
+                                   ELSE error_message END,
+                               error_details=CASE WHEN $3::boolean
+                                   THEN jsonb_build_object(
+                                       'classification', 'redispatch_livelock',
+                                       'unchanged_recoveries', $5::int,
+                                       'fingerprint', $6::jsonb
+                                   ) ELSE error_details END,
+                               updated_at=CURRENT_TIMESTAMP
+                         WHERE id=$1::uuid
+                           AND status='processing'
+                           AND execution_lane='pinned'
+                           AND lease_expires_at IS NOT NULL
+                           AND lease_expires_at < NOW()
+                           {completion_exclusion}
+                           {control_guard}
+                        RETURNING id
+                        """,
+                        job_uuid,
+                        json.dumps(fragment),
+                        tripped,
+                        json.dumps(freeze),
+                        recovery_count,
+                        json.dumps(fingerprint),
+                    )
+                    if updated is None:
+                        continue
+
+                    if not tripped:
+                        recovered.append(str(job_uuid))
+                        continue
+
+                    destination = "job_diagnostic"
+                    officer_thread_id: str | None = None
+                    notification_queued = False
+                    metadata: dict[str, Any] = {}
+                    if officer_thread is not None:
+                        metadata = _json_object_or_empty(officer_thread["metadata"])
+                    officer_cfg = (
+                        (metadata.get("config_override") or {}).get("officer") or {}
+                        if isinstance(metadata.get("config_override"), Mapping)
+                        else {}
+                    )
+                    officer_live = (
+                        officer_thread is not None
+                        and officer_thread["project_id"] == project_uuid
+                        and str(officer_thread["status"]) != "ended"
+                        and isinstance(officer_cfg, Mapping)
+                        and str(officer_cfg.get("enabled", False)).lower() == "true"
+                    )
+                    payload = {
+                        "kind": "redispatch_livelock",
+                        "job_id": str(job_uuid),
+                        "incident_generation": recovery_generation,
+                        "unchanged_recoveries": recovery_count,
+                        "summary": (
+                            f"Job {str(job_uuid)[:8]} was parked after three "
+                            "lease recoveries without audit/completion movement"
+                        ),
+                    }
+                    if officer_live:
+                        officer_thread_id = str(officer_thread["id"])
+                        notification_queued = (
+                            await self._enqueue_session_wake_event_on_conn(
+                                conn,
+                                UUID(officer_thread_id),
+                                source="lease_recovery",
+                                dedup_key=(
+                                    "redispatch_livelock:"
+                                    f"{job_uuid}:{recovery_generation}"
+                                ),
+                                payload_json=json.dumps(payload),
+                                project_uuid=project_uuid,
+                            )
+                        )
+                        destination = "wake"
+                    elif post is not None and project_uuid is not None:
+                        state = _json_object_or_empty(post["state"])
+                        ledger = state.get("while_vacant")
+                        ledger = ledger if isinstance(ledger, list) else []
+                        duplicate = any(
+                            isinstance(item, Mapping)
+                            and str(item.get("job_id") or "") == str(job_uuid)
+                            and str(item.get("status") or "") == "redispatch_livelock"
+                            and str(item.get("incident_generation") or "")
+                            == recovery_generation
+                            for item in ledger
+                        )
+                        if not duplicate:
+                            entry = {
+                                "job_id": str(job_uuid),
+                                "status": "redispatch_livelock",
+                                "incident_generation": recovery_generation,
+                                "description": payload["summary"][:200],
+                                "at": db_now.isoformat(),
+                            }
+                            vacant_fragment, _ = self._while_vacant_ring(
+                                state, [entry], self.WHILE_VACANT_CAP
+                            )
+                            await conn.execute(
+                                "UPDATE project_officers "
+                                "SET state=state || $2::jsonb, updated_at=now() "
+                                "WHERE project_id=$1",
+                                project_uuid,
+                                json.dumps(vacant_fragment),
+                            )
+                        destination = "while_vacant"
+                    trips.append(
+                        LeaseRecoveryCircuitTrip(
+                            job_id=str(job_uuid),
+                            project_id=(
+                                str(project_uuid) if project_uuid is not None else None
+                            ),
+                            unchanged_recoveries=recovery_count,
+                            officer_destination=destination,
+                            officer_thread_id=officer_thread_id,
+                            notification_queued=notification_queued,
+                        )
+                    )
+
+        return LeaseRecoveryBatch(
+            recovered_job_ids=tuple(recovered),
+            circuit_trips=tuple(trips),
+        )
 
     # Cancels orphaned critic/verification subjobs that can never progress.
     # Hoisted to a constant so tests can assert on the predicate directly
@@ -8638,6 +9178,9 @@ class PostgresDB:
                        AND execution_lane = 'pinned'
                        AND assigned_agent_id IS NULL
                        AND freeze_data IS NULL
+                       AND COALESCE(
+                           context->'{_LEASE_RECOVERY_CONTEXT_KEY}'->>'state', ''
+                       ) <> 'tripped'
                        {status_guard}
                        {control_guard}
                     RETURNING id
@@ -13608,6 +14151,10 @@ class PostgresDB:
             )
         else:
             completion_guard = ""
+        trip_guard = (
+            f" AND COALESCE(context->'{_LEASE_RECOVERY_CONTEXT_KEY}'->>'state', '')"
+            " <> 'tripped'"
+        )
         return await conn.fetchrow(
             f"""
             UPDATE jobs
@@ -13623,7 +14170,7 @@ class PostgresDB:
                    assigned_agent_id = NULL,
                    freeze_data = NULL,
                    updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}
+             WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}{trip_guard}
             RETURNING id, priority, user_id
             """,
             *args,
@@ -13763,6 +14310,105 @@ class PostgresDB:
                     completion_control_claim_id=completion_control_claim_id,
                 )
             return row is not None
+
+    async def acknowledge_lease_recovery_circuit(
+        self,
+        job_id: str,
+        *,
+        expected_status: str,
+        expected_generation: str,
+        acknowledged_by: Mapping[str, Any],
+        context_merge: Mapping[str, Any] | None = None,
+        completion_commands_enabled: bool = False,
+    ) -> bool:
+        """Atomically acknowledge one observed redispatch-livelock trip.
+
+        This is deliberately separate from :meth:`queue_job_for_resume`.
+        Generic resume writers fail closed while the server-owned trip marker
+        exists; only the explicitly authorized HTTP boundary reaches this CAS.
+        The observed status plus recovery generation/state fence concurrent
+        acknowledgements and a newer incident. The former active diagnostic is
+        retained under a hidden history key while the live freeze, error,
+        assignment, lease, and recovery episode are cleared together.
+
+        Like an ordinary explicit resume, acknowledgement starts a new work
+        round and therefore consumes ``context.completion_decision``. Sibling
+        context keys and optional feedback are merged, never replaced.
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return False
+        generation = str(expected_generation or "").strip()
+        if not generation:
+            return False
+        actor = dict(acknowledged_by)
+        if not actor:
+            raise ValueError("acknowledged_by must identify the authorized actor")
+
+        completion_guard = _completion_sweep_exclusion_clause(
+            completion_commands_enabled
+        )
+        control_guard = (
+            f" AND NOT ({_completion_control_active_sql('context')})"
+            if completion_commands_enabled
+            else ""
+        )
+        query = f"""
+            UPDATE jobs
+               SET context = (
+                       COALESCE(context, '{{}}'::jsonb)
+                       - '{_LEASE_RECOVERY_CONTEXT_KEY}'
+                       - 'completion_decision'
+                   )
+                   || $2::jsonb
+                   || CASE WHEN freeze_data IS NULL THEN '{{}}'::jsonb
+                           ELSE jsonb_build_object(
+                               'last_freeze_data', freeze_data
+                           ) END
+                   || jsonb_build_object(
+                       '_lease_recovery_last_trip',
+                       jsonb_build_object(
+                           'recovery', context->'{_LEASE_RECOVERY_CONTEXT_KEY}',
+                           'freeze_data', freeze_data,
+                           'error_message', error_message,
+                           'error_details', error_details,
+                           'acknowledged_at', to_jsonb(clock_timestamp()),
+                           'acknowledged_by', $5::jsonb
+                       )
+                   ),
+                   status = 'paused',
+                   assigned_agent_id = NULL,
+                   lease_expires_at = NULL,
+                   freeze_data = NULL,
+                   error_message = NULL,
+                   error_details = NULL,
+                   updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1::uuid
+               AND status::text = $3::text
+               AND execution_lane = 'pinned'
+               AND context->'{_LEASE_RECOVERY_CONTEXT_KEY}'->>'state' = 'tripped'
+               AND context->'{_LEASE_RECOVERY_CONTEXT_KEY}'->>'generation' = $4::text
+               {completion_guard}
+               {control_guard}
+            RETURNING id
+            """
+        args = (
+            job_uuid,
+            json.dumps(dict(context_merge or {})),
+            expected_status,
+            generation,
+            json.dumps(actor),
+        )
+        async with self.acquire() as conn:
+            if completion_commands_enabled:
+                async with conn.transaction():
+                    if await self._completion_resume_blocked_on_conn(conn, job_uuid):
+                        return False
+                    row = await conn.fetchrow(query, *args)
+            else:
+                row = await conn.fetchrow(query, *args)
+        return row is not None
 
     async def queue_stateless_job_for_resume(
         self,
@@ -14285,6 +14931,9 @@ class PostgresDB:
                   AND j.execution_lane = 'pinned'
                   AND j.assigned_agent_id IS NULL
                   AND j.freeze_data IS NULL
+                  AND COALESCE(
+                      j.context->'{_LEASE_RECOVERY_CONTEXT_KEY}'->>'state', ''
+                  ) <> 'tripped'
                   {completion_exclusion}
                   {control_guard}
                   -- Mode A: skip jobs whose cloud-folder baseline is still

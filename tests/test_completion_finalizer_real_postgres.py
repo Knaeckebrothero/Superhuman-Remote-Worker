@@ -435,6 +435,51 @@ async def test_s27_reviewing_cas_and_effect_marker_commit_together(
 
 
 @pytest.mark.asyncio
+async def test_s27_approval_consumes_the_reviewed_completion_decision(pg, monkeypatch):
+    accepted, target_id, critic_id = await _critic_verdict_fixture(pg)
+    async with pg.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE jobs
+            SET resolved_config='{"agent":{"autonomy":"full"}}'::jsonb,
+                context=COALESCE(context, '{}'::jsonb) || jsonb_build_object(
+                    'completion_decision',
+                    jsonb_build_object('tool_call_id', 'round-2-reviewed-tool')
+                )
+            WHERE id=$1
+            """,
+            target_id,
+        )
+    db = _pool_db(pg)
+    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(
+        main,
+        "_resolve_critic_outcome",
+        lambda *_args: ("approved", "round 2 approved"),
+    )
+    runner = await _claimed_runner(db, accepted.command_id)
+    critic = await db.get_job(str(critic_id))
+
+    plan = await runner.run_transactional(
+        name="critic_verdict",
+        group="critic_verdict",
+        callback=lambda: main._materialize_critic_verdict_transactional(critic),
+        supersede_if=lambda output: output["world_cas_won"] is False,
+    )
+
+    assert plan["world_cas_won"] is True
+    assert plan["outcome"] == "approved"
+    assert plan["new_status"] == "completed"
+    async with pg.acquire() as conn:
+        target = await conn.fetchrow(
+            "SELECT status::text, context ? 'completion_decision' AS decision_live "
+            "FROM jobs WHERE id=$1",
+            target_id,
+        )
+    assert dict(target) == {"status": "completed", "decision_live": False}
+
+
+@pytest.mark.asyncio
 async def test_s27_oversized_findings_persist_in_domain_not_effect_detail(
     pg, monkeypatch
 ):
@@ -1297,6 +1342,208 @@ async def test_successor_adopts_done_predecessor_status_not_stale_accept_snapsho
     assert json.loads(states[0]["outcome"])["new_status"] == "completed"
     assert json.loads(states[1]["outcome"])["new_status"] == "completed"
     assert status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_feedback_round_accept_finishes_and_consumes_its_exact_decision(pg):
+    """Round 1 reviewing -> feedback processing -> round 2 terminal."""
+
+    async with pg.acquire() as conn:
+        agent_id = await conn.fetchval(
+            "INSERT INTO agents (config_name, hostname, status) "
+            "VALUES ('developer', $1, 'working') RETURNING id",
+            f"feedback-finalizer-{uuid4().hex[:10]}",
+        )
+        job_id = await conn.fetchval(
+            """
+            INSERT INTO jobs (
+                description, status, execution_lane, assigned_agent_id, context
+            ) VALUES (
+                'feedback round finalizer', 'processing', 'pinned', $1,
+                jsonb_build_object(
+                    'completion_decision',
+                    jsonb_build_object(
+                        'tool_call_id', 'round-1-tool',
+                        'recorded_at', '2026-08-18T10:00:00+00:00'
+                    )
+                )
+            ) RETURNING id
+            """,
+            agent_id,
+        )
+    first = await accept_completion_command(
+        pg,
+        job_id=str(job_id),
+        payload={
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": None,
+            "freeze_data": None,
+        },
+        lease_token=None,
+        agent_id=str(agent_id),
+        client_report_id=str(uuid4()),
+        requested_by="round-1-agent",
+    )
+
+    async def finalize_round_one(_runner):
+        async with pg.acquire() as conn:
+            assert (
+                await conn.execute(
+                    "UPDATE jobs SET status='reviewing' "
+                    "WHERE id=$1 AND status='processing'",
+                    job_id,
+                )
+                == "UPDATE 1"
+            )
+        return {"status": "handled", "new_status": "reviewing"}
+
+    assert (
+        await CompletionFinalizer(pg, workflow=finalize_round_one).finalize_command(
+            first.command_id
+        )
+    ).disposition == "done"
+
+    # The verification feedback transition voids round 1 and journals a fresh
+    # round-2 decision before that report is accepted against processing.
+    async with pg.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE jobs
+            SET status='processing', assigned_agent_id=$2,
+                context=(COALESCE(context, '{}'::jsonb)-'completion_decision')
+                    || jsonb_build_object(
+                        'completion_decision',
+                        jsonb_build_object(
+                            'tool_call_id', 'round-2-tool',
+                            'recorded_at', '2026-08-18T10:05:00+00:00'
+                        )
+                    )
+            WHERE id=$1 AND status='reviewing'
+            """,
+            job_id,
+            agent_id,
+        )
+    second = await accept_completion_command(
+        pg,
+        job_id=str(job_id),
+        payload={
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": None,
+            "freeze_data": None,
+        },
+        lease_token=None,
+        agent_id=str(agent_id),
+        client_report_id=str(uuid4()),
+        requested_by="round-2-agent",
+    )
+
+    class _PoolDatabase:
+        def acquire(self):
+            return pg.acquire()
+
+        async def delete_checkpoint_thread(self, _job_id):
+            return None
+
+    async def finalize_round_two(runner):
+        accepted_decision = runner.command["payload"]["_accepted_completion_decision"][
+            "tool_call_id"
+        ]
+        updated = await PostgresDB.update_job_status(
+            _PoolDatabase(),
+            str(job_id),
+            status="completed",
+            expected_status="processing",
+            completion_command_id=runner.command_id,
+            completion_finalizing_by=runner.owner,
+            consume_completion_decision_tool_call_id=accepted_decision,
+        )
+        assert updated
+        return {"status": "handled", "new_status": "completed"}
+
+    second_result = await CompletionFinalizer(
+        pg, workflow=finalize_round_two
+    ).finalize_command(second.command_id)
+
+    assert second_result.disposition == "done"
+    async with pg.acquire() as conn:
+        job = await conn.fetchrow(
+            "SELECT status, context ? 'completion_decision' AS decision_live "
+            "FROM jobs WHERE id=$1",
+            job_id,
+        )
+        commands = await conn.fetch(
+            "SELECT report_seq, state, outcome->>'new_status' AS new_status "
+            "FROM job_completion_commands WHERE job_id=$1 ORDER BY report_seq",
+            job_id,
+        )
+    assert dict(job) == {"status": "completed", "decision_live": False}
+    assert [dict(row) for row in commands] == [
+        {"report_seq": 1, "state": "done", "new_status": "reviewing"},
+        {"report_seq": 2, "state": "done", "new_status": "completed"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_genuine_status_change_supersedes_and_cannot_leave_live_decision(pg):
+    async with pg.acquire() as conn:
+        agent_id = await conn.fetchval(
+            "INSERT INTO agents (config_name, hostname, status) "
+            "VALUES ('developer', $1, 'working') RETURNING id",
+            f"status-race-{uuid4().hex[:10]}",
+        )
+        job_id = await conn.fetchval(
+            """
+            INSERT INTO jobs (
+                description, status, execution_lane, assigned_agent_id, context
+            ) VALUES (
+                'status race', 'processing', 'pinned', $1,
+                jsonb_build_object(
+                    'completion_decision',
+                    jsonb_build_object('tool_call_id', 'status-race-tool')
+                )
+            ) RETURNING id
+            """,
+            agent_id,
+        )
+    accepted = await accept_completion_command(
+        pg,
+        job_id=str(job_id),
+        payload={"should_stop": True, "goal_achieved": True},
+        lease_token=None,
+        agent_id=str(agent_id),
+        client_report_id=str(uuid4()),
+        requested_by="status-race-agent",
+    )
+    async with pg.acquire() as conn:
+        await conn.execute("UPDATE jobs SET status='paused' WHERE id=$1", job_id)
+
+    async def must_not_run(_runner):
+        raise AssertionError("stale acceptance reached the completion workflow")
+
+    result = await CompletionFinalizer(pg, workflow=must_not_run).finalize_command(
+        accepted.command_id
+    )
+
+    assert result.disposition == "superseded"
+    assert result.outcome["observed_status"] == "paused"
+    assert result.outcome["completion_decision_disposition"] == (
+        "voided_exact_acceptance"
+    )
+    async with pg.acquire() as conn:
+        state = await conn.fetchrow(
+            "SELECT status, context ? 'completion_decision' AS decision_live, "
+            "(SELECT state FROM job_completion_commands WHERE id=$2) AS command_state "
+            "FROM jobs WHERE id=$1",
+            job_id,
+            UUID(accepted.command_id),
+        )
+    assert dict(state) == {
+        "status": "paused",
+        "decision_live": False,
+        "command_state": "superseded",
+    }
 
 
 @pytest.mark.asyncio

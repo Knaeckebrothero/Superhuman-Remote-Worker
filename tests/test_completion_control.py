@@ -303,6 +303,43 @@ async def test_delayed_agent_release_reports_owner_conflict_without_dispatch():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_leased_agent_release_routes_to_recovery_without_dispatch(enabled):
+    job_id = str(uuid4())
+    agent_id = str(uuid4())
+    db = MagicMock()
+    db.get_job = AsyncMock(
+        return_value={
+            "id": job_id,
+            "status": "processing",
+            "execution_lane": "pinned",
+            "assigned_agent_id": agent_id,
+            "lease_expires_at": "2026-08-18T12:00:00+00:00",
+            "context": {},
+        }
+    )
+    db.route_pinned_agent_release_to_lease_recovery = AsyncMock(return_value=True)
+    db.pause_job = AsyncMock()
+    trigger = MagicMock()
+    with (
+        patch.object(main, "COMPLETION_COMMANDS_ENABLED", enabled),
+        patch.object(main, "require_internal", AsyncMock()),
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_trigger_dispatch", trigger),
+    ):
+        result = await main.agent_release_job(MagicMock(), job_id, agent_id=agent_id)
+
+    assert result == {"status": "lease_recovery_pending", "job_id": job_id}
+    db.route_pinned_agent_release_to_lease_recovery.assert_awaited_once_with(
+        job_id,
+        completion_commands_enabled=enabled,
+        expected_agent_id=agent_id,
+    )
+    db.pause_job.assert_not_awaited()
+    trigger.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_blocking_message_loser_has_zero_notification_side_effects():
     job_id = str(uuid4())
     agent_id = str(uuid4())

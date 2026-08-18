@@ -196,6 +196,39 @@ class TestUpdateJobStatusClassA:
         )
 
     @pytest.mark.asyncio
+    async def test_completion_decision_is_consumed_by_exact_identity_in_status_cas(
+        self,
+    ):
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        db = _db_with_connection(conn)
+        command_id = "44444444-4444-4444-8444-444444444444"
+
+        assert await db.update_job_status(
+            JOB_ID,
+            status="completed",
+            expected_status="processing",
+            completion_command_id=command_id,
+            completion_finalizing_by="attempt-owner",
+            consume_completion_decision_tool_call_id="round-2-tool",
+        )
+
+        args = conn.execute.await_args.args
+        sql = _normalized(args[0])
+        assert "'{completion_decision,tool_call_id}' = $2::text" in sql
+        assert "- 'completion_decision'" in sql
+        assert "command.id = $5::uuid" in sql
+        assert "command.finalizing_by = $6::text" in sql
+        assert args[1:] == (
+            "completed",
+            "round-2-tool",
+            UUID(JOB_ID),
+            "processing",
+            UUID(command_id),
+            "attempt-owner",
+        )
+
+    @pytest.mark.asyncio
     async def test_completion_term_arguments_must_be_paired(self):
         conn = AsyncMock()
         db = _db_with_connection(conn)

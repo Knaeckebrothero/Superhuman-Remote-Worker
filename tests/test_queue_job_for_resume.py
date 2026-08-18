@@ -154,6 +154,43 @@ async def test_resume_without_feedback_still_sheds_freeze(db):
 
 
 @pytest.mark.asyncio
+async def test_generic_resume_refuses_redispatch_trip_without_shedding_fences(db):
+    """Automation cannot turn the circuit's diagnostic freeze into false success."""
+    circuit = {
+        "version": 1,
+        "generation": "incident-1",
+        "state": "tripped",
+        "unchanged_recoveries": 3,
+    }
+    freeze = {
+        "freeze_type": "redispatch_livelock",
+        "automatic_redispatch": False,
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET status='paused', context=context || $2::jsonb, "
+            "freeze_data=$3::jsonb WHERE id=$1",
+            UUID(JOB),
+            json.dumps({"_lease_recovery": circuit}),
+            json.dumps(freeze),
+        )
+
+    assert not await db.queue_job_for_resume(
+        JOB, {"queued_feedback": "automation tried to resume"}
+    )
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, context, freeze_data FROM jobs WHERE id=$1", UUID(JOB)
+        )
+    context = json.loads(row["context"])
+    assert row["status"] == "paused"
+    assert context["_lease_recovery"] == circuit
+    assert "queued_feedback" not in context
+    assert json.loads(row["freeze_data"]) == freeze
+
+
+@pytest.mark.asyncio
 async def test_critic_returned_resume_clears_freeze_so_dispatcher_sees_job(db):
     """The critic-'returned' arm resumes the reviewing parent through this
     same write. The parent always arrives frozen (``job_complete`` freeze from
