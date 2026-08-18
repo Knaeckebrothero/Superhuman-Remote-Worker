@@ -1107,12 +1107,13 @@ class KnowledgeStore:
         # NULL, so using it here would silently reintroduce the clobber.
         #
         # retrieval_messages ($11) gets the identical treatment for the same
-        # reason, against the column's own empty-array default rather than a
+        # reason, against the column's own empty-array default — ``TEXT[]
+        # DEFAULT '{}'``, vector/0001_initial.sql:495 — rather than a
         # literal 1. The explicit ``::text[]`` casts are load-bearing: both
         # sides of a bare ``COALESCE($11, '{}')`` are otherwise untyped, and
         # Postgres's fallback type for an all-unknown COALESCE is scalar
-        # ``text``, not ``text[]`` — verified against a live Postgres, not
-        # just this mock-based suite (which cannot catch a mistake here).
+        # ``text``, not ``text[]`` (this mock-based suite cannot catch that
+        # mistake — it never executes real SQL).
         #
         # remaining_cycles ($23) is new (task 5) and does NOT follow this
         # pattern — it has no ON CONFLICT branch at all (see the docstring).
