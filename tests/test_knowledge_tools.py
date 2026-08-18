@@ -1291,9 +1291,7 @@ class TestKbLint:
         ctx = _make_context()
         ctx.has_workspace.return_value = True
         ws, _ = _fake_kb_workspace(
-            {
-                "docs/a.md": '---\nid: a\ntype: note\ndescription: "d"\n---\n\n# A\n'
-            }
+            {"docs/a.md": '---\nid: a\ntype: note\ndescription: "d"\n---\n\n# A\n'}
         )
         ctx.workspace_manager = ws
         tools, _ = _make_tools(ctx)
@@ -1401,9 +1399,7 @@ class TestKbIndex:
         ctx = _make_context()
         ctx.has_workspace.return_value = True
         ws, writes = _fake_kb_workspace(
-            {
-                "docs/a.md": '---\nid: a\ntype: note\ndescription: "d"\n---\n\n# A\n'
-            }
+            {"docs/a.md": '---\nid: a\ntype: note\ndescription: "d"\n---\n\n# A\n'}
         )
         ctx.workspace_manager = ws
         tools, _ = _make_tools(ctx)
