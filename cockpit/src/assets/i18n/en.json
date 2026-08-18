@@ -3183,6 +3183,224 @@
     "deliveryFailed": "delivery failed; retry state retained",
     "notQueued": "not queued"
   },
+  "officerCard": {
+    "title": "Centurion",
+    "intro": "A standing officer for this project: he holds the charge, watches jobs and fleet, dispatches workers from his kit, and pages you only when something genuinely needs you. You talk to him in a conference; his background log is the session transcript. The post outlives him — kit, budgets, and memory stay with it between incarnations.",
+    "readOnly": "You can view this Officer Post, but only a project owner or system administrator can manage it.",
+    "a11y": {
+      "loading": "Loading Officer Post",
+      "region": "Officer Post",
+      "brainModel": "Officer model",
+      "reasoning": "Officer reasoning effort",
+      "actionsPerWake": "Maximum actions per wake",
+      "slotName": "Slot {{index}} name",
+      "slotCount": "Slot {{index}} count",
+      "slotModel": "Slot {{index}} model",
+      "slotWorkspace": "Slot {{index}} workspace",
+      "slotPool": "Slot {{index}} pool",
+      "removeSlot": "Remove slot {{name}}",
+      "maxWorkers": "Maximum workers",
+      "tokenCeiling": "Daily token ceiling",
+      "pagesPerDay": "Maximum pages per day",
+      "sleepMin": "Minimum sleep in minutes",
+      "sleepMax": "Maximum sleep in minutes",
+      "holdNote": "Officer hold note",
+      "routingPolicy": "Worker-question routing policy"
+    },
+    "actions": {
+      "addSlot": "Add slot",
+      "cancel": "Cancel",
+      "commission": "Commission centurion",
+      "conference": "Conference",
+      "confirmDecommission": "Confirm decommission",
+      "confirmHold": "Confirm hold",
+      "decommission": "Decommission",
+      "decommissionKeepRunning": "Decommission — leave them running",
+      "hold": "Hold",
+      "keepOfficer": "Keep him",
+      "openLog": "Open log",
+      "rejoinConference": "Rejoin conference",
+      "release": "Release",
+      "save": "Save changes"
+    },
+    "backlog": {
+      "autoPull": "Auto-pull",
+      "on": "on — ready tickets are dispatched into free pool slots",
+      "off": "off — pools stay idle until he dispatches by hand",
+      "stalled": "Stalled",
+      "stalledDetail": "{{count}} claimed ticket(s) not moving — these are never released automatically; resume or cancel the job, then close or re-ready the ticket."
+    },
+    "brain": {
+      "actionsHint": "Hard cap on tool calls each wake.",
+      "actionsLabel": "Actions per wake",
+      "modelHint": "The brain his judgment runs on — pick a strong one; his wakes are cheap but his decisions steer everything. Blank uses your session default.",
+      "modelLabel": "Officer's own model",
+      "reasoningHint": "Effort per wake. Clamped to what the model supports.",
+      "reasoningLabel": "Reasoning"
+    },
+    "budgets": {
+      "pages": "Pages per day",
+      "pagesHint": "How often he may page you (default 3).",
+      "tokenCeiling": "Daily token ceiling",
+      "tokenCeilingHint": "Across his whole command. Blank means no ceiling."
+    },
+    "category": {
+      "none": "No pool — officer dispatches by hand",
+      "researcher": "Researcher — deliverable is an answer",
+      "tester": "Tester — deliverable is issue tickets",
+      "executor": "Executor — deliverable is shipped files"
+    },
+    "decommission": {
+      "hint": "His kit, budgets, digest, and sitrep fingerprints stay on the post; recommissioning restores them with a continuity brief.",
+      "inFlightWarning": "He has {{count}} job(s) in flight. Decommissioning leaves them running — their completions land on the post's ledger for his successor."
+    },
+    "defaults": {
+      "default": "default",
+      "project": "project",
+      "session": "session default",
+      "unlimited": "unlimited",
+      "worker": "worker default"
+    },
+    "digest": {"title": "Digest — what he queued for you"},
+    "errors": {
+      "commission": "Commission failed",
+      "conference": "Could not open the conference",
+      "decommission": "Decommission failed",
+      "hold": "Hold failed",
+      "policy": "Could not change worker-question routing",
+      "release": "Release failed",
+      "update": "Update failed",
+      "withDetail": "{{fallback}}: {{detail}}"
+    },
+    "hold": {
+      "noteHint": "Shown on the badge — why he is standing down. Legate input still reaches him while held.",
+      "noteLabel": "Hold note",
+      "placeholder": "maintenance"
+    },
+    "holdKind": {"maintenance": "maintenance", "conference": "conference"},
+    "immediacy": {
+      "nextDelivery": "applies at next delivery",
+      "nextDispatch": "applies at next dispatch",
+      "nextRespawn": "applies on next respawn",
+      "nextSleep": "applies at next sleep filing"
+    },
+    "kit": {
+      "breakerOpen": "BREAKER OPEN",
+      "ready": "ready {{count}}",
+      "readyBelowFloor": "ready {{count}} — BELOW FLOOR"
+    },
+    "machineState": {
+      "not-attempted": "not attempted",
+      "in-progress": "in progress",
+      "retryable-failed": "retryable failure",
+      "permanent-failed": "permanent failure",
+      "activated": "activated",
+      "pending-sync": "pending sync",
+      "canonical": "canonical",
+      "failed": "failed",
+      "superseded": "superseded",
+      "pending": "pending",
+      "synced": "synced",
+      "projection-only": "projection only",
+      "retryable": "retryable",
+      "queued": "queued",
+      "delivered": "delivered",
+      "unknown": "unknown"
+    },
+    "messages": {
+      "commissioned": "Commissioned.",
+      "commissionedWithBrief": "Commissioned — his first wake carries the continuity brief. Open log to watch him take the post.",
+      "decommissioned": "Post decommissioned — kit, budgets, and fingerprints stay on the post for his successor.",
+      "held": "Held — dispatches pause and the watchdog stands down; your input still reaches him.",
+      "released": "Released — queued events drain within a tick.",
+      "updated": "Post updated — the next sitrep's capacity line carries the truth."
+    },
+    "policy": {
+      "title": "Worker questions",
+      "label": "When a worker asks a question",
+      "userDirect": "Direct to me",
+      "officerAndUser": "Officer and me",
+      "officerFirst": "Officer first",
+      "officerFirstRecommended": "Officer first (recommended)",
+      "hint": "Officer first falls back to you if the officer is unavailable, and escalates to you if he stays silent past {{minutes}} min.",
+      "hintVacant": "Officer first falls back to you if the officer is unavailable, and escalates to you if he stays silent past {{minutes}} min. While the post is vacant, questions come direct to you regardless.",
+      "value": {
+        "user_direct": "Direct to me",
+        "officer_and_user": "Officer and me",
+        "officer_first": "Officer first"
+      }
+    },
+    "reasoning": {
+      "defaultHigh": "default (high)",
+      "low": "low",
+      "medium": "medium",
+      "high": "high",
+      "xhigh": "extra high",
+      "max": "maximum"
+    },
+    "roster": {
+      "count": "Count",
+      "countHint": "Zero blocks new admission without cancelling work already in flight; counts may range from 0 to 20.",
+      "drainHint": "{{inFlight}} in flight — drains to {{count}}",
+      "hint": "Give a slot a pool and the officer fills it automatically from ready tickets of that kind; leave it unset for capacity he dispatches by hand.",
+      "maxWorkers": "Max workers",
+      "maxWorkersHint": "Flat concurrency cap. Without a kit it is the only gate (default 3).",
+      "model": "Model",
+      "pool": "Pool",
+      "slot": "Slot",
+      "slotPlaceholder": "line",
+      "workspace": "Workspace"
+    },
+    "sections": {"brain": "His brain", "budgets": "Budgets", "kit": "Kit", "sleep": "Sleep"},
+    "sleep": {
+      "hint": "He files his own sleep between wakes; the server clamps to these bounds.",
+      "min": "Min (minutes)",
+      "max": "Max (minutes)"
+    },
+    "status": {
+      "active": "active",
+      "suspended": "suspended",
+      "ended": "ended",
+      "created": "created",
+      "processing": "processing",
+      "waiting_for_reply": "waiting for reply",
+      "paused": "paused",
+      "pending_review": "pending review",
+      "completed": "completed",
+      "failed": "failed",
+      "cancelled": "cancelled",
+      "held": "held",
+      "heldKind": "held — {{kind}}",
+      "unknown": "unknown"
+    },
+    "summary": {
+      "ceilingReached": "— ceiling reached; sleeping until reset",
+      "model": "His model",
+      "nextWake": "Next wake",
+      "pagesToday": "Pages today",
+      "queuedEvents": "Queued events",
+      "spendToday": "Spend today",
+      "tokens": "tokens"
+    },
+    "vacant": {
+      "dropped": "… {{count}} older entry or entries dropped",
+      "flatCapHint": "No slots means a flat cap of 3 concurrent workers. The officer runs headless; his first wake carries the continuity brief — and the while-vacant ledger, if jobs finished without him.",
+      "hint": "The post is vacant — no centurion holds this century. A project owner or system administrator can assign the kit and commission him.",
+      "ledgerTitle": "While the post was vacant",
+      "pastIncarnations": "Past incarnations"
+    },
+    "validation": {
+      "blankSlot": "Every roster row needs a slot name.",
+      "duplicateSlot": "Slot name '{{name}}' appears more than once. Rename or remove the duplicate."
+    },
+    "wake": {
+      "dueNow": "due now",
+      "eventDriven": "not scheduled (event-driven)",
+      "inMinutes": "in {{count}} min",
+      "overdueMinutes": "overdue {{count}} min"
+    },
+    "workspace": {"sandbox": "sandbox", "virtual": "virtual", "none": "none", "vmRoot": "VM (root)"}
+  },
   "pwa": {
     "splash": "Assembling legion…",
     "install": {

@@ -28,12 +28,14 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
+import main as orch_main
 from orchestrator.database.postgres import OfficerPostLifecycleConflict, PostgresDB
 from services.officer_admission import (
     OfficerAdmissionConflict,
     SlotAdmissionError,
     admit_and_create_job,
     admit_and_create_job_in_transaction,
+    count_in_flight_by_slot,
     prepare_officer_admission,
 )
 
@@ -2160,6 +2162,269 @@ async def test_final_boundary_rejects_lifecycle_or_roster_change(db, mutation):
             ticket_ready_at=READY_GENERATION,
         )
     assert await _job_count(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_bp11_whole_roster_replaces_post_thread_admission_and_recommission(
+    db, monkeypatch
+):
+    seed = await _seed_post(db)
+    original = {
+        "line": {
+            "count": 2,
+            "category": "executor",
+            "model": "old-model",
+            "backend": "sandbox",
+        },
+        "scout": {
+            "count": 1,
+            "category": "researcher",
+            "model": "scout-model",
+            "backend": "virtual",
+            "spend_ceiling_daily": 7.5,
+        },
+    }
+    await db.update_project_officer_post(
+        seed["project_id"], config_updates={"officer": {"slots": original}}
+    )
+
+    survivor = {"scout": original["scout"]}
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(
+        orch_main,
+        "require_project_owner",
+        AsyncMock(
+            return_value=({"id": str(uuid4()), "is_admin": True}, {"name": "proof"})
+        ),
+    )
+    monkeypatch.setattr(
+        orch_main,
+        "require_project_member",
+        AsyncMock(
+            return_value=({"id": str(uuid4()), "is_admin": True}, {"name": "proof"})
+        ),
+    )
+    monkeypatch.setattr(
+        orch_main, "_inject_officer_notice", AsyncMock(return_value=False)
+    )
+    api_update = await orch_main.patch_project_officer(
+        MagicMock(), seed["project_id"], {"slots": survivor}
+    )
+    api_summary = await orch_main.get_project_officer_summary(
+        MagicMock(), seed["project_id"]
+    )
+    post = await db.get_project_officer(seed["project_id"])
+    thread = await db.get_thread(seed["thread_id"])
+    thread_slots = _json(thread["metadata"])["config_override"]["officer"]["slots"]
+
+    assert api_update["config_override"]["officer"]["slots"] == survivor
+    assert api_summary["kit"] == {
+        "scout": {**survivor["scout"], "in_flight": 0},
+    }
+    assert post["config_override"]["officer"]["slots"] == survivor
+    assert thread_slots == survivor
+    assert "line" not in thread_slots
+
+    with pytest.raises(SlotAdmissionError, match="Unknown slot 'line'"):
+        await prepare_officer_admission(
+            db,
+            project_id=seed["project_id"],
+            thread_id=seed["thread_id"],
+            requested_slot="line",
+            require_auto_pull=False,
+        )
+    assert (
+        await prepare_officer_admission(
+            db,
+            project_id=seed["project_id"],
+            thread_id=seed["thread_id"],
+            requested_slot="scout",
+            require_auto_pull=False,
+        )
+    ).slot_name == "scout"
+
+    remaining = {
+        "builders": {
+            **survivor["scout"],
+            "count": 0,
+        }
+    }
+    await db.update_project_officer_post(
+        seed["project_id"], config_updates={"officer": {"slots": remaining}}
+    )
+    renamed_post = await db.get_project_officer(seed["project_id"])
+    renamed_thread = await db.get_thread(seed["thread_id"])
+    assert renamed_post["config_override"]["officer"]["slots"] == remaining
+    assert (
+        _json(renamed_thread["metadata"])["config_override"]["officer"]["slots"]
+        == remaining
+    )
+    assert set(renamed_post["config_override"]["officer"]["slots"]) == {"builders"}
+    with pytest.raises(SlotAdmissionError, match="Unknown slot 'scout'"):
+        await prepare_officer_admission(
+            db,
+            project_id=seed["project_id"],
+            thread_id=seed["thread_id"],
+            requested_slot="scout",
+            require_auto_pull=False,
+        )
+    with pytest.raises(SlotAdmissionError, match="0/0"):
+        await prepare_officer_admission(
+            db,
+            project_id=seed["project_id"],
+            thread_id=seed["thread_id"],
+            requested_slot="builders",
+            require_auto_pull=False,
+        )
+
+    reopened = {"builders": {**remaining["builders"], "count": 1}}
+    await db.update_project_officer_post(
+        seed["project_id"], config_updates={"officer": {"slots": reopened}}
+    )
+    preparation = await prepare_officer_admission(
+        db,
+        project_id=seed["project_id"],
+        thread_id=seed["thread_id"],
+        requested_slot="builders",
+        require_auto_pull=False,
+    )
+    assert preparation.slot_name == "builders"
+    in_flight = await admit_and_create_job(
+        db,
+        preparation=preparation,
+        job_kwargs=_job_kwargs("BP-11 visible drain"),
+        ticket_note_id="bp11-drain",
+        ticket_ready_at=READY_GENERATION,
+    )
+    in_flight_row = await db.get_job(str(in_flight["id"]))
+    assert str(in_flight_row["created_by_thread_id"]) == seed["thread_id"]
+    assert in_flight_row["status"] not in {"completed", "failed", "cancelled"}
+    assert _json(in_flight_row["context"])["officer_slot"] == "builders"
+    drained = {"builders": {**remaining["builders"], "count": 0}}
+    await db.update_project_officer_post(
+        seed["project_id"], config_updates={"officer": {"slots": drained}}
+    )
+    assert (await db.get_job(str(in_flight["id"]))) is not None
+    async with db.acquire() as conn:
+        assert await count_in_flight_by_slot(conn, [UUID(seed["thread_id"])]) == {
+            "builders": 1
+        }
+    # The preparation fast fence rejects the zero cap before the final
+    # post-locked capacity count; the durable job and count above prove the
+    # in-flight work was neither hidden nor cancelled by the shrink.
+    with pytest.raises(SlotAdmissionError, match="0/0"):
+        await prepare_officer_admission(
+            db,
+            project_id=seed["project_id"],
+            thread_id=seed["thread_id"],
+            requested_slot="builders",
+            require_auto_pull=False,
+        )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET status='completed' WHERE id=$1", in_flight["id"]
+        )
+    await db.update_project_officer_post(
+        seed["project_id"], config_updates={"officer": {"slots": reopened}}
+    )
+    assert (
+        await prepare_officer_admission(
+            db,
+            project_id=seed["project_id"],
+            thread_id=seed["thread_id"],
+            requested_slot="builders",
+            require_auto_pull=False,
+        )
+    ).slot_name == "builders"
+
+    await db.decommission_project_officer(
+        seed["project_id"], seed["thread_id"], reason="BP-11 recommission"
+    )
+    durable = (await db.get_project_officer(seed["project_id"]))["config_override"]
+    successor_id = uuid4()
+    successor_config = json.loads(json.dumps(durable))
+    successor_config.setdefault("officer", {})["enabled"] = True
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO threads (id, project_id, status, metadata)
+            VALUES ($1, $2, 'active', $3::jsonb)
+            """,
+            successor_id,
+            UUID(seed["project_id"]),
+            json.dumps({"config_override": successor_config}),
+        )
+    assert await db.register_project_officer_thread(
+        seed["project_id"],
+        str(successor_id),
+        expected_post_config_override=durable,
+    )
+    recommissioned = await db.get_thread(str(successor_id))
+    assert (
+        _json(recommissioned["metadata"])["config_override"]["officer"]["slots"]
+        == reopened
+    )
+
+    flattened = await db.update_project_officer_post(
+        seed["project_id"], config_updates={"officer": {"slots": None}}
+    )
+    assert flattened["post"]["config_override"]["officer"]["slots"] is None
+    flattened_thread = await db.get_thread(str(successor_id))
+    assert (
+        _json(flattened_thread["metadata"])["config_override"]["officer"]["slots"]
+        is None
+    )
+    flat_preparation = await prepare_officer_admission(
+        db,
+        project_id=seed["project_id"],
+        thread_id=str(successor_id),
+        requested_slot="removed-name-is-ignored-on-flat-cap",
+        require_auto_pull=False,
+    )
+    assert flat_preparation.slot_name is None
+
+
+@pytest.mark.asyncio
+async def test_bp11_concurrent_whole_roster_writes_never_form_a_union(db):
+    seed = await _seed_post(db)
+    roster_a = {"alpha": {"count": 1, "model": "a", "backend": "sandbox"}}
+    roster_b = {"beta": {"count": 2, "model": "b", "backend": "virtual"}}
+
+    async with db.acquire() as blocker:
+        transaction = blocker.transaction()
+        await transaction.start()
+        await blocker.fetchrow(
+            "SELECT project_id FROM project_officers WHERE project_id=$1 FOR UPDATE",
+            UUID(seed["project_id"]),
+        )
+        write_a = asyncio.create_task(
+            db.update_project_officer_post(
+                seed["project_id"],
+                config_updates={"officer": {"slots": roster_a}},
+            )
+        )
+        write_b = asyncio.create_task(
+            db.update_project_officer_post(
+                seed["project_id"],
+                config_updates={"officer": {"slots": roster_b}},
+            )
+        )
+        await asyncio.sleep(0.1)
+        assert not write_a.done() and not write_b.done()
+        await transaction.commit()
+
+    results = await asyncio.gather(write_a, write_b)
+    observed = [
+        result["post"]["config_override"]["officer"]["slots"] for result in results
+    ]
+    assert roster_a in observed and roster_b in observed
+    post = await db.get_project_officer(seed["project_id"])
+    thread = await db.get_thread(seed["thread_id"])
+    final_slots = post["config_override"]["officer"]["slots"]
+    assert final_slots in (roster_a, roster_b)
+    assert (
+        _json(thread["metadata"])["config_override"]["officer"]["slots"] == final_slots
+    )
 
 
 @pytest.mark.asyncio

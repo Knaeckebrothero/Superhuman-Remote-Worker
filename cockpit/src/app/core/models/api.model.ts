@@ -1350,7 +1350,7 @@ export interface OfficerLive {
   pages_today?: {used: number; budget: number} | null;
   token_ceiling?: {daily: number; deferred_today?: boolean} | null;
   digest?: {at: string; subject: string; message: string}[] | null;
-  conference?: {thread_id: string; status: string} | null;
+  conference?: {thread_id: string; status?: string | null} | null;
   /** Not yet in the O1–O4 contract; optional so the editor seeds them when the backend adds them. */
   max_actions_per_wake?: number | null;
   max_concurrent_workers?: number | null;
@@ -1388,6 +1388,8 @@ export interface OfficerVacantLedger {
 
 /** `GET /api/projects/{id}/officer` — the post, always present. */
 export interface OfficerPost {
+  /** Server-owned owner/admin capability for Officer mutations. */
+  can_manage: boolean;
   commissioned: boolean;
   held?: OfficerHold | null;
   officer?: OfficerLive | null;
@@ -1397,6 +1399,7 @@ export interface OfficerPost {
   incarnations?: OfficerIncarnation[] | null;
   while_vacant?: OfficerVacantLedger | null;
   backlog?: OfficerBacklogState | null;
+  conference?: {thread_id: string; status?: string | null} | null;
 }
 
 /** The officer's own brain (distinct from the slot models his workers run on). */

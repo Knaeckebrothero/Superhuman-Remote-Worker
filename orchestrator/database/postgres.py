@@ -10896,6 +10896,30 @@ class PostgresDB:
                     merged[key] = value
             return merged
 
+        def _merge_post_config(base: Any, override: Any) -> Dict[str, Any]:
+            """Merge a post fragment, with whole-roster semantics for slots.
+
+            Officer Post PATCH treats ``officer.slots`` as the caller's complete
+            desired roster.  A recursive merge is still correct for every other
+            config field, but it would retain omitted/renamed slot keys as ghost
+            capacity.  Keep this exception local to the authoritative post writer
+            rather than changing the repository's general JSON merge contract.
+            """
+
+            merged = _deep_merge(base, override)
+            override_officer = (
+                override.get("officer") if isinstance(override, dict) else None
+            )
+            if isinstance(override_officer, dict) and "slots" in override_officer:
+                merged_officer = merged.get("officer")
+                if not isinstance(merged_officer, dict):
+                    merged_officer = {}
+                merged["officer"] = {
+                    **merged_officer,
+                    "slots": override_officer["slots"],
+                }
+            return merged
+
         async with self.acquire() as conn:
             async with conn.transaction():
                 post = await conn.fetchrow(
@@ -10930,7 +10954,7 @@ class PostgresDB:
                         current_config = {}
                 if not isinstance(current_config, dict):
                     current_config = {}
-                merged_config = _deep_merge(current_config, config_updates or {})
+                merged_config = _merge_post_config(current_config, config_updates or {})
 
                 officer_config = merged_config.get("officer") or {}
                 if isinstance(officer_config, dict):
@@ -10994,7 +11018,7 @@ class PostgresDB:
                     if not isinstance(metadata, dict):
                         metadata = {}
                     runtime_config = metadata.get("config_override") or {}
-                    runtime_config = _deep_merge(runtime_config, config_updates)
+                    runtime_config = _merge_post_config(runtime_config, config_updates)
                     updated_thread = await conn.fetchrow(
                         """
                         UPDATE threads

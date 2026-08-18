@@ -259,6 +259,51 @@ def _with_correctness_health(db):
 
 class TestOfficerSummaryEndpoint:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("is_admin", "role", "expected"),
+        [
+            (True, None, True),
+            (False, "owner", True),
+            (False, "editor", False),
+            (False, "viewer", False),
+        ],
+    )
+    async def test_management_capability_matches_mutation_authority(
+        self, monkeypatch, is_admin, role, expected
+    ):
+        db = _with_correctness_health(SimpleNamespace())
+        db.get_officer_thread_for_project = AsyncMock(return_value=None)
+        db.get_or_create_project_officer = AsyncMock(
+            return_value={
+                "project_id": PROJECT_ID,
+                "thread_id": None,
+                "config_override": {},
+                "communication_policy": {},
+                "state": {},
+                "incarnations": [],
+            }
+        )
+        db.get_project_officer_lineage = AsyncMock(return_value=[])
+        db.get_user_role_in_project = AsyncMock(return_value=role)
+        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(
+            main,
+            "require_project_member",
+            AsyncMock(return_value=({"id": "user-1", "is_admin": is_admin}, {})),
+        )
+        monkeypatch.setattr(
+            main, "_find_open_conference_thread", AsyncMock(return_value=None)
+        )
+
+        out = await main.get_project_officer_summary(MagicMock(), PROJECT_ID)
+
+        assert out["can_manage"] is expected
+        if is_admin:
+            db.get_user_role_in_project.assert_not_awaited()
+        else:
+            db.get_user_role_in_project.assert_awaited_once_with(PROJECT_ID, "user-1")
+
+    @pytest.mark.asyncio
     async def test_summary_shape(self, monkeypatch):
         from datetime import datetime, timezone
 
@@ -311,7 +356,11 @@ class TestOfficerSummaryEndpoint:
         monkeypatch.setattr(
             main, "require_approved_user", AsyncMock(return_value={"id": "u"})
         )
-        monkeypatch.setattr(main, "require_project_member", AsyncMock())
+        monkeypatch.setattr(
+            main,
+            "require_project_member",
+            AsyncMock(return_value=({"id": "u", "is_admin": True}, {})),
+        )
         monkeypatch.setattr(
             main,
             "_find_open_conference_thread",
@@ -333,6 +382,7 @@ class TestOfficerSummaryEndpoint:
         assert out["kit"] == {"line": {"count": 2, "in_flight": 1}}
         assert out["communication_policy"]["worker_messages"] == "user_direct"
         assert out["incarnations"] == [incarnation]
+        assert out["can_manage"] is True
 
     @pytest.mark.asyncio
     async def test_no_officer_renders_enable_prompt(self, monkeypatch):
@@ -358,7 +408,11 @@ class TestOfficerSummaryEndpoint:
         monkeypatch.setattr(
             main, "require_approved_user", AsyncMock(return_value={"id": "u"})
         )
-        monkeypatch.setattr(main, "require_project_member", AsyncMock())
+        monkeypatch.setattr(
+            main,
+            "require_project_member",
+            AsyncMock(return_value=({"id": "u", "is_admin": True}, {})),
+        )
         monkeypatch.setattr(
             main, "_find_open_conference_thread", AsyncMock(return_value=None)
         )
@@ -376,6 +430,7 @@ class TestOfficerSummaryEndpoint:
         assert out["incarnations"] == []
         assert out["communication_policy"]["officer_response_minutes"] == 15
         assert out["while_vacant"] == {"entries": [], "dropped": 0}
+        assert out["can_manage"] is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("stale_link_kind", ["ended", "missing"])
@@ -414,7 +469,11 @@ class TestOfficerSummaryEndpoint:
         monkeypatch.setattr(
             main, "require_approved_user", AsyncMock(return_value={"id": "u"})
         )
-        monkeypatch.setattr(main, "require_project_member", AsyncMock())
+        monkeypatch.setattr(
+            main,
+            "require_project_member",
+            AsyncMock(return_value=({"id": "u", "is_admin": True}, {})),
+        )
         monkeypatch.setattr(
             main, "_find_open_conference_thread", AsyncMock(return_value=None)
         )

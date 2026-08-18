@@ -35258,6 +35258,16 @@ async def list_officers(request: Request) -> dict[str, Any]:
     return {"officers": officers, "total": len(officers)}
 
 
+async def _can_manage_project_officer(user: dict[str, Any], project_id: str) -> bool:
+    """Server-owned owner/admin capability for Officer mutations."""
+    if user.get("is_admin"):
+        return True
+    return (
+        await postgres_db.get_user_role_in_project(project_id, str(user["id"]))
+        == "owner"
+    )
+
+
 @app.get("/api/projects/{project_id}/officer")
 async def get_project_officer_summary(
     request: Request, project_id: str
@@ -35273,8 +35283,10 @@ async def get_project_officer_summary(
     in-flight counts follow every incarnation on the post, not just the
     current thread.
     """
-    await require_approved_user(request, postgres_db)
-    await require_project_member(request, postgres_db, project_id, min_role="viewer")
+    user, _project = await require_project_member(
+        request, postgres_db, project_id, min_role="viewer"
+    )
+    can_manage = await _can_manage_project_officer(user, project_id)
 
     post = await postgres_db.get_or_create_project_officer(project_id) or {}
     officer = await postgres_db.get_officer_thread_for_project(project_id)
@@ -35339,6 +35351,10 @@ async def get_project_officer_summary(
     )
     floor_wakes = await postgres_db.list_officer_floor_wake_outcomes(project_id)
     post_block: dict[str, Any] = {
+        # OC-10: a safe capability derived from the same current membership
+        # authority as the mutation endpoints.  It is refreshed with every
+        # summary poll; the owner/admin endpoint guards remain authoritative.
+        "can_manage": can_manage,
         # OC-03 read surface: commissioned means a LIVE thread holds the post,
         # not that the link column is non-null. ``officer`` comes from the
         # post join with the non-ended filter, so it IS the live-post proof; a
@@ -36505,10 +36521,11 @@ async def patch_project_officer(
     request: Request, project_id: str, body: dict[str, Any]
 ) -> dict[str, Any]:
     """Edit the post — the missing form (officer_post.md §7). Auth: project
-    admin (the kit belongs to the century, §11 Q1).
+    owner or system admin (the kit belongs to the century, §11 decision 1).
 
-    Writes the durable row always; when commissioned, deep-merges the kit
-    fragment into thread metadata and injects a one-line notice —
+    Writes the durable row always; when commissioned, merges the fragment into
+    thread metadata (with an explicitly supplied ``slots`` map replacing the
+    whole roster) and injects a one-line notice —
     deliberately NOT a wake (the next sitrep's capacity line carries the
     truth). Shrinking below in-flight is drain semantics, decided: the 409
     lives at the next dispatch, running jobs are untouched.
@@ -38836,6 +38853,16 @@ async def create_thread(
                     status_code=400,
                     detail="A conference session needs exactly one project — "
                     "the officer's identity is project-scoped.",
+                )
+            # A conference is an Officer-management mutation: opening it holds
+            # the background Officer.  Project attachment alone admits viewers
+            # and editors to ordinary sessions, so enforce the current
+            # owner/admin authority again here before that side effect.  This
+            # is the server fence for a stale card whose role was just revoked.
+            if not await _can_manage_project_officer(user, primary_project_id):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Project owner role required to open an Officer conference",
                 )
             _open_conf = await _find_open_conference_thread(primary_project_id)
             if _open_conf:
