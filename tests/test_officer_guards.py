@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from services import session_wake
+from services.usage_ledger import llm_tokens_from_rows
 
 THREAD_ID = str(uuid.uuid4())
 
@@ -29,19 +30,46 @@ def _thread(ceiling=None, officer_state=None):
     return {"id": THREAD_ID, "metadata": metadata}
 
 
-def _ledger(tokens, unit="tokens", available=True, raises=False):
+def _ledger(tokens, unit=None, available=True, raises=False):
+    """`unit=None` splits `tokens` across the three real LLM token units."""
     ledger = SimpleNamespace()
     ledger.is_available = available
     if raises:
         ledger.query_usage = AsyncMock(side_effect=RuntimeError("metering down"))
     else:
+        if unit is not None:
+            rows = [{"unit": unit, "quantity": tokens}]
+        else:
+            third = tokens // 3
+            rows = [
+                {"unit": "prompt-token", "quantity": tokens - 2 * third},
+                {"unit": "cached-prompt-token", "quantity": third},
+                {"unit": "completion-token", "quantity": third},
+                {"unit": "vcpu-hour", "quantity": 999},
+            ]
         ledger.query_usage = AsyncMock(
-            return_value={
-                "by_category": [{"unit": unit, "quantity": tokens}],
-                "total_cost_usd": 0.0,
-            }
+            return_value={"by_category": rows, "total_cost_usd": 0.0}
         )
     return ledger
+
+
+class TestLlmTokensFromRows:
+    def test_realistic_payload_sums_all_three_units(self):
+        rows = [
+            {"category": "llm", "unit": "prompt-token", "quantity": 1_200_000.0},
+            {"category": "llm", "unit": "cached-prompt-token", "quantity": 250_000.0},
+            {"category": "llm", "unit": "completion-token", "quantity": 50_000.0},
+            {"category": "compute", "unit": "vcpu-hour", "quantity": 3.5},
+        ]
+        assert llm_tokens_from_rows(rows) == 1_500_000
+
+    def test_defensive_about_missing_keys(self):
+        rows = [
+            {},
+            {"unit": "prompt-token"},
+            {"unit": "completion-token", "quantity": None},
+        ]
+        assert llm_tokens_from_rows(rows) == 0.0
 
 
 class TestCeilingParse:
@@ -82,6 +110,24 @@ class TestCeilingDeferral:
         assert out == (now + timedelta(days=1)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
+
+    @pytest.mark.asyncio
+    async def test_units_below_ceiling_individually_defer_when_summed(self):
+        ledger = _ledger(0)
+        ledger.query_usage = AsyncMock(
+            return_value={
+                "by_category": [
+                    {"unit": "prompt-token", "quantity": 60_000},
+                    {"unit": "cached-prompt-token", "quantity": 25_000},
+                    {"unit": "completion-token", "quantity": 15_000},
+                ],
+                "total_cost_usd": 0.0,
+            }
+        )
+        out = await session_wake._officer_ceiling_deferral(
+            None, _thread(ceiling=100_000), usage_ledger=ledger
+        )
+        assert out is not None
 
     @pytest.mark.asyncio
     async def test_scoped_to_this_thread_today(self):

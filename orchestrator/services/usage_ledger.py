@@ -91,6 +91,15 @@ def cache_hit_ratio_from_rows(rows: Sequence[Dict[str, Any]]) -> float:
     return cached / total_prompt if total_prompt > 0 else 0.0
 
 
+def llm_tokens_from_rows(rows: Sequence[Dict[str, Any]]) -> float:
+    """Return the summed LLM token quantity for usage aggregate rows."""
+    return sum(
+        float(r.get("quantity") or 0.0)
+        for r in rows
+        if r.get("unit") in LLM_TOKEN_UNITS
+    )
+
+
 @dataclass
 class UsageEvent:
     """One metered resource *dimension* (a vcpu-hour line, a prompt-token line).
@@ -1236,4 +1245,5 @@ __all__ = [
     "LLM_TOKEN_UNITS",
     "V1_USAGE_COMPAT_PREDICATE",
     "cache_hit_ratio_from_rows",
+    "llm_tokens_from_rows",
 ]

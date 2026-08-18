@@ -727,15 +727,13 @@ async def _budget_section(
     if usage_ledger is None or not project_id or not _budget_visible(thread):
         return []
     try:
+        from services.usage_ledger import llm_tokens_from_rows
+
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         usage = await usage_ledger.query_usage(
             from_ts=day_start, to_ts=now, scope_project_id=project_id
         )
-        tokens = sum(
-            item.get("quantity") or 0
-            for item in usage.get("by_category") or []
-            if item.get("unit") == "tokens"
-        )
+        tokens = llm_tokens_from_rows(usage.get("by_category") or [])
         cost = usage.get("total_cost_usd") or 0.0
         return [f"Budget today (project): ${cost:.2f}, {int(tokens):,} tokens."]
     except Exception:

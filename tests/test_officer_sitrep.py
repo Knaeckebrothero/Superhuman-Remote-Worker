@@ -191,7 +191,9 @@ class TestSitrepBuild:
         ledger.query_usage = AsyncMock(
             return_value={
                 "by_category": [
-                    {"unit": "tokens", "quantity": 123456, "cost_usd": 2.5},
+                    {"unit": "prompt-token", "quantity": 100000, "cost_usd": 1.5},
+                    {"unit": "cached-prompt-token", "quantity": 20000, "cost_usd": 0.5},
+                    {"unit": "completion-token", "quantity": 3456, "cost_usd": 0.5},
                     {"unit": "requests", "quantity": 42, "cost_usd": 0.0},
                 ],
                 "total_cost_usd": 2.5,
