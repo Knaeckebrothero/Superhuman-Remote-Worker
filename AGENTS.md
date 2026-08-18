@@ -44,6 +44,15 @@ git clone git@github.com:superhuman-remote-worker/knowledge-history.git
 
 Without those clones the paths referenced throughout this repository will not resolve.
 
+Both clones are gitignored here, so a stray `git add -A` cannot publish a private repo
+into the public one. Because that would also hide them from a bare `rg <term>`, a
+committed `.ignore` re-includes them for ripgrep only — search reaches the vault, git
+still does not.
+
+A note becomes visible to SRW when it is **pushed**, not when it is saved: the
+orchestrator indexes the GitHub repository, never your working copy. Nothing warns you
+about the gap, and both sides look healthy while it exists.
+
 The same two repositories are attached to the SRW project on the cluster, so agents read
 and write the *same* vault through the knowledge-base tools. Notes an agent writes land
 flat at `knowledge/<slug>.md`; treat that root as an inbox and file them into
