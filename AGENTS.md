@@ -66,9 +66,7 @@ Two rules that matter when adding notes:
   — that overrides the stem.
 - **`policy/` holds the two manifests CI validates against the code**
   (`policy/endpoint_inventory.txt`, `policy/ci_self_hosted_runners.md`). CI cannot read the
-  private vault, so these live beside the code. The generated job-tool catalogue is written
-  by `scripts/generate-job-surface.py` straight into the vault
-  (`knowledge-base/knowledge/generated/`), so running it needs the vault cloned.
+  private vault, so anything a gate checks lives beside the code, never in a note.
 - **The design trail from before 2026-08-17 is in this repository's git history**, under
   the old `docs/` path. `git log -- docs/…` and `git show <sha>:docs/…` work; the folder
   was removed going forward.
