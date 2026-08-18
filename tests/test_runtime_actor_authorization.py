@@ -275,3 +275,142 @@ async def test_recommission_invalidates_old_incarnation_immediately():
     assert denied.value.detail["code"] == "runtime_not_current"
     assert denied.value.detail["actor"]["thread_id"] == OFFICER_THREAD
     db.record_security_event.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Sliding refresh window — knowledge/issues/
+# officer_runtime_grant_expires_after_24h_and_dies_silently.md
+# ---------------------------------------------------------------------------
+
+
+class _FakeConn:
+    """Records execute() calls so the test can assert on the UPDATE issued."""
+
+    def __init__(self, row):
+        self._row = row
+        self.executed: list[tuple] = []
+
+    async def fetchrow(self, *args, **kwargs):
+        return self._row
+
+    async def fetchval(self, *args, **kwargs):
+        return None
+
+    async def execute(self, sql, *args):
+        self.executed.append((sql, args))
+        return "UPDATE 1"
+
+    def transaction(self):
+        conn = self
+
+        class _Txn:
+            async def __aenter__(self_inner):
+                return conn
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        return _Txn()
+
+
+def _refresh_db(conn):
+    db = MagicMock()
+    db.record_security_event = AsyncMock()
+
+    class _Acquire:
+        async def __aenter__(self):
+            return conn
+
+        async def __aexit__(self, *exc):
+            return False
+
+    db.acquire = MagicMock(return_value=_Acquire())
+    return db
+
+
+def _grant_row(*, caller_kind="officer", thread_id=OFFICER_THREAD):
+    from datetime import datetime, timedelta, timezone
+
+    return {
+        "id": str(uuid4()),
+        "caller_kind": caller_kind,
+        "user_id": USER_ID,
+        "project_id": PROJECT_A,
+        "project_role": "owner",
+        "thread_id": thread_id,
+        "officer_incarnation": 0,
+        # Valid, but close to the wall — the case that used to kill the officer.
+        "refresh_expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+        "revoked_at": None,
+    }
+
+
+def _refresh_request():
+    from src.shared.runtime_actor import RUNTIME_ACTOR_REFRESH_HEADER
+
+    request = MagicMock()
+    request.method = "POST"
+    request.headers = Headers(
+        raw=[(RUNTIME_ACTOR_REFRESH_HEADER.lower().encode(), b"srr_" + b"A" * 43)]
+    )
+    request.url.path = "/api/runtime-actors/refresh"
+    request.client = None
+    return request
+
+
+@pytest.mark.asyncio
+async def test_refresh_slides_the_window_for_a_live_thread():
+    """An officer that keeps working must not hit an absolute wall.
+
+    The grant's lifetime is an IDLE timeout, not a fixed lease: reaching the
+    mint proves `_current_actor` already re-derived authority from a thread that
+    is not ended, and that liveness is what licenses the extension.
+    """
+    from datetime import datetime, timezone
+
+    row = _grant_row()
+    conn = _FakeConn(row)
+    db = _refresh_db(conn)
+    before = row["refresh_expires_at"]
+
+    with (
+        patch.object(service, "_current_actor", AsyncMock(side_effect=lambda d, a: a)),
+        patch.object(
+            service,
+            "_insert_access_token",
+            AsyncMock(return_value=("sra_" + "B" * 43, datetime.now(timezone.utc))),
+        ),
+    ):
+        actor = await service.refresh_runtime_actor_request(db, _refresh_request())
+
+    assert actor.refresh_expires_at is not None
+    assert actor.refresh_expires_at > before, (
+        "a successful refresh on a live thread must push the wall forward"
+    )
+    sql = " ".join(s for s, _ in conn.executed)
+    assert "refresh_expires_at" in sql, "the UPDATE must persist the new expiry"
+
+
+@pytest.mark.asyncio
+async def test_refresh_does_not_slide_a_worker_grant():
+    """Workers are job-scoped and have no thread liveness to justify sliding."""
+    from datetime import datetime, timezone
+
+    row = _grant_row(caller_kind="worker", thread_id=None)
+    conn = _FakeConn(row)
+    db = _refresh_db(conn)
+    before = row["refresh_expires_at"]
+
+    with (
+        patch.object(service, "_current_actor", AsyncMock(side_effect=lambda d, a: a)),
+        patch.object(
+            service,
+            "_insert_access_token",
+            AsyncMock(return_value=("sra_" + "B" * 43, datetime.now(timezone.utc))),
+        ),
+    ):
+        actor = await service.refresh_runtime_actor_request(db, _refresh_request())
+
+    assert actor.refresh_expires_at == before, "worker grants keep their fixed wall"
+    sql = " ".join(s for s, _ in conn.executed)
+    assert "refresh_expires_at" not in sql

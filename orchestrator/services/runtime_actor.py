@@ -668,19 +668,56 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
                 "expired_credential", "Runtime actor refresh has expired.", actor=actor
             )
         await _current_actor(db, actor)
+
+        # The grant's lifetime is an IDLE timeout, not a fixed lease. Sliding it
+        # forward on each successful refresh is what lets an agent that is
+        # SPECIFIED to run indefinitely — a Centurion on its wake/sleep cycle —
+        # keep working. The previous absolute wall made officer capability a
+        # function of when its pod last started, the same nondeterminism the
+        # POD_BOOTSTRAP_TTL comment above exists to remove: officer 6ce5bc4c
+        # went silently unauthorized 24h after boot and burned ~52 turns being
+        # refused (knowledge/issues/
+        # officer_runtime_grant_expires_after_24h_and_dies_silently.md).
+        #
+        # Liveness, not trust, licenses the extension: reaching this line means
+        # _current_actor re-derived authority from the live thread, and
+        # derive_runtime_actor refuses an `ended` one. An active thread is
+        # therefore the signal, so a thread-bound grant needs no absolute cap
+        # while its thread lives. Authority itself is never cached — it is
+        # recomputed on every access and every refresh — so the window bounds
+        # only how long a stolen refresh token stays useful, and a stolen token
+        # can only be used while the thread it names is still alive.
+        #
+        # Workers are deliberately excluded: they are job-scoped, _current_actor
+        # short-circuits them without any thread check, and they have no
+        # liveness to justify an open-ended credential.
+        slides = actor.caller_kind != "worker" and bool(row["thread_id"])
+        next_refresh_expires_at = (
+            now + timedelta(seconds=REFRESH_TTL_SECONDS) if slides else None
+        )
         async with db.acquire() as conn:
             async with conn.transaction():
                 access_token, access_expires_at = await _insert_access_token(
                     conn, row["id"], now=now
                 )
-                await conn.execute(
-                    "UPDATE runtime_actor_grants SET last_refreshed_at = now() "
-                    "WHERE id = $1",
-                    row["id"],
-                )
+                if next_refresh_expires_at is not None:
+                    await conn.execute(
+                        "UPDATE runtime_actor_grants SET last_refreshed_at = now(), "
+                        "refresh_expires_at = $2 WHERE id = $1",
+                        row["id"],
+                        next_refresh_expires_at,
+                    )
+                else:
+                    await conn.execute(
+                        "UPDATE runtime_actor_grants SET last_refreshed_at = now() "
+                        "WHERE id = $1",
+                        row["id"],
+                    )
         actor.access_credential = access_token
         actor.refresh_credential = token
         actor.access_expires_at = access_expires_at
+        if next_refresh_expires_at is not None:
+            actor.refresh_expires_at = next_refresh_expires_at
         return actor
     except RuntimeActorCredentialError as error:
         await _audit_denial(
