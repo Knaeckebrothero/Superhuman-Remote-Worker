@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import math
 from typing import Any
@@ -83,6 +84,29 @@ def completion_control_claim_active(
 
     observed = float(now_epoch) if now_epoch is not None else time.time()
     return expiry > observed
+
+
+def completion_control_claim_detail(context: Any) -> str:
+    """Describe an active claim for control 409s; the bare prefix is load-bearing."""
+
+    detail = "job control is in progress"
+    marker = _json_object(context).get(COMPLETION_CONTROL_CLAIM_KEY)
+    if not isinstance(marker, dict):
+        return detail
+    if marker.get("version") != COMPLETION_CONTROL_CLAIM_VERSION:
+        return detail
+    source = marker.get("source")
+    if not isinstance(source, str) or not 0 < len(source) <= 64:
+        return detail
+    raw_expiry = marker.get("expires_epoch")
+    if not isinstance(raw_expiry, (int, float)) or isinstance(raw_expiry, bool):
+        return detail
+    try:
+        expires_at = datetime.fromtimestamp(float(raw_expiry), tz=timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return detail
+    stamp = expires_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return f"{detail} (source={source}, expires_at={stamp})"
 
 
 def completion_control_claim_owned_active(
@@ -612,5 +636,6 @@ __all__ = [
     "CompletionControl",
     "CompletionControlDecision",
     "completion_control_claim_active",
+    "completion_control_claim_detail",
     "completion_control_claim_owned_active",
 ]

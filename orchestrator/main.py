@@ -13899,7 +13899,7 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                 ):
                     raise HTTPException(
                         status_code=409,
-                        detail="job control is in progress",
+                        detail=_completion_control_claim_detail(refreshed),
                     )
                 elif not refreshed or refreshed.get("status") != "cancelled":
                     raise HTTPException(
@@ -13967,7 +13967,7 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
                 ):
                     raise HTTPException(
                         status_code=409,
-                        detail="job control is in progress",
+                        detail=_completion_control_claim_detail(refreshed),
                     )
                 if not refreshed or refreshed.get("status") != "cancelled":
                     raise HTTPException(
@@ -14099,7 +14099,8 @@ async def pause_job(request: Request, job_id: str) -> dict[str, str]:
                 refreshed = await postgres_db.get_job(job_id)
                 if _active_completion_control_claim(refreshed):
                     raise HTTPException(
-                        status_code=409, detail="job control is in progress"
+                        status_code=409,
+                        detail=_completion_control_claim_detail(refreshed),
                     )
                 raise HTTPException(
                     status_code=400,
@@ -14265,7 +14266,8 @@ async def agent_release_job(
             )
             if _active_completion_control_claim(refreshed):
                 raise HTTPException(
-                    status_code=409, detail="job control is in progress"
+                    status_code=409,
+                    detail=_completion_control_claim_detail(refreshed),
                 )
             if (
                 COMPLETION_COMMANDS_ENABLED
@@ -23813,6 +23815,16 @@ def _active_completion_control_claim(
     from services.completion_control import completion_control_claim_active
 
     return completion_control_claim_active(job.get("context"))
+
+
+def _completion_control_claim_detail(
+    job: Mapping[str, Any] | None,
+) -> str:
+    """Describe the active reserved marker without importing Gate-3 code flag-off."""
+
+    from services.completion_control import completion_control_claim_detail
+
+    return completion_control_claim_detail(job.get("context") if job else None)
 
 
 async def _run_completion_effect(

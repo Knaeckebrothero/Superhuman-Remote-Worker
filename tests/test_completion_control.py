@@ -1,5 +1,6 @@
 """Focused M2 command-aware control admission proofs."""
 
+import json
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -9,6 +10,7 @@ import pytest
 from orchestrator.services.completion_control import (
     CompletionControl,
     completion_control_claim_active,
+    completion_control_claim_detail,
 )
 from fastapi import HTTPException
 from unittest.mock import MagicMock, patch
@@ -50,6 +52,42 @@ def test_control_marker_expiry_and_malformed_fail_closed():
             }
         },
         now_epoch=100.0,
+    )
+
+
+def test_control_claim_detail_names_source_and_expiry_with_bare_fallback():
+    marker = {
+        "_completion_control_claim": {
+            "version": 1,
+            "source": "public_pause",
+            "expires_epoch": 4_102_444_800,
+        }
+    }
+    detail = completion_control_claim_detail(marker)
+    assert detail == (
+        "job control is in progress"
+        " (source=public_pause, expires_at=2100-01-01T00:00:00Z)"
+    )
+    assert completion_control_claim_detail(json.dumps(marker)) == detail
+
+    bare = "job control is in progress"
+    assert completion_control_claim_detail(None) == bare
+    assert completion_control_claim_detail({"_completion_control_claim": []}) == bare
+    assert (
+        completion_control_claim_detail({"_completion_control_claim": {"version": 99}})
+        == bare
+    )
+    assert (
+        completion_control_claim_detail(
+            {
+                "_completion_control_claim": {
+                    "version": 1,
+                    "source": "public_pause",
+                    "expires_epoch": 10**10000,
+                }
+            }
+        )
+        == bare
     )
 
 
